@@ -110,8 +110,11 @@ def main() -> None:
     ap.add_argument("--n-cand", type=int, default=24,
                     help="подстановок на (чанк, уровень)")
     ap.add_argument("--embodiment", type=int, default=0, help="franka_libero_20hz")
-    ap.add_argument("--fix-gripper", choices=["auto", "yes", "no"], default="auto",
-                    help="перевести захват из -1/+1 в 0/1, как ждёт кодек")
+    ap.add_argument("--fix-gripper", choices=["auto", "yes", "no", "invert"],
+                    default="auto",
+                    help="перевести захват: auto/yes = (x+1)/2, invert = (1-x)/2")
+    ap.add_argument("--no-gripper", action="store_true",
+                    help="исключить канал захвата из нормы ошибки действия")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -156,7 +159,11 @@ def main() -> None:
         need = g.min() < -0.5
     else:
         need = args.fix_gripper == "yes"
-    if need:
+    if args.fix_gripper == "invert":
+        print(f"\nЗАХВАТ: диапазон [{g.min():+.2f}, {g.max():+.2f}] -> (1-x)/2 "
+              f"(перевёрнутое соглашение).")
+        A[:, :, -1] = (1.0 - A[:, :, -1]) / 2.0
+    elif need:
         print(f"\nЗАХВАТ: в данных диапазон [{g.min():+.2f}, {g.max():+.2f}], "
               f"кодек ждёт [0, 1] — перевожу (x+1)/2.")
         A[:, :, -1] = (A[:, :, -1] + 1.0) / 2.0
@@ -224,7 +231,8 @@ def main() -> None:
 
         # ---------- перебор подстановок ----------
         rng = np.random.default_rng(1)
-        rows = []                                   # (уровень, ошибка латенты, ошибка действия, вариант)
+        rows = []          # (уровень, ошибка латенты, ошибка действия, вариант)
+        ch_dev = []        # вклад каждого канала в отклонение
         for lev in range(L):
             for _ in range(args.n_cand):
                 p = int(rng.integers(P))
@@ -237,12 +245,22 @@ def main() -> None:
                     h = latent_from_codes(E, c)
                     le = (h - h_ours).norm(dim=-1).amax(-1) / np.sqrt(Dz)   # (B,)
                     d_ = decode(c)
-                    ae = (d_ - base).abs().flatten(1).amax(-1) / scale       # (B,)
+                    dev = (d_ - base).abs()                       # (B, T, D)
+                    ch_dev.append(dev.amax(1).median(0).values.cpu().numpy())
+                    if args.no_gripper:
+                        dev = dev[..., :-1]
+                    ae = dev.flatten(1).amax(-1) / scale                     # (B,)
                     for i in range(len(a)):
                         rows.append((lev, float(le[i]), float(ae[i]), tag))
 
     R = np.array([(r[0], r[1], r[2], 0 if r[3] == "A" else 1) for r in rows])
     print(f"замеров {len(R)}: A {(R[:,3]==0).sum()}, B {(R[:,3]==1).sum()}")
+    cd = np.median(np.stack(ch_dev), axis=0) / scale
+    print("медианное отклонение по каналам: " + " ".join(f"{v:.4f}" for v in cd)
+          + ("   (захват исключён из нормы)" if args.no_gripper else ""))
+    if cd[-1] > 2 * cd[:-1].max():
+        print("  ВНИМАНИЕ: захват доминирует над остальными каналами — "
+              "перепроверить\n  вывод с --no-gripper.")
 
     # ---------- наивное сравнение (то, что НЕ доказывает ничего) ----------
     print("\n" + "=" * 78)
