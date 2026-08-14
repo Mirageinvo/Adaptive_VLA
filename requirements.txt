@@ -21,8 +21,22 @@ omegaconf>=2.3
 # в ~/.local/bin вне PATH.
 huggingface_hub>=0.34,<1.0
 hf_transfer>=0.1
-transformers>=4.44,<4.50
-tokenizers>=0.20
+# SmolVLMConfig появился в transformers 4.50; прежняя граница <4.50 была
+# унаследована из другого проекта (prismatic/VQ-VLA), здесь его нет.
+# ВЕРХНЯЯ ГРАНИЦА ОБЯЗАТЕЛЬНА: transformers 5.x меняет API и тянет
+# huggingface-hub 1.x с tokenizers 0.22.
+transformers>=4.50,<4.57
+tokenizers<0.22
+accelerate>=0.30,<2
+num2words>=0.5
+
+# torch и его спутники ПРИБИТЫ к версии базового образа. Установка любого из
+# них без пина утащит остальные: `pip install -U torchvision` однажды подняла
+# torch 2.4.1 -> 2.13.0 и поставила пакеты nvidia-cu13 поверх сборки под
+# CUDA 12.4. Ставить только с --index-url на нужный CUDA-канал.
+torch==2.4.1
+torchvision==0.19.1
+torchaudio==2.4.1
 
 # датасеты LIBERO
 zarr>=2.16,<3

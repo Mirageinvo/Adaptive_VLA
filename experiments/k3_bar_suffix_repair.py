@@ -88,13 +88,41 @@ def greedy_suffix(E, codes, target, p, level):
     return out
 
 
-def build_state(z, t_idx, keys):
-    """Проприоцепция в текст промпта. Точный состав вектора у них не
-    документирован; сверяется санитарной проверкой."""
-    parts = [np.asarray(z["data"][k])[t_idx] for k in keys if k in z["data"]]
-    if not parts:
-        return np.zeros((len(t_idx), 1), np.float32)
-    return np.concatenate([p.reshape(len(t_idx), -1) for p in parts], 1).astype(np.float32)
+# Константы нормировки из scripts/utils.py:163. Состояние 8-мерное:
+# process_state даёт [pos(3), axis-angle(3), gripper(2)].
+STATE_Q99 = np.array([0.13556506, 0.33566484, 1.27066591, 3.27734607,
+                      2.4061097, 0.59776972, 0.04031316, -0.00177811])
+STATE_Q01 = np.array([-0.39912487, -0.26883513, 0.03826696, 1.50895805,
+                      -2.71979114, -1.08050857, 0.00174237, -0.04002561])
+# MAX_ACTION_Q = max(|Q99|, |Q01|), utils.py:199
+MAX_ACTION_Q = np.array([0.9375, 0.9107142686843872, 0.9375,
+                         0.20357142388820648, 0.26357144117355347, 0.375, 1.0])
+
+
+def quat2axisangle(q):
+    """q в порядке (x,y,z,w). Повторяет robosuite T.quat2axisangle."""
+    q = np.asarray(q, np.float64).copy()
+    q[..., 3] = np.clip(q[..., 3], -1.0, 1.0)
+    den = np.sqrt(np.clip(1.0 - q[..., 3] ** 2, 0.0, None))
+    small = den < 1e-8
+    ang = 2.0 * np.arccos(q[..., 3])
+    out = q[..., :3] * (ang / np.where(small, 1.0, den))[..., None]
+    return np.where(small[..., None], np.zeros_like(q[..., :3]), out)
+
+
+def build_state(z, t_idx, quat_wxyz: bool):
+    """[pos(3), axis-angle(3), gripper(2)], нормировано в [-1, 1].
+
+    В зарре кватернион записан с w ПЕРВЫМ (первая компонента ~0.999 при почти
+    единичном повороте), а robosuite ждёт (x,y,z,w) — переставляем."""
+    d = z["data"]
+    pos = np.asarray(d["robot0_eef_pos"])[t_idx]
+    q = np.asarray(d["robot0_eef_quat"])[t_idx]
+    if quat_wxyz:
+        q = np.concatenate([q[:, 1:], q[:, :1]], 1)
+    grip = np.asarray(d["robot0_gripper_qpos"])[t_idx]
+    st = np.concatenate([pos, quat2axisangle(q), grip], 1)
+    return ((st - STATE_Q01) / (STATE_Q99 - STATE_Q01) * 2.0 - 1.0).astype(np.float32)
 
 
 def build_batch(z, t_idx, tasks, state, proc, args, device):
@@ -104,8 +132,14 @@ def build_batch(z, t_idx, tasks, state, proc, args, device):
     sys.path.insert(0, os.path.join(os.path.abspath(args.root), "scripts"))
     from utils import prompt_template          # scripts/utils.py, не smolvla/
 
-    tf = (Compose([CenterCrop(int(224 * 0.875)), Resize(224)]) if args.center_crop
-          else Compose([Resize(224)]))
+    # Обучение: RandomCrop(224) из 256 -> 87.5% поля зрения. Их оценка:
+    # CenterCrop(196) из 224 -> те же 87.5%. У нас картинки 128, поэтому кроп
+    # берём тем же долей от фактического размера, потом ресайз в 224.
+    hw = int(np.asarray(z["data"]["agentview_rgb"][0]).shape[0])
+    tf = (Compose([CenterCrop(int(hw * 0.875)), Resize((224, 224))])
+          if args.center_crop else Compose([Resize((224, 224))]))
+    print(f"кроп: {'CenterCrop(' + str(int(hw * 0.875)) + ') + ' if args.center_crop else ''}"
+          f"Resize(224) из {hw}px")
     k1 = "agentview_rgb" if "agentview_rgb" in z["data"] else "agentview_image"
     k2 = ("robot0_eye_in_hand_rgb" if "robot0_eye_in_hand_rgb" in z["data"]
           else "robot0_eye_in_hand_image")
@@ -117,10 +151,18 @@ def build_batch(z, t_idx, tasks, state, proc, args, device):
         im1, im2 = im1[..., ::-1].copy(), im2[..., ::-1].copy()
     t1 = tf(torch.from_numpy(im1).permute(0, 3, 1, 2))
     t2 = tf(torch.from_numpy(im2).permute(0, 3, 1, 2))
-    images = [[t1[i].numpy(), t2[i].numpy()] for i in range(len(t_idx))]
+    # Обучение склеивало виды в ОДНУ картинку по ширине и удаляло первый
+    # плейсхолдер изображения из сообщения (utils.py: messages[1]["content"][1:]).
     msgs = [prompt_template(state=state[i], task=tasks[i], mode="discrete",
                             action_vocab_size=2048, action_token_len=48)
             for i in range(len(t_idx))]
+    if args.tiled:
+        im = torch.cat([t1, t2], dim=-1)
+        images = [[im[i].numpy()] for i in range(len(t_idx))]
+        for m in msgs:
+            m[1]["content"] = m[1]["content"][1:]
+    else:
+        images = [[t1[i].numpy(), t2[i].numpy()] for i in range(len(t_idx))]
     texts = proc.apply_chat_template(msgs, add_generation_prompt=True)
     b = proc(text=texts, images=images, return_tensors="pt", padding=True,
              action_processor_kwargs={"embodiment_ids": args.embodiment})
@@ -140,11 +182,13 @@ def main() -> None:
     ap.add_argument("--exec-window", type=int, default=8)
     ap.add_argument("--embodiment", type=int, default=0)
     ap.add_argument("--center-crop", action="store_true", default=True)
-    ap.add_argument("--bgr", action="store_true", default=True,
-                    help="разворот каналов, как в eval_libero")
-    ap.add_argument("--state-keys",
-                    default="robot0_eef_pos,robot0_eef_quat,robot0_gripper_qpos",
-                    help="состав вектора состояния для промпта")
+    ap.add_argument("--bgr", action="store_true", default=False,
+                    help="разворот каналов; средние по каналам R>G>B говорят, "
+                         "что в зарре уже RGB, поэтому по умолчанию выключен")
+    ap.add_argument("--quat-wxyz", action="store_true", default=True,
+                    help="в зарре кватернион с w первым; robosuite ждёт xyzw")
+    ap.add_argument("--tiled", action="store_true", default=True,
+                    help="склеить два вида в одну картинку, как при обучении")
     ap.add_argument("--sanity-max", type=float, default=0.15)
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
@@ -167,13 +211,26 @@ def main() -> None:
     cand = [i for s, e in zip(starts, ends) for i in range(s, e - T)]
     t_idx = np.sort(np.random.default_rng(0).choice(cand, args.n_obs, replace=False))
 
-    uid = (np.asarray(zz["data"]["task_uid"])[t_idx].astype(int).ravel()
-           if "task_uid" in zz["data"] else np.zeros(len(t_idx), int))
-    tasks = [LIBERO10[u % len(LIBERO10)] for u in uid]
+    # Инструкция лежит прямо в данных — угадывать по task_uid не нужно.
+    if "prompt" in zz["data"]:
+        raw = np.asarray(zz["data"]["prompt"])[t_idx]
+        tasks = [(v.decode() if isinstance(v, bytes) else str(v)).strip()
+                 for v in raw.ravel()]
+        print(f"инструкции из зарра, пример: {tasks[0]!r}")
+    else:
+        uid = np.asarray(zz["data"]["task_uid"])[t_idx].astype(int).ravel()
+        tasks = [LIBERO10[u % len(LIBERO10)] for u in uid]
+        print("ВНИМАНИЕ: ключа 'prompt' нет, инструкции взяты по хардкоду —\n"
+              "  соответствие индексов их порядку НЕ проверено.")
 
+    # Подготовка действий РОВНО как при обучении (scripts/utils.py:246):
+    # поканальное деление на MAX_ACTION_Q, НЕГАЦИЯ захвата, обрезка в [-1,1].
+    # Прежние замеры (K-1, K-2) шли на сырых действиях: каналы 3 и 4 там были
+    # примерно впятеро мельче обучающих. Их надо переснять.
     A = np.stack([acts[t:t + T] for t in t_idx]).astype(np.float32)
-    if A[:, :, -1].min() < -0.5:
-        A[:, :, -1] = (1.0 - A[:, :, -1]) / 2.0
+    A[..., :-1] = A[..., :-1] / MAX_ACTION_Q[:-1]
+    A[..., -1] = -A[..., -1]
+    A = np.clip(A, -1.0, 1.0)
     a_true = torch.from_numpy(A).to(args.device)
     scale = float(a_true.max() - a_true.min())
     B = len(t_idx)
@@ -189,8 +246,9 @@ def main() -> None:
     print(f"блоков {model.num_blocks}, block_size {model.block_size} — "
           f"блок = уровень RVQ\n")
 
-    st = build_state(zz, t_idx, args.state_keys.split(","))
-    print(f"состояние: {st.shape[1]} чисел из {args.state_keys}")
+    st = build_state(zz, t_idx, args.quat_wxyz)
+    print(f"состояние: {st.shape[1]} чисел, диапазон после нормировки "
+          f"[{st.min():.2f}, {st.max():.2f}]")
     batch = build_batch(zz, t_idx, tasks, st, proc, args, args.device)
 
     def dec(codes):
