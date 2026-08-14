@@ -132,8 +132,16 @@ def main() -> None:
         base = rec0[..., :D_act]
 
         def act_err(h):
-            rec, _ = model._decode(h, args.embodiment, None)
-            return ((rec[..., :D_act] - base).abs().flatten(1).amax(-1) / scale)
+            """Две нормы отклика.
+
+            max не раскладывается аддитивно по полосам спектра: он берёт
+            наибольшее одиночное отклонение, и вклад слабых направлений в нём
+            теряется. rms раскладывается, и только на ней проверка
+            аддитивности ниже имеет смысл."""
+            dv = (model._decode(h, args.embodiment, None)[0][..., :D_act]
+                  - base).abs().flatten(1)
+            return (dv.amax(-1) / scale,
+                    dv.pow(2).mean(-1).sqrt() / scale)
 
         def apply_at(p, delta):
             h = h0.clone()
@@ -152,23 +160,36 @@ def main() -> None:
         print("=" * 74)
         print("Смещения РАВНОЙ нормы, направленные в разные полосы спектра.\n")
         names = [f"ГК {lo+1}-{hi}" for lo, hi in BANDS] + ["изотропное"]
-        print(f"{'норма':>8}" + "".join(f"{n:>13}" for n in names))
-        prof = {}
-        for tau in taus:
-            meds = []
-            for lo, hi in BANDS + [(None, None)]:
-                acc = []
-                for _ in range(args.n_trials):
-                    p = int(torch.randint(P, (1,), generator=gen, device=args.device))
-                    if lo is None:
-                        d = torch.randn(Bn, Dz, generator=gen, device=args.device)
-                    else:
-                        c = torch.randn(Bn, hi - lo, generator=gen, device=args.device)
-                        d = c @ PC[lo:hi]
-                    acc.append(act_err(apply_at(p, rescale(d, tau))).cpu().numpy())
-                meds.append(float(np.median(np.concatenate(acc))))
-            prof[tau] = meds
-            print(f"{tau:>8.3f}" + "".join(f"{m:>13.4f}" for m in meds))
+        for which, mi in (("max", 0), ("rms", 1)):
+            print(f"\nотклик в норме {which}:")
+            print(f"{'норма':>8}" + "".join(f"{n:>13}" for n in names)
+                  + f"{'изотр. предсказ.':>18}")
+            for tau in taus:
+                meds = []
+                for lo, hi in BANDS + [(None, None)]:
+                    acc = []
+                    for _ in range(args.n_trials):
+                        p = int(torch.randint(P, (1,), generator=gen,
+                                              device=args.device))
+                        if lo is None:
+                            d = torch.randn(Bn, Dz, generator=gen,
+                                            device=args.device)
+                        else:
+                            c = torch.randn(Bn, hi - lo, generator=gen,
+                                            device=args.device)
+                            d = c @ PC[lo:hi]
+                        acc.append(act_err(apply_at(p, rescale(d, tau)))[mi]
+                                   .cpu().numpy())
+                    meds.append(float(np.median(np.concatenate(acc))))
+                # ПРОВЕРКА АДДИТИВНОСТИ. Изотропное направление раскладывается
+                # по полосам с долями энергии (hi-lo)/Dz. Если отклик ведёт
+                # себя как квадратично-аддитивный, предсказание совпадёт с
+                # измеренным изотропным. Расхождение означает, что разложение
+                # по полосам в этой норме интерпретировать нельзя.
+                pred = float(np.sqrt(sum((hi - lo) / Dz * meds[b] ** 2
+                                         for b, (lo, hi) in enumerate(BANDS))))
+                print(f"{tau:>8.3f}" + "".join(f"{m:>13.4f}" for m in meds)
+                      + f"{pred:>18.4f}")
 
         # ---------- C. где лежит энергия настоящих смещений ----------
         print("\n" + "=" * 74)
@@ -199,11 +220,13 @@ def main() -> None:
     print("""
 КАК ЧИТАТЬ.
 
-B. Если чувствительность падает от первых полос к последним, декодер
-   анизотропен по главным компонентам словаря, и величина падения — мера
-   анизотропии. Изотропный столбец должен лечь ближе к последним полосам:
-   случайное направление в 512 измерениях почти целиком попадает в хвост
-   спектра.
+B. Сначала смотреть на ПОСЛЕДНИЙ столбец против измеренного изотропного.
+   Совпадают — разложение по полосам в этой норме осмысленно, профиль можно
+   читать. Расходятся в разы — норма не раскладывается, и профиль в ней
+   интерпретировать нельзя (у max так и ожидается: он берёт наибольшее
+   одиночное отклонение и теряет вклад слабых направлений).
+   Там, где разложение осмысленно: падает ли чувствительность от первых полос
+   к последним, и насколько.
 
 C. Если у δ_B доля энергии в ЧУВСТВИТЕЛЬНЫХ полосах меньше, чем у δ_A, —
    механизм объяснён: жадная переквантизация снимает с смещения ту часть,
