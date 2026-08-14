@@ -266,9 +266,14 @@ def main() -> None:
         args.ckpt, trust_remote_code=True, dtype=torch.bfloat16).to(args.device).eval()
     proc = VisionLanguageActionProcessor.from_pretrained(
         args.ckpt, trust_remote_code=True, mode="discrete")
-    assert model.block_size == P, f"block_size={model.block_size}, ожидался {P}"
-    print(f"блоков {model.num_blocks}, block_size {model.block_size} — "
-          f"блок = уровень RVQ\n")
+    bs, nb = model.block_size, model.num_blocks
+    assert bs * nb == P * L, f"{bs}x{nb} != {P}x{L}"
+    bpl = P // bs                      # блоков на один уровень RVQ
+    assert P % bs == 0, "уровень не делится на целое число блоков"
+    print(f"блоков {nb}, block_size {bs}, на уровень {bpl} блоков.\n"
+          f"Раскладка поуровневая, поэтому блоки 0..{bpl-1} покрывают уровень 0\n"
+          f"целиком, и уровень 1 предсказывается ПОСЛЕ него — обусловленность,\n"
+          f"на которой стоит замер, сохраняется.\n")
 
     st = build_state(zz, t_idx, args.quat_wxyz)
     print(f"состояние: {st.shape[1]} чисел, диапазон после нормировки "
@@ -294,14 +299,23 @@ def main() -> None:
             history_tokens=hist).float()
 
     with torch.no_grad():
+        def gen_from(hist, n_blocks):
+            """Достроить n_blocks блоков жадно, начиная с истории hist."""
+            for _ in range(n_blocks):
+                c = blk(hist).argmax(-1)
+                hist = c if hist is None else torch.cat([hist, c], 1)
+            return hist
+
+        def to_levels(flat_tok):
+            """(B, P*L) -> (B, P, L). Раскладка поуровневая, как в decode."""
+            return flat_tok.reshape(-1, L, P).transpose(1, 2)
+
+        def to_flat(c):
+            return c.transpose(1, 2).reshape(len(c), -1)
+
         # ---------- обычная генерация BAR, блок за блоком ----------
-        cols, hist = [], None
-        for _ in range(L):
-            lg = blk(hist)
-            c = lg.argmax(-1)
-            cols.append(c)
-            hist = c if hist is None else torch.cat([hist, c], 1)
-        codes = torch.stack(cols, -1)                 # (B, P, L)
+        flat_gen = gen_from(None, nb)                 # (B, P*L)
+        codes = to_levels(flat_gen)                   # (B, P, L)
 
         base = dec(codes)
         e_base = err(base)
@@ -341,11 +355,10 @@ def main() -> None:
 
                 c0 = codes[:, :, 0].clone()
                 c0[:, p] = v
-                # BAR пересчитывает fine при новом coarse-префиксе
-                lg1n = blk(c0)
-                c1n = lg1n.argmax(-1)
-                lg2n = blk(torch.cat([c0, c1n], 1))
-                c2n = lg2n.argmax(-1)
+                # BAR достраивает ВСЕ оставшиеся блоки при новом уровне 0
+                rest = gen_from(c0, nb - bpl)
+                cn = to_levels(rest)
+                c1n, c2n = cn[:, :, 1], cn[:, :, 2]
 
                 # влияние: где сменился top-1 первого fine-уровня
                 infl[p] += (c1n != codes[:, :, 1]).float().mean(0).cpu()
