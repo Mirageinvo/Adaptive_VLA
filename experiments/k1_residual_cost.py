@@ -47,6 +47,7 @@ import argparse
 import os
 import sys
 
+import einops
 import numpy as np
 import torch
 
@@ -173,10 +174,22 @@ def main() -> None:
     Dz = E.shape[-1]
 
     with torch.no_grad():
-        codes = torch.as_tensor(model.encode(a, embodiment_ids=args.embodiment),
-                                device=args.device)
-        assert codes.shape[1] == P * L, f"{codes.shape} против P*L={P*L}"
-        codes = codes.reshape(-1, P, L)          # перемежение [p0q0, p0q1, ...]
+        flat = torch.as_tensor(np.asarray(model.encode(a, embodiment_ids=args.embodiment)),
+                               device=args.device, dtype=torch.long)
+        assert flat.shape[1] == P * L, f"{flat.shape} против P*L={P*L}"
+
+        # ВНИМАНИЕ. Докстринг model.decode утверждает, что токены перемежаются
+        # ([q0_t0, q1_t0, ...]), но код (modeling_actioncodec.py:595) делает
+        #     einops.rearrange(tokens, "b (n m) -> b m n", m=n_tokens_per_quantizer)
+        # где n — уровень и он ВНЕШНИЙ. То есть раскладка ПОУРОВНЕВАЯ:
+        # [q0_t0..q0_t15, q1_t0..q1_t15, ...]. Докстринг противоречит коду.
+        # Пользуемся их же вызовом, чтобы соглашение совпадало по построению.
+        codes = einops.rearrange(flat, "b (n m) -> b m n", m=P)      # (B, P, L)
+
+        def unflatten_back(c):
+            return einops.rearrange(c, "b m n -> b (n m)")
+
+        assert torch.equal(unflatten_back(codes), flat), "разворот не обратим"
 
         # ---- САНИТАРНАЯ ПРОВЕРКА: наша таблица против их from_codes ----
         h_ours = latent_from_codes(E, codes)                       # (B, P, D)
@@ -190,8 +203,10 @@ def main() -> None:
                             "будет считаться в неверном пространстве")
 
         def decode(c):
-            rec, _ = model.decode(c.reshape(len(c), P * L),
-                                  embodiment_ids=args.embodiment)
+            # numpy, а не torch: в их torch-ветке (modeling_actioncodec.py:511)
+            # вызывается tokens.dtype.is_integer, чего у torch.dtype нет.
+            t = unflatten_back(c).cpu().numpy().astype(np.int64)
+            rec, _ = model.decode(t, embodiment_ids=args.embodiment)
             return torch.as_tensor(np.asarray(rec)[..., :D_act],
                                    device=args.device, dtype=torch.float32)
 
