@@ -109,6 +109,8 @@ def main() -> None:
     ap.add_argument("--n-cand", type=int, default=24,
                     help="подстановок на (чанк, уровень)")
     ap.add_argument("--embodiment", type=int, default=0, help="franka_libero_20hz")
+    ap.add_argument("--fix-gripper", choices=["auto", "yes", "no"], default="auto",
+                    help="перевести захват из -1/+1 в 0/1, как ждёт кодек")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -135,11 +137,37 @@ def main() -> None:
             chunks.append(ep[i * T:(i + 1) * T])
         start = e
     A = np.stack(chunks).astype(np.float32)
+
+    # ---- диагностика формата: она ловит несовпадение соглашений ----
+    print("каналы действия в данных:")
+    for d in range(A.shape[2]):
+        c = A[:, :, d]
+        u = np.unique(c)
+        print(f"  {d}: [{c.min():+.3f}, {c.max():+.3f}] "
+              f"среднее {c.mean():+.3f}"
+              + (f", значений всего {len(u)}: {u[:4]}" if len(u) <= 4 else ""))
+
+    # ActionCodec описывает эмбодимент как «gripper position (1 open/0 close)»,
+    # а LIBERO обычно даёт -1/+1. При несовпадении канал захвата
+    # реконструируется плохо, и это утащит все числа.
+    g = A[:, :, -1]
+    if args.fix_gripper == "auto":
+        need = g.min() < -0.5
+    else:
+        need = args.fix_gripper == "yes"
+    if need:
+        print(f"\nЗАХВАТ: в данных диапазон [{g.min():+.2f}, {g.max():+.2f}], "
+              f"кодек ждёт [0, 1] — перевожу (x+1)/2.")
+        A[:, :, -1] = (A[:, :, -1] + 1.0) / 2.0
+    else:
+        print(f"\nЗАХВАТ: диапазон [{g.min():+.2f}, {g.max():+.2f}], "
+              f"перевод не нужен.")
+
     idx = np.random.default_rng(0).choice(len(A), size=min(args.n_chunks, len(A)),
                                           replace=False)
     a = torch.from_numpy(A[idx]).to(args.device)
     scale = float(a.max() - a.min())
-    print(f"чанков {len(a)}, размах действий {scale:.2f}")
+    print(f"\nчанков {len(a)}, размах действий {scale:.2f}")
 
     E = projected_codebooks(model, args.device)
     Dz = E.shape[-1]
@@ -169,7 +197,15 @@ def main() -> None:
 
         base = decode(codes)
         floor = ((base - a).abs().median() / scale).item()
-        print(f"пол кодека (encode-decode): {floor:.4f} размаха\n")
+        per_ch = [((base - a)[:, :, d].abs().median() / scale).item()
+                  for d in range(D_act)]
+        print(f"пол кодека (encode-decode): {floor:.4f} размаха")
+        print("  по каналам: " + " ".join(f"{e:.4f}" for e in per_ch))
+        if floor > 0.05:
+            print("  ВНИМАНИЕ: велик. Скорее всего не сошлись формат действий,\n"
+                  "  частота или нормализация. Смотреть, какой канал виноват —\n"
+                  "  дальнейшие числа при таком поле недостоверны.")
+        print()
 
         # ---------- перебор подстановок ----------
         rng = np.random.default_rng(1)
