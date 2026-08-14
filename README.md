@@ -23,9 +23,12 @@ Kill-тесты из `PLAN.md` §7 — на выпущенных весах, д�
 ```bash
 pip install -r requirements.txt
 # либо контейнер:
-export AVLA_DATA=/путь/к/данным   # необязательно
 ./docker/build.sh && ./docker/start.sh && ./docker/into.sh
 ```
+
+Домашний каталог монтируется по тому же пути, что снаружи, — соседние проекты
+видны, абсолютные пути одинаковы внутри и снаружи. `AVLA_DATA` нужна только
+для данных ВНЕ home (отдельный раздел на кластере).
 
 Веса тянутся с HuggingFace:
 `ZibinDong/ActionCodec-Base-RVQft`, `ZibinDong/SmolVLM2-2.2B-ActionCodec-BAR-LIBERO`.

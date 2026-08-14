@@ -53,7 +53,8 @@ RUN groupadd -g ${GID} ${USER} || true && \
     echo "${USER} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USER} && \
     chmod 0440 /etc/sudoers.d/${USER}
 
-WORKDIR /workspace/avla
+# Рабочий каталог задаётся при запуске (start.sh -w), здесь только запасной.
+WORKDIR /tmp
 
 USER ${UID}:${GID}
 
