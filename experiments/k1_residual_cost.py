@@ -113,6 +113,7 @@ def main() -> None:
     ap.add_argument("--fix-gripper", choices=["auto", "yes", "no", "invert"],
                     default="auto",
                     help="перевести захват: auto/yes = (x+1)/2, invert = (1-x)/2")
+    ap.add_argument("--n-bins", type=int, default=8, help="корзин по ошибке латенты")
     ap.add_argument("--no-gripper", action="store_true",
                     help="исключить канал захвата из нормы ошибки действия")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -152,20 +153,21 @@ def main() -> None:
               + (f", значений всего {len(u)}: {u[:4]}" if len(u) <= 4 else ""))
 
     # ActionCodec описывает эмбодимент как «gripper position (1 open/0 close)»,
-    # а LIBERO обычно даёт -1/+1. При несовпадении канал захвата
-    # реконструируется плохо, и это утащит все числа.
+    # LIBERO даёт -1/+1. УСТАНОВЛЕНО ИЗМЕРЕНИЕМ: соглашение ПЕРЕВЁРНУТОЕ, то
+    # есть верно (1-x)/2, а не (x+1)/2. Пол кодека на этом канале:
+    #   (x+1)/2 -> 0.5120 размаха (декодер выдаёт противоположное значение)
+    #   (1-x)/2 -> 0.0023 размаха
+    # Поэтому auto делает именно (1-x)/2; вариант "yes" оставлен для сверки.
     g = A[:, :, -1]
-    if args.fix_gripper == "auto":
-        need = g.min() < -0.5
-    else:
-        need = args.fix_gripper == "yes"
-    if args.fix_gripper == "invert":
-        print(f"\nЗАХВАТ: диапазон [{g.min():+.2f}, {g.max():+.2f}] -> (1-x)/2 "
-              f"(перевёрнутое соглашение).")
+    mode = args.fix_gripper
+    if mode == "auto":
+        mode = "invert" if g.min() < -0.5 else "no"
+    if mode == "invert":
+        print(f"\nЗАХВАТ: диапазон [{g.min():+.2f}, {g.max():+.2f}] -> (1-x)/2.")
         A[:, :, -1] = (1.0 - A[:, :, -1]) / 2.0
-    elif need:
-        print(f"\nЗАХВАТ: в данных диапазон [{g.min():+.2f}, {g.max():+.2f}], "
-              f"кодек ждёт [0, 1] — перевожу (x+1)/2.")
+    elif mode == "yes":
+        print(f"\nЗАХВАТ: -> (x+1)/2. ВНИМАНИЕ: измерено, что это НЕВЕРНО "
+              f"для LIBERO;\n  ждать пол ~0.51 на этом канале.")
         A[:, :, -1] = (A[:, :, -1] + 1.0) / 2.0
     else:
         print(f"\nЗАХВАТ: диапазон [{g.min():+.2f}, {g.max():+.2f}], "
@@ -281,29 +283,48 @@ B по построению есть наилучшее RVQ-приближени
     print("\n" + "=" * 78)
     print("ПРИ РАВНОЙ ОШИБКЕ ЛАТЕНТЫ")
     print("=" * 78)
-    q = np.quantile(R[:, 1], np.linspace(0, 1, 9))
-    print(f"{'корзина ошибки латенты':>26}{'n(A)':>7}{'n(B)':>7}"
-          f"{'действие A':>13}{'действие B':>13}{'A/B':>8}")
-    ratios = []
+    q = np.quantile(R[:, 1], np.linspace(0, 1, args.n_bins + 1))
+    print(f"{'корзина ошибки латенты':>24}{'n(A)':>6}{'n(B)':>6}"
+          f"{'лат.A':>8}{'лат.B':>8}{'пере':>7}"
+          f"{'действие A':>12}{'действие B':>12}{'A/B':>7}")
+    ratios, clean = [], []
     for k in range(len(q) - 1):
         m = (R[:, 1] >= q[k]) & (R[:, 1] < q[k + 1])
         mA, mB = m & (R[:, 3] == 0), m & (R[:, 3] == 1)
         nA, nB = int(mA.sum()), int(mB.sum())
+        tag = f"[{q[k]:.3f}, {q[k+1]:.3f})"
         if nA < 20 or nB < 20:
-            print(f"{f'[{q[k]:.3f}, {q[k+1]:.3f})':>26}{nA:>7}{nB:>7}"
-                  f"{'мало данных':>13}")
+            print(f"{tag:>24}{nA:>6}{nB:>6}{'мало данных':>50}")
             continue
+        # ВЫРОВНЯЛОСЬ ЛИ НА САМОМ ДЕЛЕ. Корзина уравнивает ошибку латенты лишь
+        # грубо: внутри неё A может кучковаться у верхнего края, B у нижнего,
+        # и тогда разница ratio — остаток того самого различия, которое мы
+        # убирали. Столбец «пере» = (лат.A - лат.B) / ширина корзины.
+        lA, lB = np.mean(R[mA, 1]), np.mean(R[mB, 1])
+        skew = (lA - lB) / max(q[k + 1] - q[k], 1e-12)
         eA, eB = np.median(R[mA, 2]), np.median(R[mB, 2])
-        ratios.append(eA / max(eB, 1e-9))
-        print(f"{f'[{q[k]:.3f}, {q[k+1]:.3f})':>26}{nA:>7}{nB:>7}"
-              f"{eA:>13.4f}{eB:>13.4f}{ratios[-1]:>8.2f}")
+        r = eA / max(eB, 1e-9)
+        ratios.append(r)
+        if abs(skew) < 0.15:
+            clean.append(r)
+        print(f"{tag:>24}{nA:>6}{nB:>6}{lA:>8.4f}{lB:>8.4f}{skew:>+7.2f}"
+              f"{eA:>12.4f}{eB:>12.4f}{r:>7.2f}")
 
     if ratios:
         med = float(np.median(ratios))
-        print(f"\nмедианное A/B по корзинам: {med:.2f}")
-        print("ВЫВОД:", "объяснение (i) — механизм есть, §4 плана обоснован"
-              if med >= 1.3 else
-              "объяснение (ii) — отдельного явления нет, заявку переписывать")
+        print(f"\nмедианное A/B по всем корзинам: {med:.2f}  (n={len(ratios)})")
+        if clean:
+            medc = float(np.median(clean))
+            print(f"то же по корзинам с |пере| < 0.15: {medc:.2f}  (n={len(clean)})")
+            med = medc
+        else:
+            print("НИ ОДНОЙ выровненной корзины — вывод делать нельзя, "
+                  "увеличить --n-cand\nили --n-bins.")
+            med = None
+        if med is not None:
+            print("ВЫВОД:", "объяснение (i) — механизм есть, §4 плана обоснован"
+                  if med >= 1.3 else
+                  "объяснение (ii) — отдельного явления нет, заявку переписывать")
     print(f"\nДля сверки: пол кодека {floor:.4f} размаха. Если ошибки действия "
           f"в корзинах\nсопоставимы с ним, эффект тонет в собственной "
           f"погрешности кодека.")
