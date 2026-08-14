@@ -235,13 +235,15 @@ def main() -> None:
     scale = float(a_true.max() - a_true.min())
     B = len(t_idx)
 
-    from transformers import AutoProcessor
-
     from smolvla.bar import SmolVLABlockwiseAR
+    # Не AutoProcessor: у них свой класс, он подтягивает ещё и action_processor
+    # из подкаталога чекпойнта (utils/vla_tokenizer.py:39).
+    from utils.vla_tokenizer import VisionLanguageActionProcessor
 
     model = SmolVLABlockwiseAR.from_pretrained(
         args.ckpt, trust_remote_code=True, dtype=torch.bfloat16).to(args.device).eval()
-    proc = AutoProcessor.from_pretrained(args.ckpt, trust_remote_code=True)
+    proc = VisionLanguageActionProcessor.from_pretrained(
+        args.ckpt, trust_remote_code=True, mode="discrete")
     assert model.block_size == P, f"block_size={model.block_size}, ожидался {P}"
     print(f"блоков {model.num_blocks}, block_size {model.block_size} — "
           f"блок = уровень RVQ\n")
