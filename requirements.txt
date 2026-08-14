@@ -2,14 +2,19 @@
 # для замеров на одном токенизаторе хватает CPU.
 # torch приходит из базового образа.
 
-numpy>=1.26,<3
+# ВЕРХНЯЯ ГРАНИЦА ОТ ActionCodec: их requirements.txt требует numpy<2.0,
+# на 2.x их код не проверялся.
+numpy>=1.24,<2
 scipy>=1.11
 
-# ActionCodec: конфиги гидрой, чекпойнты через safetensors/HF
+# ActionCodec, ядро. Версия vector-quantize-pytorch ЖЁСТКАЯ — так у них
+# (requirements.txt), API этой библиотеки между минорными версиями менялся.
+vector-quantize-pytorch==1.27.15
+einops
+safetensors>=0.4
+termcolor
 hydra-core>=1.3
 omegaconf>=2.3
-einops>=0.7
-safetensors>=0.4
 
 # ВЕРХНЯЯ ГРАНИЦА ОБЯЗАТЕЛЬНА: hub 1.x ломает transformers и tokenizers.
 # Скачивать питоновским API hf_hub_download, а не CLI — тот ставится
@@ -27,3 +32,15 @@ pyarrow>=15
 
 matplotlib>=3.8
 tqdm>=4.66
+
+# --- Ниже НЕ нужно для замеров на токенизаторе; ставить, когда дойдём до
+# --- роллаутов в LIBERO. Версии взяты из ActionCodec/requirements.txt.
+# torchvision
+# imageio
+# lightning
+# peft
+# mujoco==3.2.3
+# robosuite==1.4.1
+# libero==0.1.0
+# libero2gym==0.1.0
+# gym==0.22.0
