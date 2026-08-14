@@ -1,0 +1,323 @@
+"""K-3 (Gate B0): умеет ли BAR сам чинить fine-суффикс после правки coarse.
+
+ЗАЧЕМ. Механизм RC-HDF предполагает, что при пересмотре грубого кода надо явно
+отозвать и перестроить зависимый fine-суффикс. Но обученная модель может делать
+это сама: BAR генерирует уровни блоками, и блок 1 предсказывается ПО блоку 0
+(token_budget 48, num_blocks 3, block_size 16 = один уровень RVQ). Если модель
+за один условный проход восстанавливает почти весь достижимый ремонт, явное
+связывание экономит в лучшем случае один проход.
+
+Проверяется на ВЫЛОЖЕННОМ чекпойнте, без обучения потока: ворота перед Phase 2,
+которая стоит месяцы.
+
+ПОЧЕМУ ОДНОЙ ЧУВСТВИТЕЛЬНОСТИ ЛОГИТОВ НЕДОСТАТОЧНО. Слабая зависимость fine от
+coarse может означать не «суффикс останется устаревшим», а «BAR игнорирует
+coarse-префикс и предсказывает fine прямо из наблюдения» — тогда устаревший
+суффикс и не был проблемой. Решают ДВЕ величины вместе: сколько ремонта вообще
+ДОСТУПНО (оракул) и какую долю его забирает BAR:
+
+    R_BAR = (e_stale - e_BAR) / (e_stale - e_oracle)
+
+ВЫБОР ОПОРЫ. Оракул можно определить как «вернуть прежнее действие» или «лучше
+всего выразить ИСТИННОЕ действие при новом префиксе». В потоке правка грубого
+кода — намеренное исправление, а не порча, поэтому суффикс должен обслуживать
+новое решение. Опора — ДАТАСЕТНОЕ действие.
+
+ПРАВИЛО ЧТЕНИЯ, зафиксировано до запуска:
+  оракул почти не улучшает stale -> чинить нечего, механизм беспредметен;
+  оракульный выигрыш крупный, R_BAR > 0.7 -> модель чинит сама, явное
+      связывание экономит не более одного прохода (6% при 16 NFE, 25% при 4);
+  оракульный выигрыш крупный, R_BAR < 0.3 -> сильный сигнал за явное
+      связывание, можно идти в Phase 2;
+  промежуточное -> нужен маленький обучаемый refiner, но не полный поток.
+
+САНИТАРНАЯ ПРОВЕРКА ОБЯЗАТЕЛЬНА и падает громко. Формат наблюдений должен
+совпадать с тем, на котором BAR обучался: порядок каналов, кроп, шаблон
+промпта. При несовпадении модель выдаст мусор, а таблицы будут выглядеть
+правдоподобно. У политики OAT в аналогичной проверке вышло 0.0106 размаха.
+
+Запуск:
+    python3 experiments/k3_bar_suffix_repair.py \
+        --ckpt ZibinDong/SmolVLM2-2.2B-ActionCodec-BAR-LIBERO \
+        --zarr <путь>/libero10_N500.zarr
+"""
+
+import argparse
+import os
+import sys
+
+import numpy as np
+import torch
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from k1_residual_cost import latent_from_codes, load_codec, projected_codebooks  # noqa: E402
+
+LIBERO10 = [
+    "put both the alphabet soup and the tomato sauce in the basket",
+    "put both the cream cheese box and the butter in the basket",
+    "turn on the stove and put the moka pot on it",
+    "put the black bowl in the bottom drawer of the cabinet and close it",
+    "put the white mug on the left plate and put the yellow and white mug on the right plate",
+    "pick up the book and place it in the back compartment of the caddy",
+    "put the white mug on the plate and put the chocolate pudding to the right of the plate",
+    "put both the alphabet soup and the cream cheese box in the basket",
+    "put both moka pots on the stove",
+    "put the yellow and white mug in the microwave and close it",
+]
+
+
+def js_div(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+    """Дивергенция Йенсена-Шеннона по последней оси, в битах."""
+    m = 0.5 * (p + q)
+
+    def kl(x, y):
+        return (x * (x.clamp_min(1e-30).log() - y.clamp_min(1e-30).log())).sum(-1)
+
+    return (0.5 * kl(p, m) + 0.5 * kl(q, m)) / float(np.log(2.0))
+
+
+def greedy_suffix(E, codes, target, p, level):
+    """Жадно переквантовать уровни > level в позиции p к target[:, p].
+    Жадно — не оптимально; это процедура кодировщика RVQ."""
+    out = codes.clone()
+    r = target[:, p] - sum(E[j][out[:, p, j]] for j in range(level + 1))
+    for j in range(level + 1, E.shape[0]):
+        c = torch.cdist(r.unsqueeze(1), E[j]).squeeze(1).argmin(-1)
+        out[:, p, j] = c
+        r = r - E[j][c]
+    return out
+
+
+def build_state(z, t_idx, keys):
+    """Проприоцепция в текст промпта. Точный состав вектора у них не
+    документирован; сверяется санитарной проверкой."""
+    parts = [np.asarray(z["data"][k])[t_idx] for k in keys if k in z["data"]]
+    if not parts:
+        return np.zeros((len(t_idx), 1), np.float32)
+    return np.concatenate([p.reshape(len(t_idx), -1) for p in parts], 1).astype(np.float32)
+
+
+def build_batch(z, t_idx, tasks, state, proc, args, device):
+    """Наблюдения в формате BAR. Повторяет scripts/eval_libero.py."""
+    from torchvision.transforms import CenterCrop, Compose, Resize
+
+    sys.path.insert(0, os.path.join(os.path.abspath(args.root), "scripts"))
+    from utils import prompt_template          # scripts/utils.py, не smolvla/
+
+    tf = (Compose([CenterCrop(int(224 * 0.875)), Resize(224)]) if args.center_crop
+          else Compose([Resize(224)]))
+    k1 = "agentview_rgb" if "agentview_rgb" in z["data"] else "agentview_image"
+    k2 = ("robot0_eye_in_hand_rgb" if "robot0_eye_in_hand_rgb" in z["data"]
+          else "robot0_eye_in_hand_image")
+    im1 = np.stack([np.asarray(z["data"][k1][t]) for t in t_idx])
+    im2 = np.stack([np.asarray(z["data"][k2][t]) for t in t_idx])
+    print(f"картинки: {k1} {im1.shape} {im1.dtype}, диапазон "
+          f"[{im1.min()}, {im1.max()}]")
+    if args.bgr:                                  # eval_libero делает [:, :, ::-1]
+        im1, im2 = im1[..., ::-1].copy(), im2[..., ::-1].copy()
+    t1 = tf(torch.from_numpy(im1).permute(0, 3, 1, 2))
+    t2 = tf(torch.from_numpy(im2).permute(0, 3, 1, 2))
+    images = [[t1[i].numpy(), t2[i].numpy()] for i in range(len(t_idx))]
+    msgs = [prompt_template(state=state[i], task=tasks[i], mode="discrete",
+                            action_vocab_size=2048, action_token_len=48)
+            for i in range(len(t_idx))]
+    texts = proc.apply_chat_template(msgs, add_generation_prompt=True)
+    b = proc(text=texts, images=images, return_tensors="pt", padding=True,
+             action_processor_kwargs={"embodiment_ids": args.embodiment})
+    return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in b.items()}
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--root", default="third_party/actioncodec")
+    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--tokenizer", default="ZibinDong/ActionCodec-Base-RVQft")
+    ap.add_argument("--zarr", required=True)
+    ap.add_argument("--n-obs", type=int, default=48)
+    ap.add_argument("--n-pos", type=int, default=6, help="позиций p на наблюдение")
+    ap.add_argument("--knn", type=int, default=16)
+    ap.add_argument("--topk", type=int, default=4)
+    ap.add_argument("--exec-window", type=int, default=8)
+    ap.add_argument("--embodiment", type=int, default=0)
+    ap.add_argument("--center-crop", action="store_true", default=True)
+    ap.add_argument("--bgr", action="store_true", default=True,
+                    help="разворот каналов, как в eval_libero")
+    ap.add_argument("--state-keys",
+                    default="robot0_eef_pos,robot0_eef_quat,robot0_gripper_qpos",
+                    help="состав вектора состояния для промпта")
+    ap.add_argument("--sanity-max", type=float, default=0.15)
+    ap.add_argument("--device", default="cuda")
+    args = ap.parse_args()
+
+    sys.path.insert(0, os.path.abspath(args.root))
+    import zarr
+
+    tok = load_codec(os.path.abspath(args.root), args.tokenizer, args.device)
+    L, P = tok.num_quantizers, tok.n_tokens_per_quantizer
+    ecfg = tok.config.embodiment_config[
+        list(tok.config.embodiment_config.keys())[args.embodiment]]
+    T, D_act = int(ecfg["freq"] * ecfg["duration"]), ecfg["action_dim"]
+    E = projected_codebooks(tok, args.device)
+
+    zz = zarr.open(os.path.abspath(args.zarr), mode="r")
+    print("ключи данных:", list(zz["data"].keys()))
+    acts = np.asarray(zz["data"]["action"])
+    ends = np.asarray(zz["meta"]["episode_ends"])
+    starts = np.concatenate([[0], ends[:-1]])
+    cand = [i for s, e in zip(starts, ends) for i in range(s, e - T)]
+    t_idx = np.sort(np.random.default_rng(0).choice(cand, args.n_obs, replace=False))
+
+    uid = (np.asarray(zz["data"]["task_uid"])[t_idx].astype(int).ravel()
+           if "task_uid" in zz["data"] else np.zeros(len(t_idx), int))
+    tasks = [LIBERO10[u % len(LIBERO10)] for u in uid]
+
+    A = np.stack([acts[t:t + T] for t in t_idx]).astype(np.float32)
+    if A[:, :, -1].min() < -0.5:
+        A[:, :, -1] = (1.0 - A[:, :, -1]) / 2.0
+    a_true = torch.from_numpy(A).to(args.device)
+    scale = float(a_true.max() - a_true.min())
+    B = len(t_idx)
+
+    from transformers import AutoProcessor
+
+    from smolvla.bar import SmolVLABlockwiseAR
+
+    model = SmolVLABlockwiseAR.from_pretrained(
+        args.ckpt, trust_remote_code=True, dtype=torch.bfloat16).to(args.device).eval()
+    proc = AutoProcessor.from_pretrained(args.ckpt, trust_remote_code=True)
+    assert model.block_size == P, f"block_size={model.block_size}, ожидался {P}"
+    print(f"блоков {model.num_blocks}, block_size {model.block_size} — "
+          f"блок = уровень RVQ\n")
+
+    st = build_state(zz, t_idx, args.state_keys.split(","))
+    print(f"состояние: {st.shape[1]} чисел из {args.state_keys}")
+    batch = build_batch(zz, t_idx, tasks, st, proc, args, args.device)
+
+    def dec(codes):
+        """codes (B,P,L) -> действие. Декодируем через латенту, минуя токены."""
+        h = latent_from_codes(E, codes)
+        return tok._decode(h, args.embodiment, None)[0][..., :D_act]
+
+    def err(x, win=None):
+        d = (x - a_true).abs()
+        if win:
+            d = d[:, :win]
+        return (d[..., :D_act - 1].flatten(1).amax(-1) / scale)
+
+    def blk(hist):
+        """Логиты следующего блока при заданной истории (B, k*P) или None."""
+        return model._predict_next_block_logits(
+            vlm_inputs_embeds=batch.get("inputs_embeds"),
+            attention_mask=batch.get("attention_mask"),
+            history_tokens=hist).float()
+
+    with torch.no_grad():
+        # ---------- обычная генерация BAR, блок за блоком ----------
+        cols, hist = [], None
+        for _ in range(L):
+            lg = blk(hist)
+            c = lg.argmax(-1)
+            cols.append(c)
+            hist = c if hist is None else torch.cat([hist, c], 1)
+        codes = torch.stack(cols, -1)                 # (B, P, L)
+
+        base = dec(codes)
+        e_base = err(base)
+        print(f"САНИТАРНАЯ ПРОВЕРКА — |ошибка| генерации против датасетной: "
+              f"медиана {float(e_base.median()):.4f} размаха")
+        assert float(e_base.median()) < args.sanity_max, (
+            "формат наблюдений не совпал с обучающим: проверить порядок каналов "
+            "(--bgr), кроп (--center-crop), разрешение и текст инструкции")
+
+        h_true = latent_from_codes(E, torch.stack(
+            [torch.as_tensor(np.asarray(tok.encode(a_true, embodiment_ids=args.embodiment)),
+                             device=args.device, dtype=torch.long)], 0)[0]
+            .reshape(B, L, P).transpose(1, 2))       # (B,P,L): раскладка поуровневая
+
+        rng = torch.Generator(device=args.device).manual_seed(1)
+        rows = {m: {k: [] for k in ("stale", "loc", "glob", "orc", "base")}
+                for m in ("local", "on-policy")}
+        infl = torch.zeros(P, P)                      # матрица влияния p -> q
+        n_infl = 0
+
+        lg0 = blk(None)                               # coarse-логиты
+        for mode in ("local", "on-policy"):
+            for _ in range(args.n_pos):
+                p = int(torch.randint(P, (1,), generator=rng, device=args.device))
+                cur = codes[:, p, 0]
+                if mode == "local":
+                    d = torch.cdist(E[0][cur], E[0])
+                    nb = d.topk(args.knn + 1, largest=False).indices[:, 1:]
+                    v = nb[torch.arange(B, device=args.device),
+                           torch.randint(args.knn, (B,), generator=rng,
+                                         device=args.device)]
+                else:
+                    tk = lg0[:, p].topk(args.topk + 1, -1).indices[:, 1:]
+                    v = tk[torch.arange(B, device=args.device),
+                           torch.randint(args.topk, (B,), generator=rng,
+                                         device=args.device)]
+
+                c0 = codes[:, :, 0].clone()
+                c0[:, p] = v
+                # BAR пересчитывает fine при новом coarse-префиксе
+                lg1n = blk(c0)
+                c1n = lg1n.argmax(-1)
+                lg2n = blk(torch.cat([c0, c1n], 1))
+                c2n = lg2n.argmax(-1)
+
+                # влияние: где сменился top-1 первого fine-уровня
+                infl[p] += (c1n != codes[:, :, 1]).float().mean(0).cpu()
+                n_infl += 1
+
+                stale = codes.clone(); stale[:, p, 0] = v
+                loc = stale.clone(); loc[:, p, 1] = c1n[:, p]; loc[:, p, 2] = c2n[:, p]
+                glob = torch.stack([c0, c1n, c2n], -1)
+                orc = greedy_suffix(E, stale, h_true, p, 0)
+
+                for k, cc in (("stale", stale), ("loc", loc), ("glob", glob),
+                              ("orc", orc), ("base", codes)):
+                    rows[mode][k].append(err(cc if k == "base" else cc).cpu().numpy()
+                                         if k == "base" else
+                                         err(dec(cc)).cpu().numpy())
+
+    # ---------- отчёт ----------
+    print("\n" + "=" * 76)
+    print("РЕМОНТ СУФФИКСА: ОШИБКА ДЕЙСТВИЯ ОТНОСИТЕЛЬНО ДАТАСЕТНОГО")
+    print("=" * 76)
+    print(f"{'режим':>12}{'база':>9}{'stale':>9}{'BAR лок.':>10}{'BAR глоб.':>11}"
+          f"{'оракул':>9}{'дост. ремонт':>14}{'R_BAR':>8}")
+    for mode in ("local", "on-policy"):
+        m = {k: float(np.median(np.concatenate(v))) for k, v in rows[mode].items()}
+        gap = m["stale"] - m["orc"]
+        r = (m["stale"] - m["loc"]) / gap if abs(gap) > 1e-9 else float("nan")
+        print(f"{mode:>12}{float(np.median(np.concatenate(rows[mode]['base']))):>9.4f}"
+              f"{m['stale']:>9.4f}{m['loc']:>10.4f}{m['glob']:>11.4f}{m['orc']:>9.4f}"
+              f"{gap:>14.4f}{r:>8.2f}")
+
+    print("\n" + "=" * 76)
+    print("МАТРИЦА ВЛИЯНИЯ: доля смен top-1 на уровне 1 в позиции q после правки p")
+    print("=" * 76)
+    infl /= max(n_infl, 1)
+    diag = float(np.mean([infl[i, i] for i in range(P) if infl[i].sum() > 0]))
+    off = float((infl.sum() - sum(infl[i, i] for i in range(P)))
+                / max((infl > 0).sum().item() - P, 1))
+    print(f"в той же позиции (диагональ): {diag:.3f}")
+    print(f"в остальных позициях:         {off:.3f}")
+    print(f"отношение:                    {diag / max(off, 1e-9):.1f}")
+    print("""
+Если влияние заметно и вне диагонали, фиксированный локальный откат суффикса
+неверен по построению, и нужен обучаемый граф зависимостей — это уже сильнее
+простой комбинации ResGen с self-correction.""")
+
+    print("""
+КАК ЧИТАТЬ ГЛАВНУЮ ТАБЛИЦУ.
+  «дост. ремонт» = stale - оракул. Мал -> чинить нечего, механизм беспредметен.
+  R_BAR = (stale - BAR лок.) / (stale - оракул) — доля доступного ремонта,
+  которую BAR берёт за ОДИН условный проход.
+    > 0.7  модель чинит сама; явное связывание экономит не более прохода;
+    < 0.3  сильный сигнал за явное связывание;
+    иначе  нужен маленький обучаемый refiner, но не полный поток.""")
+
+
+if __name__ == "__main__":
+    main()
