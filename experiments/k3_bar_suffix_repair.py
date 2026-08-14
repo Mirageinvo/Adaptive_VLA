@@ -215,6 +215,12 @@ def main() -> None:
     # num_blocks = 16), тогда как ActionCodec-Base-RVQft даёт 48 токенов
     # (3 уровня x 16 позиций). Подстановка чужого кодека дала бы правдоподобный
     # мусор.
+    # Регистрация типа `action_codec` в AutoConfig/AutoModel происходит как
+    # побочный эффект импорта их пакета (configuration_actioncodec.py:225,
+    # modeling_actioncodec.py:658). Без неё AutoModel.from_pretrained внутри
+    # процессора не узнает архитектуру.
+    import actioncodec  # noqa: F401
+
     import importlib.util
     _sp = importlib.util.spec_from_file_location(
         "ac_vla_tokenizer",
