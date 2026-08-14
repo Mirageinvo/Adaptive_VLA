@@ -99,6 +99,25 @@ MAX_ACTION_Q = np.array([0.9375, 0.9107142686843872, 0.9375,
                          0.20357142388820648, 0.26357144117355347, 0.375, 1.0])
 
 
+def prompt_template(state, task: str) -> list:
+    """Копия discrete-ветки scripts/utils.py:91. Перенесена, а не
+    импортирована: scripts/utils.py тянет gym, robosuite и libero, которые
+    нужны только симулятору. Два плейсхолдера изображения — как у них; при
+    склейке видов первый удаляется вызывающей стороной."""
+    return [
+        {"role": "system",
+         "content": "Analyze the input image and predict robot actions."},
+        {"role": "user",
+         "content": [
+             {"type": "image"},
+             {"type": "image"},
+             {"type": "text",
+              "text": f"**State**: {[round(v, 3) for v in state.tolist()]}, "
+                      f"**Task**: {task}."},
+         ]},
+    ]
+
+
 def quat2axisangle(q):
     """q в порядке (x,y,z,w). Повторяет robosuite T.quat2axisangle."""
     q = np.asarray(q, np.float64).copy()
@@ -129,9 +148,6 @@ def build_batch(z, t_idx, tasks, state, proc, args, device):
     """Наблюдения в формате BAR. Повторяет scripts/eval_libero.py."""
     from torchvision.transforms import CenterCrop, Compose, Resize
 
-    sys.path.insert(0, os.path.join(os.path.abspath(args.root), "scripts"))
-    from utils import prompt_template          # scripts/utils.py, не smolvla/
-
     # Обучение: RandomCrop(224) из 256 -> 87.5% поля зрения. Их оценка:
     # CenterCrop(196) из 224 -> те же 87.5%. У нас картинки 128, поэтому кроп
     # берём тем же долей от фактического размера, потом ресайз в 224.
@@ -153,9 +169,7 @@ def build_batch(z, t_idx, tasks, state, proc, args, device):
     t2 = tf(torch.from_numpy(im2).permute(0, 3, 1, 2))
     # Обучение склеивало виды в ОДНУ картинку по ширине и удаляло первый
     # плейсхолдер изображения из сообщения (utils.py: messages[1]["content"][1:]).
-    msgs = [prompt_template(state=state[i], task=tasks[i], mode="discrete",
-                            action_vocab_size=2048, action_token_len=48)
-            for i in range(len(t_idx))]
+    msgs = [prompt_template(state[i], tasks[i]) for i in range(len(t_idx))]
     if args.tiled:
         im = torch.cat([t1, t2], dim=-1)
         images = [[im[i].numpy()] for i in range(len(t_idx))]
@@ -237,8 +251,16 @@ def main() -> None:
 
     from smolvla.bar import SmolVLABlockwiseAR
     # Не AutoProcessor: у них свой класс, он подтягивает ещё и action_processor
-    # из подкаталога чекпойнта (utils/vla_tokenizer.py:39).
-    from utils.vla_tokenizer import VisionLanguageActionProcessor
+    # из подкаталога чекпойнта (utils/vla_tokenizer.py:39). Грузим ФАЙЛОМ,
+    # минуя utils/__init__.py: тот импортирует scripts.utils, который тянет
+    # gym, robosuite и libero — весь симуляторный стек, нам не нужный.
+    import importlib.util
+    _sp = importlib.util.spec_from_file_location(
+        "ac_vla_tokenizer",
+        os.path.join(os.path.abspath(args.root), "utils", "vla_tokenizer.py"))
+    _m = importlib.util.module_from_spec(_sp)
+    _sp.loader.exec_module(_m)
+    VisionLanguageActionProcessor = _m.VisionLanguageActionProcessor
 
     model = SmolVLABlockwiseAR.from_pretrained(
         args.ckpt, trust_remote_code=True, dtype=torch.bfloat16).to(args.device).eval()
