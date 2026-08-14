@@ -210,8 +210,23 @@ def main() -> None:
     sys.path.insert(0, os.path.abspath(args.root))
     import zarr
 
-    tok = load_codec(os.path.abspath(args.root), args.tokenizer, args.device)
+    # ТОКЕНИЗАТОР БЕРЁМ ИЗ ЧЕКПОЙНТА, а не со стороны. Выложенный BAR обучен
+    # с 16-токенным кодеком (их путь называется vq_v2_16tokens, block_size*
+    # num_blocks = 16), тогда как ActionCodec-Base-RVQft даёт 48 токенов
+    # (3 уровня x 16 позиций). Подстановка чужого кодека дала бы правдоподобный
+    # мусор.
+    import importlib.util
+    _sp = importlib.util.spec_from_file_location(
+        "ac_vla_tokenizer",
+        os.path.join(os.path.abspath(args.root), "utils", "vla_tokenizer.py"))
+    _m = importlib.util.module_from_spec(_sp)
+    _sp.loader.exec_module(_m)
+    proc = _m.VisionLanguageActionProcessor.from_pretrained(
+        args.ckpt, trust_remote_code=True, mode="discrete")
+    tok = proc.action_processor.to(args.device).eval()
     L, P = tok.num_quantizers, tok.n_tokens_per_quantizer
+    print(f"кодек ИЗ ЧЕКПОЙНТА: словарь {tok.vocab_size}, уровней {L}, "
+          f"позиций {P}, токенов {L * P}")
     ecfg = tok.config.embodiment_config[
         list(tok.config.embodiment_config.keys())[args.embodiment]]
     T, D_act = int(ecfg["freq"] * ecfg["duration"]), ecfg["action_dim"]
@@ -250,24 +265,13 @@ def main() -> None:
     B = len(t_idx)
 
     from smolvla.bar import SmolVLABlockwiseAR
-    # Не AutoProcessor: у них свой класс, он подтягивает ещё и action_processor
-    # из подкаталога чекпойнта (utils/vla_tokenizer.py:39). Грузим ФАЙЛОМ,
-    # минуя utils/__init__.py: тот импортирует scripts.utils, который тянет
-    # gym, robosuite и libero — весь симуляторный стек, нам не нужный.
-    import importlib.util
-    _sp = importlib.util.spec_from_file_location(
-        "ac_vla_tokenizer",
-        os.path.join(os.path.abspath(args.root), "utils", "vla_tokenizer.py"))
-    _m = importlib.util.module_from_spec(_sp)
-    _sp.loader.exec_module(_m)
-    VisionLanguageActionProcessor = _m.VisionLanguageActionProcessor
 
     model = SmolVLABlockwiseAR.from_pretrained(
         args.ckpt, trust_remote_code=True, dtype=torch.bfloat16).to(args.device).eval()
-    proc = VisionLanguageActionProcessor.from_pretrained(
-        args.ckpt, trust_remote_code=True, mode="discrete")
     bs, nb = model.block_size, model.num_blocks
-    assert bs * nb == P * L, f"{bs}x{nb} != {P}x{L}"
+    assert bs * nb == P * L, (
+        f"модель ждёт {bs}x{nb}={bs*nb} токенов, кодек даёт {P}x{L}={P*L}. "
+        "Значит это не тот кодек.")
     bpl = P // bs                      # блоков на один уровень RVQ
     assert P % bs == 0, "уровень не делится на целое число блоков"
     print(f"блоков {nb}, block_size {bs}, на уровень {bpl} блоков.\n"
