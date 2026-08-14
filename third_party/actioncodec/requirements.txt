@@ -1,0 +1,26 @@
+# Core
+torch>=2.0.0
+numpy>=1.24.0,<2.0.0
+transformers>=4.40.0
+einops
+vector-quantize-pytorch==1.27.15
+
+# Training
+lightning
+peft
+omegaconf
+
+# Vision
+torchvision
+imageio
+
+# Robotics (for evaluation)
+mujoco==3.2.3
+robosuite==1.4.1
+libero==0.1.0
+libero2gym==0.1.0
+gym==0.22.0
+
+# Utilities
+termcolor
+huggingface_hub

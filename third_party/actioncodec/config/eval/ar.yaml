@@ -1,0 +1,43 @@
+# =============================================================================
+# AR (Autoregressive) Model Evaluation Config
+# =============================================================================
+#
+# Parameter override notes:
+# - ckpt_dir: overridden by shell script's --ckpt_dir argument
+# - MODEL.vlm.kwargs.pretrained_model_name_or_path: will be set to ckpt_dir by code
+#
+# Therefore, the actual model loading path depends on the ckpt_dir passed by
+# the shell script, not the configuration here
+# =============================================================================
+
+MODEL:
+    # Base model path for vision-language processor (used for processor initialization)
+    # Note: The model itself is loaded from ckpt_dir, this path is only for processor
+    model_name: /mnt/dataset/dzb/huggingface/HuggingFaceTB/SmolVLM2-256M-Video-Instruct
+
+    answer_start_token: "Assistant:"
+
+    action_processor:
+        # Used for constructing action tokens in prompt_template
+        vocab_size: 2048
+        token_len: 16
+
+    vla_processor:
+        kwargs:
+            mode: "discrete"  # action token mode
+            vocab_shift: 0
+
+    vlm:
+        # Model class: standard AR model uses AutoModelForImageTextToText
+        # bar/pd models use SmolVLABlockwiseAR / SmolVLAParallelDecoding respectively
+        _target_: transformers.AutoModelForImageTextToText
+        kwargs:
+            # pretrained_model_name_or_path will be overridden to ckpt_dir by code
+            pretrained_model_name_or_path: ${MODEL.model_name}
+            trust_remote_code: true
+            dtype: bfloat16
+            _attn_implementation: "flash_attention_2"
+
+TRAINING:
+    # Checkpoint directory (overridden by shell script's --ckpt_dir argument)
+    ckpt_dir: "/mnt/dataset/dzb/vq_checkpoints/toy_goal/vq_v2_16tokens_1220/"

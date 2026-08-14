@@ -1,1 +1,31 @@
-# Adaptive_VLA
+# Adaptive VLA
+
+Дискретный поток над иерархическими RVQ-кодами действий.
+
+| файл | что внутри |
+|---|---|
+| `PLAN.md` | план исследования: что занято, где новизна, kill-тесты, фазы |
+| `FINDINGS.md` | все замеры с числами и с тем, чего из них НЕ следует |
+| `LESSONS.md` | методика; каждый пункт оплачен ошибкой |
+| `experiments/` | скрипты замеров |
+| `third_party/actioncodec` | клон ActionCodec (не редактировать) |
+
+## Порядок работы
+
+Kill-тесты из `PLAN.md` §7 — на выпущенных весах, до всякого обучения.
+Порядок: 7.2 → 7.4 → 7.3 → 7.1.
+
+Перед §7.2 — проверка входа декодера, см. `FINDINGS.md` §1. Сделана,
+результат меняет формулировку механизма.
+
+## Окружение
+
+```bash
+pip install -r requirements.txt
+# либо контейнер:
+export AVLA_DATA=/путь/к/данным   # необязательно
+./docker/build.sh && ./docker/start.sh && ./docker/into.sh
+```
+
+Веса тянутся с HuggingFace:
+`ZibinDong/ActionCodec-Base-RVQft`, `ZibinDong/SmolVLM2-2.2B-ActionCodec-BAR-LIBERO`.

@@ -1,0 +1,11 @@
+__pycache__/
+.claude/
+.pytest_cache/
+.vscode/
+scripts/upload_to_hf.py
+lightning_logs/
+tmp_upload/
+tests/
+*.log
+evaluation/
+test.py

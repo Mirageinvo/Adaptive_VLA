@@ -1,0 +1,71 @@
+# Knowledge Isolation (KI) Strategy Config
+strategy: ki
+
+MODEL:
+  model_name: HuggingFaceTB/SmolVLM2-256M-Video-Instruct # SmolVLM2-500M-Video-Instruct / SmolVLM2-2.2B-Instruct
+  answer_start_token: "Assistant:" # If using other VLM backbones, please check the start token for answer generation and modify it accordingly.
+
+  action_processor:
+    vocab_size: 2048
+    token_len: 16
+    _target_: transformers.AutoModel
+    kwargs:
+      pretrained_model_name_or_path: ZibinDong/ActionCodec-Base
+      trust_remote_code: true
+
+  vl_processor:
+    _target_: transformers.AutoProcessor
+    kwargs:
+      pretrained_model_name_or_path: ${MODEL.model_name}/vl_processor
+      trust_remote_code: true
+
+  vla_processor:
+    kwargs:
+      mode: "discrete"
+      vocab_shift: 0
+
+  vlm:
+    _target_: smolvla.ki.SmolVLAKnowledgeIsolation
+    kwargs:
+      pretrained_model_name_or_path: ${MODEL.model_name}
+      trust_remote_code: true
+      dtype: bfloat16
+      _attn_implementation: "flash_attention_2"
+
+TRAINING:
+  ckpt_dir: "/path/to/save/checkpoints" # Specify the directory to save checkpoints
+  training_steps: 50000
+  warmup_steps: 100
+  batch_size: 16
+  num_workers: 12
+  val_check_interval: 1000
+
+  use_lora: false
+  lora_kwargs:
+    lora_alpha: 32
+    r: 16
+    task_type: "CAUSAL_LM"
+    target_modules:
+      - "q_proj"
+      - "k_proj"
+      - "v_proj"
+      - "o_proj"
+      - "up_proj"
+      - "down_proj"
+      - "gate_proj"
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    kwargs:
+      lr: 2e-4
+      weight_decay: 1e-10
+      eps: 1e-8
+      betas: [0.9, 0.999]
+
+  trainer:
+    devices: [0, 1, 2, 3]
+    accumulate_grad_batches: 1
+    precision: bf16-mixed
+    gradient_clip_val: 1.0
+    log_every_n_steps: 10
+    strategy: "ddp_find_unused_parameters_true"

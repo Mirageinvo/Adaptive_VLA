@@ -1,0 +1,60 @@
+FROM pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+
+# MuJoCo на кластере без дисплея должен рендерить через EGL.
+ENV MUJOCO_GL=egl
+ENV PYOPENGL_PLATFORM=egl
+
+RUN apt-get update && apt-get install -y \
+    sudo \
+    curl \
+    git \
+    wget \
+    nano \
+    tmux \
+    htop \
+    build-essential \
+    # ниже — то, что понадобится MuJoCo/robosuite на ступени 1;
+    # ставится сразу, чтобы не пересобирать образ ради системных библиотек
+    libgl1 \
+    libglew-dev \
+    libegl1 \
+    libgles2 \
+    libosmesa6-dev \
+    libglfw3 \
+    patchelf \
+    && rm -rf /var/lib/apt/lists/*
+
+# Пакеты ступеней 0-2. Ставятся до создания пользователя, в системный env.
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -U pip && \
+    pip install --no-cache-dir -r /tmp/requirements.txt && \
+    rm /tmp/requirements.txt
+
+# СИМУЛЯТОРНЫЙ СТЕК НАМЕРЕННО НЕ СТАВИТСЯ ЗДЕСЬ.
+#
+# robosuite 1.4 и 1.5 несовместимы по формату controller_configs, а датасеты
+# robomimic записаны конкретной версией. Пин наугад забетонирует поломку в
+# образе. Правильная версия читается из самих данных: s0b_real_data.py
+# печатает env_args, где есть env_version. После первого прогона добавить
+# сюда явные пины и пересобрать:
+#
+#   RUN pip install --no-cache-dir \
+#         mujoco==<...> robosuite==<...> robomimic==<...>
+
+ARG USER=docker_user
+ARG UID=1000
+ARG GID=1000
+
+RUN groupadd -g ${GID} ${USER} || true && \
+    useradd -m -u ${UID} -g ${GID} ${USER} || true && \
+    echo "${USER} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USER} && \
+    chmod 0440 /etc/sudoers.d/${USER}
+
+WORKDIR /workspace/avla
+
+USER ${UID}:${GID}
+
+CMD ["/bin/bash"]

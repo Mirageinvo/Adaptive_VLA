@@ -1,0 +1,23 @@
+name: actioncodec
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch>=2.0.0
+  - pytorch-cuda=11.8
+  - numpy<2.0.0
+  - pip
+  - pip:
+    - transformers>=4.40.0
+    - einops
+    - vector-quantize-pytorch
+    - lightning
+    - peft
+    - omegaconf
+    - torchvision
+    - imageio
+    - termcolor
+    - huggingface_hub
