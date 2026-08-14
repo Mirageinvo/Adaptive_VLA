@@ -64,6 +64,8 @@ def main() -> None:
     ap.add_argument("--n-chunks", type=int, default=2048)
     ap.add_argument("--embodiment", type=int, default=0)
     ap.add_argument("--n-boot", type=int, default=400)
+    ap.add_argument("--metric", choices=["max", "rms"], default="max",
+                    help="норма ошибки по непрерывным каналам")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -93,6 +95,7 @@ def main() -> None:
     a = torch.from_numpy(A[idx]).to(args.device)
     N, scale = len(a), float(a.max() - a.min())
     print(f"чанков {N}, размах {scale:.2f}\n")
+    err = err_rms = grip = None
 
     E = projected_codebooks(model, args.device)
 
@@ -101,16 +104,39 @@ def main() -> None:
                                device=args.device, dtype=torch.long)
         codes = einops.rearrange(flat, "b (n m) -> b m n", m=P)
 
-        # ошибка при декодировании из первых k уровней
-        err = np.zeros((N, L))
+        # Ошибка при декодировании из первых k уровней.
+        #
+        # КАНАЛ ЗАХВАТА СЧИТАЕТСЯ ОТДЕЛЬНО. Он бинарный, и в момент
+        # переключения декодер промахивается примерно на единицу — при размахе
+        # 1.94 это ~0.51 размаха. Максимум-норма по всему чанку тогда упирается
+        # в него у всех чанков с переключением (а их больше половины), кривая
+        # «глубина -> ошибка» выглядит плоской, и меряется наличие
+        # переключения, а не потребность в глубине. Проверено: при такой норме
+        # медиана держится на 0.5145 при всех k, тогда как 25-й процентиль
+        # (чанки без переключения) честно падает 0.0664 -> 0.0425.
+        cont = slice(0, D_act - 1)
+        err = np.zeros((N, L))          # непрерывные каналы, max-норма
+        err_rms = np.zeros((N, L))      # они же, среднеквадратичная
+        grip = np.zeros((N, L))         # доля неверных шагов захвата
         for k in range(1, L + 1):
             h = sum(E[j][codes[:, :, j]] for j in range(k))
             rec = model._decode(h, args.embodiment, None)[0][..., :D_act]
-            err[:, k - 1] = ((rec - a).abs().flatten(1).amax(-1)
-                             / scale).cpu().numpy()
+            d = (rec - a).abs()
+            err[:, k - 1] = (d[..., cont].flatten(1).amax(-1) / scale).cpu().numpy()
+            err_rms[:, k - 1] = (d[..., cont].flatten(1).pow(2).mean(-1).sqrt()
+                                 / scale).cpu().numpy()
+            grip[:, k - 1] = ((rec[..., -1] > 0.5) != (a[..., -1] > 0.5)
+                              ).float().mean(-1).cpu().numpy()
 
+        print("захват отдельно, доля неверных шагов по глубине: "
+              + " ".join(f"{grip[:, k].mean():.3f}" for k in range(L)))
+        print("непрерывные каналы, медиана по элементам (сверка с K-1): "
+              f"{float(np.median(err_rms[:, -1])):.4f} rms\n")
+
+    if args.metric == "rms":
+        err = err_rms
     print("=" * 74)
-    print("A. КРИВАЯ ГЛУБИНА -> ОШИБКА")
+    print("A. КРИВАЯ ГЛУБИНА -> ОШИБКА (только непрерывные каналы)")
     print("=" * 74)
     print(f"{'уровней':>9}{'медиана':>11}{'25%':>10}{'75%':>10}{'90%':>10}"
           f"{'прирост':>11}")
