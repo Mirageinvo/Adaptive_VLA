@@ -178,8 +178,7 @@ def build_batch(z, t_idx, tasks, state, proc, args, device):
     else:
         images = [[t1[i].numpy(), t2[i].numpy()] for i in range(len(t_idx))]
     texts = proc.apply_chat_template(msgs, add_generation_prompt=True)
-    b = proc(text=texts, images=images, return_tensors="pt", padding=True,
-             action_processor_kwargs={"embodiment_ids": args.embodiment})
+    b = proc(text=texts, images=images, return_tensors="pt", padding=True)
     return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in b.items()}
 
 
@@ -199,8 +198,11 @@ def main() -> None:
     ap.add_argument("--bgr", action="store_true", default=False,
                     help="разворот каналов; средние по каналам R>G>B говорят, "
                          "что в зарре уже RGB, поэтому по умолчанию выключен")
-    ap.add_argument("--quat-wxyz", action="store_true", default=True,
-                    help="в зарре кватернион с w первым; robosuite ждёт xyzw")
+    ap.add_argument("--quat-wxyz", action="store_true", default=False,
+                    help="переставить кватернион из wxyz в xyzw. По умолчанию "
+                         "ВЫКЛ: константы STATE_Q01/Q99[3] лежат в [1.51, 3.28] "
+                         "(около pi), то есть схват развёрнут на 180 градусов, "
+                         "и первая компонента 0.9988 в зарре — это x, а не w")
     ap.add_argument("--tiled", action="store_true", default=True,
                     help="склеить два вида в одну картинку, как при обучении")
     ap.add_argument("--sanity-max", type=float, default=0.15)
