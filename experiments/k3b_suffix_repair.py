@@ -16,7 +16,7 @@
 
 ПОСТАНОВКА K-3b. Воспроизводим то, что делает итеративный генератор:
 
-  z_ideal   — жадная генерация BAR целиком. Это «правильное» решение: в
+  z_ref   — жадная генерация BAR целиком. Это «правильное» решение: в
               позиции p стоит top-1 код v, и суффикс согласован с ним.
   u         — код рангов 2..k в позиции p: РАННЕЕ, ХУДШЕЕ решение.
   z_old     — полная генерация при u: согласованное старое состояние.
@@ -28,12 +28,12 @@
   BAR глоб. — полная перегенерация обоих тонких блоков;
   проекция  — жадная переквантизация суффикса в позиции p К ЦЕЛИ.
 
-ОДНА ЦЕЛЬ ВЕЗДЕ. Целью служит z_ideal — то, что модель выдала бы, приняв
+ОДНА ЦЕЛЬ ВЕЗДЕ. Целью служит z_ref — то, что модель выдала бы, приняв
 верное решение с самого начала. К ней строится проекция, ею же меряется
 качество. Отдельно, НЕ смешивая внутри отношения, приводится качество против
 датасетного действия на исполняемом окне.
 
-Заметим: BAR глоб. при верном coarse воспроизводит z_ideal тождественно, то
+Заметим: BAR глоб. при верном coarse воспроизводит z_ref тождественно, то
 есть даёт нулевую ошибку ценой полной перегенерации. Поэтому вопрос ставится
 так: насколько ЛОКАЛЬНЫЙ ремонт приближается к тому, что даёт полная
 перегенерация, и обходит ли явная проекция собственный пересчёт модели.
@@ -104,9 +104,14 @@ def main() -> None:
     ap.add_argument("--root", default="third_party/actioncodec")
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--n-obs", type=int, default=96)
-    ap.add_argument("--n-pos", type=int, default=8)
+    ap.add_argument("--all-pos", action="store_true", default=True,
+                    help="проходить ВСЕ позиции, а не случайные с возвращением")
+    ap.add_argument("--margin", type=float, default=0.05,
+                    help="граница практически значимого преимущества проекции, "
+                         "в долях закрытого разрыва")
     ap.add_argument("--rank-lo", type=int, default=1, help="нижний ранг худшего кода")
     ap.add_argument("--rank-hi", type=int, default=5, help="верхний ранг")
+    ap.add_argument("--seeds", default="0", help="сиды выборки данных")
     ap.add_argument("--pos-offsets", default="0,3,4",
                     help="штатные смещения позиций; обучение шло со случайными, "
                          "валидация с 3, симулятор с 4")
@@ -170,6 +175,15 @@ def main() -> None:
         return tok._decode(latent_from_codes(E, codes), args.embodiment,
                            None)[0][..., :D_act]
 
+    def metrics(a, ref, w):
+        """Три величины. Захват СЧИТАЕТСЯ ОТДЕЛЬНО: он бинарный, в общей норме
+        теряется, а момент его переключения может определять успех задачи."""
+        d = (a[:, :w] - ref[:, :w]).abs()
+        cont = d[..., :D_act - 1]
+        return (cont.flatten(1).amax(-1) / scale,
+                cont.flatten(1).pow(2).mean(-1).sqrt() / scale,
+                ((a[:, :w, -1] > 0) != (ref[:, :w, -1] > 0)).float().mean(-1))
+
     def to_levels(flat):
         return flat.reshape(-1, L, P).transpose(1, 2)
 
@@ -198,120 +212,152 @@ def main() -> None:
             return hist
 
         with torch.no_grad():
-            z_ideal = to_levels(gen(None, nb))           # верное решение
-            a_ideal = dec(z_ideal)
+            z_ref = to_levels(gen(None, nb))          # жадный top-1 выход BAR
+            a_ref = dec(z_ref)
             lg0 = blk(None)
             rng = torch.Generator(device=args.device).manual_seed(1)
 
-            acc = {k: {w: [] for w in WINDOWS} for k in
-                   ("stale", "loc", "glob", "proj")}
-            acc_gt = {k: {w: [] for w in WINDOWS} for k in
-                      ("ideal", "stale", "loc", "glob", "proj")}
+            VAR = ("old", "stale", "loc", "glob", "proj")
+            acc = {k: {w: {m: [] for m in ("max", "rms", "grip")}
+                       for w in WINDOWS} for k in VAR}
+            acc_gt = {k: {w: {m: [] for m in ("max", "rms", "grip")}
+                          for w in WINDOWS} for k in VAR + ("ref",)}
             js_p, chg_all = [], []
             infl = torch.zeros(P, P)
             cnt = torch.zeros(P)
             ar = torch.arange(B, device=args.device)
+            plist = list(range(P)) if args.all_pos else [
+                int(torch.randint(P, (1,), generator=rng, device=args.device))
+                for _ in range(P)]
 
-            for _ in range(args.n_pos):
-                p = int(torch.randint(P, (1,), generator=rng, device=args.device))
-                v = z_ideal[:, p, 0]                     # top-1: верный код
-                # индекс 0 — сам top-1, поэтому худший код берём из индексов
-                # [rank_lo, rank_hi), что соответствует рангам rank_lo+1..rank_hi
-                rk = lg0[:, p].topk(args.rank_hi, -1).indices
+            for p_ in plist:
+                v = z_ref[:, p_, 0]
+                rk = lg0[:, p_].topk(args.rank_hi, -1).indices
                 u = rk[ar, torch.randint(args.rank_lo, args.rank_hi, (B,),
                                          generator=rng, device=args.device)]
 
-                # согласованное СТАРОЕ состояние при худшем коде u
-                c0_old = z_ideal[:, :, 0].clone()
-                c0_old[:, p] = u
-                lg1_old = blk(c0_old)                    # кэш: нужен и для JS
+                c0_old = z_ref[:, :, 0].clone()
+                c0_old[:, p_] = u
+                lg1_old = blk(c0_old)
                 c1_old = lg1_old.argmax(-1)
                 lg2_old = blk(torch.cat([c0_old, c1_old], 1))
                 z_old = torch.stack([c0_old, c1_old, lg2_old.argmax(-1)], -1)
 
-                # поток исправляет u -> v
-                c0_new = z_ideal[:, :, 0]
+                c0_new = z_ref[:, :, 0]
                 stale = z_old.clone()
                 stale[:, :, 0] = c0_new
 
-                # ЛОКАЛЬНЫЙ ремонт с ПОСЛЕДОВАТЕЛЬНЫМ контекстом
                 lg1 = blk(c0_new)
                 c1 = z_old[:, :, 1].clone()
-                c1[:, p] = lg1.argmax(-1)[:, p]
+                c1[:, p_] = lg1.argmax(-1)[:, p_]
                 lg2 = blk(torch.cat([c0_new, c1], 1))
                 c2 = z_old[:, :, 2].clone()
-                c2[:, p] = lg2.argmax(-1)[:, p]
+                c2[:, p_] = lg2.argmax(-1)[:, p_]
                 loc = torch.stack([c0_new, c1, c2], -1)
 
                 glob = to_levels(gen(c0_new, nb - bpl))
-                # ВСТРОЕННАЯ ПРОВЕРКА: жадная генерация детерминирована, и при
-                # верном coarse полная перегенерация обязана дать ровно цель.
-                assert torch.equal(glob, z_ideal), (
-                    "полная перегенерация при верном coarse не воспроизвела "
-                    "z_ideal — генерация недетерминирована или контекст сбит")
-                proj = greedy_suffix(E, stale, latent_from_codes(E, z_ideal), p, 0)
+                assert torch.equal(glob, z_ref), (
+                    "перегенерация при верном coarse не дала z_ref — "
+                    "генерация недетерминирована или контекст сбит")
+                proj = greedy_suffix(E, stale, latent_from_codes(E, z_ref), p_, 0)
 
-                # чувствительность ИМЕННО в изменённой позиции
-                js_p.append(float(js_div(lg1_old.softmax(-1)[:, p],
-                                         lg1.softmax(-1)[:, p]).median()))
+                js_p.append(float(js_div(lg1_old.softmax(-1)[:, p_],
+                                         lg1.softmax(-1)[:, p_]).median()))
                 ch = (c1_old != lg1.argmax(-1)).float().mean(0)
-                infl[p] += ch.cpu()
-                cnt[p] += 1
+                infl[p_] += ch.cpu()
+                cnt[p_] += 1
                 chg_all.append(float(ch.mean()))
 
-                for k, cc in (("stale", stale), ("loc", loc), ("glob", glob),
-                              ("proj", proj)):
-                    d = (dec(cc) - a_ideal).abs()[..., :D_act - 1]
-                    for w in WINDOWS:
-                        acc[k][w].append((d[:, :w].flatten(1).amax(-1)
-                                          / scale).cpu().numpy())
-                for k, cc in (("ideal", z_ideal), ("stale", stale), ("loc", loc),
-                              ("glob", glob), ("proj", proj)):
-                    d = (dec(cc) - a_true).abs()[..., :D_act - 1]
-                    for w in WINDOWS:
-                        acc_gt[k][w].append((d[:, :w].flatten(1).amax(-1)
-                                             / scale).cpu().numpy())
+                dd = {k: dec(cc) for k, cc in
+                      (("old", z_old), ("stale", stale), ("loc", loc),
+                       ("glob", glob), ("proj", proj))}
+                for w in WINDOWS:
+                    for k, a_ in dd.items():
+                        for nm, val in zip(("max", "rms", "grip"),
+                                           metrics(a_, a_ref, w)):
+                            acc[k][w][nm].append(val.cpu().numpy())
+                    for k, a_ in list(dd.items()) + [("ref", a_ref)]:
+                        for nm, val in zip(("max", "rms", "grip"),
+                                           metrics(a_, a_true, w)):
+                            acc_gt[k][w][nm].append(val.cpu().numpy())
 
-        epi_rep = np.tile(EPI, args.n_pos)
-        print("ЦЕЛЬ — z_ideal (что модель выдала бы, приняв верное решение сразу)")
-        print(f"{'окно':>6}{'stale':>9}{'BAR лок.':>10}{'BAR глоб.':>11}"
-              f"{'проекция':>11}{'закрыто BAR':>26}{'закрыто проекцией':>26}")
-        for w in WINDOWS:
-            e = {k: np.concatenate(acc[k][w]) for k in acc}
-            rb = paired_ci(e["stale"] - e["loc"], e["stale"], epi_rep)
-            rp = paired_ci(e["stale"] - e["proj"], e["stale"], epi_rep)
-            print(f"{w:>6}{e['stale'].mean():>9.4f}{e['loc'].mean():>10.4f}"
-                  f"{e['glob'].mean():>11.4f}{e['proj'].mean():>11.4f}"
-                  f"{f'{rb[0]:+.2f} [{rb[1]:+.2f}, {rb[2]:+.2f}]':>26}"
-                  f"{f'{rp[0]:+.2f} [{rp[1]:+.2f}, {rp[2]:+.2f}]':>26}")
+        epi_rep = np.tile(EPI, len(plist))
 
-        print("\nЦЕЛЬ — датасетное действие (качество, отдельно от отношения выше)")
-        print(f"{'окно':>6}{'ideal':>9}{'stale':>9}{'BAR лок.':>10}"
-              f"{'BAR глоб.':>11}{'проекция':>11}")
+        print("ЦЕЛЬ — z_ref (жадный top-1 выход BAR; НЕ истина)")
+        print(f"{'окно':>5}{'норма':>6}{'z_old':>8}{'stale':>8}{'BAR лок.':>9}"
+              f"{'глоб.':>7}{'проекц.':>8}{'закрыто BAR':>24}"
+              f"{'закрыто проекц.':>24}{'преим. проекции':>24}")
         for w in WINDOWS:
-            e = {k: np.concatenate(acc_gt[k][w]).mean() for k in acc_gt}
-            print(f"{w:>6}{e['ideal']:>9.4f}{e['stale']:>9.4f}{e['loc']:>10.4f}"
-                  f"{e['glob']:>11.4f}{e['proj']:>11.4f}")
+            for nm in ("max", "rms"):
+                e = {k: np.concatenate(acc[k][w][nm]) for k in VAR}
+                rb = paired_ci(e["stale"] - e["loc"], e["stale"], epi_rep)
+                rp = paired_ci(e["stale"] - e["proj"], e["stale"], epi_rep)
+                # ПРЯМОЙ ПАРНЫЙ ТЕСТ ЭКВИВАЛЕНТНОСТИ. Перекрытие интервалов rb и
+                # rp равенства НЕ доказывает; бутстрапим саму разность.
+                ad = paired_ci(e["loc"] - e["proj"], e["stale"], epi_rep)
+                print(f"{w:>5}{nm:>6}{e['old'].mean():>8.4f}{e['stale'].mean():>8.4f}"
+                      f"{e['loc'].mean():>9.4f}{e['glob'].mean():>7.4f}"
+                      f"{e['proj'].mean():>8.4f}"
+                      f"{f'{rb[0]:+.2f} [{rb[1]:+.2f},{rb[2]:+.2f}]':>24}"
+                      f"{f'{rp[0]:+.2f} [{rp[1]:+.2f},{rp[2]:+.2f}]':>24}"
+                      f"{f'{ad[0]:+.3f} [{ad[1]:+.3f},{ad[2]:+.3f}]':>24}")
+
+        print("\nЦЕЛЬ — датасетное действие (качество), с интервалами")
+        print(f"{'окно':>5}{'норма':>6}{'z_ref':>8}{'z_old':>8}{'stale':>8}"
+              f"{'BAR лок.':>9}{'проекц.':>8}{'z_old -> z_ref улучшает?':>30}")
+        for w in WINDOWS:
+            for nm in ("max", "rms"):
+                e = {k: np.concatenate(acc_gt[k][w][nm]) for k in acc_gt}
+                # ПРОВЕРКА ПРЕДПОСЫЛКИ: правка coarse должна улучшать качество,
+                # иначе замер меряет согласованность, а не исправление.
+                imp = paired_ci(e["old"] - e["ref"], e["old"], epi_rep)
+                print(f"{w:>5}{nm:>6}{e['ref'].mean():>8.4f}{e['old'].mean():>8.4f}"
+                      f"{e['stale'].mean():>8.4f}{e['loc'].mean():>9.4f}"
+                      f"{e['proj'].mean():>8.4f}"
+                      f"{f'{imp[0]:+.3f} [{imp[1]:+.3f},{imp[2]:+.3f}]':>30}")
+
+        print("\nЗАХВАТ отдельно (доля неверных шагов), окно 4")
+        eg = {k: np.concatenate(acc_gt[k][4]["grip"]).mean() for k in acc_gt}
+        print("  " + "  ".join(f"{k}={eg[k]:.3f}" for k in
+                               ("ref", "old", "stale", "loc", "proj")))
 
         infl = infl / cnt.clamp_min(1).unsqueeze(1)
         d_ = float(np.mean([infl[i, i] for i in range(P) if cnt[i] > 0]))
         o_ = float(np.mean([infl[i, q] for i in range(P) if cnt[i] > 0
                             for q in range(P) if q != i]))
-        print(f"\nJS в изменённой позиции p: медиана {np.median(js_p):.4f} бит, "
-              f"смен top-1 всего {np.mean(chg_all):.1%}")
+        print(f"\nJS в изменённой позиции: медиана {np.median(js_p):.4f} бит, "
+              f"смен top-1 {np.mean(chg_all):.1%}")
         print(f"влияние: диагональ {d_:.3f}, вне диагонали {o_:.3f}, "
-              f"отношение {d_ / max(o_, 1e-9):.1f}")
-        print("(нормировка на число выпадений каждой позиции; внедиагональ по "
-              "ВСЕМ q != p)\n")
+              f"отношение {d_ / max(o_, 1e-9):.1f}\n")
 
-    print("""
-КАК ЧИТАТЬ. «закрыто» = (e_stale - e_вариант) / e_stale по ПАРНЫМ разностям,
+    print(f"""
+КАК ЧИТАТЬ.
+
+ГЛАВНОЕ — столбец «преим. проекции» = (e_BAR_лок - e_проекц) / e_stale по
+парным разностям. Перекрытие интервалов двух отдельных долей равенства НЕ
+доказывает, поэтому бутстрапится сама разность. Граница практической
+значимости зафиксирована до запуска: {args.margin:.2f} закрытого разрыва.
+  верхняя граница интервала НИЖЕ {args.margin:.2f} -> жадная проекция практически
+      эквивалентна обычному условному пересчёту, отдельный механизм не нужен;
+  интервал уходит выше -> преимущество есть, механизм имеет смысл.
+
+ПРОВЕРКА ПРЕДПОСЫЛКИ — столбец «z_old -> z_ref улучшает?». z_ref это лишь
+жадный top-1 выход BAR, а не истина, и код ранга 2-5 не обязан быть ошибкой.
+Если переход не улучшает качество относительно датасета, замер меряет
+восстановление внутренней согласованности, а не исправление решения.
+
+ВНИМАНИЕ ПРО ВЫЧИСЛЕНИЯ. BAR лок. и BAR глоб. зовут модель ОДИНАКОВОЕ число
+раз (по разу на уровень). Трансформер считает логиты для всего блока, и
+вставка одной позиции не экономит ни проходов, ни операций. Поэтому локальный
+ремонт при равной цене даёт лишь часть того, что даёт полная перегенерация, и
+компромисса «вычисления против качества» здесь НЕТ. Он появился бы только при
+настоящей разреженной архитектуре. «закрыто» = (e_stale - e_вариант) / e_stale по ПАРНЫМ разностям,
 отношение сумм внутри бутстрап-реплики, интервалы кластерные по эпизодам.
   проекция закрывает существенно больше BAR -> явное связывание оправдано;
   BAR не меньше проекции -> модель чинит сама, механизм беспредметен;
   обе доли около нуля -> суффикс не компенсирует смену coarse вообще.
-BAR глоб. служит опорой: при верном coarse он воспроизводит цель тождественно,
-то есть показывает, чего стоит добиться ценой полной перегенерации.""")
+BAR глоб. служит опорой и встроенной проверкой: при верном coarse он обязан
+воспроизвести z_ref тождественно.""")
 
 
 if __name__ == "__main__":
