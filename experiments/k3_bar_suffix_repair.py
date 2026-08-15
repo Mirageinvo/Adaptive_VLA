@@ -154,8 +154,6 @@ def build_batch(z, t_idx, tasks, state, proc, args, device):
     hw = int(np.asarray(z["data"]["agentview_rgb"][0]).shape[0])
     tf = (Compose([CenterCrop(int(hw * 0.875)), Resize((224, 224))])
           if args.center_crop else Compose([Resize((224, 224))]))
-    print(f"кроп: {'CenterCrop(' + str(int(hw * 0.875)) + ') + ' if args.center_crop else ''}"
-          f"Resize(224) из {hw}px")
     k1 = "agentview_rgb" if "agentview_rgb" in z["data"] else "agentview_image"
     k2 = ("robot0_eye_in_hand_rgb" if "robot0_eye_in_hand_rgb" in z["data"]
           else "robot0_eye_in_hand_image")
@@ -163,7 +161,17 @@ def build_batch(z, t_idx, tasks, state, proc, args, device):
     im2 = np.stack([np.asarray(z["data"][k2][t]) for t in t_idx])
     print(f"картинки: {k1} {im1.shape} {im1.dtype}, диапазон "
           f"[{im1.min()}, {im1.max()}]")
-    if args.bgr:                                  # eval_libero делает [:, :, ::-1]
+    # ВНИМАНИЕ. В eval_libero.py стоит obs[...][:, :, ::-1] на массиве
+    # (B,H,W,C) — это разворот оси 2, то есть ЗЕРКАЛО ПО ШИРИНЕ, а не
+    # перестановка каналов, как читается с первого взгляда. Плюс robosuite
+    # обычно отдаёт кадры перевёрнутыми по высоте. Что именно нужно нашему
+    # зарру — решает перебор (--probe).
+    f = args.flip
+    if "h" in f:
+        im1, im2 = im1[:, ::-1].copy(), im2[:, ::-1].copy()
+    if "w" in f:
+        im1, im2 = im1[:, :, ::-1].copy(), im2[:, :, ::-1].copy()
+    if "c" in f:
         im1, im2 = im1[..., ::-1].copy(), im2[..., ::-1].copy()
     t1 = tf(torch.from_numpy(im1).permute(0, 3, 1, 2))
     t2 = tf(torch.from_numpy(im2).permute(0, 3, 1, 2))
@@ -195,9 +203,12 @@ def main() -> None:
     ap.add_argument("--exec-window", type=int, default=8)
     ap.add_argument("--embodiment", type=int, default=0)
     ap.add_argument("--center-crop", action="store_true", default=True)
-    ap.add_argument("--bgr", action="store_true", default=False,
-                    help="разворот каналов; средние по каналам R>G>B говорят, "
-                         "что в зарре уже RGB, поэтому по умолчанию выключен")
+    ap.add_argument("--flip", default="",
+                    help="какие оси разворачивать: h (высота), w (ширина), "
+                         "c (каналы); можно сочетать, например 'hc'")
+    ap.add_argument("--probe", action="store_true",
+                    help="перебрать формат картинок и напечатать ошибку "
+                         "санитарной проверки для каждой комбинации")
     ap.add_argument("--quat-wxyz", action="store_true", default=False,
                     help="переставить кватернион из wxyz в xyzw. По умолчанию "
                          "ВЫКЛ: константы STATE_Q01/Q99[3] лежат в [1.51, 3.28] "
@@ -349,6 +360,41 @@ def main() -> None:
 
         base = dec(codes)
         e_base = err(base)
+        if args.probe:
+            print("\n" + "=" * 60)
+            print("ПЕРЕБОР ФОРМАТА: ошибка генерации против датасетной")
+            print("=" * 60)
+            print(f"{'flip':>6}{'кроп':>7}{'склейка':>9}{'ошибка':>10}")
+            best = (1e9, None)
+            for fl in ("", "h", "w", "c", "hw", "hc", "wc", "hwc"):
+                for cr in (True, False):
+                    for ti in (True, False):
+                        args.flip, args.center_crop, args.tiled = fl, cr, ti
+                        bb = build_batch(zz, t_idx, tasks, st, proc, args,
+                                         args.device)
+                        _, _, ve, _ = model._build_vlm_inputs_embeds(
+                            input_ids=bb["input_ids"], inputs_embeds=None,
+                            pixel_values=bb.get("pixel_values"),
+                            pixel_attention_mask=bb.get("pixel_attention_mask"),
+                            image_hidden_states=None)
+                        h_, am = ve, bb.get("attention_mask")
+                        hist = None
+                        for _ in range(nb):
+                            lg = model._predict_next_block_logits(
+                                vlm_inputs_embeds=h_, attention_mask=am,
+                                history_tokens=hist).float()
+                            c = lg.argmax(-1)
+                            hist = c if hist is None else torch.cat([hist, c], 1)
+                        e = float(err(dec(to_levels(hist))).median())
+                        print(f"{fl or '-':>6}{str(cr):>7}{str(ti):>9}{e:>10.4f}")
+                        if e < best[0]:
+                            best = (e, (fl, cr, ti))
+            print(f"\nлучшее: flip={best[1][0] or '-'} кроп={best[1][1]} "
+                  f"склейка={best[1][2]}, ошибка {best[0]:.4f}")
+            print("Ниже 0.05 — формат найден. Около 0.19 у всех — дело не в\n"
+                  "формате, а в разрешении 128 против обучающих 256.")
+            return
+
         print(f"САНИТАРНАЯ ПРОВЕРКА — |ошибка| генерации против датасетной: "
               f"медиана {float(e_base.median()):.4f} размаха")
         assert float(e_base.median()) < args.sanity_max, (
