@@ -148,7 +148,7 @@ def load_lerobot(n_obs: int, T: int, n_ep: int = 8, seed: int = 0):
     rng = np.random.default_rng(seed)
     eps = rng.choice(1693, size=min(n_ep, n_obs), replace=False)
     per_ep = int(np.ceil(n_obs / len(eps)))
-    im1, im2, st, act, tasks = [], [], [], [], []
+    im1, im2, st, act, prev, tasks = [], [], [], [], [], []
 
     def png(cell):
         return np.asarray(Image.open(io.BytesIO(cell["bytes"])).convert("RGB"))
@@ -170,6 +170,7 @@ def load_lerobot(n_obs: int, T: int, n_ep: int = 8, seed: int = 0):
             im2.append(png(c2[s0]))
             st.append(S_[s0])
             act.append(A_[s0:s0 + T])
+            prev.append(A_[max(s0 - 1, 0)])      # действие ДО чанка, для базы
             tasks.append(tasks_map[ti[s0]])
         if len(tasks) >= n_obs:
             break
@@ -179,7 +180,7 @@ def load_lerobot(n_obs: int, T: int, n_ep: int = 8, seed: int = 0):
           f"картинки {im1[0].shape}")
     to_t = lambda a: torch.from_numpy(np.stack(a[:k])).permute(0, 3, 1, 2)  # noqa: E731
     return (to_t(im1), to_t(im2), np.stack(st[:k]), np.stack(act[:k]),
-            tasks[:k])
+            np.stack(prev[:k]), tasks[:k])
 
 
 def build_state(z, t_idx, quat_wxyz: bool):
@@ -306,7 +307,7 @@ def main() -> None:
     E = projected_codebooks(tok, args.device)
 
     if args.source == "lerobot":
-        IM1, IM2, ST_RAW, A, tasks = load_lerobot(args.n_obs, T)
+        IM1, IM2, ST_RAW, A, PREV, tasks = load_lerobot(args.n_obs, T)
         zz = t_idx = None
     else:
         zz = zarr.open(os.path.abspath(args.zarr), mode="r")
@@ -322,7 +323,7 @@ def main() -> None:
         tasks = [(v.decode() if isinstance(v, bytes) else str(v)).strip()
                  for v in raw.ravel()]
         A = np.stack([acts[t:t + span:args.stride] for t in t_idx]).astype(np.float32)
-        ST_RAW = None
+        ST_RAW = PREV = None
         IM1 = torch.from_numpy(np.stack(
             [np.asarray(zz["data"]["agentview_rgb"][t]) for t in t_idx])
         ).permute(0, 3, 1, 2)
@@ -337,6 +338,11 @@ def main() -> None:
     A[..., :-1] = A[..., :-1] / MAX_ACTION_Q[:-1]
     A[..., -1] = -A[..., -1]
     A = np.clip(A, -1.0, 1.0)
+    if PREV is not None:
+        PREV = np.asarray(PREV, np.float32).copy()
+        PREV[..., :-1] = PREV[..., :-1] / MAX_ACTION_Q[:-1]
+        PREV[..., -1] = -PREV[..., -1]
+        PREV = torch.from_numpy(np.clip(PREV, -1.0, 1.0)).to(args.device)
     a_true = torch.from_numpy(A).to(args.device)
     scale = float(a_true.max() - a_true.min())
     B = len(A)
@@ -434,7 +440,12 @@ def main() -> None:
         zero = torch.zeros_like(a_true)
         zero[..., -1] = a_true[..., -1]              # захват оставляем истинный
         mean = a_true.mean(0, keepdim=True).expand_as(a_true)
-        prev = torch.cat([a_true[:, :1], a_true[:, :-1]], 1)   # удержание
+        # ЧЕСТНОЕ УДЕРЖАНИЕ: повтор последнего действия ДО чанка, одно и то же
+        # на все шаги. Прежний вариант (сдвиг истинной последовательности на
+        # шаг) подглядывал будущее: политика видит одно наблюдение в начале и
+        # предсказывает все T шагов, истинного действия шага t-1 у неё нет.
+        prev = (PREV.unsqueeze(1).expand_as(a_true) if PREV is not None
+                else torch.zeros_like(a_true))
         e_zero, e_mean, e_prev = err(zero), err(mean), err(prev)
         m = float(e_base.median())
         print("\nСАНИТАРНАЯ ПРОВЕРКА, медианы ошибки против датасетного действия:")
