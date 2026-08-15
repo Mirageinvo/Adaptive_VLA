@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# результаты прогонов и кэши — не в индекс
+logs/
+*.npz
+*.ckpt
+*.safetensors
+
+# данные монтируются или качаются отдельно
+data/

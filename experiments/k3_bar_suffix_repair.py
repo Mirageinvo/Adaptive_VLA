@@ -129,6 +129,34 @@ def quat2axisangle(q):
     return np.where(small[..., None], np.zeros_like(q[..., :3]), out)
 
 
+def load_lerobot(n_obs: int, T: int, seed: int = 0):
+    """Родной обучающий датасет BAR: physical-intelligence/libero в формате
+    LeRobot. Берём ровно так же, как их LiberoAllDataset (scripts/utils.py:205):
+    delta_timestamps = [i/10 for i in range(T)].
+
+    Зачем вместо зарра OAT: там картинки 128x128, а обучение шло на 256, и
+    подбор формата упёрся в ошибку 0.137 при переборе всех комбинаций
+    разворотов и кропов. Родной источник снимает разом разрешение, ориентацию,
+    порядок каналов и состав состояния."""
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    ds = LeRobotDataset("physical-intelligence/libero",
+                        delta_timestamps={"actions": [i / 10 for i in range(T)]})
+    print(f"LeRobot: эпизодов {ds.num_episodes}, кадров {ds.num_frames}")
+    idx = np.sort(np.random.default_rng(seed).choice(len(ds), n_obs, replace=False))
+    items = [ds[int(i)] for i in idx]
+    k0 = items[0]
+    print("поля образца: " + ", ".join(
+        f"{k}{tuple(v.shape)}" if hasattr(v, "shape") else f"{k}<{type(v).__name__}>"
+        for k, v in k0.items()))
+    im1 = torch.stack([(it["image"] * 255).to(torch.uint8) for it in items])
+    im2 = torch.stack([(it["wrist_image"] * 255).to(torch.uint8) for it in items])
+    act = torch.stack([torch.as_tensor(it["actions"]) for it in items]).float()
+    st = torch.stack([torch.as_tensor(it["state"]) for it in items]).float()
+    tasks = [it["task"] for it in items]
+    return im1, im2, st.numpy(), act.numpy(), tasks
+
+
 def build_state(z, t_idx, quat_wxyz: bool):
     """[pos(3), axis-angle(3), gripper(2)], нормировано в [-1, 1].
 
@@ -144,47 +172,43 @@ def build_state(z, t_idx, quat_wxyz: bool):
     return ((st - STATE_Q01) / (STATE_Q99 - STATE_Q01) * 2.0 - 1.0).astype(np.float32)
 
 
-def build_batch(z, t_idx, tasks, state, proc, args, device):
-    """Наблюдения в формате BAR. Повторяет scripts/eval_libero.py."""
+def build_batch(im1, im2, tasks, state, proc, args, device):
+    """Наблюдения в формате BAR. im1/im2 — тензоры (B,C,H,W) uint8.
+
+    Обучение (scripts/utils.py:205): RandomCrop(int(256*0.875)) + Resize(224),
+    то есть 87.5% поля зрения. На инференсе берём CenterCrop той же долей —
+    детерминированно. Виды склеиваются в ОДНУ картинку по ширине, и из
+    сообщения удаляется первый плейсхолдер изображения."""
     from torchvision.transforms import CenterCrop, Compose, Resize
 
-    # Обучение: RandomCrop(224) из 256 -> 87.5% поля зрения. Их оценка:
-    # CenterCrop(196) из 224 -> те же 87.5%. У нас картинки 128, поэтому кроп
-    # берём тем же долей от фактического размера, потом ресайз в 224.
-    hw = int(np.asarray(z["data"]["agentview_rgb"][0]).shape[0])
+    n = len(tasks)
+    hw = int(im1.shape[-2])
     tf = (Compose([CenterCrop(int(hw * 0.875)), Resize((224, 224))])
           if args.center_crop else Compose([Resize((224, 224))]))
-    k1 = "agentview_rgb" if "agentview_rgb" in z["data"] else "agentview_image"
-    k2 = ("robot0_eye_in_hand_rgb" if "robot0_eye_in_hand_rgb" in z["data"]
-          else "robot0_eye_in_hand_image")
-    im1 = np.stack([np.asarray(z["data"][k1][t]) for t in t_idx])
-    im2 = np.stack([np.asarray(z["data"][k2][t]) for t in t_idx])
-    print(f"картинки: {k1} {im1.shape} {im1.dtype}, диапазон "
-          f"[{im1.min()}, {im1.max()}]")
-    # ВНИМАНИЕ. В eval_libero.py стоит obs[...][:, :, ::-1] на массиве
-    # (B,H,W,C) — это разворот оси 2, то есть ЗЕРКАЛО ПО ШИРИНЕ, а не
-    # перестановка каналов, как читается с первого взгляда. Плюс robosuite
-    # обычно отдаёт кадры перевёрнутыми по высоте. Что именно нужно нашему
-    # зарру — решает перебор (--probe).
-    f = args.flip
+    print(f"картинки {tuple(im1.shape)} {im1.dtype}, "
+          f"диапазон [{int(im1.min())}, {int(im1.max())}], "
+          f"кроп {int(hw * 0.875) if args.center_crop else hw} -> 224")
+
+    # Развороты нужны только источнику zarr: там ориентация кадров чужая
+    # (перебор показал, что нужно зеркало по ширине). У родного датасета
+    # формат уже тот, на котором модель обучалась.
+    f = (args.flip or "w") if args.source == "zarr" else ""
     if "h" in f:
-        im1, im2 = im1[:, ::-1].copy(), im2[:, ::-1].copy()
+        im1, im2 = im1.flip(-2), im2.flip(-2)
     if "w" in f:
-        im1, im2 = im1[:, :, ::-1].copy(), im2[:, :, ::-1].copy()
+        im1, im2 = im1.flip(-1), im2.flip(-1)
     if "c" in f:
-        im1, im2 = im1[..., ::-1].copy(), im2[..., ::-1].copy()
-    t1 = tf(torch.from_numpy(im1).permute(0, 3, 1, 2))
-    t2 = tf(torch.from_numpy(im2).permute(0, 3, 1, 2))
-    # Обучение склеивало виды в ОДНУ картинку по ширине и удаляло первый
-    # плейсхолдер изображения из сообщения (utils.py: messages[1]["content"][1:]).
-    msgs = [prompt_template(state[i], tasks[i]) for i in range(len(t_idx))]
+        im1, im2 = im1.flip(-3), im2.flip(-3)
+
+    t1, t2 = tf(im1), tf(im2)
+    msgs = [prompt_template(state[i], tasks[i]) for i in range(n)]
     if args.tiled:
         im = torch.cat([t1, t2], dim=-1)
-        images = [[im[i].numpy()] for i in range(len(t_idx))]
+        images = [[im[i].numpy()] for i in range(n)]
         for m in msgs:
             m[1]["content"] = m[1]["content"][1:]
     else:
-        images = [[t1[i].numpy(), t2[i].numpy()] for i in range(len(t_idx))]
+        images = [[t1[i].numpy(), t2[i].numpy()] for i in range(n)]
     texts = proc.apply_chat_template(msgs, add_generation_prompt=True)
     b = proc(text=texts, images=images, return_tensors="pt", padding=True)
     return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in b.items()}
@@ -195,7 +219,10 @@ def main() -> None:
     ap.add_argument("--root", default="third_party/actioncodec")
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--tokenizer", default="ZibinDong/ActionCodec-Base-RVQft")
-    ap.add_argument("--zarr", required=True)
+    ap.add_argument("--source", choices=["lerobot", "zarr"], default="lerobot",
+                    help="lerobot — родной обучающий датасет BAR (правильное "
+                         "разрешение и формат); zarr — данные OAT, 128x128")
+    ap.add_argument("--zarr", default=None, help="нужен только при --source zarr")
     ap.add_argument("--n-obs", type=int, default=48)
     ap.add_argument("--n-pos", type=int, default=6, help="позиций p на наблюдение")
     ap.add_argument("--knn", type=int, default=16)
@@ -206,15 +233,6 @@ def main() -> None:
     ap.add_argument("--flip", default="",
                     help="какие оси разворачивать: h (высота), w (ширина), "
                          "c (каналы); можно сочетать, например 'hc'")
-    ap.add_argument("--stride", type=int, default=1,
-                    help="шаг по кадрам при наборе чанка. Их обучение брало "
-                         "delta_timestamps [i/10 for i in range(20)] — шаг 0.1 с, "
-                         "то есть чанк на ДВЕ секунды. Если зарр 20 Гц, нужен 2")
-    ap.add_argument("--probe-stride", action="store_true",
-                    help="перебрать шаг 1..3 при найденном формате картинок")
-    ap.add_argument("--probe", action="store_true",
-                    help="перебрать формат картинок и напечатать ошибку "
-                         "санитарной проверки для каждой комбинации")
     ap.add_argument("--quat-wxyz", action="store_true", default=False,
                     help="переставить кватернион из wxyz в xyzw. По умолчанию "
                          "ВЫКЛ: константы STATE_Q01/Q99[3] лежат в [1.51, 3.28] "
@@ -259,39 +277,42 @@ def main() -> None:
     T, D_act = int(ecfg["freq"] * ecfg["duration"]), ecfg["action_dim"]
     E = projected_codebooks(tok, args.device)
 
-    zz = zarr.open(os.path.abspath(args.zarr), mode="r")
-    print("ключи данных:", list(zz["data"].keys()))
-    acts = np.asarray(zz["data"]["action"])
-    ends = np.asarray(zz["meta"]["episode_ends"])
-    starts = np.concatenate([[0], ends[:-1]])
-    span = T * args.stride                      # сколько кадров покрывает чанк
-    cand = [i for s, e in zip(starts, ends) for i in range(s, e - span)]
-    t_idx = np.sort(np.random.default_rng(0).choice(cand, args.n_obs, replace=False))
-
-    # Инструкция лежит прямо в данных — угадывать по task_uid не нужно.
-    if "prompt" in zz["data"]:
+    if args.source == "lerobot":
+        IM1, IM2, ST_RAW, A, tasks = load_lerobot(args.n_obs, T)
+        zz = t_idx = None
+    else:
+        zz = zarr.open(os.path.abspath(args.zarr), mode="r")
+        print("ключи данных:", list(zz["data"].keys()))
+        acts = np.asarray(zz["data"]["action"])
+        ends = np.asarray(zz["meta"]["episode_ends"])
+        starts = np.concatenate([[0], ends[:-1]])
+        span = T * args.stride
+        cand = [i for s_, e_ in zip(starts, ends) for i in range(s_, e_ - span)]
+        t_idx = np.sort(np.random.default_rng(0).choice(cand, args.n_obs,
+                                                        replace=False))
         raw = np.asarray(zz["data"]["prompt"])[t_idx]
         tasks = [(v.decode() if isinstance(v, bytes) else str(v)).strip()
                  for v in raw.ravel()]
-        print(f"инструкции из зарра, пример: {tasks[0]!r}")
-    else:
-        uid = np.asarray(zz["data"]["task_uid"])[t_idx].astype(int).ravel()
-        tasks = [LIBERO10[u % len(LIBERO10)] for u in uid]
-        print("ВНИМАНИЕ: ключа 'prompt' нет, инструкции взяты по хардкоду —\n"
-              "  соответствие индексов их порядку НЕ проверено.")
+        A = np.stack([acts[t:t + span:args.stride] for t in t_idx]).astype(np.float32)
+        ST_RAW = None
+        IM1 = torch.from_numpy(np.stack(
+            [np.asarray(zz["data"]["agentview_rgb"][t]) for t in t_idx])
+        ).permute(0, 3, 1, 2)
+        IM2 = torch.from_numpy(np.stack(
+            [np.asarray(zz["data"]["robot0_eye_in_hand_rgb"][t]) for t in t_idx])
+        ).permute(0, 3, 1, 2)
 
     # Подготовка действий РОВНО как при обучении (scripts/utils.py:246):
     # поканальное деление на MAX_ACTION_Q, НЕГАЦИЯ захвата, обрезка в [-1,1].
-    # Прежние замеры (K-1, K-2) шли на сырых действиях: каналы 3 и 4 там были
-    # примерно впятеро мельче обучающих. Их надо переснять.
-    A = np.stack([acts[t:t + span:args.stride] for t in t_idx]).astype(np.float32)
-    assert A.shape[1] == T, f"чанк {A.shape[1]} шагов при шаге {args.stride}"
+    assert A.shape[1] == T, f"чанк {A.shape[1]} шагов, ожидалось {T}"
+    A = np.asarray(A, np.float32).copy()
     A[..., :-1] = A[..., :-1] / MAX_ACTION_Q[:-1]
     A[..., -1] = -A[..., -1]
     A = np.clip(A, -1.0, 1.0)
     a_true = torch.from_numpy(A).to(args.device)
     scale = float(a_true.max() - a_true.min())
-    B = len(t_idx)
+    B = len(A)
+    print(f"наблюдений {B}, инструкция: {tasks[0]!r}")
 
     from smolvla.bar import SmolVLABlockwiseAR
 
@@ -314,10 +335,18 @@ def main() -> None:
           f"целиком, и уровень 1 предсказывается ПОСЛЕ него — обусловленность,\n"
           f"на которой стоит замер, сохраняется.\n")
 
-    st = build_state(zz, t_idx, args.quat_wxyz)
+    if args.source == "lerobot":
+        # В их LiberoAllDataset состояние из датасета нормируется напрямую
+        # 8-мерными константами, без process_state — значит оно уже приведено.
+        assert ST_RAW.shape[1] == len(STATE_Q99), (
+            f"состояние {ST_RAW.shape[1]}-мерное, константы {len(STATE_Q99)}-мерные")
+        st = ((ST_RAW - STATE_Q01) / (STATE_Q99 - STATE_Q01) * 2.0 - 1.0
+              ).astype(np.float32)
+    else:
+        st = build_state(zz, t_idx, args.quat_wxyz)
     print(f"состояние: {st.shape[1]} чисел, диапазон после нормировки "
           f"[{st.min():.2f}, {st.max():.2f}]")
-    batch = build_batch(zz, t_idx, tasks, st, proc, args, args.device)
+    batch = build_batch(IM1, IM2, tasks, st, proc, args, args.device)
 
     def dec(codes):
         """codes (B,P,L) -> действие. Декодируем через латенту, минуя токены."""
@@ -370,78 +399,7 @@ def main() -> None:
 
         base = dec(codes)
         e_base = err(base)
-        if args.probe_stride:
-            print("\n" + "=" * 52)
-            print("ПЕРЕБОР ШАГА ПО КАДРАМ (формат картинок фиксирован)")
-            print("=" * 52)
-            print(f"{'шаг':>5}{'секунд в чанке':>17}{'ошибка':>10}")
-            for stv in (1, 2, 3, 4):
-                sp = T * stv
-                ti = np.sort(np.random.default_rng(0).choice(
-                    [i for s_, e_ in zip(starts, ends) for i in range(s_, e_ - sp)],
-                    args.n_obs, replace=False))
-                Av = np.stack([acts[t:t + sp:stv] for t in ti]).astype(np.float32)
-                Av[..., :-1] = Av[..., :-1] / MAX_ACTION_Q[:-1]
-                Av[..., -1] = -Av[..., -1]
-                Av = np.clip(Av, -1.0, 1.0)
-                at = torch.from_numpy(Av).to(args.device)
-                sc = float(at.max() - at.min())
-                stv_ = build_state(zz, ti, args.quat_wxyz)
-                bb = build_batch(zz, ti, [tasks[0]] * len(ti), stv_, proc, args,
-                                 args.device)
-                _, _, ve, _ = model._build_vlm_inputs_embeds(
-                    input_ids=bb["input_ids"], inputs_embeds=None,
-                    pixel_values=bb.get("pixel_values"),
-                    pixel_attention_mask=bb.get("pixel_attention_mask"),
-                    image_hidden_states=None)
-                hist = None
-                for _ in range(nb):
-                    c = model._predict_next_block_logits(
-                        vlm_inputs_embeds=ve,
-                        attention_mask=bb.get("attention_mask"),
-                        history_tokens=hist).float().argmax(-1)
-                    hist = c if hist is None else torch.cat([hist, c], 1)
-                d = dec(to_levels(hist))
-                e = float(((d - at).abs()[..., :D_act - 1].flatten(1).amax(-1)
-                           / sc).median())
-                print(f"{stv:>5}{T * stv / 20.0:>17.1f}{e:>10.4f}")
-            print("\n(секунды посчитаны в предположении, что зарр записан на 20 Гц)")
-            return
 
-        if args.probe:
-            print("\n" + "=" * 60)
-            print("ПЕРЕБОР ФОРМАТА: ошибка генерации против датасетной")
-            print("=" * 60)
-            print(f"{'flip':>6}{'кроп':>7}{'склейка':>9}{'ошибка':>10}")
-            best = (1e9, None)
-            for fl in ("", "h", "w", "c", "hw", "hc", "wc", "hwc"):
-                for cr in (True, False):
-                    for ti in (True, False):
-                        args.flip, args.center_crop, args.tiled = fl, cr, ti
-                        bb = build_batch(zz, t_idx, tasks, st, proc, args,
-                                         args.device)
-                        _, _, ve, _ = model._build_vlm_inputs_embeds(
-                            input_ids=bb["input_ids"], inputs_embeds=None,
-                            pixel_values=bb.get("pixel_values"),
-                            pixel_attention_mask=bb.get("pixel_attention_mask"),
-                            image_hidden_states=None)
-                        h_, am = ve, bb.get("attention_mask")
-                        hist = None
-                        for _ in range(nb):
-                            lg = model._predict_next_block_logits(
-                                vlm_inputs_embeds=h_, attention_mask=am,
-                                history_tokens=hist).float()
-                            c = lg.argmax(-1)
-                            hist = c if hist is None else torch.cat([hist, c], 1)
-                        e = float(err(dec(to_levels(hist))).median())
-                        print(f"{fl or '-':>6}{str(cr):>7}{str(ti):>9}{e:>10.4f}")
-                        if e < best[0]:
-                            best = (e, (fl, cr, ti))
-            print(f"\nлучшее: flip={best[1][0] or '-'} кроп={best[1][1]} "
-                  f"склейка={best[1][2]}, ошибка {best[0]:.4f}")
-            print("Ниже 0.05 — формат найден. Около 0.19 у всех — дело не в\n"
-                  "формате, а в разрешении 128 против обучающих 256.")
-            return
 
         # ПОЧЕМУ НЕ АБСОЛЮТНЫЙ ПОРОГ. Расхождение стохастической политики с
         # КОНКРЕТНОЙ демонстрацией — не ошибка формата, а нормальный остаток
