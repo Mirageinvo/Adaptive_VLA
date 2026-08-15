@@ -469,6 +469,12 @@ def main() -> None:
         KEYS = ("base", "stale", "loc", "glob", "orc")
         rows = {m: {k: [] for k in KEYS} for m in ("local", "on-policy")}
         rows_w = {m: {k: [] for k in KEYS} for m in ("local", "on-policy")}
+        # ВЫДЕЛЕННЫЙ ЭФФЕКТ ПОДМЕНЫ: отклонение от НЕВОЗМУЩЁННОГО декодирования,
+        # как в K-1. Против датасетного действия эффект тонет: собственная
+        # ошибка клонирования ~0.069, а подмена одного кода из 16 позиций даёт
+        # ~0.001. Здесь ошибка модели сокращается и остаётся только сдвиг.
+        rows_d = {m: {k: [] for k in ("stale", "loc", "glob", "orc")}
+                  for m in ("local", "on-policy")}
         js = {m: [] for m in ("local", "on-policy")}      # расхождение логитов
         top1 = {m: [] for m in ("local", "on-policy")}    # доля смен top-1
         infl = torch.zeros(P, P)                          # влияние p -> q
@@ -517,15 +523,33 @@ def main() -> None:
                 glob = torch.stack([c0, c1n, c2n], -1)
                 orc = greedy_suffix(E, stale, h_true, pp, 0)
 
+                a_base = dec(codes)
                 for k, cc in (("base", codes), ("stale", stale), ("loc", loc),
                               ("glob", glob), ("orc", orc)):
                     a_ = dec(cc)
                     rows[mode][k].append(err(a_).cpu().numpy())
                     rows_w[mode][k].append(err(a_, args.exec_window).cpu().numpy())
+                    if k != "base":
+                        d_ = (a_ - a_base).abs()[..., :D_act - 1]
+                        rows_d[mode][k].append(
+                            (d_.flatten(1).amax(-1) / scale).cpu().numpy())
 
     # ---------- отчёт ----------
     def med(d):
         return {k: float(np.median(np.concatenate(v))) for k, v in d.items()}
+
+    print("\n" + "=" * 78)
+    print("ВЫДЕЛЕННЫЙ ЭФФЕКТ ПОДМЕНЫ (отклонение от невозмущённого декодирования)")
+    print("=" * 78)
+    print("Ошибка клонирования здесь сокращается: остаётся только сдвиг от правки.\n")
+    print(f"{'режим':>11}{'stale':>10}{'BAR лок.':>11}{'BAR глоб.':>12}"
+          f"{'оракул':>10}{'дост. ремонт':>15}{'R_BAR':>8}")
+    for mode in ("local", "on-policy"):
+        m = med(rows_d[mode])
+        gap = m["stale"] - m["orc"]
+        r = (m["stale"] - m["loc"]) / gap if abs(gap) > 1e-9 else float("nan")
+        print(f"{mode:>11}{m['stale']:>10.4f}{m['loc']:>11.4f}{m['glob']:>12.4f}"
+              f"{m['orc']:>10.4f}{gap:>15.4f}{r:>8.2f}")
 
     for tag, data, note in (("ВЕСЬ ЧАНК", rows, ""),
                             (f"ПЕРВЫЕ {args.exec_window} ШАГОВ", rows_w,
