@@ -206,6 +206,12 @@ def main() -> None:
     ap.add_argument("--flip", default="",
                     help="какие оси разворачивать: h (высота), w (ширина), "
                          "c (каналы); можно сочетать, например 'hc'")
+    ap.add_argument("--stride", type=int, default=1,
+                    help="шаг по кадрам при наборе чанка. Их обучение брало "
+                         "delta_timestamps [i/10 for i in range(20)] — шаг 0.1 с, "
+                         "то есть чанк на ДВЕ секунды. Если зарр 20 Гц, нужен 2")
+    ap.add_argument("--probe-stride", action="store_true",
+                    help="перебрать шаг 1..3 при найденном формате картинок")
     ap.add_argument("--probe", action="store_true",
                     help="перебрать формат картинок и напечатать ошибку "
                          "санитарной проверки для каждой комбинации")
@@ -256,7 +262,8 @@ def main() -> None:
     acts = np.asarray(zz["data"]["action"])
     ends = np.asarray(zz["meta"]["episode_ends"])
     starts = np.concatenate([[0], ends[:-1]])
-    cand = [i for s, e in zip(starts, ends) for i in range(s, e - T)]
+    span = T * args.stride                      # сколько кадров покрывает чанк
+    cand = [i for s, e in zip(starts, ends) for i in range(s, e - span)]
     t_idx = np.sort(np.random.default_rng(0).choice(cand, args.n_obs, replace=False))
 
     # Инструкция лежит прямо в данных — угадывать по task_uid не нужно.
@@ -275,7 +282,8 @@ def main() -> None:
     # поканальное деление на MAX_ACTION_Q, НЕГАЦИЯ захвата, обрезка в [-1,1].
     # Прежние замеры (K-1, K-2) шли на сырых действиях: каналы 3 и 4 там были
     # примерно впятеро мельче обучающих. Их надо переснять.
-    A = np.stack([acts[t:t + T] for t in t_idx]).astype(np.float32)
+    A = np.stack([acts[t:t + span:args.stride] for t in t_idx]).astype(np.float32)
+    assert A.shape[1] == T, f"чанк {A.shape[1]} шагов при шаге {args.stride}"
     A[..., :-1] = A[..., :-1] / MAX_ACTION_Q[:-1]
     A[..., -1] = -A[..., -1]
     A = np.clip(A, -1.0, 1.0)
@@ -360,6 +368,44 @@ def main() -> None:
 
         base = dec(codes)
         e_base = err(base)
+        if args.probe_stride:
+            print("\n" + "=" * 52)
+            print("ПЕРЕБОР ШАГА ПО КАДРАМ (формат картинок фиксирован)")
+            print("=" * 52)
+            print(f"{'шаг':>5}{'секунд в чанке':>17}{'ошибка':>10}")
+            for stv in (1, 2, 3, 4):
+                sp = T * stv
+                ti = np.sort(np.random.default_rng(0).choice(
+                    [i for s_, e_ in zip(starts, ends) for i in range(s_, e_ - sp)],
+                    args.n_obs, replace=False))
+                Av = np.stack([acts[t:t + sp:stv] for t in ti]).astype(np.float32)
+                Av[..., :-1] = Av[..., :-1] / MAX_ACTION_Q[:-1]
+                Av[..., -1] = -Av[..., -1]
+                Av = np.clip(Av, -1.0, 1.0)
+                at = torch.from_numpy(Av).to(args.device)
+                sc = float(at.max() - at.min())
+                stv_ = build_state(zz, ti, args.quat_wxyz)
+                bb = build_batch(zz, ti, [tasks[0]] * len(ti), stv_, proc, args,
+                                 args.device)
+                _, _, ve, _ = model._build_vlm_inputs_embeds(
+                    input_ids=bb["input_ids"], inputs_embeds=None,
+                    pixel_values=bb.get("pixel_values"),
+                    pixel_attention_mask=bb.get("pixel_attention_mask"),
+                    image_hidden_states=None)
+                hist = None
+                for _ in range(nb):
+                    c = model._predict_next_block_logits(
+                        vlm_inputs_embeds=ve,
+                        attention_mask=bb.get("attention_mask"),
+                        history_tokens=hist).float().argmax(-1)
+                    hist = c if hist is None else torch.cat([hist, c], 1)
+                d = dec(to_levels(hist))
+                e = float(((d - at).abs()[..., :D_act - 1].flatten(1).amax(-1)
+                           / sc).median())
+                print(f"{stv:>5}{T * stv / 20.0:>17.1f}{e:>10.4f}")
+            print("\n(секунды посчитаны в предположении, что зарр записан на 20 Гц)")
+            return
+
         if args.probe:
             print("\n" + "=" * 60)
             print("ПЕРЕБОР ФОРМАТА: ошибка генерации против датасетной")
