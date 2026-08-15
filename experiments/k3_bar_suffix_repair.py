@@ -272,8 +272,14 @@ def main() -> None:
 
     from smolvla.bar import SmolVLABlockwiseAR
 
+    # token_budget и num_blocks НАДО ПЕРЕДАВАТЬ ЯВНО: в config.json чекпойнта
+    # их нет, и from_pretrained берёт умолчания класса (4 блока по 4 = 16
+    # токенов), тогда как кодек даёт 48. В их config/eval/bar.yaml они
+    # задаются из конфига: token_budget = token_len, num_blocks = 3.
     model = SmolVLABlockwiseAR.from_pretrained(
-        args.ckpt, trust_remote_code=True, dtype=torch.bfloat16).to(args.device).eval()
+        args.ckpt, trust_remote_code=True, dtype=torch.bfloat16,
+        token_budget=P * L, num_blocks=L,
+        action_vocab_size=tok.vocab_size).to(args.device).eval()
     bs, nb = model.block_size, model.num_blocks
     assert bs * nb == P * L, (
         f"модель ждёт {bs}x{nb}={bs*nb} токенов, кодек даёт {P}x{L}={P*L}. "
