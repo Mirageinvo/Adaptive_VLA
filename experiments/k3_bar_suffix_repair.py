@@ -52,18 +52,6 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from k1_residual_cost import latent_from_codes, load_codec, projected_codebooks  # noqa: E402
 
-LIBERO10 = [
-    "put both the alphabet soup and the tomato sauce in the basket",
-    "put both the cream cheese box and the butter in the basket",
-    "turn on the stove and put the moka pot on it",
-    "put the black bowl in the bottom drawer of the cabinet and close it",
-    "put the white mug on the left plate and put the yellow and white mug on the right plate",
-    "pick up the book and place it in the back compartment of the caddy",
-    "put the white mug on the plate and put the chocolate pudding to the right of the plate",
-    "put both the alphabet soup and the cream cheese box in the basket",
-    "put both moka pots on the stove",
-    "put the yellow and white mug in the microwave and close it",
-]
 
 
 def js_div(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
@@ -227,7 +215,10 @@ def main() -> None:
     ap.add_argument("--n-pos", type=int, default=6, help="позиций p на наблюдение")
     ap.add_argument("--knn", type=int, default=16)
     ap.add_argument("--topk", type=int, default=4)
-    ap.add_argument("--exec-window", type=int, default=8)
+    ap.add_argument("--exec-window", type=int, default=8,
+                    help="сколько первых шагов чанка реально исполняется")
+    ap.add_argument("--stride", type=int, default=1,
+                    help="шаг по кадрам, только для --source zarr")
     ap.add_argument("--embodiment", type=int, default=0)
     ap.add_argument("--center-crop", action="store_true", default=True)
     ap.add_argument("--flip", default="",
@@ -390,9 +381,6 @@ def main() -> None:
             """(B, P*L) -> (B, P, L). Раскладка поуровневая, как в decode."""
             return flat_tok.reshape(-1, L, P).transpose(1, 2)
 
-        def to_flat(c):
-            return c.transpose(1, 2).reshape(len(c), -1)
-
         # ---------- обычная генерация BAR, блок за блоком ----------
         flat_gen = gen_from(None, nb)                 # (B, P*L)
         codes = to_levels(flat_gen)                   # (B, P, L)
@@ -430,63 +418,95 @@ def main() -> None:
             .reshape(B, L, P).transpose(1, 2))       # (B,P,L): раскладка поуровневая
 
         rng = torch.Generator(device=args.device).manual_seed(1)
-        rows = {m: {k: [] for k in ("stale", "loc", "glob", "orc", "base")}
-                for m in ("local", "on-policy")}
-        infl = torch.zeros(P, P)                      # матрица влияния p -> q
+        KEYS = ("base", "stale", "loc", "glob", "orc")
+        rows = {m: {k: [] for k in KEYS} for m in ("local", "on-policy")}
+        rows_w = {m: {k: [] for k in KEYS} for m in ("local", "on-policy")}
+        js = {m: [] for m in ("local", "on-policy")}      # расхождение логитов
+        top1 = {m: [] for m in ("local", "on-policy")}    # доля смен top-1
+        infl = torch.zeros(P, P)                          # влияние p -> q
         n_infl = 0
 
-        lg0 = blk(None)                               # coarse-логиты
+        lg0 = blk(None)                                   # coarse-логиты
+        lg1_base = blk(codes[:, :, 0])                    # логиты уровня 1 как есть
+        p1_base = lg1_base.softmax(-1)
+
         for mode in ("local", "on-policy"):
             for _ in range(args.n_pos):
-                p = int(torch.randint(P, (1,), generator=rng, device=args.device))
-                cur = codes[:, p, 0]
+                pp = int(torch.randint(P, (1,), generator=rng, device=args.device))
+                cur = codes[:, pp, 0]
+                ar = torch.arange(B, device=args.device)
                 if mode == "local":
-                    d = torch.cdist(E[0][cur], E[0])
-                    nb = d.topk(args.knn + 1, largest=False).indices[:, 1:]
-                    v = nb[torch.arange(B, device=args.device),
-                           torch.randint(args.knn, (B,), generator=rng,
-                                         device=args.device)]
+                    # сосед в словаре: как в K-1
+                    nbr = torch.cdist(E[0][cur], E[0]).topk(
+                        args.knn + 1, largest=False).indices[:, 1:]
+                    v = nbr[ar, torch.randint(args.knn, (B,), generator=rng,
+                                              device=args.device)]
                 else:
-                    tk = lg0[:, p].topk(args.topk + 1, -1).indices[:, 1:]
-                    v = tk[torch.arange(B, device=args.device),
-                           torch.randint(args.topk, (B,), generator=rng,
-                                         device=args.device)]
+                    # альтернатива из собственных top-k логитов модели
+                    tk = lg0[:, pp].topk(args.topk + 1, -1).indices[:, 1:]
+                    v = tk[ar, torch.randint(args.topk, (B,), generator=rng,
+                                             device=args.device)]
 
                 c0 = codes[:, :, 0].clone()
-                c0[:, p] = v
-                # BAR достраивает ВСЕ оставшиеся блоки при новом уровне 0
-                rest = gen_from(c0, nb - bpl)
-                cn = to_levels(rest)
-                c1n, c2n = cn[:, :, 1], cn[:, :, 2]
+                c0[:, pp] = v
 
-                # влияние: где сменился top-1 первого fine-уровня
-                infl[p] += (c1n != codes[:, :, 1]).float().mean(0).cpu()
+                # BAR пересчитывает уровни 1 и 2 при новом уровне 0
+                lg1n = blk(c0)
+                c1n = lg1n.argmax(-1)
+                c2n = to_levels(gen_from(torch.cat([c0, c1n], 1),
+                                         nb - 2 * bpl))[:, :, 2]
+
+                # насколько сместились распределения уровня 1 и где сменился top-1
+                js[mode].append(js_div(p1_base, lg1n.softmax(-1)).mean(0).cpu())
+                chg = (c1n != codes[:, :, 1]).float()
+                top1[mode].append(float(chg.mean()))
+                infl[pp] += chg.mean(0).cpu()
                 n_infl += 1
 
-                stale = codes.clone(); stale[:, p, 0] = v
-                loc = stale.clone(); loc[:, p, 1] = c1n[:, p]; loc[:, p, 2] = c2n[:, p]
+                stale = codes.clone(); stale[:, pp, 0] = v
+                loc = stale.clone()
+                loc[:, pp, 1], loc[:, pp, 2] = c1n[:, pp], c2n[:, pp]
                 glob = torch.stack([c0, c1n, c2n], -1)
-                orc = greedy_suffix(E, stale, h_true, p, 0)
+                orc = greedy_suffix(E, stale, h_true, pp, 0)
 
-                for k, cc in (("stale", stale), ("loc", loc), ("glob", glob),
-                              ("orc", orc), ("base", codes)):
-                    rows[mode][k].append(err(cc if k == "base" else cc).cpu().numpy()
-                                         if k == "base" else
-                                         err(dec(cc)).cpu().numpy())
+                for k, cc in (("base", codes), ("stale", stale), ("loc", loc),
+                              ("glob", glob), ("orc", orc)):
+                    a_ = dec(cc)
+                    rows[mode][k].append(err(a_).cpu().numpy())
+                    rows_w[mode][k].append(err(a_, args.exec_window).cpu().numpy())
 
     # ---------- отчёт ----------
-    print("\n" + "=" * 76)
-    print("РЕМОНТ СУФФИКСА: ОШИБКА ДЕЙСТВИЯ ОТНОСИТЕЛЬНО ДАТАСЕТНОГО")
-    print("=" * 76)
-    print(f"{'режим':>12}{'база':>9}{'stale':>9}{'BAR лок.':>10}{'BAR глоб.':>11}"
-          f"{'оракул':>9}{'дост. ремонт':>14}{'R_BAR':>8}")
+    def med(d):
+        return {k: float(np.median(np.concatenate(v))) for k, v in d.items()}
+
+    for tag, data, note in (("ВЕСЬ ЧАНК", rows, ""),
+                            (f"ПЕРВЫЕ {args.exec_window} ШАГОВ", rows_w,
+                             " (только они и исполняются до перепланирования)")):
+        print("\n" + "=" * 78)
+        print(f"РЕМОНТ СУФФИКСА, {tag}{note}")
+        print("=" * 78)
+        print(f"{'режим':>11}{'база':>9}{'stale':>9}{'BAR лок.':>10}"
+              f"{'BAR глоб.':>11}{'оракул':>9}{'дост. ремонт':>14}{'R_BAR':>8}")
+        for mode in ("local", "on-policy"):
+            m = med(data[mode])
+            gap = m["stale"] - m["orc"]
+            r = (m["stale"] - m["loc"]) / gap if abs(gap) > 1e-9 else float("nan")
+            print(f"{mode:>11}{m['base']:>9.4f}{m['stale']:>9.4f}{m['loc']:>10.4f}"
+                  f"{m['glob']:>11.4f}{m['orc']:>9.4f}{gap:>14.4f}{r:>8.2f}")
+
+    print("\n" + "=" * 78)
+    print("ЧУВСТВИТЕЛЬНОСТЬ УРОВНЯ 1 К ПОДМЕНЕ КОДА УРОВНЯ 0")
+    print("=" * 78)
+    print(f"{'режим':>11}{'JS, бит':>10}{'JS в позиции p':>16}{'смен top-1':>13}")
     for mode in ("local", "on-policy"):
-        m = {k: float(np.median(np.concatenate(v))) for k, v in rows[mode].items()}
-        gap = m["stale"] - m["orc"]
-        r = (m["stale"] - m["loc"]) / gap if abs(gap) > 1e-9 else float("nan")
-        print(f"{mode:>12}{float(np.median(np.concatenate(rows[mode]['base']))):>9.4f}"
-              f"{m['stale']:>9.4f}{m['loc']:>10.4f}{m['glob']:>11.4f}{m['orc']:>9.4f}"
-              f"{gap:>14.4f}{r:>8.2f}")
+        J = torch.stack(js[mode])                 # (n_pos, P)
+        print(f"{mode:>11}{float(J.mean()):>10.4f}{float(J.max()):>16.4f}"
+              f"{float(np.mean(top1[mode])):>12.1%}")
+    print("""
+JS считается между распределениями уровня 1 до и после подмены. Малая величина
+означает, что BAR почти не смотрит на грубый код и предсказывает тонкие прямо
+из наблюдения — тогда устаревший суффикс и не был проблемой, а не то что
+механизм нужен.""")
 
     print("\n" + "=" * 76)
     print("МАТРИЦА ВЛИЯНИЯ: доля смен top-1 на уровне 1 в позиции q после правки p")
