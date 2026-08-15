@@ -222,7 +222,9 @@ def main() -> None:
                          "и первая компонента 0.9988 в зарре — это x, а не w")
     ap.add_argument("--tiled", action="store_true", default=True,
                     help="склеить два вида в одну картинку, как при обучении")
-    ap.add_argument("--sanity-max", type=float, default=0.15)
+    ap.add_argument("--sanity-ratio", type=float, default=0.7,
+                    help="генерация должна быть лучше лучшей тривиальной базы "
+                         "хотя бы в 1/ratio раз")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
 
@@ -441,11 +443,28 @@ def main() -> None:
                   "формате, а в разрешении 128 против обучающих 256.")
             return
 
-        print(f"САНИТАРНАЯ ПРОВЕРКА — |ошибка| генерации против датасетной: "
-              f"медиана {float(e_base.median()):.4f} размаха")
-        assert float(e_base.median()) < args.sanity_max, (
-            "формат наблюдений не совпал с обучающим: проверить порядок каналов "
-            "(--bgr), кроп (--center-crop), разрешение и текст инструкции")
+        # ПОЧЕМУ НЕ АБСОЛЮТНЫЙ ПОРОГ. Расхождение стохастической политики с
+        # КОНКРЕТНОЙ демонстрацией — не ошибка формата, а нормальный остаток
+        # клонирования: валидных продолжений много, сравниваем с одним. Поэтому
+        # критерий — бьёт ли модель тривиальные базы. Если наблюдения поданы
+        # неверно, предсказание не будет лучше нулевого.
+        zero = torch.zeros_like(a_true)
+        zero[..., -1] = a_true[..., -1]              # захват оставляем истинный
+        mean = a_true.mean(0, keepdim=True).expand_as(a_true)
+        prev = torch.cat([a_true[:, :1], a_true[:, :-1]], 1)   # удержание
+        e_zero, e_mean, e_prev = err(zero), err(mean), err(prev)
+        m = float(e_base.median())
+        print("\nСАНИТАРНАЯ ПРОВЕРКА, медианы ошибки против датасетного действия:")
+        print(f"  генерация BAR      {m:.4f}")
+        print(f"  нулевое действие   {float(e_zero.median()):.4f}")
+        print(f"  среднее по выборке {float(e_mean.median()):.4f}")
+        print(f"  удержание прошлого {float(e_prev.median()):.4f}")
+        best_base = min(float(e_zero.median()), float(e_mean.median()),
+                        float(e_prev.median()))
+        print(f"  модель лучше лучшей базы в {best_base / max(m, 1e-9):.2f} раза")
+        assert m < best_base * args.sanity_ratio, (
+            "модель не бьёт тривиальную базу — наблюдения поданы неверно. "
+            "Перебрать формат: --probe")
 
         h_true = latent_from_codes(E, torch.stack(
             [torch.as_tensor(np.asarray(tok.encode(a_true, embodiment_ids=args.embodiment)),
