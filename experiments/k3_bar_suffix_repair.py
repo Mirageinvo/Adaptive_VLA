@@ -309,10 +309,22 @@ def main() -> None:
             d = d[:, :win]
         return (d[..., :D_act - 1].flatten(1).amax(-1) / scale)
 
+    # Эмбеддинги VLM (текст + картинки) считаются ОДИН раз: от истории токенов
+    # действия они не зависят, а стоят дорого. Процессор отдаёт input_ids и
+    # pixel_values, эмбеддинги строит сама модель.
+    with torch.no_grad():
+        _, _, VLM_EMB, _ = model._build_vlm_inputs_embeds(
+            input_ids=batch["input_ids"],
+            inputs_embeds=None,
+            pixel_values=batch.get("pixel_values"),
+            pixel_attention_mask=batch.get("pixel_attention_mask"),
+            image_hidden_states=None)
+    print(f"эмбеддинги VLM: {tuple(VLM_EMB.shape)}")
+
     def blk(hist):
         """Логиты следующего блока при заданной истории (B, k*P) или None."""
         return model._predict_next_block_logits(
-            vlm_inputs_embeds=batch.get("inputs_embeds"),
+            vlm_inputs_embeds=VLM_EMB,
             attention_mask=batch.get("attention_mask"),
             history_tokens=hist).float()
 
