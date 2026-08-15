@@ -117,32 +117,69 @@ def quat2axisangle(q):
     return np.where(small[..., None], np.zeros_like(q[..., :3]), out)
 
 
-def load_lerobot(n_obs: int, T: int, seed: int = 0):
-    """Родной обучающий датасет BAR: physical-intelligence/libero в формате
-    LeRobot. Берём ровно так же, как их LiberoAllDataset (scripts/utils.py:205):
-    delta_timestamps = [i/10 for i in range(T)].
+def load_lerobot(n_obs: int, T: int, n_ep: int = 8, seed: int = 0):
+    """Родной обучающий датасет BAR — physical-intelligence/libero, ветка v2.0.
 
-    Зачем вместо зарра OAT: там картинки 128x128, а обучение шло на 256, и
-    подбор формата упёрся в ошибку 0.137 при переборе всех комбинаций
-    разворотов и кропов. Родной источник снимает разом разрешение, ориентацию,
-    порядок каналов и состав состояния."""
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    Читаем parquet НАПРЯМУЮ, без библиотеки lerobot: она версии 0.4.4 требует
+    формат новее v2.0 и отказывается открывать датасет (BackwardCompatibility-
+    Error). Формат при этом простой, и прямое чтение полностью под контролем.
 
-    ds = LeRobotDataset("physical-intelligence/libero",
-                        delta_timestamps={"actions": [i / 10 for i in range(T)]})
-    print(f"LeRobot: эпизодов {ds.num_episodes}, кадров {ds.num_frames}")
-    idx = np.sort(np.random.default_rng(seed).choice(len(ds), n_obs, replace=False))
-    items = [ds[int(i)] for i in idx]
-    k0 = items[0]
-    print("поля образца: " + ", ".join(
-        f"{k}{tuple(v.shape)}" if hasattr(v, "shape") else f"{k}<{type(v).__name__}>"
-        for k, v in k0.items()))
-    im1 = torch.stack([(it["image"] * 255).to(torch.uint8) for it in items])
-    im2 = torch.stack([(it["wrist_image"] * 255).to(torch.uint8) for it in items])
-    act = torch.stack([torch.as_tensor(it["actions"]) for it in items]).float()
-    st = torch.stack([torch.as_tensor(it["state"]) for it in items]).float()
-    tasks = [it["task"] for it in items]
-    return im1, im2, st.numpy(), act.numpy(), tasks
+    Из meta/info.json: 1693 эпизода, 273465 кадров, fps 10, картинки 256x256
+    закодированными байтами прямо в parquet (видео нет), состояние 8-мерное —
+    ровно под константы STATE_Q99/Q01, без process_state.
+
+    Обучение брало delta_timestamps [i/10 for i in range(20)] при fps 10, то
+    есть ДВАДЦАТЬ ПОДРЯД идущих кадров.
+    """
+    import io
+    import json
+
+    import pyarrow.parquet as pq
+    from huggingface_hub import hf_hub_download
+    from PIL import Image
+
+    rid, rev = "physical-intelligence/libero", "v2.0"
+    tasks_map = {}
+    for line in open(hf_hub_download(rid, "meta/tasks.jsonl", repo_type="dataset",
+                                     revision=rev)):
+        d = json.loads(line)
+        tasks_map[d["task_index"]] = d["task"]
+
+    rng = np.random.default_rng(seed)
+    eps = rng.choice(1693, size=min(n_ep, n_obs), replace=False)
+    per_ep = int(np.ceil(n_obs / len(eps)))
+    im1, im2, st, act, tasks = [], [], [], [], []
+
+    def png(cell):
+        return np.asarray(Image.open(io.BytesIO(cell["bytes"])).convert("RGB"))
+
+    for e in eps:
+        f = hf_hub_download(rid, f"data/chunk-{e // 1000:03d}/episode_{e:06d}.parquet",
+                            repo_type="dataset", revision=rev)
+        t = pq.read_table(f)
+        n = t.num_rows
+        if n <= T:
+            continue
+        starts = rng.choice(n - T, size=min(per_ep, n - T), replace=False)
+        A_ = np.asarray(t.column("actions").to_pylist(), np.float32)
+        S_ = np.asarray(t.column("state").to_pylist(), np.float32)
+        ti = t.column("task_index").to_pylist()
+        c1, c2 = t.column("image").to_pylist(), t.column("wrist_image").to_pylist()
+        for s0 in starts:
+            im1.append(png(c1[s0]))
+            im2.append(png(c2[s0]))
+            st.append(S_[s0])
+            act.append(A_[s0:s0 + T])
+            tasks.append(tasks_map[ti[s0]])
+        if len(tasks) >= n_obs:
+            break
+
+    k = min(n_obs, len(tasks))
+    print(f"LeRobot v2.0: {len(eps)} эпизодов, {k} наблюдений, "
+          f"картинки {im1[0].shape}")
+    to_t = lambda a: torch.from_numpy(np.stack(a[:k])).permute(0, 3, 1, 2)  # noqa: E731
+    return (to_t(im1), to_t(im2), np.stack(st[:k]), np.stack(act[:k]),
+            tasks[:k])
 
 
 def build_state(z, t_idx, quat_wxyz: bool):
