@@ -117,7 +117,7 @@ def quat2axisangle(q):
     return np.where(small[..., None], np.zeros_like(q[..., :3]), out)
 
 
-def load_lerobot(n_obs: int, T: int, n_ep: int = 8, seed: int = 0):
+def load_lerobot(n_obs: int, T: int, n_ep: int = 24, seed: int = 0):
     """Родной обучающий датасет BAR — physical-intelligence/libero, ветка v2.0.
 
     Читаем parquet НАПРЯМУЮ, без библиотеки lerobot: она версии 0.4.4 требует
@@ -146,9 +146,11 @@ def load_lerobot(n_obs: int, T: int, n_ep: int = 8, seed: int = 0):
         tasks_map[d["task_index"]] = d["task"]
 
     rng = np.random.default_rng(seed)
+    # Эпизодов берём много: замеры внутри эпизода сильно коррелированы, и
+    # кластерный бутстрап по ним требует достаточного числа кластеров.
     eps = rng.choice(1693, size=min(n_ep, n_obs), replace=False)
     per_ep = int(np.ceil(n_obs / len(eps)))
-    im1, im2, st, act, prev, tasks = [], [], [], [], [], []
+    im1, im2, st, act, prev, tasks, epi = [], [], [], [], [], [], []
 
     def png(cell):
         return np.asarray(Image.open(io.BytesIO(cell["bytes"])).convert("RGB"))
@@ -172,6 +174,7 @@ def load_lerobot(n_obs: int, T: int, n_ep: int = 8, seed: int = 0):
             act.append(A_[s0:s0 + T])
             prev.append(A_[max(s0 - 1, 0)])      # действие ДО чанка, для базы
             tasks.append(tasks_map[ti[s0]])
+            epi.append(int(e))                   # кластер для бутстрапа
         if len(tasks) >= n_obs:
             break
 
@@ -179,8 +182,9 @@ def load_lerobot(n_obs: int, T: int, n_ep: int = 8, seed: int = 0):
     print(f"LeRobot v2.0: {len(eps)} эпизодов, {k} наблюдений, "
           f"картинки {im1[0].shape}")
     to_t = lambda a: torch.from_numpy(np.stack(a[:k])).permute(0, 3, 1, 2)  # noqa: E731
+    print(f"  эпизодов в выборке: {len(set(epi[:k]))}")
     return (to_t(im1), to_t(im2), np.stack(st[:k]), np.stack(act[:k]),
-            np.stack(prev[:k]), tasks[:k])
+            np.stack(prev[:k]), tasks[:k], np.array(epi[:k]))
 
 
 def build_state(z, t_idx, quat_wxyz: bool):
@@ -307,7 +311,7 @@ def main() -> None:
     E = projected_codebooks(tok, args.device)
 
     if args.source == "lerobot":
-        IM1, IM2, ST_RAW, A, PREV, tasks = load_lerobot(args.n_obs, T)
+        IM1, IM2, ST_RAW, A, PREV, tasks, EPI = load_lerobot(args.n_obs, T)
         zz = t_idx = None
     else:
         zz = zarr.open(os.path.abspath(args.zarr), mode="r")
@@ -324,6 +328,7 @@ def main() -> None:
                  for v in raw.ravel()]
         A = np.stack([acts[t:t + span:args.stride] for t in t_idx]).astype(np.float32)
         ST_RAW = PREV = None
+        EPI = np.zeros(args.n_obs, int)
         IM1 = torch.from_numpy(np.stack(
             [np.asarray(zz["data"]["agentview_rgb"][t]) for t in t_idx])
         ).permute(0, 3, 1, 2)
@@ -538,18 +543,45 @@ def main() -> None:
     def med(d):
         return {k: float(np.median(np.concatenate(v))) for k, v in d.items()}
 
+    def boot_ci(d, n_boot=400, seed=0):
+        """Кластерный бутстрап ПО ЭПИЗОДАМ: наблюдения внутри эпизода сильно
+        коррелированы, и бутстрап по строкам дал бы неправдоподобно узкий
+        интервал. Возвращает интервалы для доступного ремонта и R_BAR."""
+        rg = np.random.default_rng(seed)
+        M = {k: np.stack(v) for k, v in d.items()}      # (n_pos, B)
+        eps_u = np.unique(EPI)
+        gaps, rs = [], []
+        for _ in range(n_boot):
+            pick = np.concatenate([np.where(EPI == e)[0] for e in
+                                   rg.choice(eps_u, len(eps_u), replace=True)])
+            g = {k: float(np.median(v[:, pick])) for k, v in M.items()}
+            gap = g["stale"] - g["orc"]
+            gaps.append(gap)
+            if abs(gap) > 1e-9:
+                rs.append((g["stale"] - g["loc"]) / gap)
+        q = lambda a: (np.percentile(a, 2.5), np.percentile(a, 97.5))  # noqa: E731
+        return q(gaps), (q(rs) if len(rs) > n_boot // 2 else (float("nan"),) * 2)
+
     print("\n" + "=" * 78)
     print("ВЫДЕЛЕННЫЙ ЭФФЕКТ ПОДМЕНЫ (отклонение от невозмущённого декодирования)")
     print("=" * 78)
     print("Ошибка клонирования здесь сокращается: остаётся только сдвиг от правки.\n")
-    print(f"{'режим':>11}{'stale':>10}{'BAR лок.':>11}{'BAR глоб.':>12}"
-          f"{'оракул':>10}{'дост. ремонт':>15}{'R_BAR':>8}")
+    print(f"{'режим':>11}{'stale':>9}{'BAR лок.':>10}{'BAR глоб.':>11}"
+          f"{'оракул':>9}{'дост. ремонт':>14}{'95% ДИ':>18}"
+          f"{'R_BAR':>8}{'95% ДИ':>18}")
     for mode in ("local", "on-policy"):
         m = med(rows_d[mode])
         gap = m["stale"] - m["orc"]
         r = (m["stale"] - m["loc"]) / gap if abs(gap) > 1e-9 else float("nan")
-        print(f"{mode:>11}{m['stale']:>10.4f}{m['loc']:>11.4f}{m['glob']:>12.4f}"
-              f"{m['orc']:>10.4f}{gap:>15.4f}{r:>8.2f}")
+        cg, cr = boot_ci(rows_d[mode])
+        print(f"{mode:>11}{m['stale']:>9.4f}{m['loc']:>10.4f}{m['glob']:>11.4f}"
+              f"{m['orc']:>9.4f}{gap:>14.4f}"
+              f"{f'[{cg[0]:+.4f}, {cg[1]:+.4f}]':>18}{r:>8.2f}"
+              f"{f'[{cr[0]:+.2f}, {cr[1]:+.2f}]':>18}")
+    print("""
+Интервалы кластерные ПО ЭПИЗОДАМ. Если ДИ доступного ремонта накрывает ноль,
+чинить нечего и R_BAR смысла не имеет. Если ДИ R_BAR шире, чем расстояние
+между порогами 0.3 и 0.7, решения принимать нельзя — нужна выборка крупнее.""")
 
     for tag, data, note in (("ВЕСЬ ЧАНК", rows, ""),
                             (f"ПЕРВЫЕ {args.exec_window} ШАГОВ", rows_w,
