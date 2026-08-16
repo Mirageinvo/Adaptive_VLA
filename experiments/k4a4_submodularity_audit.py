@@ -295,9 +295,18 @@ def analyze(G, chg, epi, pos, task, floor_om, P, args, dh=None) -> None:
         print(f"  доля троек top-4-по-выигрышу, попавших и в top-4-по-||dh||: "
               f"{ov:.1%}")
 
-    print("\nВЕЛИЧИНА НАРУШЕНИЯ (только нарушения, в долях одиночного выигрыша)")
+    # НОРМИРОВКА ПОЭКЗЕМПЛЯРНАЯ. Делить процентиль объединённой по всем
+    # вмешательствам величины на ГЛОБАЛЬНОЕ среднее нельзя: полученное число не
+    # относится ни к какому конкретному вмешательству. Нормируем каждое
+    # нарушение на СВОЙ g1_i, а строки с вырожденным g1_i исключаем и считаем
+    # отдельно.
+    ok_g1 = g1 > tau
+    print("\nВЕЛИЧИНА НАРУШЕНИЯ (нормировка на СВОЙ g1_i каждого вмешательства)")
+    print(f"  исключено вмешательств с вырожденным g1: "
+          f"{(~ok_g1).sum()} из {n_rows}")
+    rel = np.abs(om) / np.maximum(g1[:, None], 1e-30)
     for nm, msk in (("содержательные", nz), ("пары из top-4", hi)):
-        v = np.abs(om[viol & msk]) / g1m
+        v = rel[viol & msk & ok_g1[:, None]]
         if v.size:
             print(f"  {nm:>38}: медиана {np.median(v):.2%}, "
                   f"90-й {np.percentile(v, 90):.2%}, "
@@ -325,15 +334,26 @@ def analyze(G, chg, epi, pos, task, floor_om, P, args, dh=None) -> None:
     n2 = (mviol & ins_m).sum(1).astype(np.float64)
     pt2, lo2, hi2 = cluster_ci(n2, ins_m.sum(1).astype(np.float64), epi)
     print(f"  строго (A внутри support):   {pt2:.2%} [{lo2:.2%}, {hi2:.2%}]")
-    dmg = np.abs(mo[mviol & mnz])
-    if dmg.size:
-        print(f"  ВЕЛИЧИНА УЩЕРБА, в долях одиночного выигрыша: "
-              f"медиана {np.median(dmg) / g1m:.2%}, "
-              f"90-й {np.percentile(dmg, 90) / g1m:.2%}, "
-              f"99-й {np.percentile(dmg, 99) / g1m:.2%}")
-        print(f"  то же в долях полного доступного разрыва: "
-              f"медиана {np.median(dmg) / gbm:.2%}, "
-              f"99-й {np.percentile(dmg, 99) / gbm:.2%}")
+    # УЩЕРБ — тоже поэкземплярно: |M_i(A,q)| / G_i*, где G_i* — лучший
+    # доступный выигрыш ТОГО ЖЕ вмешательства. Вырожденные G_i* исключаются.
+    ok_gb = gbest > tau
+    sel = mviol & mnz & ok_gb[:, None]
+    if sel.any():
+        d_g1 = (np.abs(mo) / np.maximum(g1[:, None], 1e-30))[
+            mviol & mnz & ok_g1[:, None]]
+        d_gb = (np.abs(mo) / np.maximum(gbest[:, None], 1e-30))[sel]
+        print(f"  исключено вмешательств с вырожденным G*: "
+              f"{(~ok_gb).sum()} из {n_rows}")
+        print(f"  УЩЕРБ / свой одиночный выигрыш g1_i: "
+              f"медиана {np.median(d_g1):.2%}, "
+              f"90-й {np.percentile(d_g1, 90):.2%}, "
+              f"99-й {np.percentile(d_g1, 99):.2%}")
+        print(f"  УЩЕРБ / свой полный доступный выигрыш G_i*: "
+              f"медиана {np.median(d_gb):.2%}, "
+              f"90-й {np.percentile(d_gb, 90):.2%}, "
+              f"99-й {np.percentile(d_gb, 99):.2%}")
+        print(f"  доля нарушений, съедающих >50% своего G_i*: "
+              f"{(d_gb > 0.5).mean():.2%}; >100%: {(d_gb > 1.0).mean():.2%}")
 
     print("\nДОЛЯ НАРУШЕНИЙ ПО РАЗМЕРУ A (только содержательные тройки)")
     print(f"  {'|A|':>5}{'содержательные':>18}{'строго':>12}{'троек':>12}")
@@ -458,7 +478,9 @@ def main() -> None:
     ap.add_argument("--n-ep", type=int, default=48)
     ap.add_argument("--max-pos", type=int, default=0)
     ap.add_argument("--set-block", type=int, default=32)
-    ap.add_argument("--tau-rel", type=float, default=1e-3)
+    ap.add_argument("--tau-rel", type=float, default=None,
+                    help="порог в долях g1; при --from-npz по умолчанию "
+                         "берётся СОХРАНЁННОЕ значение, а не 1e-3")
     ap.add_argument("--rank-lo", type=int, default=1)
     ap.add_argument("--rank-hi", type=int, default=5)
     ap.add_argument("--pos-offset", type=int, default=3)
@@ -469,7 +491,8 @@ def main() -> None:
     ap.add_argument("--tiled", action="store_true", default=True)
     ap.add_argument("--source", default="lerobot")
     ap.add_argument("--flip", default="")
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="сид И выборки данных, И расписания рангов")
     ap.add_argument("--dump", default="logs/k4a4_submodularity.npz")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
@@ -478,8 +501,15 @@ def main() -> None:
 
     if args.from_npz:
         d = np.load(args.from_npz, allow_pickle=True)
+        # порог берём из файла, если пользователь не задал свой явно: иначе
+        # пересчёт молча поехал бы на другом пороге
+        if args.tau_rel is None:
+            args.tau_rel = float(d["tau_rel"]) if "tau_rel" in d else 1e-3
+            src = "из файла"
+        else:
+            src = "задан явно"
         print(f"пересчёт из {args.from_npz}: commit {d['commit']}, "
-              f"seed {d['seed']}\n")
+              f"seed {d['seed']}, tau_rel {args.tau_rel:g} ({src})\n")
         analyze(d["G"], d["chg"], d["epi"], d["pos"],
                 d["task"] if "task" in d else None,
                 float(d["floor_om"]), int(d["P"]), args,
@@ -488,6 +518,8 @@ def main() -> None:
 
     if not args.ckpt:
         raise SystemExit("нужен --ckpt или --from-npz")
+    if args.tau_rel is None:
+        args.tau_rel = 1e-3
 
     import torch
 
@@ -601,7 +633,11 @@ def main() -> None:
                 len(blockS), -1).T.double()
         return Gt
 
-    rng = torch.Generator(device=args.device).manual_seed(1)
+    # Генератор рангов вмешательства ПРИВЯЗАН К СИДУ. Раньше здесь стояло
+    # manual_seed(1), из-за чего расписание рангов было тождественным у всех
+    # прогонов и различались только данные — то есть источники случайности не
+    # были независимыми, хотя отчёт называл прогоны «двумя сидами».
+    rng = torch.Generator(device=args.device).manual_seed(1000 + args.seed)
     ar = torch.arange(B, device=args.device)
     n_pos = args.max_pos or P
 
