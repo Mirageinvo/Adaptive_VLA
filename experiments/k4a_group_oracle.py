@@ -181,8 +181,9 @@ def main() -> None:
 
         res = {k: {K: [] for K in BUDGETS} for k in
                ("singleton", "greedy", "same", "js", "window", "random")}
-        es_all, inter_sum, inter_cnt = [], torch.zeros(P, P), 0
-        exact_g, exact_greedy = [], []
+        es_all, inter_cnt = [], 0
+        inter_sum, inter_abs, inter_raw = torch.zeros(P, P), torch.zeros(P, P), []
+        exact_g, exact_greedy, exact_base = [], [], []
         ex_pos = list(range(0, P, max(1, P // args.exact_pos)))[:args.exact_pos]
 
         for p_ in range(P):
@@ -265,10 +266,17 @@ def main() -> None:
             # ---------- C. парные взаимодействия ----------
             pairs = list(itertools.combinations(range(P), 2))
             gp = g_of(pairs)                              # (n_pairs, B)
+            # ВНИМАНИЕ. Среднее по батчу знаковой величины уничтожает
+            # разнознаковые взаимодействия: при |I| крупном среднее может выйти
+            # нулевым. Поэтому копим и знаковое, и модуль, и сырые значения.
             for idx, (q, r) in enumerate(pairs):
-                v = float((gp[idx] - singles[q] - singles[r]).mean())
+                w = (gp[idx] - singles[q] - singles[r])
+                v, va = float(w.mean()), float(w.abs().mean())
                 inter_sum[q, r] += v
                 inter_sum[r, q] += v
+                inter_abs[q, r] += va
+                inter_abs[r, q] += va
+                inter_raw.append(w.cpu().numpy())
             inter_cnt += 1
 
             # ---------- B. точный перебор на подвыборке ----------
@@ -291,6 +299,7 @@ def main() -> None:
                                           - ee).reshape(len(blockS), -1).max(0).values)
                 exact_g.append(best.cpu().numpy())
                 exact_greedy.append(greedy_gain[4][sub])
+                exact_base.append(est.cpu().numpy())   # ЗНАМЕНАТЕЛЬ ТЕХ ЖЕ строк
 
     es = np.concatenate(es_all)
     epi_rep = np.tile(EPI, P)
@@ -312,28 +321,42 @@ def main() -> None:
 
     if exact_g:
         eg, gg = np.concatenate(exact_g), np.concatenate(exact_greedy)
+        eb = np.concatenate(exact_base)
         print("\n" + "=" * 78)
         print(f"ТОЧНЫЙ ПЕРЕБОР ПОДМНОЖЕСТВ <= 4 (позиций {len(ex_pos)}, "
               f"наблюдений {min(args.exact_obs, B)})")
         print("=" * 78)
-        print(f"  точный оракул закрывает   {eg.sum() / es[:len(eg)].sum():.3f}")
-        print(f"  жадный послед. закрывает  {gg.sum() / es[:len(gg)].sum():.3f}")
+        print(f"  точный оракул закрывает   {eg.sum() / eb.sum():.3f}")
+        print(f"  жадный послед. закрывает  {gg.sum() / eb.sum():.3f}")
         print(f"  жадный сохраняет от точного {gg.sum() / max(eg.sum(), 1e-9):.1%}")
 
     M = (inter_sum / max(inter_cnt, 1)).numpy()
-    off = M[~np.eye(P, dtype=bool)]
+    Ma = (inter_abs / max(inter_cnt, 1)).numpy()
+    raw = np.concatenate(inter_raw)
+    msk = ~np.eye(P, dtype=bool)
     dist = np.abs(np.subtract.outer(np.arange(P), np.arange(P)))
-    near = M[(dist == 1)]
-    far = M[(dist >= 4) & ~np.eye(P, dtype=bool)]
+    # масштаб для сравнения: типичный одиночный выигрыш
+    g1 = np.concatenate(res["singleton"][1]).mean()
     print("\n" + "=" * 78)
     print("ПАРНЫЕ ВЗАИМОДЕЙСТВИЯ I(q,r) = G({q,r}) - G({q}) - G({r})")
     print("=" * 78)
-    print(f"  среднее по всем парам      {off.mean():+.5f}")
-    print(f"  соседние по времени (|q-r|=1) {near.mean():+.5f}")
-    print(f"  дальние (|q-r|>=4)         {far.mean():+.5f}")
-    print(f"  доля положительных          {(off > 0).mean():.1%}")
-    print(f"  верхний дециль / медиана    {np.percentile(off, 90):+.5f} / "
-          f"{np.median(off):+.5f}")
+    print(f"типичный ОДИНОЧНЫЙ выигрыш для масштаба: {g1:.5f}\n")
+    print(f"{'величина':>34}{'значение':>12}{'в долях выигрыша':>20}")
+    for nm, v in (("среднее знаковое, все пары", M[msk].mean()),
+                  ("среднее МОДУЛЯ, все пары", Ma[msk].mean()),
+                  ("модуль, соседние |q-r|=1", Ma[dist == 1].mean()),
+                  ("модуль, дальние |q-r|>=4", Ma[(dist >= 4) & msk].mean()),
+                  ("сырое: 90-й проц. модуля", np.percentile(np.abs(raw), 90)),
+                  ("сырое: 99-й проц. модуля", np.percentile(np.abs(raw), 99))):
+        print(f"{nm:>34}{v:>12.5f}{v / max(abs(g1), 1e-12):>19.1%}")
+    print(f"\n  доля положительных сырых значений: {(raw > 0).mean():.1%}")
+    print("""
+Сравнивать надо МОДУЛЬ с типичным одиночным выигрышем. Если модуль составляет
+единицы процентов — взаимодействия действительно малы, и превосходство жадного
+над одиночным объясняется не ими, а насыщением: после исправления главной
+позиции остаток мал, и предельные вклады прочих падают.
+Если модуль сопоставим с выигрышем — взаимодействия существенны, а знаковое
+среднее около нуля лишь означает, что они разнознаковые.""")
     print("""
 Положительное взаимодействие означает, что позиции полезнее обновлять вместе.
   сильные взаимодействия у СОСЕДНИХ по времени -> хватит фиксированных блоков;
