@@ -42,8 +42,9 @@ Delta положительна в 10.4-44.9% отдельных случаев. 
     tau = max(1e-8, 1e-3 * median(g1), 3 * измеренный численный пол),
 
 где пол — максимальное расхождение float32 с float64 на одиночных наборах.
-Плечо bfloat16 остаётся справочным: показывает, во что обошлось бы
-декодирование в половинной точности.
+Справочное плечо bfloat16 печатается, если получится: их декодер не переводится
+в половинную точность целиком (часть нормировок остаётся во float32), а чужой
+код мы не правим. На порог это не влияет — он считается по float64.
 
 Нарушением считается Omega < -tau.
 
@@ -334,10 +335,6 @@ def main() -> None:
         # расхождение bf16 показывает, что было бы без этой правки.
         tok64 = copy.deepcopy(tok).double().eval()
         E64 = projected_codebooks(tok64, args.device)
-        # у bf16-плеча должен быть СВОЙ модуль в bf16, иначе вход и веса
-        # разной точности и слой падает
-        tokbf = copy.deepcopy(tok).to(torch.bfloat16).eval()
-        Ebf = projected_codebooks(tokbf, args.device)
         u0 = lg0[:, 0].topk(args.rank_hi, -1).indices[
             ar, torch.randint(args.rank_lo, args.rank_hi, (B,),
                               generator=torch.Generator(device=args.device)
@@ -364,21 +361,33 @@ def main() -> None:
 
         g64 = singles_at(tok64, E64, torch.float64)
         g32 = singles_at(tok32, E, torch.float32)
-        gbf = singles_at(tokbf, Ebf, torch.bfloat16)
         gsc = float(g64.max(0).values.median())
         d32 = float((g32 - g64).abs().max())
-        dbf = float((gbf - g64).abs().max())
         floor32 = 3.0 * d32
         print(f"\nЧИСЛЕННЫЙ ПОЛ (масштаб: медианный лучший одиночный "
               f"{gsc:.3e})")
         print(f"  float32 против float64: макс. расхождение {d32:.3e} "
-              f"({d32 / max(gsc, 1e-30):.3%} одиночного выигрыша) <- рабочий путь")
-        print(f"  bfloat16 против float64: макс. расхождение {dbf:.3e} "
-              f"({dbf / max(gsc, 1e-30):.3%}) <- справочно, так НЕ считаем")
+              f"({d32 / max(gsc, 1e-30):.3%} одиночного выигрыша)")
         print(f"  пол порога 3*float32 = {floor32:.3e}")
         print(f"  порог из плана 1e-3*g1 = {1e-3 * gsc:.3e} -> "
-              f"{'его и берём' if 1e-3 * gsc >= floor32 else 'ниже пола, берём пол'}\n")
-        del tok64, E64, tokbf, Ebf, g64, g32, gbf
+              f"{'его и берём' if 1e-3 * gsc >= floor32 else 'ниже пола, берём пол'}")
+        # Плечо bfloat16 — справочное. Их декодер не переводится в половинную
+        # точность целиком (часть нормировок остаётся во float32 и слой падает),
+        # а чужой код мы не трогаем. Рабочий путь float32, и нужное для порога
+        # число даёт сравнение с float64 выше, поэтому неудача здесь не мешает.
+        try:
+            tokbf = copy.deepcopy(tok).to(torch.bfloat16).eval()
+            gbf = singles_at(tokbf, projected_codebooks(tokbf, args.device),
+                             torch.bfloat16)
+            dbf = float((gbf - g64).abs().max())
+            print(f"  справочно, bfloat16 против float64: {dbf:.3e} "
+                  f"({dbf / max(gsc, 1e-30):.3%})")
+            del tokbf, gbf
+        except RuntimeError as e:
+            print(f"  справочное плечо bfloat16 не считается: "
+                  f"{str(e).splitlines()[0]}")
+        print()
+        del tok64, E64, g64, g32
         torch.cuda.empty_cache()
 
         for p_ in range(n_pos):
