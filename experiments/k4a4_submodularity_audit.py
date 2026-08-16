@@ -1,68 +1,47 @@
 """K-4a4: прямой тест субмодулярности функции группового ремонта.
 
 ЗАЧЕМ. В фазе A измерено, что СРЕДНЕЕ Delta для трёх способов выбора
-отрицательно. Это утверждение про три конкретных набора, а не про функцию:
-Delta положительна в 10.4-44.9% отдельных случаев. Субмодулярность — условие на
-ВСЕ приращения, и его надо проверять прямо, иначе заявка «функция ремонта
-субмодулярна» ничем не обеспечена.
+отрицательно. Это утверждение про три конкретных набора, а не про функцию.
+Субмодулярность — условие на ВСЕ приращения, и его надо проверять прямо.
 
 ЧТО СЧИТАЕМ. В позициях набора S устаревшая латента заменяется опорной:
 
     e(S) = MSE(Dec(h_stale->S), a_ref),   G(S) = e(пусто) - e(S).
 
-Всё на КВАДРАТЕ ошибки, без корня: корень вогнут и сам порождает мнимую
-супераддитивность (см. LESSONS.md и самопроверку в k4a2_phase_a.py).
+Всё на КВАДРАТЕ ошибки: корень вогнут и сам порождает мнимую
+супераддитивность (см. LESSONS.md).
 
-Локальная убывающая отдача:
+    Omega(A; q, r) = G(A+q) + G(A+r) - G(A) - G(A+q+r) >= 0   (убывающая отдача)
+    M(A, q)        = G(A+q) - G(A)                            (монотонность)
 
-    Omega(A; q, r) = G(A+q) + G(A+r) - G(A) - G(A+q+r) >= 0.
+ВЫРОЖДЕННОСТЬ. Если позиция не изменилась, её латента совпадает с опорной
+ПОБИТОВО, поэтому G(A+q) = G(A) точно и Omega = 0 тождественно. Содержательны
+только тройки, где ОБЕ позиции q, r лежат в changed support. Все доли считаются
+по содержательным; деление на все тройки занижает результат примерно в десять
+раз. То же для монотонности (содержательна, если изменена q) и для СЛОЁВ по
+силе позиции: маска top-4 обязана пересекаться с маской содержательных, иначе
+при support меньше четырёх в слой попадают позиции с нулевым выигрышем и
+искусственно занижают долю нарушений примерно на четверть.
 
-Достаточно перебрать все A размера <= 2 и все пары q, r вне A: итоговый набор
-имеет размер <= 4. Это 12720 троек на пример.
+ПРО ГАРАНТИЮ ЖАДНОГО ОТБОРА. Величина gamma = [m(q|A)+m(r|A)] / m(qr|A)
+приводится только как ОПИСАТЕЛЬНАЯ локальная парная статистика. Это НЕ
+submodularity ratio из теорем Das & Kempe: тот определяется как минимум по
+допустимым парам множеств, а не потройно, и требует монотонности функции,
+которая здесь нарушается. Подстановка процентиля в 1 - exp(-gamma) гарантией
+не является и не вычисляется.
 
-Монотонность:
+ТОЧНОСТЬ. Пол измеряется НЕПОСРЕДСТВЕННО ДЛЯ Omega (разность четырёх величин),
+а не для одиночных выигрышей: у Omega он заведомо выше. Сравниваются полные
+таблицы G во float32 и float64 на отдельном вмешательстве.
 
-    M(A, q) = G(A+q) - G(A).
-
-Отрицательная M означает, что добавление позиции ухудшает результат — оракулу
-тогда нужно право отказа, а router нельзя учить «чем больше, тем лучше».
-
-ТОЧНОСТЬ ДЕКОДИРОВАНИЯ. Здесь она может решить исход, потому что решение
-принимается ПО КАЖДОЙ ТРОЙКЕ, а не по среднему: случайная ошибка округления в
-среднем гасится числом примеров, в пороговом счётчике — нет.
-
-Важное уточнение, найденное при первом запуске: кодек `proc.action_processor`
-грузится БЕЗ указания dtype, то есть во float32. Аргумент `dtype=torch.bfloat16`
-задаётся только BAR-модели и на путь декодирования не влияет. Оценка «шум
-округления ~4% одиночного выигрыша» относилась бы к bf16-кодеку и здесь
-неприменима; прежние замеры этим не затронуты.
-
-Порог всё равно берётся с измеренным полом, а не только по формуле из плана:
-
-    tau = max(1e-8, 1e-3 * median(g1), 3 * измеренный численный пол),
-
-где пол — максимальное расхождение float32 с float64 на одиночных наборах.
-Справочное плечо bfloat16 печатается, если получится: их декодер не переводится
-в половинную точность целиком (часть нормировок остаётся во float32), а чужой
-код мы не правим. На порог это не влияет — он считается по float64.
-
-Нарушением считается Omega < -tau.
-
-ПРАВИЛО ЧТЕНИЯ, зафиксировано до запуска:
-  доля массы нарушений <= 5% доступного выигрыша И крупные нарушения редки ->
-      разрешена формулировка «приближённая субмодулярность»;
-  иначе — только «наборы в среднем избыточны, но функция не субмодулярна».
-Провал НЕ закрывает active-set направление: он лишь запрещает строить новизну
-на субмодулярности.
-
-ПРО ОБЪЁМ. Полная таблица G(S) для всех вмешательств — 1536 x 2517 x 4 байта =
-15.5 ГБ. Поэтому статистика считается по каждому вмешательству на лету, а в NPZ
-кладётся подвыборка таблиц (--keep-tables) и поэкземплярные агрегаты, которых
-достаточно для кластерного бутстрапа.
+ОБЪЁМ. Таблица G для всех вмешательств — 1536 x 2517 x 4 байта = 15.5 МБ,
+поэтому сохраняется ЦЕЛИКОМ вместе с масками, эпизодами, позициями и порогами.
+Режим --from-npz пересчитывает всю статистику без модели и без кодека.
 
 Запуск:
     python3 experiments/k4a4_submodularity_audit.py \
         --ckpt ZibinDong/SmolVLM2-2.2B-ActionCodec-BAR-LIBERO
+    python3 experiments/k4a4_submodularity_audit.py --from-npz logs/k4a4.npz
 """
 
 import argparse
@@ -72,17 +51,10 @@ import subprocess
 import sys
 
 import numpy as np
-import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from k1_residual_cost import latent_from_codes, projected_codebooks  # noqa: E402
-from k3_bar_suffix_repair import (  # noqa: E402
-    MAX_ACTION_Q,
-    STATE_Q01,
-    STATE_Q99,
-    build_batch,
-    load_lerobot,
-)
+
+TAU_SWEEP = (1e-4, 1e-3, 1e-2)
 
 
 def build_sets(P: int, kmax: int = 4):
@@ -107,14 +79,14 @@ def build_triples(P: int, idx: dict, max_a: int = 2):
                 for x in A + (q, r):
                     m |= 1 << x
                 um.append(m)
-                qm.append((1 << q) | (1 << r))   # маска ТОЛЬКО пары
+                qm.append((1 << q) | (1 << r))
                 na.append(ka)
     return tuple(np.asarray(v) for v in (iA, iAq, iAr, iAqr, um, qm, na))
 
 
 def build_mono(P: int, idx: dict, max_a: int = 3):
     """Пары (A, q): |A| <= max_a, q вне A."""
-    iA, iAq, um, qm = [], [], [], []
+    iA, iAq, um, qm, na = [], [], [], [], []
     for ka in range(max_a + 1):
         for A in itertools.combinations(range(P), ka):
             for q in range(P):
@@ -126,46 +98,48 @@ def build_mono(P: int, idx: dict, max_a: int = 3):
                 for x in A + (q,):
                     m |= 1 << x
                 um.append(m)
-                qm.append(1 << q)                # маска ТОЛЬКО добавляемой
-    return tuple(np.asarray(v) for v in (iA, iAq, um, qm))
+                qm.append(1 << q)
+                na.append(ka)
+    return tuple(np.asarray(v) for v in (iA, iAq, um, qm, na))
 
 
 def selftest(P: int = 8) -> None:
-    """Проверка счётчика нарушений на функциях С ИЗВЕСТНЫМ ОТВЕТОМ.
+    """СТРОГАЯ проверка счётчика на функциях с АНАЛИТИЧЕСКИ известным ответом.
 
-    1. Модулярная (аддитивная) -> Omega тождественно ноль, нарушений нет.
-    2. Покрытие множеств -> субмодулярна по построению, нарушений нет.
-    3. Покрытие плюс супермодулярная надбавка на ОДНОЙ паре -> нарушения
-       обязаны найтись, и ровно на тройках, содержащих эту пару."""
+    Основа модулярная (никакой случайной функции покрытия — результат должен
+    быть детерминированным):
+
+      1. чисто модулярная               -> Omega = 0 всюду, нарушений 0;
+      2. модулярная минус парный штраф  -> Omega = c_qr >= 0, нарушений 0
+         (субмодулярна по построению);
+      3. модулярная плюс парный БОНУС b на паре {a,b} -> Omega = -b ровно на
+         тройках, где {q,r} = {a,b} и A не содержит ни a, ни b. Их число
+         равно 1 + (P-2) + C(P-2,2) — проверяется ТОЧНОЕ совпадение."""
     sets, idx = build_sets(P)
     iA, iAq, iAr, iAqr, _, _, _ = build_triples(P, idx)
-    rng = np.random.default_rng(0)
-
-    w = rng.gamma(1.0, 1.0, size=P)
+    w = np.arange(1, P + 1, dtype=float)          # детерминированные веса
     g_mod = np.array([w[list(S)].sum() if S else 0.0 for S in sets])
 
-    U = 40
-    cov = rng.random((P, U)) < 0.25
-    g_cov = np.array([cov[list(S)].any(0).sum() if S else 0 for S in sets],
-                     float)
+    def pairs_in(S):
+        return list(itertools.combinations(sorted(S), 2))
 
-    bonus, pair = 3.0, (2, 5)
-    g_sup = g_cov + np.array([bonus if set(pair) <= set(S) else 0.0
-                              for S in sets])
+    c = 0.3
+    g_sub = g_mod - np.array([c * len(pairs_in(S)) for S in sets])
+    a, b, bonus = 2, 5, 3.0
+    g_sup = g_mod + np.array([bonus if {a, b} <= set(S) else 0.0 for S in sets])
 
-    print("САМОПРОВЕРКА счётчика нарушений:")
-    for nm, g, expect in (("модулярная", g_mod, 0),
-                          ("покрытие (субмодулярна)", g_cov, 0),
-                          ("покрытие + бонус на паре", g_sup, None)):
+    exp_sup = 1 + (P - 2) + (P - 2) * (P - 3) // 2
+    print("САМОПРОВЕРКА счётчика (основа модулярная, ответ аналитический):")
+    for nm, g, exp in (("модулярная", g_mod, 0),
+                       ("модулярная - парный штраф", g_sub, 0),
+                       (f"модулярная + бонус на паре {a},{b}", g_sup, exp_sup)):
         om = g[iAq] + g[iAr] - g[iA] - g[iAqr]
         n = int((om < -1e-9).sum())
-        print(f"  {nm:>28}: нарушений {n}")
-        if expect == 0 and n:
-            raise SystemExit(f"самопроверка провалена: {nm} дала {n} нарушений")
-        if expect is None and n == 0:
-            raise SystemExit("самопроверка провалена: супермодулярную надбавку "
-                             "не заметили")
-    print("  счётчик отличает субмодулярную функцию от несубмодулярной\n")
+        ok = "ok" if n == exp else "ПРОВАЛ"
+        print(f"  {nm:>34}: нарушений {n:>4}, ожидалось {exp:>4}  {ok}")
+        if n != exp:
+            raise SystemExit(f"самопроверка провалена на «{nm}»")
+    print("  счётчик даёт ТОЧНО предсказанное число нарушений\n")
 
 
 def cluster_ci(num, den, epi, n_boot: int = 2000, seed: int = 0):
@@ -181,19 +155,229 @@ def cluster_ci(num, den, epi, n_boot: int = 2000, seed: int = 0):
     return pt, float(np.percentile(out, 2.5)), float(np.percentile(out, 97.5))
 
 
+# ----------------------------------------------------------------------------
+#                                  АНАЛИЗ
+# ----------------------------------------------------------------------------
+def analyze(G, chg, epi, pos, task, floor_om, P, args) -> None:
+    """Вся статистика считается ЗДЕСЬ, из сохранённой таблицы G.
+
+    Никакой модели и кодека не требуется, поэтому любые изменения масок,
+    порогов и слоёв пересчитываются мгновенно."""
+    sets, idx = build_sets(P)
+    tA, tAq, tAr, tAqr, t_um, qr_um, t_na = build_triples(P, idx)
+    mA, mAq, m_um, m_qm, m_na = build_mono(P, idx)
+    n_rows = G.shape[0]
+
+    g1 = G[:, 1:1 + P].max(1)                     # лучший одиночный
+    gbest = G.max(1)                              # полный доступный выигрыш
+    g1m, gbm = g1.mean(), gbest.mean()
+
+    # ПОРОГ. По вмешательству (все строки одной позиции делят медиану), но не
+    # ниже измеренного пола ИМЕННО ДЛЯ Omega.
+    tau = np.empty(n_rows)
+    for p_ in np.unique(pos):
+        m = pos == p_
+        tau[m] = max(1e-8, args.tau_rel * float(np.median(g1[m])), floor_om)
+
+    om = G[:, tAq] + G[:, tAr] - G[:, tA] - G[:, tAqr]
+    mo = G[:, mAq] - G[:, mA]
+    cm = chg[:, None]
+    nz = (qr_um[None, :] & ~cm) == 0              # содержательные тройки
+    inside = (t_um[None, :] & ~cm) == 0           # ещё и A внутри support
+    mnz = (m_qm[None, :] & ~cm) == 0              # содержательные пары
+
+    # СЛОИ ПО СИЛЕ. Маска top-4 ОБЯЗАНА пересекаться с nz: у неизменённой
+    # позиции одиночный выигрыш ровно ноль, поэтому при support меньше четырёх
+    # она попадает в top-4 и приносит тождественно нулевые тройки.
+    t4 = np.argsort(-G[:, 1:1 + P], 1)[:, :4]
+    top_m = np.zeros(n_rows, np.int64)
+    for j in range(4):
+        top_m |= (1 << t4[:, j].astype(np.int64))
+    hi = nz & ((qr_um[None, :] & ~top_m[:, None]) == 0)
+    hi_str = hi & inside
+    lo_m = nz & ~hi
+
+    tt = tau[:, None]
+    viol, mviol = om < -tt, mo < -tt
+
+    print("=" * 78)
+    print("K-4a4. ПРЯМОЙ ТЕСТ СУБМОДУЛЯРНОСТИ (всё на КВАДРАТЕ ошибки)")
+    print("=" * 78)
+    print(f"вмешательств {n_rows}, эпизодов {len(np.unique(epi))}, "
+          f"позиций {len(np.unique(pos))}, троек {om.shape[1]}, "
+          f"пар монотонности {mo.shape[1]}")
+    print(f"масштаб: лучший одиночный {g1m:.3e}, полный доступный {gbm:.3e}")
+    print(f"пол для Omega (float32 против float64) {floor_om:.3e}, "
+          f"порог tau в долях g1 {args.tau_rel:g}, "
+          f"медианный tau {np.median(tau):.3e}\n")
+
+    def rate(mask_num, mask_den, name, width=38):
+        n = (viol & mask_num).sum(1).astype(np.float64)
+        d = mask_den.sum(1).astype(np.float64)
+        pt, lo, hi_ = cluster_ci(n, d, epi)
+        print(f"  {name:>{width}} {pt:8.2%} [{lo:.2%}, {hi_:.2%}]"
+              f"   троек/вмеш. {d.mean():8.1f}")
+        return pt
+
+    print("ДОЛЯ НАРУШЕНИЙ СУБМОДУЛЯРНОСТИ")
+    r_all = rate(nz, nz, "содержательные (q,r изменены)")
+    r_str = rate(inside, inside, "строго (и A внутри support)")
+    r_hi = rate(hi, hi, "СОДЕРЖ. пары из top-4")
+    r_hs = rate(hi_str, hi_str, "СОДЕРЖ. top-4, строго (A внутри)")
+    r_lo = rate(lo_m, lo_m, "остальные содержательные")
+    print(f"  {'для сравнения, по ВСЕМ тройкам':>38} "
+          f"{(viol.sum() / viol.size):8.2%}   <- разбавлено нулями, "
+          f"содержательных {nz.mean():.2%}")
+
+    nhi = hi.sum(1)
+    print(f"\n  содержательных top-4 троек на вмешательство: "
+          f"среднее {nhi.mean():.1f}, медиана {np.median(nhi):.0f}, "
+          f"квартили {np.percentile(nhi, 25):.0f}/{np.percentile(nhi, 75):.0f}")
+    print(f"  вмешательств без единой содержательной top-4 тройки: "
+          f"{(nhi == 0).mean():.1%}")
+
+    print("\nЗНАК И ВЕЛИЧИНА Omega ПО СЛОЯМ (Omega > 0 = убывающая отдача)")
+    print(f"  {'слой':>38}{'средн. Om':>12}{'средн.|Om|':>12}{'|Om|/tau':>10}")
+    for nm, msk in (("все содержательные", nz), ("пары из top-4", hi),
+                    ("top-4, строго", hi_str), ("остальные содерж.", lo_m)):
+        n_ = np.maximum(msk.sum(1), 1)
+        mo_ = ((om * msk).sum(1) / n_).mean()
+        ao_ = ((np.abs(om) * msk).sum(1) / n_).mean()
+        # запас над ФАКТИЧЕСКИМ порогом, а не над приближением
+        rt = ((np.abs(om) * msk).sum(1) / n_ / tau).mean()
+        print(f"  {nm:>38}{mo_ / g1m:>+11.2%}{ao_ / g1m:>12.2%}{rt:>10.0f}")
+
+    print("\nВЕЛИЧИНА НАРУШЕНИЯ (только нарушения, в долях одиночного выигрыша)")
+    for nm, msk in (("содержательные", nz), ("пары из top-4", hi)):
+        v = np.abs(om[viol & msk]) / g1m
+        if v.size:
+            print(f"  {nm:>38}: медиана {np.median(v):.2%}, "
+                  f"90-й {np.percentile(v, 90):.2%}, "
+                  f"99-й {np.percentile(v, 99):.2%}, макс {v.max():.2%}")
+
+    print("\nСВИП ПОРОГА: доля нарушений при разных tau/g1")
+    print(f"  {'tau/g1':>10}{'содержательные':>18}{'top-4':>12}"
+          f"{'монотонность':>16}")
+    for tr in TAU_SWEEP:
+        t2 = np.empty(n_rows)
+        for p_ in np.unique(pos):
+            m = pos == p_
+            t2[m] = max(floor_om, tr * float(np.median(g1[m])))
+        v2, mv2 = om < -t2[:, None], mo < -t2[:, None]
+        print(f"  {tr:>10.0e}{(v2 & nz).sum() / max(nz.sum(), 1):>17.2%}"
+              f"{(v2 & hi).sum() / max(hi.sum(), 1):>12.2%}"
+              f"{(mv2 & mnz).sum() / max(mnz.sum(), 1):>16.2%}")
+
+    print("\nМОНОТОННОСТЬ")
+    n = (mviol & mnz).sum(1).astype(np.float64)
+    d = mnz.sum(1).astype(np.float64)
+    pt, lo, hi_ = cluster_ci(n, d, epi)
+    print(f"  доля нарушений (q изменена): {pt:.2%} [{lo:.2%}, {hi_:.2%}]")
+    ins_m = (m_um[None, :] & ~cm) == 0
+    n2 = (mviol & ins_m).sum(1).astype(np.float64)
+    pt2, lo2, hi2 = cluster_ci(n2, ins_m.sum(1).astype(np.float64), epi)
+    print(f"  строго (A внутри support):   {pt2:.2%} [{lo2:.2%}, {hi2:.2%}]")
+    dmg = np.abs(mo[mviol & mnz])
+    if dmg.size:
+        print(f"  ВЕЛИЧИНА УЩЕРБА, в долях одиночного выигрыша: "
+              f"медиана {np.median(dmg) / g1m:.2%}, "
+              f"90-й {np.percentile(dmg, 90) / g1m:.2%}, "
+              f"99-й {np.percentile(dmg, 99) / g1m:.2%}")
+        print(f"  то же в долях полного доступного разрыва: "
+              f"медиана {np.median(dmg) / gbm:.2%}, "
+              f"99-й {np.percentile(dmg, 99) / gbm:.2%}")
+
+    print("\nДОЛЯ НАРУШЕНИЙ ПО РАЗМЕРУ A (только содержательные тройки)")
+    print(f"  {'|A|':>5}{'содержательные':>18}{'строго':>12}{'троек':>12}")
+    for ka in range(int(t_na.max()) + 1):
+        sl = t_na == ka
+        a1 = (viol[:, sl] & nz[:, sl]).sum() / max(nz[:, sl].sum(), 1)
+        a2 = (viol[:, sl] & inside[:, sl]).sum() / max(inside[:, sl].sum(), 1)
+        print(f"  {ka:>5}{a1:>17.2%}{a2:>12.2%}{int(nz[:, sl].sum()):>12}")
+
+    print("\nМАКРО-СТАТИСТИКА ПО ВМЕШАТЕЛЬСТВАМ (по содержательным тройкам)")
+    mac = (viol & nz).sum(1) / np.maximum(nz.sum(1), 1)
+    ok = nz.sum(1) > 0
+    print(f"  среднее {mac[ok].mean():.2%}, медиана {np.median(mac[ok]):.2%}, "
+          f"90-й проц. {np.percentile(mac[ok], 90):.2%}, "
+          f"макс {mac[ok].max():.2%}")
+    print(f"  доля вмешательств хотя бы с одним содержательным нарушением: "
+          f"{((viol & nz).sum(1) > 0).mean():.1%}")
+    mas = (viol & inside).sum(1) / np.maximum(inside.sum(1), 1)
+    print(f"  строго: среднее {mas.mean():.2%}, медиана {np.median(mas):.2%}, "
+          f"90-й проц. {np.percentile(mas, 90):.2%}")
+
+    # ЛОКАЛЬНОЕ ПАРНОЕ ОТНОШЕНИЕ. ОПИСАТЕЛЬНАЯ статистика, НЕ submodularity
+    # ratio и НЕ основание для гарантии жадного отбора: тот определяется как
+    # минимум по допустимым парам множеств и требует монотонности функции,
+    # которая здесь нарушается. Никакого 1 - exp(-gamma) не вычисляется.
+    den = G[:, tAqr] - G[:, tA]
+    okd = (den > tt) & nz
+    ratio = 1.0 + om[okd] / den[okd]
+    print("\nЛОКАЛЬНОЕ ПАРНОЕ ОТНОШЕНИЕ [m(q|A)+m(r|A)] / m(qr|A) — ОПИСАТЕЛЬНО")
+    print(f"  (не submodularity ratio Das-Kempe; теоретической гарантии из него "
+          f"не следует)\n  считается по {ratio.size} тройкам со знаменателем "
+          f"выше tau")
+    for q in (1, 5, 25, 50, 75, 95):
+        print(f"    {q:>2}-й процентиль {np.percentile(ratio, q):>8.3f}")
+    print(f"    доля ниже 1: {(ratio < 1).mean():.1%}")
+
+    if task is not None and len(np.unique(task)) > 1:
+        print("\nПО ЗАДАЧАМ (12 самых частых)")
+        u, c = np.unique(task, return_counts=True)
+        print(f"  {'задача':>52}{'вмеш.':>7}{'эпиз':>6}{'содерж.':>10}"
+              f"{'top-4':>9}")
+        for t in u[np.argsort(-c)][:12]:
+            m = task == t
+            if m.sum() < 20:
+                continue
+            a1 = (viol[m] & nz[m]).sum() / max(nz[m].sum(), 1)
+            a2 = (viol[m] & hi[m]).sum() / max(hi[m].sum(), 1)
+            print(f"  {str(t)[:52]:>52}{int(m.sum()):>7}"
+                  f"{len(np.unique(epi[m])):>6}{a1:>10.2%}{a2:>9.2%}")
+
+    print("\n" + "=" * 78)
+    print("ВЫВОД")
+    print("=" * 78)
+    print(f"  содержательные тройки: {r_all:.2%} нарушений")
+    print(f"  пары из top-4:         {r_hi:.2%} нарушений, "
+          f"среднее Omega {((om * hi).sum(1) / np.maximum(hi.sum(1), 1)).mean() / g1m:+.2%}")
+    if r_all > 0.30:
+        print("""
+  ГЛОБАЛЬНО функция НЕ субмодулярна: знак взаимодействия произвольной
+  содержательной пары близок к случайному. Формулировка «приближённая
+  субмодулярность» недоступна.""")
+    if r_hi < 0.6 * r_all:
+        print("""  СЛОЙ СИЛЬНЫХ ПОЗИЦИЙ ведёт себя иначе: нарушений заметно меньше.
+  Сравнивать слои законно только при сопоставимом масштабе |Omega| — см.
+  столбцы выше. Если масштабы близки, допустима формулировка «сильные
+  позиции систематически перекрываются, тогда как взаимодействие
+  произвольных пар знакопеременно».""")
+    else:
+        print("""  СЛОЙ СИЛЬНЫХ ПОЗИЦИЙ не отличается заметно: взаимодействия
+  знакопеременны и там. Тогда set-aware router нужен не только чтобы
+  устранять избыточность, но и чтобы находить редкие комплементарные пары.""")
+    print("""
+Направление это НЕ закрывает: оракульная разреженность и провал независимого
+ранжирования от субмодулярности не зависят. Закрывается лишь возможность
+опереть новизну на субмодулярность.
+МОНОТОННОСТЬ. Нарушения означают, что добавление позиции способно ухудшить
+результат: оракулу нужно право отказа, router нельзя учить «чем больше, тем
+лучше», а L_BCE по changed-support не может быть основной целью.""")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--from-npz", default=None,
+                    help="пересчитать статистику из сохранённых таблиц, "
+                         "без модели и кодека")
     ap.add_argument("--root", default="third_party/actioncodec")
-    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--ckpt", default=None)
     ap.add_argument("--n-obs", type=int, default=96)
     ap.add_argument("--n-ep", type=int, default=48)
     ap.add_argument("--max-pos", type=int, default=0)
     ap.add_argument("--set-block", type=int, default=32)
-    ap.add_argument("--keep-neg", type=int, default=100_000,
-                    help="сколько величин нарушения хранить на позицию "
-                         "для процентилей")
-    ap.add_argument("--keep-tables", type=int, default=64,
-                    help="сколько таблиц G(S) сложить в NPZ целиком")
+    ap.add_argument("--tau-rel", type=float, default=1e-3)
     ap.add_argument("--rank-lo", type=int, default=1)
     ap.add_argument("--rank-hi", type=int, default=5)
     ap.add_argument("--pos-offset", type=int, default=3)
@@ -211,6 +395,24 @@ def main() -> None:
 
     selftest()
 
+    if args.from_npz:
+        d = np.load(args.from_npz, allow_pickle=True)
+        print(f"пересчёт из {args.from_npz}: commit {d['commit']}, "
+              f"seed {d['seed']}\n")
+        analyze(d["G"], d["chg"], d["epi"], d["pos"],
+                d["task"] if "task" in d else None,
+                float(d["floor_om"]), int(d["P"]), args)
+        return
+
+    if not args.ckpt:
+        raise SystemExit("нужен --ckpt или --from-npz")
+
+    import torch
+
+    from k1_residual_cost import latent_from_codes, projected_codebooks
+    from k3_bar_suffix_repair import (MAX_ACTION_Q, STATE_Q01, STATE_Q99,
+                                      build_batch, load_lerobot)
+
     try:
         commit = subprocess.check_output(["git", "rev-parse", "HEAD"],
                                          text=True).strip()
@@ -219,6 +421,7 @@ def main() -> None:
     print(f"commit {commit}, seed {args.seed}\n")
 
     sys.path.insert(0, os.path.abspath(args.root))
+    import copy
     import importlib.util
 
     import actioncodec  # noqa: F401
@@ -235,24 +438,18 @@ def main() -> None:
     cfg = tok.config.embodiment_config[
         list(tok.config.embodiment_config.keys())[args.embodiment]]
     T, D_act = int(cfg["freq"] * cfg["duration"]), cfg["action_dim"]
-    # Кодек грузится БЕЗ указания dtype, то есть уже во float32: аргумент
-    # dtype=bfloat16 задаётся только BAR-модели и пути декодирования не
-    # касается. .float() ниже — страховка на случай смены умолчания, а не
-    # понижение точности откуда-то сверху.
-    import copy
-
     print(f"dtype кодека при загрузке: {next(tok.parameters()).dtype}")
     tok32 = copy.deepcopy(tok).float().eval()
     E = projected_codebooks(tok32, args.device)
 
-    IM1, IM2, ST_RAW, A, PREV, tasks, EPI = load_lerobot(
+    IM1, IM2, ST_RAW, A_, PREV, tasks, EPI = load_lerobot(
         args.n_obs, T, n_ep=args.n_ep, seed=args.seed)
-    A = np.asarray(A, np.float32).copy()
-    A[..., :-1] = A[..., :-1] / MAX_ACTION_Q[:-1]
-    A[..., -1] = -A[..., -1]
-    a_true = torch.from_numpy(np.clip(A, -1.0, 1.0)).to(args.device)
+    A_ = np.asarray(A_, np.float32).copy()
+    A_[..., :-1] = A_[..., :-1] / MAX_ACTION_Q[:-1]
+    A_[..., -1] = -A_[..., -1]
+    a_true = torch.from_numpy(np.clip(A_, -1.0, 1.0)).to(args.device)
     scale = float(a_true.max() - a_true.min())
-    B = len(A)
+    B = len(A_)
     st = ((ST_RAW - STATE_Q01) / (STATE_Q99 - STATE_Q01) * 2.0 - 1.0).astype(np.float32)
 
     from smolvla.bar import SmolVLABlockwiseAR
@@ -295,398 +492,110 @@ def main() -> None:
                                  None)[0][..., :D_act])
         return torch.cat(out)
 
-    def dec_lat(h):
-        return dec_with(tok32, h)
-
-    def sq_of(dec, ref):
-        """СРЕДНИЙ КВАДРАТ по непрерывным каналам на исполняемом окне."""
-        d = (dec[:, :args.window] - ref[:, :args.window]).abs()[..., :D_act - 1]
+    def sq_with(m, h, ref):
+        d = (dec_with(m, h)[:, :args.window]
+             - ref[:, :args.window]).abs()[..., :D_act - 1]
         return d.flatten(1).pow(2).mean(-1) / scale ** 2
 
     sets, idx = build_sets(P)
-    tA, tAq, tAr, tAqr, t_um, qr_um, t_na = build_triples(P, idx)
-    mA, mAq, m_um, m_qm = build_mono(P, idx)
     print(f"наборов размера <=4 (с пустым): {len(sets)}")
-    print(f"троек (A,q,r), |A|<=2: {len(tA)}")
-    print(f"пар (A,q), |A|<=3: {len(mA)}\n")
+
+    def gtable(m, EE, dt, stale, z_ref, aref=None):
+        """Таблица G(S) для всех наборов, в заданной точности."""
+        hs = latent_from_codes(EE, stale).to(dt)
+        hr = latent_from_codes(EE, z_ref).to(dt)
+        ref = dec_with(m, hr) if aref is None else aref
+        e0 = sq_with(m, hs, ref)
+        Gt = torch.zeros(hs.shape[0], len(sets), dtype=torch.float64,
+                         device=hs.device)
+        for i in range(1, len(sets), args.set_block):
+            blockS = sets[i:i + args.set_block]
+            hh = hs.unsqueeze(0).repeat(len(blockS), 1, 1, 1)
+            for j, S in enumerate(blockS):
+                hh[j][:, list(S)] = hr[:, list(S)]
+            ee = sq_with(m, hh.reshape(-1, P, hs.shape[-1]),
+                         ref.repeat(len(blockS), 1, 1))
+            Gt[:, i:i + len(blockS)] = (e0.repeat(len(blockS)) - ee).reshape(
+                len(blockS), -1).T.double()
+        return Gt
 
     rng = torch.Generator(device=args.device).manual_seed(1)
     ar = torch.arange(B, device=args.device)
     n_pos = args.max_pos or P
 
-    # поэкземплярные агрегаты для бутстрапа
-    agg = {k: [] for k in ("n_viol", "sum_neg", "max_neg", "n_tri",
-                           "n_viol_nz", "sum_neg_nz", "n_tri_nz",
-                           "n_viol_ch", "sum_neg_ch", "n_tri_ch",
-                           "n_mono_viol", "sum_mono_neg", "n_mono",
-                           "n_mono_viol_nz", "n_mono_nz",
-                           "om_all", "om_hi", "om_lo",
-                           "aom_all", "aom_hi", "aom_lo",
-                           "n_viol_hi", "n_tri_hi",
-                           "g_best4", "g1", "e0", "ndiff")}
-    neg_keep, gam_keep, tables, epi_all, pos_all = [], [], [], [], []
-    n_kept = 0
-    # разбивка нарушений по размеру A: растёт ли отклонение с глубиной набора
-    viol_by_a = np.zeros(3)
-    tri_by_a = np.zeros(3)
+    def make_stale(p_):
+        u = lg0[:, p_].topk(args.rank_hi, -1).indices[
+            ar, torch.randint(args.rank_lo, args.rank_hi, (B,),
+                              generator=rng, device=args.device)]
+        c0 = z_ref[:, :, 0].clone()
+        c0[:, p_] = u
+        c1 = blk(c0).argmax(-1)
+        z_old = torch.stack([c0, c1,
+                             blk(torch.cat([c0, c1], 1)).argmax(-1)], -1)
+        s = z_old.clone()
+        s[:, :, 0] = z_ref[:, :, 0]
+        return s
 
     with torch.no_grad():
-        # раскладка плоских токенов ПОУРОВНЕВАЯ, см. FINDINGS §1
         z_ref = gen(None, nb).reshape(-1, L, P).transpose(1, 2)
-        a_ref = dec_lat(latent_from_codes(E, z_ref))
+        a_ref = dec_with(tok32, latent_from_codes(E, z_ref))
         lg0 = blk(None)
 
-        # ---------- ЧИСЛЕННЫЙ ПОЛ ----------
-        # Сравниваем одиночные выигрыши, посчитанные тремя точностями. float64
-        # принимаем за истину; расхождение float32 задаёт пол порога, а
-        # расхождение bf16 показывает, что было бы без этой правки.
+        # ---------- ПОЛ ДЛЯ Omega, а не для одиночных выигрышей ----------
+        # Omega — разность ЧЕТЫРЁХ величин, её численный пол заведомо выше.
+        # Меряем сравнением полных таблиц G во float32 и float64.
         tok64 = copy.deepcopy(tok).double().eval()
         E64 = projected_codebooks(tok64, args.device)
-        u0 = lg0[:, 0].topk(args.rank_hi, -1).indices[
-            ar, torch.randint(args.rank_lo, args.rank_hi, (B,),
-                              generator=torch.Generator(device=args.device)
-                              .manual_seed(99), device=args.device)]
-        c0p = z_ref[:, :, 0].clone()
-        c0p[:, 0] = u0
-        c1p = blk(c0p).argmax(-1)
-        zp = torch.stack([c0p, c1p,
-                          blk(torch.cat([c0p, c1p], 1)).argmax(-1)], -1)
-        stp = zp.clone()
-        stp[:, :, 0] = z_ref[:, :, 0]
-
-        def singles_at(m, EE, dt):
-            hs = latent_from_codes(EE, stp).to(dt)
-            hr = latent_from_codes(EE, z_ref).to(dt)
-            ref = dec_with(m, hr)
-            e0_ = sq_of(dec_with(m, hs), ref)
-            out = []
-            for q in range(P):
-                h = hs.clone()
-                h[:, q] = hr[:, q]
-                out.append(e0_ - sq_of(dec_with(m, h), ref))
-            return torch.stack(out).double()
-
-        g64 = singles_at(tok64, E64, torch.float64)
-        g32 = singles_at(tok32, E, torch.float32)
-        gsc = float(g64.max(0).values.median())
-        d32 = float((g32 - g64).abs().max())
-        floor32 = 3.0 * d32
-        print(f"\nЧИСЛЕННЫЙ ПОЛ (масштаб: медианный лучший одиночный "
-              f"{gsc:.3e})")
-        print(f"  float32 против float64: макс. расхождение {d32:.3e} "
-              f"({d32 / max(gsc, 1e-30):.3%} одиночного выигрыша)")
-        print(f"  пол порога 3*float32 = {floor32:.3e}")
-        print(f"  порог из плана 1e-3*g1 = {1e-3 * gsc:.3e} -> "
-              f"{'его и берём' if 1e-3 * gsc >= floor32 else 'ниже пола, берём пол'}")
-        # Плечо bfloat16 — справочное. Их декодер не переводится в половинную
-        # точность целиком (часть нормировок остаётся во float32 и слой падает),
-        # а чужой код мы не трогаем. Рабочий путь float32, и нужное для порога
-        # число даёт сравнение с float64 выше, поэтому неудача здесь не мешает.
-        try:
-            tokbf = copy.deepcopy(tok).to(torch.bfloat16).eval()
-            gbf = singles_at(tokbf, projected_codebooks(tokbf, args.device),
-                             torch.bfloat16)
-            dbf = float((gbf - g64).abs().max())
-            print(f"  справочно, bfloat16 против float64: {dbf:.3e} "
-                  f"({dbf / max(gsc, 1e-30):.3%})")
-            del tokbf, gbf
-        except RuntimeError as e:
-            print(f"  справочное плечо bfloat16 не считается: "
-                  f"{str(e).splitlines()[0]}")
-        print()
-        del tok64, E64, g64, g32
+        st0 = make_stale(0)
+        G32 = gtable(tok32, E, torch.float32, st0, z_ref).cpu().numpy()
+        G64 = gtable(tok64, E64, torch.float64, st0, z_ref).cpu().numpy()
+        tA, tAq, tAr, tAqr, _, _, _ = build_triples(P, idx)
+        d_om = np.abs((G32[:, tAq] + G32[:, tAr] - G32[:, tA] - G32[:, tAqr])
+                      - (G64[:, tAq] + G64[:, tAr] - G64[:, tA] - G64[:, tAqr]))
+        g1_0 = G64[:, 1:1 + P].max(1)
+        floor_om = 3.0 * float(d_om.max())
+        print(f"\nЧИСЛЕННЫЙ ПОЛ ДЛЯ Omega (float32 против float64), "
+              f"вмешательство 0")
+        print(f"  максимум расхождения {d_om.max():.3e} "
+              f"({d_om.max() / g1_0.mean():.4%} одиночного выигрыша)")
+        print(f"  99-й процентиль      {np.percentile(d_om, 99):.3e}")
+        print(f"  для сравнения, пол по одиночным выигрышам "
+              f"{np.abs(G32[:, 1:1 + P] - G64[:, 1:1 + P]).max():.3e}")
+        print(f"  пол 3*max = {floor_om:.3e}, порог {args.tau_rel:g}*g1 "
+              f"= {args.tau_rel * np.median(g1_0):.3e}\n")
+        del tok64, E64, G64
         torch.cuda.empty_cache()
 
+        Gs, chgs, poss = [], [], []
         for p_ in range(n_pos):
-            u = lg0[:, p_].topk(args.rank_hi, -1).indices[
-                ar, torch.randint(args.rank_lo, args.rank_hi, (B,),
-                                  generator=rng, device=args.device)]
-            c0_old = z_ref[:, :, 0].clone()
-            c0_old[:, p_] = u
-            c1_old = blk(c0_old).argmax(-1)
-            z_old = torch.stack([c0_old, c1_old,
-                                 blk(torch.cat([c0_old, c1_old], 1)).argmax(-1)], -1)
-            stale = z_old.clone()
-            stale[:, :, 0] = z_ref[:, :, 0]
+            stale = make_stale(p_) if p_ else st0
+            Gt = (G32 if p_ == 0 else
+                  gtable(tok32, E, torch.float32, stale, z_ref,
+                         a_ref).cpu().numpy())
+            Gs.append(Gt.astype(np.float32))
+            diff = (stale != z_ref).any(-1)
+            chgs.append((diff.int()
+                         * (1 << torch.arange(P, device=args.device))
+                         ).sum(-1).cpu().numpy())
+            poss.append(np.full(B, p_))
+            print(f"  позиция {p_ + 1}/{n_pos} готова", flush=True)
 
-            h_st = latent_from_codes(E, stale)
-            h_rf = latent_from_codes(E, z_ref)
-            e0 = sq_of(dec_lat(h_st), a_ref)                 # e(пусто)
-            diff = (stale != z_ref).any(-1)                  # (B, P)
-            chg_mask = (diff.int()
-                        * (1 << torch.arange(P, device=args.device))).sum(-1)
-
-            # ---------- таблица G(S) для всех 2517 наборов ----------
-            G = torch.zeros(B, len(sets), device=args.device)
-            for i in range(1, len(sets), args.set_block):
-                blockS = sets[i:i + args.set_block]
-                hh = h_st.unsqueeze(0).repeat(len(blockS), 1, 1, 1)
-                for j, S in enumerate(blockS):
-                    hh[j][:, list(S)] = h_rf[:, list(S)]
-                ee = sq_of(dec_lat(hh.reshape(-1, P, h_st.shape[-1])),
-                           a_ref.repeat(len(blockS), 1, 1))
-                G[:, i:i + len(blockS)] = (e0.repeat(len(blockS)) - ee).reshape(
-                    len(blockS), -1).T
-            Gn = G.cpu().numpy()
-
-            # ---------- Omega и монотонность ----------
-            om = Gn[:, tAq] + Gn[:, tAr] - Gn[:, tA] - Gn[:, tAqr]
-            mo = Gn[:, mAq] - Gn[:, mA]
-
-            g1 = Gn[:, 1:1 + P].max(1)                       # лучший одиночный
-            # порог из плана, но не ниже измеренного численного пола
-            tau = max(1e-8, 1e-3 * float(np.median(g1)), floor32)
-            neg = np.maximum(0.0, -om)
-            viol = om < -tau
-            mneg = np.maximum(0.0, -mo)
-            mviol = mo < -tau
-
-            cm = chg_mask.cpu().numpy()[:, None]
-            # СОДЕРЖАТЕЛЬНЫЕ тройки. Если позиция не изменилась, её латента
-            # совпадает с опорной ПОБИТОВО, поэтому G(A+q) = G(A) точно и
-            # Omega = 0 тождественно. Значит Omega может быть ненулевой только
-            # когда ОБЕ позиции q, r лежат в changed support. Без этого условия
-            # знаменатель разбавлен вырожденными тройками примерно в 12 раз, и
-            # доля нарушений выглядит вчетверо меньше настоящей.
-            nz = ((qr_um[None, :] & ~cm) == 0)                # (B, n_tri)
-            inside = (t_um[None, :] & ~cm) == 0               # ещё и A внутри
-
-            # ПРИМИРЕНИЕ С A2. Там Delta ВЫБРАННЫХ наборов систематически
-            # отрицательна, здесь знак Omega по всем содержательным тройкам
-            # симметричен. Совместимо это лишь если избыточность сосредоточена
-            # среди ВЫСОКОВЫИГРЫШНЫХ пар — тех, что и попадают в набор.
-            # Проверяем маской «обе позиции входят в top-4 по одиночному
-            # выигрышу». Знак: Omega > 0 означает убывающую отдачу, то есть
-            # избыточность, и отвечает отрицательной Delta.
-            t4 = np.argsort(-Gn[:, 1:1 + P], 1)[:, :4]
-            top_m = np.zeros(B, np.int64)
-            for j in range(4):
-                top_m |= (1 << t4[:, j])
-            hi = (qr_um[None, :] & ~top_m[:, None]) == 0
-            lo_m = nz & ~hi
-            aom = np.abs(om)
-            for key, msk in (("all", nz), ("hi", hi), ("lo", lo_m)):
-                n_ = np.maximum(msk.sum(1), 1)
-                agg[f"om_{key}"].append((om * msk).sum(1) / n_)
-                # МОДУЛЬ нужен отдельно: если у слабых пар |Omega| едва выше
-                # порога, то их 45% нарушений — случайный знак мелкой величины,
-                # а не свойство функции. Сравнивать слои можно лишь зная,
-                # сопоставим ли масштаб.
-                agg[f"aom_{key}"].append((aom * msk).sum(1) / n_)
-            agg["n_viol_hi"].append((viol & hi).sum(1).astype(np.float64))
-            agg["n_tri_hi"].append(hi.sum(1).astype(np.float64))
-
-            agg["n_viol"].append(viol.sum(1).astype(np.float64))
-            agg["sum_neg"].append((neg * viol).sum(1))
-            agg["max_neg"].append(neg.max(1))
-            agg["n_tri"].append(np.full(B, om.shape[1], np.float64))
-            agg["n_viol_nz"].append((viol & nz).sum(1).astype(np.float64))
-            agg["sum_neg_nz"].append((neg * viol * nz).sum(1))
-            agg["n_tri_nz"].append(nz.sum(1).astype(np.float64))
-            agg["n_viol_ch"].append((viol & inside).sum(1).astype(np.float64))
-            agg["sum_neg_ch"].append((neg * viol * inside).sum(1))
-            agg["n_tri_ch"].append(inside.sum(1).astype(np.float64))
-
-            # ОТНОШЕНИЕ СУБМОДУЛЯРНОСТИ (Das & Kempe). Для пары {q,r} при
-            # префиксе A:  gamma = [m(q|A) + m(r|A)] / m({q,r}|A) = 1 + Om/den.
-            # Для субмодулярной функции gamma >= 1; жадный отбор получает
-            # гарантию (1 - e^{-gamma}). Величина безразмерная и не зависит от
-            # произвольной нормировки, в отличие от «массы нарушений».
-            den = Gn[:, tAqr] - Gn[:, tA]
-            okd = (den > tau) & nz
-            gam = np.where(okd, 1.0 + om / np.where(okd, den, 1.0), np.nan)
-            gam_keep.append(gam[okd].astype(np.float32))
-            # у монотонности вырожденность та же: если q не изменилась,
-            # M(A,q) = 0 тождественно
-            mnz = (m_qm[None, :] & ~cm) == 0
-            agg["n_mono_viol"].append(mviol.sum(1).astype(np.float64))
-            agg["sum_mono_neg"].append((mneg * mviol).sum(1))
-            agg["n_mono"].append(np.full(B, mo.shape[1], np.float64))
-            agg["n_mono_viol_nz"].append((mviol & mnz).sum(1).astype(np.float64))
-            agg["n_mono_nz"].append(mnz.sum(1).astype(np.float64))
-            agg["g_best4"].append(Gn.max(1))
-            agg["g1"].append(g1)
-            agg["e0"].append(e0.cpu().numpy())
-            agg["ndiff"].append(diff.sum(-1).cpu().numpy().astype(np.float64))
-            epi_all.append(EPI)
-            pos_all.append(np.full(B, p_))
-
-            for ka in range(3):
-                sl = t_na == ka
-                viol_by_a[ka] += viol[:, sl].sum()
-                tri_by_a[ka] += viol[:, sl].size
-
-            v = neg[viol]
-            if v.size:
-                if v.size > args.keep_neg:
-                    v = np.random.default_rng(p_).choice(v, args.keep_neg,
-                                                         replace=False)
-                neg_keep.append(v.astype(np.float32))
-            if n_kept < args.keep_tables:
-                take = min(B, args.keep_tables - n_kept)
-                tables.append(Gn[:take].astype(np.float32))
-                n_kept += take
-            print(f"  позиция {p_ + 1}/{n_pos}: нарушений "
-                  f"{viol.mean():.4%}, tau {tau:.3e}", flush=True)
-
-    Ag = {k: np.concatenate(v) for k, v in agg.items()}
-    epi = np.concatenate(epi_all)
-    negs = np.concatenate(neg_keep) if neg_keep else np.zeros(1)
-    g1m = Ag["g1"].mean()
-
-    print("\n" + "=" * 78)
-    print("K-4a4. ПРЯМОЙ ТЕСТ СУБМОДУЛЯРНОСТИ (всё на КВАДРАТЕ ошибки)")
-    print("=" * 78)
-    print(f"вмешательств {len(epi)}, эпизодов {len(np.unique(epi))}, "
-          f"троек на вмешательство {int(Ag['n_tri'][0])}")
-    print(f"масштаб: лучший одиночный выигрыш {g1m:.3e}, "
-          f"полный доступный выигрыш {Ag['g_best4'].mean():.3e}\n")
-
-    print("""ВЫРОЖДЕННЫЕ ТРОЙКИ. Если позиция не изменилась, её латента совпадает
-с опорной побитово, поэтому G(A+q) = G(A) точно и Omega = 0 тождественно.
-Omega может быть ненулевой ТОЛЬКО когда обе позиции q, r лежат в changed
-support. Доля по всем тройкам разбавлена этими нулями примерно в 12 раз и
-самостоятельного смысла не имеет — читать строку «среди содержательных».
-""")
-    r, lo, hi = cluster_ci(Ag["n_viol"], Ag["n_tri"], epi)
-    print(f"  доля нарушений, все тройки           {r:.4%} [{lo:.4%}, {hi:.4%}]"
-          f"   <- разбавлена")
-    rn, lon, hin = cluster_ci(Ag["n_viol_nz"], Ag["n_tri_nz"], epi)
-    print(f"  СРЕДИ СОДЕРЖАТЕЛЬНЫХ (q,r изменены)  {rn:.4%} "
-          f"[{lon:.4%}, {hin:.4%}]   <- главное число")
-    r2, lo2, hi2 = cluster_ci(Ag["n_viol_ch"], Ag["n_tri_ch"], epi)
-    print(f"  строже: ещё и A внутри support       {r2:.4%} [{lo2:.4%}, {hi2:.4%}]")
-    print(f"  доля содержательных троек от всех    "
-          f"{Ag['n_tri_nz'].sum() / Ag['n_tri'].sum():.2%}")
-    r3, lo3, hi3 = cluster_ci(Ag["n_mono_viol"], Ag["n_mono"], epi)
-    r4, lo4, hi4 = cluster_ci(Ag["n_mono_viol_nz"], Ag["n_mono_nz"], epi)
-    print(f"\n  нарушения монотонности, все пары     {r3:.4%} [{lo3:.4%}, {hi3:.4%}]")
-    print(f"  СРЕДИ СОДЕРЖАТЕЛЬНЫХ (q изменена)    {r4:.4%} "
-          f"[{lo4:.4%}, {hi4:.4%}]")
-
-    print(f"\n  средняя отрицательная часть Omega на тройку: "
-          f"{Ag['sum_neg'].sum() / Ag['n_tri'].sum():.3e} "
-          f"({Ag['sum_neg'].sum() / Ag['n_tri'].sum() / max(g1m, 1e-30):.3%} "
-          f"одиночного выигрыша)")
-    if negs.size > 1:
-        print("  величина нарушения (только нарушения), в долях одиночного "
-              "выигрыша:")
-        for q in (50, 90, 95, 99):
-            print(f"    {q}-й процентиль {np.percentile(negs, q) / max(g1m, 1e-30):>10.2%}")
-    print(f"    максимум         {Ag['max_neg'].max() / max(g1m, 1e-30):>10.2%}")
-
-    # ОТНОШЕНИЕ СУБМОДУЛЯРНОСТИ. Безразмерно, от нормировки не зависит и прямо
-    # даёт гарантию жадного отбора (1 - e^{-gamma}). Для субмодулярной функции
-    # gamma >= 1 всюду.
-    gam = np.concatenate(gam_keep) if gam_keep else np.zeros(1)
-    print(f"\n  ОТНОШЕНИЕ СУБМОДУЛЯРНОСТИ gamma = [m(q|A)+m(r|A)] / m(qr|A)")
-    print(f"  (>= 1 для субмодулярной; считается по {len(gam)} тройкам "
-          f"со знаменателем выше tau)")
-    for q in (1, 5, 25, 50, 75):
-        print(f"    {q:>2}-й процентиль {np.percentile(gam, q):>8.3f}")
-    print(f"    минимум          {gam.min():>8.3f}")
-    print(f"    доля gamma < 1   {(gam < 1).mean():>8.1%}")
-    gmin = float(np.percentile(gam, 5))
-    print(f"    гарантия жадного при gamma = 5-й проц.: "
-          f"1 - exp(-gamma) = {1 - np.exp(-max(gmin, 0)):.3f}")
-    print("    ВНИМАНИЕ: минимум gamma неустойчив — при знаменателе чуть выше "
-          "tau\n    отношение разлетается. Читать процентили, не минимум. "
-          "И сама\n    гарантия здесь пессимистична до бесполезности: жадный "
-          "эмпирически\n    сохраняет 97% точного (K-4a2), так что предсказательной "
-          "силы у неё нет.")
-
-    # Метрика «масса нарушений» из плана НЕ приводится: сумма max(0,-Omega) по
-    # 12720 тройкам, делённая на один скалярный выигрыш, имеет произвольный
-    # масштаб, и порог 5% к ней неприменим. Вместо неё — доля нарушений и
-    # gamma, обе безразмерные.
-
-    print("\n  ЗНАК Omega ПО СЛОЯМ (Omega > 0 = убывающая отдача = избыточность;"
-          "\n  в долях одиночного выигрыша). Примиряет A2 с настоящим замером:")
-    rh, loh, hih = cluster_ci(Ag["n_viol_hi"], Ag["n_tri_hi"], epi)
-    print(f"{'слой':>36}{'среднее Omega':>16}{'среднее |Omega|':>17}"
-          f"{'|Om| / tau':>12}")
-    tau_ref = 1e-3 * g1m
-    for nm, key in (("все содержательные тройки", "all"),
-                    ("обе позиции в top-4 по одиночному", "hi"),
-                    ("остальные содержательные", "lo")):
-        v = Ag[f"om_{key}"].mean() / max(g1m, 1e-30)
-        a = Ag[f"aom_{key}"].mean() / max(g1m, 1e-30)
-        print(f"    {nm:>32}{v:>+16.2%}{a:>17.2%}"
-              f"{Ag[f'aom_{key}'].mean() / max(tau_ref, 1e-30):>12.0f}")
-    print(f"    доля нарушений среди пар из top-4: {rh:.2%} "
-          f"[{loh:.2%}, {hih:.2%}]  против {rn:.2%} по всем содержательным")
-    print("""    Читать так. Среднее Omega у пар из top-4 заметно ПОЛОЖИТЕЛЬНО при
-    околонулевом среднем по всем содержательным -> избыточность есть, но
-    сосредоточена среди высоковыигрышных позиций, то есть ровно тех, что
-    берёт независимый отбор. A2 и настоящий замер тогда согласованы, а учить
-    router надо распознавать ПЕРЕКРЫТИЕ СИЛЬНЫХ позиций, а не общую
-    убывающую отдачу.
-    ОБЯЗАТЕЛЬНАЯ ОГОВОРКА. Сравнивать доли нарушений между слоями можно лишь
-    при сопоставимом масштабе |Omega|. Если у слабых пар |Omega| всего в
-    несколько раз выше порога, их доля нарушений — это случайный знак мелкой
-    величины, и глобальные 45% ничего не характеризуют. Столбец |Om|/tau
-    показывает запас над порогом в каждом слое.""")
-
-    print("\n  доля нарушений по размеру A (растёт ли отклонение с глубиной):")
-    for ka in range(3):
-        print(f"    |A| = {ka}: {viol_by_a[ka] / max(tri_by_a[ka], 1):.4%}"
-              f"   троек {int(tri_by_a[ka])}")
-
-    print("\n  макро-среднее по вмешательствам (не по тройкам):")
-    mac = Ag["n_viol"] / np.maximum(Ag["n_tri"], 1)
-    print(f"    доля нарушений: среднее {mac.mean():.4%}, "
-          f"медиана {np.median(mac):.4%}, "
-          f"90-й проц. {np.percentile(mac, 90):.4%}, макс {mac.max():.4%}")
-    print(f"    доля вмешательств хотя бы с одним нарушением: "
-          f"{(Ag['n_viol'] > 0).mean():.1%}")
-
-    print("\n" + "=" * 78)
-    print("ВЫВОД")
-    print("=" * 78)
-    print("""МЕТРИКА ВОРОТ ИЗ ПЛАНА НЕПРИГОДНА и здесь не приводится: «масса
-нарушений» — это сумма max(0,-Omega) по 12720 тройкам, делённая на один
-скалярный выигрыш; её масштаб произвольный, и порог 5% к ней неприменим. Это
-дефект спецификации метрики, а не результат.
-
-Вывод при этом порога не требует и от нормировки не зависит:""")
-    # Ответ ПОСЛОЙНЫЙ, одной меткой не описывается: глобальная доля и доля
-    # среди сильных позиций расходятся в разы, и обе величины содержательны.
-    print(f"  по всем содержательным тройкам:  {rn:.2%} нарушений")
-    print(f"  среди пар из top-4:              {rh:.2%} нарушений, "
-          f"среднее Omega {Ag['om_hi'].mean() / max(g1m, 1e-30):+.2%}")
-    if rh < 0.20 and Ag["om_hi"].mean() > 0 and rn > 0.30:
-        print("""
-  ГЛОБАЛЬНО функция НЕ субмодулярна: знак взаимодействия произвольной пары
-  близок к подбрасыванию монеты. Писать «приближённая субмодулярность» про
-  функцию в целом нельзя.
-  НО В РАБОЧЕЙ ОБЛАСТИ — среди высоковыигрышных позиций, то есть тех, что
-  вообще попадают в набор, — поведение убывающее и устойчивое. Допустимая
-  формулировка: «сильные позиции систематически перекрываются, тогда как
-  взаимодействие произвольных пар знакопеременно и мало».
-  Проверить по столбцу |Om|/tau, что у слабых пар масштаб не вырожден: если
-  вырожден, глобальная доля не характеризует ничего.""")
-    elif rn < 0.20:
-        print("\n  Отклонения редки во всех слоях -> приближённая "
-              "субмодулярность, жадный отбор обоснован.")
-    else:
-        print("\n  Нарушения заметны и в рабочей области -> опираться на "
-              "субмодулярность нельзя нигде.")
-    print("""
-Направление это НЕ закрывает: оракульная разреженность и провал независимого
-ранжирования от субмодулярности не зависят. Закрывается лишь возможность
-опереть новизну на субмодулярность и на классическую гарантию жадного отбора.
-ОТДЕЛЬНО. Нарушения МОНОТОННОСТИ означают, что добавление позиции способно
-ухудшить результат. Тогда оракулу необходимо право отказа (пустой набор в
-переборе), а router нельзя учить правилу «чем больше позиций, тем лучше».""")
+    G = np.concatenate(Gs)
+    chg = np.concatenate(chgs)
+    pos = np.concatenate(poss)
+    epi = np.tile(EPI, n_pos)
+    task = np.tile(np.asarray(tasks), n_pos)
 
     if args.dump:
         os.makedirs(os.path.dirname(args.dump) or ".", exist_ok=True)
-        np.savez_compressed(
-            args.dump, commit=commit, seed=args.seed, epi=epi,
-            pos=np.concatenate(pos_all), neg_sample=negs, gamma=gam,
-            tables=np.concatenate(tables) if tables else np.zeros(1),
-            **{k: v for k, v in Ag.items()})
-        print(f"\nсырые величины сохранены: {args.dump}")
+        np.savez_compressed(args.dump, G=G, chg=chg, epi=epi, pos=pos,
+                            task=task, floor_om=floor_om, P=P,
+                            commit=commit, seed=args.seed,
+                            tau_rel=args.tau_rel, window=args.window)
+        print(f"\nтаблицы сохранены целиком: {args.dump} "
+              f"({G.nbytes / 1e6:.1f} МБ до сжатия)\n")
+
+    analyze(G, chg, epi, pos, task, floor_om, P, args)
 
 
 if __name__ == "__main__":
