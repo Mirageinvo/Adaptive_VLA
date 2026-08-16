@@ -94,7 +94,7 @@ def build_sets(P: int, kmax: int = 4):
 
 def build_triples(P: int, idx: dict, max_a: int = 2):
     """Тройки (A, q, r): |A| <= max_a, q < r, обе вне A."""
-    iA, iAq, iAr, iAqr, um, na = [], [], [], [], [], []
+    iA, iAq, iAr, iAqr, um, qm, na = [], [], [], [], [], [], []
     for ka in range(max_a + 1):
         for A in itertools.combinations(range(P), ka):
             rest = [x for x in range(P) if x not in A]
@@ -107,13 +107,14 @@ def build_triples(P: int, idx: dict, max_a: int = 2):
                 for x in A + (q, r):
                     m |= 1 << x
                 um.append(m)
+                qm.append((1 << q) | (1 << r))   # маска ТОЛЬКО пары
                 na.append(ka)
-    return tuple(np.asarray(v) for v in (iA, iAq, iAr, iAqr, um, na))
+    return tuple(np.asarray(v) for v in (iA, iAq, iAr, iAqr, um, qm, na))
 
 
 def build_mono(P: int, idx: dict, max_a: int = 3):
     """Пары (A, q): |A| <= max_a, q вне A."""
-    iA, iAq, um = [], [], []
+    iA, iAq, um, qm = [], [], [], []
     for ka in range(max_a + 1):
         for A in itertools.combinations(range(P), ka):
             for q in range(P):
@@ -125,7 +126,8 @@ def build_mono(P: int, idx: dict, max_a: int = 3):
                 for x in A + (q,):
                     m |= 1 << x
                 um.append(m)
-    return tuple(np.asarray(v) for v in (iA, iAq, um))
+                qm.append(1 << q)                # маска ТОЛЬКО добавляемой
+    return tuple(np.asarray(v) for v in (iA, iAq, um, qm))
 
 
 def selftest(P: int = 8) -> None:
@@ -136,7 +138,7 @@ def selftest(P: int = 8) -> None:
     3. Покрытие плюс супермодулярная надбавка на ОДНОЙ паре -> нарушения
        обязаны найтись, и ровно на тройках, содержащих эту пару."""
     sets, idx = build_sets(P)
-    iA, iAq, iAr, iAqr, _, _ = build_triples(P, idx)
+    iA, iAq, iAr, iAqr, _, _, _ = build_triples(P, idx)
     rng = np.random.default_rng(0)
 
     w = rng.gamma(1.0, 1.0, size=P)
@@ -302,8 +304,8 @@ def main() -> None:
         return d.flatten(1).pow(2).mean(-1) / scale ** 2
 
     sets, idx = build_sets(P)
-    tA, tAq, tAr, tAqr, t_um, t_na = build_triples(P, idx)
-    mA, mAq, m_um = build_mono(P, idx)
+    tA, tAq, tAr, tAqr, t_um, qr_um, t_na = build_triples(P, idx)
+    mA, mAq, m_um, m_qm = build_mono(P, idx)
     print(f"наборов размера <=4 (с пустым): {len(sets)}")
     print(f"троек (A,q,r), |A|<=2: {len(tA)}")
     print(f"пар (A,q), |A|<=3: {len(mA)}\n")
@@ -314,10 +316,12 @@ def main() -> None:
 
     # поэкземплярные агрегаты для бутстрапа
     agg = {k: [] for k in ("n_viol", "sum_neg", "max_neg", "n_tri",
+                           "n_viol_nz", "sum_neg_nz", "n_tri_nz",
                            "n_viol_ch", "sum_neg_ch", "n_tri_ch",
                            "n_mono_viol", "sum_mono_neg", "n_mono",
+                           "n_mono_viol_nz", "n_mono_nz",
                            "g_best4", "g1", "e0", "ndiff")}
-    neg_keep, tables, epi_all, pos_all = [], [], [], []
+    neg_keep, gam_keep, tables, epi_all, pos_all = [], [], [], [], []
     n_kept = 0
     # разбивка нарушений по размеру A: растёт ли отклонение с глубиной набора
     viol_by_a = np.zeros(3)
@@ -435,18 +439,43 @@ def main() -> None:
             mviol = mo < -tau
 
             cm = chg_mask.cpu().numpy()[:, None]
-            inside = (t_um[None, :] & ~cm) == 0               # (B, n_tri)
+            # СОДЕРЖАТЕЛЬНЫЕ тройки. Если позиция не изменилась, её латента
+            # совпадает с опорной ПОБИТОВО, поэтому G(A+q) = G(A) точно и
+            # Omega = 0 тождественно. Значит Omega может быть ненулевой только
+            # когда ОБЕ позиции q, r лежат в changed support. Без этого условия
+            # знаменатель разбавлен вырожденными тройками примерно в 12 раз, и
+            # доля нарушений выглядит вчетверо меньше настоящей.
+            nz = ((qr_um[None, :] & ~cm) == 0)                # (B, n_tri)
+            inside = (t_um[None, :] & ~cm) == 0               # ещё и A внутри
 
             agg["n_viol"].append(viol.sum(1).astype(np.float64))
             agg["sum_neg"].append((neg * viol).sum(1))
             agg["max_neg"].append(neg.max(1))
             agg["n_tri"].append(np.full(B, om.shape[1], np.float64))
+            agg["n_viol_nz"].append((viol & nz).sum(1).astype(np.float64))
+            agg["sum_neg_nz"].append((neg * viol * nz).sum(1))
+            agg["n_tri_nz"].append(nz.sum(1).astype(np.float64))
             agg["n_viol_ch"].append((viol & inside).sum(1).astype(np.float64))
             agg["sum_neg_ch"].append((neg * viol * inside).sum(1))
             agg["n_tri_ch"].append(inside.sum(1).astype(np.float64))
+
+            # ОТНОШЕНИЕ СУБМОДУЛЯРНОСТИ (Das & Kempe). Для пары {q,r} при
+            # префиксе A:  gamma = [m(q|A) + m(r|A)] / m({q,r}|A) = 1 + Om/den.
+            # Для субмодулярной функции gamma >= 1; жадный отбор получает
+            # гарантию (1 - e^{-gamma}). Величина безразмерная и не зависит от
+            # произвольной нормировки, в отличие от «массы нарушений».
+            den = Gn[:, tAqr] - Gn[:, tA]
+            okd = (den > tau) & nz
+            gam = np.where(okd, 1.0 + om / np.where(okd, den, 1.0), np.nan)
+            gam_keep.append(gam[okd].astype(np.float32))
+            # у монотонности вырожденность та же: если q не изменилась,
+            # M(A,q) = 0 тождественно
+            mnz = (m_qm[None, :] & ~cm) == 0
             agg["n_mono_viol"].append(mviol.sum(1).astype(np.float64))
             agg["sum_mono_neg"].append((mneg * mviol).sum(1))
             agg["n_mono"].append(np.full(B, mo.shape[1], np.float64))
+            agg["n_mono_viol_nz"].append((mviol & mnz).sum(1).astype(np.float64))
+            agg["n_mono_nz"].append(mnz.sum(1).astype(np.float64))
             agg["g_best4"].append(Gn.max(1))
             agg["g1"].append(g1)
             agg["e0"].append(e0.cpu().numpy())
@@ -485,12 +514,27 @@ def main() -> None:
     print(f"масштаб: лучший одиночный выигрыш {g1m:.3e}, "
           f"полный доступный выигрыш {Ag['g_best4'].mean():.3e}\n")
 
+    print("""ВЫРОЖДЕННЫЕ ТРОЙКИ. Если позиция не изменилась, её латента совпадает
+с опорной побитово, поэтому G(A+q) = G(A) точно и Omega = 0 тождественно.
+Omega может быть ненулевой ТОЛЬКО когда обе позиции q, r лежат в changed
+support. Доля по всем тройкам разбавлена этими нулями примерно в 12 раз и
+самостоятельного смысла не имеет — читать строку «среди содержательных».
+""")
     r, lo, hi = cluster_ci(Ag["n_viol"], Ag["n_tri"], epi)
-    print(f"  доля нарушений субмодулярности   {r:.4%} [{lo:.4%}, {hi:.4%}]")
+    print(f"  доля нарушений, все тройки           {r:.4%} [{lo:.4%}, {hi:.4%}]"
+          f"   <- разбавлена")
+    rn, lon, hin = cluster_ci(Ag["n_viol_nz"], Ag["n_tri_nz"], epi)
+    print(f"  СРЕДИ СОДЕРЖАТЕЛЬНЫХ (q,r изменены)  {rn:.4%} "
+          f"[{lon:.4%}, {hin:.4%}]   <- главное число")
     r2, lo2, hi2 = cluster_ci(Ag["n_viol_ch"], Ag["n_tri_ch"], epi)
-    print(f"  то же ВНУТРИ changed support     {r2:.4%} [{lo2:.4%}, {hi2:.4%}]")
+    print(f"  строже: ещё и A внутри support       {r2:.4%} [{lo2:.4%}, {hi2:.4%}]")
+    print(f"  доля содержательных троек от всех    "
+          f"{Ag['n_tri_nz'].sum() / Ag['n_tri'].sum():.2%}")
     r3, lo3, hi3 = cluster_ci(Ag["n_mono_viol"], Ag["n_mono"], epi)
-    print(f"  доля нарушений монотонности      {r3:.4%} [{lo3:.4%}, {hi3:.4%}]")
+    r4, lo4, hi4 = cluster_ci(Ag["n_mono_viol_nz"], Ag["n_mono_nz"], epi)
+    print(f"\n  нарушения монотонности, все пары     {r3:.4%} [{lo3:.4%}, {hi3:.4%}]")
+    print(f"  СРЕДИ СОДЕРЖАТЕЛЬНЫХ (q изменена)    {r4:.4%} "
+          f"[{lo4:.4%}, {hi4:.4%}]")
 
     print(f"\n  средняя отрицательная часть Omega на тройку: "
           f"{Ag['sum_neg'].sum() / Ag['n_tri'].sum():.3e} "
@@ -503,17 +547,25 @@ def main() -> None:
             print(f"    {q}-й процентиль {np.percentile(negs, q) / max(g1m, 1e-30):>10.2%}")
     print(f"    максимум         {Ag['max_neg'].max() / max(g1m, 1e-30):>10.2%}")
 
-    # МАССА нарушений. Два знаменателя, оба напечатаны: сумма по 12720 тройкам
-    # несопоставима с одним выигрышем напрямую, поэтому рядом идёт величина на
-    # тройку. Ворота ставились на массу относительно доступного выигрыша.
-    m_pt, m_lo, m_hi = cluster_ci(Ag["sum_neg"], Ag["g_best4"], epi)
-    print(f"\n  МАССА нарушений / полный доступный выигрыш: "
-          f"{m_pt:.3%} [{m_lo:.3%}, {m_hi:.3%}]")
-    print(f"  она же в расчёте на одну тройку:            "
-          f"{m_pt / Ag['n_tri'][0]:.3e}")
-    mm_pt, mm_lo, mm_hi = cluster_ci(Ag["sum_mono_neg"], Ag["g_best4"], epi)
-    print(f"  масса нарушений монотонности / выигрыш:     "
-          f"{mm_pt:.3%} [{mm_lo:.3%}, {mm_hi:.3%}]")
+    # ОТНОШЕНИЕ СУБМОДУЛЯРНОСТИ. Безразмерно, от нормировки не зависит и прямо
+    # даёт гарантию жадного отбора (1 - e^{-gamma}). Для субмодулярной функции
+    # gamma >= 1 всюду.
+    gam = np.concatenate(gam_keep) if gam_keep else np.zeros(1)
+    print(f"\n  ОТНОШЕНИЕ СУБМОДУЛЯРНОСТИ gamma = [m(q|A)+m(r|A)] / m(qr|A)")
+    print(f"  (>= 1 для субмодулярной; считается по {len(gam)} тройкам "
+          f"со знаменателем выше tau)")
+    for q in (1, 5, 25, 50, 75):
+        print(f"    {q:>2}-й процентиль {np.percentile(gam, q):>8.3f}")
+    print(f"    минимум          {gam.min():>8.3f}")
+    print(f"    доля gamma < 1   {(gam < 1).mean():>8.1%}")
+    gmin = float(np.percentile(gam, 5))
+    print(f"    гарантия жадного при gamma = 5-й проц.: "
+          f"1 - exp(-gamma) = {1 - np.exp(-max(gmin, 0)):.3f}")
+
+    # Метрика «масса нарушений» из плана НЕ приводится: сумма max(0,-Omega) по
+    # 12720 тройкам, делённая на один скалярный выигрыш, имеет произвольный
+    # масштаб, и порог 5% к ней неприменим. Вместо неё — доля нарушений и
+    # gamma, обе безразмерные.
 
     print("\n  доля нарушений по размеру A (растёт ли отклонение с глубиной):")
     for ka in range(3):
@@ -529,26 +581,43 @@ def main() -> None:
           f"{(Ag['n_viol'] > 0).mean():.1%}")
 
     print("\n" + "=" * 78)
-    print("ВОРОТА, зафиксированы до запуска")
+    print("ВЫВОД")
     print("=" * 78)
-    ok = m_pt <= 0.05
-    print(f"  масса нарушений <= 5% доступного выигрыша -> {m_pt:.3%} "
-          f"{'ПРОЙДЕНО' if ok else 'НЕ ПРОЙДЕНО'}")
+    print("""МЕТРИКА ВОРОТ ИЗ ПЛАНА НЕПРИГОДНА и здесь не приводится: «масса
+нарушений» — это сумма max(0,-Omega) по 12720 тройкам, делённая на один
+скалярный выигрыш; её масштаб произвольный, и порог 5% к ней неприменим. Это
+дефект спецификации метрики, а не результат.
+
+Вывод при этом порога не требует и от нормировки не зависит:""")
+    if rn < 0.05:
+        print(f"  доля нарушений среди содержательных троек {rn:.2%} мала и "
+              f"gamma в основном >= 1 -> приближённая субмодулярность,\n"
+              f"  жадный отбор получает теоретическое основание.")
+    elif rn < 0.20:
+        print(f"  доля нарушений {rn:.2%}: отклонения заметны, но редки. "
+              f"Формулировать как «преимущественно убывающая отдача\n"
+              f"  с заметным хвостом», гарантию жадного брать по gamma, а не "
+              f"по классической 1-1/e.")
+    else:
+        print(f"  доля нарушений среди содержательных троек {rn:.2%} — знак "
+              f"взаимодействия близок к подбрасыванию монеты.\n"
+              f"  ФУНКЦИЯ НЕ СУБМОДУЛЯРНА. Формулировка «приближённая "
+              f"субмодулярность» недоступна; писать\n"
+              f"  «наборы в среднем избыточны, но знак локального "
+              f"взаимодействия непостоянен».")
     print("""
-ПРОЙДЕНО -> разрешена формулировка «приближённая субмодулярность», и жадный
-    отбор получает теоретическое основание.
-НЕ ПРОЙДЕНО -> писать только «наборы в среднем избыточны, но функция не
-    субмодулярна». Направление это НЕ закрывает: оракульная разреженность и
-    провал независимого ранжирования от субмодулярности не зависят.
-ОТДЕЛЬНО. Заметная доля нарушений МОНОТОННОСТИ означает, что добавление
-    позиции способно ухудшить результат. Тогда оракулу необходимо право
-    отказа, а router нельзя учить правилу «чем больше позиций, тем лучше».""")
+Направление это НЕ закрывает: оракульная разреженность и провал независимого
+ранжирования от субмодулярности не зависят. Закрывается лишь возможность
+опереть новизну на субмодулярность и на классическую гарантию жадного отбора.
+ОТДЕЛЬНО. Нарушения МОНОТОННОСТИ означают, что добавление позиции способно
+ухудшить результат. Тогда оракулу необходимо право отказа (пустой набор в
+переборе), а router нельзя учить правилу «чем больше позиций, тем лучше».""")
 
     if args.dump:
         os.makedirs(os.path.dirname(args.dump) or ".", exist_ok=True)
         np.savez_compressed(
             args.dump, commit=commit, seed=args.seed, epi=epi,
-            pos=np.concatenate(pos_all), neg_sample=negs,
+            pos=np.concatenate(pos_all), neg_sample=negs, gamma=gam,
             tables=np.concatenate(tables) if tables else np.zeros(1),
             **{k: v for k, v in Ag.items()})
         print(f"\nсырые величины сохранены: {args.dump}")
