@@ -158,7 +158,20 @@ def cluster_ci(num, den, epi, n_boot: int = 2000, seed: int = 0):
 # ----------------------------------------------------------------------------
 #                                  АНАЛИЗ
 # ----------------------------------------------------------------------------
-def analyze(G, chg, epi, pos, task, floor_om, P, args) -> None:
+def layer_stats(om, tau, msk, g1m):
+    """Средние Om, |Om| и АСИММЕТРИЯ внутри слоя.
+
+    Асимметрия = средн.Om / средн.|Om| в [-1, +1]. От масштаба слоя не зависит,
+    поэтому только ею и законно сравнивать слои с разным разбросом: доля
+    нарушений при разном разбросе несопоставима."""
+    n_ = np.maximum(msk.sum(1), 1)
+    mo_ = ((om * msk).sum(1) / n_).mean()
+    ao_ = ((np.abs(om) * msk).sum(1) / n_).mean()
+    rt = ((np.abs(om) * msk).sum(1) / n_ / tau).mean()
+    return mo_ / g1m, ao_ / g1m, mo_ / max(ao_, 1e-30), rt
+
+
+def analyze(G, chg, epi, pos, task, floor_om, P, args, dh=None) -> None:
     """Вся статистика считается ЗДЕСЬ, из сохранённой таблицы G.
 
     Никакой модели и кодека не требуется, поэтому любые изменения масок,
@@ -244,18 +257,43 @@ def analyze(G, chg, epi, pos, task, floor_om, P, args) -> None:
                          ("пары из top-4", "hi", hi),
                          ("top-4, строго", "hs", hi_str),
                          ("остальные содерж.", "lo", lo_m)):
-        n_ = np.maximum(msk.sum(1), 1)
-        mo_ = ((om * msk).sum(1) / n_).mean()
-        ao_ = ((np.abs(om) * msk).sum(1) / n_).mean()
-        rt = ((np.abs(om) * msk).sum(1) / n_ / tau).mean()
-        asym[key] = mo_ / max(ao_, 1e-30)
-        print(f"  {nm:>34}{mo_ / g1m:>+10.2%}{ao_ / g1m:>11.2%}"
-              f"{asym[key]:>+12.2f}{rt:>10.0f}")
+        v, a, sk, rt = layer_stats(om, tau, msk, g1m)
+        asym[key] = sk
+        print(f"  {nm:>34}{v:>+10.2%}{a:>11.2%}{sk:>+12.2f}{rt:>10.0f}")
     print("""  АСИММЕТРИЯ = средн.Om / средн.|Om|, лежит в [-1, +1] и от масштаба
   НЕ зависит. Это единственный законный способ сравнить слои, когда их |Om|
   различаются: доля нарушений при разном разбросе несопоставима, а знак
   распределения — сопоставим. +1 означает «всегда избыточность», -1 —
   «всегда комплементарность», 0 — симметрия.""")
+
+    # КОНТРОЛЬ НА АЛГЕБРАИЧЕСКИЙ ОТБОР. Слои выше определены по одиночным
+    # выигрышам, а они же стоят в числителе Omega = G(q) + G(r) - G(qr).
+    # Отбирая пары с малыми G(q), G(r), мы механически смещаем Omega вниз,
+    # если G(qr) не убывает так же быстро. Разрываем связь: делим слои по
+    # НОРМЕ СМЕЩЕНИЯ ЛАТЕНТЫ ||dh_q||, которая в вычислении Omega не участвует.
+    # Если картина сохраняется — эффект структурный, а не отбор.
+    if dh is not None:
+        d4 = np.argsort(-dh, 1)[:, :4]
+        dm = np.zeros(n_rows, np.int64)
+        for j in range(4):
+            dm |= (1 << d4[:, j].astype(np.int64))
+        hi_d = nz & ((qr_um[None, :] & ~dm[:, None]) == 0)
+        lo_d = nz & ~hi_d
+        print("\n  КОНТРОЛЬ: слои по норме смещения латенты ||dh||, "
+              "не по выигрышу")
+        print(f"  {'слой':>34}{'средн. Om':>10}{'средн.|Om|':>11}"
+              f"{'асимметрия':>12}")
+        for nm, key, msk in (("top-4 по ||dh||", "hid", hi_d),
+                             ("остальные по ||dh||", "lod", lo_d)):
+            v, a, sk, _ = layer_stats(om, tau, msk, g1m)
+            asym[key] = sk
+            print(f"  {nm:>34}{v:>+10.2%}{a:>11.2%}{sk:>+12.2f}")
+        agree = (asym["hid"] > 0.2) and (asym["lod"] < -0.2)
+        print(f"  совпадение с разбиением по выигрышу: "
+              f"{'ДА, эффект структурный' if agree else 'НЕТ, возможен отбор'}")
+        ov = float(np.mean((hi & hi_d).sum(1) / np.maximum(hi.sum(1), 1)))
+        print(f"  доля троек top-4-по-выигрышу, попавших и в top-4-по-||dh||: "
+              f"{ov:.1%}")
 
     print("\nВЕЛИЧИНА НАРУШЕНИЯ (только нарушения, в долях одиночного выигрыша)")
     for nm, msk in (("содержательные", nz), ("пары из top-4", hi)):
@@ -420,7 +458,8 @@ def main() -> None:
               f"seed {d['seed']}\n")
         analyze(d["G"], d["chg"], d["epi"], d["pos"],
                 d["task"] if "task" in d else None,
-                float(d["floor_om"]), int(d["P"]), args)
+                float(d["floor_om"]), int(d["P"]), args,
+                d["dh"] if "dh" in d else None)
         return
 
     if not args.ckpt:
@@ -585,7 +624,7 @@ def main() -> None:
         del tok64, E64, G64
         torch.cuda.empty_cache()
 
-        Gs, chgs, poss = [], [], []
+        Gs, chgs, poss, dhs = [], [], [], []
         for p_ in range(n_pos):
             stale = make_stale(p_) if p_ else st0
             Gt = (G32 if p_ == 0 else
@@ -596,25 +635,31 @@ def main() -> None:
             chgs.append((diff.int()
                          * (1 << torch.arange(P, device=args.device))
                          ).sum(-1).cpu().numpy())
+            # норма смещения латенты: не участвует в вычислении Omega, поэтому
+            # годится как независимый способ разбить слои (контроль на отбор)
+            dhs.append((latent_from_codes(E, z_ref)
+                        - latent_from_codes(E, stale)).float()
+                       .norm(dim=-1).cpu().numpy())
             poss.append(np.full(B, p_))
             print(f"  позиция {p_ + 1}/{n_pos} готова", flush=True)
 
     G = np.concatenate(Gs)
     chg = np.concatenate(chgs)
+    dh = np.concatenate(dhs)
     pos = np.concatenate(poss)
     epi = np.tile(EPI, n_pos)
     task = np.tile(np.asarray(tasks), n_pos)
 
     if args.dump:
         os.makedirs(os.path.dirname(args.dump) or ".", exist_ok=True)
-        np.savez_compressed(args.dump, G=G, chg=chg, epi=epi, pos=pos,
+        np.savez_compressed(args.dump, G=G, chg=chg, dh=dh, epi=epi, pos=pos,
                             task=task, floor_om=floor_om, P=P,
                             commit=commit, seed=args.seed,
                             tau_rel=args.tau_rel, window=args.window)
         print(f"\nтаблицы сохранены целиком: {args.dump} "
               f"({G.nbytes / 1e6:.1f} МБ до сжатия)\n")
 
-    analyze(G, chg, epi, pos, task, floor_om, P, args)
+    analyze(G, chg, epi, pos, task, floor_om, P, args, dh)
 
 
 if __name__ == "__main__":
