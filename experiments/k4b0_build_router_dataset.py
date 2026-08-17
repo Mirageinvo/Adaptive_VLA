@@ -761,10 +761,10 @@ def main() -> None:
                 flush()
 
                 # ---- ПРОВЕРКА СЖАТИЯ: полный перебор против G(S ∩ C)
-                if verify_now and p_ == 0 and args.verify_full:
+                if p_ == 0 and len(verify) < args.verify_full:
                     full_sets = [S for k in range(args.kmax + 1)
                                  for S in itertools.combinations(range(P), k)]
-                    for b in range(min(args.verify_full, B)):
+                    for b in range(min(args.verify_full - len(verify), B)):
                         gmap_b = {tuple(sorted(S)): float(gg_all[b][j])
                                   for j, S in enumerate(subs_all[b])}
                         Cb = set(torch.nonzero(diff[b]).flatten().tolist())
@@ -796,11 +796,10 @@ def main() -> None:
                 Lab["p"].append(np.full(B, p_, np.int16))
         return
 
-    done, verify_now = 0, True
+    done = 0
     for ln, gi in sorted(groups.items()):
         for j in range(0, len(gi), args.batch):
             run_batch(gi[j:j + args.batch], ln)
-            verify_now = False
             done += len(gi[j:j + args.batch])
             print(f"наблюдения {done}/{N} (длина {ln})", flush=True)
 
