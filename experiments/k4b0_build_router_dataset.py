@@ -152,28 +152,29 @@ def load_lerobot_b0(n_obs: int, T: int, n_ep: int, seed: int):
 def split_by_episode(epi, tasks, fracs=(0.70, 0.15, 0.15), seed: int = 0):
     """Разбиение ПО ЭПИЗОДАМ со стратификацией ПО ЗАДАЧАМ.
 
-    Каждая задача делится в тех же долях, поэтому редкие задачи не оказываются
-    целиком в одном split. Все наблюдения эпизода и все его вмешательства
-    попадают в одну часть по построению."""
+    Наивное «round(0.15 * n) эпизодов задачи в validation» непригодно: в LIBERO
+    около 130 задач, при 400 эпизодах на задачу приходится ~3, и round(0.45)
+    даёт НОЛЬ — validation остаётся пустым. Поэтому используется метод
+    наибольшего дефицита с переносом остатка ЧЕРЕЗ задачи: каждый следующий
+    эпизод уходит в ту часть, которой сейчас больше всего не хватает до целевой
+    доли. Глобальные пропорции при этом точные, а эпизоды одной задачи
+    расходятся по разным частям.
+
+    Все наблюдения эпизода и все его вмешательства попадают в одну часть по
+    построению, потому что решение принимается на уровне эпизода."""
     rng = np.random.default_rng(seed)
     ep_task = {}
     for e, t in zip(epi, tasks):
         ep_task.setdefault(int(e), t)
-    out = {}
+    out, have = {}, np.zeros(3)
+    fr = np.asarray(fracs, float)
     for t in sorted(set(ep_task.values())):
         eps = np.array(sorted(e for e, tt in ep_task.items() if tt == t))
         rng.shuffle(eps)
-        n = len(eps)
-        n_tr = max(1, int(round(fracs[0] * n)))
-        n_va = int(round(fracs[1] * n))
-        if n_tr + n_va >= n:            # у редких задач тест важнее validation
-            n_va = max(0, n - n_tr - 1)
-        for e in eps[:n_tr]:
-            out[int(e)] = 0
-        for e in eps[n_tr:n_tr + n_va]:
-            out[int(e)] = 1
-        for e in eps[n_tr + n_va:]:
-            out[int(e)] = 2
+        for e in eps:
+            s = int(np.argmax(fr * (have.sum() + 1.0) - have))
+            out[int(e)] = s
+            have[s] += 1
     return np.array([out[int(e)] for e in epi], np.int8)
 
 
@@ -429,7 +430,7 @@ def main() -> None:
                 F["cand_margin"].append(marg.cpu().numpy())
                 F["cand_topk_p"].append(topk_p.cpu().numpy())
                 F["cand_old_tokens"].append(z_old.cpu().numpy().astype(np.int16))
-                F["cand_q"].append(np.tile(np.arange(P, np.int16), (B, 1)))
+                F["cand_q"].append(np.tile(np.arange(P, dtype=np.int16), (B, 1)))
                 F["cand_dq"].append(np.tile((np.arange(P) - p_).astype(np.int16),
                                             (B, 1)))
                 F["cand_absdq"].append(np.tile(
@@ -608,8 +609,11 @@ def _sanity(feats, labels, EPI, SPLIT, TASKS, args, verify, P) -> None:
     T = np.asarray(TASKS)
     miss = [t for t in sorted(set(TASKS))
             if len({int(s) for s in SPLIT[T == t]}) < 2]
-    print(f"  4. задач, представленных менее чем в двух split: {len(miss)} "
-          f"из {len(set(TASKS))}")
+    fr = [float((SPLIT == s).mean()) for s in (0, 1, 2)]
+    print(f"  4. доли split {[round(x, 3) for x in fr]} (цель 0.70/0.15/0.15); "
+          f"задач в одном split: {len(miss)} из {len(set(TASKS))}")
+    for s, nm in ((1, "validation"), (2, "test")):
+        assert (SPLIT == s).sum() > 0, f"{nm} пуст — разбиение выродилось"
 
     oi, pp, sp = labels["obs_idx"], labels["p"], labels["split"]
     for o in np.unique(oi)[:200]:
