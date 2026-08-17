@@ -816,7 +816,8 @@ def _sanity(feats, labels, EPI, SPLIT, TASKS, args, verify, P) -> None:
     # расхождения |G_полн(S) - G_сжат(S∩C)|, посчитанные при построении
     if verify:
         w = max(verify)
-        g1m = float(np.abs(labels["sing_gain"]).max())
+        # сверка идёт на MSE-шкале, поэтому и масштаб берётся оттуда
+        g1m = float(np.abs(labels["sing_gain_mse"]).max())
         print(f"  6. сжатие G(S) = G(S∩C) сверено с полным перебором 2517 "
               f"наборов на {len(verify)} примерах:\n"
               f"      максимум расхождения {w:.3e} "
