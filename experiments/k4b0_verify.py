@@ -38,7 +38,32 @@ def g_of(gmap, C, S):
 
 
 def to_rms(e0_mse, g_mse):
+    """Перевод выигрыша из MSE в RMS. ВЫПУКЛА по g_mse, поэтому усреднять
+    выигрыши в MSE и переводить среднее — НЕЛЬЗЯ: по Йенсену это занижает
+    результат. Переводить надо каждую реализацию, потом усреднять."""
     return np.sqrt(e0_mse) - np.sqrt(max(e0_mse - g_mse, 0.0))
+
+
+def cluster_ci(num, den, epi, n_boot=2000, seed=0):
+    """Отношение сумм с бутстрапом ПО ЭПИЗОДАМ: 16 вмешательств наблюдения и
+    наблюдения одного эпизода зависимы, независимая пересэмплировка строк
+    занизила бы интервал."""
+    rng = np.random.default_rng(seed)
+    eps = np.unique(epi)
+    ix = {e: np.where(epi == e)[0] for e in eps}
+    pt = num.sum() / max(den.sum(), 1e-30)
+    out = np.empty(n_boot)
+    for b in range(n_boot):
+        sel = np.concatenate([ix[e] for e in rng.choice(eps, len(eps), True)])
+        out[b] = num[sel].sum() / max(den[sel].sum(), 1e-30)
+    return pt, float(np.percentile(out, 2.5)), float(np.percentile(out, 97.5))
+
+
+def macro_by(num, den, key):
+    """Макро-среднее по группам: иначе результат определяют несколько задач с
+    особенно крупным исходным разрывом."""
+    return float(np.mean([num[key == k].sum() / max(den[key == k].sum(), 1e-30)
+                          for k in np.unique(key)]))
 
 
 def main() -> None:
@@ -95,6 +120,7 @@ def main() -> None:
 
     tsk = np.asarray(meta["tasks"])[ft["obs_task_idx"]][lb["obs_idx"]]
     tr = set(tsk[sp == 0])
+    globals()["tsk"] = tsk
     for s_, nm in ((1, "val"), (2, "test")):
         miss = len(set(tsk[sp == s_]) - tr)
         print(f"  7. задач в {nm}, отсутствующих в train: {miss}")
@@ -133,9 +159,11 @@ def main() -> None:
     print("ОРАКУЛЬНЫЕ ЧИСЛА: воспроизводятся ли ворота фазы A")
     print("=" * 74)
     print("  доля закрытого разрыва = сумма выигрышей / сумма e(пусто), RMS")
+    # МЕТРИКИ — на всех строках части. Подвыборка idx нужна только для
+    # проверки целостности таблицы выше: на 2000 строках доверительный
+    # интервал шире, а числа для ворот B1 должны быть окончательными.
     for s_, nm in ((None, "все"), (0, "train"), (1, "val"), (2, "test")):
-        m = np.ones(n, bool) if s_ is None else (sp == s_)
-        ii = idx[m[idx]]
+        ii = np.arange(n) if s_ is None else np.where(sp == s_)[0]
         if len(ii) < 20:
             continue
         base = np.sqrt(e0[ii]).sum()
@@ -154,53 +182,63 @@ def main() -> None:
     print("  фаза A на 96 наблюдениях давала  0.93 / 0.91 / 0.79")
 
     print("\n" + "=" * 74)
-    print("ПЛАНКА ДЛЯ B1: ПРИЧИННЫЕ BASELINE НА ЭТОМ ЖЕ ДАТАСЕТЕ")
+    print("ПЛАНКА ДЛЯ B1: ПРИЧИННЫЕ BASELINE, ВСЯ ЧАСТЬ, С ИНТЕРВАЛАМИ")
     print("=" * 74)
     print("  Числа фазы A (0.40 / 0.79 / 0.91) получены на ДРУГОЙ выборке и с\n"
-          "  другой длиной паддинга, поэтому переносить их нельзя — router\n"
-          "  сравнивается с тем, что измерено здесь.")
-    ent, mrg = ft["cand_entropy"], ft["cand_margin"]
-    pcol = lb["p"]
-    rs = np.random.default_rng(1)
+          "  другой длиной паддинга, поэтому не переносятся.\n"
+          "  Оценка идёт по ВСЕМ строкам части, интервалы — кластерный\n"
+          "  бутстрап по эпизодам, macro — среднее по задачам.")
+    ent, mrg, pcol = ft["cand_entropy"], ft["cand_margin"], lb["p"]
     for s_, nm in ((2, "test"), (1, "val")):
-        ii = idx[(sp == s_)[idx]]
-        if len(ii) < 20:
-            continue
-        base = np.sqrt(e0[ii]).sum()
-        print(f"\n  {nm} (n={len(ii)}), доля закрытого разрыва:")
-        print(f"  {'способ отбора':>28}" + "".join(f"{f'K={K}':>10}"
-                                                   for K in (1, 2, 4)))
-        rows = {}
+        ii = np.where(sp == s_)[0]
+        den = np.sqrt(e0[ii])
+        ep_i, tk_i = epi[ii], tsk[ii]
+        print(f"\n  {nm}: строк {len(ii)}, наблюдений "
+              f"{len(np.unique(lb['obs_idx'][ii]))}, эпизодов "
+              f"{len(np.unique(ep_i))}")
         for K in (1, 2, 4):
-            acc = {k: 0.0 for k in
-                   ("энтропия (прич.)", "малый запас (прич.)",
-                    "только p (прич.)", "окно вокруг p (прич.)",
-                    "случайно, 20 сид. (прич.)", "одиночный оракул",
-                    "жадный оракул", "точный оракул <=K")}
-            for i in ii:
-                gmap, C = make_gmap(lb, int(i), P, kmax)
-                pp = int(pcol[i])
-                acc["энтропия (прич.)"] += to_rms(
-                    e0[i], g_of(gmap, C, np.argsort(-ent[i])[:K]))
-                acc["малый запас (прич.)"] += to_rms(
-                    e0[i], g_of(gmap, C, np.argsort(mrg[i])[:K]))
-                acc["только p (прич.)"] += to_rms(e0[i], g_of(gmap, C, (pp,)))
-                w0 = min(max(pp - K // 2, 0), P - K)
-                acc["окно вокруг p (прич.)"] += to_rms(
-                    e0[i], g_of(gmap, C, range(w0, w0 + K)))
-                r = np.mean([g_of(gmap, C, rs.choice(P, K, replace=False))
-                             for _ in range(20)])
-                acc["случайно, 20 сид. (прич.)"] += to_rms(e0[i], r)
-                acc["одиночный оракул"] += to_rms(
-                    e0[i], g_of(gmap, C, np.argsort(-lb["sing_gain_rms"][i])[:K]))
-                acc["жадный оракул"] += to_rms(
-                    e0[i], g_of(gmap, C,
-                                [q for q in lb["add_path"][i][:K] if q >= 0]))
-                acc["точный оракул <=K"] += lb["best_gain_by_k_rms"][i, K]
-            for k, v in acc.items():
-                rows.setdefault(k, {})[K] = v / base
-        for k, r in rows.items():
-            print(f"  {k:>28}" + "".join(f"{r[K]:>10.3f}" for K in (1, 2, 4)))
+            print(f"\n  {'способ отбора':>26}  K={K}   доля [95% ДИ]"
+                  f"{'macro':>10}")
+            gm_all = [make_gmap(lb, int(i), P, kmax) for i in ii]
+            rows = {}
+            for nm_, sel in (
+                    ("энтропия (прич.)",
+                     lambda i, j: np.argsort(-ent[i])[:K]),
+                    ("малый запас (прич.)",
+                     lambda i, j: np.argsort(mrg[i])[:K]),
+                    ("только p (прич.)", lambda i, j: (int(pcol[i]),)),
+                    ("окно вокруг p (прич.)",
+                     lambda i, j: range(min(max(int(pcol[i]) - K // 2, 0),
+                                            P - K),
+                                        min(max(int(pcol[i]) - K // 2, 0),
+                                            P - K) + K)),
+                    ("одиночный оракул",
+                     lambda i, j: np.argsort(-lb["sing_gain_rms"][i])[:K]),
+                    ("жадный оракул",
+                     lambda i, j: [q for q in lb["add_path"][i][:K] if q >= 0]),
+            ):
+                num = np.array([to_rms(e0[i], g_of(*gm_all[j], sel(i, j)))
+                                for j, i in enumerate(ii)])
+                rows[nm_] = (num, cluster_ci(num, den, ep_i),
+                             macro_by(num, den, tk_i))
+            num = lb["best_gain_by_k_rms"][ii, K]
+            rows["точный оракул <=K"] = (num, cluster_ci(num, den, ep_i),
+                                         macro_by(num, den, tk_i))
+            # СЛУЧАЙНЫЙ отбор: 20 НЕЗАВИСИМЫХ политик. Каждую переводим в RMS
+            # ЦЕЛИКОМ и агрегируем по всей части, и только потом усредняем:
+            # to_rms выпукла, поэтому усреднение в MSE занижает результат.
+            per_seed = []
+            for sd in range(20):
+                r = np.random.default_rng(1000 + sd)
+                nm2 = np.array([to_rms(e0[i], g_of(*gm_all[j],
+                                                   r.choice(P, K, False)))
+                                for j, i in enumerate(ii)])
+                per_seed.append(nm2.sum() / den.sum())
+            ps = np.array(per_seed)
+            for nm_, (num, (pt, lo, hi), mac) in rows.items():
+                print(f"  {nm_:>26}  {pt:>6.3f} [{lo:.3f},{hi:.3f}]{mac:>10.3f}")
+            print(f"  {'случайно, 20 политик':>26}  {ps.mean():>6.3f} "
+                  f"[{ps.min():.3f},{ps.max():.3f}]   ст.откл. {ps.std():.4f}")
 
     print("\n" + "=" * 74)
     print("СТАТИСТИКА МЕТОК ПО SPLIT")
@@ -215,6 +253,46 @@ def main() -> None:
         print(f"  {nm:>7}{m.sum():>8}{lb['no_repair'][m].mean():>15.2%}"
               f"{neg[chg].mean():>16.2%}"
               f"{lb['best_size_by_k'][m, kmax].mean():>16.2f}")
+    # K_practical: наименьший набор, теряющий не более tau (и не более 1%)
+    # от максимума. Именно он показывает, как часто можно остановиться раньше
+    # БЕЗ содержательной потери, в отличие от размера точного argmax.
+    print("\n  K_practical — наименьший |S| с G(S) >= G* - порог:")
+    for lbl, rel in (("порог tau", None), ("потеря <= 1%", 0.01)):
+        dist = np.zeros(kmax + 1, np.int64)
+        for i in range(n):
+            gstar = lb["best_gain_by_k_rms"][i, kmax]
+            thr = (gstar - lb["tau"][i]) if rel is None else gstar * (1 - rel)
+            k_ = kmax
+            for K in range(kmax + 1):
+                if lb["best_gain_by_k_rms"][i, K] >= thr:
+                    k_ = K
+                    break
+            dist[k_] += 1
+        print(f"    {lbl:>14}: " + " ".join(
+            f"{i}:{dist[i] / n:.0%}" for i in range(kmax + 1))
+            + f"   среднее {(dist * np.arange(kmax + 1)).sum() / n:.2f}")
+
+    # ЭМПИРИЧЕСКАЯ сверка «ровно K» против «<= K». Равенство гарантировано лишь
+    # когда набор можно добить позициями ВНЕ support: нужно 16 - |C| >= K - |S*|.
+    # При крупном support запаса может не быть, и «ровно K» вынужден брать
+    # вредные позиции внутри support.
+    worst_d, n_diff = 0.0, 0
+    for i in rng.choice(n, size=min(3000, n), replace=False):
+        gmap, C = make_gmap(lb, int(i), P, kmax)
+        free = P - len(C)
+        best_le = max(gmap.values())
+        best_ex = max((g for S, g in gmap.items()
+                       if len(S) == kmax or len(S) + free >= kmax),
+                      default=best_le)
+        d = best_le - best_ex
+        if d > 1e-12:
+            n_diff += 1
+            worst_d = max(worst_d, d)
+    print(f"\n  «ровно K» против «<=K»: расходятся в {n_diff} случаях, "
+          f"макс. разница {worst_d:.3e}")
+    print(f"    свободных позиций вне support: среднее "
+          f"{(P - np.array([bin(int(x)).count('1') for x in lb['support']])).mean():.2f}")
+
     sz = lb["best_size_by_k"][:, kmax]
     print("\n  размер лучшего набора при бюджете "
           f"{kmax}: " + " ".join(f"{i}:{(sz == i).mean():.0%}"
