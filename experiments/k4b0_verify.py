@@ -297,9 +297,38 @@ def main() -> None:
     print("\n  размер лучшего набора при бюджете "
           f"{kmax}: " + " ".join(f"{i}:{(sz == i).mean():.0%}"
                                  for i in range(kmax + 1)))
-    print(f"  обратимые траектории с REMOVE: "
+    # АБЛЯЦИЯ ОБРАТИМОСТИ. Частота REMOVE ничего не решает: важно, даёт ли
+    # обратимая процедура ВЫИГРЫШ против чистого добавления при том же бюджете.
+    # Оба набора сохранены, таблица G(S) позволяет оценить любой из них.
+    ga, gr = np.zeros(n), np.zeros(n)
+    for i in range(n):
+        gmap, C = make_gmap(lb, i, P, kmax)
+        add = [q for q in lb["add_path"][i] if q >= 0]
+        rev = [q for q in lb["rev_set"][i] if q >= 0]
+        ga[i] = to_rms(e0[i], g_of(gmap, C, add))
+        gr[i] = to_rms(e0[i], g_of(gmap, C, rev))
+    den = np.sqrt(e0)
+    for s_, nm in ((2, "test"), (1, "val")):
+        m = sp == s_
+        pa = ga[m].sum() / den[m].sum()
+        pr = gr[m].sum() / den[m].sum()
+        d = gr[m] - ga[m]
+        pt, lo, hi_ = cluster_ci(d, den[m], epi[m])
+        print(f"\n  ОБРАТИМОСТЬ, {nm}: жадное добавление {pa:.3f}, "
+              f"обратимая {pr:.3f}")
+        print(f"    прирост {pt:+.4f} [{lo:+.4f}, {hi_:+.4f}] доли разрыва")
+        print(f"    строк, где обратимая строго лучше: {(d > 1e-12).mean():.2%}; "
+              f"хуже: {(d < -1e-12).mean():.2%}")
+        print(f"    средний размер набора: добавление "
+              f"{np.array([(lb['add_path'][i] >= 0).sum() for i in np.where(m)[0]]).mean():.2f}, "
+              f"обратимая "
+              f"{np.array([(lb['rev_set'][i] >= 0).sum() for i in np.where(m)[0]]).mean():.2f}")
+    print(f"\n  траекторий с REMOVE: "
           f"{(lb['rev_action'] == 0).any(1).mean():.2%}, "
           f"средняя длина {lb['rev_len'].mean():.2f}")
+    print("""    ЧИТАТЬ: слово reversible в названии метода оправдано только
+    приростом, а не частотой REMOVE. Порог плана — не менее +0.03 доли
+    закрытого разрыва либо меньший средний размер набора без потери качества.""")
     print(f"  средняя длина сжатой таблицы: {np.diff(lb['g_off']).mean():.1f}")
 
     print("\nвсе проверки пройдены")
