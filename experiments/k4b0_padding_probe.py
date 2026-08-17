@@ -9,10 +9,21 @@ builder-батча. Но она НЕ совпадает с тем, как мод
 
 Решение принимается ДО обучения B1.
 
-ТРИ РЕЖИМА на ОДНИХ И ТЕХ ЖЕ наблюдениях:
-  batch1   — по одному наблюдению, естественная длина. Это инференс.
-  dynamic  — padding до максимума В БАТЧЕ, как было до правки.
-  fixed    — padding до общей длины по всей выборке. Так собран B0.
+ТРИ ОСИ РАСХОЖДЕНИЯ с официальным scripts/eval_libero.py, а не одна:
+  ДЛИНА паддинга — там padding=True по батчу из n_envs окружений;
+  СТОРОНА паддинга — там padding_side="left", у нас умолчание процессора;
+  pos_offset — там ПО УМОЛЧАНИЮ 4, а все наши замеры идут на 3.
+
+Утверждение «в LIBERO батч равен единице» НЕВЕРНО: n_envs по умолчанию 10.
+Правильно — семантика n_envs=1 достигается естественной длиной, а официальный
+режим это дополненный слева батч из десяти окружений одной задачи.
+
+РЕЖИМЫ на ОДНИХ И ТЕХ ЖЕ наблюдениях (имя = длина_сторона_offset):
+  nat_r_3     естественная длина, без паддинга — новая сборка B0;
+  fix181_r_3  фиксированная 181 — прежняя сборка B0;
+  nat_l_4     естественная длина, слева, offset 4;
+  dyn10_l_4   дополнение по батчу из 10 слева, offset 4 — ближе всего к eval;
+  dyn10_l_3   то же при offset 3 — выделяет вклад ОДНОГО offset.
 
 ЧТО СРАВНИВАЕМ:
   доля наблюдений с побитово совпавшим z_ref;
@@ -44,12 +55,35 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from k4b0_build_router_dataset import greedy_paths, subsets_of  # noqa: E402
 
 
+def rankdata_avg(x):
+    """Ранги СО СРЕДНИМ по ничьим.
+
+    Наивное argsort(argsort(x)) даёт порядковые ранги и разрывает ничьи по
+    индексу. В одиночных выигрышах около десяти точных нулей на строку
+    (позиции вне changed-support), и порядковые ранги присваивают им
+    одинаковый порядок в обоих режимах — то есть создают искусственную
+    согласованность и ЗАВЫШАЮТ корреляцию."""
+    x = np.asarray(x, np.float64)
+    o = np.argsort(x, kind="mergesort")
+    r = np.empty(len(x), np.float64)
+    r[o] = np.arange(len(x), dtype=np.float64)
+    xs = x[o]
+    i = 0
+    while i < len(xs):
+        j = i
+        while j + 1 < len(xs) and xs[j + 1] == xs[i]:
+            j += 1
+        if j > i:
+            r[o[i:j + 1]] = (i + j) / 2.0
+        i = j + 1
+    return r
+
+
 def spearman(a, b):
-    """Ранговая корреляция без scipy: Пирсон по рангам."""
-    ra = np.argsort(np.argsort(a)).astype(np.float64)
-    rb = np.argsort(np.argsort(b)).astype(np.float64)
-    ra -= ra.mean()
-    rb -= rb.mean()
+    """Ранговая корреляция Спирмена с корректной обработкой ничьих."""
+    ra, rb = rankdata_avg(a), rankdata_avg(b)
+    ra = ra - ra.mean()
+    rb = rb - rb.mean()
     d = np.sqrt((ra ** 2).sum() * (rb ** 2).sum())
     return float((ra * rb).sum() / d) if d > 0 else 1.0
 
@@ -60,6 +94,9 @@ def main() -> None:
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--n-obs", type=int, default=96)
     ap.add_argument("--n-ep", type=int, default=48)
+    ap.add_argument("--fixed-pad", type=int, default=181,
+                    help="длина фиксированного паддинга ПРЕЖНЕГО B0; берётся "
+                         "из его metadata, а не пересчитывается по выборке")
     ap.add_argument("--dyn-batch", type=int, default=32,
                     help="батч для режима dynamic; должен быть меньше n-obs, "
                          "иначе dynamic совпадёт с fixed")
@@ -135,11 +172,12 @@ def main() -> None:
     rank_table = np.random.default_rng(10_000 + args.seed).integers(
         args.rank_lo, args.rank_hi, size=(N, P))
 
-    def run(lo, hi, pad_to):
-        """Один блок наблюдений в заданном режиме паддинга."""
+    def run(lo, hi, pad_to, pad_side, pos_off):
+        """Один блок наблюдений в заданном режиме."""
         B = hi - lo
         batch = build_batch(IM1[lo:hi], IM2[lo:hi], TASKS[lo:hi], st_all[lo:hi],
-                            proc, args, args.device, pad_to=pad_to)
+                            proc, args, args.device, pad_to=pad_to,
+                            pad_side=pad_side)
         with torch.no_grad():
             _, vlen, VLM, _ = model._build_vlm_inputs_embeds(
                 input_ids=batch["input_ids"], inputs_embeds=None,
@@ -151,7 +189,7 @@ def main() -> None:
                 alen = bs + (0 if hist is None else hist.shape[1])
                 apos = model._build_action_pos_ids_strided(
                     batch_size=B, base_pos=vlen, action_seq_len=alen,
-                    device=VLM.device, position_offset=args.pos_offset)
+                    device=VLM.device, position_offset=pos_off)
                 pids = model._build_joint_position_ids(
                     batch_size=B, vlm_seq_len=vlen, action_pos_ids=apos,
                     device=VLM.device)
@@ -228,20 +266,25 @@ def main() -> None:
                         out["sing"][p_, b, q] = gm.get((q,), 0.0)
         return out
 
-    regimes = {}
-    print("режим batch1 (инференс): по одному наблюдению...")
-    parts = [run(i, i + 1, None) for i in range(N)]
-    regimes["batch1"] = _merge(parts, P, N)
-    print(f"  vlen: мин {min(p['vlen'] for p in parts)}, "
-          f"макс {max(p['vlen'] for p in parts)}")
-    for nm, pad in (("dynamic", None), ("fixed", pad_fixed)):
-        print(f"режим {nm}...")
-        ps = [run(lo, min(lo + args.dyn_batch, N), pad)
-              for lo in range(0, N, args.dyn_batch)]
+    # опорный режим — ближайший к официальному eval
+    specs = [
+        ("nat_r_3", None, None, 3, 1),
+        ("fix181_r_3", args.fixed_pad, None, 3, args.dyn_batch),
+        ("nat_l_4", None, "left", 4, 1),
+        ("dyn10_l_3", None, "left", 3, 10),
+        ("dyn10_l_4", None, "left", 4, 10),
+    ]
+    regimes, vl = {}, {}
+    for nm, pad, side, off, bsz in specs:
+        print(f"режим {nm}: pad={pad or 'естественная'}, "
+              f"side={side or 'умолчание'}, offset={off}, batch={bsz}")
+        ps = [run(lo, min(lo + bsz, N), pad, side, off)
+              for lo in range(0, N, bsz)]
         regimes[nm] = _merge(ps, P, N)
-        print(f"  vlen по батчам: {[p['vlen'] for p in ps]}")
+        vl[nm] = sorted({p["vlen"] for p in ps})
+        print(f"  vlen: {vl[nm] if len(vl[nm]) < 6 else [vl[nm][0], '...', vl[nm][-1]]}")
 
-    _report(regimes, P, N, args)
+    _report(regimes, P, N, args, ref="dyn10_l_4")
 
 
 def _merge(parts, P, N):
@@ -256,40 +299,59 @@ def _merge(parts, P, N):
     return out
 
 
-def _report(R, P, N, args):
+def _report(R, P, N, args, ref):
     def to_rms(e0, g):
         return np.sqrt(e0) - np.sqrt(max(e0 - g, 0.0))
 
     def g_of(gm, C, S):
         return gm[tuple(sorted(set(S) & C))]
 
-    print("\n" + "=" * 74)
-    print("СРАВНЕНИЕ РЕЖИМОВ ПАДДИНГА")
-    print("=" * 74)
-    ref = "batch1"
-    for nm in ("dynamic", "fixed"):
-        a, b = R[ref], R[nm]
-        zeq = (a["z_ref"] == b["z_ref"]).all(axis=(1, 2)).mean()
-        jac, spr = [], []
+    K = args.kmax
+    print("\n" + "=" * 78)
+    print(f"РАСХОЖДЕНИЕ С ОПОРНЫМ РЕЖИМОМ {ref} (ближайший к eval_libero)")
+    print("=" * 78)
+    print(f"  {'режим':>12}{'z_ref':>8}{'Jac supp':>10}{'Спирмен':>10}"
+          f"{'Jac top4':>10}{'лучшая':>9}{'перенос':>9}")
+    a_ = R[ref]
+    for nm in R:
+        if nm == ref:
+            continue
+        b_ = R[nm]
+        zeq = (a_["z_ref"] == b_["z_ref"]).all(axis=(1, 2)).mean()
+        jac, spr, jt, best1, num_x, den_x = [], [], [], [], 0.0, 0.0
         for p_ in range(P):
             for i in range(N):
-                sa, sb = int(a["supp"][p_, i]), int(b["supp"][p_, i])
-                inter = bin(sa & sb).count("1")
+                sa, sb = int(a_["supp"][p_, i]), int(b_["supp"][p_, i])
                 uni = bin(sa | sb).count("1")
-                jac.append(1.0 if uni == 0 else inter / uni)
-                spr.append(spearman(a["sing"][p_, i], b["sing"][p_, i]))
-        print(f"\n  {ref} против {nm}:")
-        print(f"    z_ref совпал побитово: {zeq:.1%} наблюдений")
-        print(f"    Jaccard changed-support: среднее {np.mean(jac):.3f}, "
-              f"доля полного совпадения {np.mean(np.array(jac) == 1.0):.1%}")
-        print(f"    Спирмен одиночных выигрышей: среднее {np.mean(spr):.3f}, "
-              f"10-й проц. {np.percentile(spr, 10):.3f}")
+                jac.append(1.0 if uni == 0 else bin(sa & sb).count("1") / uni)
+                spr.append(spearman(a_["sing"][p_, i], b_["sing"][p_, i]))
+                ta = set(np.argsort(-a_["sing"][p_, i])[:K].tolist())
+                tb = set(np.argsort(-b_["sing"][p_, i])[:K].tolist())
+                jt.append(len(ta & tb) / len(ta | tb))
+                best1.append(int(np.argmax(a_["sing"][p_, i])
+                                 == np.argmax(b_["sing"][p_, i])))
+                # ПЕРЕНОС: набор, выбранный в режиме nm, оцениваем метками
+                # ОПОРНОГО режима. Это и есть вопрос «сработает ли router,
+                # обученный на чужом протоколе».
+                gm = a_["gmaps"][p_][i]
+                C = set(q for q in range(P) if a_["supp"][p_, i] >> q & 1)
+                e0 = float(a_["e0"][p_, i])
+                num_x += to_rms(e0, g_of(gm, C, list(tb)))
+                den_x += to_rms(e0, g_of(gm, C, list(ta)))
+        print(f"  {nm:>12}{zeq:>8.1%}{np.mean(jac):>10.3f}{np.mean(spr):>10.3f}"
+              f"{np.mean(jt):>10.3f}{np.mean(best1):>9.1%}"
+              f"{num_x / max(den_x, 1e-30):>9.1%}")
+    print("""  z_ref   — доля наблюдений с побитово совпавшим планом;
+  Jac supp— Jaccard changed-support; Спирмен — по одиночным выигрышам (ничьи
+            усреднены); Jac top4 — совпадение четвёрок; лучшая — совпала ли
+            сильнейшая позиция;
+  ПЕРЕНОС — какую долю ОПОРНОГО одиночного оракула даёт top-4, выбранная в
+            чужом режиме. Это прямой ответ на вопрос, переносится ли router.""")
 
-    print("\n  ОРАКУЛЬНЫЕ ЧИСЛА И BASELINE ПРИ K=4, доля закрытого разрыва")
-    print(f"  {'режим':>10}{'точный':>10}{'жадный':>10}{'одиночн.':>10}"
-          f"{'энтропия':>10}{'запас':>9}{'vlen':>8}")
-    for nm in ("batch1", "dynamic", "fixed"):
-        r = R[nm]
+    print("\n  ОРАКУЛЫ И ПРИЧИННЫЕ BASELINE ВНУТРИ КАЖДОГО РЕЖИМА, K=4")
+    print(f"  {'режим':>12}{'точный':>9}{'жадный':>9}{'одиночн.':>10}"
+          f"{'энтроп.':>9}{'запас':>8}")
+    for nm, r in R.items():
         num = {k: 0.0 for k in ("ex", "gr", "sg", "en", "mg")}
         den = 0.0
         for p_ in range(P):
@@ -301,27 +363,30 @@ def _report(R, P, N, args):
                 num["ex"] += to_rms(e0, max(gm.values()))
                 add, _, _, _, _, _ = greedy_paths(
                     {S: to_rms(e0, g) for S, g in gm.items()},
-                    sorted(C), 0.0, args.kmax)
+                    sorted(C), 0.0, K)
                 num["gr"] += to_rms(e0, g_of(gm, C, add))
                 num["sg"] += to_rms(e0, g_of(
-                    gm, C, np.argsort(-r["sing"][p_, i])[:args.kmax]))
+                    gm, C, np.argsort(-r["sing"][p_, i])[:K]))
                 num["en"] += to_rms(e0, g_of(
-                    gm, C, np.argsort(-r["ent"][p_, i])[:args.kmax]))
+                    gm, C, np.argsort(-r["ent"][p_, i])[:K]))
                 num["mg"] += to_rms(e0, g_of(
-                    gm, C, np.argsort(r["mrg"][p_, i])[:args.kmax]))
-        print(f"  {nm:>10}{num['ex'] / den:>10.3f}{num['gr'] / den:>10.3f}"
-              f"{num['sg'] / den:>10.3f}{num['en'] / den:>10.3f}"
-              f"{num['mg'] / den:>9.3f}")
+                    gm, C, np.argsort(r["mrg"][p_, i])[:K]))
+        print(f"  {nm:>12}{num['ex'] / den:>9.3f}{num['gr'] / den:>9.3f}"
+              f"{num['sg'] / den:>10.3f}{num['en'] / den:>9.3f}"
+              f"{num['mg'] / den:>8.3f}")
 
     print("""
 ЧИТАТЬ ТАК, зафиксировано до запуска.
-  Спирмен >= 0.9 и оракульные числа в пределах 0.02 -> структура и ранжирование
-      сохраняются; оставить B0, но ЗАФИКСИРОВАТЬ тот же паддинг в будущем
-      refiner и симуляторе, иначе распределение входов разъедется позже.
-  Расходятся -> пересобрать B0 в режиме batch1, потому что именно он
-      соответствует инференсу LIBERO.
-Отдельно: если dynamic и fixed близки друг к другу, но оба далеки от batch1,
-      значит дело не в разбросе длины, а в самом факте паддинга.""")
+  Сравнение dyn10_l_3 против dyn10_l_4 выделяет вклад ОДНОГО pos_offset.
+  Сравнение nat_l_4 против dyn10_l_4 выделяет вклад ОДНОЙ длины паддинга.
+  Сравнение nat_r_3 против nat_l_4 выделяет вклад СТОРОНЫ и offset вместе.
+
+  ПЕРЕНОС близок к 100% -> протокол сборки можно выбирать по удобству, router
+      перенесётся; достаточно зафиксировать один режим везде.
+  ПЕРЕНОС заметно ниже 100% -> собирать B0 надо в том режиме, в котором будет
+      идти evaluation, и объявить его частью метода.
+  Агрегаты внутри режимов при этом могут совпадать: устойчивость статистики не
+      означает переносимости поэкземплярных решений.""")
 
 
 if __name__ == "__main__":

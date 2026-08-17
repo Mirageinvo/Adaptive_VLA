@@ -142,7 +142,7 @@ def load_lerobot_b0(n_obs: int, T: int, n_ep: int, seed: int):
                             repo_type="dataset", revision=rev)
         t = pq.read_table(f)
         n = t.num_rows
-        if n < T + 1:
+        if n < T:            # длина ровно T даёт один допустимый чанк (старт 0)
             continue
         # пока эпизодов не хватает — берём с каждого поменьше, чтобы места
         # хватило на нужное их число
@@ -564,6 +564,13 @@ def main() -> None:
     print("  " + ", ".join(f"{k}:{len(v)}" for k, v in sorted(groups.items())))
     print()
 
+    # OBS-LEVEL ПРИЗНАКИ ПИШУТСЯ ПО ИСХОДНОМУ ИНДЕКСУ. При группировке по длине
+    # наблюдения обходятся не по порядку, а канонической сортировкой в конце
+    # переставляются только int_* и cand_*. Если копить obs_* через append, то
+    # obs_state[int_obs_idx[i]] укажет на ЧУЖОЕ наблюдение: оракульные числа при
+    # этом останутся верными (они не смотрят на obs_*), а router обучится на
+    # перепутанном контексте.
+    OBS = {}
     row0 = [0]          # счётчик строк: последний батч короче, арифметика по lo неверна
 
     F = {k: [] for k in FEATURE_KEYS}
@@ -640,9 +647,10 @@ def main() -> None:
             else:
                 w = am[:, :VLM.shape[1]].to(VLM.dtype).unsqueeze(-1).float()
                 pooled = (VLM.float() * w).sum(1) / w.sum(1).clamp_min(1.0)
-            F["obs_pooled_ctx"].append(pooled.cpu().numpy())
-            F["obs_task_idx"].append(task_idx[sel_t])
-            F["obs_state"].append(st_all[sel_t])
+            pv = pooled.cpu().numpy()
+            if "ctx" not in OBS:
+                OBS["ctx"] = np.zeros((N, pv.shape[1]), np.float32)
+            OBS["ctx"][sel_t] = pv
 
             hist = None
             for _ in range(nb):
@@ -806,7 +814,14 @@ def main() -> None:
     # ---------------- сборка ----------------
     # Признаки и сырые метки копились блоками формы (B, ...) в одном порядке
     # (батч -> позиция p -> пример), поэтому строки соответствуют по индексу.
+    # obs-level кладём ЦЕЛИКОМ и в исходном порядке; int_obs_idx индексирует их
+    F["obs_pooled_ctx"] = [OBS["ctx"]]
+    F["obs_task_idx"] = [task_idx]
+    F["obs_state"] = [st_all]
     feats = {k: np.concatenate(v) for k, v in F.items() if v}
+    assert np.array_equal(feats["obs_task_idx"], task_idx)
+    assert np.allclose(feats["obs_state"], st_all)
+    assert len(feats["obs_pooled_ctx"]) == N
     raw = {k: np.concatenate(v) for k, v in Lab.items() if k != "g_flat" and v}
     raw["g_flat"] = np.concatenate(Lab["g_flat"]).astype(np.float32)
     raw["g_off"] = np.asarray(g_off, np.int64)
