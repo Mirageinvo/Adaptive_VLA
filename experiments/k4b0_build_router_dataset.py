@@ -237,10 +237,18 @@ def greedy_paths(gmap, C, tau: float, kmax: int = 4):
 
     ADD          — жадное добавление ровно kmax шагов;
     ADD+STOP     — остановка, когда предельный выигрыш не превышает tau;
-    ADD/REM/STOP — на каждом шаге рассматриваются и удаления. Каждый шаг строго
-                   увеличивает G более чем на tau, поэтому состояние не может
-                   повториться и искусственный предел длины не нужен; множество
-                   посещённых состояний оставлено лишь как страховка."""
+    ADD/REM/SWAP/STOP — на каждом шаге рассматриваются добавление, удаление и
+                   ОБМЕН. Обмен обязателен: строгий подъём без него не может
+                   выйти из локального оптимума, где надо сперва потерять.
+                   Пример: G(0)=1.0, G(0,1)=1.05, G(1,2)=1.8 при бюджете 2 —
+                   жадный встаёт на (0,1), потому что удаление нуля само по
+                   себе ухудшает, а вместе с добавлением двойки улучшает на
+                   0.75. Без обмена доля REMOVE занижается, и вывод об
+                   обратимости получается преждевременным.
+                   Обмен записывается двумя ходами, REMOVE и ADD: итоговое
+                   состояние то же, а кодировка остаётся единообразной.
+                   Каждый ход строго увеличивает G более чем на tau, поэтому
+                   состояние не повторяется и предел длины не нужен."""
     def g(S):
         return gmap[tuple(sorted(S))]
 
@@ -260,27 +268,36 @@ def greedy_paths(gmap, C, tau: float, kmax: int = 4):
         stop_k = i + 1
 
     S, acts, qs_, seen = (), [], [], {()}
-    while len(acts) < 4 * kmax + 4:
-        best = (tau, None, None)
+    while len(acts) < 6 * kmax + 6:
+        best = (tau, None, None, None)          # (прирост, вид, q_out, q_in)
         for q in C:
             if q in S:
-                Tn = tuple(x for x in S if x != q)
-                a_ = 0
+                d = g(tuple(x for x in S if x != q)) - g(S)
+                if d > best[0]:
+                    best = (d, "rem", q, None)
             elif len(S) < kmax:
-                Tn = tuple(sorted(S + (q,)))
-                a_ = 1
-            else:
-                continue
-            d = g(Tn) - g(S)
-            if d > best[0]:
-                best = (d, a_, q)
+                d = g(tuple(sorted(S + (q,)))) - g(S)
+                if d > best[0]:
+                    best = (d, "add", None, q)
+        for qo in S:                             # ОБМЕН
+            rest = tuple(x for x in S if x != qo)
+            for qi in C:
+                if qi in S:
+                    continue
+                d = g(tuple(sorted(rest + (qi,)))) - g(S)
+                if d > best[0]:
+                    best = (d, "swap", qo, qi)
         if best[1] is None:
             break
-        q = best[2]
-        acts.append(best[1])
-        qs_.append(q)
-        S = (tuple(sorted(S + (q,))) if best[1] == 1
-             else tuple(x for x in S if x != q))
+        _, kind, qo, qi = best
+        if kind in ("rem", "swap"):
+            acts.append(0)
+            qs_.append(qo)
+            S = tuple(x for x in S if x != qo)
+        if kind in ("add", "swap"):
+            acts.append(1)
+            qs_.append(qi)
+            S = tuple(sorted(S + (qi,)))
         if S in seen:
             break
         seen.add(S)
@@ -436,7 +453,10 @@ def main() -> None:
                          "перебором 2517 наборов")
     ap.add_argument("--rank-lo", type=int, default=1)
     ap.add_argument("--rank-hi", type=int, default=5)
-    ap.add_argument("--pos-offset", type=int, default=3)
+    ap.add_argument("--pos-offset", type=int, default=4,
+                    help="умолчание scripts/eval_libero.py. Прежние замеры шли "
+                         "на 3, и при 4 задача заметно труднее: оракул 0.872 "
+                         "против 0.941, причинные признаки 0.29 против 0.42")
     ap.add_argument("--window", type=int, default=4)
     ap.add_argument("--chunk", type=int, default=4096)
     ap.add_argument("--embodiment", type=int, default=0)
@@ -548,21 +568,16 @@ def main() -> None:
     # группы паддинга нет вовсе: получается ровно семантика batch=1, но с
     # батчингом. Естественная длина берётся из attention_mask, без отдельных
     # прогонов по одному.
-    print("первый проход: естественные длины наблюдений...")
-    nat = np.zeros(N, np.int64)
-    for lo in range(0, N, args.batch):
-        hi = min(lo + args.batch, N)
-        bb = build_batch(IM1[lo:hi], IM2[lo:hi], TASKS[lo:hi], st_all[lo:hi],
-                         proc, args, "cpu")
-        am = bb.get("attention_mask")
-        nat[lo:hi] = (am.sum(1).numpy() if am is not None
-                      else bb["input_ids"].shape[1])
-        del bb
-    groups = {int(v): np.where(nat == v)[0] for v in np.unique(nat)}
-    print(f"  длины: мин {nat.min()}, макс {nat.max()}, "
-          f"различных {len(groups)}")
-    print("  " + ", ".join(f"{k}:{len(v)}" for k, v in sorted(groups.items())))
-    print()
+    # ЛЕВЫЙ ПАДДИНГ, как в scripts/eval_libero.py. Группировка по длине не
+    # нужна: она ЭКВИВАЛЕНТНА левому паддингу и это доказано и кодом, и
+    # замером. VLM-позиции строятся как [0..vlen-1], токены действия
+    # начинаются с base_pos = vlen. При левом паддинге настоящие токены
+    # занимают ПОСЛЕДНИЕ L позиций, то есть кончаются на vlen-1, и разрыв до
+    # токенов действия равен нулю при любом объёме паддинга. При правом
+    # паддинге разрыв равен vlen-L и гуляет — это и портило прежнюю сборку.
+    # Замер k4b0_padding_probe: nat_l_4 совпал с dyn10_l_4 на 100% по всем
+    # метрикам, а nat_r_3 тождественно dyn10_l_3.
+    print(f"паддинг: левый (как в eval_libero), pos_offset={args.pos_offset}")
 
     # OBS-LEVEL ПРИЗНАКИ ПИШУТСЯ ПО ИСХОДНОМУ ИНДЕКСУ. При группировке по длине
     # наблюдения обходятся не по порядку, а канонической сортировкой в конце
@@ -591,7 +606,7 @@ def main() -> None:
         sel_t = np.asarray(sel)
         batch = build_batch(IM1[sel_t], IM2[sel_t], [TASKS[i] for i in sel_t],
                             st_all[sel_t], proc, args_ns, args.device,
-                            pad_to=pad_to)
+                            pad_to=pad_to, pad_side="left")
         with torch.no_grad():
             # «Vocabulary expanded» в логе — предупреждение процессора; здесь
             # явно убеждаемся, что все id помещаются в таблицу эмбеддингов
@@ -633,9 +648,7 @@ def main() -> None:
             # vlen — ДОПОЛНЕННАЯ длина префикса. Она входит в base_pos для
             # позиционных id токенов действия, поэтому при padding=True зависит
             # от состава батча. Логируем, чтобы это было видно.
-            vlens.append((int(sel_t[0]), B, int(vlen), int(pad_to)))
-            assert int(batch["input_ids"].shape[1]) == int(pad_to), (
-                "внутри группы паддинга быть не должно")
+            vlens.append((int(sel_t[0]), B, int(vlen)))
 
             # ПРИЗНАК уровня наблюдения: усреднённый контекст VLM
             # masked mean. При группировке по длине паддинга внутри группы нет,
@@ -804,12 +817,9 @@ def main() -> None:
                 Lab["p"].append(np.full(B, p_, np.int16))
         return
 
-    done = 0
-    for ln, gi in sorted(groups.items()):
-        for j in range(0, len(gi), args.batch):
-            run_batch(gi[j:j + args.batch], ln)
-            done += len(gi[j:j + args.batch])
-            print(f"наблюдения {done}/{N} (длина {ln})", flush=True)
+    for lo in range(0, N, args.batch):
+        run_batch(np.arange(lo, min(lo + args.batch, N)), None)
+        print(f"наблюдения {min(lo + args.batch, N)}/{N}", flush=True)
 
     # ---------------- сборка ----------------
     # Признаки и сырые метки копились блоками формы (B, ...) в одном порядке
@@ -880,10 +890,8 @@ def main() -> None:
                 tau_by_p=[float(x) for x in labels["tau_by_p"]],
                 pos_offset=args.pos_offset, window=args.window,
                 vlm_dtype=args.vlm_dtype,
-                padding_protocol="группировка по естественной длине "
-                                 "(семантика batch=1, см. k4b0_padding_probe)",
-                nat_len_min=int(nat.min()), nat_len_max=int(nat.max()),
-                nat_len_groups=len(groups),
+                padding_protocol="левый паддинг, как в eval_libero; "
+                                 "эквивалентен отсутствию паддинга",
                 metric_table="MSE, нормировка на scale**2",
                 metric_primary="RMS (как в воротах B1)",
                 continuous_channels=int(D_act - 1), scale=scale,
