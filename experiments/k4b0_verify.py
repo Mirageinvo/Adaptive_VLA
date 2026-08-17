@@ -154,6 +154,55 @@ def main() -> None:
     print("  фаза A на 96 наблюдениях давала  0.93 / 0.91 / 0.79")
 
     print("\n" + "=" * 74)
+    print("ПЛАНКА ДЛЯ B1: ПРИЧИННЫЕ BASELINE НА ЭТОМ ЖЕ ДАТАСЕТЕ")
+    print("=" * 74)
+    print("  Числа фазы A (0.40 / 0.79 / 0.91) получены на ДРУГОЙ выборке и с\n"
+          "  другой длиной паддинга, поэтому переносить их нельзя — router\n"
+          "  сравнивается с тем, что измерено здесь.")
+    ent, mrg = ft["cand_entropy"], ft["cand_margin"]
+    pcol = lb["p"]
+    rs = np.random.default_rng(1)
+    for s_, nm in ((2, "test"), (1, "val")):
+        ii = idx[(sp == s_)[idx]]
+        if len(ii) < 20:
+            continue
+        base = np.sqrt(e0[ii]).sum()
+        print(f"\n  {nm} (n={len(ii)}), доля закрытого разрыва:")
+        print(f"  {'способ отбора':>28}" + "".join(f"{f'K={K}':>10}"
+                                                   for K in (1, 2, 4)))
+        rows = {}
+        for K in (1, 2, 4):
+            acc = {k: 0.0 for k in
+                   ("энтропия (прич.)", "малый запас (прич.)",
+                    "только p (прич.)", "окно вокруг p (прич.)",
+                    "случайно, 20 сид. (прич.)", "одиночный оракул",
+                    "жадный оракул", "точный оракул <=K")}
+            for i in ii:
+                gmap, C = make_gmap(lb, int(i), P, kmax)
+                pp = int(pcol[i])
+                acc["энтропия (прич.)"] += to_rms(
+                    e0[i], g_of(gmap, C, np.argsort(-ent[i])[:K]))
+                acc["малый запас (прич.)"] += to_rms(
+                    e0[i], g_of(gmap, C, np.argsort(mrg[i])[:K]))
+                acc["только p (прич.)"] += to_rms(e0[i], g_of(gmap, C, (pp,)))
+                w0 = min(max(pp - K // 2, 0), P - K)
+                acc["окно вокруг p (прич.)"] += to_rms(
+                    e0[i], g_of(gmap, C, range(w0, w0 + K)))
+                r = np.mean([g_of(gmap, C, rs.choice(P, K, replace=False))
+                             for _ in range(20)])
+                acc["случайно, 20 сид. (прич.)"] += to_rms(e0[i], r)
+                acc["одиночный оракул"] += to_rms(
+                    e0[i], g_of(gmap, C, np.argsort(-lb["sing_gain_rms"][i])[:K]))
+                acc["жадный оракул"] += to_rms(
+                    e0[i], g_of(gmap, C,
+                                [q for q in lb["add_path"][i][:K] if q >= 0]))
+                acc["точный оракул <=K"] += lb["best_gain_by_k_rms"][i, K]
+            for k, v in acc.items():
+                rows.setdefault(k, {})[K] = v / base
+        for k, r in rows.items():
+            print(f"  {k:>28}" + "".join(f"{r[K]:>10.3f}" for K in (1, 2, 4)))
+
+    print("\n" + "=" * 74)
     print("СТАТИСТИКА МЕТОК ПО SPLIT")
     print("=" * 74)
     print(f"  {'split':>7}{'строк':>8}{'нечего чинить':>16}{'вредных в supp':>16}"
