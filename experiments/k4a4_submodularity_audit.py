@@ -304,13 +304,18 @@ def analyze(G, chg, epi, pos, task, floor_om, P, args, dh=None) -> None:
     print("\nВЕЛИЧИНА НАРУШЕНИЯ (нормировка на СВОЙ g1_i каждого вмешательства)")
     print(f"  исключено вмешательств с вырожденным g1: "
           f"{(~ok_g1).sum()} из {n_rows}")
-    rel = np.abs(om) / np.maximum(g1[:, None], 1e-30)
+    # Нормировка на g1_i неустойчива в хвосте: g1_i бывает чуть выше порога при
+    # крупной Omega, и максимум разлетается. Нормировка на G_i* ограничена
+    # сверху смыслом задачи, поэтому приводится рядом и читать надо её.
+    ok_gb0 = gbest > tau
     for nm, msk in (("содержательные", nz), ("пары из top-4", hi)):
-        v = rel[viol & msk & ok_g1[:, None]]
-        if v.size:
-            print(f"  {nm:>38}: медиана {np.median(v):.2%}, "
-                  f"90-й {np.percentile(v, 90):.2%}, "
-                  f"99-й {np.percentile(v, 99):.2%}, макс {v.max():.2%}")
+        for base, bn, okm in ((g1, "g1_i", ok_g1), (gbest, "G_i*", ok_gb0)):
+            v = (np.abs(om) / np.maximum(base[:, None], 1e-30))[
+                viol & msk & okm[:, None]]
+            if v.size:
+                print(f"  {nm:>24} / {bn:>5}: медиана {np.median(v):>7.2%}, "
+                      f"90-й {np.percentile(v, 90):>8.2%}, "
+                      f"99-й {np.percentile(v, 99):>9.2%}")
 
     print("\nСВИП ПОРОГА: доля нарушений при разных tau/g1")
     print(f"  {'tau/g1':>10}{'содержательные':>18}{'top-4':>12}"
