@@ -485,6 +485,9 @@ def main() -> None:
         token_budget=P * L, num_blocks=L,
         action_vocab_size=tok.vocab_size).to(args.device).eval()
     bs, nb = model.block_size, model.num_blocks
+    print(f"dtype модели по факту: {next(model.parameters()).dtype} "
+          f"(запрошен {args.vlm_dtype})")
+    vlens = []
 
     # РАНГИ ВМЕШАТЕЛЬСТВА фиксируются ДО батчевого цикла отдельным numpy RNG.
     # Раньше сид зависел от смещения батча, поэтому --batch 8 и --batch 16 дали
@@ -563,6 +566,13 @@ def main() -> None:
                 d = (dec(h)[:, :args.window]
                      - ref[:, :args.window]).abs()[..., :D_act - 1]
                 return d.flatten(1).pow(2).mean(-1) / scale ** 2
+
+            # vlen — ДОПОЛНЕННАЯ длина префикса. Она входит в base_pos для
+            # позиционных id токенов действия, поэтому при padding=True зависит
+            # от состава батча. Логируем, чтобы это было видно.
+            vlens.append((lo, hi, int(vlen), int(batch["input_ids"].shape[1])))
+            print(f"    батч [{lo}:{hi}]: vlen {int(vlen)}, "
+                  f"input_ids {int(batch['input_ids'].shape[1])}", flush=True)
 
             # ПРИЗНАК уровня наблюдения: усреднённый контекст VLM
             F["obs_pooled_ctx"].append(VLM.float().mean(1).cpu().numpy())
