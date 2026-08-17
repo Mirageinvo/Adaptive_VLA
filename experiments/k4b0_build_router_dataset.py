@@ -732,6 +732,26 @@ def main() -> None:
     if HID is not None:
         assert row0[0] == n_int, f"скрытых состояний {row0[0]} против {n_int}"
 
+    # КАНОНИЧЕСКИЙ ПОРЯДОК СТРОК: (наблюдение, позиция p). Порядок накопления
+    # зависит от размера батча — при --batch 16 сначала идут все наблюдения
+    # батча при p=0, при --batch 8 то же, но батчи короче. Содержимое одно, а
+    # раскладка разная, и файлы становятся несравнимыми. Сортировка это снимает.
+    perm = np.lexsort((raw["p"], raw["obs_idx"]))
+    lens = np.diff(raw["g_off"])
+    raw["g_flat"] = np.concatenate(
+        [raw["g_flat"][raw["g_off"][i]:raw["g_off"][i + 1]] for i in perm])
+    raw["g_off"] = np.concatenate([[0], np.cumsum(lens[perm])]).astype(np.int64)
+    for k in list(raw):
+        if k not in ("g_flat", "g_off"):
+            raw[k] = raw[k][perm]
+    for k in list(feats):
+        if k.startswith(("int_", "cand_")):
+            feats[k] = feats[k][perm]
+    if HID is not None:
+        HID[:n_int] = HID[:n_int][perm]
+    assert (np.diff(raw["obs_idx"] * P + raw["p"]) > 0).all(), \
+        "канонический порядок строк нарушен"
+
     split_int = SPLIT[raw["obs_idx"]]
     print("\nвывод производных меток (пороги — только по train)...")
     labels = dict(raw)
@@ -764,7 +784,13 @@ def main() -> None:
                 feature_keys=sorted(feats), hidden_file=(HIDDEN_FILE
                                                          if HID is not None else None),
                 hidden_dim=(int(hid_dim) if HID is not None else None),
-                tasks=uniq_tasks, batch_independent_ranks=True,
+                tasks=uniq_tasks, batch=args.batch,
+                batch_independent_ranks=True,
+                # Ранги вмешательства и порядок строк от батча не зависят. Но
+                # логиты VLM в bfloat16 зависят: при почти равных значениях
+                # topk/argmax переворачиваются, и выбранный код u может стать
+                # другим. Побитовое воспроизведение требует ТОГО ЖЕ --batch.
+                bitwise_repro_requires_same_batch=True,
                 split_counts={k: int((SPLIT == i).sum())
                               for i, k in enumerate(("train", "val", "test"))})
     with open(mp, "w") as fh:
