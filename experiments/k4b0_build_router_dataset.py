@@ -157,7 +157,8 @@ def load_lerobot_b0(n_obs: int, T: int, n_ep: int, seed: int):
             tasks[:k], epi)
 
 
-def split_by_episode(epi, tasks, fracs=(0.70, 0.15, 0.15), seed: int = 0):
+def split_by_episode(epi, tasks, fracs=(0.70, 0.15, 0.15), seed: int = 0,
+                     task_in_train: bool = True):
     """Разбиение ПО ЭПИЗОДАМ со стратификацией ПО ЗАДАЧАМ.
 
     Наивное «round(0.15 * n) эпизодов задачи в validation» непригодно: в LIBERO
@@ -176,10 +177,21 @@ def split_by_episode(epi, tasks, fracs=(0.70, 0.15, 0.15), seed: int = 0):
         ep_task.setdefault(int(e), t)
     out, have = {}, np.zeros(3)
     fr = np.asarray(fracs, float)
+    by_task = {}
     for t in sorted(set(ep_task.values())):
         eps = np.array(sorted(e for e, tt in ep_task.items() if tt == t))
         rng.shuffle(eps)
-        for e in eps:
+        by_task[t] = eps
+    # ПЕРВЫЙ эпизод каждой задачи уходит в train. Иначе задача может целиком
+    # оказаться в val/test, и замер незаметно превратится в перенос на НОВЫЕ
+    # задачи — другой протокол, который надо объявлять явно, а не получать
+    # случайно. Для протокола переноса ставить task_in_train=False.
+    if task_in_train:
+        for t, eps in by_task.items():
+            out[int(eps[0])] = 0
+            have[0] += 1
+    for t, eps in by_task.items():
+        for e in (eps[1:] if task_in_train else eps):
             s = int(np.argmax(fr * (have.sum() + 1.0) - have))
             out[int(e)] = s
             have[s] += 1
@@ -381,6 +393,10 @@ def main() -> None:
                     help="порог значимости в долях g1; как в K-4a4")
     ap.add_argument("--gap-rel", type=float, default=1e-2,
                     help="G* ниже этой доли медианного G* -> ремонтировать нечего")
+    ap.add_argument("--task-in-train", type=int, default=1,
+                    help="1 — гарантировать хотя бы один эпизод каждой задачи "
+                         "в train (обобщение на новые эпизоды); 0 — допускать "
+                         "задачи только в val/test (перенос на новые задачи)")
     ap.add_argument("--save-hidden", type=int, default=1,
                     help="сохранять скрытые состояния действия старого прохода "
                          "отдельным .npy; это сильнейший причинный признак")
@@ -437,7 +453,8 @@ def main() -> None:
     IM1, IM2, ST_RAW, A_, TASKS, EPI = load_lerobot_b0(
         args.n_obs, T, args.n_ep, args.seed)
     N = len(TASKS)
-    SPLIT = split_by_episode(EPI, TASKS, seed=args.seed)
+    SPLIT = split_by_episode(EPI, TASKS, seed=args.seed,
+                         task_in_train=bool(args.task_in_train))
     st_all = ((ST_RAW - STATE_Q01) / (STATE_Q99 - STATE_Q01) * 2.0
               - 1.0).astype(np.float32)
     A_ = np.asarray(A_, np.float32).copy()
@@ -682,6 +699,11 @@ def main() -> None:
 
                 # ---- в цикле копим ТОЛЬКО сырое: таблицу и её смещения
                 for b in range(B):
+                    # G(пусто) = 0 ПО ОПРЕДЕЛЕНИЮ. Из-за разной композиции
+                    # батча порядок редукции в декодере отличается, и выходит
+                    # ~1e-9 вместо нуля — на три порядка ниже порога, но
+                    # тождество лучше не размывать.
+                    gg_all[b][0] = 0.0
                     Lab["g_flat"].append(gg_all[b])
                     g_off.append(g_off[-1] + len(gg_all[b]))
                 Lab["e_empty"].append(e0.cpu().numpy())
