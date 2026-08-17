@@ -393,6 +393,13 @@ def main() -> None:
                     help="порог значимости в долях g1; как в K-4a4")
     ap.add_argument("--gap-rel", type=float, default=1e-2,
                     help="G* ниже этой доли медианного G* -> ремонтировать нечего")
+    ap.add_argument("--vlm-dtype", default="bfloat16",
+                    choices=["bfloat16", "float32"],
+                    help="точность VLM. В bf16 (8 бит мантиссы) argmax по 2048 "
+                         "кодам переворачивается на почти-ничьих при смене "
+                         "композиции батча. На V100 bf16 всё равно эмулируется "
+                         "на FP32-ядрах (K-4a3), то есть float32 там почти "
+                         "бесплатен и заметно устойчивее")
     ap.add_argument("--task-in-train", type=int, default=1,
                     help="1 — гарантировать хотя бы один эпизод каждой задачи "
                          "в train (обобщение на новые эпизоды); 0 — допускать "
@@ -472,7 +479,8 @@ def main() -> None:
     from smolvla.bar import SmolVLABlockwiseAR
 
     model = SmolVLABlockwiseAR.from_pretrained(
-        args.ckpt, trust_remote_code=True, dtype=torch.bfloat16,
+        args.ckpt, trust_remote_code=True,
+        dtype=getattr(torch, args.vlm_dtype),
         token_budget=P * L, num_blocks=L,
         action_vocab_size=tok.vocab_size).to(args.device).eval()
     bs, nb = model.block_size, model.num_blocks
@@ -777,6 +785,7 @@ def main() -> None:
                 gap_rel=args.gap_rel, gap_threshold=float(labels["gap_threshold"]),
                 tau_by_p=[float(x) for x in labels["tau_by_p"]],
                 pos_offset=args.pos_offset, window=args.window,
+                vlm_dtype=args.vlm_dtype,
                 metric_table="MSE, нормировка на scale**2",
                 metric_primary="RMS (как в воротах B1)",
                 continuous_channels=int(D_act - 1), scale=scale,
