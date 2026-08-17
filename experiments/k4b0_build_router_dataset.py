@@ -540,15 +540,29 @@ def main() -> None:
     # последний батч дал vlen 174 против 175 у остальных, и 74 вмешательства из
     # 512 сменили changed-support. К точности это отношения не имеет — на
     # float32 числа совпали до последней цифры.
-    print("первый проход: общая длина паддинга...")
-    pad_to = 0
+    # ПЕРВЫЙ ПРОХОД: ЕСТЕСТВЕННАЯ длина каждого наблюдения.
+    # Замер k4b0_padding_probe: при паддинге до общей длины z_ref совпадает с
+    # инференсом лишь в 27% наблюдений, Спирмен одиночных выигрышей 0.47.
+    # Агрегаты устойчивы, поэкземплярная структура — нет, а router предсказывает
+    # именно поэкземплярно. Поэтому наблюдения ГРУППИРУЮТСЯ ПО ДЛИНЕ и внутри
+    # группы паддинга нет вовсе: получается ровно семантика batch=1, но с
+    # батчингом. Естественная длина берётся из attention_mask, без отдельных
+    # прогонов по одному.
+    print("первый проход: естественные длины наблюдений...")
+    nat = np.zeros(N, np.int64)
     for lo in range(0, N, args.batch):
         hi = min(lo + args.batch, N)
         bb = build_batch(IM1[lo:hi], IM2[lo:hi], TASKS[lo:hi], st_all[lo:hi],
                          proc, args, "cpu")
-        pad_to = max(pad_to, int(bb["input_ids"].shape[1]))
+        am = bb.get("attention_mask")
+        nat[lo:hi] = (am.sum(1).numpy() if am is not None
+                      else bb["input_ids"].shape[1])
         del bb
-    print(f"  общая длина паддинга: {pad_to} токенов\n")
+    groups = {int(v): np.where(nat == v)[0] for v in np.unique(nat)}
+    print(f"  длины: мин {nat.min()}, макс {nat.max()}, "
+          f"различных {len(groups)}")
+    print("  " + ", ".join(f"{k}:{len(v)}" for k, v in sorted(groups.items())))
+    print()
 
     row0 = [0]          # счётчик строк: последний батч короче, арифметика по lo неверна
 
@@ -562,12 +576,14 @@ def main() -> None:
     g_off = [0]
     verify = []
 
-    def run_batch(lo, hi):
+    def run_batch(sel, pad_to):
+        """sel — произвольный набор индексов наблюдений ОДНОЙ длины."""
         nonlocal verify
-        B = hi - lo
+        B = len(sel)
         args_ns = args
-        batch = build_batch(IM1[lo:hi], IM2[lo:hi], TASKS[lo:hi],
-                            st_all[lo:hi], proc, args_ns, args.device,
+        sel_t = np.asarray(sel)
+        batch = build_batch(IM1[sel_t], IM2[sel_t], [TASKS[i] for i in sel_t],
+                            st_all[sel_t], proc, args_ns, args.device,
                             pad_to=pad_to)
         with torch.no_grad():
             # «Vocabulary expanded» в логе — предупреждение процессора; здесь
@@ -610,13 +626,14 @@ def main() -> None:
             # vlen — ДОПОЛНЕННАЯ длина префикса. Она входит в base_pos для
             # позиционных id токенов действия, поэтому при padding=True зависит
             # от состава батча. Логируем, чтобы это было видно.
-            vlens.append((lo, hi, int(vlen), int(batch["input_ids"].shape[1])))
-            print(f"    батч [{lo}:{hi}]: vlen {int(vlen)}, "
-                  f"input_ids {int(batch['input_ids'].shape[1])}", flush=True)
+            vlens.append((int(sel_t[0]), B, int(vlen), int(pad_to)))
+            assert int(batch["input_ids"].shape[1]) == int(pad_to), (
+                "внутри группы паддинга быть не должно")
 
             # ПРИЗНАК уровня наблюдения: усреднённый контекст VLM
-            # masked mean: при фиксированном pad_to в среднее иначе попадают
-            # дополняющие позиции, и признак зависит от длины паддинга
+            # masked mean. При группировке по длине паддинга внутри группы нет,
+            # но маска оставлена: она делает признак корректным независимо от
+            # режима и ничего не стоит
             am = batch.get("attention_mask")
             if am is None:
                 pooled = VLM.float().mean(1)
@@ -624,8 +641,8 @@ def main() -> None:
                 w = am[:, :VLM.shape[1]].to(VLM.dtype).unsqueeze(-1).float()
                 pooled = (VLM.float() * w).sum(1) / w.sum(1).clamp_min(1.0)
             F["obs_pooled_ctx"].append(pooled.cpu().numpy())
-            F["obs_task_idx"].append(task_idx[lo:hi])
-            F["obs_state"].append(st_all[lo:hi])
+            F["obs_task_idx"].append(task_idx[sel_t])
+            F["obs_state"].append(st_all[sel_t])
 
             hist = None
             for _ in range(nb):
@@ -639,7 +656,7 @@ def main() -> None:
 
             for p_ in range(P):
                 ranks = lg0[:, p_].topk(args.rank_hi, -1).indices
-                rk = torch.as_tensor(rank_table[lo:hi, p_], device=args.device)
+                rk = torch.as_tensor(rank_table[sel_t, p_], device=args.device)
                 u = ranks[ar, rk]
                 v = z_ref[:, p_, 0]
                 c0_old = z_ref[:, :, 0].clone()
@@ -668,7 +685,7 @@ def main() -> None:
 
                 eu, ev = E[0][u], E[0][v]
                 de = (ev - eu).float()
-                F["int_obs_idx"].append(np.arange(lo, hi))
+                F["int_obs_idx"].append(sel_t.copy())
                 F["int_p"].append(np.full(B, p_, np.int16))
                 F["int_u"].append(u.cpu().numpy().astype(np.int32))
                 F["int_v"].append(v.cpu().numpy().astype(np.int32))
@@ -744,7 +761,7 @@ def main() -> None:
                 flush()
 
                 # ---- ПРОВЕРКА СЖАТИЯ: полный перебор против G(S ∩ C)
-                if lo == 0 and p_ == 0 and args.verify_full:
+                if verify_now and p_ == 0 and args.verify_full:
                     full_sets = [S for k in range(args.kmax + 1)
                                  for S in itertools.combinations(range(P), k)]
                     for b in range(min(args.verify_full, B)):
@@ -775,13 +792,17 @@ def main() -> None:
                     g_off.append(g_off[-1] + len(gg_all[b]))
                 Lab["e_empty"].append(e0.cpu().numpy())
                 Lab["support"].append(supp.cpu().numpy())
-                Lab["obs_idx"].append(np.arange(lo, hi))
+                Lab["obs_idx"].append(sel_t.copy())
                 Lab["p"].append(np.full(B, p_, np.int16))
         return
 
-    for lo in range(0, N, args.batch):
-        run_batch(lo, min(lo + args.batch, N))
-        print(f"наблюдения {min(lo + args.batch, N)}/{N}", flush=True)
+    done, verify_now = 0, True
+    for ln, gi in sorted(groups.items()):
+        for j in range(0, len(gi), args.batch):
+            run_batch(gi[j:j + args.batch], ln)
+            verify_now = False
+            done += len(gi[j:j + args.batch])
+            print(f"наблюдения {done}/{N} (длина {ln})", flush=True)
 
     # ---------------- сборка ----------------
     # Признаки и сырые метки копились блоками формы (B, ...) в одном порядке
@@ -844,7 +865,11 @@ def main() -> None:
                 gap_rel=args.gap_rel, gap_threshold=float(labels["gap_threshold"]),
                 tau_by_p=[float(x) for x in labels["tau_by_p"]],
                 pos_offset=args.pos_offset, window=args.window,
-                vlm_dtype=args.vlm_dtype, pad_to=int(pad_to),
+                vlm_dtype=args.vlm_dtype,
+                padding_protocol="группировка по естественной длине "
+                                 "(семантика batch=1, см. k4b0_padding_probe)",
+                nat_len_min=int(nat.min()), nat_len_max=int(nat.max()),
+                nat_len_groups=len(groups),
                 metric_table="MSE, нормировка на scale**2",
                 metric_primary="RMS (как в воротах B1)",
                 continuous_channels=int(D_act - 1), scale=scale,
