@@ -64,6 +64,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # БЕЛЫЙ СПИСОК признаков. Всё, чего здесь нет, в features.npz не попадёт.
 FEATURE_KEYS = {
+    # константа кодека: позволяет ВОССТАНОВИТЬ полные векторы, не храня их
+    #   delta_emb   = codebook_proj[0][int_v] - codebook_proj[0][int_u]
+    #   cand_latent = sum_j codebook_proj[j][cand_old_tokens[..., j]]
+    # это точно и на два порядка компактнее, чем хранить сами векторы
+    "codebook_proj",
     # уровень наблюдения
     "obs_pooled_ctx", "obs_task_idx", "obs_state",
     # уровень вмешательства (наблюдение + позиция правки p)
@@ -71,10 +76,13 @@ FEATURE_KEYS = {
     "int_coarse_delta_norm", "int_coarse_cos", "int_logp_diff",
     "int_rank_u", "int_logp_u", "int_logp_v",
     # уровень кандидата q, форма (n_int, P, ...)
-    "cand_entropy", "cand_margin", "cand_topk_p", "cand_old_tokens",
-    "cand_q", "cand_dq", "cand_absdq", "cand_is_p",
+    "cand_entropy", "cand_margin", "cand_topk_p", "cand_topk_idx",
+    "cand_old_tokens", "cand_q", "cand_dq", "cand_absdq", "cand_is_p",
     "cand_latent_norm", "cand_coarse_logp", "cand_coarse_entropy",
 }
+# скрытые состояния действия из СТАРОГО прохода лежат отдельным файлом:
+# массив крупный, и в npz он мешал бы ленивой загрузке
+HIDDEN_FILE = "features_hidden.npy"
 FORBIDDEN_SUBSTR = ("ref", "after", "js", "oracle", "gain", "label",
                     "changed", "support", "true", "target")
 
@@ -187,10 +195,16 @@ def subsets_of(C, kmax: int = 4):
 def greedy_paths(gmap, C, tau: float, kmax: int = 4):
     """Три траектории из СЖАТОЙ таблицы, без единого вызова модели.
 
+    Порядок жадного отбора одинаков для MSE и RMS: максимум выигрыша — это
+    минимум остаточной ошибки, а корень монотонен. Различается только момент
+    ОСТАНОВКИ, поэтому tau задаётся на основной метрике (RMS).
+
     ADD          — жадное добавление ровно kmax шагов;
     ADD+STOP     — остановка, когда предельный выигрыш не превышает tau;
-    ADD/REM/STOP — на каждом шаге рассматриваются и удаления; отвечает
-                   обратимой постановке и мотивирован немонотонностью."""
+    ADD/REM/STOP — на каждом шаге рассматриваются и удаления. Каждый шаг строго
+                   увеличивает G более чем на tau, поэтому состояние не может
+                   повториться и искусственный предел длины не нужен; множество
+                   посещённых состояний оставлено лишь как страховка."""
     def g(S):
         return gmap[tuple(sorted(S))]
 
@@ -209,27 +223,148 @@ def greedy_paths(gmap, C, tau: float, kmax: int = 4):
             break
         stop_k = i + 1
 
-    S, rev = (), []
-    while True:
+    S, acts, qs_, seen = (), [], [], {()}
+    while len(acts) < 4 * kmax + 4:
         best = (tau, None, None)
         for q in C:
             if q in S:
-                if len(S) > 0:
-                    d = g(tuple(x for x in S if x != q)) - g(S)
-                    if d > best[0]:
-                        best = (d, "rem", q)
+                Tn = tuple(x for x in S if x != q)
+                a_ = 0
             elif len(S) < kmax:
-                d = g(tuple(sorted(S + (q,)))) - g(S)
-                if d > best[0]:
-                    best = (d, "add", q)
+                Tn = tuple(sorted(S + (q,)))
+                a_ = 1
+            else:
+                continue
+            d = g(Tn) - g(S)
+            if d > best[0]:
+                best = (d, a_, q)
         if best[1] is None:
             break
-        rev.append((1 if best[1] == "add" else -1) * (best[2] + 1))
-        S = (tuple(sorted(S + (best[2],))) if best[1] == "add"
-             else tuple(x for x in S if x != best[2]))
-        if len(rev) > 2 * kmax:          # защита от зацикливания
+        q = best[2]
+        acts.append(best[1])
+        qs_.append(q)
+        S = (tuple(sorted(S + (q,))) if best[1] == 1
+             else tuple(x for x in S if x != q))
+        if S in seen:
             break
-    return add, marg, stop_k, rev, tuple(sorted(S))
+        seen.add(S)
+    return add, marg, stop_k, acts, qs_, tuple(sorted(S))
+
+
+def derive_labels(raw, split, P, kmax, tau_rel, gap_rel):
+    """Все производные метки — ОТДЕЛЬНО от основного цикла.
+
+    Так пороги считаются ТОЛЬКО по train и применяются к val/test без
+    изменений, а любая правка правил пересчитывается без GPU.
+
+    Основная метрика — RMS, потому что ворота B1 (0.40 / 0.79 / 0.91 / 0.93)
+    получены на ней. Таблица хранится в MSE, перевод точный:
+
+        e_S = e_empty - G_mse(S)
+        G_rms(S) = sqrt(e_empty) - sqrt(max(e_S, 0))
+    """
+    gf, off = raw["g_flat"], raw["g_off"]
+    e0 = raw["e_empty"].astype(np.float64)
+    supp = raw["support"]
+    n = len(e0)
+    out = {}
+
+    def tbl(i):
+        C = [q for q in range(P) if supp[i] >> q & 1]
+        subs = subsets_of(C, kmax)
+        v = gf[off[i]:off[i + 1]].astype(np.float64)
+        return C, {tuple(sorted(S)): v[j] for j, S in enumerate(subs)}
+
+    def to_rms(i, g_mse):
+        return np.sqrt(e0[i]) - np.sqrt(max(e0[i] - g_mse, 0.0))
+
+    sing_mse = np.zeros((n, P), np.float32)
+    sing_rms = np.zeros((n, P), np.float32)
+    gstar_mse = np.zeros(n, np.float32)
+    gstar_rms = np.zeros(n, np.float32)
+    for i in range(n):
+        C, gm = tbl(i)
+        for q in C:
+            sing_mse[i, q] = gm[(q,)]
+            sing_rms[i, q] = to_rms(i, gm[(q,)])
+        bm = max(0.0, max(gm.values()))
+        gstar_mse[i] = bm
+        gstar_rms[i] = to_rms(i, bm)
+
+    # ПОРОГИ ТОЛЬКО ПО TRAIN, отдельно для каждой позиции вмешательства p.
+    # В K-4a4 порог строился по агрегированному масштабу выигрыша, а не по
+    # максимуму конкретного примера; здесь то же правило.
+    tr = split == 0
+    tau_p = np.zeros(P, np.float64)
+    for p_ in range(P):
+        m = tr & (raw["p"] == p_)
+        med = float(np.median(sing_rms[m].max(1))) if m.any() else 0.0
+        tau_p[p_] = max(1e-9, tau_rel * med)
+    tau = tau_p[raw["p"]]
+    gap_thr = gap_rel * float(np.median(gstar_rms[tr]))
+
+    out["sing_gain_mse"] = sing_mse
+    out["sing_gain_rms"] = sing_rms
+    out["g_star_mse"] = gstar_mse
+    out["g_star_rms"] = gstar_rms
+    out["tau"] = tau.astype(np.float32)
+    out["tau_by_p"] = tau_p.astype(np.float32)
+    out["gap_threshold"] = np.float32(gap_thr)
+    out["gap_valid"] = (gstar_rms > gap_thr)
+    out["no_repair"] = ~out["gap_valid"]
+    # нормируем ТОЛЬКО там, где ремонтировать есть что; иначе метка неустойчива
+    nrm = np.zeros((n, P), np.float32)
+    gv = out["gap_valid"]
+    nrm[gv] = sing_rms[gv] / gstar_rms[gv, None]
+    out["sing_gain_norm"] = nrm
+    # знак по ПОРОГУ, а не по сравнению с нулём: 1 полезна, 0 нейтральна, -1 вредна
+    sign = np.zeros((n, P), np.int8)
+    sign[sing_rms > tau[:, None]] = 1
+    sign[sing_rms < -tau[:, None]] = -1
+    out["sing_sign"] = sign
+
+    # ЛУЧШИЙ НАБОР ПО БЮДЖЕТАМ. Для оракула «ровно K» и «не более K» дают
+    # ОДИНАКОВЫЙ выигрыш: недостающие слоты добиваются позициями вне support,
+    # которые ничего не меняют. Различается ЦЕНА: фиксированный бюджет тратит K
+    # всегда, адаптивный — best_size_by_k. Поэтому выигрыш хранится один раз, а
+    # рядом лежит фактический размер.
+    bs = np.full((n, kmax + 1, kmax), -1, np.int16)
+    bg_mse = np.zeros((n, kmax + 1), np.float32)
+    bg_rms = np.zeros((n, kmax + 1), np.float32)
+    bsz = np.zeros((n, kmax + 1), np.int8)
+    add_p = np.full((n, kmax), -1, np.int16)
+    add_m = np.zeros((n, kmax), np.float32)
+    stop = np.zeros(n, np.int8)
+    rev_a = np.full((n, 4 * kmax + 4), -1, np.int8)
+    rev_q = np.full((n, 4 * kmax + 4), -1, np.int16)
+    rev_l = np.zeros(n, np.int16)
+    rev_s = np.full((n, kmax), -1, np.int16)
+    for i in range(n):
+        C, gm = tbl(i)
+        for K in range(kmax + 1):
+            best, bv = (), -1e30
+            for S, g in gm.items():
+                if len(S) <= K and g > bv:
+                    best, bv = S, g
+            bs[i, K, :len(best)] = best
+            bg_mse[i, K] = bv
+            bg_rms[i, K] = to_rms(i, bv)
+            bsz[i, K] = len(best)
+        # траектории считаются на RMS: порядок тот же, но STOP по основной метрике
+        gm_r = {S: to_rms(i, g) for S, g in gm.items()}
+        a_, m_, sk, ra, rq, rs = greedy_paths(gm_r, C, float(tau[i]), kmax)
+        add_p[i, :len(a_)] = a_
+        add_m[i, :len(m_)] = m_
+        stop[i] = sk
+        rev_a[i, :len(ra)] = ra
+        rev_q[i, :len(rq)] = rq
+        rev_l[i] = len(ra)
+        rev_s[i, :len(rs)] = rs
+    out.update(best_set_by_k=bs, best_gain_by_k_mse=bg_mse,
+               best_gain_by_k_rms=bg_rms, best_size_by_k=bsz,
+               add_path=add_p, add_marg_rms=add_m, stop_k=stop,
+               rev_action=rev_a, rev_q=rev_q, rev_len=rev_l, rev_set=rev_s)
+    return out
 
 
 def main() -> None:
@@ -246,6 +381,9 @@ def main() -> None:
                     help="порог значимости в долях g1; как в K-4a4")
     ap.add_argument("--gap-rel", type=float, default=1e-2,
                     help="G* ниже этой доли медианного G* -> ремонтировать нечего")
+    ap.add_argument("--save-hidden", type=int, default=1,
+                    help="сохранять скрытые состояния действия старого прохода "
+                         "отдельным .npy; это сильнейший причинный признак")
     ap.add_argument("--verify-full", type=int, default=8,
                     help="на скольких вмешательствах сверить сжатие с полным "
                          "перебором 2517 наборов")
@@ -322,11 +460,37 @@ def main() -> None:
         action_vocab_size=tok.vocab_size).to(args.device).eval()
     bs, nb = model.block_size, model.num_blocks
 
+    # РАНГИ ВМЕШАТЕЛЬСТВА фиксируются ДО батчевого цикла отдельным numpy RNG.
+    # Раньше сид зависел от смещения батча, поэтому --batch 8 и --batch 16 дали
+    # бы РАЗНЫЕ вмешательства и несравнимые датасеты.
+    rank_table = np.random.default_rng(10_000 + args.seed).integers(
+        args.rank_lo, args.rank_hi, size=(N, P))
+
+    # Скрытые состояния позиций действия из УЖЕ СОСТОЯВШЕГОСЯ прохода —
+    # сильнейший причинный признак. Берём предвызовным хуком на action_lm_head
+    # (третий код при этом не правится).
+    _cap = {}
+
+    def _grab(_m, inp):
+        _cap["h"] = inp[0].detach()
+
+    model.action_lm_head.register_forward_pre_hook(_grab)
+    hid_dim = int(model.action_lm_head.in_features)
+    HID = (np.zeros((N * P, P, hid_dim), np.float16)
+           if args.save_hidden else None)
+    if HID is not None:
+        print(f"скрытые состояния: {HID.shape}, "
+              f"{HID.nbytes / 1e6:.0f} МБ (float16)")
+
+    row0 = [0]          # счётчик строк: последний батч короче, арифметика по lo неверна
+
     F = {k: [] for k in FEATURE_KEYS}
-    Lab = {k: [] for k in
-           ("sing_gain", "e_empty", "g_star", "support", "g_flat", "g_off",
-            "best_exact_k", "best_le_k", "add_path", "add_marg", "stop_k",
-            "rev_path", "rev_set", "tau", "obs_idx", "p")}
+    F["codebook_proj"] = [E.float().cpu().numpy().astype(np.float16)]
+    # В ЦИКЛЕ копятся только СЫРЫЕ метки. Всё производное (пороги, знаки,
+    # нормировки, наборы по бюджетам, траектории) считается потом в
+    # derive_labels: тогда пороги берутся только по train и любая правка правил
+    # пересчитывается без GPU.
+    Lab = {k: [] for k in ("e_empty", "support", "g_flat", "obs_idx", "p")}
     g_off = [0]
     verify = []
 
@@ -337,6 +501,12 @@ def main() -> None:
         batch = build_batch(IM1[lo:hi], IM2[lo:hi], TASKS[lo:hi],
                             st_all[lo:hi], proc, args_ns, args.device)
         with torch.no_grad():
+            # «Vocabulary expanded» в логе — предупреждение процессора; здесь
+            # явно убеждаемся, что все id помещаются в таблицу эмбеддингов
+            emb = model.vlm.text_model.get_input_embeddings()
+            assert int(batch["input_ids"].max()) < emb.num_embeddings, (
+                f"input_ids до {int(batch['input_ids'].max())} при таблице "
+                f"{emb.num_embeddings}")
             _, vlen, VLM, _ = model._build_vlm_inputs_embeds(
                 input_ids=batch["input_ids"], inputs_embeds=None,
                 pixel_values=batch.get("pixel_values"),
@@ -382,13 +552,10 @@ def main() -> None:
             lg0 = blk(None)
             lp0 = lg0.log_softmax(-1)
             ar = torch.arange(B, device=args.device)
-            rng = torch.Generator(device=args.device).manual_seed(
-                1000 + args.seed + lo)
 
             for p_ in range(P):
                 ranks = lg0[:, p_].topk(args.rank_hi, -1).indices
-                rk = torch.randint(args.rank_lo, args.rank_hi, (B,),
-                                   generator=rng, device=args.device)
+                rk = torch.as_tensor(rank_table[lo:hi, p_], device=args.device)
                 u = ranks[ar, rk]
                 v = z_ref[:, p_, 0]
                 c0_old = z_ref[:, :, 0].clone()
@@ -401,7 +568,12 @@ def main() -> None:
                 ent = -(pb * lpb).sum(-1)
                 t2 = lg_before.topk(2, -1).values
                 marg = t2[..., 0] - t2[..., 1]
-                topk_p = pb.topk(args.topk_probs, -1).values
+                tk = pb.topk(args.topk_probs, -1)
+                topk_p, topk_i = tk.values, tk.indices
+                if HID is not None:
+                    HID[row0[0]:row0[0] + B] = \
+                        _cap["h"][:, -P:].float().cpu().numpy().astype(np.float16)
+                row0[0] += B
 
                 c1_old = lg_before.argmax(-1)
                 z_old = torch.stack(
@@ -429,6 +601,8 @@ def main() -> None:
                 F["cand_entropy"].append(ent.cpu().numpy())
                 F["cand_margin"].append(marg.cpu().numpy())
                 F["cand_topk_p"].append(topk_p.cpu().numpy())
+                F["cand_topk_idx"].append(
+                    topk_i.cpu().numpy().astype(np.int16))
                 F["cand_old_tokens"].append(z_old.cpu().numpy().astype(np.int16))
                 F["cand_q"].append(np.tile(np.arange(P, dtype=np.int16), (B, 1)))
                 F["cand_dq"].append(np.tile((np.arange(P) - p_).astype(np.int16),
@@ -506,45 +680,14 @@ def main() -> None:
                                        for S in full_sets], np.float32)
                         verify.append(float(np.abs(gf - gc).max()))
 
-                # ---- поэкземплярные метки из сжатой таблицы
-                blk_lab = {k: [] for k in
-                           ("sing_gain", "g_star", "tau", "best_exact_k",
-                            "best_le_k", "add_path", "add_marg", "stop_k",
-                            "rev_path", "rev_set")}
+                # ---- в цикле копим ТОЛЬКО сырое: таблицу и её смещения
                 for b in range(B):
-                    C = torch.nonzero(diff[b]).flatten().tolist()
-                    gmap = {tuple(sorted(S)): float(gg_all[b][j])
-                            for j, S in enumerate(subs_all[b])}
                     Lab["g_flat"].append(gg_all[b])
                     g_off.append(g_off[-1] + len(gg_all[b]))
-                    sing = np.array([gmap.get((q,), 0.0) for q in range(P)],
-                                    np.float32)
-                    blk_lab["sing_gain"].append(sing)
-                    blk_lab["g_star"].append(np.float32(max(0.0, max(gmap.values()))))
-                    tau = max(1e-8, args.tau_rel * max(float(sing.max()), 0.0))
-                    blk_lab["tau"].append(np.float32(tau))
-                    # «ровно K» при |C| < K недостижимо: позиции вне C ничего не
-                    # меняют, поэтому берём ровно min(K, |C|)
-                    kk = min(args.kmax, len(C))
-                    ex = max((S for S in subs_all[b] if len(S) == kk),
-                             key=lambda S: gmap[tuple(sorted(S))], default=())
-                    le = max(subs_all[b], key=lambda S: gmap[tuple(sorted(S))])
-                    blk_lab["best_exact_k"].append(_pad(ex, args.kmax))
-                    blk_lab["best_le_k"].append(_pad(le, args.kmax))
-                    add, mg, sk, rev, rset = greedy_paths(gmap, C, tau, args.kmax)
-                    blk_lab["add_path"].append(_pad(add, args.kmax))
-                    blk_lab["add_marg"].append(_pad(mg, args.kmax, 0.0, np.float32))
-                    blk_lab["stop_k"].append(np.int8(sk))
-                    blk_lab["rev_path"].append(_pad(rev, 2 * args.kmax))
-                    blk_lab["rev_set"].append(_pad(rset, args.kmax))
-
-                # все метки блока — массивы формы (B, ...), как и признаки
                 Lab["e_empty"].append(e0.cpu().numpy())
                 Lab["support"].append(supp.cpu().numpy())
                 Lab["obs_idx"].append(np.arange(lo, hi))
                 Lab["p"].append(np.full(B, p_, np.int16))
-                for k, v in blk_lab.items():
-                    Lab[k].append(np.stack(v))
         return
 
     for lo in range(0, N, args.batch):
@@ -552,34 +695,81 @@ def main() -> None:
         print(f"наблюдения {min(lo + args.batch, N)}/{N}", flush=True)
 
     # ---------------- сборка ----------------
-    # И признаки, и метки накапливались блоками формы (B, ...) в одном и том же
-    # порядке (батч -> позиция p -> пример), поэтому строки соответствуют друг
-    # другу по индексу. Единственное исключение — g_flat: рваная таблица,
-    # склеиваемая по g_off.
+    # Признаки и сырые метки копились блоками формы (B, ...) в одном порядке
+    # (батч -> позиция p -> пример), поэтому строки соответствуют по индексу.
     feats = {k: np.concatenate(v) for k, v in F.items() if v}
-    labels = {k: np.concatenate(v) for k, v in Lab.items()
-              if k != "g_flat" and v}
-    labels["g_flat"] = np.concatenate(Lab["g_flat"]).astype(np.float32)
-    labels["g_off"] = np.asarray(g_off, np.int64)
-    labels["split"] = SPLIT[labels["obs_idx"]]
-    labels["episode"] = EPI[labels["obs_idx"]]
-    n_int = len(labels["obs_idx"])
-    assert labels["g_off"][-1] == len(labels["g_flat"])
-    assert len(labels["g_off"]) == n_int + 1
-    for k in ("int_obs_idx", "int_p"):
-        assert len(feats[k]) == n_int, f"{k}: {len(feats[k])} против {n_int}"
-    assert (feats["int_obs_idx"] == labels["obs_idx"]).all(), \
+    raw = {k: np.concatenate(v) for k, v in Lab.items() if k != "g_flat" and v}
+    raw["g_flat"] = np.concatenate(Lab["g_flat"]).astype(np.float32)
+    raw["g_off"] = np.asarray(g_off, np.int64)
+    n_int = len(raw["obs_idx"])
+    assert raw["g_off"][-1] == len(raw["g_flat"])
+    assert len(raw["g_off"]) == n_int + 1
+    assert (feats["int_obs_idx"] == raw["obs_idx"]).all(), \
         "порядок строк признаков и меток разошёлся"
-    assert (feats["int_p"] == labels["p"]).all()
+    assert (feats["int_p"] == raw["p"]).all()
+    if HID is not None:
+        assert row0[0] == n_int, f"скрытых состояний {row0[0]} против {n_int}"
+
+    split_int = SPLIT[raw["obs_idx"]]
+    print("\nвывод производных меток (пороги — только по train)...")
+    labels = dict(raw)
+    labels.update(derive_labels(raw, split_int, P, args.kmax,
+                                args.tau_rel, args.gap_rel))
+    labels["split"] = split_int
+    labels["episode"] = EPI[raw["obs_idx"]]
 
     _sanity(feats, labels, EPI, SPLIT, TASKS, args, verify, P)
 
+    # ---------------- запись и ПОВТОРНАЯ ПРОВЕРКА ----------------
+    os.makedirs(args.out, exist_ok=True)
+    fp = os.path.join(args.out, "features.npz")
+    lp = os.path.join(args.out, "labels.npz")
+    mp = os.path.join(args.out, "metadata.json")
+    np.savez_compressed(fp, **feats)
+    np.savez_compressed(lp, **labels)
+    if HID is not None:
+        np.save(os.path.join(args.out, HIDDEN_FILE), HID[:n_int])
+    meta = dict(commit=commit, ckpt=args.ckpt, seed=args.seed, n_obs=int(N),
+                n_episodes=int(len(np.unique(EPI))), n_interventions=int(n_int),
+                P=int(P), L=int(L), kmax=args.kmax, tau_rel=args.tau_rel,
+                gap_rel=args.gap_rel, gap_threshold=float(labels["gap_threshold"]),
+                tau_by_p=[float(x) for x in labels["tau_by_p"]],
+                pos_offset=args.pos_offset, window=args.window,
+                metric_table="MSE, нормировка на scale**2",
+                metric_primary="RMS (как в воротах B1)",
+                continuous_channels=int(D_act - 1), scale=scale,
+                dataset="physical-intelligence/libero", revision="v2.0",
+                feature_keys=sorted(feats), hidden_file=(HIDDEN_FILE
+                                                         if HID is not None else None),
+                hidden_dim=(int(hid_dim) if HID is not None else None),
+                tasks=uniq_tasks, batch_independent_ranks=True,
+                split_counts={k: int((SPLIT == i).sum())
+                              for i, k in enumerate(("train", "val", "test"))})
+    with open(mp, "w") as fh:
+        json.dump(meta, fh, ensure_ascii=False, indent=2)
 
-def _pad(seq, n, fill=-1, dt=np.int16):
-    a = np.full(n, fill, dt)
-    for i, x in enumerate(list(seq)[:n]):
-        a[i] = x
-    return a
+    print("\n" + "=" * 70)
+    print("ПРОВЕРКА ЗАПИСАННОГО (файлы открываются заново)")
+    print("=" * 70)
+    import hashlib
+    fz, lz = np.load(fp, allow_pickle=True), np.load(lp, allow_pickle=True)
+    assert set(fz.files) == set(feats), "ключи признаков не совпали"
+    assert set(lz.files) == set(labels), "ключи меток не совпали"
+    assert len(fz["int_obs_idx"]) == n_int and len(lz["obs_idx"]) == n_int
+    assert (fz["int_obs_idx"] == lz["obs_idx"]).all(), \
+        "индексы признаков и меток в файлах разошлись"
+    assert np.array_equal(fz["cand_old_tokens"], feats["cand_old_tokens"])
+    assert np.allclose(lz["g_flat"], labels["g_flat"])
+    bad = set(fz.files) - FEATURE_KEYS
+    assert not bad, f"в записанном файле посторонние ключи: {bad}"
+    for path in (fp, lp, mp) + ((os.path.join(args.out, HIDDEN_FILE),)
+                                if HID is not None else ()):
+        h = hashlib.sha256(open(path, "rb").read()).hexdigest()[:16]
+        print(f"  {os.path.basename(path):>22}  "
+              f"{os.path.getsize(path) / 1e6:>8.1f} МБ  sha256:{h}")
+    print(f"  строк-вмешательств {n_int}, наблюдений {N}, "
+          f"ключей признаков {len(fz.files)}, меток {len(lz.files)}")
+    print(f"\nготово: {args.out}")
 
 
 def _sanity(feats, labels, EPI, SPLIT, TASKS, args, verify, P) -> None:
@@ -636,18 +826,49 @@ def _sanity(feats, labels, EPI, SPLIT, TASKS, args, verify, P) -> None:
     else:
         print("  6. сверка сжатия не проводилась (--verify-full 0)")
 
-    gs = labels["g_star"]
-    thr = args.gap_rel * float(np.median(gs))
-    print(f"  7. G* <= порога (ремонтировать нечего): "
-          f"{(gs <= thr).mean():.2%}, порог {thr:.3e}")
-    sg = labels["sing_gain"]
-    print(f"  8. доля отрицательных одиночных выигрышей: {(sg < 0).mean():.2%}")
-    sz = (labels["best_le_k"] >= 0).sum(1)
-    print(f"  9. размер лучшего набора <=K: " + " ".join(
+    gs = labels["g_star_rms"]
+    thr = float(labels["gap_threshold"])
+    print(f"  7. ремонтировать нечего (G* <= порога, порог по TRAIN "
+          f"{thr:.3e}): {labels['no_repair'].mean():.2%}")
+
+    sg, tau = labels["sing_gain_rms"], labels["tau"][:, None]
+    chg = np.stack([(labels["support"] >> q & 1).astype(bool)
+                    for q in range(P)], 1)
+    neg = sg < -tau
+    print(f"  8. одиночные выигрыши по ПОРОГУ, а не по сравнению с нулём:")
+    print(f"      отрицательных среди всех позиций      {neg.mean():.2%}")
+    print(f"      отрицательных ВНУТРИ changed-support  "
+          f"{neg[chg].mean():.2%}")
+    print(f"      положительных внутри support          "
+          f"{(sg > tau)[chg].mean():.2%}")
+
+    sz = labels["best_size_by_k"][:, args.kmax]
+    print(f"  9. размер лучшего набора при бюджете {args.kmax}: " + " ".join(
         f"{i}:{(sz == i).mean():.0%}" for i in range(args.kmax + 1)))
+    gk = labels["best_gain_by_k_rms"]
+    print(f"      средний выигрыш по бюджетам K=0..{args.kmax}: " + " ".join(
+        f"{gk[:, K].mean():.2e}" for K in range(args.kmax + 1)))
     print(f" 10. средняя длина сжатой таблицы: "
           f"{np.diff(labels['g_off']).mean():.1f} наборов "
           f"(полный перебор дал бы 2517)")
+
+    # ПОКРЫТИЕ ЗАДАЧ. Если задача val/test отсутствует в train, замер уходит в
+    # перенос на НОВЫЕ задачи, а это другой протокол и его надо объявлять явно.
+    T = np.asarray(TASKS)
+    tr_t = set(T[SPLIT == 0])
+    for s_, nm in ((1, "validation"), (2, "test")):
+        miss = sorted(set(T[SPLIT == s_]) - tr_t)
+        frac = ((~np.isin(T[SPLIT == s_], list(tr_t))).mean()
+                if (SPLIT == s_).any() else 0.0)
+        print(f" 11. задач в {nm}, отсутствующих в train: {len(miss)} "
+              f"({frac:.1%} наблюдений части)")
+    print("      если доля заметна, протокол — перенос на НОВЫЕ задачи, "
+          "и это надо объявлять отдельно")
+
+    rl = labels["rev_len"]
+    print(f" 12. обратимые траектории: средняя длина {rl.mean():.2f}, "
+          f"максимум {rl.max()}, доля с хотя бы одним REMOVE "
+          f"{((labels['rev_action'] == 0).any(1)).mean():.2%}")
 
 
 if __name__ == "__main__":
