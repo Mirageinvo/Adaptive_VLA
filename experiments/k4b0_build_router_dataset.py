@@ -63,7 +63,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # БЕЛЫЙ СПИСОК признаков. Всё, чего здесь нет, в features.npz не попадёт.
-FEATURE_KEYS = {
+FEATURE_KEYS = (
     # константа кодека: позволяет ВОССТАНОВИТЬ полные векторы, не храня их
     #   delta_emb   = codebook_proj[0][int_v] - codebook_proj[0][int_u]
     #   cand_latent = sum_j codebook_proj[j][cand_old_tokens[..., j]]
@@ -79,7 +79,8 @@ FEATURE_KEYS = {
     "cand_entropy", "cand_margin", "cand_topk_p", "cand_topk_idx",
     "cand_old_tokens", "cand_q", "cand_dq", "cand_absdq", "cand_is_p",
     "cand_latent_norm", "cand_coarse_logp", "cand_coarse_entropy",
-}
+)
+FEATURE_SET = frozenset(FEATURE_KEYS)
 # скрытые состояния действия из СТАРОГО прохода лежат отдельным файлом:
 # массив крупный, и в npz он мешал бы ленивой загрузке
 HIDDEN_FILE = "features_hidden.npy"
@@ -817,7 +818,7 @@ def main() -> None:
         "индексы признаков и меток в файлах разошлись"
     assert np.array_equal(fz["cand_old_tokens"], feats["cand_old_tokens"])
     assert np.allclose(lz["g_flat"], labels["g_flat"])
-    bad = set(fz.files) - FEATURE_KEYS
+    bad = set(fz.files) - FEATURE_SET
     assert not bad, f"в записанном файле посторонние ключи: {bad}"
     for path in (fp, lp, mp) + ((os.path.join(args.out, HIDDEN_FILE),)
                                 if HID is not None else ()):
@@ -835,7 +836,7 @@ def _sanity(feats, labels, EPI, SPLIT, TASKS, args, verify, P) -> None:
     print("САНИТАРНЫЕ ПРОВЕРКИ")
     print("=" * 70)
 
-    bad = set(feats) - FEATURE_KEYS
+    bad = set(feats) - FEATURE_SET
     assert not bad, f"посторонние ключи в признаках: {bad}"
     for k in feats:
         low = k.lower()
