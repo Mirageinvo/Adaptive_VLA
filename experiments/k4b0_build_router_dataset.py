@@ -511,6 +511,22 @@ def main() -> None:
         print(f"скрытые состояния: {HID.shape}, "
               f"{HID.nbytes / 1e6:.0f} МБ (float16)")
 
+    # ПЕРВЫЙ ПРОХОД: общий максимум длины промпта по ВСЕЙ выборке.
+    # Иначе паддинг идёт до максимума В БАТЧЕ, vlen гуляет между батчами, а он
+    # входит в base_pos позиционных id токенов действия. Замер: при --batch 8
+    # последний батч дал vlen 174 против 175 у остальных, и 74 вмешательства из
+    # 512 сменили changed-support. К точности это отношения не имеет — на
+    # float32 числа совпали до последней цифры.
+    print("первый проход: общая длина паддинга...")
+    pad_to = 0
+    for lo in range(0, N, args.batch):
+        hi = min(lo + args.batch, N)
+        bb = build_batch(IM1[lo:hi], IM2[lo:hi], TASKS[lo:hi], st_all[lo:hi],
+                         proc, args, "cpu")
+        pad_to = max(pad_to, int(bb["input_ids"].shape[1]))
+        del bb
+    print(f"  общая длина паддинга: {pad_to} токенов\n")
+
     row0 = [0]          # счётчик строк: последний батч короче, арифметика по lo неверна
 
     F = {k: [] for k in FEATURE_KEYS}
@@ -528,7 +544,8 @@ def main() -> None:
         B = hi - lo
         args_ns = args
         batch = build_batch(IM1[lo:hi], IM2[lo:hi], TASKS[lo:hi],
-                            st_all[lo:hi], proc, args_ns, args.device)
+                            st_all[lo:hi], proc, args_ns, args.device,
+                            pad_to=pad_to)
         with torch.no_grad():
             # «Vocabulary expanded» в логе — предупреждение процессора; здесь
             # явно убеждаемся, что все id помещаются в таблицу эмбеддингов
@@ -796,7 +813,7 @@ def main() -> None:
                 gap_rel=args.gap_rel, gap_threshold=float(labels["gap_threshold"]),
                 tau_by_p=[float(x) for x in labels["tau_by_p"]],
                 pos_offset=args.pos_offset, window=args.window,
-                vlm_dtype=args.vlm_dtype,
+                vlm_dtype=args.vlm_dtype, pad_to=int(pad_to),
                 metric_table="MSE, нормировка на scale**2",
                 metric_primary="RMS (как в воротах B1)",
                 continuous_channels=int(D_act - 1), scale=scale,

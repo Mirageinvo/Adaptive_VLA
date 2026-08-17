@@ -202,7 +202,7 @@ def build_state(z, t_idx, quat_wxyz: bool):
     return ((st - STATE_Q01) / (STATE_Q99 - STATE_Q01) * 2.0 - 1.0).astype(np.float32)
 
 
-def build_batch(im1, im2, tasks, state, proc, args, device):
+def build_batch(im1, im2, tasks, state, proc, args, device, pad_to=None):
     """Наблюдения в формате BAR. im1/im2 — тензоры (B,C,H,W) uint8.
 
     Обучение (scripts/utils.py:205): RandomCrop(int(256*0.875)) + Resize(224),
@@ -240,7 +240,15 @@ def build_batch(im1, im2, tasks, state, proc, args, device):
     else:
         images = [[t1[i].numpy(), t2[i].numpy()] for i in range(n)]
     texts = proc.apply_chat_template(msgs, add_generation_prompt=True)
-    b = proc(text=texts, images=images, return_tensors="pt", padding=True)
+    # pad_to=None — прежнее поведение: паддинг до самой длинной последовательности
+    # В БАТЧЕ. Тогда vlen зависит от состава батча, а vlen входит в base_pos для
+    # позиционных id токенов действия, то есть один и тот же кадр обрабатывается
+    # по-разному в зависимости от соседей. Для многобатчевых сборок задавать
+    # pad_to = общий максимум по всей выборке.
+    b = (proc(text=texts, images=images, return_tensors="pt", padding=True)
+         if pad_to is None else
+         proc(text=texts, images=images, return_tensors="pt",
+              padding="max_length", max_length=int(pad_to), truncation=False))
     return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in b.items()}
 
 
