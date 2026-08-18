@@ -25,6 +25,8 @@ def make_gmap(lab, i, P, kmax):
 
     Хранятся только подмножества changed-support: для позиции вне support
     латента совпадает с опорной побитово, поэтому G(S) = G(S ∩ C) точно."""
+    # Кэшировать по маске support бессмысленно: их 13467 различных на 16000
+    # строк, кэш только добавляет накладные расходы (замерено).
     C = tuple(q for q in range(P) if lab["support"][i] >> q & 1)
     subs = [S for k in range(kmax + 1) for S in itertools.combinations(C, k)]
     v = lab["g_flat"][lab["g_off"][i]:lab["g_off"][i + 1]]
@@ -47,15 +49,19 @@ def to_rms(e0_mse, g_mse):
 def cluster_ci(num, den, epi, n_boot=2000, seed=0):
     """Отношение сумм с бутстрапом ПО ЭПИЗОДАМ: 16 вмешательств наблюдения и
     наблюдения одного эпизода зависимы, независимая пересэмплировка строк
-    занизила бы интервал."""
-    rng = np.random.default_rng(seed)
-    eps = np.unique(epi)
-    ix = {e: np.where(epi == e)[0] for e in eps}
-    pt = num.sum() / max(den.sum(), 1e-30)
-    out = np.empty(n_boot)
-    for b in range(n_boot):
-        sel = np.concatenate([ix[e] for e in rng.choice(eps, len(eps), True)])
-        out[b] = num[sel].sum() / max(den[sel].sum(), 1e-30)
+    занизила бы интервал.
+
+    Считается через ПОЭПИЗОДНЫЕ ЧАСТИЧНЫЕ СУММЫ. Отношение сумм по выборке
+    эпизодов равно отношению сумм их агрегатов, поэтому реплика — это гather
+    по 75 числам, а не склейка и суммирование 2400 строк. Результат
+    тождественный, работы на два порядка меньше."""
+    _, code = np.unique(epi, return_inverse=True)
+    ne = code.max() + 1
+    nb = np.bincount(code, weights=np.asarray(num, np.float64), minlength=ne)
+    db = np.bincount(code, weights=np.asarray(den, np.float64), minlength=ne)
+    pt = nb.sum() / max(db.sum(), 1e-30)
+    idx = np.random.default_rng(seed).integers(0, ne, size=(n_boot, ne))
+    out = nb[idx].sum(1) / np.maximum(db[idx].sum(1), 1e-30)
     return pt, float(np.percentile(out, 2.5)), float(np.percentile(out, 97.5))
 
 
@@ -74,8 +80,17 @@ def main() -> None:
     args = ap.parse_args()
 
     meta = json.load(open(os.path.join(args.dir, "metadata.json")))
-    ft = np.load(os.path.join(args.dir, "features.npz"), allow_pickle=True)
-    lb = np.load(os.path.join(args.dir, "labels.npz"), allow_pickle=True)
+    # МАТЕРИАЛИЗУЕМ СРАЗУ. np.load возвращает ленивый NpzFile: каждое
+    # обращение вида lb["g_flat"] заново читает и РАСПАКОВЫВАЕТ весь массив из
+    # архива. make_gmap обращается к нему на каждой строке, поэтому
+    # многомегабайтный массив распаковывался бы 16000 раз — замерено 19 минут
+    # против долей секунды.
+    _ft = np.load(os.path.join(args.dir, "features.npz"), allow_pickle=True)
+    _lb = np.load(os.path.join(args.dir, "labels.npz"), allow_pickle=True)
+    print(f"чтение: признаков {len(_ft.files)}, меток {len(_lb.files)}...",
+          flush=True)
+    ft = {k: _ft[k] for k in _ft.files}
+    lb = {k: _lb[k] for k in _lb.files}
     P, kmax = meta["P"], meta["kmax"]
     n = len(lb["obs_idx"])
 
@@ -93,10 +108,10 @@ def main() -> None:
     print("\n" + "=" * 74)
     print("ЦЕЛОСТНОСТЬ")
     print("=" * 74)
-    bad = [k for k in ft.files if any(s in k.lower() for s in FORBIDDEN)]
+    bad = [k for k in ft if any(s in k.lower() for s in FORBIDDEN)]
     assert not bad, f"запрещённые ключи в признаках: {bad}"
-    print(f"  1. признаков {len(ft.files)}, запрещённых ключей нет")
-    assert set(ft.files) == set(meta["feature_keys"])
+    print(f"  1. признаков {len(ft)}, запрещённых ключей нет")
+    assert set(ft) == set(meta["feature_keys"])
     print("  2. состав признаков совпал с metadata")
 
     assert (ft["int_obs_idx"] == lb["obs_idx"]).all()
@@ -139,7 +154,7 @@ def main() -> None:
     e0 = lb["e_empty"].astype(np.float64)
     worst_s, worst_b, worst_z = 0.0, 0.0, 0.0
     for i in idx[:500]:
-        gmap, C = make_gmap(lb, int(i), P, kmax)
+        gmap, C = make_gmap(lb, int(i), P, kmax)   # до построения GM
         assert abs(gmap[()]) == 0.0, "G(пусто) не ноль"
         for q in range(P):
             got = to_rms(e0[i], g_of(gmap, C, (q,)))
@@ -162,6 +177,9 @@ def main() -> None:
     # МЕТРИКИ — на всех строках части. Подвыборка idx нужна только для
     # проверки целостности таблицы выше: на 2000 строках доверительный
     # интервал шире, а числа для ворот B1 должны быть окончательными.
+    print(f"  построение таблиц для {n} строк (один раз на все части)...",
+          flush=True)
+    GM = [make_gmap(lb, i, P, kmax) for i in range(n)]
     for s_, nm in ((None, "все"), (0, "train"), (1, "val"), (2, "test")):
         ii = np.arange(n) if s_ is None else np.where(sp == s_)[0]
         if len(ii) < 20:
@@ -171,7 +189,7 @@ def main() -> None:
         gr = np.zeros(len(ii))
         sg = np.zeros(len(ii))
         for j, i in enumerate(ii):
-            gmap, C = make_gmap(lb, int(i), P, kmax)
+            gmap, C = GM[i]
             path = [q for q in lb["add_path"][i] if q >= 0]
             gr[j] = to_rms(e0[i], g_of(gmap, C, path))
             top4 = np.argsort(-lb["sing_gain_rms"][i])[:kmax]
@@ -196,10 +214,12 @@ def main() -> None:
         print(f"\n  {nm}: строк {len(ii)}, наблюдений "
               f"{len(np.unique(lb['obs_idx'][ii]))}, эпизодов "
               f"{len(np.unique(ep_i))}")
+        # таблицы строятся ОДИН раз на часть, а не заново на каждое K:
+        # прежде это было три прохода по 2400 строкам вместо одного
+        gm_all = [GM[i] for i in ii]
         for K in (1, 2, 4):
             print(f"\n  {'способ отбора':>26}  K={K}   доля [95% ДИ]"
                   f"{'macro':>10}")
-            gm_all = [make_gmap(lb, int(i), P, kmax) for i in ii]
             rows = {}
             for nm_, sel in (
                     ("энтропия (прич.)",
@@ -227,11 +247,15 @@ def main() -> None:
             # СЛУЧАЙНЫЙ отбор: 20 НЕЗАВИСИМЫХ политик. Каждую переводим в RMS
             # ЦЕЛИКОМ и агрегируем по всей части, и только потом усредняем:
             # to_rms выпукла, поэтому усреднение в MSE занижает результат.
+            # 20 независимых политик. np.random.choice(replace=False) стоит
+            # десятки микросекунд на вызов, а нужен лишь случайный набор из K
+            # позиций: берём K наименьших из строки шума, это на порядок
+            # дешевле и распределение то же.
             per_seed = []
             for sd in range(20):
-                r = np.random.default_rng(1000 + sd)
-                nm2 = np.array([to_rms(e0[i], g_of(*gm_all[j],
-                                                   r.choice(P, K, False)))
+                noise = np.random.default_rng(1000 + sd).random((len(ii), P))
+                pick = np.argpartition(noise, K - 1, axis=1)[:, :K]
+                nm2 = np.array([to_rms(e0[i], g_of(*gm_all[j], pick[j]))
                                 for j, i in enumerate(ii)])
                 per_seed.append(nm2.sum() / den.sum())
             ps = np.array(per_seed)
@@ -259,7 +283,7 @@ def main() -> None:
     print("\n  K_practical — наименьший |S| с G(S) >= G* - порог:")
     for lbl, rel in (("порог tau", None), ("потеря <= 1%", 0.01)):
         dist = np.zeros(kmax + 1, np.int64)
-        for i in range(n):
+        for i in range(n):   # только чтение готовых best_gain_by_k_rms
             gstar = lb["best_gain_by_k_rms"][i, kmax]
             thr = (gstar - lb["tau"][i]) if rel is None else gstar * (1 - rel)
             k_ = kmax
@@ -306,8 +330,11 @@ def main() -> None:
     # остановка, но без обмена.
     ga, gr, gf, gmt = (np.zeros(n), np.zeros(n), np.zeros(n), np.zeros(n))
     na, nr = np.zeros(n), np.zeros(n)
+    print(f"  абляция обратимости, строк {n}...", flush=True)
     for i in range(n):
-        gmap, C = make_gmap(lb, i, P, kmax)
+        if i and i % 4000 == 0:
+            print(f"    {i}/{n}", flush=True)
+        gmap, C = GM[i]
         full = [q for q in lb["add_path"][i] if q >= 0]
         adds = [q for q in lb["add_stop_set"][i] if q >= 0]
         rev = [q for q in lb["rev_set"][i] if q >= 0]

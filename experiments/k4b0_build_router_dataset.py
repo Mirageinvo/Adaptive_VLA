@@ -1013,15 +1013,19 @@ def main() -> None:
     print("\n" + "=" * 70)
     print("ПРОВЕРКА ЗАПИСАННОГО (файлы открываются заново)")
     print("=" * 70)
-    fz, lz = np.load(fp, allow_pickle=True), np.load(lp, allow_pickle=True)
-    assert set(fz.files) == set(feats), "ключи признаков не совпали"
-    assert set(lz.files) == set(labels), "ключи меток не совпали"
+    # NpzFile ленив и распаковывает массив на КАЖДОЕ обращение; здесь их
+    # немного, но материализуем сразу, чтобы правило было единым
+    _fz, _lz = np.load(fp, allow_pickle=True), np.load(lp, allow_pickle=True)
+    fz = {k: _fz[k] for k in _fz.files}
+    lz = {k: _lz[k] for k in _lz.files}
+    assert set(fz) == set(feats), "ключи признаков не совпали"
+    assert set(lz) == set(labels), "ключи меток не совпали"
     assert len(fz["int_obs_idx"]) == n_int and len(lz["obs_idx"]) == n_int
     assert (fz["int_obs_idx"] == lz["obs_idx"]).all(), \
         "индексы признаков и меток в файлах разошлись"
     assert np.array_equal(fz["cand_old_tokens"], feats["cand_old_tokens"])
     assert np.allclose(lz["g_flat"], labels["g_flat"])
-    bad = set(fz.files) - FEATURE_SET
+    bad = set(fz) - FEATURE_SET
     assert not bad, f"в записанном файле посторонние ключи: {bad}"
     for path in (fp, lp, mp) + ((os.path.join(args.out, HIDDEN_FILE),)
                                 if HID is not None else ()):
@@ -1029,7 +1033,7 @@ def main() -> None:
         print(f"  {os.path.basename(path):>22}  "
               f"{os.path.getsize(path) / 1e6:>8.1f} МБ  sha256:{h}")
     print(f"  строк-вмешательств {n_int}, наблюдений {N}, "
-          f"ключей признаков {len(fz.files)}, меток {len(lz.files)}")
+          f"ключей признаков {len(fz)}, меток {len(lz)}")
     print(f"\nготово: {args.out}")
 
 
