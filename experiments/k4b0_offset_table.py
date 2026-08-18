@@ -53,6 +53,10 @@ def main() -> None:
     ap.add_argument("--root", default="third_party/actioncodec")
     ap.add_argument("--script", default="scripts/eval_libero_bar.sh")
     ap.add_argument("--out", default="data/pos_offset_table.json")
+    ap.add_argument("--libero-path", default=None,
+                    help="путь к склонированному репозиторию LIBERO. Нужен, "
+                         "если пакет не установлен: реестр задач читается по "
+                         "пути, БЕЗ установки в рабочее окружение")
     args = ap.parse_args()
 
     sh = os.path.join(args.root, args.script)
@@ -64,12 +68,25 @@ def main() -> None:
     tot3 = sum(v.count(3) for v in offs.values())
     print(f"  всего задач {tot3 + tot4}: офсет 4 у {tot4}, офсет 3 у {tot3}\n")
 
+    if args.libero_path:
+        sys.path.insert(0, os.path.abspath(args.libero_path))
     try:
         from libero.libero import benchmark
     except ImportError as e:
         raise SystemExit(
-            f"нужен пакет libero (тот же, что для симулятора): {e}\n"
-            "он же используется в scripts/utils.py:404")
+            f"реестр задач LIBERO недоступен: {e}\n"
+            "Он же используется в scripts/utils.py:404 и НЕ заменяется "
+            "сопоставлением строк по смыслу: suite узнаётся легко, а офсет "
+            "задан ПОРЯДКОМ внутри suite, и перестановка внутри десятки меняет "
+            "офсет у большинства задач.\n"
+            "Без установки в рабочее окружение:\n"
+            "  git clone --depth 1 https://github.com/Lifelong-Robot-Learning/"
+            "LIBERO.git /tmp/LIBERO\n"
+            "  python3 experiments/k4b0_offset_table.py "
+            "--libero-path /tmp/LIBERO --out data/pos_offset_table.json")
+
+    src_mod = getattr(benchmark, "__file__", "?")
+    print(f"реестр задач: {src_mod}")
 
     bd = benchmark.get_benchmark_dict()
     table, dup = {}, []
