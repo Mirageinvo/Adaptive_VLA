@@ -6,7 +6,7 @@
     goal    (4 4 4 4 4 4 4 4 3 3)
     spatial (4 4 4 4 3 3 3 3 4 3)
     object  (4 4 4 4 4 4 4 4 4 3)
-    long    (4 3 4 4 3 4 3 3 4 3)
+    10      (4 3 4 4 3 4 3 3 4 3)   переменная POS_OFFSET_LONG, suite "10"
 
 Замер k4b0_padding_probe: между офсетами 3 и 4 меняется сам план BAR, а с ним
 stale, z_ref и полезность позиций. Оракул при офсете 3 даёт 0.941, при 4 —
@@ -30,21 +30,32 @@ import os
 import re
 import sys
 
-SUITES = ("goal", "spatial", "object", "long")
+# Имя переменной в .sh и имя suite для реестра — РАЗНЫЕ: последняя строка
+# скрипта это `run_suite "10" "Long" POS_OFFSET_LONG`, то есть длинный набор
+# передаётся как "10", а в реестре LIBERO зовётся libero_10. Пара
+# (суффикс переменной, имя suite) берётся из скрипта, а не придумывается.
+SUITES = (("goal", "goal"), ("spatial", "spatial"),
+          ("object", "object"), ("long", "10"))
 
 
 def parse_offsets(sh_path: str):
     """Массивы POS_OFFSET_<SUITE> из вендоренного скрипта."""
     src = open(sh_path).read()
     out = {}
-    for s in SUITES:
-        m = re.search(rf"POS_OFFSET_{s.upper()}=\(([^)]*)\)", src)
+    for var, suite in SUITES:
+        m = re.search(rf"POS_OFFSET_{var.upper()}=\(([^)]*)\)", src)
         if not m:
-            raise SystemExit(f"в {sh_path} не найден POS_OFFSET_{s.upper()}")
+            raise SystemExit(f"в {sh_path} не найден POS_OFFSET_{var.upper()}")
         vals = [int(x) for x in m.group(1).split()]
         if len(vals) != 10:
-            raise SystemExit(f"{s}: ожидалось 10 офсетов, найдено {len(vals)}")
-        out[s] = vals
+            raise SystemExit(f"{var}: ожидалось 10 офсетов, найдено {len(vals)}")
+        out[suite] = vals
+        # сверяем, что скрипт действительно вызывает run_suite с этим именем
+        if not re.search(rf'run_suite\s+"{suite}"\s+\S+\s+POS_OFFSET_{var.upper()}',
+                         src):
+            raise SystemExit(
+                f"в {sh_path} нет вызова run_suite \"{suite}\" с "
+                f"POS_OFFSET_{var.upper()} — имена suite разошлись")
     return out, hashlib.sha256(src.encode()).hexdigest()
 
 
@@ -62,8 +73,8 @@ def main() -> None:
     sh = os.path.join(args.root, args.script)
     offs, sh_hash = parse_offsets(sh)
     print(f"офсеты разобраны из {sh}")
-    for s in SUITES:
-        print(f"  {s:>8}: {offs[s]}")
+    for _, suite in SUITES:
+        print(f"  {suite:>8}: {offs[suite]}")
     tot4 = sum(v.count(4) for v in offs.values())
     tot3 = sum(v.count(3) for v in offs.values())
     print(f"  всего задач {tot3 + tot4}: офсет 4 у {tot4}, офсет 3 у {tot3}\n")
@@ -89,14 +100,19 @@ def main() -> None:
     print(f"реестр задач: {src_mod}")
 
     bd = benchmark.get_benchmark_dict()
+    print(f"ключи реестра: {sorted(bd)}")
     table, dup = {}, []
-    for s in SUITES:
-        suite = bd[f"libero_{s}"]()
+    for _, suite in SUITES:
+        key = f"libero_{suite}"
+        if key not in bd:
+            raise SystemExit(f"в реестре нет {key}; доступны {sorted(bd)}")
+        bench = bd[key]()
         for tid in range(10):
-            lang = suite.get_task(tid).language
+            lang = bench.get_task(tid).language
             if lang in table:
                 dup.append(lang)
-            table[lang] = dict(suite=s, task_id=tid, pos_offset=offs[s][tid])
+            table[lang] = dict(suite=suite, task_id=tid,
+                               pos_offset=offs[suite][tid])
     if dup:
         raise SystemExit(f"описания задач повторяются между suite: {dup}")
     assert len(table) == 40, f"задач {len(table)}, ожидалось 40"
