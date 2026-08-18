@@ -52,11 +52,10 @@ q вне C латента совпадает ПОБИТОВО, поэтому з
 bfloat16 ОПРОВЕРГНУТА: прогон на float32 дал те же числа до последней цифры.
 После общей длины паддинга расхождение 0.00%, остаточный шум 5.7e-08.
 
-  ОТКРЫТЫЙ ВОПРОС. Общая длина паддинга снимает зависимость от builder-батча, но
-  НЕ совпадает с реальным инференсом LIBERO, где батч равен единице и каждое
-  наблюдение идёт со своей длиной. Совпадают ли структура и ранжирование в этих
-  режимах — проверяет k4b0_padding_probe.py. Решение принимается ДО обучения B1:
-  иначе router обучится не на том распределении входов.
+  ВОПРОС ЗАКРЫТ замером k4b0_padding_probe: левый паддинг ЭКВИВАЛЕНТЕН его
+  отсутствию, потому что настоящие токены кончаются ровно перед токенами
+  действия при любом объёме дополнения. Расходился правый паддинг. Решает же
+  не паддинг, а pos_offset, и он берётся ПО ЗАДАЧЕ из eval_libero_bar.sh.
 
 БЮДЖЕТ «НЕ БОЛЕЕ K». Из установленной немонотонности (K-4a4: нарушения в
 29-31% случаев, 2.1% из них съедают весь доступный выигрыш) следует, что router
@@ -280,8 +279,12 @@ def greedy_paths(gmap, C, tau: float, kmax: int = 4):
         stop_k = i + 1
 
     S, acts, qs_, qo_, seen = (), [], [], [], {()}
-    cap = 6 * kmax + 6
-    while len(acts) < cap:
+    # ЛИМИТ ТЕОРЕТИЧЕСКИЙ, а не произвольный. Каждый ход строго увеличивает G
+    # более чем на tau, поэтому состояние не повторяется, а число достижимых
+    # состояний равно числу наборов в таблице. Прежний cap = 6*kmax+6 обрезал
+    # траекторию МОЛЧА и возвращал недосчитанный набор.
+    max_steps = len(gmap) - 1
+    while True:
         best = (tau, None, None, None)          # (прирост, вид, q_out, q_in)
         for q in C:
             if q in S:
@@ -302,6 +305,11 @@ def greedy_paths(gmap, C, tau: float, kmax: int = 4):
                     best = (d, "swap", qo, qi)
         if best[1] is None:
             break
+        if len(acts) >= max_steps:
+            raise RuntimeError(
+                f"обратимый поиск не сошёлся за {max_steps} ходов "
+                f"(число достижимых состояний): |C|={len(C)}, kmax={kmax}, "
+                f"S={S}. Молчаливое усечение недопустимо.")
         # 1 = ADD(qi), 0 = REMOVE(qo), 2 = SWAP(qo -> qi). Атомарно.
         _, kind, qo, qi = best
         acts.append({"add": 1, "rem": 0, "swap": 2}[kind])
@@ -319,6 +327,21 @@ def greedy_paths(gmap, C, tau: float, kmax: int = 4):
     # упора заполняет бюджет даже бесполезными позициями, поэтому сравнение с
     # ним мерило бы РАННЮЮ ОСТАНОВКУ, а не обратимость.
     add_stop = tuple(sorted(add[:stop_k]))
+    # ЛОКАЛЬНАЯ ОПТИМАЛЬНОСТЬ итога: ни один ход не должен давать больше tau.
+    # Это ловит и молчаливое усечение, и ошибку в переборе ходов.
+    for q in C:
+        if q in S:
+            assert g(tuple(x for x in S if x != q)) - g(S) <= tau, \
+                f"итог не локально оптимален: REMOVE {q} улучшает"
+        elif len(S) < kmax:
+            assert g(tuple(sorted(S + (q,)))) - g(S) <= tau, \
+                f"итог не локально оптимален: ADD {q} улучшает"
+    for qo in S:
+        rest = tuple(x for x in S if x != qo)
+        for qi in C:
+            if qi not in S:
+                assert g(tuple(sorted(rest + (qi,)))) - g(S) <= tau, \
+                    f"итог не локально оптимален: SWAP {qo}->{qi} улучшает"
     return add, marg, stop_k, acts, qs_, qo_, tuple(sorted(S)), add_stop
 
 
@@ -439,6 +462,11 @@ def derive_labels(raw, split, P, kmax, tau_rel, gap_rel):
         rev_l[i] = len(ra)
         rev_s[i, :len(rs)] = rs
         add_stop_s[i, :len(ast)] = ast
+    ra_ = np.asarray(rev_af, np.int8)
+    assert len(rev_if) == len(ra_) == len(rev_of), "рваные траектории разошлись"
+    assert rev_off[0] == 0 and rev_off[-1] == len(ra_)
+    assert np.array_equal(np.diff(np.asarray(rev_off)), rev_l), \
+        "смещения не согласованы с длинами траекторий"
     out.update(best_set_by_k=bs, best_gain_by_k_mse=bg_mse,
                best_gain_by_k_rms=bg_rms, best_size_by_k=bsz,
                add_path=add_p, add_marg_rms=add_m, stop_k=stop,
@@ -466,11 +494,10 @@ def main() -> None:
                     help="G* ниже этой доли медианного G* -> ремонтировать нечего")
     ap.add_argument("--vlm-dtype", default="bfloat16",
                     choices=["bfloat16", "float32"],
-                    help="точность VLM. В bf16 (8 бит мантиссы) argmax по 2048 "
-                         "кодам переворачивается на почти-ничьих при смене "
-                         "композиции батча. На V100 bf16 всё равно эмулируется "
-                         "на FP32-ядрах (K-4a3), то есть float32 там почти "
-                         "бесплатен и заметно устойчивее")
+                    help="точность VLM. Объяснение расхождений через "
+                         "переворот argmax в bf16 ОПРОВЕРГНУТО: float32 дал те "
+                         "же числа до последней цифры, причиной был правый "
+                         "паддинг. Опция оставлена как абляция")
     ap.add_argument("--task-in-train", type=int, default=1,
                     help="1 — гарантировать хотя бы один эпизод каждой задачи "
                          "в train (обобщение на новые эпизоды); 0 — допускать "

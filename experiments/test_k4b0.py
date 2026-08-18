@@ -92,6 +92,27 @@ def test_standalone_remove_possible():
     check("SWAP не засчитан как REMOVE", acts.count(0) == 1, f"acts={acts}")
 
 
+def test_greedy_no_silent_truncation():
+    """Лимит теоретический: усечения нет, при недосчёте — исключение.
+
+    Прежде стоял произвольный cap = 6*kmax+6, и по его достижении функция
+    МОЛЧА возвращала недосчитанный набор. Теперь предел равен числу достижимых
+    состояний, а итог дополнительно проверяется на локальную оптимальность."""
+    rng = np.random.default_rng(11)
+    for _ in range(200):
+        C = sorted(rng.choice(7, rng.integers(2, 6), replace=False).tolist())
+        g = {S: float(rng.normal()) for S in subsets_of(C, 4)}
+        g[()] = 0.0
+        greedy_paths(g, C, 1e-9, 4)          # упадёт при недосчёте
+    check("итог локально оптимален на 200 функциях", True)
+    # вырожденный случай: все ходы улучшают почти одинаково
+    C = list(range(6))
+    g = {S: 0.001 * len(S) for S in subsets_of(C, 4)}
+    S = greedy_paths(g, C, 1e-12, 4)[6]
+    check("при равных приращениях набирается полный бюджет", len(S) == 4,
+          f"S={S}")
+
+
 def test_rev_trajectory_ragged():
     """Рваное хранение траекторий: длина не ограничена шириной массива."""
     rng = np.random.default_rng(5)
@@ -280,14 +301,32 @@ def test_derive_labels():
     check("знак вредной позиции = -1", out["sing_sign"][0, 2] == -1)
     check("знак позиции вне support = 0", out["sing_sign"][0, 3] == 0)
     check("STOP до вредного шага", out["stop_k"][0] == 2)
-    check("REMOVE отличим от padding",
-          set(np.unique(out["rev_action"][0])) <= {-1, 0, 1})
+    # рваный формат: строка извлекается по смещениям, padding отсутствует
+    lo, hi = out["rev_off"][0], out["rev_off"][1]
+    acts = out["rev_action"][lo:hi]
+    qin, qout = out["rev_q_in"][lo:hi], out["rev_q_out"][lo:hi]
+    check("длина строки совпадает с rev_len", hi - lo == out["rev_len"][0],
+          f"{hi - lo} против {out['rev_len'][0]}")
+    check("коды ходов только из {0,1,2}", set(acts.tolist()) <= {0, 1, 2},
+          f"acts={acts.tolist()}")
+    check("рваные массивы согласованы",
+          len(out["rev_action"]) == len(out["rev_q_in"]) == len(out["rev_q_out"]))
+    check("смещения начинаются с нуля и покрывают массив",
+          out["rev_off"][0] == 0
+          and out["rev_off"][-1] == len(out["rev_action"]))
+    check("разности смещений равны длинам",
+          np.array_equal(np.diff(out["rev_off"]), out["rev_len"]))
+    check("у ADD нет q_out", all(o == -1 for a, o in zip(acts, qout) if a == 1),
+          f"acts={acts.tolist()}, qout={qout.tolist()}")
+    check("у REMOVE нет q_in", all(i == -1 for a, i in zip(acts, qin) if a == 0),
+          f"acts={acts.tolist()}, qin={qin.tolist()}")
 
 
 def main():
     for fn in (test_greedy_basic, test_greedy_useful_swap,
                test_standalone_remove_possible,
                test_rev_trajectory_ragged,
+               test_greedy_no_silent_truncation,
                test_greedy_nonmonotone, test_greedy_terminates,
                test_ragged_permutation, test_gof_intersection, test_split,
                test_group_order_restored, test_exact_vs_le_k,
