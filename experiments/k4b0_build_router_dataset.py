@@ -969,7 +969,6 @@ def main() -> None:
     print("\n" + "=" * 70)
     print("ПРОВЕРКА ЗАПИСАННОГО (файлы открываются заново)")
     print("=" * 70)
-    import hashlib
     fz, lz = np.load(fp, allow_pickle=True), np.load(lp, allow_pickle=True)
     assert set(fz.files) == set(feats), "ключи признаков не совпали"
     assert set(lz.files) == set(labels), "ключи меток не совпали"
