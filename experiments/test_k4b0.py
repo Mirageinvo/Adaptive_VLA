@@ -37,31 +37,71 @@ def test_greedy_basic():
     C = [0, 1, 2]
     g = {(): 0.0, (0,): 1.0, (1,): 0.9, (2,): -0.2,
          (0, 1): 1.2, (0, 2): 0.8, (1, 2): 0.7, (0, 1, 2): 1.0}
-    add, marg, stop, acts, qs, S = greedy_paths(g, C, 1e-9, 3)
+    add, marg, stop, acts, qs, qo, S, ast = greedy_paths(g, C, 1e-9, 3)
     check("жадный берёт сильнейшую первой", add[0] == 0, f"add={add}")
     check("STOP до вредного шага", stop == 2, f"stop={stop}")
     check("обратимый сходится к максимуму", S == (0, 1), f"S={S}")
 
 
-def test_greedy_useful_remove():
-    """Случай, где REMOVE ПОЛЕЗЕН: жадный берёт 0, потом 1, но пара (1,2)
-    лучше, и оптимум достигается только через удаление нуля."""
+def test_greedy_useful_swap():
+    """ОБМЕН полезен: жадный берёт 0, потом 1, но пара (1,2) лучше, и попасть
+    туда можно только заменив 0 на 2 — удаление нуля само по себе ухудшает."""
     C = [0, 1, 2]
     g = {(): 0.0, (0,): 1.0, (1,): 0.6, (2,): 0.5,
          (0, 1): 1.05, (0, 2): 1.02, (1, 2): 1.8, (0, 1, 2): 1.1}
-    add, _, _, acts, qs, S = greedy_paths(g, C, 1e-9, 2)
+    add, _, _, acts, qs, qo, S, ast = greedy_paths(g, C, 1e-9, 2)
     check("жадное добавление даёт не оптимум", set(add) == {0, 1},
           f"add={add}, G={g[tuple(sorted(add))]}")
     check("обратимый находит (1,2)", S == (1, 2), f"S={S}, G={g[S]}")
-    check("в траектории есть REMOVE", 0 in acts, f"acts={acts}, qs={qs}")
+    check("в траектории есть SWAP (код 2)", 2 in acts, f"acts={acts}")
+    check("SWAP хранит обе позиции", any(a == 2 and o >= 0
+                                         for a, o in zip(acts, qo)),
+          f"acts={acts}, qs={qs}, qo={qo}")
+    check("SWAP НЕ разложен в пару REMOVE+ADD", acts.count(0) == 0,
+          f"acts={acts}")
+
+
+def test_no_standalone_remove():
+    """САМОСТОЯТЕЛЬНЫЙ REMOVE не срабатывает, пока доступен ОБМЕН.
+
+    Доказательство. Позиция входит в набор только при улучшении, то есть
+    G(S+q) > G(S). Чтобы позже удаление r улучшало, нужно G(S-r) > G(S). Но на
+    том шаге, когда добавлялась последняя q, был доступен и обмен r -> q с
+    приростом G(S-r+q) - G(S), который при этом условии БОЛЬШЕ прироста
+    добавления. Значит обмен был бы выбран, и до состояния с полезным
+    удалением дело не дойдёт.
+
+    Практическое следствие: вся статистика «обратимости» — это ОБМЕНЫ, и
+    считать их надо отдельно от удалений. Прежние 7.62% были обменами."""
+    rng = np.random.default_rng(3)
+    n_rem = n_swap = 0
+    for _ in range(500):
+        C = sorted(rng.choice(8, rng.integers(2, 6), replace=False).tolist())
+        g = {S: float(rng.normal()) for S in subsets_of(C, 4)}
+        g[()] = 0.0
+        acts = greedy_paths(g, C, 1e-9, 4)[3]
+        n_rem += acts.count(0)
+        n_swap += acts.count(2)
+    check("самостоятельных REMOVE нет", n_rem == 0, f"их {n_rem}")
+    check("обмены при этом встречаются", n_swap > 0, f"их {n_swap}")
+
+    # тот же случай без обмена: удаление тоже не срабатывает, потому что
+    # добавление шло только на улучшение
+    C = [0, 1]
+    g = {(): 0.0, (0,): 0.5, (1,): 0.9, (0, 1): 0.6}
+    add, _, _, acts, _, _, S, ast = greedy_paths(g, C, 1e-9, 2)
+    check("ADD-до-упора берёт обе позиции", set(add) == {0, 1}, f"add={add}")
+    check("обратимый останавливается на лучшей", S == (1,), f"S={S}")
+    check("ADD+STOP даёт тот же набор", ast == (1,), f"ast={ast}")
 
 
 def test_greedy_nonmonotone():
     """Немонотонная функция: добавление ЛЮБОЙ позиции ухудшает."""
     C = [0, 1]
     g = {(): 0.0, (0,): -0.3, (1,): -0.5, (0, 1): -0.9}
-    add, marg, stop, acts, qs, S = greedy_paths(g, C, 1e-9, 2)
+    add, marg, stop, acts, qs, qo, S, ast = greedy_paths(g, C, 1e-9, 2)
     check("STOP на нуле позиций", stop == 0, f"stop={stop}")
+    check("ADD+STOP даёт пустой набор", ast == (), f"ast={ast}")
     check("обратимый оставляет пустой набор", S == (), f"S={S}")
     check("обратимый не делает ходов", len(acts) == 0, f"acts={acts}")
 
@@ -75,7 +115,7 @@ def test_greedy_terminates():
         subs = subsets_of(C, 4)
         g = {S: float(rng.normal()) for S in subs}
         g[()] = 0.0
-        _, _, _, acts, _, _ = greedy_paths(g, C, 1e-9, 4)
+        acts = greedy_paths(g, C, 1e-9, 4)[3]
         worst = max(worst, len(acts))
     check("обратимая траектория конечна", worst <= 20, f"макс длина {worst}")
 
@@ -228,7 +268,8 @@ def test_derive_labels():
 
 
 def main():
-    for fn in (test_greedy_basic, test_greedy_useful_remove,
+    for fn in (test_greedy_basic, test_greedy_useful_swap,
+               test_no_standalone_remove,
                test_greedy_nonmonotone, test_greedy_terminates,
                test_ragged_permutation, test_gof_intersection, test_split,
                test_group_order_restored, test_exact_vs_le_k,

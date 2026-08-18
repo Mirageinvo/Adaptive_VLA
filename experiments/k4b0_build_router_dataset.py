@@ -71,6 +71,7 @@ bfloat16 ОПРОВЕРГНУТА: прогон на float32 дал те же ч
 """
 
 import argparse
+import hashlib
 import io
 import itertools
 import json
@@ -90,7 +91,7 @@ FEATURE_KEYS = (
     # это точно и на два порядка компактнее, чем хранить сами векторы
     "codebook_proj",
     # уровень наблюдения
-    "obs_pooled_ctx", "obs_task_idx", "obs_state",
+    "obs_pooled_ctx", "obs_task_idx", "obs_state", "obs_pos_offset",
     # уровень вмешательства (наблюдение + позиция правки p)
     "int_obs_idx", "int_p", "int_u", "int_v",
     "int_coarse_delta_norm", "int_coarse_cos", "int_logp_diff",
@@ -245,8 +246,10 @@ def greedy_paths(gmap, C, tau: float, kmax: int = 4):
                    себе ухудшает, а вместе с добавлением двойки улучшает на
                    0.75. Без обмена доля REMOVE занижается, и вывод об
                    обратимости получается преждевременным.
-                   Обмен записывается двумя ходами, REMOVE и ADD: итоговое
-                   состояние то же, а кодировка остаётся единообразной.
+                   Обмен хранится АТОМАРНОЙ операцией, а не парой REMOVE+ADD.
+                   Пара ломала бы интерпретацию: промежуточный REMOVE ухудшает
+                   цель, и в статистику самостоятельных отзывов попадали бы
+                   половинки обменов.
                    Каждый ход строго увеличивает G более чем на tau, поэтому
                    состояние не повторяется и предел длины не нужен."""
     def g(S):
@@ -267,7 +270,7 @@ def greedy_paths(gmap, C, tau: float, kmax: int = 4):
             break
         stop_k = i + 1
 
-    S, acts, qs_, seen = (), [], [], {()}
+    S, acts, qs_, qo_, seen = (), [], [], [], {()}
     while len(acts) < 6 * kmax + 6:
         best = (tau, None, None, None)          # (прирост, вид, q_out, q_in)
         for q in C:
@@ -289,19 +292,23 @@ def greedy_paths(gmap, C, tau: float, kmax: int = 4):
                     best = (d, "swap", qo, qi)
         if best[1] is None:
             break
+        # 1 = ADD(qi), 0 = REMOVE(qo), 2 = SWAP(qo -> qi). Атомарно.
         _, kind, qo, qi = best
+        acts.append({"add": 1, "rem": 0, "swap": 2}[kind])
+        qs_.append(qi if kind in ("add", "swap") else qo)
+        qo_.append(qo if kind in ("rem", "swap") else -1)
         if kind in ("rem", "swap"):
-            acts.append(0)
-            qs_.append(qo)
             S = tuple(x for x in S if x != qo)
         if kind in ("add", "swap"):
-            acts.append(1)
-            qs_.append(qi)
             S = tuple(sorted(S + (qi,)))
         if S in seen:
             break
         seen.add(S)
-    return add, marg, stop_k, acts, qs_, tuple(sorted(S))
+    # набор ADD+STOP: честная пара для сравнения с обратимым. Чистое ADD до
+    # упора заполняет бюджет даже бесполезными позициями, поэтому сравнение с
+    # ним мерило бы РАННЮЮ ОСТАНОВКУ, а не обратимость.
+    add_stop = tuple(sorted(add[:stop_k]))
+    return add, marg, stop_k, acts, qs_, qo_, tuple(sorted(S)), add_stop
 
 
 def derive_labels(raw, split, P, kmax, tau_rel, gap_rel):
@@ -392,6 +399,8 @@ def derive_labels(raw, split, P, kmax, tau_rel, gap_rel):
     rev_q = np.full((n, 4 * kmax + 4), -1, np.int16)
     rev_l = np.zeros(n, np.int16)
     rev_s = np.full((n, kmax), -1, np.int16)
+    rev_o = np.full((n, 6 * kmax + 6), -1, np.int16)
+    add_stop_s = np.full((n, kmax), -1, np.int16)
     for i in range(n):
         C, gm = tbl(i)
         for K in range(kmax + 1):
@@ -405,18 +414,22 @@ def derive_labels(raw, split, P, kmax, tau_rel, gap_rel):
             bsz[i, K] = len(best)
         # траектории считаются на RMS: порядок тот же, но STOP по основной метрике
         gm_r = {S: to_rms(i, g) for S, g in gm.items()}
-        a_, m_, sk, ra, rq, rs = greedy_paths(gm_r, C, float(tau[i]), kmax)
+        a_, m_, sk, ra, rq, ro, rs, ast = greedy_paths(gm_r, C, float(tau[i]),
+                                                       kmax)
         add_p[i, :len(a_)] = a_
         add_m[i, :len(m_)] = m_
         stop[i] = sk
         rev_a[i, :len(ra)] = ra
         rev_q[i, :len(rq)] = rq
+        rev_o[i, :len(ro)] = ro
         rev_l[i] = len(ra)
         rev_s[i, :len(rs)] = rs
+        add_stop_s[i, :len(ast)] = ast
     out.update(best_set_by_k=bs, best_gain_by_k_mse=bg_mse,
                best_gain_by_k_rms=bg_rms, best_size_by_k=bsz,
                add_path=add_p, add_marg_rms=add_m, stop_k=stop,
-               rev_action=rev_a, rev_q=rev_q, rev_len=rev_l, rev_set=rev_s)
+               rev_action=rev_a, rev_q=rev_q, rev_q_out=rev_o,
+               rev_len=rev_l, rev_set=rev_s, add_stop_set=add_stop_s)
     return out
 
 
@@ -453,10 +466,13 @@ def main() -> None:
                          "перебором 2517 наборов")
     ap.add_argument("--rank-lo", type=int, default=1)
     ap.add_argument("--rank-hi", type=int, default=5)
-    ap.add_argument("--pos-offset", type=int, default=4,
-                    help="умолчание scripts/eval_libero.py. Прежние замеры шли "
-                         "на 3, и при 4 задача заметно труднее: оракул 0.872 "
-                         "против 0.941, причинные признаки 0.29 против 0.42")
+    ap.add_argument("--offset-table", default="data/pos_offset_table.json",
+                    help="офсет ПО ЗАДАЧЕ из eval_libero_bar.sh; строится "
+                         "k4b0_offset_table.py. Единый офсет не воспроизводит "
+                         "опубликованный режим: 27 задач идут на 4, 13 на 3")
+    ap.add_argument("--pos-offset", type=int, default=None,
+                    help="ЕДИНЫЙ офсет для всех задач — только как абляция; "
+                         "по умолчанию берётся таблица")
     ap.add_argument("--window", type=int, default=4)
     ap.add_argument("--chunk", type=int, default=4096)
     ap.add_argument("--embodiment", type=int, default=0)
@@ -515,6 +531,39 @@ def main() -> None:
 
     uniq_tasks = sorted(set(TASKS))
     task_idx = np.array([uniq_tasks.index(t) for t in TASKS], np.int32)
+
+    # POS_OFFSET ПО ЗАДАЧЕ. Официальный eval_libero_bar.sh задаёт офсет
+    # отдельно каждой задаче каждого suite; единый офсет не воспроизводит
+    # опубликованный режим, а между 3 и 4 меняется сам план BAR.
+    if args.pos_offset is not None:
+        off_by_obs = np.full(N, args.pos_offset, np.int64)
+        off_meta = dict(mode="единый (абляция)", value=args.pos_offset)
+        print(f"pos_offset: ЕДИНЫЙ {args.pos_offset} — это АБЛЯЦИЯ, "
+              f"не официальный протокол")
+    else:
+        if not os.path.exists(args.offset_table):
+            raise SystemExit(
+                f"нет {args.offset_table}. Построить:\n"
+                f"  python3 experiments/k4b0_offset_table.py "
+                f"--out {args.offset_table}")
+        tb = json.load(open(args.offset_table))
+        miss = sorted(set(TASKS) - set(tb["tasks"]))
+        if miss:
+            raise SystemExit(f"нет офсета для задач: {miss[:3]} "
+                             f"(всего {len(miss)})")
+        off_by_obs = np.array([tb["tasks"][t]["pos_offset"] for t in TASKS],
+                              np.int64)
+        off_meta = dict(mode="по задаче", table=args.offset_table,
+                        table_sha256=hashlib.sha256(
+                            open(args.offset_table, "rb").read()).hexdigest(),
+                        source=tb["source"], source_sha256=tb["source_sha256"])
+        seen = {tb["tasks"][t]["suite"] for t in TASKS}
+        print(f"pos_offset по задаче из {args.offset_table}")
+        print(f"  suite в выборке: {sorted(seen)}, задач {len(uniq_tasks)}")
+        for v in sorted(set(off_by_obs.tolist())):
+            m = off_by_obs == v
+            print(f"  офсет {v}: наблюдений {m.sum()}, "
+                  f"задач {len(set(np.asarray(TASKS)[m]))}")
     for nm, s in (("train", 0), ("val", 1), ("test", 2)):
         m = SPLIT == s
         print(f"  {nm:>5}: наблюдений {m.sum():>5}, эпизодов "
@@ -577,7 +626,7 @@ def main() -> None:
     # паддинге разрыв равен vlen-L и гуляет — это и портило прежнюю сборку.
     # Замер k4b0_padding_probe: nat_l_4 совпал с dyn10_l_4 на 100% по всем
     # метрикам, а nat_r_3 тождественно dyn10_l_3.
-    print(f"паддинг: левый (как в eval_libero), pos_offset={args.pos_offset}")
+    print(f"паддинг: левый (как в eval_libero)")
 
     # OBS-LEVEL ПРИЗНАКИ ПИШУТСЯ ПО ИСХОДНОМУ ИНДЕКСУ. При группировке по длине
     # наблюдения обходятся не по порядку, а канонической сортировкой в конце
@@ -598,8 +647,8 @@ def main() -> None:
     g_off = [0]
     verify = []
 
-    def run_batch(sel, pad_to):
-        """sel — произвольный набор индексов наблюдений ОДНОЙ длины."""
+    def run_batch(sel, pad_to, pos_off):
+        """sel — набор индексов наблюдений с ОДНИМ pos_offset."""
         nonlocal verify
         B = len(sel)
         args_ns = args
@@ -624,7 +673,7 @@ def main() -> None:
                 alen = bs + (0 if hist is None else hist.shape[1])
                 apos = model._build_action_pos_ids_strided(
                     batch_size=B, base_pos=vlen, action_seq_len=alen,
-                    device=VLM.device, position_offset=args.pos_offset)
+                    device=VLM.device, position_offset=pos_off)
                 pids = model._build_joint_position_ids(
                     batch_size=B, vlm_seq_len=vlen, action_pos_ids=apos,
                     device=VLM.device)
@@ -817,9 +866,14 @@ def main() -> None:
                 Lab["p"].append(np.full(B, p_, np.int16))
         return
 
-    for lo in range(0, N, args.batch):
-        run_batch(np.arange(lo, min(lo + args.batch, N)), None)
-        print(f"наблюдения {min(lo + args.batch, N)}/{N}", flush=True)
+    # батчи собираются внутри ОДНОГО офсета: position_ids строятся на весь батч
+    done = 0
+    for off in sorted(set(off_by_obs.tolist())):
+        gi = np.where(off_by_obs == off)[0]
+        for j in range(0, len(gi), args.batch):
+            run_batch(gi[j:j + args.batch], None, int(off))
+            done += len(gi[j:j + args.batch])
+            print(f"наблюдения {done}/{N} (офсет {off})", flush=True)
 
     # ---------------- сборка ----------------
     # Признаки и сырые метки копились блоками формы (B, ...) в одном порядке
@@ -828,6 +882,7 @@ def main() -> None:
     F["obs_pooled_ctx"] = [OBS["ctx"]]
     F["obs_task_idx"] = [task_idx]
     F["obs_state"] = [st_all]
+    F["obs_pos_offset"] = [off_by_obs.astype(np.int16)]
     feats = {k: np.concatenate(v) for k, v in F.items() if v}
     assert np.array_equal(feats["obs_task_idx"], task_idx)
     assert np.allclose(feats["obs_state"], st_all)
@@ -888,8 +943,8 @@ def main() -> None:
                 P=int(P), L=int(L), kmax=args.kmax, tau_rel=args.tau_rel,
                 gap_rel=args.gap_rel, gap_threshold=float(labels["gap_threshold"]),
                 tau_by_p=[float(x) for x in labels["tau_by_p"]],
-                pos_offset=args.pos_offset, window=args.window,
-                vlm_dtype=args.vlm_dtype,
+                window=args.window,
+                vlm_dtype=args.vlm_dtype, pos_offset=off_meta,
                 padding_protocol="левый паддинг, как в eval_libero; "
                                  "эквивалентен отсутствию паддинга",
                 metric_table="MSE, нормировка на scale**2",

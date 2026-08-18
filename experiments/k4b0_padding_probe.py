@@ -361,9 +361,9 @@ def _report(R, P, N, args, ref):
                 e0 = float(r["e0"][p_, i])
                 den += np.sqrt(e0)
                 num["ex"] += to_rms(e0, max(gm.values()))
-                add, _, _, _, _, _ = greedy_paths(
+                add = greedy_paths(
                     {S: to_rms(e0, g) for S, g in gm.items()},
-                    sorted(C), 0.0, K)
+                    sorted(C), 0.0, K)[0]
                 num["gr"] += to_rms(e0, g_of(gm, C, add))
                 num["sg"] += to_rms(e0, g_of(
                     gm, C, np.argsort(-r["sing"][p_, i])[:K]))

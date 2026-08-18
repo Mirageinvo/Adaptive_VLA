@@ -300,35 +300,52 @@ def main() -> None:
     # АБЛЯЦИЯ ОБРАТИМОСТИ. Частота REMOVE ничего не решает: важно, даёт ли
     # обратимая процедура ВЫИГРЫШ против чистого добавления при том же бюджете.
     # Оба набора сохранены, таблица G(S) позволяет оценить любой из них.
-    ga, gr = np.zeros(n), np.zeros(n)
+    # ЧЕСТНАЯ ПАРА. Сравнивать обратимую политику с ADD-до-упора нельзя: та
+    # заполняет бюджет даже бесполезными позициями, и разница мерила бы РАННЮЮ
+    # ОСТАНОВКУ вместе с обратимостью. Опорой служит ADD+STOP — та же
+    # остановка, но без обмена.
+    ga, gr, gf = np.zeros(n), np.zeros(n), np.zeros(n)
+    na, nr = np.zeros(n), np.zeros(n)
     for i in range(n):
         gmap, C = make_gmap(lb, i, P, kmax)
-        add = [q for q in lb["add_path"][i] if q >= 0]
+        full = [q for q in lb["add_path"][i] if q >= 0]
+        adds = [q for q in lb["add_stop_set"][i] if q >= 0]
         rev = [q for q in lb["rev_set"][i] if q >= 0]
-        ga[i] = to_rms(e0[i], g_of(gmap, C, add))
+        gf[i] = to_rms(e0[i], g_of(gmap, C, full))
+        ga[i] = to_rms(e0[i], g_of(gmap, C, adds))
         gr[i] = to_rms(e0[i], g_of(gmap, C, rev))
+        na[i], nr[i] = len(adds), len(rev)
     den = np.sqrt(e0)
     for s_, nm in ((2, "test"), (1, "val")):
         m = sp == s_
-        pa = ga[m].sum() / den[m].sum()
-        pr = gr[m].sum() / den[m].sum()
         d = gr[m] - ga[m]
         pt, lo, hi_ = cluster_ci(d, den[m], epi[m])
-        print(f"\n  ОБРАТИМОСТЬ, {nm}: жадное добавление {pa:.3f}, "
-              f"обратимая {pr:.3f}")
-        print(f"    прирост {pt:+.4f} [{lo:+.4f}, {hi_:+.4f}] доли разрыва")
-        print(f"    строк, где обратимая строго лучше: {(d > 1e-12).mean():.2%}; "
-              f"хуже: {(d < -1e-12).mean():.2%}")
-        print(f"    средний размер набора: добавление "
-              f"{np.array([(lb['add_path'][i] >= 0).sum() for i in np.where(m)[0]]).mean():.2f}, "
-              f"обратимая "
-              f"{np.array([(lb['rev_set'][i] >= 0).sum() for i in np.where(m)[0]]).mean():.2f}")
-    print(f"\n  траекторий с REMOVE: "
-          f"{(lb['rev_action'] == 0).any(1).mean():.2%}, "
-          f"средняя длина {lb['rev_len'].mean():.2f}")
-    print("""    ЧИТАТЬ: слово reversible в названии метода оправдано только
-    приростом, а не частотой REMOVE. Порог плана — не менее +0.03 доли
-    закрытого разрыва либо меньший средний размер набора без потери качества.""")
+        print(f"\n  ОБРАТИМОСТЬ, {nm}:")
+        print(f"    ADD до упора (не пара для сравнения) "
+              f"{gf[m].sum() / den[m].sum():.3f}, размер "
+              f"{np.array([(lb['add_path'][i] >= 0).sum() for i in np.where(m)[0]]).mean():.2f}")
+        print(f"    ADD+STOP (честная пара)           "
+              f"{ga[m].sum() / den[m].sum():.3f}, размер {na[m].mean():.2f}")
+        print(f"    ADD/SWAP+STOP                     "
+              f"{gr[m].sum() / den[m].sum():.3f}, размер {nr[m].mean():.2f}")
+        print(f"    прирост обратимости {pt:+.4f} [{lo:+.4f}, {hi_:+.4f}]")
+        print(f"    строго лучше в {(d > 1e-12).mean():.2%} строк, "
+              f"хуже в {(d < -1e-12).mean():.2%}")
+        eq = np.isclose(nr[m], na[m])
+        if eq.any():
+            de = d[eq]
+            print(f"    при РАВНОМ размере набора ({eq.mean():.0%} строк): "
+                  f"прирост {de.sum() / den[m][eq].sum():+.4f}")
+    ra = lb["rev_action"]
+    print(f"\n  состав обратимых траекторий: SWAP в "
+          f"{(ra == 2).any(1).mean():.2%} строк, самостоятельный REMOVE в "
+          f"{(ra == 0).any(1).mean():.2%}, средняя длина {lb['rev_len'].mean():.2f}")
+    print("""    Самостоятельный REMOVE структурно не срабатывает, пока доступен
+    обмен: позиция входит только при улучшении, и если позже её удаление
+    улучшает, то обмен на том же шаге давал больше и был бы выбран (см.
+    test_no_standalone_remove). Поэтому «обратимость» здесь означает ОБМЕН.
+    Слово reversible оправдано приростом над ADD+STOP при равном размере
+    набора, а не частотой ходов. Порог плана — не менее +0.03.""")
     print(f"  средняя длина сжатой таблицы: {np.diff(lb['g_off']).mean():.1f}")
 
     print("\nвсе проверки пройдены")
