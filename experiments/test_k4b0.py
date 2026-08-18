@@ -61,38 +61,55 @@ def test_greedy_useful_swap():
           f"acts={acts}")
 
 
-def test_no_standalone_remove():
-    """САМОСТОЯТЕЛЬНЫЙ REMOVE не срабатывает, пока доступен ОБМЕН.
+def test_standalone_remove_possible():
+    """САМОСТОЯТЕЛЬНЫЙ REMOVE ВОЗМОЖЕН — детерминированный контрпример.
 
-    Доказательство. Позиция входит в набор только при улучшении, то есть
-    G(S+q) > G(S). Чтобы позже удаление r улучшало, нужно G(S-r) > G(S). Но на
-    том шаге, когда добавлялась последняя q, был доступен и обмен r -> q с
-    приростом G(S-r+q) - G(S), который при этом условии БОЛЬШЕ прироста
-    добавления. Значит обмен был бы выбран, и до состояния с полезным
-    удалением дело не дойдёт.
+    Прежде здесь стояло обратное утверждение с «доказательством»: позиция
+    входит только при улучшении, значит удаление позже улучшать не может,
+    иначе обмен на том же шаге дал бы больше. Рассуждение молча предполагало,
+    что состояние достигнуто последним ДОБАВЛЕНИЕМ; после ОБМЕНА оно
+    неприменимо. Случайный поиск на 500 функциях контрпримера не нашёл и был
+    принят за подтверждение — отрицательный поиск доказательством не является.
 
-    Практическое следствие: вся статистика «обратимости» — это ОБМЕНЫ, и
-    считать их надо отдельно от удалений. Прежние 7.62% были обменами."""
-    rng = np.random.default_rng(3)
-    n_rem = n_swap = 0
-    for _ in range(500):
+    Ожидаемая траектория при kmax=3:
+        ADD 0, ADD 1, ADD 2, SWAP 0->3, REMOVE 1  ->  {2,3}"""
+    C = [0, 1, 2, 3]
+    g = {(): 0.0, (0,): 1.0, (1,): 0.5, (2,): 0.4, (3,): 0.3,
+         (0, 1): 2.0, (0, 2): 1.2, (0, 3): 1.1,
+         (1, 2): 2.2, (1, 3): 2.1, (2, 3): 5.0,
+         (0, 1, 2): 3.0, (0, 1, 3): 2.5, (0, 2, 3): 3.5, (1, 2, 3): 4.0}
+    check("таблица полна", set(g) == set(subsets_of(C, 3)))
+    add, _, _, acts, qin, qout, S, ast = greedy_paths(g, C, 1e-9, 3)
+    check("траектория ADD,ADD,ADD,SWAP,REMOVE", acts == [1, 1, 1, 2, 0],
+          f"acts={acts}")
+    check("итог — оптимум {2,3}", S == (2, 3), f"S={S}, G={g[S]}")
+    check("SWAP хранит обе позиции", qin[3] == 3 and qout[3] == 0,
+          f"q_in={qin[3]}, q_out={qout[3]}")
+    check("у REMOVE q_in = -1, q_out = удаляемая",
+          qin[4] == -1 and qout[4] == 1, f"q_in={qin[4]}, q_out={qout[4]}")
+    check("у ADD q_out = -1", all(qout[i] == -1 for i in range(3)),
+          f"qout={qout[:3]}")
+    check("SWAP не засчитан как REMOVE", acts.count(0) == 1, f"acts={acts}")
+
+
+def test_rev_trajectory_ragged():
+    """Рваное хранение траекторий: длина не ограничена шириной массива."""
+    rng = np.random.default_rng(5)
+    flat_a, off = [], [0]
+    lens = []
+    for _ in range(50):
         C = sorted(rng.choice(8, rng.integers(2, 6), replace=False).tolist())
         g = {S: float(rng.normal()) for S in subsets_of(C, 4)}
         g[()] = 0.0
         acts = greedy_paths(g, C, 1e-9, 4)[3]
-        n_rem += acts.count(0)
-        n_swap += acts.count(2)
-    check("самостоятельных REMOVE нет", n_rem == 0, f"их {n_rem}")
-    check("обмены при этом встречаются", n_swap > 0, f"их {n_swap}")
-
-    # тот же случай без обмена: удаление тоже не срабатывает, потому что
-    # добавление шло только на улучшение
-    C = [0, 1]
-    g = {(): 0.0, (0,): 0.5, (1,): 0.9, (0, 1): 0.6}
-    add, _, _, acts, _, _, S, ast = greedy_paths(g, C, 1e-9, 2)
-    check("ADD-до-упора берёт обе позиции", set(add) == {0, 1}, f"add={add}")
-    check("обратимый останавливается на лучшей", S == (1,), f"S={S}")
-    check("ADD+STOP даёт тот же набор", ast == (1,), f"ast={ast}")
+        flat_a.extend(acts)
+        off.append(off[-1] + len(acts))
+        lens.append(len(acts))
+    check("смещения согласованы с длинами",
+          off[-1] == len(flat_a) == sum(lens))
+    ok = all(len(flat_a[off[i]:off[i + 1]]) == lens[i] for i in range(50))
+    check("каждая траектория извлекается по своим смещениям", ok)
+    check("длины бывают разные", len(set(lens)) > 1, f"длины {sorted(set(lens))}")
 
 
 def test_greedy_nonmonotone():
@@ -269,7 +286,8 @@ def test_derive_labels():
 
 def main():
     for fn in (test_greedy_basic, test_greedy_useful_swap,
-               test_no_standalone_remove,
+               test_standalone_remove_possible,
+               test_rev_trajectory_ragged,
                test_greedy_nonmonotone, test_greedy_terminates,
                test_ragged_permutation, test_gof_intersection, test_split,
                test_group_order_restored, test_exact_vs_le_k,

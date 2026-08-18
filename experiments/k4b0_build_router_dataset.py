@@ -250,6 +250,15 @@ def greedy_paths(gmap, C, tau: float, kmax: int = 4):
                    Пара ломала бы интерпретацию: промежуточный REMOVE ухудшает
                    цель, и в статистику самостоятельных отзывов попадали бы
                    половинки обменов.
+                   САМОСТОЯТЕЛЬНЫЙ REMOVE ВОЗМОЖЕН и встречается: после обмена
+                   набор оказывается в конфигурации, где удаление улучшает без
+                   замены. Пример, воспроизводимый кодом (kmax=3):
+                   ADD 0, ADD 1, ADD 2, SWAP 0->3, REMOVE 1 -> {2,3}.
+                   Прежнее утверждение о структурной невозможности было
+                   ошибочным: индукция молча предполагала, что состояние
+                   достигнуто последним ДОБАВЛЕНИЕМ, а после обмена аргумент не
+                   применим. Случайный поиск, не нашедший контрпримера,
+                   доказательством не является.
                    Каждый ход строго увеличивает G более чем на tau, поэтому
                    состояние не повторяется и предел длины не нужен."""
     def g(S):
@@ -271,7 +280,8 @@ def greedy_paths(gmap, C, tau: float, kmax: int = 4):
         stop_k = i + 1
 
     S, acts, qs_, qo_, seen = (), [], [], [], {()}
-    while len(acts) < 6 * kmax + 6:
+    cap = 6 * kmax + 6
+    while len(acts) < cap:
         best = (tau, None, None, None)          # (прирост, вид, q_out, q_in)
         for q in C:
             if q in S:
@@ -295,7 +305,8 @@ def greedy_paths(gmap, C, tau: float, kmax: int = 4):
         # 1 = ADD(qi), 0 = REMOVE(qo), 2 = SWAP(qo -> qi). Атомарно.
         _, kind, qo, qi = best
         acts.append({"add": 1, "rem": 0, "swap": 2}[kind])
-        qs_.append(qi if kind in ("add", "swap") else qo)
+        # q_in — что ВХОДИТ, q_out — что УХОДИТ. У REMOVE входящей нет.
+        qs_.append(qi if kind in ("add", "swap") else -1)
         qo_.append(qo if kind in ("rem", "swap") else -1)
         if kind in ("rem", "swap"):
             S = tuple(x for x in S if x != qo)
@@ -395,11 +406,13 @@ def derive_labels(raw, split, P, kmax, tau_rel, gap_rel):
     add_p = np.full((n, kmax), -1, np.int16)
     add_m = np.zeros((n, kmax), np.float32)
     stop = np.zeros(n, np.int8)
-    rev_a = np.full((n, 4 * kmax + 4), -1, np.int8)
-    rev_q = np.full((n, 4 * kmax + 4), -1, np.int16)
+    # ТРАЕКТОРИИ ХРАНЯТСЯ РВАНО, как таблица G: длина не ограничена сверху
+    # выбранной шириной массива, и рассогласование ширин невозможно по
+    # построению. Прежде цикл допускал 6*kmax+6 ходов, а массивы вмещали
+    # 4*kmax+4 — на длинной траектории присваивание упало бы.
+    rev_af, rev_if, rev_of, rev_off = [], [], [], [0]
     rev_l = np.zeros(n, np.int16)
     rev_s = np.full((n, kmax), -1, np.int16)
-    rev_o = np.full((n, 6 * kmax + 6), -1, np.int16)
     add_stop_s = np.full((n, kmax), -1, np.int16)
     for i in range(n):
         C, gm = tbl(i)
@@ -419,16 +432,20 @@ def derive_labels(raw, split, P, kmax, tau_rel, gap_rel):
         add_p[i, :len(a_)] = a_
         add_m[i, :len(m_)] = m_
         stop[i] = sk
-        rev_a[i, :len(ra)] = ra
-        rev_q[i, :len(rq)] = rq
-        rev_o[i, :len(ro)] = ro
+        rev_af.extend(ra)
+        rev_if.extend(rq)
+        rev_of.extend(ro)
+        rev_off.append(rev_off[-1] + len(ra))
         rev_l[i] = len(ra)
         rev_s[i, :len(rs)] = rs
         add_stop_s[i, :len(ast)] = ast
     out.update(best_set_by_k=bs, best_gain_by_k_mse=bg_mse,
                best_gain_by_k_rms=bg_rms, best_size_by_k=bsz,
                add_path=add_p, add_marg_rms=add_m, stop_k=stop,
-               rev_action=rev_a, rev_q=rev_q, rev_q_out=rev_o,
+               rev_action=np.asarray(rev_af, np.int8),
+               rev_q_in=np.asarray(rev_if, np.int16),
+               rev_q_out=np.asarray(rev_of, np.int16),
+               rev_off=np.asarray(rev_off, np.int64),
                rev_len=rev_l, rev_set=rev_s, add_stop_set=add_stop_s)
     return out
 
@@ -1095,17 +1112,17 @@ def _sanity(feats, labels, EPI, SPLIT, TASKS, args, verify, P) -> None:
     print("      если доля заметна, протокол — перенос на НОВЫЕ задачи, "
           "и это надо объявлять отдельно")
 
-    rl, ra = labels["rev_len"], labels["rev_action"]
+    rl, ra, ro = labels["rev_len"], labels["rev_action"], labels["rev_off"]
+    has = lambda code: np.array(  # noqa: E731
+        [(ra[ro[i]:ro[i + 1]] == code).any() for i in range(len(rl))])
     print(f" 12. обратимые траектории: средняя длина {rl.mean():.2f}, "
           f"максимум {rl.max()}")
-    print(f"      SWAP в {(ra == 2).any(1).mean():.2%} строк, "
-          f"самостоятельный REMOVE в {(ra == 0).any(1).mean():.2%}")
-    print("      REMOVE структурно равен нулю, пока доступен обмен: позиция "
-          "входит\n      только при улучшении, и если позже её удаление "
-          "улучшает, то обмен\n      на том же шаге давал больше и был бы "
-          "выбран. «Обратимость» здесь\n      означает ОБМЕН, и оправдана она "
-          "приростом над ADD+STOP при равном\n      размере набора, а не "
-          "частотой ходов — см. k4b0_verify.py")
+    print(f"      SWAP в {has(2).mean():.2%} строк, "
+          f"самостоятельный REMOVE в {has(0).mean():.2%}")
+    print("      Оба хода возможны: после обмена набор попадает в конфигурацию,\n"
+          "      где удаление улучшает без замены. Оправдана обратимость "
+          "приростом\n      над ADD+STOP при РАВНОМ размере набора, а не "
+          "частотой ходов —\n      см. k4b0_verify.py")
 
 
 if __name__ == "__main__":

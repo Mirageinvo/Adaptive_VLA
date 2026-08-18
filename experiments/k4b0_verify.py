@@ -304,7 +304,7 @@ def main() -> None:
     # заполняет бюджет даже бесполезными позициями, и разница мерила бы РАННЮЮ
     # ОСТАНОВКУ вместе с обратимостью. Опорой служит ADD+STOP — та же
     # остановка, но без обмена.
-    ga, gr, gf = np.zeros(n), np.zeros(n), np.zeros(n)
+    ga, gr, gf, gmt = (np.zeros(n), np.zeros(n), np.zeros(n), np.zeros(n))
     na, nr = np.zeros(n), np.zeros(n)
     for i in range(n):
         gmap, C = make_gmap(lb, i, P, kmax)
@@ -314,6 +314,7 @@ def main() -> None:
         gf[i] = to_rms(e0[i], g_of(gmap, C, full))
         ga[i] = to_rms(e0[i], g_of(gmap, C, adds))
         gr[i] = to_rms(e0[i], g_of(gmap, C, rev))
+        gmt[i] = to_rms(e0[i], g_of(gmap, C, full[:len(rev)]))
         na[i], nr[i] = len(adds), len(rev)
     den = np.sqrt(e0)
     for s_, nm in ((2, "test"), (1, "val")):
@@ -331,21 +332,26 @@ def main() -> None:
         print(f"    прирост обратимости {pt:+.4f} [{lo:+.4f}, {hi_:+.4f}]")
         print(f"    строго лучше в {(d > 1e-12).mean():.2%} строк, "
               f"хуже в {(d < -1e-12).mean():.2%}")
-        eq = np.isclose(nr[m], na[m])
-        if eq.any():
-            de = d[eq]
-            print(f"    при РАВНОМ размере набора ({eq.mean():.0%} строк): "
-                  f"прирост {de.sum() / den[m][eq].sum():+.4f}")
-    ra = lb["rev_action"]
-    print(f"\n  состав обратимых траекторий: SWAP в "
-          f"{(ra == 2).any(1).mean():.2%} строк, самостоятельный REMOVE в "
-          f"{(ra == 0).any(1).mean():.2%}, средняя длина {lb['rev_len'].mean():.2f}")
-    print("""    Самостоятельный REMOVE структурно не срабатывает, пока доступен
-    обмен: позиция входит только при улучшении, и если позже её удаление
-    улучшает, то обмен на том же шаге давал больше и был бы выбран (см.
-    test_no_standalone_remove). Поэтому «обратимость» здесь означает ОБМЕН.
-    Слово reversible оправдано приростом над ADD+STOP при равном размере
-    набора, а не частотой ходов. Порог плана — не менее +0.03.""")
+        # MATCHED-COST на ВСЕХ строках: жадное добавление обрезается до
+        # фактического размера обратимого набора. Иначе прирост частично
+        # объясняется разным числом пересчитанных позиций, а не обменом.
+        dm = gr[m] - gmt[m]
+        pm, lm, hm = cluster_ci(dm, den[m], epi[m])
+        print(f"    при РАВНОМ числе позиций (ADD обрезан до |rev_set|): "
+              f"{pm:+.4f} [{lm:+.4f}, {hm:+.4f}]")
+        print(f"      строго лучше в {(dm > 1e-12).mean():.2%}, "
+              f"хуже в {(dm < -1e-12).mean():.2%}")
+    ra, ro = lb["rev_action"], lb["rev_off"]
+    hs = np.array([(ra[ro[i]:ro[i + 1]] == 2).any() for i in range(n)])
+    hr = np.array([(ra[ro[i]:ro[i + 1]] == 0).any() for i in range(n)])
+    print(f"\n  состав обратимых траекторий: SWAP в {hs.mean():.2%} строк, "
+          f"самостоятельный REMOVE в {hr.mean():.2%}, "
+          f"средняя длина {lb['rev_len'].mean():.2f}")
+    print("""    Оба хода возможны. Самостоятельный REMOVE встречается после
+    обмена: набор попадает в конфигурацию, где удаление улучшает без замены
+    (детерминированный пример — test_standalone_remove_possible).
+    Слово reversible оправдано приростом над ADD+STOP ПРИ РАВНОМ ЧИСЛЕ
+    ПОЗИЦИЙ, а не частотой ходов. Порог плана — не менее +0.03.""")
     print(f"  средняя длина сжатой таблицы: {np.diff(lb['g_off']).mean():.1f}")
 
     print("\nвсе проверки пройдены")
