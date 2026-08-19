@@ -20,9 +20,14 @@
 
 АСИММЕТРИЯ, КОТОРУЮ ЛЕГКО ПОТЕРЯТЬ. Одиночный оракул O1 ранжирует все 16
 позиций и предпочтёт БЕЗОПАСНЫЙ НОЛЬ вне support вредной позиции внутри него.
-Поэтому «истинные gains, но принудительно четыре внутри support» — это НЕ O1, а
-величина строго не выше. Разница и есть цена того, что идеальный классификатор
-support сам по себе вредит.
+Поэтому «истинные gains, но принудительно четыре внутри support» — это НЕ O1.
+
+ЗНАК ЭТОЙ РАЗНИЦЫ НЕ ФИКСИРОВАН, и я ошибочно утверждал обратное. Если G
+аддитивна, true-in-C ≤ O1: подмена вредной позиции нулём не может навредить.
+При КОМПЛЕМЕНТАРНОСТИ неравенство переворачивается — позиция с отрицательным
+одиночным выигрышем бывает полезна в паре. На реальных данных вышло именно так
+(true-in-C 0.724 против O1 0.701), и это прямая мера комплементарности,
+согласующаяся с опровержением субмодулярности в K-4a4.
 
 Запуск:
     python3 experiments/k4b0_extra_baselines.py --dir data/k4b0_v2
@@ -208,6 +213,90 @@ def decomposition(tables, lb, e0, idx, ent, K, rng, n_rand=20):
     return res
 
 
+def static_analysis(tables, lb, e0, iv, it, epi, tsk, P, K, tr, res):
+    """ПОЧЕМУ ФИКСИРОВАННАЯ МАСКА ТАК СИЛЬНА.
+
+    prior[q] не зависит от строки: score одинаков для всех 16000 вмешательств,
+    поэтому top-K — это ОДНО И ТО ЖЕ множество позиций всегда. Если такая маска
+    близка к одиночному оракулу, гипотеза «активное множество зависит от
+    состояния» под угрозой, и это надо разобрать, а не спрятать.
+
+    Печатаем три вещи.
+
+    1. ПРОФИЛЬ ПО ПОЗИЦИЯМ: средний нормированный одиночный выигрыш, частота
+       попадания в changed-support и частота попадания в оракульный лучший
+       набор. Если профиль резко неравномерен, дело в статическом распределении
+       массы ошибки по временным позициям, а не в состоянии.
+
+    2. ЛУЧШАЯ ФИКСИРОВАННАЯ МАСКА, подобранная по фактическому G на validation
+       (а не по средним одиночным выигрышам) — честный сильнейший статический
+       baseline. Перебор ограничен десятью лучшими позициями профиля: C(10,4) =
+       210 наборов вместо 1820, а отброшенные позиции заведомо слабее.
+
+    3. МЕТРИКА, НЕ ЗАВИСЯЩАЯ ОТ МАСШТАБА СТРОКИ: среднее по строкам отношение
+       G(S)/G*, только по gap_valid. Основная метрика — отношение сумм, и её
+       определяют строки с крупной исходной ошибкой; фиксированная маска могла
+       бы выигрывать просто потому, что ловит позиции, где ошибка велика всегда.
+       Если преимущество сохраняется и здесь, эффект не масштабный.
+    """
+    import itertools
+    # ПРОФИЛЬ СЧИТАЕТСЯ ТОЛЬКО ПО gap_valid. sing_gain_norm делится на g*, и на
+    # строках, где чинить нечего, отношение неограниченно; одна такая строка
+    # уводит среднее по позиции на порядки (поймано дымовым прогоном).
+    tr = tr[lb["gap_valid"][tr]]
+    y = lb["sing_gain_norm"]
+    prof = y[tr].mean(0)
+    supp_f = np.array([(lb["support"][tr] >> q & 1).mean() for q in range(P)])
+    bs = lb["best_set_by_k"][tr, K]
+    best_f = np.array([(bs == q).any(1).mean() for q in range(P)])
+
+    print("\n" + "=" * 74)
+    print("ПОЧЕМУ РАБОТАЕТ ФИКСИРОВАННАЯ МАСКА (профиль по train)")
+    print("=" * 74)
+    print(f"  {'поз':>4}{'ср. одиночный':>15}{'доля в support':>16}"
+          f"{'доля в лучшем наборе':>22}")
+    for q in range(P):
+        print(f"  {q:>4}{prof[q]:>15.4f}{supp_f[q]:>16.1%}{best_f[q]:>22.1%}")
+    fixed = sorted(np.argsort(-prof)[:K].tolist())
+    print(f"  маска prior[q] при K={K}: {fixed} — ОДНА И ТА ЖЕ для всех строк")
+
+    cand = np.argsort(-prof)[:10].tolist()
+    best_S, best_R = None, -1e30
+    for S in itertools.combinations(sorted(cand), K):
+        num, den = eval_sets(tables[1], e0, iv, [list(S)] * len(iv))
+        R = num.sum() / den.sum()
+        if R > best_R:
+            best_S, best_R = S, R
+    print(f"\n  лучшая фиксированная маска по validation: {list(best_S)}, "
+          f"R_val={best_R:.3f}")
+    num, den = eval_sets(tables[2], e0, it, [list(best_S)] * len(it))
+    report("фикс-маска (подбор по val)", num, den, epi[it], tsk[it], res)
+    res["test/K4/фикс-маска"] = res.pop("фикс-маска (подбор по val)")
+
+    print("\n" + "=" * 74)
+    print("КОНТРОЛЬ МАСШТАБА: среднее отношение G(S)/G* по строкам, test")
+    print("=" * 74)
+    gstar = lb["best_gain_by_k_rms"][:, K]
+    # ВТОРОЕ УСЛОВИЕ ОБЯЗАТЕЛЬНО. gap_valid проверяет исходный разрыв, а
+    # знаменатель здесь — ЛУЧШИЙ ДОСТИЖИМЫЙ выигрыш; он бывает около нуля и без
+    # того, и отношение улетает. Медиана печатается как основная величина.
+    gv = lb["gap_valid"][it] & (gstar[it] > 0)
+    print(f"  строк с осмысленным разрывом и g* > 0: {gv.sum()} из {len(it)}")
+    for nm, sets in (("фикс-маска", [list(best_S)] * len(it)),
+                     ("O1", [list(np.argsort(-lb['sing_gain_rms'][i],
+                                             kind='stable')[:K]) for i in it]),
+                     ("точный оракул", [list(lb["best_set_by_k"][i, K]
+                                             [lb["best_set_by_k"][i, K] >= 0])
+                                        for i in it])):
+        num, _ = eval_sets(tables[2], e0, it, sets)
+        r = num[gv] / gstar[it][gv]
+        print(f"  {nm:<20} медиана {np.median(r):.3f}   "
+              f"среднее {r.mean():.3f}   доля строк с G(S) <= 0 "
+              f"{(r <= 0).mean():.1%}")
+    print("  ЧИТАТЬ ТАК: если фикс-маска здесь резко проседает относительно\n"
+          "  своего места в отношении сумм, её сила была масштабным эффектом.")
+
+
 def selftest():
     """Синтетика с ИЗВЕСТНЫМ ОТВЕТОМ для машинки отбора и подсчёта.
 
@@ -225,13 +314,19 @@ def selftest():
     # ничьи: все нули -> должны идти подряд по индексу
     assert list(topk_sets(np.zeros((1, P)), 3)[0]) == [0, 1, 2], "ничьи неустойчивы"
 
-    # support {1,3}: позиция 1 полезна, позиция 3 ВРЕДНА.
+    # support {1,3}: позиция 1 полезна, позиция 3 ВРЕДНА и не окупается в паре
+    # (0.35 < 0.5) — АДДИТИВНЫЙ случай, только в нём true-in-C ниже O1.
     gmap = {(): 0.0, (1,): 0.5, (3,): -0.2, (1, 3): 0.35}
     C = {1, 3}
     e0 = 1.0
     o1 = to_rms(e0, g_of(gmap, C, [1]))          # берёт 1, остальные нули
     tin = to_rms(e0, g_of(gmap, C, [1, 3]))      # принудительно оба из C
-    assert tin < o1, "true-in-C обязан быть не выше O1 при вредной позиции"
+    assert tin < o1, "в аддитивном случае true-in-C обязан быть не выше O1"
+    # КОМПЛЕМЕНТАРНЫЙ случай: та же вредная позиция окупается в паре, и
+    # неравенство ПЕРЕВОРАЧИВАЕТСЯ. Обобщать знак разности нельзя.
+    gmap2 = {(): 0.0, (1,): 0.5, (3,): -0.2, (1, 3): 0.9}
+    assert to_rms(e0, g_of(gmap2, C, [1, 3])) > to_rms(e0, g_of(gmap2, C, [1])), \
+        "при комплементарности true-in-C обязан быть выше O1"
     assert abs(to_rms(e0, g_of(gmap, C, [1, 0, 2])) - o1) < 1e-12, \
         "добивка позициями вне support изменила выигрыш"
     print("самопроверка пройдена: отбор, ничьи, forced, добивка, асимметрия O1")
@@ -253,13 +348,24 @@ def make_fake(d, P=8, kmax=4, n_obs=40, seed=0):
     e0 = r.uniform(0.5, 2.0, n)
     supp = np.array([int(r.integers(1, 1 << P)) for _ in range(n)], np.int64)
     g_flat, g_off, sg = [], [0], np.zeros((n, P), np.float32)
+    bset = np.full((n, kmax + 1, kmax), -1, np.int16)
+    bg = np.zeros((n, kmax + 1), np.float32)
     for i in range(n):
         C = tuple(q for q in range(P) if supp[i] >> q & 1)
         w = r.normal(0.15, 0.2, len(C))
+        best = {k: ((), -1e30) for k in range(kmax + 1)}
         for k in range(kmax + 1):
             for S in itertools.combinations(range(len(C)), k):
-                g_flat.append(float(sum(w[j] for j in S)) * e0[i] * 0.4)
+                g = float(sum(w[j] for j in S)) * e0[i] * 0.4
+                g_flat.append(g)
+                for kk in range(k, kmax + 1):
+                    if g > best[kk][1]:
+                        best[kk] = (tuple(C[j] for j in S), g)
         g_off.append(len(g_flat))
+        for k in range(kmax + 1):
+            S, g = best[k]
+            bset[i, k, :len(S)] = S
+            bg[i, k] = to_rms(e0[i], g)
         for j, q in enumerate(C):
             sg[i, q] = to_rms(e0[i], w[j] * e0[i] * 0.4)
     np.savez(os.path.join(d, "features.npz"),
@@ -271,8 +377,14 @@ def make_fake(d, P=8, kmax=4, n_obs=40, seed=0):
              split=split, e_empty=e0, support=supp,
              g_flat=np.array(g_flat, np.float32),
              g_off=np.array(g_off, np.int64), sing_gain_rms=sg,
-             sing_gain_norm=sg / np.maximum(sg.max(1, keepdims=True), 1e-6),
-             best_size_by_k=np.full((n, kmax + 1), kmax, np.int8))
+             # нормировка КАК В BUILDER: делим на лучший достижимый выигрыш и
+             # объявляем строку негодной, когда чинить нечего. Иначе поддельные
+             # данные ведут себя не как настоящие и дымовой прогон обманывает.
+             sing_gain_norm=(sg / np.maximum(bg[:, kmax:kmax + 1], 1e-6)
+                             * (bg[:, kmax:kmax + 1] > 1e-3)),
+             best_size_by_k=np.full((n, kmax + 1), kmax, np.int8),
+             best_set_by_k=bset, best_gain_by_k_rms=bg,
+             gap_valid=bg[:, kmax] > 1e-3)
     json.dump(dict(P=P, kmax=kmax, commit="fake",
                    tasks=[f"t{i}" for i in range(4)]),
               open(os.path.join(d, "metadata.json"), "w"))
@@ -429,6 +541,9 @@ def main() -> None:
     print("  ворота B1: R >= 0.60 И R - B_prior >= 0.05 И нижняя граница")
     print("  парного ДИ выше нуля, воспроизводимо на трёх сидах обучения.")
 
+    static_analysis(tables, lb, e0, idx_of[1], idx_of[2], epi, tsk, P, kmax,
+                    tr, res)
+
     # ---- РАЗЛОЖЕНИЕ РАЗРЫВА -----------------------------------------------
     print("\n" + "=" * 74)
     print("РАЗЛОЖЕНИЕ РАЗРЫВА: «найти support» против «упорядочить внутри»")
@@ -444,10 +559,14 @@ def main() -> None:
         a = res[f"{nm}/decomp/random-16"]["R"]
         b = res[f"{nm}/decomp/random-in-C"]["R"]
         c = res[f"{nm}/decomp/entropy-in-C"]["R"]
-        d = res[f"{nm}/decomp/O1"]["R"]
-        print(f"\n  знание support даёт          {b - a:+.3f}")
-        print(f"  причинный порядок внутри     {c - b:+.3f}")
-        print(f"  остаток до одиночного оракула{d - c:+.3f}")
+        d = res[f"{nm}/decomp/true-in-C"]["R"]
+        o = res[f"{nm}/decomp/O1"]["R"]
+        # Верхняя точка лестницы — true-in-C, а НЕ O1: при комплементарности
+        # принудительный выбор внутри support обходит одиночное ранжирование.
+        print(f"\n  знание support даёт             {b - a:+.3f}")
+        print(f"  причинный порядок внутри        {c - b:+.3f}")
+        print(f"  остаток до идеального порядка   {d - c:+.3f}")
+        print(f"  комплементарность (true-in-C - O1) {d - o:+.3f}")
         print("  ЧИТАТЬ ТАК: если первое слагаемое доминирует, router надо\n"
               "  строить и мерить прежде всего как классификатор support;\n"
               "  если второе — центр тяжести в знаке и величине выигрыша.")
