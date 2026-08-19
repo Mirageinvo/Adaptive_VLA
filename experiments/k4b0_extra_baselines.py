@@ -213,7 +213,7 @@ def decomposition(tables, lb, e0, idx, ent, K, rng, n_rand=20):
     return res
 
 
-def static_analysis(tables, lb, e0, iv, it, epi, tsk, P, K, tr, res):
+def static_analysis(tables, lb, e0, iv, it, epi, tsk, P, K, tr, res, ft_off):
     """ПОЧЕМУ ФИКСИРОВАННАЯ МАСКА ТАК СИЛЬНА.
 
     prior[q] не зависит от строки: score одинаков для всех 16000 вмешательств,
@@ -273,6 +273,20 @@ def static_analysis(tables, lb, e0, iv, it, epi, tsk, P, K, tr, res):
     report("фикс-маска (подбор по val)", num, den, epi[it], tsk[it], res)
     res["test/K4/фикс-маска"] = res.pop("фикс-маска (подбор по val)")
 
+    # ПРОФИЛЬ ОТДЕЛЬНО ПО ОФСЕТАМ. Протокол смешанный: 27 задач идут на офсете
+    # 4, 13 на офсете 3, а офсет задаёт шаг position ids для токенов действия.
+    # Если пики профиля СДВИГАЮТСЯ вместе с офсетом, «выделенные позиции» — это
+    # артефакт разметки позиций, а не свойство горизонта действия.
+    off = ft_off[lb["obs_idx"]]
+    print("\n  профиль по офсетам (пики должны совпасть, иначе это артефакт"
+          " position ids)")
+    for o in sorted(set(off[tr].tolist())):
+        m = tr[off[tr] == o]
+        pr = y[m].mean(0)
+        print(f"    офсет {o}, строк {len(m):>5}: маска "
+              f"{sorted(np.argsort(-pr)[:K].tolist())}, пик на позиции "
+              f"{int(np.argmax(pr))}")
+
     print("\n" + "=" * 74)
     print("КОНТРОЛЬ МАСШТАБА: среднее отношение G(S)/G* по строкам, test")
     print("=" * 74)
@@ -282,19 +296,42 @@ def static_analysis(tables, lb, e0, iv, it, epi, tsk, P, K, tr, res):
     # того, и отношение улетает. Медиана печатается как основная величина.
     gv = lb["gap_valid"][it] & (gstar[it] > 0)
     print(f"  строк с осмысленным разрывом и g* > 0: {gv.sum()} из {len(it)}")
+    nums = {}
     for nm, sets in (("фикс-маска", [list(best_S)] * len(it)),
                      ("O1", [list(np.argsort(-lb['sing_gain_rms'][i],
                                              kind='stable')[:K]) for i in it]),
                      ("точный оракул", [list(lb["best_set_by_k"][i, K]
                                              [lb["best_set_by_k"][i, K] >= 0])
                                         for i in it])):
-        num, _ = eval_sets(tables[2], e0, it, sets)
+        num, den = eval_sets(tables[2], e0, it, sets)
+        nums[nm] = (num, den)
         r = num[gv] / gstar[it][gv]
         print(f"  {nm:<20} медиана {np.median(r):.3f}   "
               f"среднее {r.mean():.3f}   доля строк с G(S) <= 0 "
               f"{(r <= 0).mean():.1%}")
     print("  ЧИТАТЬ ТАК: если фикс-маска здесь резко проседает относительно\n"
           "  своего места в отношении сумм, её сила была масштабным эффектом.")
+
+    # РАССЛОЕНИЕ ПО ВЕЛИЧИНЕ ИСХОДНОЙ ОШИБКИ. Основная метрика — отношение
+    # сумм, поэтому строки с крупной e(пусто) весят больше. Прямая проверка
+    # гипотезы «фиксированная маска сильна там, где ошибка велика, и промахи
+    # прячутся в лёгких строках»: если её отставание от O1 растёт к лёгким
+    # квартилям, преимущество в основной метрике держится на весах.
+    print("\n  расслоение по квартилям e(пусто), test")
+    qs = np.quantile(e0[it], [0.25, 0.5, 0.75])
+    b = np.digitize(e0[it], qs)
+    print(f"  {'квартиль':>10}{'фикс R':>10}{'O1 R':>10}"
+          f"{'фикс med':>11}{'O1 med':>9}{'фикс вред':>11}")
+    for k in range(4):
+        m = b == k
+        mg = m & gv
+        f_n, f_d = nums["фикс-маска"][0][m], nums["фикс-маска"][1][m]
+        o_n = nums["O1"][0][m]
+        rf = nums["фикс-маска"][0][mg] / gstar[it][mg]
+        ro = nums["O1"][0][mg] / gstar[it][mg]
+        print(f"  {k + 1:>10}{f_n.sum() / f_d.sum():>10.3f}"
+              f"{o_n.sum() / f_d.sum():>10.3f}{np.median(rf):>11.3f}"
+              f"{np.median(ro):>9.3f}{(rf <= 0).mean():>11.1%}")
 
 
 def selftest():
@@ -372,6 +409,7 @@ def make_fake(d, P=8, kmax=4, n_obs=40, seed=0):
              cand_entropy=r.uniform(0, 3, (n, P)).astype(np.float32),
              cand_margin=r.uniform(0, 1, (n, P)).astype(np.float32),
              obs_task_idx=(np.arange(n_obs) % 4).astype(np.int64),
+             obs_pos_offset=(3 + np.arange(n_obs) % 2).astype(np.int64),
              int_obs_idx=obs, int_p=p)
     np.savez(os.path.join(d, "labels.npz"), obs_idx=obs, p=p, episode=ep,
              split=split, e_empty=e0, support=supp,
@@ -542,7 +580,7 @@ def main() -> None:
     print("  парного ДИ выше нуля, воспроизводимо на трёх сидах обучения.")
 
     static_analysis(tables, lb, e0, idx_of[1], idx_of[2], epi, tsk, P, kmax,
-                    tr, res)
+                    tr, res, ft["obs_pos_offset"])
 
     # ---- РАЗЛОЖЕНИЕ РАЗРЫВА -----------------------------------------------
     print("\n" + "=" * 74)
