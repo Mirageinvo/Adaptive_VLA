@@ -23,10 +23,10 @@
 Поэтому «истинные gains, но принудительно четыре внутри support» — это НЕ O1.
 
 ЗНАК ЭТОЙ РАЗНИЦЫ НЕ ФИКСИРОВАН, и я ошибочно утверждал обратное. Если G
-аддитивна, true-in-C ≤ O1: подмена вредной позиции нулём не может навредить.
+аддитивна, O1|support ≤ O1: подмена вредной позиции нулём не может навредить.
 При КОМПЛЕМЕНТАРНОСТИ неравенство переворачивается — позиция с отрицательным
 одиночным выигрышем бывает полезна в паре. На реальных данных вышло именно так
-(true-in-C 0.724 против O1 0.701), и это прямая мера комплементарности,
+(O1|support 0.724 против O1 0.701), и это прямая мера комплементарности,
 согласующаяся с опровержением субмодулярности в K-4a4.
 
 Запуск:
@@ -35,6 +35,7 @@
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -150,6 +151,25 @@ def prior_scores(pri, kind, p, tsk_idx, P, alpha=0.0):
     raise ValueError(kind)
 
 
+def paired_ci(num_a, num_b, den, epi, n_boot=2000, seed=0):
+    """ПАРНАЯ разность двух долей закрытого разрыва, бутстрап по эпизодам.
+
+    Раздельные интервалы двух политик сравнивать нельзя: политики оценены на
+    ОДНИХ И ТЕХ ЖЕ строках и сильно скоррелированы, поэтому перекрытие
+    раздельных интервалов ничего не говорит о значимости разности. Реплика
+    берёт один и тот же набор эпизодов для обеих политик."""
+    _, code = np.unique(epi, return_inverse=True)
+    ne = code.max() + 1
+    a = np.bincount(code, weights=np.asarray(num_a, np.float64), minlength=ne)
+    b = np.bincount(code, weights=np.asarray(num_b, np.float64), minlength=ne)
+    d = np.bincount(code, weights=np.asarray(den, np.float64), minlength=ne)
+    pt = (a.sum() - b.sum()) / max(d.sum(), 1e-30)
+    idx = np.random.default_rng(seed).integers(0, ne, size=(n_boot, ne))
+    dd = np.maximum(d[idx].sum(1), 1e-30)
+    out = (a[idx].sum(1) - b[idx].sum(1)) / dd
+    return pt, float(np.percentile(out, 2.5)), float(np.percentile(out, 97.5))
+
+
 def report(name, num, den, epi, tsk, out=None):
     pt, lo, hi = cluster_ci(num, den, epi)
     mac = macro_by(num, den, tsk)
@@ -165,7 +185,7 @@ def decomposition(tables, lb, e0, idx, ent, K, rng, n_rand=20):
     1. random-16      — случайные K из всех 16;
     2. random-in-C    — случайные K внутри истинного support;
     3. entropy-in-C   — идеальный support + причинное ранжирование внутри;
-    4. true-in-C      — истинные gains, но ПРИНУДИТЕЛЬНО K внутри support;
+    4. O1|support      — истинные gains, но ПРИНУДИТЕЛЬНО K внутри support;
     5. O1             — истинные gains по всем 16 (это и есть 0.701).
 
     При |C| < K добираем позициями ВНЕ support: они дают ровно ноль, поэтому
@@ -183,7 +203,7 @@ def decomposition(tables, lb, e0, idx, ent, K, rng, n_rand=20):
         extra = [q for q in all_pos if q not in C_sorted][:need]
         return list(base) + extra
 
-    for nm in ("random-16", "random-in-C", "entropy-in-C", "true-in-C", "O1"):
+    for nm in ("random-16", "random-in-C", "entropy-in-C", "O1|support", "O1"):
         acc = []
         reps = n_rand if nm.startswith("random") else 1
         for rep in range(reps):
@@ -202,7 +222,7 @@ def decomposition(tables, lb, e0, idx, ent, K, rng, n_rand=20):
                     o = [q for q in np.argsort(-ent[i], kind="stable")
                          if q in C][:K]
                     sets.append(fill(o, C, allp))
-                elif nm == "true-in-C":
+                elif nm == "O1|support":
                     o = [q for q in np.argsort(-sg[i], kind="stable")
                          if q in C][:K]
                     sets.append(fill(o, C, allp))
@@ -260,18 +280,30 @@ def static_analysis(tables, lb, e0, iv, it, epi, tsk, P, K, tr, res, ft_off):
     fixed = sorted(np.argsort(-prof)[:K].tolist())
     print(f"  маска prior[q] при K={K}: {fixed} — ОДНА И ТА ЖЕ для всех строк")
 
-    cand = np.argsort(-prof)[:10].tolist()
+    # ПОЛНЫЙ ПЕРЕБОР C(P,K). Прежде перебирались только подмножества десяти
+    # лучших позиций профиля, то есть отбор был предвзят в пользу самого
+    # профиля: набор, сильный за счёт ВЗАИМОДЕЙСТВИЙ слабых по одиночке
+    # позиций, в кандидаты не попадал. Для P=16, K=4 это 1820 наборов —
+    # перебор дешевле, чем оговорка.
+    all_S = list(itertools.combinations(range(P), K))
     best_S, best_R = None, -1e30
-    for S in itertools.combinations(sorted(cand), K):
+    for j, S in enumerate(all_S):
+        if j % 500 == 0:
+            print(f"    перебор масок: {j}/{len(all_S)}", flush=True)
         num, den = eval_sets(tables[1], e0, iv, [list(S)] * len(iv))
         R = num.sum() / den.sum()
         if R > best_R:
             best_S, best_R = S, R
-    print(f"\n  лучшая фиксированная маска по validation: {list(best_S)}, "
-          f"R_val={best_R:.3f}")
+    print(f"\n  лучшая из всех {len(all_S)} масок, подбор по validation: "
+          f"{list(best_S)}, R_val={best_R:.3f}")
+    if list(best_S) != fixed:
+        print(f"    ОТЛИЧАЕТСЯ от маски средних одиночных выигрышей {fixed} — "
+              f"значит статический набор выигрывает и от взаимодействий")
     num, den = eval_sets(tables[2], e0, it, [list(best_S)] * len(it))
     report("фикс-маска (подбор по val)", num, den, epi[it], tsk[it], res)
     res["test/K4/фикс-маска"] = res.pop("фикс-маска (подбор по val)")
+    res["fixed_mask"] = list(map(int, best_S))
+    fix_num = num
 
     # ПРОФИЛЬ ОТДЕЛЬНО ПО ОФСЕТАМ. Протокол смешанный: 27 задач идут на офсете
     # 4, 13 на офсете 3, а офсет задаёт шаг position ids для токенов действия.
@@ -340,7 +372,7 @@ def selftest():
     Строим одну строку, где support = {1, 3}, выигрыши заданы руками, и
     проверяем, что: top-K по score выбирает то, что должен; forced-политика
     действительно ставит p первым; добивка нейтральными не меняет G; величина
-    true-in-C не выше O1 при вредной позиции внутри support.
+    O1|support не выше O1 при вредной позиции внутри support.
     """
     P, K = 8, 4
     score = np.zeros((1, P))
@@ -352,18 +384,18 @@ def selftest():
     assert list(topk_sets(np.zeros((1, P)), 3)[0]) == [0, 1, 2], "ничьи неустойчивы"
 
     # support {1,3}: позиция 1 полезна, позиция 3 ВРЕДНА и не окупается в паре
-    # (0.35 < 0.5) — АДДИТИВНЫЙ случай, только в нём true-in-C ниже O1.
+    # (0.35 < 0.5) — АДДИТИВНЫЙ случай, только в нём O1|support ниже O1.
     gmap = {(): 0.0, (1,): 0.5, (3,): -0.2, (1, 3): 0.35}
     C = {1, 3}
     e0 = 1.0
     o1 = to_rms(e0, g_of(gmap, C, [1]))          # берёт 1, остальные нули
     tin = to_rms(e0, g_of(gmap, C, [1, 3]))      # принудительно оба из C
-    assert tin < o1, "в аддитивном случае true-in-C обязан быть не выше O1"
+    assert tin < o1, "в аддитивном случае O1|support обязан быть не выше O1"
     # КОМПЛЕМЕНТАРНЫЙ случай: та же вредная позиция окупается в паре, и
     # неравенство ПЕРЕВОРАЧИВАЕТСЯ. Обобщать знак разности нельзя.
     gmap2 = {(): 0.0, (1,): 0.5, (3,): -0.2, (1, 3): 0.9}
     assert to_rms(e0, g_of(gmap2, C, [1, 3])) > to_rms(e0, g_of(gmap2, C, [1])), \
-        "при комплементарности true-in-C обязан быть выше O1"
+        "при комплементарности O1|support обязан быть выше O1"
     assert abs(to_rms(e0, g_of(gmap, C, [1, 0, 2])) - o1) < 1e-12, \
         "добивка позициями вне support изменила выигрыш"
     print("самопроверка пройдена: отбор, ничьи, forced, добивка, асимметрия O1")
@@ -420,7 +452,9 @@ def make_fake(d, P=8, kmax=4, n_obs=40, seed=0):
              # данные ведут себя не как настоящие и дымовой прогон обманывает.
              sing_gain_norm=(sg / np.maximum(bg[:, kmax:kmax + 1], 1e-6)
                              * (bg[:, kmax:kmax + 1] > 1e-3)),
-             best_size_by_k=np.full((n, kmax + 1), kmax, np.int8),
+             # РАЗМЕР ДОЛЖЕН СООТВЕТСТВОВАТЬ НАБОРУ. Прежде здесь стояла
+             # константа kmax, и фикстура была рассогласована сама с собой.
+             best_size_by_k=(bset >= 0).sum(2).astype(np.int8),
              best_set_by_k=bset, best_gain_by_k_rms=bg,
              gap_valid=bg[:, kmax] > 1e-3)
     json.dump(dict(P=P, kmax=kmax, commit="fake",
@@ -530,6 +564,17 @@ def main() -> None:
         if R > best_a_R:
             best_a, best_a_R = alpha, R
     print(f"  выбрано: lambda={best_lam}, alpha={best_a}")
+    # СВЕРКА ВЫРОЖДЕНИЯ ПО НАБОРАМ, А НЕ ПО АГРЕГАТУ. При большом lambda
+    # индикатор [q=p] обязан перевесить любой разброс z-нормированной энтропии,
+    # и «энтропия + lambda*[q=p]» должна давать РОВНО ТЕ ЖЕ наборы, что и
+    # «p + энтропия». Совпадение R этого не доказывает: разные наборы могут
+    # дать одинаковую сумму. Сравниваем сами наборы.
+    s_comb = topk_sets((zent + best_lam * is_p)[iv], kmax)
+    s_forc = topk_sets(zent[iv], kmax, p_all[iv])
+    same = (np.sort(s_comb, 1) == np.sort(s_forc, 1)).all(1)
+    print(f"  сверка вырождения при lambda={best_lam}: наборы совпали в "
+          f"{same.mean():.1%} строк val "
+          f"({'вырождение подтверждено' if same.all() else 'НЕ полное'})")
 
     pol = policies(best_lam, best_a)
     res = {}
@@ -597,19 +642,63 @@ def main() -> None:
         a = res[f"{nm}/decomp/random-16"]["R"]
         b = res[f"{nm}/decomp/random-in-C"]["R"]
         c = res[f"{nm}/decomp/entropy-in-C"]["R"]
-        d = res[f"{nm}/decomp/true-in-C"]["R"]
+        d = res[f"{nm}/decomp/O1|support"]["R"]
         o = res[f"{nm}/decomp/O1"]["R"]
-        # Верхняя точка лестницы — true-in-C, а НЕ O1: при комплементарности
+        # Верхняя точка лестницы — O1|support, а НЕ O1: при комплементарности
         # принудительный выбор внутри support обходит одиночное ранжирование.
         print(f"\n  знание support даёт             {b - a:+.3f}")
         print(f"  причинный порядок внутри        {c - b:+.3f}")
         print(f"  остаток до идеального порядка   {d - c:+.3f}")
-        print(f"  комплементарность (true-in-C - O1) {d - o:+.3f}")
+        print(f"  комплементарность (O1|support - O1) {d - o:+.3f}")
         print("  ЧИТАТЬ ТАК: если первое слагаемое доминирует, router надо\n"
               "  строить и мерить прежде всего как классификатор support;\n"
               "  если второе — центр тяжести в знаке и величине выигрыша.")
 
+    # ---- ПАРНЫЕ РАЗНОСТИ -------------------------------------------------
+    # Раздельные интервалы двух политик пересекаются почти всегда, потому что
+    # обе оценены на одних строках. Значимость разности показывает только
+    # парный бутстрап по эпизодам.
+    print("\n" + "=" * 74)
+    print("ПАРНЫЕ РАЗНОСТИ ПО ЭПИЗОДАМ, test")
+    print("=" * 74)
+    it = idx_of[2]
+    sg_ = lb["sing_gain_rms"]
+    fx = res["fixed_mask"]
+    pairs_sets = {
+        "фикс-маска": [fx] * len(it),
+        "B_prior": topk_sets(prior_scores(pri, "pq", p_all, tsk_idx, P)[it],
+                             kmax).tolist(),
+        "B_heur": topk_sets(zent[it], kmax, p_all[it]).tolist(),
+        "энтропия": topk_sets(zent[it], kmax).tolist(),
+        "O1": [list(np.argsort(-sg_[i], kind="stable")[:kmax]) for i in it],
+        "O1|support": [],
+    }
+    for j, i in enumerate(it):
+        _, C = tables[2][j]
+        o = [q for q in np.argsort(-sg_[i], kind="stable") if q in C][:kmax]
+        o += [q for q in range(P) if q not in C][:kmax - len(o)]
+        pairs_sets["O1|support"].append(o)
+    pn = {}
+    for k_, v_ in pairs_sets.items():
+        pn[k_], pden = eval_sets(tables[2], e0, it, v_)
+    for a_, b_ in (("B_prior", "фикс-маска"), ("O1", "B_prior"),
+                   ("O1|support", "O1"), ("B_heur", "энтропия"),
+                   ("B_prior", "B_heur")):
+        pt, lo, hi = paired_ci(pn[a_], pn[b_], pden, epi[it])
+        mark = "значимо" if lo > 0 or hi < 0 else "НЕ значимо"
+        print(f"  {a_:>12} - {b_:<12} {pt:+.4f} [{lo:+.4f}, {hi:+.4f}]  {mark}")
+        res[f"paired/{a_}-{b_}"] = dict(diff=pt, lo=lo, hi=hi)
+
     if args.out:
+        res["meta"] = dict(
+            dataset_commit=meta.get("commit"), lam=float(best_lam),
+            alpha=float(best_a), n_rows=int(n),
+            split_counts=meta.get("split_counts"),
+            episodes={s_: sorted(map(int, np.unique(epi[sp == s_])))
+                      for s_ in (0, 1, 2)},
+            sha256={f: hashlib.sha256(
+                open(os.path.join(args.dir, f), "rb").read()).hexdigest()
+                for f in ("features.npz", "labels.npz")})
         json.dump(res, open(args.out, "w"), ensure_ascii=False, indent=1)
         print(f"\n  сохранено: {args.out}")
 
