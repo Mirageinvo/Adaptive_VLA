@@ -664,11 +664,23 @@ def main() -> None:
     it = idx_of[2]
     sg_ = lb["sing_gain_rms"]
     fx = res["fixed_mask"]
+    # ПОЛИТИКИ БЕРУТСЯ ПО ИМЕНИ ВЫБРАННОЙ НА VALIDATION, а не задаются заново.
+    # Прежде здесь был захардкожен prior[p,q]; на этом датасете он совпал с
+    # выбранным B_prior, но при другом исходе отбора парная разность считалась
+    # бы не для той политики, которая объявлена планкой.
+    def sets_of(policy_name):
+        sc_, forced_, _ = pol[policy_name]
+        return topk_sets(sc_[it], kmax,
+                         None if forced_ is None else forced_[it]).tolist()
+
+    name_prior = bp.split("/")[-1]
+    name_heur = bh.split("/")[-1]
+    print(f"  парные разности для выбранных политик: B_prior = {name_prior}, "
+          f"B_heur = {name_heur}")
     pairs_sets = {
         "фикс-маска": [fx] * len(it),
-        "B_prior": topk_sets(prior_scores(pri, "pq", p_all, tsk_idx, P)[it],
-                             kmax).tolist(),
-        "B_heur": topk_sets(zent[it], kmax, p_all[it]).tolist(),
+        "B_prior": sets_of(name_prior),
+        "B_heur": sets_of(name_heur),
         "энтропия": topk_sets(zent[it], kmax).tolist(),
         "O1": [list(np.argsort(-sg_[i], kind="stable")[:kmax]) for i in it],
         "O1|support": [],
