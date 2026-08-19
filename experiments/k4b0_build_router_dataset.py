@@ -522,6 +522,10 @@ def main() -> None:
     ap.add_argument("--window", type=int, default=4)
     ap.add_argument("--chunk", type=int, default=4096)
     ap.add_argument("--embodiment", type=int, default=0)
+    ap.add_argument("--per-timestep", action="store_true",
+                    help="дополнительно сохранить ошибку ПО КАЖДОМУ шагу "
+                         "действия: позволяет пересчитать метрику для любого "
+                         "окна исполнения без пересборки")
     ap.add_argument("--center-crop", action="store_true", default=True)
     ap.add_argument("--tiled", action="store_true", default=True)
     ap.add_argument("--source", default="lerobot")
@@ -690,6 +694,8 @@ def main() -> None:
     # derive_labels: тогда пороги берутся только по train и любая правка правил
     # пересчитывается без GPU.
     Lab = {k: [] for k in ("e_empty", "support", "g_flat", "obs_idx", "p")}
+    if args.per_timestep:
+        Lab["e_empty_t"], Lab["g_flat_t"] = [], []
     g_off = [0]
     verify = []
 
@@ -735,10 +741,21 @@ def main() -> None:
                                              args.embodiment, None)[0][..., :D_act])
                 return torch.cat(out)
 
+            def sq_t(h, ref):
+                """Средний квадрат ошибки ОТДЕЛЬНО ПО КАЖДОМУ шагу действия.
+
+                Хранить надо именно квадраты, а не RMS: корень не складывается,
+                и `sqrt(mean)` по объединению окон не выражается через
+                `sqrt(mean)` по частям. Из квадратов любое окно получается
+                точно: e(W) = sqrt(mean_{t in W} mse(t))."""
+                d = (dec(h) - ref).abs()[..., :D_act - 1]      # (B, T, C)
+                return d.pow(2).mean(-1) / scale ** 2          # (B, T)
+
             def sq(h, ref):
-                d = (dec(h)[:, :args.window]
-                     - ref[:, :args.window]).abs()[..., :D_act - 1]
-                return d.flatten(1).pow(2).mean(-1) / scale ** 2
+                # ВЫРАЖЕНО ЧЕРЕЗ sq_t, а не продублировано: иначе скалярная
+                # метрика и потимшаговая могли бы разойтись при правке одной
+                # из них, и расхождение было бы незаметным.
+                return sq_t(h, ref)[:, :args.window].mean(-1)
 
             # vlen — ДОПОЛНЕННАЯ длина префикса. Она входит в base_pos для
             # позиционных id токенов действия, поэтому при padding=True зависит
@@ -839,6 +856,11 @@ def main() -> None:
                 # ---- МЕТКИ: здесь и только здесь появляется z_ref
                 h_rf = latent_from_codes(E, z_ref)
                 e0 = sq(h_st, a_ref)
+                if args.per_timestep:
+                    e0_t = sq_t(h_st, a_ref)
+                    assert torch.allclose(e0_t[:, :args.window].mean(-1), e0,
+                                          atol=1e-6), \
+                        "потимшаговая ошибка не сводится к скалярной"
                 diff = (stale != z_ref).any(-1)          # changed support
                 supp = (diff.int() * (1 << qs)).sum(-1)
 
@@ -849,21 +871,36 @@ def main() -> None:
                 subs_all = [subsets_of(torch.nonzero(diff[b]).flatten().tolist(),
                                        args.kmax) for b in range(B)]
                 gg_all = [None] * B
+                gg_t = [None] * B
                 buf_h, buf_a, buf_e, owner = [], [], [], []
+                buf_et = []
 
                 def flush():
                     if not buf_h:
                         return
                     hh = torch.stack(buf_h)
                     aa = torch.stack(buf_a)
-                    ee = sq(hh, aa)
+                    if args.per_timestep:
+                        # СКАЛЯР ВЫВОДИТСЯ ИЗ ПОТИМШАГОВОГО, а не считается
+                        # рядом: два независимых вычисления одной величины
+                        # разошлись бы незаметно.
+                        ee_t = sq_t(hh, aa)
+                        ee = ee_t[:, :args.window].mean(-1)
+                        gvt = (torch.stack(buf_et) - ee_t).cpu().numpy()
+                    else:
+                        ee = sq(hh, aa)
                     gv = (torch.stack(buf_e) - ee).cpu().numpy()
-                    for (b_, j_), g_ in zip(owner, gv):
+                    for k_, ((b_, j_), g_) in enumerate(zip(owner, gv)):
                         gg_all[b_][j_] = g_
+                        if args.per_timestep:
+                            gg_t[b_][j_] = gvt[k_]
                     buf_h.clear(); buf_a.clear(); buf_e.clear(); owner.clear()
+                    buf_et.clear()
 
                 for b in range(B):
                     gg_all[b] = np.zeros(len(subs_all[b]), np.float32)
+                    if args.per_timestep:
+                        gg_t[b] = np.zeros((len(subs_all[b]), T), np.float32)
                     for j, S in enumerate(subs_all[b]):
                         h = h_st[b].clone()
                         if S:
@@ -871,6 +908,8 @@ def main() -> None:
                         buf_h.append(h)
                         buf_a.append(a_ref[b])
                         buf_e.append(e0[b])
+                        if args.per_timestep:
+                            buf_et.append(e0_t[b])
                         owner.append((b, j))
                         if len(buf_h) >= args.chunk:
                             flush()
@@ -905,8 +944,12 @@ def main() -> None:
                     # тождество лучше не размывать.
                     gg_all[b][0] = 0.0
                     Lab["g_flat"].append(gg_all[b])
+                    if args.per_timestep:
+                        Lab["g_flat_t"].append(gg_t[b])
                     g_off.append(g_off[-1] + len(gg_all[b]))
                 Lab["e_empty"].append(e0.cpu().numpy())
+                if args.per_timestep:
+                    Lab["e_empty_t"].append(e0_t.cpu().numpy())
                 Lab["support"].append(supp.cpu().numpy())
                 Lab["obs_idx"].append(sel_t.copy())
                 Lab["p"].append(np.full(B, p_, np.int16))
@@ -933,8 +976,13 @@ def main() -> None:
     assert np.array_equal(feats["obs_task_idx"], task_idx)
     assert np.allclose(feats["obs_state"], st_all)
     assert len(feats["obs_pooled_ctx"]) == N
-    raw = {k: np.concatenate(v) for k, v in Lab.items() if k != "g_flat" and v}
+    RAGGED = ("g_flat", "g_flat_t")
+    raw = {k: np.concatenate(v) for k, v in Lab.items()
+           if k not in RAGGED and v}
     raw["g_flat"] = np.concatenate(Lab["g_flat"]).astype(np.float32)
+    if args.per_timestep:
+        raw["g_flat_t"] = np.concatenate(Lab["g_flat_t"]).astype(np.float32)
+        assert len(raw["g_flat_t"]) == len(raw["g_flat"])
     raw["g_off"] = np.asarray(g_off, np.int64)
     n_int = len(raw["obs_idx"])
     assert raw["g_off"][-1] == len(raw["g_flat"])
@@ -951,11 +999,14 @@ def main() -> None:
     # раскладка разная, и файлы становятся несравнимыми. Сортировка это снимает.
     perm = np.lexsort((raw["p"], raw["obs_idx"]))
     lens = np.diff(raw["g_off"])
-    raw["g_flat"] = np.concatenate(
-        [raw["g_flat"][raw["g_off"][i]:raw["g_off"][i + 1]] for i in perm])
+    off0 = raw["g_off"]
+    for k in ("g_flat", "g_flat_t"):
+        if k in raw:
+            raw[k] = np.concatenate(
+                [raw[k][off0[i]:off0[i + 1]] for i in perm])
     raw["g_off"] = np.concatenate([[0], np.cumsum(lens[perm])]).astype(np.int64)
     for k in list(raw):
-        if k not in ("g_flat", "g_off"):
+        if k not in ("g_flat", "g_flat_t", "g_off"):
             raw[k] = raw[k][perm]
     for k in list(feats):
         if k.startswith(("int_", "cand_")):
@@ -1027,6 +1078,24 @@ def main() -> None:
         "индексы признаков и меток в файлах разошлись"
     assert np.array_equal(fz["cand_old_tokens"], feats["cand_old_tokens"])
     assert np.allclose(lz["g_flat"], labels["g_flat"])
+    if args.per_timestep:
+        assert np.allclose(lz["g_flat_t"], labels["g_flat_t"])
+        assert np.allclose(lz["e_empty_t"], labels["e_empty_t"])
+        # ПОТИМШАГОВАЯ ТАБЛИЦА ОБЯЗАНА СВОДИТЬСЯ К СКАЛЯРНОЙ. Проверка идёт по
+        # ПЕРЕЗАГРУЖЕННОМУ файлу, а не по памяти: она ловит и порчу при записи,
+        # и рассогласование перестановки строк между двумя рваными массивами.
+        # g_flat_t[j, t] = e0_t[t] - e_S_t[t], поэтому среднее по окну равно
+        # e0(окно) - e_S(окно), то есть в точности скалярному G. Никакого
+        # индексирования по строкам не нужно, разность берётся поэлементно.
+        w = args.window
+        assert np.allclose(lz["g_flat_t"][:, :w].mean(1), lz["g_flat"],
+                           atol=1e-6), \
+            "потимшаговая таблица не сводится к скалярной после перезаписи"
+        assert np.allclose(lz["e_empty_t"][:, :w].mean(1), lz["e_empty"],
+                           atol=1e-6), "e_empty не сводится по окну"
+        print(f"  потимшаговая таблица сведена к скалярной по окну {w}: "
+              f"{lz['g_flat_t'].shape}, "
+              f"{lz['g_flat_t'].nbytes / 1e6:.1f} МБ")
     bad = set(fz) - FEATURE_SET
     assert not bad, f"в записанном файле посторонние ключи: {bad}"
     for path in (fp, lp, mp) + ((os.path.join(args.out, HIDDEN_FILE),)
