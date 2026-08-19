@@ -122,7 +122,12 @@ def main() -> None:
     import importlib.util
 
     import torch
-    import actioncodec  # noqa: F401
+
+    # ПУТЬ ДО ИМПОРТА. Пакет actioncodec живёт в вендоренном дереве и не
+    # установлен в окружение, поэтому sys.path обязан быть дополнен раньше
+    # импорта — как в k4b0_build_router_dataset.py.
+    sys.path.insert(0, os.path.abspath(args.root))
+    import actioncodec  # noqa: F401,E402
 
     meta = json.load(open(os.path.join(args.dir, "metadata.json")))
     _ft = np.load(os.path.join(args.dir, "features.npz"), allow_pickle=True)
@@ -134,7 +139,6 @@ def main() -> None:
     print(f"коды {old.shape}, проекции {proj.shape}, окно метрики {window}, "
           f"непрерывных каналов {n_cont}")
 
-    sys.path.insert(0, os.path.abspath(args.root))
     sp = importlib.util.spec_from_file_location(
         "ac_vla_tok", os.path.join(os.path.abspath(args.root), "utils",
                                    "vla_tokenizer.py"))
