@@ -12,6 +12,8 @@
        B_heur  — лучшая НЕОБУЧАЕМАЯ эвристика,
        B_prior — лучшая обученная по train таблица (тоже deployable).
    Обе выбираются ТОЛЬКО по validation, test печатается для уже выбранной.
+   Статический baseline ищется ПОЛНЫМ перебором всех C(16,4)=1820 масок по
+   validation, а не подмножествами лучших позиций профиля.
 
 2. РАЗЛОЖЕНИЕ РАЗРЫВА. Позиции вне changed-support дают ровно ноль, внутри
    support примерно треть даёт ОТРИЦАТЕЛЬНЫЙ выигрыш. Поэтому задача router
@@ -149,6 +151,15 @@ def prior_scores(pri, kind, p, tsk_idx, P, alpha=0.0):
         # шумная; смесь с глобальной таблицей и вес alpha выбираются на val.
         return alpha * pri["tpq"][tsk_idx, p] + (1 - alpha) * pri["pq"][p]
     raise ValueError(kind)
+
+
+def _commit():
+    try:
+        import subprocess
+        return subprocess.check_output(["git", "rev-parse", "HEAD"],
+                                       text=True).strip()
+    except Exception:
+        return "unknown"
 
 
 def paired_ci(num_a, num_b, den, epi, n_boot=2000, seed=0):
@@ -648,7 +659,7 @@ def main() -> None:
         # принудительный выбор внутри support обходит одиночное ранжирование.
         print(f"\n  знание support даёт             {b - a:+.3f}")
         print(f"  причинный порядок внутри        {c - b:+.3f}")
-        print(f"  остаток до идеального порядка   {d - c:+.3f}")
+        print(f"  до singleton-порядка внутри support {d - c:+.3f}")
         print(f"  комплементарность (O1|support - O1) {d - o:+.3f}")
         print("  ЧИТАТЬ ТАК: если первое слагаемое доминирует, router надо\n"
               "  строить и мерить прежде всего как классификатор support;\n"
@@ -703,7 +714,9 @@ def main() -> None:
 
     if args.out:
         res["meta"] = dict(
-            dataset_commit=meta.get("commit"), lam=float(best_lam),
+            dataset_commit=meta.get("commit"), analysis_commit=_commit(),
+            B_heur_name=bh.split("/")[-1], B_prior_name=bp.split("/")[-1],
+            lam=float(best_lam),
             alpha=float(best_a), n_rows=int(n),
             split_counts=meta.get("split_counts"),
             episodes={s_: sorted(map(int, np.unique(epi[sp == s_])))
