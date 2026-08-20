@@ -88,7 +88,9 @@ class Rows:
         «маска -> позиция в рваной таблице» строится однократно, а смена окна
         сводится к индексированию массива. Без этого перебор 1820 масок в
         двенадцати окнах был бы главной стоимостью скрипта."""
-        MI = np.empty((len(idx), len(masks)), np.int64)
+        # int32 хватает: индексов всего len(g_flat) ~ 3.4e6 на полном
+        # датасете, а память при 16000 строках на 1820 масок вдвое меньше.
+        MI = np.empty((len(idx), len(masks)), np.int32)
         for j, i in enumerate(idx):
             i = int(i)
             loc, C, o0 = self.index[i], self.C[i], self.off[i]
@@ -210,6 +212,32 @@ def prior_score(pri, kind, p, tsk, P, alpha=0.0):
     return alpha * pri["tpq"][tsk, p] + (1 - alpha) * pri["pq"][p]
 
 
+def fit_S_cond(M_tr, key_tr):
+    """Лучшая ЦЕЛЬНАЯ маска на каждое значение ключа, обучение только по train.
+
+    Ключ — любая структурная величина, известная до дорогого прохода: позиция
+    правки p, пара (офсет, p), пара (ранг подменённого кода, p). Такие baseline
+    видят взаимодействия внутри набора, но не видят ни картинки, ни состояния
+    робота, ни токенов, поэтому отделяют состояние-зависимость от структурной.
+    """
+    return {int(u): int(np.argmax(M_tr[key_tr == u].sum(0)))
+            for u in np.unique(key_tr)}
+
+
+def apply_S_cond(M, key, pick, default):
+    idx = np.array([pick.get(int(k), default) for k in key])
+    return M[np.arange(len(key)), idx]
+
+
+def fit_prior_cond(y, key, P):
+    """Средняя полезность позиции при данном значении ключа, только train."""
+    return {int(u): y[key == u].mean(0) for u in np.unique(key)}
+
+
+def apply_prior_cond(tab, key, fallback):
+    return np.stack([tab.get(int(k), fallback) for k in key])
+
+
 def diversity(sets, P):
     """Насколько оптимальные наборы РАЗНЫЕ между строками.
 
@@ -240,7 +268,7 @@ def selftest():
     позиция 0, а во второй — позиция 1. Развёртка обязана это увидеть: на
     блоке [0:2] лучшая позиция 0, на блоке [2:4] — позиция 1, а на префиксе 4
     обе примерно равны."""
-    P, T, kmax = 3, 4, 2
+    P, T, kmax = 4, 4, 3
     C = (0, 1)
     subs = [S for k in range(kmax + 1) for S in itertools.combinations(C, k)]
     e0_t = np.array([[1.0, 1.0, 1.0, 1.0]])
@@ -282,10 +310,18 @@ def selftest():
     for k in range(1, kmax + 1):
         bk[k] = max(bk[k], bk[k - 1])
     kc = bk / np.sqrt(e0w[0])
-    assert kc[0] == 0.0, "K=0 обязан давать ноль"
-    assert kc[1] < kc[2], f"кривая не растёт до K=2: {kc}"
-    assert kc[2] <= 1.0 + 1e-12, f"доля больше единицы: {kc}"
-    assert abs(kc[2] - kc[kmax]) < 1e-12, f"плато после K=2 не вышло: {kc}"
+    # ПРОВЕРКА ПО ТОЧНЫМ ЗНАЧЕНИЯМ, а не по монотонности. e0 = 1, одна позиция
+    # закрывает 0.4 квадрата ошибки, обе — 0.8, поэтому кривая обязана быть
+    # ровно [0, 1-sqrt(0.6), 1-sqrt(0.2)] и дальше выйти на плато: в support
+    # только две позиции, третий слот брать неоткуда. Прежняя проверка на
+    # монотонность и <=1 ПРОПУСКАЛА двойное применение to_rms — оно даёт
+    # [0, 0.1199, 0.3313], тоже монотонное и тоже меньше единицы. И плато при
+    # kmax=2 сравнивало kc[2] с самим собой.
+    expected = np.array([0.0, 1.0 - np.sqrt(0.6), 1.0 - np.sqrt(0.2),
+                         1.0 - np.sqrt(0.2)])
+    assert np.allclose(kc, expected, atol=1e-12), \
+        f"кривая по K не совпала с точным ответом:\n  вышло {kc}\n" \
+        f"  ждали {expected}"
 
     print("самопроверка пройдена: окна разделяются, активная позиция "
           "переезжает вместе с блоком, RMS по частям не складывается, "
@@ -309,14 +345,22 @@ def main() -> None:
     meta = json.load(open(os.path.join(args.dir, "metadata.json")))
     _lb = np.load(os.path.join(args.dir, "labels.npz"), allow_pickle=True)
     lb = {k: _lb[k] for k in _lb.files}          # материализуем: NpzFile ленив
-    if "g_flat_t" not in lb:
-        raise SystemExit("датасет собран без --per-timestep, развёртка "
-                         "невозможна: пересоберите с этим флагом")
+    # СКАЛЯРНЫЙ РЕЖИМ. Без потимшаговой таблицы развёртка по окнам невозможна,
+    # но всё остальное — S(p), условные baseline, оракульные границы, парные
+    # интервалы — считается из обычной таблицы, которая И ЕСТЬ окно протокола.
+    # Так полный прогон на k4b0_v2 идёт тем же кодом, без второй реализации.
+    SCALAR = "g_flat_t" not in lb
+    if SCALAR:
+        print("потимшаговой таблицы нет: считаю ТОЛЬКО окно протокола "
+              f"({meta['window']} шагов) из скалярной таблицы")
     _ft = np.load(os.path.join(args.dir, "features.npz"), allow_pickle=True)
     tsk_idx = _ft["obs_task_idx"][lb["obs_idx"]]
+    off_all = np.asarray(_ft["obs_pos_offset"])[lb["obs_idx"]].astype(np.int64)
+    rank_all = np.asarray(_ft["int_rank_u"]).astype(np.int64)
     tsk = np.asarray(meta["tasks"])[tsk_idx]
     P, K = meta["P"], meta["kmax"]
-    T = lb["e_empty_t"].shape[1]
+    T = (lb["e_empty_t"].shape[1] if "e_empty_t" in lb
+         else int(meta.get("action_steps", meta["window"])))
     epi, sp = lb["episode"], lb["split"]
     n = len(lb["obs_idx"])
     print(f"строк {n}, шагов действия {T}, окно протокола {meta['window']}, "
@@ -336,9 +380,14 @@ def main() -> None:
                            rows.mask_map(it, all_masks))
     res = {}
 
-    for name, w in windows(T).items():
-        gw = lb["g_flat_t"][:, w].mean(1)
-        e0w = lb["e_empty_t"][:, w].mean(1)
+    wins = ({f"протокол {meta['window']}": None} if SCALAR
+            else windows(T))
+    for name, w in wins.items():
+        if w is None:
+            gw, e0w = lb["g_flat"], lb["e_empty"].astype(np.float64)
+        else:
+            gw = lb["g_flat_t"][:, w].mean(1)
+            e0w = lb["e_empty_t"][:, w].mean(1)
         # СВЕРКА С ПРОТОКОЛЬНЫМИ ЧИСЛАМИ: окно 4 обязано воспроизвести
         # сохранённую скалярную таблицу, иначе развёртке верить нельзя.
         if name == f"префикс {meta['window']}":
@@ -376,34 +425,79 @@ def main() -> None:
                            for q in range(P)] for i in itr])
         den_tr = np.sqrt(e0w[itr])
         pri = fit_priors(sg_tr, den_tr, p_all[itr], tsk_idx[itr], P)
+        ok_tr = den_tr > 1e-12
+        y_tr = sg_tr[ok_tr] / den_tr[ok_tr, None]
 
-        cond = {}
-        cond["S_global (train)"] = M_it[:, int(np.argmax(M_tr.sum(0)))]
+        g_pick = int(np.argmax(M_tr.sum(0)))
         sp_pick = np.zeros(P, np.int64)
         for pp in range(P):
             m = p_all[itr] == pp
             sp_pick[pp] = int(np.argmax(M_tr[m].sum(0))) if m.any() else 0
-        cond["S(p) (train)"] = M_it[np.arange(len(it)), sp_pick[p_all[it]]]
-        for kind, nm_ in (("glob", "prior[q]"), ("pq", "prior[p,q]"),
-                          ("off", "prior[q-p]")):
-            sc = prior_score(pri, kind, p_all[it], tsk_idx[it], P)
-            sets_ = np.argsort(-sc, axis=1, kind="stable")[:, :4]
-            cond[nm_], _ = eval_sets(rows, gw, e0w, it, sets_.tolist())
+
+        # СОСТАВНЫЕ КЛЮЧИ. Особенно важен ранг подменённого кода: это
+        # ПАРАМЕТР НАШЕГО искусственного вмешательства, и если изменчивость
+        # объясняется им, то она вообще не про состояние робота, а про то,
+        # насколько сильно мы сломали план.
+        KEYS = {"S(p)": p_all,
+                "S(offset,p)": off_all * P + p_all,
+                "S(rank_u,p)": rank_all * P + p_all}
+        picks = {k_: fit_S_cond(M_tr, v_[itr]) for k_, v_ in KEYS.items()}
+        ptabs = {k_: fit_prior_cond(y_tr, v_[itr][ok_tr], P)
+                 for k_, v_ in KEYS.items()}
+
+        def build_cond(ix, M, alpha):
+            """Одни и те же обученные по train объекты на любой части."""
+            c = {"S_global (train)": M[:, g_pick],
+                 "S(p) (train)": M[np.arange(len(ix)), sp_pick[p_all[ix]]]}
+            for k_, key in KEYS.items():
+                if k_ != "S(p)":
+                    c[k_ + " (train)"] = apply_S_cond(M, key[ix], picks[k_],
+                                                      g_pick)
+                sc_ = apply_prior_cond(ptabs[k_], key[ix], pri["glob"])
+                c["prior" + k_[1:]], _ = eval_sets(
+                    rows, gw, e0w, ix,
+                    np.argsort(-sc_, 1, kind="stable")[:, :4].tolist())
+            for kind, nm_ in (("glob", "prior[q]"), ("pq", "prior[p,q]"),
+                              ("off", "prior[q-p]"), ("task", "prior[task,p,q]")):
+                sc = prior_score(pri, kind, p_all[ix], tsk_idx[ix], P, alpha)
+                c[nm_], _ = eval_sets(
+                    rows, gw, e0w, ix,
+                    np.argsort(-sc, 1, kind="stable")[:, :4].tolist())
+            return c
+
+        # ВЕРХНЯЯ ГРАНИЦА ЛЮБОГО МЕТОДА, ЗНАЮЩЕГО ТОЛЬКО p. Маска на каждое p
+        # подбирается ПО САМОМУ test, то есть оракульно. Нужна потому, что
+        # S(p), обученный на train, выбирает лучшую из 1820 масок по сотням
+        # строк, и шум отбора занижает её на test — а это ЗАВЫШАЕТ разрыв
+        # «точный − S(p)» и делает ворота оптимистичными. Честная нижняя
+        # граница состояние-зависимости считается от этой границы, а не от
+        # обученного S(p).
+        sp_or = np.zeros(P, np.int64)
+        for pp in range(P):
+            m = p_all[it] == pp
+            sp_or[pp] = int(np.argmax(M_it[m].sum(0))) if m.any() else 0
+        sp_oracle = M_it[np.arange(len(it)), sp_or[p_all[it]]]
         ba, bv = 0.0, -1e30                       # alpha выбирается на val
-        M_iv_ = M_iv
-        sg_iv = np.array([[to_rms(e0w[int(i)], rows.g(gw, int(i), [q]))
-                           for q in range(P)] for i in iv])
         for a_ in (0.0, 0.25, 0.5, 0.75, 1.0):
             sc = prior_score(pri, "task", p_all[iv], tsk_idx[iv], P, a_)
-            st = np.argsort(-sc, axis=1, kind="stable")[:, :4]
-            nv, dv = eval_sets(rows, gw, e0w, iv, st.tolist())
+            nv, dv = eval_sets(
+                rows, gw, e0w, iv,
+                np.argsort(-sc, 1, kind="stable")[:, :4].tolist())
             if nv.sum() / dv.sum() > bv:
                 ba, bv = a_, nv.sum() / dv.sum()
-        sc = prior_score(pri, "task", p_all[it], tsk_idx[it], P, ba)
-        cond[f"prior[task,p,q] a={ba}"], _ = eval_sets(
-            rows, gw, e0w, it, np.argsort(-sc, 1, kind="stable")[:, :4].tolist())
-        best_cond = max(cond, key=lambda k_: cond[k_].sum())
+
+        # ИМЯ ЛУЧШЕГО BASELINE ВЫБИРАЕТСЯ НА VALIDATION. Прежде здесь стояло
+        # max по сумме на TEST, то есть test использовался для выбора модели —
+        # ровно то, от чего мы предостерегаем в собственном протоколе.
+        cond_val = build_cond(iv, M_iv, ba)
+        cond = build_cond(it, M_it, ba)
+        den_v = np.sqrt(e0w[iv])
+        best_cond = max(cond_val, key=lambda k_: cond_val[k_].sum() / den_v.sum())
         d_cond = paired_ci(ex_n, cond[best_cond], den, epi[it])
+        # ОБЪЯВЛЕННЫЙ ЗАРАНЕЕ основной non-state baseline — S(p), без отбора.
+        d_sp = paired_ci(ex_n, cond["S(p) (train)"], den, epi[it])
+        d_spo = paired_ci(ex_n, sp_oracle, den, epi[it])
+        cond["S(p) ОРАКУЛ на test"] = sp_oracle
 
         # разнообразие ВНУТРИ фиксированного p: если наборы разные и при
         # известном p, изменчивость нельзя списать на позицию правки
@@ -434,6 +528,11 @@ def main() -> None:
             row[nm_] = dict(R=pt, lo=lo, hi=hi, macro=macro_by(num, den,
                                                                tsk[it]))
         row |= dict(best_cond=best_cond, exact_minus_cond=d_cond,
+                    cond_val={k_: float(v_.sum() / den_v.sum())
+                              for k_, v_ in cond_val.items()},
+                    alpha_task=float(ba), S_global=list(all_masks[g_pick]),
+                    S_of_p=[list(all_masks[int(x)]) for x in sp_pick],
+                    exact_minus_Sp=d_sp, exact_minus_Sp_oracle=d_spo,
                     jaccard_within_p=jac_p, median_cond_over_gstar=med,
                     mask=list(map(int, bm)), jaccard=jac, entropy=ent,
                     freq=freq.tolist(), K_curve=kc,
@@ -454,9 +553,13 @@ def main() -> None:
               + ("  значимо" if d_ex[1] > 0 or d_ex[2] < 0 else "  НЕ значимо"))
         print("    условные baseline без состояния: " + "  ".join(
             f"{k_} {v_.sum() / den.sum():.3f}" for k_, v_ in cond.items()))
-        print(f"    лучший из них — {best_cond}; точный − он "
+        print(f"    лучший ПО VALIDATION — {best_cond}; точный − он "
               f"{d_cond[0]:+.4f} [{d_cond[1]:+.4f}, {d_cond[2]:+.4f}]"
               + ("  значимо" if d_cond[1] > 0 else "  НЕ значимо"))
+        print(f"    точный − S(p) объявленный  {d_sp[0]:+.4f} "
+              f"[{d_sp[1]:+.4f}, {d_sp[2]:+.4f}]")
+        print(f"    точный − S(p) ОРАКУЛ       {d_spo[0]:+.4f} "
+              f"[{d_spo[1]:+.4f}, {d_spo[2]:+.4f}]  <- честная нижняя граница")
         print(f"    разнообразие лучших наборов: Жаккар {jac:.3f} "
               f"(внутри фиксированного p {jac_p:.3f}), "
               f"энтропия позиций {ent:.3f}")
@@ -498,7 +601,27 @@ def main() -> None:
           "  ПРОТОКОЛЬНЫМ остаётся окно 4: политика исполняет четыре шага.")
 
     if args.out:
-        json.dump(res, open(args.out, "w"), ensure_ascii=False, indent=1)
+        import hashlib
+        import subprocess
+        try:
+            ac = subprocess.check_output(["git", "rev-parse", "HEAD"],
+                                         text=True).strip()
+        except Exception:
+            ac = "unknown"
+        res["meta"] = dict(
+            analysis_commit=ac, dataset_commit=meta.get("commit"),
+            ckpt=meta.get("ckpt"), scalar_mode=bool(SCALAR),
+            protocol_window=int(meta["window"]), action_steps=int(T),
+            windows=list(wins), P=int(P), kmax=int(K),
+            split_rows={s_: int((sp == s_).sum()) for s_ in (0, 1, 2)},
+            split_episodes={s_: int(len(np.unique(epi[sp == s_])))
+                            for s_ in (0, 1, 2)},
+            random_seeds=list(range(20)), bootstrap_seed=0,
+            sha256={f: hashlib.sha256(
+                open(os.path.join(args.dir, f), "rb").read()).hexdigest()
+                for f in ("features.npz", "labels.npz")})
+        json.dump(res, open(args.out, "w"), ensure_ascii=False, indent=1,
+                  default=float)
         print(f"\n  сохранено: {args.out}")
 
 
