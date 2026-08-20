@@ -276,8 +276,10 @@ def main() -> None:
             pt, lo, hi = cluster_ci(num, den, epi[it])
             row[lbl] = dict(R=pt, lo=lo, hi=hi,
                             macro=macro_by(num, den, tsk[it]))
-        kc = [float((to_rms(e0w[it], bestK[:, k])).sum() / den.sum())
-              for k in range(K + 1)]
+        # bestK УЖЕ на RMS-шкале: to_rms применён внутри singleton_and_best.
+        # Прежде здесь стояло второе преобразование, и величина зажималась в
+        # единицу во всех окнах — знаменатель den тоже равен sqrt(e0).
+        kc = [float(bestK[:, k].sum() / den.sum()) for k in range(K + 1)]
         row |= dict(mask=list(map(int, bm)), jaccard=jac, entropy=ent,
                     freq=freq.tolist(), K_curve=kc,
                     fixed_minus_random=d_fx, exact_minus_fixed=d_ex)
