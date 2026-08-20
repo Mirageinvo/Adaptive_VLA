@@ -353,8 +353,16 @@ def main() -> None:
                        or args.device == "cpu" else "cpu")
     dtype = getattr(torch, args.dtype)
     if dev.type == "cuda":
-        print(f"GPU: {torch.cuda.get_device_name(0)}, torch {torch.__version__}"
-              f", CUDA {torch.version.cuda}")
+        cc = torch.cuda.get_device_capability(0)
+        print(f"GPU: {torch.cuda.get_device_name(0)} (sm_{cc[0]}{cc[1]}), "
+              f"torch {torch.__version__}, CUDA {torch.version.cuda}")
+        # BF16 АППАРАТНО ПОЯВИЛСЯ В AMPERE (sm_80). На Volta и Turing он
+        # выполняется эмуляцией, и соотношения времён не переносятся ни на
+        # какое реальное развёртывание. Молча мерить в этом режиме нельзя.
+        if args.dtype == "bfloat16" and cc[0] < 8:
+            print("  ВНИМАНИЕ: bfloat16 без аппаратной поддержки на sm_"
+                  f"{cc[0]}{cc[1]} — числа НЕ ПЕРЕНОСИМЫ. Повторите с "
+                  "--dtype float16 (нативен здесь) и --dtype float32.")
     else:
         print("CUDA недоступна — замер на CPU, к целевой машине НЕ ОТНОСИТСЯ")
     print(f"dtype {args.dtype}, контекст {args.ctx_len} токенов, "
@@ -406,8 +414,35 @@ def main() -> None:
                         print(f"  {mode + f' (K={K})':<16}{v['median']:>12.3f}"
                               f"{v['p90']:>9.3f}{v['p95']:>9.3f}"
                               f"{dense / v['median']:>16.3f}")
+                # РАЗЛОЖЕНИЕ ЭКОНОМИИ. Три числа отвечают на три разных
+                # вопроса, и смешивать их нельзя:
+                #   dense - masked  — экономия на ВЫХОДЕ (argmax и scatter для
+                #                     4 позиций вместо 16). Она реальна, но к
+                #                     разреженности запросов отношения не
+                #                     имеет: логиты всё равно посчитаны все.
+                #   masked - static — экономия на ЗАПРОСАХ, то есть ровно то,
+                #                     ради чего затевается метод.
+                #   dynamic - static — цена router, top-k, gather и scatter.
                 res[key] = dict(times=t, params=int(n_par),
                                 router_params=int(n_rt), dense=dense)
+                for K in args.K:
+                    if K >= P_POS:
+                        continue
+                    ms, st = t[f"masked_K{K}"]["median"], t[f"static_K{K}"]["median"]
+                    dy = t[f"dynamic_K{K}"]["median"]
+                    print(f"\n  разложение при K={K}:")
+                    print(f"    на выходе  (dense-masked)   {dense - ms:>8.3f} мс"
+                          f"  {(dense - ms) / dense:>7.1%} от плотного шага")
+                    print(f"    НА ЗАПРОСАХ (masked-static) {ms - st:>8.3f} мс"
+                          f"  {(ms - st) / dense:>7.1%}  <- предмет метода")
+                    print(f"    цена router (dynamic-static){dy - st:>8.3f} мс"
+                          f"  {(dy - st) / dense:>7.1%}")
+                    if dy - st > ms - st:
+                        print("    router дороже всей экономии на запросах: "
+                              "динамический выбор себя не окупает")
+                    res[key][f"decomp_K{K}"] = dict(
+                        out_side=dense - ms, query_side=ms - st,
+                        router_cost=dy - st)
 
                 # ---- РАСПИСАНИЕ: первый шаг плотный, остальные разреженные
                 print(f"\n  цикл refinement, первый шаг плотный:")
@@ -440,9 +475,12 @@ def main() -> None:
     print("\n" + "=" * 74)
     print("ЧИТАТЬ ТАК, правило записано до запуска")
     print("=" * 74)
-    print("  masked dense обязан идти вровень с dense: он считает все 16\n"
-          "  позиций. Если он оказался быстрее — замер неверен, где-то\n"
-          "  выпала часть вычислений.\n"
+    print("  masked считает все 16 запросов, но argmax и scatter делает\n"
+          "  только для K. Поэтому он законно быстрее dense — на величину\n"
+          "  экономии НА ВЫХОДЕ, которая к разреженности запросов отношения\n"
+          "  не имеет. Предмет метода — только (masked - static).\n"
+          "  Если masked оказался быстрее static, замер неверен: считать\n"
+          "  меньше запросов не может быть дороже.\n"
           "  dynamic минус static — это цена router, top-k, gather и scatter.\n"
           "  Если она съедает экономию, разреженность нужна СТАТИЧЕСКАЯ, а\n"
           "  обучаемый выбор себя не окупает.\n"
