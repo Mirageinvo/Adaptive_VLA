@@ -37,8 +37,79 @@ class ChunkBatch:
     task_names: list[str]
     starts: np.ndarray
     gripper_mode: str
+    states: torch.Tensor | None = None
     dataset_id: str = LIBERO_DATASET_ID
     revision: str = LIBERO_REVISION
+
+
+def _episode_parquet_path(dataset_id: str, revision: str, episode_id: int) -> str:
+    return hf_hub_download(
+        repo_id=dataset_id,
+        filename=f"data/chunk-{episode_id // 1000:03d}/episode_{episode_id:06d}.parquet",
+        repo_type="dataset",
+        revision=revision,
+    )
+
+
+def load_libero_chunks_indexed(
+    episode_ids: np.ndarray,
+    starts: np.ndarray,
+    chunk_len: int = 20,
+    dataset_id: str = LIBERO_DATASET_ID,
+    revision: str = LIBERO_REVISION,
+    device: str = "cpu",
+    gripper_mode: str = "invert",
+    include_state: bool = True,
+) -> ChunkBatch:
+    """Reload exact chunks by (episode_id, start) without re-sampling."""
+
+    episode_ids = np.asarray(episode_ids, dtype=np.int64)
+    starts = np.asarray(starts, dtype=np.int64)
+    if episode_ids.shape != starts.shape:
+        raise ValueError("episode_ids and starts must have the same shape")
+
+    tasks_map = _load_tasks_map(dataset_id, revision)
+    raw_actions: list[np.ndarray] = []
+    raw_states: list[np.ndarray] = []
+    task_ids: list[int] = []
+    task_names: list[str] = []
+
+    cache: dict[int, object] = {}
+    columns = ["actions", "task_index"] + (["state"] if include_state else [])
+    for episode_id, start in zip(episode_ids.tolist(), starts.tolist()):
+        if episode_id not in cache:
+            path = _episode_parquet_path(dataset_id, revision, int(episode_id))
+            cache[episode_id] = pq.read_table(path, columns=columns)
+        table = cache[episode_id]
+        n_rows = table.num_rows
+        if start < 0 or start + chunk_len > n_rows:
+            raise ValueError(f"Invalid start={start} for episode={episode_id} with n_rows={n_rows}")
+        actions_ep = np.asarray(table.column("actions").to_pylist(), dtype=np.float32)
+        task_idx_ep = np.asarray(table.column("task_index").to_pylist(), dtype=np.int64)
+        raw_actions.append(actions_ep[start : start + chunk_len])
+        task_ids.append(int(task_idx_ep[start]))
+        task_names.append(tasks_map[int(task_idx_ep[start])])
+        if include_state:
+            state_ep = np.asarray(table.column("state").to_pylist(), dtype=np.float32)
+            raw_states.append(state_ep[start : start + chunk_len])
+
+    raw = np.stack(raw_actions).astype(np.float32)
+    actions = normalize_actions(raw, gripper_mode=gripper_mode)
+    states = None
+    if include_state:
+        states = torch.from_numpy(np.stack(raw_states).astype(np.float32)).to(device)
+    return ChunkBatch(
+        actions=torch.from_numpy(actions).to(device),
+        raw_actions=torch.from_numpy(raw).to(device),
+        episode_ids=episode_ids.copy(),
+        task_ids=np.asarray(task_ids, dtype=np.int64),
+        task_names=task_names,
+        starts=starts.copy(),
+        gripper_mode=gripper_mode,
+        states=states,
+        dataset_id=dataset_id,
+        revision=revision,
+    )
 
 
 def _load_tasks_map(dataset_id: str, revision: str) -> dict[int, str]:
@@ -122,12 +193,7 @@ def load_libero_chunks(
     starts: list[int] = []
 
     for episode_id in episode_ids:
-        path = hf_hub_download(
-            repo_id=dataset_id,
-            filename=f"data/chunk-{episode_id // 1000:03d}/episode_{episode_id:06d}.parquet",
-            repo_type="dataset",
-            revision=revision,
-        )
+        path = _episode_parquet_path(dataset_id, revision, int(episode_id))
         table = pq.read_table(path, columns=["actions", "task_index"])
         n_rows = table.num_rows
         if n_rows < chunk_len:

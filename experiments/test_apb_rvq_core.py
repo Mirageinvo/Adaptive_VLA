@@ -55,10 +55,33 @@ def test_greedy_recovers_additive_oracle():
     assert all(errs[i + 1] <= errs[i] for i in range(len(errs) - 1)), errs
 
 
+def test_allocate_from_logits_depth3_mass():
+    """Strong depth-3 prior at B=28 must not starve level-3 under fixed allocator."""
+    from experiments.rate4_train_router import allocate_from_logits
+
+    logits = torch.zeros(1, 16, 3)
+    logits[..., 2] = 5.0  # prefer depth-3 everywhere
+    depth = allocate_from_logits(logits, budget=28)
+    assert int(depth.sum().item()) == 28
+    frac3 = float((depth == 3).float().mean().item())
+    assert frac3 >= 0.2, f"expected substantial depth-3 mass, got {frac3}"
+
+
+def test_episode_grouped_split_no_leak():
+    from experiments.rate4_train_router import episode_grouped_split
+
+    rows = [{"episode_id": i // 4, "chunk_idx": i, "budget": 28} for i in range(40)]
+    train, val, meta = episode_grouped_split(rows, val_frac=0.2, seed=0)
+    assert not meta["overlap_episodes"]
+    assert {r["episode_id"] for r in train}.isdisjoint({r["episode_id"] for r in val})
+
+
 def main():
     test_budget_exact()
     test_validate_depth_map()
     test_greedy_recovers_additive_oracle()
+    test_allocate_from_logits_depth3_mass()
+    test_episode_grouped_split_no_leak()
     print("all tests passed")
 
 

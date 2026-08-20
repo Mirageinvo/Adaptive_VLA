@@ -110,7 +110,7 @@ From `artifacts/apb_rvq/oracle_full/validate_search.json`:
   - Thresholds A/B + CI pass on full seed=0 and on seeds 1/2.
   - Multi-seed mean peak ≈ **30.1% at B=28**, with low seed-to-seed variance.
   - Greedy-vs-beam mean retention remains slightly below 0.95 → downstream labels may use greedy maps, but papers/reports should note beam as the tighter search reference.
-- **Next stage:** Phase A rate3 (`coarse_codes` + `depth_map` labels from existing oracle artifacts; no rate1 recompute), then tiny router eval before optional Phase B BAR features.
+- **Next stage:** Phase A rate3 labels + Phase-A router (M0/M1) retained-gain eval; then Phase B visual cache / BAR features if retained gain is nontrivial.
 
 ## Revisions and Environment
 - Working commit used for full/seed runs: `cafd70e4ba22416ce5ab62ff91effd633835439e`
