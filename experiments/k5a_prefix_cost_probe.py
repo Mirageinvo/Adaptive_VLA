@@ -284,19 +284,37 @@ def main() -> None:
                 action_key_mask=torch.ones(B, alen, device=dev,
                                            dtype=torch.long))
             ah = model.bos_embedding.expand(B, n, -1).to(dev, dtype)
+            # K/V ПРЕФИКСА СНИМАЮТСЯ ХУКОМ, а не считаются заново. Прежняя
+            # версия вызывала k_proj и v_proj отдельно, после чего orig()
+            # вычислял их второй раз внутри себя — prefill выходил дороже
+            # опорного первого блока (80.5 мс против 61.0) и занижал приз.
+            # Хуки висят на модулях башни VLM; экспертная башня использует
+            # ДРУГИЕ модули, поэтому перепутать нельзя.
+            grab = {}
+            hs = []
             for li in range(nL):
-                vl = model.vlm.text_model.layers[li]
-                vn = vl.input_layernorm(vh)
-                vk = vl.self_attn.k_proj(vn).view(B, Lv, nkv, hd).transpose(1, 2)
-                vv = vl.self_attn.v_proj(vn).view(B, Lv, nkv, hd).transpose(1, 2)
+                sa = model.vlm.text_model.layers[li].self_attn
+                hs.append(sa.k_proj.register_forward_hook(
+                    lambda m, i, o, l=li: grab.__setitem__((l, "k"), o)))
+                hs.append(sa.v_proj.register_forward_hook(
+                    lambda m, i, o, l=li: grab.__setitem__((l, "v"), o)))
+            try:
                 dummy = torch.empty((B, Lv + alen, hid), device=dev, dtype=dtype)
-                cos, sin = model.vlm.text_model.rotary_emb(dummy, position_ids=pid)
-                _, vk_r = apply_rotary_pos_emb(vk, vk, cos[:, :Lv], sin[:, :Lv])
-                cache.append((vk_r, vv))
-                vh, ah = orig(vlm_hidden_states=vh, action_hidden_states=ah,
-                              layer_idx=li, attention_mask=m4, position_ids=pid,
-                              past_key_values=None, use_cache=False,
-                              cache_position=None)
+                cos, sin = model.vlm.text_model.rotary_emb(dummy,
+                                                           position_ids=pid)
+                cv, sv = cos[:, :Lv], sin[:, :Lv]
+                for li in range(nL):
+                    vh, ah = orig(vlm_hidden_states=vh, action_hidden_states=ah,
+                                  layer_idx=li, attention_mask=m4,
+                                  position_ids=pid, past_key_values=None,
+                                  use_cache=False, cache_position=None)
+                    vk = grab[(li, "k")].view(B, Lv, nkv, hd).transpose(1, 2)
+                    vv = grab[(li, "v")].view(B, Lv, nkv, hd).transpose(1, 2)
+                    _, vk_r = apply_rotary_pos_emb(vk, vk, cv, sv)
+                    cache.append((vk_r, vv))
+            finally:
+                for h in hs:
+                    h.remove()
         return cache
 
     cache = prefill()
@@ -374,7 +392,19 @@ def main() -> None:
               f"  ({ref[k_blocks]['p50'] / cac[k_blocks]['p50']:.2f}x)")
     t_pref = bench(prefill, max(3, args.warmup // 4), max(10, args.iters // 5),
                    dev)
-    print(f"  prefill (проход 1 + сохранение кэша): p50 {t_pref['p50']:.2f} мс")
+    print(f"  prefill (проход 1 + сохранение кэша): p50 {t_pref['p50']:.2f} мс"
+          f"  против опорного первого блока {ref[0]['p50']:.2f} мс")
+    # РАЗЛОЖЕНИЕ ПРОХОДА НА ДВЕ БАШНИ. Кэшированный проход — это стоимость
+    # экспертной башни плюс внимание к сохранённым ключам. Разность с опорным
+    # даёт цену башни VLM. Это прямое измерение того, что подгонка
+    # t(q) = 62.39 + 0.2149*q из §7б приписывала одному свободному члену:
+    # туда попала и ФИКСИРОВАННАЯ стоимость экспертной башни, отчего оценка
+    # выигрыша от кэша (1.84x) оказалась завышенной.
+    tower_vlm = ref[1]["p50"] - cac[1]["p50"]
+    print(f"\n  разложение блочного прохода (по блоку 2):")
+    print(f"    башня действия (кэшированный проход)  {cac[1]['p50']:.2f} мс")
+    print(f"    башня VLM (разность с опорным)        {tower_vlm:.2f} мс")
+    print(f"    избыточно пересчитывается дважды      {2 * tower_vlm:.2f} мс")
     total_cached = t_pref["p50"] + cac[1]["p50"] + cac[2]["p50"]
     print(f"\n  три прохода: опорно {total_ref:.2f} мс -> с кэшем "
           f"{total_cached:.2f} мс, выигрыш {total_ref - total_cached:.2f} мс "
