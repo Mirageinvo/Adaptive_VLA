@@ -81,6 +81,21 @@ class Rows:
             self.C.append(set(C))
             self.index.append({S: j for j, S in enumerate(subs)})
 
+    def mask_map(self, idx, masks):
+        """Индексы в gw для КАЖДОЙ маски и каждой строки, посчитанные один раз.
+
+        Составы подмножеств от окна не зависят, поэтому отображение
+        «маска -> позиция в рваной таблице» строится однократно, а смена окна
+        сводится к индексированию массива. Без этого перебор 1820 масок в
+        двенадцати окнах был бы главной стоимостью скрипта."""
+        MI = np.empty((len(idx), len(masks)), np.int64)
+        for j, i in enumerate(idx):
+            i = int(i)
+            loc, C, o0 = self.index[i], self.C[i], self.off[i]
+            for m, S in enumerate(masks):
+                MI[j, m] = o0 + loc[tuple(sorted(set(S) & C))]
+        return MI
+
     def g(self, gw, i, S):
         """G произвольного набора в текущем окне: сводим к пересечению с C."""
         j = self.index[i][tuple(sorted(set(S) & self.C[i]))]
@@ -123,16 +138,62 @@ def singleton_and_best(rows, gw, e0w, idx, K):
         for k in range(1, K + 1):                       # монотонизация по <=K
             bestK[j, k] = max(bestK[j, k], bestK[j, k - 1])
         best.append(list(bs))
-        cur, avail = [], sorted(rows.C[i])
+        # ЖАДНЫЙ СО СТОПОМ. Прежде ход делался всегда, даже когда он ухудшал
+        # набор, и величина была не «жадный оракул», а «жадный ровно K».
+        # Позиции вне support дают ровно ноль, поэтому добивка ими безопасна и
+        # сохраняет равную стоимость.
+        cur, best_v = [], 0.0
         for _ in range(K):
             cand = [(to_rms(e0, rows.g(gw, i, cur + [q])), q)
-                    for q in avail if q not in cur]
+                    for q in sorted(rows.C[i]) if q not in cur]
             if not cand:
                 break
             v, q = max(cand)
-            cur = cur + [q]
+            if v <= best_v:
+                break
+            cur, best_v = cur + [q], v
         greedy.append(cur + [q for q in range(P) if q not in cur][:K - len(cur)])
     return sing, best, bestK, greedy
+
+
+def fit_priors(sing, den, p, tsk, P):
+    """Таблицы средней полезности позиции, ТОЛЬКО по train.
+
+    Метка нормируется на sqrt(e0) строки — это её собственный вклад в основную
+    метрику, величина безразмерная и всегда положительная в знаменателе. Делить
+    на g* нельзя: на части строк он около нуля и отношение улетает."""
+    y = sing / den[:, None]
+    pq = np.zeros((P, P))
+    for q_ in range(P):
+        for pp in range(P):
+            m = p == pp
+            pq[pp, q_] = y[m, q_].mean() if m.any() else 0.0
+    off = np.zeros(2 * P - 1)
+    cnt = np.zeros(2 * P - 1)
+    for j in range(len(y)):
+        for q_ in range(P):
+            off[q_ - p[j] + P - 1] += y[j, q_]
+            cnt[q_ - p[j] + P - 1] += 1
+    off /= np.maximum(cnt, 1)
+    nt = int(tsk.max()) + 1
+    tpq = np.zeros((nt, P, P))
+    for t_ in range(nt):
+        for pp in range(P):
+            m = (tsk == t_) & (p == pp)
+            if m.any():
+                tpq[t_, pp] = y[m].mean(0)
+    return dict(glob=y.mean(0), pq=pq, off=off, tpq=tpq)
+
+
+def prior_score(pri, kind, p, tsk, P, alpha=0.0):
+    n = len(p)
+    if kind == "glob":
+        return np.tile(pri["glob"], (n, 1))
+    if kind == "pq":
+        return pri["pq"][p]
+    if kind == "off":
+        return pri["off"][np.arange(P)[None, :] - p[:, None] + P - 1]
+    return alpha * pri["tpq"][tsk, p] + (1 - alpha) * pri["pq"][p]
 
 
 def diversity(sets, P):
@@ -193,8 +254,28 @@ def selftest():
     rw = to_rms(e0_t[0].mean(), g_t[1].mean())
     assert abs(rw - (r1 + r2) / 2) > 1e-3, \
         "проверка на несходимость RMS по частям не сработала"
+    # КРИВАЯ ПО K. Прежняя ошибка — двойное применение to_rms — существующей
+    # самопроверкой не ловилась, поэтому проверяется отдельно и с известным
+    # ответом: при двух полезных позициях кривая обязана расти до K=2 и дальше
+    # выйти на плато, а её значение при K=2 совпасть с точным оптимумом.
+    gw = g_t[:, :4].mean(1)
+    e0w = e0_t[:, :4].mean(1)
+    bk = np.zeros(kmax + 1)
+    for S, loc in rows.index[0].items():
+        v = to_rms(e0w[0], gw[loc])
+        if len(S) <= kmax:
+            bk[len(S)] = max(bk[len(S)], v)
+    for k in range(1, kmax + 1):
+        bk[k] = max(bk[k], bk[k - 1])
+    kc = bk / np.sqrt(e0w[0])
+    assert kc[0] == 0.0, "K=0 обязан давать ноль"
+    assert kc[1] < kc[2], f"кривая не растёт до K=2: {kc}"
+    assert kc[2] <= 1.0 + 1e-12, f"доля больше единицы: {kc}"
+    assert abs(kc[2] - kc[kmax]) < 1e-12, f"плато после K=2 не вышло: {kc}"
+
     print("самопроверка пройдена: окна разделяются, активная позиция "
-          "переезжает вместе с блоком, RMS по частям не складывается")
+          "переезжает вместе с блоком, RMS по частям не складывается, "
+          "кривая по K растёт и выходит на плато")
 
 
 def main() -> None:
@@ -230,8 +311,15 @@ def main() -> None:
           flush=True)
     rows = Rows(lb, P, K)
 
-    iv, it = np.where(sp == 1)[0], np.where(sp == 2)[0]
+    itr, iv, it = (np.where(sp == 0)[0], np.where(sp == 1)[0],
+                   np.where(sp == 2)[0])
+    p_all = lb["p"].astype(np.int64)
     all_masks = list(itertools.combinations(range(P), 4))
+    print(f"строю отображение масок ({len(all_masks)} на строку, один раз)...",
+          flush=True)
+    MI_tr, MI_iv, MI_it = (rows.mask_map(itr, all_masks),
+                           rows.mask_map(iv, all_masks),
+                           rows.mask_map(it, all_masks))
     res = {}
 
     for name, w in windows(T).items():
@@ -248,12 +336,9 @@ def main() -> None:
         o1 = [list(np.argsort(-sing[j], kind="stable")[:4])
               for j in range(len(it))]
 
-        bm, bR = None, -1e30                     # маска подбирается на val
-        for S in all_masks:
-            num, den = eval_sets(rows, gw, e0w, iv, [list(S)] * len(iv))
-            R = num.sum() / den.sum()
-            if R > bR:
-                bm, bR = S, R
+        # МАСКИ ПЕРЕБИРАЮТСЯ ВЕКТОРНО через предпосчитанное отображение.
+        M_iv = to_rms(e0w[iv][:, None], gw[MI_iv])
+        bm = all_masks[int(np.argmax(M_iv.sum(0)))]
         fx_n, den = eval_sets(rows, gw, e0w, it, [list(bm)] * len(it))
         o1_n, _ = eval_sets(rows, gw, e0w, it, o1)
         ex_n, _ = eval_sets(rows, gw, e0w, it, best)
@@ -265,6 +350,56 @@ def main() -> None:
                               [list(r.permutation(P)[:4]) for _ in it])
             rnd.append(rn)
         rn_n = np.mean(rnd, 0)
+
+        # ---- УСЛОВНЫЕ BASELINE БЕЗ СОСТОЯНИЯ, обучаются ТОЛЬКО по train.
+        # Ключевой из них S(p): своя ЦЕЛЬНАЯ четвёрка на каждую позицию
+        # правки p. Он видит взаимодействия внутри набора и зависимость от p,
+        # но НЕ видит ни картинку, ни состояние робота, ни токены. Поэтому он
+        # отделяет настоящую состояние-зависимость от зависимости от p.
+        M_tr = to_rms(e0w[itr][:, None], gw[MI_tr])
+        M_it = to_rms(e0w[it][:, None], gw[MI_it])
+        sg_tr = np.array([[to_rms(e0w[int(i)], rows.g(gw, int(i), [q]))
+                           for q in range(P)] for i in itr])
+        den_tr = np.sqrt(e0w[itr])
+        pri = fit_priors(sg_tr, den_tr, p_all[itr], tsk_idx[itr], P)
+
+        cond = {}
+        cond["S_global (train)"] = M_it[:, int(np.argmax(M_tr.sum(0)))]
+        sp_pick = np.zeros(P, np.int64)
+        for pp in range(P):
+            m = p_all[itr] == pp
+            sp_pick[pp] = int(np.argmax(M_tr[m].sum(0))) if m.any() else 0
+        cond["S(p) (train)"] = M_it[np.arange(len(it)), sp_pick[p_all[it]]]
+        for kind, nm_ in (("glob", "prior[q]"), ("pq", "prior[p,q]"),
+                          ("off", "prior[q-p]")):
+            sc = prior_score(pri, kind, p_all[it], tsk_idx[it], P)
+            sets_ = np.argsort(-sc, axis=1, kind="stable")[:, :4]
+            cond[nm_], _ = eval_sets(rows, gw, e0w, it, sets_.tolist())
+        ba, bv = 0.0, -1e30                       # alpha выбирается на val
+        M_iv_ = M_iv
+        sg_iv = np.array([[to_rms(e0w[int(i)], rows.g(gw, int(i), [q]))
+                           for q in range(P)] for i in iv])
+        for a_ in (0.0, 0.25, 0.5, 0.75, 1.0):
+            sc = prior_score(pri, "task", p_all[iv], tsk_idx[iv], P, a_)
+            st = np.argsort(-sc, axis=1, kind="stable")[:, :4]
+            nv, dv = eval_sets(rows, gw, e0w, iv, st.tolist())
+            if nv.sum() / dv.sum() > bv:
+                ba, bv = a_, nv.sum() / dv.sum()
+        sc = prior_score(pri, "task", p_all[it], tsk_idx[it], P, ba)
+        cond[f"prior[task,p,q] a={ba}"], _ = eval_sets(
+            rows, gw, e0w, it, np.argsort(-sc, 1, kind="stable")[:, :4].tolist())
+        best_cond = max(cond, key=lambda k_: cond[k_].sum())
+        d_cond = paired_ci(ex_n, cond[best_cond], den, epi[it])
+
+        # разнообразие ВНУТРИ фиксированного p: если наборы разные и при
+        # известном p, изменчивость нельзя списать на позицию правки
+        jac_p = float(np.mean([diversity([best[j] for j in
+                                          np.where(p_all[it] == pp)[0]], P)[0]
+                               for pp in range(P)
+                               if (p_all[it] == pp).sum() > 1]))
+        gstar = ex_n
+        ok = gstar > 0
+        med = float(np.median(cond[best_cond][ok] / gstar[ok]))
 
         jac, ent, freq = diversity(best, P)
         d_fx = paired_ci(fx_n, rn_n, den, epi[it])
@@ -280,7 +415,13 @@ def main() -> None:
         # Прежде здесь стояло второе преобразование, и величина зажималась в
         # единицу во всех окнах — знаменатель den тоже равен sqrt(e0).
         kc = [float(bestK[:, k].sum() / den.sum()) for k in range(K + 1)]
-        row |= dict(mask=list(map(int, bm)), jaccard=jac, entropy=ent,
+        for nm_, num in cond.items():
+            pt, lo, hi = cluster_ci(num, den, epi[it])
+            row[nm_] = dict(R=pt, lo=lo, hi=hi, macro=macro_by(num, den,
+                                                               tsk[it]))
+        row |= dict(best_cond=best_cond, exact_minus_cond=d_cond,
+                    jaccard_within_p=jac_p, median_cond_over_gstar=med,
+                    mask=list(map(int, bm)), jaccard=jac, entropy=ent,
                     freq=freq.tolist(), K_curve=kc,
                     fixed_minus_random=d_fx, exact_minus_fixed=d_ex)
         res[name] = row
@@ -297,20 +438,43 @@ def main() -> None:
         print(f"    точный − фикс    {d_ex[0]:+.4f} [{d_ex[1]:+.4f}, "
               f"{d_ex[2]:+.4f}]"
               + ("  значимо" if d_ex[1] > 0 or d_ex[2] < 0 else "  НЕ значимо"))
-        print(f"    разнообразие лучших наборов: Жаккар {jac:.3f}, "
+        print("    условные baseline без состояния: " + "  ".join(
+            f"{k_} {v_.sum() / den.sum():.3f}" for k_, v_ in cond.items()))
+        print(f"    лучший из них — {best_cond}; точный − он "
+              f"{d_cond[0]:+.4f} [{d_cond[1]:+.4f}, {d_cond[2]:+.4f}]"
+              + ("  значимо" if d_cond[1] > 0 else "  НЕ значимо"))
+        print(f"    разнообразие лучших наборов: Жаккар {jac:.3f} "
+              f"(внутри фиксированного p {jac_p:.3f}), "
               f"энтропия позиций {ent:.3f}")
         print(f"    кривая K: " + " ".join(f"{v:.3f}" for v in kc))
 
     print("\n" + "=" * 74)
     print("СВОДКА: держится ли разреженность при удлинении окна")
     print("=" * 74)
-    print(f"  {'окно':<14}{'случ.':>8}{'фикс':>8}{'O1':>8}{'точн.':>8}"
-          f"{'точн.-фикс':>12}{'Жаккар':>9}")
+    print(f"  {'окно':<14}{'случ.':>7}{'фикс':>7}{'лучш.усл.':>10}{'O1':>7}"
+          f"{'точн.':>7}{'точн.-усл.':>22}{'Жак|p':>7}")
     for k, v in res.items():
-        print(f"  {k:<14}{v['случайные 4']['R']:>8.3f}{v['фикс-маска']['R']:>8.3f}"
-              f"{v['O1']['R']:>8.3f}{v['точный <=4']['R']:>8.3f}"
-              f"{v['exact_minus_fixed'][0]:>12.4f}{v['jaccard']:>9.3f}")
-    print("\n  ЧИТАТЬ ТАК, правило записано до запуска.\n"
+        d = v["exact_minus_cond"]
+        print(f"  {k:<14}{v['случайные 4']['R']:>7.3f}"
+              f"{v['фикс-маска']['R']:>7.3f}"
+              f"{v[v['best_cond']]['R']:>10.3f}{v['O1']['R']:>7.3f}"
+              f"{v['точный <=4']['R']:>7.3f}"
+              f"   {d[0]:>+7.4f} [{d[1]:>+7.4f},{d[2]:>+7.4f}]"
+              f"{v['jaccard_within_p']:>7.3f}")
+    print("\n  ВОРОТА ПО УСЛОВНЫМ BASELINE, записаны до запуска.\n"
+          "  Величина «точный − лучший условный» отделяет настоящую\n"
+          "  состояние-зависимость от зависимости от позиции правки p и от\n"
+          "  задачи. S(p) даёт свою ЦЕЛЬНУЮ четвёрку на каждое p, то есть\n"
+          "  видит и взаимодействия внутри набора, но не видит ни картинки,\n"
+          "  ни состояния робота, ни токенов.\n"
+          "    >= 0.10 — сильное доказательство динамического запаса;\n"
+          "    >= 0.05 при положительной нижней границе — переходить к полной\n"
+          "            пересборке;\n"
+          "    <  0.05 — изменчивость объясняется p и задачей, формулировку\n"
+          "            «state-dependent» снять.\n"
+          "  Жаккар ВНУТРИ фиксированного p дополняет: если наборы разные и\n"
+          "  при известном p, изменчивость на p не спишешь.\n"
+          "\n  ЧИТАТЬ ТАК, правило записано до запуска.\n"
           "  Если на длинных окнах фикс-маска сходится со случайным выбором —\n"
           "  объяснение через геометрию декодера полное. Если точный оракул\n"
           "  при этом держится заметно выше случайного, а Жаккар лучших\n"

@@ -943,6 +943,11 @@ def main() -> None:
                     # ~1e-9 вместо нуля — на три порядка ниже порога, но
                     # тождество лучше не размывать.
                     gg_all[b][0] = 0.0
+                    if args.per_timestep:
+                        # G(пустое) = 0 ТОЧНО и в каждом окне, а не с точностью
+                        # до 1e-9: иначе развёртка по окнам наследует шум в
+                        # опорной точке, от которой считаются все выигрыши.
+                        gg_t[b][0] = 0.0
                     Lab["g_flat"].append(gg_all[b])
                     if args.per_timestep:
                         Lab["g_flat_t"].append(gg_t[b])
@@ -1040,7 +1045,8 @@ def main() -> None:
                 P=int(P), L=int(L), kmax=args.kmax, tau_rel=args.tau_rel,
                 gap_rel=args.gap_rel, gap_threshold=float(labels["gap_threshold"]),
                 tau_by_p=[float(x) for x in labels["tau_by_p"]],
-                window=args.window,
+                window=args.window, per_timestep=bool(args.per_timestep),
+                action_steps=int(T),
                 vlm_dtype=args.vlm_dtype, pos_offset=off_meta,
                 padding_protocol="левый паддинг, как в eval_libero; "
                                  "эквивалентен отсутствию паддинга",
