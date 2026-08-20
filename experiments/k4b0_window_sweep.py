@@ -152,7 +152,12 @@ def singleton_and_best(rows, gw, e0w, idx, K):
             if v <= best_v:
                 break
             cur, best_v = cur + [q], v
-        greedy.append(cur + [q for q in range(P) if q not in cur][:K - len(cur)])
+        # ДОБИВКА ТОЛЬКО ПОЗИЦИЯМИ ВНЕ SUPPORT: они дают ровно ноль, поэтому
+        # стоимость выровнена, а значение не меняется. Прежде добивалось из
+        # range(P), то есть могло подставить ВРЕДНУЮ позицию внутри support, и
+        # остановка ухудшала результат вместо того чтобы его сохранять.
+        pad = [q for q in range(P) if q not in cur and q not in rows.C[i]]
+        greedy.append(cur + pad[:K - len(cur)])
     return sing, best, bestK, greedy
 
 
@@ -162,7 +167,16 @@ def fit_priors(sing, den, p, tsk, P):
     Метка нормируется на sqrt(e0) строки — это её собственный вклад в основную
     метрику, величина безразмерная и всегда положительная в знаменателе. Делить
     на g* нельзя: на части строк он около нуля и отношение улетает."""
+    # СТРОКИ С НУЛЕВЫМ РАЗРЫВОМ ИСКЛЮЧАЮТСЯ. В узком окне повреждение может
+    # не задевать оцениваемые шаги вовсе, тогда e0(окно) = 0, знаменатель ноль
+    # и отношение улетает в бесконечность, отравляя средние по позициям. На
+    # блоке [16:20] это и происходило: prior[q] выходил 0.026 вместо разумного.
+    ok = den > 1e-12
+    if not ok.any():
+        raise SystemExit("в этом окне не осталось строк с ненулевым разрывом")
+    sing, den, p, tsk = sing[ok], den[ok], p[ok], tsk[ok]
     y = sing / den[:, None]
+    assert np.isfinite(y).all(), "нормированная метка не конечна"
     pq = np.zeros((P, P))
     for q_ in range(P):
         for pp in range(P):
