@@ -444,16 +444,43 @@ def main() -> None:
                         continue
                     ms, st = t[f"masked_K{K}"]["median"], t[f"static_K{K}"]["median"]
                     dy = t[f"dynamic_K{K}"]["median"]
-                    print(f"\n  разложение при K={K}:")
+                    # ПОРОГ РАЗРЕШЕНИЯ. Разброс самого плотного режима задаёт
+                    # масштаб, ниже которого разность неотличима от шума.
+                    # Без этого «экономия» в 0.03 мс на шаге 1.1 мс читается
+                    # как результат, хотя знак у неё случайный — что и
+                    # обнаружилось: static выходил медленнее masked, хотя
+                    # делает строго меньше работы.
+                    d0 = t[f"dense_K{args.K[0]}"]
+                    noise = d0["p90"] - d0["p10"]
+                    tag = lambda v: ("" if abs(v) > noise
+                                     else "  В ПРЕДЕЛАХ ШУМА")
+                    print(f"\n  разложение при K={K} "
+                          f"(порог разрешения {noise:.3f} мс):")
                     print(f"    на выходе  (dense-masked)   {dense - ms:>8.3f} мс"
-                          f"  {(dense - ms) / dense:>7.1%} от плотного шага")
+                          f"  {(dense - ms) / dense:>7.1%}{tag(dense - ms)}")
                     print(f"    НА ЗАПРОСАХ (masked-static) {ms - st:>8.3f} мс"
-                          f"  {(ms - st) / dense:>7.1%}  <- предмет метода")
+                          f"  {(ms - st) / dense:>7.1%}{tag(ms - st)}"
+                          + ("" if abs(ms - st) <= noise else "  <- предмет метода"))
                     print(f"    цена router (dynamic-static){dy - st:>8.3f} мс"
-                          f"  {(dy - st) / dense:>7.1%}")
+                          f"  {(dy - st) / dense:>7.1%}{tag(dy - st)}")
+                    if ms < st - noise:
+                        print("    ВНИМАНИЕ: static медленнее masked за "
+                              "пределами шума — считать меньше запросов не "
+                              "может быть дороже, замер под вопросом")
                     if dy - st > ms - st:
                         print("    router дороже всей экономии на запросах: "
                               "динамический выбор себя не окупает")
+                    # ПОТОЛОК ВЕТКИ. Даже при БЕСПЛАТНОМ router и refiner,
+                    # занимающем ВСЁ время вывода, сквозное ускорение не
+                    # превысит 1/(1 - r_max), где r_max = (T-1)/T*(1 - S/D).
+                    # Если этот потолок ниже 1.15x, ворота недостижимы в
+                    # принципе, а не из-за качества реализации.
+                    for T_ in args.steps:
+                        rmax = (T_ - 1) / T_ * max(0.0, 1 - st / dense)
+                        print(f"    потолок ветки при T={T_}, бесплатном "
+                              f"router и f=100%: {1 / (1 - rmax):.3f}x"
+                              + ("" if 1 / (1 - rmax) >= 1.15
+                                 else "  <- НЕДОСТИЖИМО"))
                     res[key][f"decomp_K{K}"] = dict(
                         out_side=dense - ms, query_side=ms - st,
                         router_cost=dy - st)
