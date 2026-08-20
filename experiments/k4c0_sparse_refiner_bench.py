@@ -243,11 +243,20 @@ def make_step(model, router, mode, K, B, device, dtype):
     # начало шага и скопировать тензор, пересекающий границу графов.
     mark = getattr(torch.compiler, "cudagraph_mark_step_begin", None)
 
+    # КЭШ КОНТЕКСТА СЧИТАЕТСЯ ВНЕ ИЗМЕРЯЕМОГО ИНТЕРВАЛА. В развёрнутой системе
+    # ключи и значения VLM-контекста вычисляются ОДИН РАЗ на наблюдение и
+    # переиспользуются всеми T шагами refinement. Раньше вызов стоял внутри
+    # run(), то есть его стоимость заряжалась каждому шагу — а она растёт
+    # линейно с длиной контекста и от числа запросов не зависит. Это раздувало
+    # фиксированную часть шага и занижало долю, которую даёт разреженность,
+    # причём тем сильнее, чем длиннее контекст.
+    with torch.no_grad():
+        ctx_kv = model.cache_ctx(ctx)
+
     def run():
         if mark is not None:
             mark()
         with torch.no_grad():
-            ctx_kv = model.cache_ctx(ctx)          # кэш VLM — один раз
             full = model.state(tok, step)
             if mode == "dense":
                 out = model(full, all_idx, ctx_kv)
