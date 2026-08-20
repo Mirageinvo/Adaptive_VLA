@@ -38,6 +38,8 @@ float32: `from_pretrained` игнорирует запрошенный dtype, и
 """
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import random
@@ -195,8 +197,21 @@ def main() -> None:
         flip = ""
 
     def make_batch():
-        return build_batch(im1, im2, tasks, state, proc, NS(), dev,
-                           pad_to=None, pad_side="left")
+        """Батч в dtype модели и БЕЗ печати.
+
+        Два подводных камня, оба обнаружены запуском.
+        1. Процессор отдаёт pixel_values во float32. Пока модель грузилась во
+           float32 (а она грузилась: from_pretrained игнорирует запрошенный
+           dtype), это не мешало. При fp16 свёртка зрения падает на
+           несовпадении типов, поэтому вещественные тензоры приводим явно.
+        2. build_batch печатает диагностику. Внутри измеряемой функции это
+           означало бы, что в стоимость CPU-шага входит вывод в консоль.
+        """
+        with contextlib.redirect_stdout(io.StringIO()):
+            b = build_batch(im1, im2, tasks, state, proc, NS(), dev,
+                            pad_to=None, pad_side="left")
+        return {k: (v.to(dtype) if torch.is_tensor(v) and v.is_floating_point()
+                    else v) for k, v in b.items()}
 
     batch = make_batch()
     with torch.no_grad():
