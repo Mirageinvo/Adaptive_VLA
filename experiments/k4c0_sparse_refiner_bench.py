@@ -234,7 +234,18 @@ def make_step(model, router, mode, K, B, device, dtype):
     fixed = torch.arange(K, device=device).expand(B, K).contiguous()
     all_idx = torch.arange(P_POS, device=device).expand(B, P_POS).contiguous()
 
+    # CUDA-ГРАФЫ И ПЕРЕДАЧА ТЕНЗОРОВ МЕЖДУ СКОМПИЛИРОВАННЫМИ МОДУЛЯМИ.
+    # При mode="reduce-overhead" выход скомпилированного модуля живёт в
+    # буфере графа и перезаписывается следующим запуском. Индексы, выданные
+    # router, идут дальше в refiner — то есть в ДРУГОЙ граф, и без разметки
+    # шага это падает с «accessing tensor output of CUDAGraphs that has been
+    # overwritten». Лечится ровно так, как советует сама ошибка: отметить
+    # начало шага и скопировать тензор, пересекающий границу графов.
+    mark = getattr(torch.compiler, "cudagraph_mark_step_begin", None)
+
     def run():
+        if mark is not None:
+            mark()
         with torch.no_grad():
             ctx_kv = model.cache_ctx(ctx)          # кэш VLM — один раз
             full = model.state(tok, step)
@@ -244,7 +255,10 @@ def make_step(model, router, mode, K, B, device, dtype):
             elif mode == "static":
                 out, idx = model(full, fixed, ctx_kv), fixed
             elif mode == "dynamic":
-                idx = router(full, K)
+                # clone обязателен: индексы пересекают границу двух графов.
+                # Он же входит в измеряемое время — это честная часть цены
+                # динамического выбора, а не накладные расходы стенда.
+                idx = router(full, K).clone()
                 out = model(full, idx, ctx_kv)
             elif mode == "masked":
                 out = model(full, all_idx, ctx_kv)  # считаем всё
