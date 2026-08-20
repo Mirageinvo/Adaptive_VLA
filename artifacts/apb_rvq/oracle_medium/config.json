@@ -1,0 +1,14 @@
+{
+  "model": "ZibinDong/ActionCodec-Base-RVQft",
+  "dataset": "physical-intelligence/libero",
+  "revision": "v2.0",
+  "n_chunks": 256,
+  "n_episodes": 128,
+  "seed": 0,
+  "embodiment": 0,
+  "budgets": "16,20,24,28,32,36,40,44,48",
+  "random_seeds": 8,
+  "static_prior_chunks": 96,
+  "device": "cuda",
+  "output": "artifacts/apb_rvq/oracle_medium"
+}

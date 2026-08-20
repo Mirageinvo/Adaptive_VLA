@@ -1,0 +1,77 @@
+{
+  "meta": {
+    "model": "ZibinDong/ActionCodec-Base-RVQft",
+    "dataset": "physical-intelligence/libero",
+    "revision": "v2.0",
+    "commit": "cafd70e4ba22416ce5ab62ff91effd633835439e",
+    "device": "cpu",
+    "seed": 0,
+    "n_chunks": 4,
+    "budgets": [
+      16,
+      20,
+      24
+    ],
+    "gripper_mode": "invert"
+  },
+  "oracle_exact": {
+    "16": {
+      "rms_mean": 0.05014440953732836,
+      "rms_ci_vs_random_delta": [
+        0.0,
+        0.0
+      ],
+      "improvement_vs_random_pct": 0.0,
+      "gap_closed_mean": 0.0
+    },
+    "20": {
+      "rms_mean": 0.03572599689494354,
+      "rms_ci_vs_random_delta": [
+        -0.020542188245977467,
+        -0.0079902634314305
+      ],
+      "improvement_vs_random_pct": 27.87335784681308,
+      "gap_closed_mean": 0.9758106138892133
+    },
+    "24": {
+      "rms_mean": 0.03085711610006336,
+      "rms_ci_vs_random_delta": [
+        -0.02467316417205051,
+        -0.010561384102231864
+      ],
+      "improvement_vs_random_pct": 34.70716905902048,
+      "gap_closed_mean": 1.2842426307924413
+    }
+  },
+  "oracle_at_most": {
+    "16": {
+      "rms_mean": 0.05014440953732836
+    },
+    "20": {
+      "rms_mean": 0.03572599689494354
+    },
+    "24": {
+      "rms_mean": 0.03085711610006336
+    }
+  },
+  "baselines": {
+    "16": {
+      "random_rms_mean": 0.05014440953732836,
+      "uniform_rms_mean": 0.05014440953732836,
+      "static_rms_mean": 0.05014440953732836,
+      "global_mix_rms_mean": 0.05014440953732836
+    },
+    "20": {
+      "random_rms_mean": 0.04953231680890746,
+      "uniform_rms_mean": 0.049077219928428596,
+      "static_rms_mean": 0.04521614381986101,
+      "global_mix_rms_mean": 0.0474683213957388
+    },
+    "24": {
+      "random_rms_mean": 0.04725957759123079,
+      "uniform_rms_mean": 0.04975263939762253,
+      "static_rms_mean": 0.04319044923860454,
+      "global_mix_rms_mean": 0.04479223325414923
+    }
+  }
+}

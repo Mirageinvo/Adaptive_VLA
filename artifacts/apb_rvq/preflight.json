@@ -1,0 +1,11 @@
+{
+  "hostname": "criptyn97s-Laptop.local",
+  "platform": "macOS-15.1.1-arm64-arm-64bit",
+  "python": "Python 3.12.3",
+  "git_head": "cafd70e4ba22416ce5ab62ff91effd633835439e",
+  "cwd": "/Users/criptyn97/Adaptive_VLA",
+  "hf_home": "",
+  "disk_home_free_gb": 17.16,
+  "disk_guardrail_ok": false,
+  "nvidia_smi": "ERROR: [Errno 2] No such file or directory: 'nvidia-smi'"
+}

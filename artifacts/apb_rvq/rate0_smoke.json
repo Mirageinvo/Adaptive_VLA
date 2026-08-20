@@ -1,0 +1,37 @@
+{
+  "model": "ZibinDong/ActionCodec-Base-RVQft",
+  "dataset": "physical-intelligence/libero",
+  "revision": "v2.0",
+  "tasks_path": "/Users/criptyn97/.cache/huggingface/hub/datasets--physical-intelligence--libero/snapshots/9dfa69510ea9e1613fc54112bc706444b686a231/meta/tasks.jsonl",
+  "device": "cpu",
+  "gripper_mode": "invert",
+  "n_chunks": 4,
+  "action_shape": [
+    4,
+    20,
+    7
+  ],
+  "codes_shape": [
+    4,
+    16,
+    3
+  ],
+  "metrics": {
+    "mse": 0.0012232324806973338,
+    "rms": 0.034974740609436034,
+    "gripper_error": 0.25,
+    "ch0_rms": 0.03567888215184212,
+    "ch1_rms": 0.027178015559911728,
+    "ch2_rms": 0.057951584458351135,
+    "ch3_rms": 0.022547326982021332,
+    "ch4_rms": 0.0327102355659008,
+    "ch5_rms": 0.01977473497390747
+  },
+  "checks": {
+    "vocab_size": 2048,
+    "rvq_levels": 3,
+    "positions": 16,
+    "level_major_layout": true,
+    "full_depth_matches_native": true
+  }
+}

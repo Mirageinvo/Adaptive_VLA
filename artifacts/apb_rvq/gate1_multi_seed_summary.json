@@ -1,0 +1,20 @@
+{
+  "decision": "GO",
+  "gate": "Gate-1 CLOSED",
+  "peak_budget": 28,
+  "improvement_vs_random_pct": {
+    "by_seed": {
+      "0": {"20": 21.2, "24": 27.7, "28": 29.9, "32": 29.6, "36": 27.6, "40": 23.3},
+      "1": {"20": 20.6, "24": 27.7, "28": 30.3, "32": 30.4, "36": 28.5, "40": 24.4},
+      "2": {"20": 21.2, "24": 28.0, "28": 30.1, "32": 29.7, "36": 27.7, "40": 23.6}
+    },
+    "mean": {"20": 21.0, "24": 27.8, "28": 30.1, "32": 29.9, "36": 27.9, "40": 23.8},
+    "std": {"20": 0.30, "24": 0.14, "28": 0.17, "32": 0.38, "36": 0.38, "40": 0.44}
+  },
+  "beam_retained_mean_full": 0.935,
+  "beam_passes_95pct": false,
+  "notes": [
+    "Use metrics_corrected.json for CI and baseline comparisons.",
+    "Greedy labels OK for rate3; report beam as conservative search reference."
+  ]
+}

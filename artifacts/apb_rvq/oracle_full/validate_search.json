@@ -1,0 +1,12 @@
+{
+  "budget": 32,
+  "beam_width": 128,
+  "n_beam_chunks": 128,
+  "n_exact_chunks": 64,
+  "beam_retained_mean": 0.9348216947193666,
+  "beam_retained_median": 0.9593030741998537,
+  "exact_subset_retained_mean": 2505851730.3485117,
+  "exact_subset_retained_median": 2.5364020637833704,
+  "passes_95pct_beam": false,
+  "passes_95pct_exact_subset": true
+}

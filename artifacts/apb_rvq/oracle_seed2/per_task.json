@@ -1,0 +1,872 @@
+{
+  "meta": {
+    "n_chunks": 512,
+    "n_tasks": 40
+  },
+  "budgets": {
+    "24": {
+      "n_tasks_positive": 40,
+      "n_tasks_ge_15pct": 40,
+      "improvement_mean_over_tasks": 28.064834155958692,
+      "improvement_median_over_tasks": 27.629713865885236,
+      "tasks": [
+        {
+          "task_id": 23,
+          "n_chunks": 16,
+          "oracle_rms_mean": 0.033515154316562226,
+          "random_rms_mean": 0.05177046743070769,
+          "improvement_vs_random_pct": 35.26202103270428
+        },
+        {
+          "task_id": 8,
+          "n_chunks": 8,
+          "oracle_rms_mean": 0.04014902316563916,
+          "random_rms_mean": 0.06141272163985577,
+          "improvement_vs_random_pct": 34.624256841951855
+        },
+        {
+          "task_id": 20,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.037426016939683955,
+          "random_rms_mean": 0.05667028700578678,
+          "improvement_vs_random_pct": 33.95830704746163
+        },
+        {
+          "task_id": 0,
+          "n_chunks": 14,
+          "oracle_rms_mean": 0.03335644547697255,
+          "random_rms_mean": 0.050496753860892016,
+          "improvement_vs_random_pct": 33.943386600923745
+        },
+        {
+          "task_id": 16,
+          "n_chunks": 16,
+          "oracle_rms_mean": 0.03125349890726881,
+          "random_rms_mean": 0.04712243906658588,
+          "improvement_vs_random_pct": 33.675973641546065
+        },
+        {
+          "task_id": 18,
+          "n_chunks": 8,
+          "oracle_rms_mean": 0.038620069811133265,
+          "random_rms_mean": 0.05597713091372081,
+          "improvement_vs_random_pct": 31.00741466964516
+        },
+        {
+          "task_id": 17,
+          "n_chunks": 12,
+          "oracle_rms_mean": 0.03805261787582763,
+          "random_rms_mean": 0.055038094987754,
+          "improvement_vs_random_pct": 30.86130999938433
+        },
+        {
+          "task_id": 14,
+          "n_chunks": 14,
+          "oracle_rms_mean": 0.03481729086824433,
+          "random_rms_mean": 0.05034106803953377,
+          "improvement_vs_random_pct": 30.837202657477047
+        },
+        {
+          "task_id": 2,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.03651068342438805,
+          "random_rms_mean": 0.05268810401000227,
+          "improvement_vs_random_pct": 30.704123614968402
+        },
+        {
+          "task_id": 19,
+          "n_chunks": 26,
+          "oracle_rms_mean": 0.0311817590549596,
+          "random_rms_mean": 0.044649610974351724,
+          "improvement_vs_random_pct": 30.163425000787853
+        },
+        {
+          "task_id": 30,
+          "n_chunks": 14,
+          "oracle_rms_mean": 0.034037397461845774,
+          "random_rms_mean": 0.048600757888583736,
+          "improvement_vs_random_pct": 29.965294903680668
+        },
+        {
+          "task_id": 1,
+          "n_chunks": 12,
+          "oracle_rms_mean": 0.026476507512733154,
+          "random_rms_mean": 0.037496691910932196,
+          "improvement_vs_random_pct": 29.38975103290671
+        },
+        {
+          "task_id": 26,
+          "n_chunks": 14,
+          "oracle_rms_mean": 0.04230808167863943,
+          "random_rms_mean": 0.05972404010318407,
+          "improvement_vs_random_pct": 29.160717182654473
+        },
+        {
+          "task_id": 4,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.040463257616978325,
+          "random_rms_mean": 0.05704052547830185,
+          "improvement_vs_random_pct": 29.0622635789523
+        },
+        {
+          "task_id": 3,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.03649375466224891,
+          "random_rms_mean": 0.051401229627801935,
+          "improvement_vs_random_pct": 29.002175771861022
+        },
+        {
+          "task_id": 11,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.037315869307581635,
+          "random_rms_mean": 0.05237327987579789,
+          "improvement_vs_random_pct": 28.750176815209166
+        },
+        {
+          "task_id": 24,
+          "n_chunks": 12,
+          "oracle_rms_mean": 0.03908168181350896,
+          "random_rms_mean": 0.054813413158912215,
+          "improvement_vs_random_pct": 28.700514050812036
+        },
+        {
+          "task_id": 39,
+          "n_chunks": 22,
+          "oracle_rms_mean": 0.05006969558480711,
+          "random_rms_mean": 0.06963481804552484,
+          "improvement_vs_random_pct": 28.096752472199647
+        },
+        {
+          "task_id": 22,
+          "n_chunks": 20,
+          "oracle_rms_mean": 0.03928376041182795,
+          "random_rms_mean": 0.05455272328217105,
+          "improvement_vs_random_pct": 27.989368727506424
+        },
+        {
+          "task_id": 31,
+          "n_chunks": 20,
+          "oracle_rms_mean": 0.046299816317474186,
+          "random_rms_mean": 0.06420164023629528,
+          "improvement_vs_random_pct": 27.88374853497996
+        },
+        {
+          "task_id": 7,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.03623689047866567,
+          "random_rms_mean": 0.049896357140271186,
+          "improvement_vs_random_pct": 27.375679196790507
+        },
+        {
+          "task_id": 27,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.043440343399113415,
+          "random_rms_mean": 0.05979292881958269,
+          "improvement_vs_random_pct": 27.348694474911994
+        },
+        {
+          "task_id": 35,
+          "n_chunks": 18,
+          "oracle_rms_mean": 0.04403502840277383,
+          "random_rms_mean": 0.060512613468899946,
+          "improvement_vs_random_pct": 27.23000069166515
+        },
+        {
+          "task_id": 37,
+          "n_chunks": 16,
+          "oracle_rms_mean": 0.04433475366275028,
+          "random_rms_mean": 0.06086265176062171,
+          "improvement_vs_random_pct": 27.15605978339087
+        },
+        {
+          "task_id": 12,
+          "n_chunks": 8,
+          "oracle_rms_mean": 0.043139515513008854,
+          "random_rms_mean": 0.059106671169696354,
+          "improvement_vs_random_pct": 27.01413451426743
+        },
+        {
+          "task_id": 38,
+          "n_chunks": 6,
+          "oracle_rms_mean": 0.042464780756915156,
+          "random_rms_mean": 0.05786272033164755,
+          "improvement_vs_random_pct": 26.611157385060952
+        },
+        {
+          "task_id": 5,
+          "n_chunks": 14,
+          "oracle_rms_mean": 0.030832526075189555,
+          "random_rms_mean": 0.041909586627031155,
+          "improvement_vs_random_pct": 26.430851371597726
+        },
+        {
+          "task_id": 29,
+          "n_chunks": 18,
+          "oracle_rms_mean": 0.038829825807400416,
+          "random_rms_mean": 0.05257881286560436,
+          "improvement_vs_random_pct": 26.14929152802946
+        },
+        {
+          "task_id": 15,
+          "n_chunks": 8,
+          "oracle_rms_mean": 0.029867077372957514,
+          "random_rms_mean": 0.040395978687766225,
+          "improvement_vs_random_pct": 26.064231284480183
+        },
+        {
+          "task_id": 13,
+          "n_chunks": 14,
+          "oracle_rms_mean": 0.05135856359529223,
+          "random_rms_mean": 0.06935636710423392,
+          "improvement_vs_random_pct": 25.9497494756224
+        },
+        {
+          "task_id": 33,
+          "n_chunks": 6,
+          "oracle_rms_mean": 0.04895348148159049,
+          "random_rms_mean": 0.06604022026525717,
+          "improvement_vs_random_pct": 25.873231062882713
+        },
+        {
+          "task_id": 10,
+          "n_chunks": 16,
+          "oracle_rms_mean": 0.042583678040094754,
+          "random_rms_mean": 0.05685590745719234,
+          "improvement_vs_random_pct": 25.102456464780477
+        },
+        {
+          "task_id": 28,
+          "n_chunks": 12,
+          "oracle_rms_mean": 0.03700669722267889,
+          "random_rms_mean": 0.049388897095991174,
+          "improvement_vs_random_pct": 25.070816724751953
+        },
+        {
+          "task_id": 32,
+          "n_chunks": 12,
+          "oracle_rms_mean": 0.0478815839271127,
+          "random_rms_mean": 0.06354720490245326,
+          "improvement_vs_random_pct": 24.65194338505955
+        },
+        {
+          "task_id": 34,
+          "n_chunks": 18,
+          "oracle_rms_mean": 0.05896597801692743,
+          "random_rms_mean": 0.0780118087189111,
+          "improvement_vs_random_pct": 24.41403553481091
+        },
+        {
+          "task_id": 9,
+          "n_chunks": 6,
+          "oracle_rms_mean": 0.04785088345339678,
+          "random_rms_mean": 0.0631802332461065,
+          "improvement_vs_random_pct": 24.262888889626556
+        },
+        {
+          "task_id": 6,
+          "n_chunks": 14,
+          "oracle_rms_mean": 0.04103460546890538,
+          "random_rms_mean": 0.05409484775632845,
+          "improvement_vs_random_pct": 24.143227736314646
+        },
+        {
+          "task_id": 36,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.05025326392747581,
+          "random_rms_mean": 0.0660275231576603,
+          "improvement_vs_random_pct": 23.89043004463271
+        },
+        {
+          "task_id": 21,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.04295556331908125,
+          "random_rms_mean": 0.05642380731861546,
+          "improvement_vs_random_pct": 23.86978943742908
+        },
+        {
+          "task_id": 25,
+          "n_chunks": 8,
+          "oracle_rms_mean": 0.04634655995118274,
+          "random_rms_mean": 0.05862683830118174,
+          "improvement_vs_random_pct": 20.94651307462962
+        }
+      ]
+    },
+    "32": {
+      "n_tasks_positive": 40,
+      "n_tasks_ge_15pct": 40,
+      "improvement_mean_over_tasks": 29.81556402806488,
+      "improvement_median_over_tasks": 29.50856525626083,
+      "tasks": [
+        {
+          "task_id": 0,
+          "n_chunks": 14,
+          "oracle_rms_mean": 0.027409860759644612,
+          "random_rms_mean": 0.045290306746117705,
+          "improvement_vs_random_pct": 39.47963100957758
+        },
+        {
+          "task_id": 20,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.03318303950687679,
+          "random_rms_mean": 0.05321208941382889,
+          "improvement_vs_random_pct": 37.6400365548264
+        },
+        {
+          "task_id": 18,
+          "n_chunks": 8,
+          "oracle_rms_mean": 0.033083853778077814,
+          "random_rms_mean": 0.05215633578873844,
+          "improvement_vs_random_pct": 36.56791015364761
+        },
+        {
+          "task_id": 16,
+          "n_chunks": 16,
+          "oracle_rms_mean": 0.027677303470951757,
+          "random_rms_mean": 0.04359260150714328,
+          "improvement_vs_random_pct": 36.50917239610848
+        },
+        {
+          "task_id": 8,
+          "n_chunks": 8,
+          "oracle_rms_mean": 0.03498395912978022,
+          "random_rms_mean": 0.05472210108426917,
+          "improvement_vs_random_pct": 36.06978088084235
+        },
+        {
+          "task_id": 23,
+          "n_chunks": 16,
+          "oracle_rms_mean": 0.03020441886322312,
+          "random_rms_mean": 0.04700448029360869,
+          "improvement_vs_random_pct": 35.741404490477706
+        },
+        {
+          "task_id": 14,
+          "n_chunks": 14,
+          "oracle_rms_mean": 0.03027910443245917,
+          "random_rms_mean": 0.04642180112442656,
+          "improvement_vs_random_pct": 34.77395598826368
+        },
+        {
+          "task_id": 2,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.03081642857436585,
+          "random_rms_mean": 0.04648083232907953,
+          "improvement_vs_random_pct": 33.70078152605208
+        },
+        {
+          "task_id": 11,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.03202788665476711,
+          "random_rms_mean": 0.04813383122519241,
+          "improvement_vs_random_pct": 33.460757559634544
+        },
+        {
+          "task_id": 19,
+          "n_chunks": 26,
+          "oracle_rms_mean": 0.026480530654217477,
+          "random_rms_mean": 0.0390107863106582,
+          "improvement_vs_random_pct": 32.119977169025454
+        },
+        {
+          "task_id": 30,
+          "n_chunks": 14,
+          "oracle_rms_mean": 0.031126877894727352,
+          "random_rms_mean": 0.0453167362921599,
+          "improvement_vs_random_pct": 31.312622131368023
+        },
+        {
+          "task_id": 27,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.03842026118335752,
+          "random_rms_mean": 0.05562487168031384,
+          "improvement_vs_random_pct": 30.929708199300332
+        },
+        {
+          "task_id": 17,
+          "n_chunks": 12,
+          "oracle_rms_mean": 0.03469622806125578,
+          "random_rms_mean": 0.05022440708221345,
+          "improvement_vs_random_pct": 30.917595494037887
+        },
+        {
+          "task_id": 26,
+          "n_chunks": 14,
+          "oracle_rms_mean": 0.03809063606513531,
+          "random_rms_mean": 0.05508862541924058,
+          "improvement_vs_random_pct": 30.85571517667321
+        },
+        {
+          "task_id": 1,
+          "n_chunks": 12,
+          "oracle_rms_mean": 0.023088165882464057,
+          "random_rms_mean": 0.03329039254007544,
+          "improvement_vs_random_pct": 30.646159084275737
+        },
+        {
+          "task_id": 37,
+          "n_chunks": 16,
+          "oracle_rms_mean": 0.03921084345559403,
+          "random_rms_mean": 0.05631945308962139,
+          "improvement_vs_random_pct": 30.37779789303415
+        },
+        {
+          "task_id": 13,
+          "n_chunks": 14,
+          "oracle_rms_mean": 0.045483694044710365,
+          "random_rms_mean": 0.06520949115461357,
+          "improvement_vs_random_pct": 30.24988657423008
+        },
+        {
+          "task_id": 22,
+          "n_chunks": 20,
+          "oracle_rms_mean": 0.03558784594377197,
+          "random_rms_mean": 0.05097452397456224,
+          "improvement_vs_random_pct": 30.18503525107692
+        },
+        {
+          "task_id": 12,
+          "n_chunks": 8,
+          "oracle_rms_mean": 0.037144249427929196,
+          "random_rms_mean": 0.05299489795164316,
+          "improvement_vs_random_pct": 29.909763272263262
+        },
+        {
+          "task_id": 35,
+          "n_chunks": 18,
+          "oracle_rms_mean": 0.040184386449797355,
+          "random_rms_mean": 0.05710840719349824,
+          "improvement_vs_random_pct": 29.63490241700818
+        },
+        {
+          "task_id": 9,
+          "n_chunks": 6,
+          "oracle_rms_mean": 0.04367203260463428,
+          "random_rms_mean": 0.0618428356302469,
+          "improvement_vs_random_pct": 29.382228095513476
+        },
+        {
+          "task_id": 24,
+          "n_chunks": 12,
+          "oracle_rms_mean": 0.035510096460609285,
+          "random_rms_mean": 0.05001003164225017,
+          "improvement_vs_random_pct": 28.994053203899295
+        },
+        {
+          "task_id": 4,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.035996594801069884,
+          "random_rms_mean": 0.05048326838997612,
+          "improvement_vs_random_pct": 28.695989881238926
+        },
+        {
+          "task_id": 38,
+          "n_chunks": 6,
+          "oracle_rms_mean": 0.03965717845855633,
+          "random_rms_mean": 0.05550244900031493,
+          "improvement_vs_random_pct": 28.548777265069308
+        },
+        {
+          "task_id": 7,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.033452110942239065,
+          "random_rms_mean": 0.046750794100375394,
+          "improvement_vs_random_pct": 28.44589790193434
+        },
+        {
+          "task_id": 10,
+          "n_chunks": 16,
+          "oracle_rms_mean": 0.03830320746743823,
+          "random_rms_mean": 0.05335921442054023,
+          "improvement_vs_random_pct": 28.216320492353987
+        },
+        {
+          "task_id": 36,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.04323642441113034,
+          "random_rms_mean": 0.05997951095096753,
+          "improvement_vs_random_pct": 27.914676652706362
+        },
+        {
+          "task_id": 5,
+          "n_chunks": 14,
+          "oracle_rms_mean": 0.02739839337294981,
+          "random_rms_mean": 0.037814215626222704,
+          "improvement_vs_random_pct": 27.54472644951525
+        },
+        {
+          "task_id": 39,
+          "n_chunks": 22,
+          "oracle_rms_mean": 0.044934308698553624,
+          "random_rms_mean": 0.06187508878019581,
+          "improvement_vs_random_pct": 27.378999231536255
+        },
+        {
+          "task_id": 15,
+          "n_chunks": 8,
+          "oracle_rms_mean": 0.02672265252435213,
+          "random_rms_mean": 0.03677591205315803,
+          "improvement_vs_random_pct": 27.336533528452904
+        },
+        {
+          "task_id": 3,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.03241718983515531,
+          "random_rms_mean": 0.044572738874767835,
+          "improvement_vs_random_pct": 27.271263436974145
+        },
+        {
+          "task_id": 31,
+          "n_chunks": 20,
+          "oracle_rms_mean": 0.04095625694226944,
+          "random_rms_mean": 0.05589141188293241,
+          "improvement_vs_random_pct": 26.72173494551446
+        },
+        {
+          "task_id": 21,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.039289112899564216,
+          "random_rms_mean": 0.05309504472886153,
+          "improvement_vs_random_pct": 26.002298142509428
+        },
+        {
+          "task_id": 29,
+          "n_chunks": 18,
+          "oracle_rms_mean": 0.036060478172099425,
+          "random_rms_mean": 0.04855583166976692,
+          "improvement_vs_random_pct": 25.73399130026162
+        },
+        {
+          "task_id": 34,
+          "n_chunks": 18,
+          "oracle_rms_mean": 0.05374264960953651,
+          "random_rms_mean": 0.07202727106691958,
+          "improvement_vs_random_pct": 25.385692372539115
+        },
+        {
+          "task_id": 28,
+          "n_chunks": 12,
+          "oracle_rms_mean": 0.034538192944274425,
+          "random_rms_mean": 0.046030147451459835,
+          "improvement_vs_random_pct": 24.966147499970578
+        },
+        {
+          "task_id": 32,
+          "n_chunks": 12,
+          "oracle_rms_mean": 0.04267080858586037,
+          "random_rms_mean": 0.056668677948332496,
+          "improvement_vs_random_pct": 24.70124567796454
+        },
+        {
+          "task_id": 6,
+          "n_chunks": 14,
+          "oracle_rms_mean": 0.03792434546435737,
+          "random_rms_mean": 0.04985706977248824,
+          "improvement_vs_random_pct": 23.93386607472767
+        },
+        {
+          "task_id": 33,
+          "n_chunks": 6,
+          "oracle_rms_mean": 0.04495684500456296,
+          "random_rms_mean": 0.05899129075444479,
+          "improvement_vs_random_pct": 23.790708035701662
+        },
+        {
+          "task_id": 25,
+          "n_chunks": 8,
+          "oracle_rms_mean": 0.04391912159311842,
+          "random_rms_mean": 0.05529621755746837,
+          "improvement_vs_random_pct": 20.574817712488088
+        }
+      ]
+    },
+    "40": {
+      "n_tasks_positive": 40,
+      "n_tasks_ge_15pct": 39,
+      "improvement_mean_over_tasks": 23.76223654194548,
+      "improvement_median_over_tasks": 23.958549518328923,
+      "tasks": [
+        {
+          "task_id": 0,
+          "n_chunks": 14,
+          "oracle_rms_mean": 0.026753482562776838,
+          "random_rms_mean": 0.040039269219080284,
+          "improvement_vs_random_pct": 33.18189096711148
+        },
+        {
+          "task_id": 16,
+          "n_chunks": 16,
+          "oracle_rms_mean": 0.027430343651529063,
+          "random_rms_mean": 0.03977544714909699,
+          "improvement_vs_random_pct": 31.036994886047925
+        },
+        {
+          "task_id": 2,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.02856126325957218,
+          "random_rms_mean": 0.041224547209395584,
+          "improvement_vs_random_pct": 30.71782422618649
+        },
+        {
+          "task_id": 20,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.03460934074023224,
+          "random_rms_mean": 0.04974251160372185,
+          "improvement_vs_random_pct": 30.42301318447562
+        },
+        {
+          "task_id": 18,
+          "n_chunks": 8,
+          "oracle_rms_mean": 0.03390104630333732,
+          "random_rms_mean": 0.04786043723079775,
+          "improvement_vs_random_pct": 29.16686878589085
+        },
+        {
+          "task_id": 23,
+          "n_chunks": 16,
+          "oracle_rms_mean": 0.03151240810543266,
+          "random_rms_mean": 0.044121741310910664,
+          "improvement_vs_random_pct": 28.57850309357554
+        },
+        {
+          "task_id": 13,
+          "n_chunks": 14,
+          "oracle_rms_mean": 0.04457832348691009,
+          "random_rms_mean": 0.06139876252045135,
+          "improvement_vs_random_pct": 27.39540398381568
+        },
+        {
+          "task_id": 8,
+          "n_chunks": 8,
+          "oracle_rms_mean": 0.03645886192786395,
+          "random_rms_mean": 0.04994135859048598,
+          "improvement_vs_random_pct": 26.99665576416757
+        },
+        {
+          "task_id": 11,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.032369307184835466,
+          "random_rms_mean": 0.04398724922112646,
+          "improvement_vs_random_pct": 26.412067683266404
+        },
+        {
+          "task_id": 22,
+          "n_chunks": 20,
+          "oracle_rms_mean": 0.036539552314642745,
+          "random_rms_mean": 0.04892449872310106,
+          "improvement_vs_random_pct": 25.314406343851655
+        },
+        {
+          "task_id": 27,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.039654350770737104,
+          "random_rms_mean": 0.052949886602950635,
+          "improvement_vs_random_pct": 25.109658745657516
+        },
+        {
+          "task_id": 1,
+          "n_chunks": 12,
+          "oracle_rms_mean": 0.023081632478073686,
+          "random_rms_mean": 0.030798882473197172,
+          "improvement_vs_random_pct": 25.0569156262064
+        },
+        {
+          "task_id": 3,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.031440064230897,
+          "random_rms_mean": 0.04190127481883763,
+          "improvement_vs_random_pct": 24.96633010133994
+        },
+        {
+          "task_id": 17,
+          "n_chunks": 12,
+          "oracle_rms_mean": 0.03514558099193877,
+          "random_rms_mean": 0.04683373737848434,
+          "improvement_vs_random_pct": 24.95670224242059
+        },
+        {
+          "task_id": 14,
+          "n_chunks": 14,
+          "oracle_rms_mean": 0.03068343626457345,
+          "random_rms_mean": 0.040832632740220434,
+          "improvement_vs_random_pct": 24.855601499459407
+        },
+        {
+          "task_id": 10,
+          "n_chunks": 16,
+          "oracle_rms_mean": 0.037960434031576784,
+          "random_rms_mean": 0.050489315387606704,
+          "improvement_vs_random_pct": 24.814916304262873
+        },
+        {
+          "task_id": 12,
+          "n_chunks": 8,
+          "oracle_rms_mean": 0.03655018407751302,
+          "random_rms_mean": 0.0485439103961769,
+          "improvement_vs_random_pct": 24.706963696951057
+        },
+        {
+          "task_id": 36,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.041109741065012924,
+          "random_rms_mean": 0.054339155171586676,
+          "improvement_vs_random_pct": 24.346006235833535
+        },
+        {
+          "task_id": 19,
+          "n_chunks": 26,
+          "oracle_rms_mean": 0.024664526597616813,
+          "random_rms_mean": 0.03254793693938311,
+          "improvement_vs_random_pct": 24.220921763638255
+        },
+        {
+          "task_id": 38,
+          "n_chunks": 6,
+          "oracle_rms_mean": 0.04027282719465236,
+          "random_rms_mean": 0.0530355671659242,
+          "improvement_vs_random_pct": 24.06449228937822
+        },
+        {
+          "task_id": 9,
+          "n_chunks": 6,
+          "oracle_rms_mean": 0.0437139070381806,
+          "random_rms_mean": 0.05740696453403402,
+          "improvement_vs_random_pct": 23.85260674727963
+        },
+        {
+          "task_id": 30,
+          "n_chunks": 14,
+          "oracle_rms_mean": 0.0309495500398137,
+          "random_rms_mean": 0.04054558882170617,
+          "improvement_vs_random_pct": 23.667281844369732
+        },
+        {
+          "task_id": 26,
+          "n_chunks": 14,
+          "oracle_rms_mean": 0.03744791088986401,
+          "random_rms_mean": 0.04891648079067799,
+          "improvement_vs_random_pct": 23.44520643234732
+        },
+        {
+          "task_id": 28,
+          "n_chunks": 12,
+          "oracle_rms_mean": 0.034217666577175405,
+          "random_rms_mean": 0.04420228548395023,
+          "improvement_vs_random_pct": 22.588467536141813
+        },
+        {
+          "task_id": 31,
+          "n_chunks": 20,
+          "oracle_rms_mean": 0.0405554384229891,
+          "random_rms_mean": 0.052083607778893336,
+          "improvement_vs_random_pct": 22.133968531603866
+        },
+        {
+          "task_id": 5,
+          "n_chunks": 14,
+          "oracle_rms_mean": 0.02674578663514022,
+          "random_rms_mean": 0.03430950129644015,
+          "improvement_vs_random_pct": 22.045539502157435
+        },
+        {
+          "task_id": 37,
+          "n_chunks": 16,
+          "oracle_rms_mean": 0.040135840051024094,
+          "random_rms_mean": 0.051397496713463275,
+          "improvement_vs_random_pct": 21.910904971154473
+        },
+        {
+          "task_id": 39,
+          "n_chunks": 22,
+          "oracle_rms_mean": 0.044236248962265516,
+          "random_rms_mean": 0.056464694951694795,
+          "improvement_vs_random_pct": 21.65679988157315
+        },
+        {
+          "task_id": 35,
+          "n_chunks": 18,
+          "oracle_rms_mean": 0.04084262667768262,
+          "random_rms_mean": 0.05207012209903338,
+          "improvement_vs_random_pct": 21.56226059926829
+        },
+        {
+          "task_id": 24,
+          "n_chunks": 12,
+          "oracle_rms_mean": 0.03606574158293759,
+          "random_rms_mean": 0.0459225821467589,
+          "improvement_vs_random_pct": 21.464038176949458
+        },
+        {
+          "task_id": 21,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.03923708778413119,
+          "random_rms_mean": 0.04952466007641359,
+          "improvement_vs_random_pct": 20.77262575131115
+        },
+        {
+          "task_id": 4,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.03662108428179246,
+          "random_rms_mean": 0.04619244776719797,
+          "improvement_vs_random_pct": 20.720624145409094
+        },
+        {
+          "task_id": 32,
+          "n_chunks": 12,
+          "oracle_rms_mean": 0.04089269037634676,
+          "random_rms_mean": 0.051567147876684864,
+          "improvement_vs_random_pct": 20.700112261132755
+        },
+        {
+          "task_id": 15,
+          "n_chunks": 8,
+          "oracle_rms_mean": 0.02538798302375643,
+          "random_rms_mean": 0.03195711683575487,
+          "improvement_vs_random_pct": 20.556090356213346
+        },
+        {
+          "task_id": 33,
+          "n_chunks": 6,
+          "oracle_rms_mean": 0.0438543862445549,
+          "random_rms_mean": 0.05489014364868219,
+          "improvement_vs_random_pct": 20.10517129406754
+        },
+        {
+          "task_id": 34,
+          "n_chunks": 18,
+          "oracle_rms_mean": 0.054155456126911666,
+          "random_rms_mean": 0.0676259419450423,
+          "improvement_vs_random_pct": 19.919110079202625
+        },
+        {
+          "task_id": 29,
+          "n_chunks": 18,
+          "oracle_rms_mean": 0.036906732101976654,
+          "random_rms_mean": 0.045492294374621794,
+          "improvement_vs_random_pct": 18.872563783977135
+        },
+        {
+          "task_id": 7,
+          "n_chunks": 10,
+          "oracle_rms_mean": 0.03524482444586407,
+          "random_rms_mean": 0.042474752309377195,
+          "improvement_vs_random_pct": 17.021706944520467
+        },
+        {
+          "task_id": 6,
+          "n_chunks": 14,
+          "oracle_rms_mean": 0.03937470242493947,
+          "random_rms_mean": 0.04713028925524897,
+          "improvement_vs_random_pct": 16.455631724020762
+        },
+        {
+          "task_id": 25,
+          "n_chunks": 8,
+          "oracle_rms_mean": 0.04402335488871219,
+          "random_rms_mean": 0.051620083106816,
+          "improvement_vs_random_pct": 14.71661369158223
+        }
+      ]
+    }
+  }
+}
