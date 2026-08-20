@@ -45,6 +45,7 @@ VLM на каждом слое зависят ТОЛЬКО от vlm_inputs_embed
 import argparse
 import json
 import os
+import random
 import statistics
 import sys
 import time
@@ -143,6 +144,9 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=1)
     ap.add_argument("--warmup", type=int, default=20)
     ap.add_argument("--iters", type=int, default=100)
+    ap.add_argument("--repeats", type=int, default=5,
+                    help="независимых серий с ПЕРЕМЕШАННЫМ порядком режимов")
+    ap.add_argument("--order-seed", type=int, default=0)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -244,38 +248,19 @@ def main() -> None:
         "префикс нельзя, дальше идти нет смысла")
     print("  побитово идентичны: префикс кэшируем")
 
-    # ---- 2. ЦЕНА РЕАЛЬНЫХ ПРОХОДОВ ---------------------------------------
-    print("\n" + "=" * 74)
-    print("2. ЦЕНА БЛОЧНЫХ ПРОХОДОВ (опорная реализация)")
-    print("=" * 74)
-    ref = {}
-    for k_blocks in (0, 1, 2):
-        hist = (torch.empty((B, 0), dtype=torch.long, device=dev) if k_blocks == 0
-                else torch.randint(0, model.action_vocab_size,
-                                   (B, k_blocks * n), device=dev))
-        alen = n + k_blocks * n
-        pid = pos_ids(alen)
-
-        def fn(h=hist, p=pid):
-            with torch.no_grad():
-                model._run_action_sequence(
-                    vlm_inputs_embeds=VLM, attention_mask=amask, bos_len=n,
-                    action_input_ids=h, position_ids=p)
-        ref[k_blocks] = bench(fn, args.warmup, args.iters, dev)
-        print(f"  блок {k_blocks + 1}, действий {alen:>2}: "
-              f"p50 {ref[k_blocks]['p50']:.2f} мс, p90 "
-              f"{ref[k_blocks]['p90']:.2f}, p99 {ref[k_blocks]['p99']:.2f}")
-    total_ref = sum(ref[i]["p50"] for i in (0, 1, 2))
-    print(f"  три прохода суммарно: {total_ref:.2f} мс")
-
-    # ---- 3. ПРОТОТИП С КЭШЕМ ПРЕФИКСА ------------------------------------
-    # Пасс 1 идёт как обычно и попутно сохраняет послойные k/v префикса УЖЕ С
-    # RoPE. Пассы 2 и 3 не считают ни q/k/v, ни MLP башни VLM: запросы только
-    # от токенов действия, ключи — сохранённые плюс собственные.
+    # ---- ПРОТОТИП С КЭШЕМ ПРЕФИКСА ---------------------------------------
     def prefill():
+        """Проход 1 как обычно, попутно сохраняем послойные k/v префикса.
+
+        K/V СНИМАЮТСЯ ХУКОМ, а не вычисляются заново: иначе k_proj и v_proj
+        башни VLM считались бы дважды (один раз для кэша, второй внутри
+        orig), и prefill выходил бы дороже опорного первого блока. Хуки висят
+        на модулях башни VLM; экспертная башня использует ДРУГИЕ модули.
+        Ключи сохраняются УЖЕ С RoPE — позиции префикса между проходами не
+        меняются, поэтому повторно применять его нельзя.
+        """
         cache = []
         with torch.no_grad():
-            vh = VLM
             alen = n
             pid = pos_ids(alen)
             m4 = model._build_joint_attention_mask_blockwise_ar(
@@ -283,15 +268,9 @@ def main() -> None:
                 device=dev,
                 action_key_mask=torch.ones(B, alen, device=dev,
                                            dtype=torch.long))
+            vh = VLM
             ah = model.bos_embedding.expand(B, n, -1).to(dev, dtype)
-            # K/V ПРЕФИКСА СНИМАЮТСЯ ХУКОМ, а не считаются заново. Прежняя
-            # версия вызывала k_proj и v_proj отдельно, после чего orig()
-            # вычислял их второй раз внутри себя — prefill выходил дороже
-            # опорного первого блока (80.5 мс против 61.0) и занижал приз.
-            # Хуки висят на модулях башни VLM; экспертная башня использует
-            # ДРУГИЕ модули, поэтому перепутать нельзя.
-            grab = {}
-            hs = []
+            grab, hs = {}, []
             for li in range(nL):
                 sa = model.vlm.text_model.layers[li].self_attn
                 hs.append(sa.k_proj.register_forward_hook(
@@ -320,7 +299,13 @@ def main() -> None:
     cache = prefill()
 
     def cached_pass(hist):
-        """Проход по действиям при кэшированном префиксе."""
+        """Проход по действиям при кэшированном префиксе.
+
+        Запросы строятся ТОЛЬКО от токенов действия, ключи и значения — из
+        кэша плюс собственные. Строки маски берутся срезом [Lv:], что и
+        проверено самопроверкой: внимание по подмножеству запросов равно
+        соответствующим строкам полного.
+        """
         with torch.no_grad():
             alen = n + hist.shape[1]
             pid = pos_ids(alen)
@@ -329,12 +314,11 @@ def main() -> None:
                 device=dev,
                 action_key_mask=torch.ones(B, alen, device=dev,
                                            dtype=torch.long))
-            mrow = m4[:, :, Lv:, :]                    # строки запросов действия
-            emb = model.bos_embedding.expand(B, n, -1).to(dev, dtype)
+            mrow = m4[:, :, Lv:, :]
+            ah = model.bos_embedding.expand(B, n, -1).to(dev, dtype)
             if hist.shape[1]:
-                emb = torch.cat(
-                    [emb, model.action_token_embedding(hist).to(dtype)], 1)
-            ah = emb
+                ah = torch.cat(
+                    [ah, model.action_token_embedding(hist).to(dtype)], 1)
             dummy = torch.empty((B, Lv + alen, hid), device=dev, dtype=dtype)
             cos, sin = model.vlm.text_model.rotary_emb(dummy, position_ids=pid)
             ca, sa = cos[:, Lv:], sin[:, Lv:]
@@ -358,61 +342,100 @@ def main() -> None:
                 ah = ah + al.mlp(al.post_attention_layernorm(ah))
             return model.action_lm_head(model.action_expert.norm(ah))
 
+    # ---- 2. ЦЕНА РЕАЛЬНЫХ ПРОХОДОВ ---------------------------------------
+    # ---- ЗАМЕРЫ СЕРИЯМИ С ПЕРЕМЕШАННЫМ ПОРЯДКОМ ---------------------------
+    # Опорные времена в двух прогонах ОДНОГО И ТОГО ЖЕ кода разошлись на 20-25%
+    # (блок 1: 60.97 против 47.86 мс), а p99 вдвое выше p50. Значит на машине
+    # дрейфуют частоты или есть посторонняя нагрузка, и сравнивать замер,
+    # сделанный в начале прогона, с замером в конце нельзя. Внутри одной серии
+    # порядок режимов перемешивается, а отношения считаются ПОСЕРИЙНО: общий
+    # дрейф сокращается в отношении, а разброс между сериями показывает, можно
+    # ли числу верить.
+    hists = {k: (torch.empty((B, 0), dtype=torch.long, device=dev) if k == 0
+                 else torch.randint(0, model.action_vocab_size,
+                                    (B, k * n), device=dev))
+             for k in (0, 1, 2)}
+    pids = {k: pos_ids(n + k * n) for k in (0, 1, 2)}
+
+    def ref_fn(k):
+        def f():
+            with torch.no_grad():
+                model._run_action_sequence(
+                    vlm_inputs_embeds=VLM, attention_mask=amask, bos_len=n,
+                    action_input_ids=hists[k], position_ids=pids[k])
+        return f
+
+    tasks = {f"ref{k}": ref_fn(k) for k in (0, 1, 2)}
+    tasks |= {f"cac{k}": (lambda k=k: cached_pass(hists[k])) for k in (1, 2)}
+    tasks["prefill"] = prefill
+
+    print("\n" + "=" * 74)
+    print(f"2. ЗАМЕРЫ: {args.repeats} серий, порядок режимов перемешан")
+    print("=" * 74)
+    rng = random.Random(args.order_seed)
+    series = []
+    for r in range(args.repeats):
+        names = list(tasks)
+        rng.shuffle(names)
+        row = {}
+        for nm in names:
+            row[nm] = bench(tasks[nm], args.warmup,
+                            max(20, args.iters // args.repeats), dev)["p50"]
+        tot_r = row["ref0"] + row["ref1"] + row["ref2"]
+        tot_c = row["prefill"] + row["cac1"] + row["cac2"]
+        row["total_ref"], row["total_cached"] = tot_r, tot_c
+        row["speedup"] = tot_r / tot_c
+        series.append(row)
+        print(f"  серия {r}: опорно {tot_r:6.2f} мс, с кэшем {tot_c:6.2f} мс, "
+              f"отношение {row['speedup']:.3f}x   (порядок: {' '.join(names)})")
+
+    med = lambda key: statistics.median(x[key] for x in series)
+    sp = sorted(x["speedup"] for x in series)
+    print(f"\n  {'режим':<10}{'медиана p50, мс':>18}{'разброс по сериям':>22}")
+    for nm in ("ref0", "ref1", "ref2", "prefill", "cac1", "cac2"):
+        vals = [x[nm] for x in series]
+        print(f"  {nm:<10}{med(nm):>18.2f}{max(vals) - min(vals):>21.2f}")
+    print(f"\n  ускорение блочной части: медиана {statistics.median(sp):.3f}x, "
+          f"диапазон [{sp[0]:.3f}, {sp[-1]:.3f}]")
+
+    ref = {k: {"p50": med(f"ref{k}")} for k in (0, 1, 2)}
+    cac = {k: {"p50": med(f"cac{k}")} for k in (1, 2)}
+    t_pref = {"p50": med("prefill")}
+    total_ref, total_cached = med("total_ref"), med("total_cached")
+
     print("\n" + "=" * 74)
     print("3. ЭКВИВАЛЕНТНОСТЬ ПРОТОТИПА С КЭШЕМ")
     print("=" * 74)
     ok = True
     for k_blocks in (0, 1, 2):
-        hist = (torch.empty((B, 0), dtype=torch.long, device=dev) if k_blocks == 0
-                else torch.randint(0, model.action_vocab_size,
-                                   (B, k_blocks * n), device=dev))
         with torch.no_grad():
             lg_ref = model._run_action_sequence(
                 vlm_inputs_embeds=VLM, attention_mask=amask, bos_len=n,
-                action_input_ids=hist, position_ids=pos_ids(n + hist.shape[1]))
-        lg_new = cached_pass(hist)
+                action_input_ids=hists[k_blocks], position_ids=pids[k_blocks])
+        lg_new = cached_pass(hists[k_blocks])
         d = (lg_ref.float() - lg_new.float()).abs()
         same = (lg_ref.argmax(-1) == lg_new.argmax(-1)).float().mean()
         print(f"  блок {k_blocks + 1}: top-1 совпал {same:.4%}, "
-              f"логиты макс {float(d.max()):.3e}, медиана "
-              f"{float(d.median()):.3e}")
+              f"логиты макс {float(d.max()):.3e}")
         ok &= bool(same == 1.0)
 
     print("\n" + "=" * 74)
-    print("4. ЦЕНА С КЭШЕМ И ИЗМЕРЕННЫЙ ПРИЗ")
+    print("4. РАЗЛОЖЕНИЕ И ПРИЗ (по медианам серий)")
     print("=" * 74)
-    cac = {}
-    for k_blocks in (1, 2):
-        hist = torch.randint(0, model.action_vocab_size,
-                             (B, k_blocks * n), device=dev)
-        cac[k_blocks] = bench(lambda h=hist: cached_pass(h), args.warmup,
-                              args.iters, dev)
-        print(f"  блок {k_blocks + 1} по кэшу: p50 {cac[k_blocks]['p50']:.2f} мс"
-              f"  против опорных {ref[k_blocks]['p50']:.2f} мс"
-              f"  ({ref[k_blocks]['p50'] / cac[k_blocks]['p50']:.2f}x)")
-    t_pref = bench(prefill, max(3, args.warmup // 4), max(10, args.iters // 5),
-                   dev)
-    print(f"  prefill (проход 1 + сохранение кэша): p50 {t_pref['p50']:.2f} мс"
-          f"  против опорного первого блока {ref[0]['p50']:.2f} мс")
-    # РАЗЛОЖЕНИЕ ПРОХОДА НА ДВЕ БАШНИ. Кэшированный проход — это стоимость
-    # экспертной башни плюс внимание к сохранённым ключам. Разность с опорным
-    # даёт цену башни VLM. Это прямое измерение того, что подгонка
-    # t(q) = 62.39 + 0.2149*q из §7б приписывала одному свободному члену:
-    # туда попала и ФИКСИРОВАННАЯ стоимость экспертной башни, отчего оценка
-    # выигрыша от кэша (1.84x) оказалась завышенной.
     tower_vlm = ref[1]["p50"] - cac[1]["p50"]
-    print(f"\n  разложение блочного прохода (по блоку 2):")
-    print(f"    башня действия (кэшированный проход)  {cac[1]['p50']:.2f} мс")
-    print(f"    башня VLM (разность с опорным)        {tower_vlm:.2f} мс")
-    print(f"    избыточно пересчитывается дважды      {2 * tower_vlm:.2f} мс")
-    total_cached = t_pref["p50"] + cac[1]["p50"] + cac[2]["p50"]
-    print(f"\n  три прохода: опорно {total_ref:.2f} мс -> с кэшем "
-          f"{total_cached:.2f} мс, выигрыш {total_ref - total_cached:.2f} мс "
-          f"({total_ref / total_cached:.2f}x на блочной части)")
-    print("  ЧИТАТЬ ТАК: это выигрыш на БЛОЧНОЙ части. Сквозной множитель "
-          "меньше:\n  зрение и ActionCodec в него не входят и не ускоряются. "
-          "Оценку 1.84x\n  из §7б можно заменить измеренной только после "
-          "сквозного замера.")
+    print(f"  башня действия (кэшированный проход)  {cac[1]['p50']:.2f} мс")
+    print(f"  башня VLM (разность с опорным)        {tower_vlm:.2f} мс")
+    print(f"  избыточно пересчитывается дважды      {2 * tower_vlm:.2f} мс")
+    print(f"  prefill против опорного первого блока "
+          f"{t_pref['p50']:.2f} против {ref[0]['p50']:.2f} мс")
+    print(f"\n  три прохода: опорно {total_ref:.2f} -> с кэшем "
+          f"{total_cached:.2f} мс, выигрыш {total_ref - total_cached:.2f} мс")
+    print("  ЧИТАТЬ ТАК: это выигрыш на БЛОЧНОЙ части. Зрение и ActionCodec\n"
+          "  в него не входят и не ускоряются. Прежняя оценка 1.84x из §7б\n"
+          "  ЗАВЫШЕНА: подгонка t(q) = 62.39 + 0.2149*q загнала в свободный\n"
+          "  член и фиксированную стоимость экспертной башни, приписав её\n"
+          "  префиксу. Сквозной множитель считать только после замера всего\n"
+          "  вызова политики.")
     if not ok:
         print("\n  ВНИМАНИЕ: top-1 совпал не везде — прототип НЕ эквивалентен, "
               "числа времени смысла не имеют до исправления")
