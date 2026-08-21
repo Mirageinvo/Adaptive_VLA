@@ -142,9 +142,15 @@ def main() -> None:
     if not args.ckpt:
         raise SystemExit("нужен --ckpt или --selftest")
 
+    # НА sys.path ТОЛЬКО КОРЕНЬ. В вендоренном дереве есть и пакет `utils/`,
+    # и модуль `scripts/utils.py`, причём они ссылаются друг на друга:
+    # utils/__init__.py делает `from scripts.utils import ...`, а
+    # scripts/utils.py — `from utils.vla_tokenizer import ...`. Если положить
+    # на путь ещё и `scripts/`, то `import utils` попадает в МОДУЛЬ, и его
+    # собственный импорт падает с «'utils' is not a package». Всё нужное
+    # реэкспортирует пакет.
     root = os.path.abspath(args.root)
     sys.path.insert(0, root)
-    sys.path.insert(0, os.path.join(root, "scripts"))
 
     import numpy as np
     import torch
@@ -152,10 +158,10 @@ def main() -> None:
 
     import actioncodec  # noqa: F401
     from smolvla.bar import SmolVLABlockwiseAR
-    from utils import (ACTION_Q01, ACTION_Q99, STATE_Q01, STATE_Q99,  # noqa: E402
-                       ActionEnsembler, dict_apply, get_cfg, get_envs,
-                       process_state, prompt_template, seed_everything)
-    from utils.vla_tokenizer import VisionLanguageActionProcessor
+    from utils import (ACTION_Q01, ACTION_Q99, STATE_Q01,  # noqa: E402
+                       STATE_Q99, ActionEnsembler, VisionLanguageActionProcessor,
+                       dict_apply, get_cfg, get_envs, process_state,
+                       prompt_template, seed_everything)
 
     dev = torch.device(args.device)
     dtype = getattr(torch, args.dtype)
