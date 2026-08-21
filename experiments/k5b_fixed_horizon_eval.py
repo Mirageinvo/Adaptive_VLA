@@ -204,7 +204,17 @@ def main() -> None:
         raise SystemExit(f"в таблице нет офсета для {args.task_suite}/{task_id}")
 
     def rollout(envs, task_desc, horizon, ensemble, pos_off, k):
-        """Один раунд из n_envs эпизодов с общими начальными состояниями."""
+        """Один раунд из n_envs эпизодов с общими начальными состояниями.
+
+        СИД СБРАСЫВАЕТСЯ ПЕРЕД КАЖДЫМ РАУНДОМ. Прежде seed_everything
+        вызывался один раз перед созданием сред, и восемь конфигураций подряд
+        расходовали глобальный ГСЧ по-разному — начальные состояния переставали
+        совпадать между горизонтами, хотя всё сравнение на этом держится.
+        Обнаружено по нарушению тождества: при H=20 чанк покрывает каждый
+        момент ровно одним планом, поэтому усреднение обязано быть пустой
+        операцией, а ens=on и ens=off дали разный успех.
+        """
+        seed_everything(args.seed + 1000 * k)
         n_envs = args.n_envs
         ens = ActionEnsembler() if ensemble else None
         ts = 0
@@ -278,9 +288,14 @@ def main() -> None:
                 reward = np.clip(reward + r_, 0, 1)
                 steps += 1
 
+        # env_steps — длина РАУНДА, а не отдельного эпизода: раунд идёт, пока
+        # не завершатся все среды, и на всех эпизодах она одинакова. Для
+        # сравнения горизонтов этого достаточно (величина считается одинаково
+        # везде), но называть её длиной эпизода нельзя.
         return [dict(success=bool(reward[i] >= 1.0), env_steps=steps,
                      policy_calls=calls, policy_ms=ms / n_envs,
-                     init_state_id=i + k * n_envs, env_index=i)
+                     init_state_id=i + k * n_envs, env_index=i,
+                     round_steps=steps)
                 for i in range(n_envs)]
 
     res = {}
@@ -321,6 +336,20 @@ def main() -> None:
                                     task_id=task_id, suite=suite_disp,
                                     pos_offset=pos_off,
                                     task_description=task_desc)
+                    # ТОЖДЕСТВО ПРИ H = ДЛИНЕ ЧАНКА. Каждый момент покрыт
+                    # ровно одним планом, усреднение — пустая операция.
+                    # Расхождение означает недетерминированность стенда.
+                    twin = res.get(
+                        f"{suite_disp}/{task_id}/"
+                        f"ens_{'off' if ens_mode == 'on' else 'on'}/H{H}")
+                    if twin is not None and H >= 20:
+                        a = [e["success"] for e in twin["episodes"]]
+                        b = [e["success"] for e in eps]
+                        if a != b:
+                            print(f"    ВНИМАНИЕ: при H={H} усреднение обязано "
+                                  f"быть тождественным, но исходы разошлись: "
+                                  f"{sum(a)} против {sum(b)} успехов — стенд "
+                                  f"недетерминирован")
                     print(f"    ens={ens_mode:<3} H={H:>2}: успех "
                           f"{s['success_rate']:.2%}, вызовов на действие "
                           f"{s['calls_per_action']:.3f}, мс на действие "
