@@ -174,16 +174,12 @@ def main() -> None:
     cfg = get_cfg(os.path.join(root, args.cfg_path))
     cfg.TRAINING.ckpt_dir = args.ckpt
     cfg.MODEL.vlm.kwargs.pretrained_model_name_or_path = args.ckpt
-    model = SmolVLABlockwiseAR.from_pretrained(
-        **cfg.MODEL.vlm.kwargs).to(dev, dtype).eval()
-    got = next(model.parameters()).dtype
-    if got != dtype:
-        print(f"  from_pretrained вернул {got} — привожу к {dtype}")
-        model = model.to(dtype)
-    print(f"  dtype модели по факту: {next(model.parameters()).dtype}")
-    processor = VisionLanguageActionProcessor.from_pretrained(
-        args.ckpt, trust_remote_code=True, mode="discrete")
     max_act_q = np.maximum(np.abs(ACTION_Q99), np.abs(ACTION_Q01))
+    # МОДЕЛЬ ГРУЗИТСЯ ПОЗЖЕ, ПОСЛЕ СОЗДАНИЯ СРЕД. AsyncVectorEnv порождает
+    # подпроцессы; если это делается через fork ПОСЛЕ инициализации CUDA в
+    # родителе, процесс зависает намертво. Официальный eval_libero.py создаёт
+    # среды на строке 70 и грузит модель на 88 — порядок не случаен.
+    model = processor = None
     tf = Compose([CenterCrop(int(224 * 0.875)), Resize(224)])
 
     suite_disp = "long" if args.task_suite == "10" else args.task_suite
@@ -289,12 +285,26 @@ def main() -> None:
 
     res = {}
     t_start = time.time()
+    if len(args.task_id) > 1:
+        raise SystemExit(
+            "одна задача на запуск: модель обязана грузиться ПОСЛЕ создания "
+            "сред, иначе fork после инициализации CUDA вешает процесс. Для "
+            "нескольких задач вызывайте скрипт в цикле оболочки.")
     for task_id in args.task_id:
         pos_off = offset_for(task_id)
         seed_everything(args.seed)
         envs, task_desc = get_envs(args.task_suite,
                                    {"task_id": task_id, "image_size": 224},
                                    args.n_envs)
+        if model is None:
+            model = SmolVLABlockwiseAR.from_pretrained(
+                **cfg.MODEL.vlm.kwargs).to(dev, dtype).eval()
+            if next(model.parameters()).dtype != dtype:
+                model = model.to(dtype)
+            print(f"  dtype модели по факту: "
+                  f"{next(model.parameters()).dtype}")
+            processor = VisionLanguageActionProcessor.from_pretrained(
+                args.ckpt, trust_remote_code=True, mode="discrete")
         print(f"\n=== suite {suite_disp}, задача {task_id}, офсет {pos_off}")
         print(f"    «{task_desc}»")
         try:
