@@ -45,6 +45,7 @@ import os
 import numpy as np
 
 CHUNK = 20
+NMETRIC = 5        # сколько меток проверяется — нужно для поправки Бонферрони
 
 
 def auc(score, label):
@@ -313,6 +314,7 @@ def main() -> None:
         print("  СЛИШКОМ ПЕРЕКОШЕНЫ ИСХОДЫ — гейт не считается.")
     else:
         grp = np.array([e["task"] for e in eps])
+        bmark = {}
         print(f"  {'метка':>10}{'AUC общ':>9}{'нуль 95%':>14}"
               f"{'AUC внутри':>12}{'нуль 95%':>14}{'пар':>7}")
         for key in ("d_mean", "ratio", "excess", "cosdef", "cum"):
@@ -323,10 +325,27 @@ def main() -> None:
             aw, npair = auc_within(sc, fail, grp)
             nw = perm_null_within(sc, fail, grp, n=2000)
             wlo, whi = np.quantile(nw, [0.025, 0.975])
-            mark = "*" if np.isfinite(aw) and (aw > whi or aw < wlo) else " "
+            # ПОПРАВКА НА МНОЖЕСТВЕННОСТЬ. Метрик пять, и при пяти
+            # независимых тестах вероятность хотя бы одной ложной звезды
+            # около 23%. Порог Бонферрони: квантиль 1 - 0.05/(2*5).
+            bhi, blo = np.quantile(nw, [1 - 0.05 / (2 * NMETRIC),
+                                        0.05 / (2 * NMETRIC)])
+            if np.isfinite(aw) and (aw > bhi or aw < blo):
+                mark = "**"
+            elif np.isfinite(aw) and (aw > whi or aw < wlo):
+                mark = "*"
+            else:
+                mark = ""
+            bmark[key] = (aw, bhi)
             print(f"  {key:>10}{a:>9.3f}{lo:>7.3f}–{hi:<6.3f}"
-                  f"{aw:>12.3f}{wlo:>8.3f}–{whi:<6.3f}{npair:>6}{mark}")
-        print("\n  ЗВЁЗДОЧКА — значим ВНУТРИ задач. Именно эта колонка решает.")
+                  f"{aw:>12.3f}{wlo:>8.3f}–{whi:<6.3f}{npair:>6}  {mark}")
+        surv = [k for k, (v, b) in bmark.items() if np.isfinite(v) and v > b]
+        thr = np.mean([b for _, b in bmark.values()])
+        print(f"\n  порог Бонферрони на {NMETRIC} метрик: ~{thr:.3f}; "
+              f"проходят: {', '.join(surv) if surv else 'НИКТО'}")
+        print("  * — сверх обычного нуля, ** — сверх поправки на "
+              "множественность.")
+        print("  ЗВЁЗДОЧКА — значим ВНУТРИ задач. Именно эта колонка решает.")
         print("  Общий AUC может целиком объясняться тем, что у трудной задачи")
         print("  дрейф выше; такая межзадачная связь лечится таблицей из")
         print("  десяти чисел и предсказателя не требует.")
