@@ -73,7 +73,7 @@ def _lengths_to_segments(lengths: list[int]):
 
 def main() -> None:
     args = parse_args()
-    budgets = sorted(int(x) for x in args.segment_budgets.split(","), reverse=True)
+    budgets = sorted((int(x) for x in args.segment_budgets.split(",")), reverse=True)
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
