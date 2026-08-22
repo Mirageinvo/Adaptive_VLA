@@ -57,6 +57,35 @@ else
   echo "  $HOME/LIBERO уже есть, пропускаю клон"
 fi
 
+say "4б/5 конфиг LIBERO — иначе первый импорт спрашивает путь и падает"
+# libero/libero/__init__.py при отсутствии ~/.libero/config.yaml вызывает
+# input("Do you want to specify a custom path for the dataset folder?"). В
+# скрипте, в heredoc и под nohup stdin нет, и это EOFError. Пишем конфиг сами
+# — ровно те пять ключей и ровно те значения, которые он вывел бы при ответе
+# "N". Путь конфига можно переопределить переменной LIBERO_CONFIG_PATH.
+#
+# ДАТАСЕТ ДЕМОНСТРАЦИЙ НАМ НЕ НУЖЕН: зонд и оценка используют только симулятор
+# и init_files с начальными состояниями. Ключ datasets может указывать в
+# несуществующий каталог, это ни на что не влияет.
+BR="$HOME/LIBERO/libero/libero"
+mkdir -p "$HOME/.libero"
+if [ -s "$HOME/.libero/config.yaml" ]; then
+  echo "  ~/.libero/config.yaml уже есть, не трогаю:"
+  sed 's/^/    /' "$HOME/.libero/config.yaml"
+else
+  cat > "$HOME/.libero/config.yaml" <<YAML
+benchmark_root: $BR
+bddl_files: $BR/bddl_files
+init_states: $BR/init_files
+datasets: $HOME/LIBERO/libero/datasets
+assets: $BR/assets
+YAML
+  echo "  записан ~/.libero/config.yaml"
+fi
+for d in "$BR/bddl_files" "$BR/init_files" "$BR/assets"; do
+  [ -d "$d" ] && echo "  есть: $d" || echo "  ОТСУТСТВУЕТ: $d"
+done
+
 say "5/5 проверка"
 NP1=$(numpy_now)
 echo "numpy: $NP0 -> $NP1"
