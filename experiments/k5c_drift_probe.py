@@ -89,7 +89,8 @@ class DriftRecorder:
         self.pair_cnt = np.zeros((chunk, chunk))
         self.rows = {k: [] for k in (
             "T", "origin", "j", "env", "pose_l2", "pose_linf",
-            "grip_absdiff", "cum_pose_l2", "done")}
+            "grip_absdiff", "cum_pose_l2", "done", "fresh_mag", "hold_l2",
+            "pose_cos")}
 
     def step(self, T, chunk_now, done_mask):
         """Принять чанк, порождённый в момент T, и записать всё, что он даёт.
@@ -124,6 +125,28 @@ class DriftRecorder:
             self.rows["cum_pose_l2"].append(
                 np.linalg.norm(self.cum[t], axis=1))
             self.rows["done"].append(done_mask.astype(np.int8))
+            # МАСШТАБ. Без него D(j) — число без смысла: 0.17 это много или
+            # мало, зависит от типичной величины самого действия.
+            self.rows["fresh_mag"].append(
+                np.linalg.norm(fresh[:, :POSE], axis=1))
+            # БАЗЛАЙН «ПОВТОРИТЬ ПЕРВОЕ ДЕЙСТВИЕ». Сравнивает со свежим не
+            # позицию j плана, а его позицию 0, размноженную на j шагов. Если
+            # hold_l2 не хуже pose_l2, то временная структура чанка не несёт
+            # ничего: держать первое действие ровно так же точно, как
+            # разворачивать план. Это самый дешёвый и самый убийственный тест
+            # для всей идеи горизонта.
+            self.rows["hold_l2"].append(np.linalg.norm(
+                self.chunks[t][:, 0, :POSE] - fresh[:, :POSE], axis=1))
+            # НАПРАВЛЕНИЕ ОТДЕЛЬНО ОТ ВЕЛИЧИНЫ. Действия — ПРИРАЩЕНИЯ позы.
+            # Два приращения могут сильно отличаться по норме, но вести робота
+            # в ту же сторону: тогда он приедет туда же, лишь быстрее или
+            # медленнее. Это качественно мягче, чем поехать не туда. L2 эти
+            # два случая склеивает, косинус — разводит.
+            a_st, a_fr = live[a][:, :POSE], fresh[:, :POSE]
+            den = np.linalg.norm(a_st, axis=1) * np.linalg.norm(a_fr, axis=1)
+            self.rows["pose_cos"].append(np.where(
+                den > 1e-12, (a_st * a_fr).sum(axis=1) / np.maximum(den, 1e-12),
+                np.nan))
 
         # --- полная попарная матрица (контроль позиционного конфаунда) --------
         # Считаются только НЕзавершённые среды: после done траектория не имеет
@@ -204,10 +227,21 @@ def action_trigger_horizon(chunk, tau):
     return np.clip(first, 1, chunk.shape[-2])
 
 
-def curve(arr, key="pose_l2", drop_done=True):
-    """Средняя кривая устаревания по смещению."""
+def curve(arr, key="pose_l2", drop_done=True, only_done=False):
+    """Средняя кривая устаревания по смещению.
+
+    only_done=True даёт ПОЛ ПО ЗАВЕРШЁННЫМ эпизодам: задача уже выполнена,
+    правильное действие со временем не меняется, поэтому расхождение между
+    позицией j и позицией 0 там не может объясняться устареванием наблюдения
+    и является позиционным артефактом. В отличие от статической фазы, где
+    робот НЕ исполняет план и расхождение равно внутричанковой изменчивости
+    самого плана, здесь план исполняется — то есть режим сопоставим с
+    основным.
+    """
     m = np.ones(len(arr["j"]), bool)
-    if drop_done:
+    if only_done:
+        m &= arr["done"] == 1
+    elif drop_done:
         m &= arr["done"] == 0
     out = []
     for j in range(CHUNK):
@@ -253,6 +287,18 @@ def selftest():
     want = alpha * np.arange(CHUNK) * np.sqrt(POSE)
     assert np.allclose(got, want, atol=1e-9), \
         f"кривая устаревания не восстановлена:\n  получено {got[:5]}\n  ждали {want[:5]}"
+
+    # 2b. БАЗЛАЙН «ДЕРЖАТЬ». В этой синтетике план ПОЧТИ ВЕРЕН (устаревание
+    #     всего alpha*j), а истина меняется случайно каждый шаг. Значит
+    #     развёртывание плана обязано быть заметно точнее повторения первого
+    #     действия — иначе базлайн посчитан неправильно.
+    cs = curve(arr, "pose_cos")
+    assert cs[1] > 0.99 and cs[1] > cs[19], \
+        f"косинус обязан быть около 1 при малом устаревании и падать: {cs[:3]}, {cs[19]}"
+    hold = curve(arr, "hold_l2")
+    assert np.all(hold[1:] > got[1:] * 5), \
+        (f"на почти верном плане «держать» обязано быть много хуже:\n"
+         f"  план  {got[1:4]}\n  держать {hold[1:4]}")
 
     # 3. ЛИНЕЙНОЕ устаревание тёплицево: матрица зависит только от разности.
     dev = toeplitz_deviation(arr["pair_mean"])
@@ -556,7 +602,7 @@ def main() -> None:
     out["success_by_env"] = np.stack([a["success_by_env"] for a in all_arr])
 
     c, ci = curve(out), curve(out, "cum_pose_l2")
-    dev = toeplitz_deviation(pm)
+    tdev = toeplitz_deviation(pm)   # НЕ dev: dev — это torch.device
     floor = None
     if static_arr:
         st = {k: np.concatenate([a[k] for a in static_arr])
@@ -565,17 +611,48 @@ def main() -> None:
         floor = curve(st)
         out["static_pose_l2_curve"] = floor
         out["static_cum_curve"] = curve(st, "cum_pose_l2")
-    print("\n" + "=" * 74)
-    hdr = f"  {'j':>3}{'D_поза':>11}{'D_накопл':>12}{'D_схват':>11}{'строк':>10}"
-    print(hdr + (f"{'пол':>10}{'за вычетом':>12}" if floor is not None else ""))
+    cc = curve(out, "pose_cos")                 # направление отдельно от нормы
+    out["pose_cos_curve"] = cc
+    ch = curve(out, "hold_l2")                  # «повторить первое действие»
+    cm = curve(out, "fresh_mag")                # масштаб самого действия
+    cdone = (curve(out, only_done=True)
+             if (out["done"] == 1).any() else None)
+    out["hold_l2_curve"], out["fresh_mag_curve"] = ch, cm
+    if cdone is not None:
+        out["done_floor_curve"] = cdone
+
+    print("\n" + "=" * 78)
+    hdr = (f"  {'j':>3}{'D_план':>10}{'D_держать':>11}{'D/|a|':>8}"
+           f"{'cos':>7}{'D_накопл':>11}{'D_схват':>10}{'строк':>9}")
+    print(hdr + (f"{'пол(готово)':>13}" if cdone is not None else "")
+          + (f"{'план-статика':>14}" if floor is not None else ""))
     cg = curve(out, "grip_absdiff")
     for j in range(CHUNK):
         n = int(((out["j"] == j) & (out["done"] == 0)).sum())
-        line = f"  {j:>3}{c[j]:>11.4f}{ci[j]:>12.4f}{cg[j]:>11.4f}{n:>10}"
+        rel = c[j] / cm[j] if cm[j] > 1e-12 else float("nan")
+        line = (f"  {j:>3}{c[j]:>10.4f}{ch[j]:>11.4f}{rel:>8.2f}"
+                f"{cc[j]:>7.3f}{ci[j]:>11.4f}{cg[j]:>10.4f}{n:>9}")
+        if cdone is not None:
+            line += f"{cdone[j]:>13.4f}"
         if floor is not None:
-            line += f"{floor[j]:>10.4f}{c[j] - floor[j]:>12.4f}"
+            line += f"{floor[j]:>14.4f}"
         print(line)
-    print(f"\n  отклонение от тёплицевости: {dev:.3f}")
+
+    # ГЛАВНЫЙ ДЕШЁВЫЙ ТЕСТ: несёт ли временная структура чанка хоть что-то.
+    print(f"  косинус направления: j=1 {cc[1]:.3f}, j=8 {cc[8]:.3f}, "
+          f"j=19 {cc[19]:.3f}")
+    print("  Если косинус остаётся высоким, устаревшее и свежее действия ведут\n"
+          "  робота В ТУ ЖЕ СТОРОНУ, и расхождение по L2 — вопрос темпа, а не\n"
+          "  направления. Это качественно мягче и объясняет, почему успех\n"
+          "  может не страдать при большом D.")
+    better = int(np.sum(c[1:] < ch[1:]))
+    print(f"\n  план точнее «держать первое действие» на {better} из "
+          f"{CHUNK - 1} смещений")
+    if better <= (CHUNK - 1) // 2:
+        print("  ВЫВОД: развёртывать план не точнее, чем повторять его первое\n"
+              "  действие. Тогда у чанка нет полезной временной структуры, и\n"
+              "  говорить о «сроке годности плана» не о чем.")
+    print(f"\n  отклонение от тёплицевости: {tdev:.3f}")
     dmax = max(det) if det else float("nan")
     print(f"  повторный вызов на том же наблюдении: max|Δ| = {dmax:.3e}")
     if det and dmax > 0.0:
@@ -583,10 +660,14 @@ def main() -> None:
               "  Тогда часть D(j) — шум повторного вызова, а не устаревание,\n"
               "  и величину dmax надо считать полом наравне со статическим.")
     if floor is not None:
-        share = float(np.nanmean(floor[1:] / np.maximum(c[1:], 1e-12)))
-        print(f"  доля позиционного пола в кривой: {share:.1%}")
-        print("  Пол — ВЕРХНЯЯ оценка артефакта: сцена не идеально статична.")
-    else:
+        print("\n  «план-статика» — НЕ пол артефакта. В статической фазе робот\n"
+              "  план НЕ исполняет, поэтому там измеряется внутричанковая\n"
+              "  изменчивость самого плана ‖C_t[j] − C_t[0]‖, а не позиционное\n"
+              "  смещение. Вычитать её из основной кривой НЕЛЬЗЯ. Полезна она\n"
+              "  только как ориентир: если основная кривая ей примерно равна,\n"
+              "  значит исполнение плана не приближает устаревшее действие к\n"
+              "  свежему по сравнению с полным бездействием.")
+    if cdone is None:
         print("  ПОЛ НЕ ИЗМЕРЕН. Линейный позиционный артефакт неотличим от\n"
               "  линейного устаревания (самотест 4c), и тёплицевость его не\n"
               "  видит. Без --static-steps рост D(j) НЕЛЬЗЯ называть\n"
@@ -606,7 +687,7 @@ def main() -> None:
         task_description=task_desc, exec_horizon=args.exec_horizon,
         n_envs=args.n_envs, k_set=args.k_set, seed=args.seed,
         pos_offset=pos_off, dtype=args.dtype, rounds=meta_rounds,
-        toeplitz_deviation=dev, minutes=(time.time() - t_start) / 60,
+        toeplitz_deviation=tdev, minutes=(time.time() - t_start) / 60,
         # ЖЕЛЕЗО В МЕТАДАННЫХ ОБЯЗАТЕЛЬНО: жадный argmax по 2048 кодам, и
         # смена ядра внимания на другом GPU способна перевернуть токен.
         # Прогоны с разных хостов нельзя молча складывать в одну таблицу.
