@@ -128,8 +128,16 @@ class DriftRecorder:
         # --- полная попарная матрица (контроль позиционного конфаунда) --------
         # Считаются только НЕзавершённые среды: после done траектория не имеет
         # смысла, а LIBERO продолжает шагать.
+        #
+        # ТОЛЬКО КОГДА ЖИВЫ ВСЕ ПРОИСХОЖДЕНИЯ. Иначе у разных пар оказываются
+        # РАЗНЫЕ множества наблюдений: пара (0,19) видна лишь с T >= 19, а
+        # (0,1) — с T >= 1. Тогда зависимость дрейфа от фазы задачи попадёт в
+        # матрицу как ложная непёплицевость, и тест начнёт срабатывать не на
+        # позицию, а на неоднородность эпизода. При полном наборе живых чанков
+        # множество (T, среда) у всех пар одно и то же, и любая зависимость
+        # вида g_T(лаг) сокращается при усреднении.
         keep = ~done_mask
-        if keep.any():
+        if keep.any() and len(origins) == self.chunk:
             p = live[:, keep, :POSE]                      # (n_live, n_keep, P)
             diff = p[:, None, :, :] - p[None, :, :, :]
             dist = np.linalg.norm(diff, axis=-1).sum(axis=-1)   # (n_live,n_live)
@@ -277,6 +285,34 @@ def selftest():
     assert np.nanmax(np.abs(sub)) < 1e-9, \
         "между непривилегированными позициями расхождения быть не должно"
 
+    # 4b. МНОЖЕСТВА НАБЛЮДЕНИЙ У ПАР ОБЯЗАНЫ СОВПАДАТЬ. Иначе неоднородность
+    #     эпизода протекает в тест как ложная непёплицевость.
+    cnt = arr_p["pair_cnt"]
+    off_diag = cnt[~np.eye(CHUNK, dtype=bool)]
+    assert off_diag.min() == off_diag.max() and off_diag.min() > 0, \
+        (f"у пар разные множества наблюдений: от {off_diag.min()} до "
+         f"{off_diag.max()} — состояние-зависимость протечёт в тёплицевость")
+
+    # 4c. ПРЕДЕЛ МЕТОДА, НАЗВАННЫЙ ЯВНО. ЛИНЕЙНОЕ позиционное смещение даёт
+    #     ‖b(j_a) − b(j_b)‖ = |j_a − j_b|·‖наклон‖, то есть ровно тёплицеву
+    #     матрицу. Такой артефакт НЕОТЛИЧИМ от линейного устаревания, а
+    #     линейный рост — именно то, что мы ожидаем увидеть. Закрывается
+    #     только контролем со статической сценой (--static-steps), где
+    #     истинное устаревание нулевое по построению.
+    slope = 0.02
+
+    def gen_linpos(T):
+        c = np.stack([truth[T + j] for j in range(CHUNK)], axis=1)
+        c[:, :, :POSE] += slope * np.arange(CHUNK)[None, :, None]
+        return c
+
+    arr_l = _drive(gen_linpos, 200)
+    assert toeplitz_deviation(arr_l["pair_mean"]) < 1e-9, \
+        "линейное позиционное смещение обязано выглядеть тёплицевым — если " \
+        "тест его ловит, значит он ловит что-то другое, и его надо разобрать"
+    assert np.allclose(curve(arr_l), slope * np.arange(CHUNK) * np.sqrt(POSE)), \
+        "линейный артефакт обязан имитировать устаревание один в один"
+
     # 5. НАКОПЛЕННОЕ расхождение. При постоянном сдвиге на одно измерение
     #    накопление обязано расти линейно, а подельтная метрика — стоять.
     def gen_const(T):
@@ -330,6 +366,13 @@ def main() -> None:
     ap.add_argument("--pos-offset", type=int, default=None)
     ap.add_argument("--offset-table", default="data/pos_offset_table.json")
     ap.add_argument("--waiting-steps", type=int, default=10)
+    ap.add_argument("--static-steps", type=int, default=0,
+                    help="шагов холостого хода с записью ДО раскатки. Даёт "
+                         "позиционный пол D(j) при почти нулевом устаревании — "
+                         "единственный контроль на ЛИНЕЙНЫЙ позиционный "
+                         "артефакт, которого тёплицевость не видит. Сдвигает "
+                         "эпизод, поэтому в основной развёртке держать 0 и "
+                         "гонять отдельным диагностическим прогоном")
     ap.add_argument("--max-steps", type=int, default=600)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default=None)
@@ -414,7 +457,7 @@ def main() -> None:
                                   do_sample=False, initial_position_shift=1)
             return np.asarray(processor.action_processor.decode(toks.tolist())[0])
 
-    all_arr, meta_rounds = [], []
+    all_arr, static_arr, meta_rounds = [], [], []
     t_start = time.time()
     try:
         for k in range(args.k_set):
@@ -428,6 +471,29 @@ def main() -> None:
             for _ in range(args.waiting_steps):
                 obs, r_, done, _ = envs.step(dummy)
                 reward = np.clip(reward + r_, 0, 1)
+
+            # --- КОНТРОЛЬ СО СТАТИЧЕСКОЙ СЦЕНОЙ ------------------------------
+            # Единственная проверка, закрывающая ЛИНЕЙНЫЙ позиционный артефакт:
+            # тёплицевость его не ловит (самотест 4c), потому что он выглядит
+            # ровно как линейное устаревание. Пока рука стоит на месте от
+            # холостых действий, наблюдение почти не меняется, значит истинное
+            # устаревание около нуля, и любое ненулевое D(j) здесь — это
+            # позиционный пол, который надо вычесть из основной кривой.
+            #
+            # Сцена не идеально статична: схват и физика доседают. Поэтому это
+            # ВЕРХНЯЯ оценка пола, а не точное его значение.
+            if args.static_steps:
+                rec_s = DriftRecorder(args.n_envs)
+                for Ts in range(args.static_steps):
+                    rec_s.step(Ts, policy(obs), done)
+                    obs, r_, done, _ = envs.step(dummy)
+                    reward = np.clip(reward + r_, 0, 1)
+                a_s = rec_s.arrays()
+                a_s["round"] = np.full(len(a_s["T"]), k)
+                static_arr.append(a_s)
+                cs = curve(a_s)
+                print(f"  раунд {k} статический пол: D(1)={cs[1]:.4f} "
+                      f"D(8)={cs[8]:.4f} D(19)={cs[19]:.4f}", flush=True)
 
             exec_chunk, exec_origin, T = None, None, 0
             while not np.all(done) and T < args.max_steps:
@@ -475,13 +541,34 @@ def main() -> None:
 
     c, ci = curve(out), curve(out, "cum_pose_l2")
     dev = toeplitz_deviation(pm)
+    floor = None
+    if static_arr:
+        st = {k: np.concatenate([a[k] for a in static_arr])
+              for k in ("T", "j", "done", "pose_l2", "cum_pose_l2",
+                        "grip_absdiff", "origin", "env")}
+        floor = curve(st)
+        out["static_pose_l2_curve"] = floor
+        out["static_cum_curve"] = curve(st, "cum_pose_l2")
     print("\n" + "=" * 74)
-    print(f"  {'j':>3}{'D_поза':>11}{'D_накопл':>12}{'D_схват':>11}{'строк':>10}")
+    hdr = f"  {'j':>3}{'D_поза':>11}{'D_накопл':>12}{'D_схват':>11}{'строк':>10}"
+    print(hdr + (f"{'пол':>10}{'за вычетом':>12}" if floor is not None else ""))
     cg = curve(out, "grip_absdiff")
     for j in range(CHUNK):
         n = int(((out["j"] == j) & (out["done"] == 0)).sum())
-        print(f"  {j:>3}{c[j]:>11.4f}{ci[j]:>12.4f}{cg[j]:>11.4f}{n:>10}")
+        line = f"  {j:>3}{c[j]:>11.4f}{ci[j]:>12.4f}{cg[j]:>11.4f}{n:>10}"
+        if floor is not None:
+            line += f"{floor[j]:>10.4f}{c[j] - floor[j]:>12.4f}"
+        print(line)
     print(f"\n  отклонение от тёплицевости: {dev:.3f}")
+    if floor is not None:
+        share = float(np.nanmean(floor[1:] / np.maximum(c[1:], 1e-12)))
+        print(f"  доля позиционного пола в кривой: {share:.1%}")
+        print("  Пол — ВЕРХНЯЯ оценка артефакта: сцена не идеально статична.")
+    else:
+        print("  ПОЛ НЕ ИЗМЕРЕН. Линейный позиционный артефакт неотличим от\n"
+              "  линейного устаревания (самотест 4c), и тёплицевость его не\n"
+              "  видит. Без --static-steps рост D(j) НЕЛЬЗЯ называть\n"
+              "  устареванием: нужен хотя бы один диагностический прогон.")
     print("\n  ЧИТАТЬ ТАК, правило записано до запуска.")
     print("  D(0) обязано быть ровно нулём — иначе стенд недетерминирован.")
     print("  Если D растёт с j и отклонение от тёплицевости мало (< ~0.15),")
