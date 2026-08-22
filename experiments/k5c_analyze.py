@@ -71,6 +71,51 @@ def auc(score, label):
     return float((ranks[label == 1].sum() - n1 * (n1 + 1) / 2.0) / (n1 * n0))
 
 
+def auc_within(score, label, group):
+    """AUC ВНУТРИ групп: сравниваются только пары из одной задачи.
+
+    ЗАЧЕМ. Объединённый по задачам AUC может целиком объясняться тем, что у
+    трудной задачи дрейф выше — то есть переизмерять межзадачную корреляцию.
+    Но межзадачная неоднородность лечится таблицей из десяти чисел, без
+    всякого предсказателя (см. вывод k5b_summarize). Методу нужно различение
+    ВНУТРИ задачи, и меряет его только эта величина.
+
+    Агрегация — по числу дискордантных пар, а не простым средним: задачи с
+    одним провалом иначе весили бы столько же, сколько задачи с пятью.
+    """
+    score, label = np.asarray(score, float), np.asarray(label, int)
+    group = np.asarray(group)
+    num = den = 0.0
+    for g in np.unique(group):
+        m = group == g
+        n1, n0 = int(label[m].sum()), int((1 - label[m]).sum())
+        if n1 == 0 or n0 == 0:
+            continue
+        a = auc(score[m], label[m])
+        if np.isfinite(a):
+            num += a * n1 * n0
+            den += n1 * n0
+    return (num / den) if den > 0 else float("nan"), int(den)
+
+
+def perm_null_within(score, label, group, n=2000, seed=0):
+    """Нуль для стратифицированного AUC: метки мешаются ВНУТРИ каждой задачи.
+
+    Перемешивать глобально нельзя — это разрушило бы и межзадачную структуру,
+    и нуль оказался бы шире правды.
+    """
+    rng = np.random.default_rng(seed)
+    group = np.asarray(group)
+    lab = np.asarray(label).copy()
+    idx = [np.where(group == g)[0] for g in np.unique(group)]
+    out = np.empty(n)
+    for i in range(n):
+        for ii in idx:
+            lab[ii] = rng.permutation(lab[ii])
+        out[i] = auc_within(score, lab, group)[0]
+    return out
+
+
 def perm_null(score, label, n=2000, seed=0):
     """Распределение AUC при перемешанных метках. Даёт честный порог."""
     rng = np.random.default_rng(seed)
@@ -169,11 +214,34 @@ def selftest():
     assert frac < 0.8, \
         (f"по десяти точкам тест обязан быть НЕнадёжным, а уверенно "
          f"срабатывает в {frac:.0%} — проверка мощности бессмысленна")
+    # 4. СТРАТИФИКАЦИЯ ОБЯЗАНА УБИВАТЬ ЧИСТО МЕЖЗАДАЧНЫЙ СИГНАЛ.
+    #    Строим случай, где ВНУТРИ задачи связи нет вовсе: у задачи A дрейф
+    #    низкий и провалов мало, у задачи B дрейф высокий и провалов много,
+    #    но внутри каждой провал назначается СЛУЧАЙНО. Объединённый AUC
+    #    обязан быть высоким (он ловит разницу задач), стратифицированный —
+    #    около 0.5. Если это не так, колонка «внутри» бесполезна.
+    g2 = np.r_[np.zeros(100, int), np.ones(100, int)]
+    sc2 = np.r_[rng.normal(0, 1, 100), rng.normal(3, 1, 100)]
+    lb2 = np.r_[(rng.random(100) < 0.10).astype(int),
+                (rng.random(100) < 0.50).astype(int)]
+    a_pool = auc(sc2, lb2)
+    a_within, npair = auc_within(sc2, lb2, g2)
+    assert a_pool > 0.65, \
+        f"объединённый AUC обязан поймать межзадачную разницу: {a_pool:.3f}"
+    assert abs(a_within - 0.5) < 0.10, \
+        (f"стратифицированный AUC обязан быть около 0.5, получено "
+         f"{a_within:.3f} — стратификация не работает")
+    nw = perm_null_within(sc2, lb2, g2, n=300)
+    assert abs(nw.mean() - 0.5) < 0.03, f"нуль внутри смещён: {nw.mean():.3f}"
+
     print("самопроверка пройдена:")
     print("  AUC точен на известных случаях, связки обрабатываются")
     print(f"  перестановочный нуль: среднее {null.mean():.3f}, sd {null.std():.3f}")
     print(f"  заданная связь видна на 200 точках (AUC {a_big:.3f}) и теряется "
           f"на 10 (уверенно лишь в {frac:.0%} подвыборок)")
+    print(f"  чисто МЕЖзадачный сигнал: общий AUC {a_pool:.3f}, "
+          f"внутри задач {a_within:.3f} ({npair} пар) — стратификация его "
+          f"снимает")
 
 
 def main() -> None:
@@ -244,15 +312,24 @@ def main() -> None:
     if fail.sum() < 5 or fail.sum() > len(fail) - 5:
         print("  СЛИШКОМ ПЕРЕКОШЕНЫ ИСХОДЫ — гейт не считается.")
     else:
-        print(f"  {'метка':>10}{'AUC':>8}{'нуль 95%':>12}{'вердикт':>12}")
+        grp = np.array([e["task"] for e in eps])
+        print(f"  {'метка':>10}{'AUC общ':>9}{'нуль 95%':>14}"
+              f"{'AUC внутри':>12}{'нуль 95%':>14}{'пар':>7}")
         for key in ("d_mean", "ratio", "excess", "cosdef", "cum"):
             sc = np.array([e[key] for e in eps], float)
             a = auc(sc, fail)
-            null = perm_null(sc, fail, n=2000)
-            hi = float(np.quantile(null, 0.975))
-            lo = float(np.quantile(null, 0.025))
-            verdict = "есть" if (a > hi or a < lo) else "нет"
-            print(f"  {key:>10}{a:>8.3f}{lo:>6.3f}–{hi:<6.3f}{verdict:>10}")
+            nl = perm_null(sc, fail, n=2000)
+            lo, hi = np.quantile(nl, [0.025, 0.975])
+            aw, npair = auc_within(sc, fail, grp)
+            nw = perm_null_within(sc, fail, grp, n=2000)
+            wlo, whi = np.quantile(nw, [0.025, 0.975])
+            mark = "*" if np.isfinite(aw) and (aw > whi or aw < wlo) else " "
+            print(f"  {key:>10}{a:>9.3f}{lo:>7.3f}–{hi:<6.3f}"
+                  f"{aw:>12.3f}{wlo:>8.3f}–{whi:<6.3f}{npair:>6}{mark}")
+        print("\n  ЗВЁЗДОЧКА — значим ВНУТРИ задач. Именно эта колонка решает.")
+        print("  Общий AUC может целиком объясняться тем, что у трудной задачи")
+        print("  дрейф выше; такая межзадачная связь лечится таблицей из")
+        print("  десяти чисел и предсказателя не требует.")
         print("\n  ЧИТАТЬ ТАК, правило записано до данных.")
         print("  Порог из K-5к: AUC < 0.60 — дрейф НЕ связан с исходом, и как")
         print("  метка горизонта он негоден, сколь угодно красиво ни росла бы")
