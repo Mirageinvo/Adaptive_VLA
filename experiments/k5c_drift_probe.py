@@ -457,7 +457,7 @@ def main() -> None:
                                   do_sample=False, initial_position_shift=1)
             return np.asarray(processor.action_processor.decode(toks.tolist())[0])
 
-    all_arr, static_arr, meta_rounds = [], [], []
+    all_arr, static_arr, meta_rounds, det = [], [], [], []
     t_start = time.time()
     try:
         for k in range(args.k_set):
@@ -471,6 +471,22 @@ def main() -> None:
             for _ in range(args.waiting_steps):
                 obs, r_, done, _ = envs.step(dummy)
                 reward = np.clip(reward + r_, 0, 1)
+
+            # --- НАСТОЯЩАЯ ПРОВЕРКА ДЕТЕРМИНИЗМА ------------------------------
+            # D(0) = 0 в записи ТОЖДЕСТВЕННО: свежее берётся как chunk[:, 0, :]
+            # и при j = 0 сравнивается с тем же самым массивом. Эта величина
+            # не проверяет ничего, кроме индексации. Реальный вопрос — даёт ли
+            # политика один и тот же чанк на одном и том же наблюдении: если
+            # нет, то ВСЯ кривая устаревания содержит шум повторного вызова,
+            # и её нельзя приписывать смене состояния. Стоит один лишний вызов
+            # на раунд.
+            c1 = policy(obs)
+            c2 = policy(obs)
+            nd = float(np.abs(c1 - c2).max())
+            det.append(nd)
+            print(f"  раунд {k} детерминизм: max|Δ| при повторном вызове "
+                  f"на том же наблюдении = {nd:.3e}"
+                  + ("" if nd == 0.0 else "  ВНИМАНИЕ: не ноль"), flush=True)
 
             # --- КОНТРОЛЬ СО СТАТИЧЕСКОЙ СЦЕНОЙ ------------------------------
             # Единственная проверка, закрывающая ЛИНЕЙНЫЙ позиционный артефакт:
@@ -560,6 +576,12 @@ def main() -> None:
             line += f"{floor[j]:>10.4f}{c[j] - floor[j]:>12.4f}"
         print(line)
     print(f"\n  отклонение от тёплицевости: {dev:.3f}")
+    dmax = max(det) if det else float("nan")
+    print(f"  повторный вызов на том же наблюдении: max|Δ| = {dmax:.3e}")
+    if det and dmax > 0.0:
+        print("  ВНИМАНИЕ: политика НЕ детерминирована на одном наблюдении.\n"
+              "  Тогда часть D(j) — шум повторного вызова, а не устаревание,\n"
+              "  и величину dmax надо считать полом наравне со статическим.")
     if floor is not None:
         share = float(np.nanmean(floor[1:] / np.maximum(c[1:], 1e-12)))
         print(f"  доля позиционного пола в кривой: {share:.1%}")
@@ -585,6 +607,13 @@ def main() -> None:
         n_envs=args.n_envs, k_set=args.k_set, seed=args.seed,
         pos_offset=pos_off, dtype=args.dtype, rounds=meta_rounds,
         toeplitz_deviation=dev, minutes=(time.time() - t_start) / 60,
+        # ЖЕЛЕЗО В МЕТАДАННЫХ ОБЯЗАТЕЛЬНО: жадный argmax по 2048 кодам, и
+        # смена ядра внимания на другом GPU способна перевернуть токен.
+        # Прогоны с разных хостов нельзя молча складывать в одну таблицу.
+        gpu=(torch.cuda.get_device_name(0) if dev.type == "cuda" else None),
+        torch_version=torch.__version__,
+        repeat_call_maxdiff=(max(det) if det else None),
+        static_steps=args.static_steps,
         self_sha256=hashlib.sha256(open(__file__, "rb").read()).hexdigest()[:16],
     ), ensure_ascii=False)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
