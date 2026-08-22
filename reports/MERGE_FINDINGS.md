@@ -100,6 +100,7 @@ Only if Stage 1 **and** Stage 2 GO.
 | `merge0_smoke.py` | 0 | Pipeline sanity |
 | `merge0_integration.py` | 0 | **Architectural gate + latency fractions** |
 | `merge1_oracle_compression.py` | 1 | Oracle curve, fixed vs adaptive |
+| `merge1_posthoc_plan_gaps.py` | 1 | **§3 scheme C + §1 span 2–4** from saved `eval_rows` |
 | `merge2_locality.py` | 2 | Pair heatmaps, span stats |
 | `merge3_labels.py` | 2 | Episode-disjoint oracle labels |
 | `merge4_train.py` | 3 | Causal MLP merger |
@@ -138,6 +139,36 @@ Launcher: `bash scripts/run_aatm_oracle.sh {smoke|medium|full}`
 - `artifacts/merge/merge0_smoke_*.json`
 - `artifacts/merge/oracle_*/summary.json`
 - `artifacts/merge/oracle_*/eval_rows.parquet`
+- `artifacts/merge/oracle_*/plan_gaps.json`
+
+After the live medium job writes rows:
+
+```bash
+# Cheap: span, locality heatmap, quantiles, heavy chunks (no GPU)
+python experiments/merge1_posthoc_plan_gaps.py \
+  --oracle-dir artifacts/merge/oracle_medium --rows-only
+
+# Scheme C, span≤4 proxy, similarity, uniform at all k
+python experiments/merge1_posthoc_plan_gaps.py \
+  --oracle-dir artifacts/merge/oracle_medium --device cuda
+
+# Optional greedy vs oracle (plan §8), extra decodes
+python experiments/merge1_posthoc_plan_gaps.py \
+  --oracle-dir artifacts/merge/oracle_medium --device cuda --compute-greedy
+```
+
+Как читать цифры: **`reports/AATM_POSTHOC_INTERPRETATION.md`** (канон).
+
+**Science decision (after medium + post-hoc cuda):** use `by_budget["8"].scheme_c` keys `*_val` only (`adaptive_gain_vs_scheme_c_val`, `adaptive_gain_vs_best_fixed_val`, `adaptive_gain_bootstrap_ci_val`, `bootstrap_p_oracle_better_than_*_val`). Fields `*_all` / `train_rms` are transparency, not the gate.
+
+**Proxies / what is not the science decision:**
+- Scheme C is a **proxy**: train-oracle winners (+ pair at k=8), not a global argmin over all partitions. Gain vs C may be optimistic.
+- Span≤4 oracle is a **proxy**: exact only when the unrestricted winner is already legal; otherwise min over observed legal schemes, not a full re-enumeration.
+- `stage1_gate` in merge1 is **pair-only** and is **not** the science decision. Do not treat merge1 GO as §3.
+
+Latency is not decided post-hoc (Stage 0 CONDITIONAL).
+
+**Binding lock (мультиагентка 2026-08-22):** не стопать live medium; лишних ранов нет. Что делать при GO / OPEN / NO-GO — `reports/AATM_POSTHOC_INTERPRETATION.md` § Binding lock. Коротко: NO-GO на optimistic bound финальный; GO/OPEN → один next = истинная C на том же split, не рестарт и не full.
 
 ---
 
@@ -145,14 +176,16 @@ Launcher: `bash scripts/run_aatm_oracle.sh {smoke|medium|full}`
 
 | Stage | Status |
 |-------|--------|
-| 0 integration gate | code ready; run on cluster pending |
-| 1 oracle curve | code ready; run pending |
-| 2–4 | not started |
+| 0 integration gate | CONDITIONAL (BAR 5.2%, merge-after no speedup) |
+| 1 oracle curve | medium done; post-hoc cuda done |
+| 2–4 | not started; no merger (AUROC 0.61, latency CONDITIONAL) |
+
+Human write-up for the advisor: **`reports/AATM_MEDIUM_RESULTS.md`**.
 
 ---
 
 ## GO/KILL decision
 
-**Decision:** `OPEN` — Stage 0–1 not yet run on cluster.
+**Decision:** `OPEN` — headroom and adaptive vs best_fixed pass on val; AUROC 0.61 does not pass. Do not train a merger.
 
-**Next:** Run Stage 0 + Stage 1 medium on V100; update this log with numbers before any merger training.
+**Next:** Do not launch full / stratified / max_span restart. True global C only if we need a non-proxy adaptive-gain number; it does not fix AUROC.

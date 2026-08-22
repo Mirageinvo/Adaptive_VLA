@@ -11,6 +11,26 @@ from .merge_ops import expand_merged_latent, expand_subsampled_latent
 from .segments import Segment
 
 
+def adjacent_cosine_similarity(latent: torch.Tensor) -> torch.Tensor:
+    """Cosine similarity between neighboring temporal positions. latent: [B, P, D]."""
+
+    if latent.ndim != 3:
+        raise ValueError(f"Expected [B, P, D], got {tuple(latent.shape)}")
+    a = latent[:, :-1, :]
+    b = latent[:, 1:, :]
+    a = a / a.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    b = b / b.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    return (a * b).sum(dim=-1)
+
+
+def adjacent_l2_distance(latent: torch.Tensor) -> torch.Tensor:
+    """L2 distance between neighboring temporal positions. latent: [B, P, D]."""
+
+    if latent.ndim != 3:
+        raise ValueError(f"Expected [B, P, D], got {tuple(latent.shape)}")
+    return (latent[:, :-1, :] - latent[:, 1:, :]).norm(dim=-1)
+
+
 def full_depth_latent(E: torch.Tensor, codes: torch.Tensor) -> torch.Tensor:
     """Return full-depth latent sum [B, P, D]."""
 
