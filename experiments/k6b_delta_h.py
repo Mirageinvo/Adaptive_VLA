@@ -1,47 +1,63 @@
 """K-6b: нужна ли BAR последовательность блоков, или уровни предсказуемы сразу.
 
 ВОПРОС. BAR тратит три полных прохода по башне (147 из 195 мс, 75% вызова),
-потому что RVQ последовательна: код уровня 2 квантует остаток уровня 1. Но это
-модельное решение BAR, а не математическая необходимость — коды суть функция
+потому что RVQ последовательна: код уровня 2 квантует остаток уровня 1. Это
+модельное решение BAR, а НЕ математическая необходимость — коды суть функция
 действий, значит в принципе предсказуемы из наблюдения напрямую. Меряем, во
-сколько обходится отказ от обусловливания:
+сколько обходится отказ от обусловливания.
 
-    dH_g = CE( k_g | h, ПЕРЕМЕШАННЫЕ k_<g ) - CE( k_g | h, настоящие k_<g )
+БАЗОВАЯ ЛИНИЯ — NULL, А НЕ ПЕРЕМЕШИВАНИЕ. Перемешанные коды предыдущих уровней
+это не отсутствие информации, а ШУМ, который голова обязана научиться
+игнорировать, тратя на это ёмкость. Тогда «параллельный» режим выглядит хуже,
+чем есть. Поэтому основная величина —
 
-где h — скрытое состояние ПЕРВОГО блока, то есть всё, чем располагала бы
-однопроходная архитектура.
+    dCE_g = CE(k_g | h, NULL) - CE(k_g | h, настоящие k_<g)
 
-ПОЧЕМУ ПЕРЕМЕШИВАНИЕ, А НЕ ОТБРАСЫВАНИЕ ВХОДА. Голова с дополнительным входом
-имеет больше параметров, и «выигрыш» обусловленной версии оказался бы отчасти
-разницей ёмкости. Поэтому обе головы одинаковы во всём, включая размер входа,
-и различаются ТОЛЬКО тем, несёт ли k_<g информацию: в контроле он перемешан
-между примерами. Тот же приём, что с перестановочным нулём в K-5c.
+где NULL — выделенный постоянный код. Перемешивание остаётся ВТОРИЧНЫМ
+контролем (перемешиваем внутри задачи, иначе вход заведомо неестественный).
+Обе головы одинаковы по архитектуре и по инициализации: перед каждой ставится
+один и тот же сид, иначе разница окажется отчасти разницей случая.
 
-ГЛАВНАЯ МЕТРИКА — НЕ ТОКЕННАЯ. Декодер принимает СУММУ латентов (§1), поэтому
-промах на соседний по эмбеддингу код почти ничего не стоит. Кросс-энтропия и
-точность по токенам вспомогательны; решает ошибка ДЕКОДИРОВАННОГО действия.
+Строго говоря это НЕ условная взаимная информация: головы не являются
+оптимальными оценщиками энтропии. Правильное название — прирост кросс-энтропии
+зонда.
 
-ЧТО ЖДЁМ ПО УЖЕ ИЗМЕРЕННОМУ. FINDINGS §A0: правка кода грубого уровня меняет
-тонкие уровни в среднем в 4.79 позиции из 16 (медиана 5, квартили 3/6). Значит
-зависимость РАЗРЕЖЕНА — примерно в одиннадцати позициях из шестнадцати её нет
-вовсе. Поэтому dH считается ПО ПОЗИЦИЯМ: среднее по всем шестнадцати размажет
-эффект, сосредоточенный в пяти.
+РАЗРЕЖЕННОСТЬ СЧИТАЕТСЯ ПОЭКЗЕМПЛЯРНО. FINDINGS §A0: правка грубого кода
+меняет тонкие уровни в среднем в 4.79 позиции из 16. Но НАБОР этих позиций у
+разных наблюдений СВОЙ. Усреднение dCE по абсолютной позиции сделало бы
+поэкземплярно разреженную зависимость равномерной, и вывод «размазано, нужен
+новый токенизатор» оказался бы ложным. Поэтому dCE сохраняется по каждому
+(наблюдение, позиция), а концентрация меряется ВНУТРИ наблюдения.
 
-ПРАВИЛО ЧТЕНИЯ, записано до запуска:
-  ошибка действия при параллельном предсказании близка к обусловленному
-      (< +10%) -> последовательность блоков не нужна, хватает голов;
-  ошибка заметно хуже, но dH сосредоточена в немногих позициях -> нужна
-      дешёвая голова, обусловленная на мягком coarse-эмбеддинге, а не
-      повторный проход башни;
-  ошибка хуже и dH размазана по всем позициям -> зависимость существенна
-      всюду, и оправдан новый токенизатор с параллельными книгами.
+ГЛАВНАЯ МЕТРИКА — ПОЛНАЯ СБОРКА, А НЕ ПОДМЕНА ОДНОГО УРОВНЯ. Заменять один
+уровень при истинных остальных значит предполагать идеальный грубый код,
+которого на инференсе нет. Считаются целиком:
+    эксперт          истинные k0,k1,k2 из токенизатора
+    BAR-последов.    все три уровня, предсказанные самой BAR
+    один проход NULL k0 из первого блока BAR, k1,k2 из h-only голов
+    дешёвая условн.  k0 из первого блока, k1|k0, k2|k0,k1 из дешёвых голов
+Сравнение — с действием ДАТАСЕТА и с экспертным декодом; поза как RMS в долях
+размаха, схват отдельно как доля неверных шагов.
+
+РАЗБИЕНИЕ ПО ЭПИЗОДАМ. С одного эпизода берётся около десяти наблюдений, и
+случайное разбиение наблюдений пустило бы соседние состояния в train и в
+validation. Делим по ЭПИЗОДАМ: train/val/test, val только для отбора эпохи,
+test только для итоговых чисел.
+
+ОФСЕТ ПО ЗАДАЧАМ. Единый pos_offset — абляция, а не протокол: официальный
+скрипт задаёт 3 или 4 отдельно для каждой из сорока задач, и k4b0_padding_probe
+показал, что выбор МЕНЯЕТ план (оракул 0.941 против 0.872). Берём из таблицы.
+
+ПОЧЕМУ generate, А НЕ ПРЯМОЙ ВЫЗОВ ПЕРВОГО БЛОКА. Прямой вызов втрое дешевле,
+но требует самим собрать аргументы внутреннего метода — место, где легко
+незаметно разойтись с настоящим путём вывода. Экономия минут на двадцатиминутной
+задаче того не стоит; форма входа проверяется assert-ом.
 
 Запуск:
     python3 experiments/k6b_delta_h.py --selftest
     PYTHONPATH=$HOME/LIBERO MUJOCO_GL=egl \\
-    python3 experiments/k6b_delta_h.py \\
-        --ckpt ZibinDong/SmolVLM2-2.2B-ActionCodec-BAR-LIBERO \\
-        --n-obs 3000 --n-ep 300 --out data/k6b_delta_h.json
+    python3 experiments/k6b_delta_h.py --ckpt <ckpt> --n-obs 128 --n-ep 32 \\
+        --seeds 3 --out data/k6b_smoke.json          # сначала дым
 """
 
 import argparse
@@ -52,135 +68,210 @@ import sys
 
 import numpy as np
 
-N_POS, N_LEVEL = 16, 3
+N_POS, N_LEVEL, T_CHUNK = 16, 3, 20
 
 
-def train_head(X, prev, y, n_codes, n_pos, seed=0, epochs=30, hid=512,
-               val_frac=0.2, device="cpu", verbose=False):
-    """Обучить одну голову p(k | X, prev) и вернуть КРОСС-ЭНТРОПИЮ ПО ПОЗИЦИЯМ.
+# ---------------------------------------------------------------------------
+# головы-зонды
+# ---------------------------------------------------------------------------
 
-    X:    (N, n_pos, d)      скрытые состояния первого блока
-    prev: (N, n_pos, p)      коды предыдущих уровней (или их перемешка)
-    y:    (N, n_pos)         целевые коды
-    Голова общая для всех позиций плюс обучаемый эмбеддинг позиции — так на
-    позицию приходится больше примеров, а разбор по позициям всё равно
-    возможен, потому что кросс-энтропия считается поэлементно.
+def _make_head(d, n_prev, n_codes, n_pos, hid, seed, device):
+    import torch
+    import torch.nn as nn
+    torch.manual_seed(seed)          # ОДИНАКОВАЯ инициализация у всех режимов
+    emb = 64
+
+    class Head(nn.Module):
+        def __init__(self):
+            super().__init__()
+            # СВОЯ ТАБЛИЦА НА КАЖДЫЙ УРОВЕНЬ: индекс 17 в книге 0 и в книге 1 —
+            # разные векторы, общая таблица искусственно связала бы их и
+            # ЗАНИЗИЛА полезность предыдущих уровней. Лишняя строка — NULL.
+            self.code_emb = nn.ModuleList(
+                [nn.Embedding(n_codes + 1, emb) for _ in range(n_prev)])
+            self.pos_emb = nn.Embedding(n_pos, emb)
+            self.net = nn.Sequential(
+                nn.Linear(d + emb * n_prev + emb, hid), nn.GELU(),
+                nn.Linear(hid, hid), nn.GELU(), nn.Linear(hid, n_codes))
+
+        def forward(self, x, pr):
+            b, p, _ = x.shape
+            parts = [x, self.pos_emb(torch.arange(p, device=x.device))
+                     .unsqueeze(0).expand(b, -1, -1)]
+            for g, e in enumerate(self.code_emb):
+                parts.append(e(pr[..., g]))
+            return self.net(torch.cat(parts, dim=-1))
+
+    return Head().to(device)
+
+
+def train_head(X, prev, y, n_codes, splits, seed=0, epochs=30, hid=512,
+               device="cpu"):
+    """Обучить p(k | X, prev). Возвращает CE по (пример, позиция) на TEST.
+
+    splits: (idx_train, idx_val, idx_test) — индексы, разбитые ПО ЭПИЗОДАМ.
+    Эпоха отбирается по val, итоговые числа считаются на test, который не
+    участвовал ни в обучении, ни в отборе.
     """
     import torch
     import torch.nn as nn
-
-    g = torch.Generator().manual_seed(seed)
-    N = X.shape[0]
-    perm = torch.randperm(N, generator=g)
-    n_val = max(1, int(N * val_frac))
-    idx_val, idx_tr = perm[:n_val], perm[n_val:]
 
     dev = torch.device(device)
     X = torch.as_tensor(X, dtype=torch.float32)
     prev = torch.as_tensor(prev, dtype=torch.long)
     y = torch.as_tensor(y, dtype=torch.long)
+    itr, iva, ite = (torch.as_tensor(s, dtype=torch.long) for s in splits)
 
-    d, n_prev = X.shape[-1], prev.shape[-1]
-    emb_dim = 64
-
-    class Head(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.code_emb = nn.Embedding(n_codes, emb_dim) if n_prev else None
-            self.pos_emb = nn.Embedding(n_pos, emb_dim)
-            inp = d + emb_dim * n_prev + emb_dim
-            self.net = nn.Sequential(nn.Linear(inp, hid), nn.GELU(),
-                                     nn.Linear(hid, hid), nn.GELU(),
-                                     nn.Linear(hid, n_codes))
-
-        def forward(self, x, pr):
-            b, p, _ = x.shape
-            pos = self.pos_emb(torch.arange(p, device=x.device))
-            pos = pos.unsqueeze(0).expand(b, -1, -1)
-            parts = [x, pos]
-            if n_prev:
-                parts.append(self.code_emb(pr).flatten(-2))
-            return self.net(torch.cat(parts, dim=-1))
-
-    m = Head().to(dev)
+    m = _make_head(X.shape[-1], prev.shape[-1], n_codes, X.shape[1], hid,
+                   seed, dev)
     opt = torch.optim.AdamW(m.parameters(), lr=3e-4, weight_decay=1e-4)
     lossf = nn.CrossEntropyLoss(reduction="none")
-    Xtr, Ptr, Ytr = X[idx_tr].to(dev), prev[idx_tr].to(dev), y[idx_tr].to(dev)
-    Xva, Pva, Yva = X[idx_val].to(dev), prev[idx_val].to(dev), y[idx_val].to(dev)
-    bs = 256
-    best = None
-    for ep in range(epochs):
+    Xtr, Ptr, Ytr = X[itr].to(dev), prev[itr].to(dev), y[itr].to(dev)
+    Xva, Pva, Yva = X[iva].to(dev), prev[iva].to(dev), y[iva].to(dev)
+    Xte, Pte, Yte = X[ite].to(dev), prev[ite].to(dev), y[ite].to(dev)
+    g = torch.Generator().manual_seed(seed)
+    bs, best = 256, None
+
+    for _ in range(epochs):
         m.train()
         order = torch.randperm(Xtr.shape[0], generator=g)
         for i in range(0, len(order), bs):
             j = order[i:i + bs]
             opt.zero_grad()
             lg = m(Xtr[j], Ptr[j])
-            loss = lossf(lg.reshape(-1, n_codes), Ytr[j].reshape(-1)).mean()
-            loss.backward()
+            lossf(lg.reshape(-1, n_codes), Ytr[j].reshape(-1)).mean().backward()
             opt.step()
         m.eval()
         with torch.no_grad():
-            lg = m(Xva, Pva)
-            ce = lossf(lg.reshape(-1, n_codes),
-                       Yva.reshape(-1)).reshape(Yva.shape)
-            ce_pos = ce.mean(dim=0).cpu().numpy()
-            acc = (lg.argmax(-1) == Yva).float().mean(dim=0).cpu().numpy()
-        # ОТБОР ПО ВАЛИДАЦИИ, а не последняя эпоха: иначе переобучение одной
-        # из двух голов создаст ложную разницу.
-        if best is None or ce_pos.mean() < best[0].mean():
-            best = (ce_pos, acc, lg.argmax(-1).cpu().numpy(), idx_val.numpy())
-        if verbose and ep % 10 == 0:
-            print(f"    эпоха {ep}: CE {ce_pos.mean():.4f}", flush=True)
-    return best
+            v = lossf(m(Xva, Pva).reshape(-1, n_codes),
+                      Yva.reshape(-1)).mean().item()
+        if best is None or v < best[0]:
+            with torch.no_grad():
+                lg = m(Xte, Pte)
+                ce = lossf(lg.reshape(-1, n_codes),
+                           Yte.reshape(-1)).reshape(Yte.shape)
+            best = (v, ce.cpu().numpy(), lg.argmax(-1).cpu().numpy(),
+                    {k: p.detach().clone() for k, p in m.state_dict().items()})
+    return dict(val=best[0], ce=best[1], pred=best[2], state=best[3], model=m)
 
 
-def selftest():
-    import torch  # noqa: F401
+def prev_variant(prev, mode, n_codes, group, seed):
+    """TRUE / NULL / SHUFFLED при одинаковой форме входа."""
+    if mode == "true":
+        return prev
+    if mode == "null":
+        return np.full_like(prev, n_codes)     # выделенный постоянный код
+    if mode == "shuffled":
+        # ПЕРЕМЕШИВАЕМ ВНУТРИ ГРУППЫ (задачи): код от другой задачи дал бы
+        # заведомо неестественный вход, и контроль стал бы слишком лёгким.
+        out = prev.copy()
+        rng = np.random.default_rng(seed)
+        for gv in np.unique(group):
+            m = np.where(group == gv)[0]
+            out[m] = prev[m[rng.permutation(len(m))]]
+        return out
+    raise ValueError(mode)
+
+
+def concentration(dce):
+    """Насколько зависимость сосредоточена ВНУТРИ наблюдения.
+
+    dce: (N, POS). Считается по каждому наблюдению отдельно, потому что набор
+    зависимых позиций у разных наблюдений СВОЙ, и среднее по абсолютной
+    позиции его размазало бы.
+    """
+    pos = np.clip(dce, 0, None)
+    tot = pos.sum(axis=1)
+    ok = tot > 1e-9
+    if not ok.any():
+        return dict(top5_share=float("nan"), n80=float("nan"), frac_active=0.0)
+    srt = np.sort(pos[ok], axis=1)[:, ::-1]
+    top5 = srt[:, :5].sum(axis=1) / tot[ok]
+    cum = np.cumsum(srt, axis=1) / tot[ok][:, None]
+    n80 = (cum < 0.8).sum(axis=1) + 1
+    return dict(top5_share=float(np.median(top5)),
+                n80=float(np.median(n80)),
+                frac_active=float(ok.mean()))
+
+
+# ---------------------------------------------------------------------------
+# самопроверки
+# ---------------------------------------------------------------------------
+
+def selftest(epochs=25):
     rng = np.random.default_rng(0)
-    N, d, C = 1500, 32, 16
-
+    N, d, C = 1800, 32, 16
     h = rng.normal(size=(N, N_POS, d)).astype(np.float32)
-    k1 = rng.integers(0, C, size=(N, N_POS))
+    k1 = rng.integers(0, C, size=(N, N_POS, 1))
+    grp = rng.integers(0, 4, size=N)
+    ep = np.arange(N) // 10                      # по десять наблюдений на «эпизод»
+    sp = split_by_episode(ep, seed=0)
 
-    def shuffled(a, seed):
-        r = np.random.default_rng(seed)
-        return a[r.permutation(a.shape[0])]
+    def run(y, mode, seed=0):
+        return train_head(h, prev_variant(k1, mode, C, grp, 7), y, C, sp,
+                          seed=seed, epochs=epochs)["ce"]
 
-    # 1. ЗАВИСИМОСТИ НЕТ: цель определяется только h. dH обязана быть ~0.
     W = rng.normal(size=(d, C))
     y_indep = (h @ W).argmax(-1)
-    ce_c, *_ = train_head(h, k1[..., None], y_indep, C, N_POS, epochs=25)
-    ce_p, *_ = train_head(h, shuffled(k1, 1)[..., None], y_indep, C, N_POS,
-                          epochs=25)
-    d0 = float(ce_p.mean() - ce_c.mean())
-    assert abs(d0) < 0.15, \
-        f"без зависимости dH обязана быть около нуля, получено {d0:+.3f}"
 
-    # 2. ЗАВИСИМОСТЬ ЕСТЬ И СОСРЕДОТОЧЕНА: цель зависит от k1 только в пяти
-    #    позициях из шестнадцати — ровно та разреженность, которую предсказывает
-    #    FINDINGS §A0. Тест обязан её увидеть И ЛОКАЛИЗОВАТЬ.
-    dep_pos = np.array([2, 5, 7, 11, 14])
-    y_dep = y_indep.copy()
-    y_dep[:, dep_pos] = k1[:, dep_pos]
-    ce_c2, *_ = train_head(h, k1[..., None], y_dep, C, N_POS, epochs=25)
-    ce_p2, *_ = train_head(h, shuffled(k1, 2)[..., None], y_dep, C, N_POS,
-                           epochs=25)
-    gap = ce_p2 - ce_c2
-    assert gap[dep_pos].mean() > 1.0, \
-        f"зависимость в пяти позициях обязана быть видна: {gap[dep_pos]}"
-    other = np.setdiff1d(np.arange(N_POS), dep_pos)
-    assert abs(gap[other].mean()) < 0.2, \
-        f"в остальных позициях разрыва быть не должно: {gap[other].mean():+.3f}"
-    assert gap[dep_pos].mean() > 5 * abs(gap[other].mean()), \
-        "разрыв обязан ЛОКАЛИЗОВАТЬСЯ, иначе поза позиционного разбора не нужна"
+    # 1. ЗАВИСИМОСТИ НЕТ -> dCE около нуля.
+    d0 = float(run(y_indep, "null").mean() - run(y_indep, "true").mean())
+    assert abs(d0) < 0.15, f"без зависимости dCE ~ 0, получено {d0:+.3f}"
+
+    # 2. ЗАВИСИМОСТЬ В ФИКСИРОВАННЫХ ПЯТИ ПОЗИЦИЯХ -> видна и локализована.
+    fixed = np.array([2, 5, 7, 11, 14])
+    y_fix = y_indep.copy()
+    y_fix[:, fixed] = k1[:, fixed, 0]
+    gap_fix = run(y_fix, "null") - run(y_fix, "true")
+    assert gap_fix[:, fixed].mean() > 1.0, "фиксированная зависимость не видна"
+    other = np.setdiff1d(np.arange(N_POS), fixed)
+    assert abs(gap_fix[:, other].mean()) < 0.25, "ложный разрыв вне зависимых"
+
+    # 3. ГЛАВНЫЙ ТЕСТ: зависимость в ПЯТИ СЛУЧАЙНЫХ позициях У КАЖДОГО примера.
+    #    Средняя карта по абсолютной позиции обязана стать ПЛОСКОЙ, а
+    #    поэкземплярная концентрация — по-прежнему находить зависимость.
+    #    Именно этот случай отличает «зависимость размазана» от «её support
+    #    перемещается», и именно его старая версия зонда не различала.
+    y_var = y_indep.copy()
+    r2 = np.random.default_rng(3)
+    for i in range(N):
+        p = r2.choice(N_POS, 5, replace=False)
+        y_var[i, p] = k1[i, p, 0]
+    gap_var = run(y_var, "null") - run(y_var, "true")
+    per_pos = gap_var.mean(axis=0)
+    flat = per_pos.std() / max(per_pos.mean(), 1e-9)
+    con = concentration(gap_var)
+    assert flat < 0.35, \
+        f"средняя карта обязана быть плоской при плавающем support, CV={flat:.2f}"
+    assert con["top5_share"] > 0.55, \
+        (f"поэкземплярная концентрация обязана находить зависимость, "
+         f"top5={con['top5_share']:.2f} — иначе плавающий support неотличим "
+         f"от равномерного")
+    con_fix = concentration(gap_fix)
 
     print("самопроверка пройдена:")
-    print(f"  без зависимости dH = {d0:+.3f} (около нуля)")
-    print(f"  при зависимости в 5 позициях из 16: dH там {gap[dep_pos].mean():.2f}, "
-          f"в остальных {gap[other].mean():+.3f}")
-    print("  контроль — ПЕРЕМЕШИВАНИЕ входа, а не его отбрасывание, поэтому")
-    print("  ёмкость голов одинакова и разница означает только информацию")
+    print(f"  без зависимости dCE = {d0:+.3f}")
+    print(f"  фиксированные 5 позиций: dCE там {gap_fix[:, fixed].mean():.2f}, "
+          f"вне {gap_fix[:, other].mean():+.3f}, top5 {con_fix['top5_share']:.2f}")
+    print(f"  ПЛАВАЮЩИЕ 5 позиций: средняя карта плоская (CV {flat:.2f}), "
+          f"но поэкземплярно top5 = {con['top5_share']:.2f}, "
+          f"позиций до 80% разрыва: {con['n80']:.0f}")
+    print("  контроль NULL, а не перемешивание; у каждого уровня своя таблица;")
+    print("  разбиение по эпизодам, test не участвует в отборе эпохи")
+
+
+def split_by_episode(ep, seed=0, fr=(0.7, 0.15)):
+    """train/val/test ПО ЭПИЗОДАМ. С одного эпизода берётся ~10 наблюдений,
+    и случайное разбиение наблюдений пустило бы соседние состояния в обе
+    части."""
+    u = np.unique(ep)
+    r = np.random.default_rng(seed).permutation(len(u))
+    n1, n2 = int(len(u) * fr[0]), int(len(u) * (fr[0] + fr[1]))
+    s = [set(u[r[:n1]]), set(u[r[n1:n2]]), set(u[r[n2:]])]
+    return tuple(np.where(np.isin(ep, list(x)))[0] for x in s)
+
+
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -194,8 +285,11 @@ def main() -> None:
     ap.add_argument("--n-obs", type=int, default=3000)
     ap.add_argument("--n-ep", type=int, default=300)
     ap.add_argument("--batch", type=int, default=8)
-    ap.add_argument("--pos-offset", type=int, default=4)
+    ap.add_argument("--offset-table", default="data/pos_offset_table.json")
+    ap.add_argument("--pos-offset", type=int, default=None,
+                    help="единый офсет — АБЛЯЦИЯ, а не протокол")
     ap.add_argument("--epochs", type=int, default=30)
+    ap.add_argument("--seeds", type=int, default=3)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
@@ -228,18 +322,24 @@ def main() -> None:
     cfg.TRAINING.ckpt_dir = args.ckpt
     cfg.MODEL.vlm.kwargs.pretrained_model_name_or_path = args.ckpt
     max_act_q = np.maximum(np.abs(ACTION_Q99), np.abs(ACTION_Q01))
-    tf = Compose([CenterCrop(int(224 * 0.875)), Resize(224)])
+    n_codes = int(cfg.MODEL.action_processor.vocab_size)
+
+    # ОФСЕТ ПО ЗАДАЧАМ, а не единый
+    off_by_task = None
+    if args.pos_offset is None:
+        if not os.path.exists(args.offset_table):
+            raise SystemExit(f"нет {args.offset_table}; постройте "
+                             f"k4b0_offset_table.py или задайте --pos-offset "
+                             f"(это АБЛЯЦИЯ, а не протокол)")
+        tb = json.load(open(args.offset_table))
+        # ключ таблицы — ОПИСАНИЕ задачи (k4b0_offset_table.py строит
+        # {описание: {suite, task_id, pos_offset}}), а по нему мы и ищем.
+        off_by_task = {k: int(v["pos_offset"]) for k, v in tb["tasks"].items()}
 
     model = SmolVLABlockwiseAR.from_pretrained(
         **cfg.MODEL.vlm.kwargs).to(dev, dtype).eval()
     proc = VisionLanguageActionProcessor.from_pretrained(
         args.ckpt, trust_remote_code=True, mode="discrete")
-
-    # ХУК НА ВХОД action_lm_head. bar.py:1247-1248 нормирует скрытое состояние
-    # экспертной башни и подаёт его в этот Linear, то есть на его входе ровно
-    # то, чем располагает предсказатель кодов. За вызов generate голова
-    # срабатывает ТРИЖДЫ (по разу на блок); берём ПЕРВЫЙ — только он доступен
-    # однопроходной архитектуре.
     grabbed = []
     model.action_lm_head.register_forward_hook(
         lambda m, i, o: grabbed.append(i[0].detach().float().cpu()))
@@ -258,140 +358,184 @@ def main() -> None:
     def png(cell):
         return np.asarray(Image.open(io.BytesIO(cell["bytes"])).convert("RGB"))
 
-    im1, im2, st, act, tsk = [], [], [], [], []
+    im1, im2, st, act, tsk, epi = [], [], [], [], [], []
     for e in order:
         if len(tsk) >= args.n_obs:
             break
         f = hf_hub_download(rid, f"data/chunk-{e // 1000:03d}/episode_{e:06d}.parquet",
                             repo_type="dataset", revision=rev)
         t = pq.read_table(f)
-        n = t.num_rows
-        if n < 20 + 1:
+        if t.num_rows < T_CHUNK + 1:
             continue
         A_ = np.asarray(t.column("actions").to_pylist(), np.float32)
         S_ = np.asarray(t.column("state").to_pylist(), np.float32)
         ti = t.column("task_index").to_pylist()
         c1, c2 = t.column("image").to_pylist(), t.column("wrist_image").to_pylist()
-        for s0 in rng.choice(n - 20 + 1, size=min(per_ep, n - 20 + 1),
-                             replace=False):
+        n_st = t.num_rows - T_CHUNK + 1
+        for s0 in rng.choice(n_st, size=min(per_ep, n_st), replace=False):
             im1.append(png(c1[int(s0)])); im2.append(png(c2[int(s0)]))
-            st.append(S_[int(s0)]); act.append(A_[int(s0):int(s0) + 20])
-            tsk.append(tasks_map[ti[int(s0)]])
-        if len(tsk) % 500 < per_ep:
-            print(f"  наблюдений {len(tsk)}", flush=True)
+            st.append(S_[int(s0)]); act.append(A_[int(s0):int(s0) + T_CHUNK])
+            tsk.append(tasks_map[ti[int(s0)]]); epi.append(int(e))
     N = len(tsk)
-    print(f"собрано {N} наблюдений")
+    epi = np.asarray(epi)
+    hw = im1[0].shape[0]
+    assert im1[0].shape[0] == im1[0].shape[1], f"неквадратная картинка {im1[0].shape}"
+    print(f"собрано {N} наблюдений, {len(np.unique(epi))} эпизодов, "
+          f"картинка {hw}x{hw}")
 
-    # --- истинные коды из ДЕЙСТВИЙ -------------------------------------------
+    # ПРЕОБРАЗОВАНИЕ ОТ ФАКТИЧЕСКОГО РАЗМЕРА. Обучающий протокол берёт 87.5%
+    # поля зрения (k3_bar_suffix_repair.py:210). Жёсткое int(224*0.875)=196
+    # верно только для картинок 224 из среды; на кадрах 256 из датасета оно
+    # обрезало бы 76.6% вместо 87.5%.
+    tf = Compose([CenterCrop(int(hw * 0.875)), Resize(224)])
+    # И НИКАКОГО РАЗВОРОТА КАНАЛОВ: `[:, :, ::-1]` в цикле оценки нужен
+    # картинкам из robosuite (BGR). PIL.convert("RGB") уже даёт RGB.
+
+    # --- истинные коды --------------------------------------------------------
     a_codec = np.asarray(act, np.float64).copy()
     a_codec[..., :-1] /= max_act_q[..., :-1]
     a_codec[..., -1] *= -1
+    a_codec = np.clip(a_codec, -1.0, 1.0)        # как в обучающем preprocessing
     toks = np.asarray(proc.action_processor.encode(a_codec), np.int64)
-    n_codes = int(cfg.MODEL.action_processor.vocab_size)
-    assert toks.shape[1] == N_POS * N_LEVEL, \
-        f"ожидалось {N_POS * N_LEVEL} токенов, получено {toks.shape[1]}"
-    # РАСКЛАДКА ПОУРОВНЕВАЯ, не перемежение по времени: BAR берёт блоками по
-    # block_size подряд (bar.py:1500-1503), значит первые 16 — уровень 0.
-    K = toks.reshape(N, N_LEVEL, N_POS)
+    assert toks.shape[1] == N_POS * N_LEVEL, f"токенов {toks.shape[1]}"
+    K_true = toks.reshape(N, N_LEVEL, N_POS)
 
-    # --- скрытые состояния первого блока -------------------------------------
-    H = []
+    # --- скрытые состояния и коды самой BAR ----------------------------------
+    H, K_bar = [], []
     st_n = ((process_state(np.asarray(st)) - STATE_Q01)
             / (STATE_Q99 - STATE_Q01) * 2.0 - 1.0)
-    for i0 in range(0, N, args.batch):
-        sl = slice(i0, min(i0 + args.batch, N))
-        b = sl.stop - sl.start
-        i1 = tf(torch.tensor(np.stack(im1[sl])[:, :, :, ::-1].copy()).permute(0, 3, 1, 2))
-        i2 = tf(torch.tensor(np.stack(im2[sl])[:, :, :, ::-1].copy()).permute(0, 3, 1, 2))
-        image = torch.cat([i1, i2], dim=-1)
-        msgs = []
-        for j in range(b):
+    # ГРУППИРОВКА ПО ОФСЕТУ: разные задачи требуют разного pos_offset, а он
+    # передаётся на весь батч.
+    offs = np.array([args.pos_offset if args.pos_offset is not None
+                     else off_by_task.get(tsk[i], 4) for i in range(N)])
+    # ОБХОД ПО ГРУППАМ ОФСЕТА, а не срезами общего порядка. Прежняя версия
+    # брала срез длиной batch и отбрасывала из него чужой офсет, но индекс
+    # всё равно двигался на batch — отброшенные наблюдения не обрабатывались
+    # НИКОГДА и оставались нулями в Hm.
+    done_cnt = 0
+    for po in sorted({int(v) for v in offs}):
+      idx_po = np.where(offs == po)[0]
+      for i0 in range(0, len(idx_po), args.batch):
+          sel = idx_po[i0:i0 + args.batch]
+          b = len(sel)
+          done_cnt += b
+          i1 = tf(torch.tensor(np.stack([im1[j] for j in sel])).permute(0, 3, 1, 2))
+          i2 = tf(torch.tensor(np.stack([im2[j] for j in sel])).permute(0, 3, 1, 2))
+          image = torch.cat([i1, i2], dim=-1)
+          msgs = []
+          for j, gi in enumerate(sel):
             m = prompt_template(
-                st_n[sl][j], None, tsk[sl.start + j],
+                st_n[gi], None, tsk[gi],
                 mode=cfg.MODEL.vla_processor.kwargs.mode,
                 action_vocab_size=n_codes,
                 action_token_len=cfg.MODEL.action_processor.token_len)
             m[1]["content"] = m[1]["content"][1:]
             msgs.append(m)
-        texts = proc.apply_chat_template(msgs, add_generation_prompt=True)
-        batch = proc(text=texts, images=[[image[j].numpy()] for j in range(b)],
+          texts = proc.apply_chat_template(msgs, add_generation_prompt=True)
+          batch = proc(text=texts, images=[[image[j].numpy()] for j in range(b)],
                      return_tensors="pt", padding=True, padding_side="left",
                      action_processor_kwargs={"embodiment_ids": 0})
-        batch = dict_apply(lambda x: x.to(dev, dtype), batch)
-        grabbed.clear()
-        with torch.no_grad():
-            model.generate(**batch, position_offset=args.pos_offset,
-                           do_sample=False, initial_position_shift=1)
-        assert len(grabbed) == N_LEVEL, \
-            f"голова сработала {len(grabbed)} раз, ждали {N_LEVEL} (по блоку)"
-        # ФОРМУ ПРОВЕРЯЕМ, А НЕ ПРЕДПОЛАГАЕМ. На первом блоке истории нет,
-        # запросов ровно block_size, поэтому вход головы обязан иметь ровно
-        # N_POS позиций. Если их больше, значит голова видит и историю, и
-        # молчаливый срез [-N_POS:] взял бы не то.
-        g0 = grabbed[0]
-        assert g0.shape[1] == N_POS, (
+          batch = dict_apply(lambda x: x.to(dev, dtype), batch)
+          grabbed.clear()
+          with torch.no_grad():
+            tk = model.generate(**batch, position_offset=po, do_sample=False,
+                                initial_position_shift=1)
+          assert len(grabbed) == N_LEVEL, f"голова сработала {len(grabbed)} раз"
+          g0 = grabbed[0]
+          assert g0.shape[1] == N_POS, (
             f"на первом блоке ждали {N_POS} позиций на входе action_lm_head, "
-            f"получено {g0.shape[1]} — разберитесь, где в этом тензоре запросы "
-            f"блока, прежде чем срезать")
-        H.append(g0.numpy())                            # ПЕРВЫЙ блок
-        if i0 % (args.batch * 50) == 0:
-            print(f"  скрытых состояний {i0 + b}/{N}", flush=True)
-    H = np.concatenate(H).astype(np.float32)
-    print(f"скрытые состояния: {H.shape}")
+            f"получено {g0.shape[1]}")
+          H.append((sel, g0.numpy(), tk.cpu().numpy().reshape(b, N_LEVEL, N_POS)))
+          if done_cnt % (args.batch * 50) < args.batch:
+            print(f"  {done_cnt}/{N} (офсет {po})", flush=True)
+    assert done_cnt == N, f"обработано {done_cnt} из {N} наблюдений"
+    Hm = np.zeros((N, N_POS, H[0][1].shape[-1]), np.float32)
+    K_bar = np.zeros((N, N_LEVEL, N_POS), np.int64)
+    for sel, hh, kk in H:
+        Hm[sel] = hh
+        K_bar[sel] = kk
+    print(f"скрытые состояния: {Hm.shape}; совпадение кодов BAR с истинными: "
+          f"{(K_bar == K_true).mean():.1%}")
 
-    # --- dH по уровням --------------------------------------------------------
-    def shuf(a, s):
-        return a[np.random.default_rng(s).permutation(a.shape[0])]
+    splits = split_by_episode(epi, seed=args.seed)
+    print(f"разбиение по эпизодам: train {len(splits[0])}, val {len(splits[1])}, "
+          f"test {len(splits[2])}")
+    grp = np.array([hash(t) % 997 for t in tsk])
 
-    res = {}
+    # --- dCE по уровням, усреднение по сидам ---------------------------------
+    res, heads = {}, {}
     for lvl in (1, 2):
-        prev = np.transpose(K[:, :lvl, :], (0, 2, 1))      # (N, POS, lvl)
-        y = K[:, lvl, :]
-        ce_c, acc_c, pred_c, idx = train_head(H, prev, y, n_codes, N_POS,
-                                              epochs=args.epochs, device=args.device)
-        ce_p, acc_p, pred_p, _ = train_head(H, shuf(prev, 100 + lvl), y, n_codes,
-                                            N_POS, epochs=args.epochs,
-                                            device=args.device)
-        gap = ce_p - ce_c
+        prev = np.transpose(K_true[:, :lvl, :], (0, 2, 1))
+        y = K_true[:, lvl, :]
+        acc = {}
+        for mode in ("true", "null", "shuffled"):
+            ces, preds = [], []
+            for s in range(args.seeds):
+                r = train_head(Hm, prev_variant(prev, mode, n_codes, grp, 7 + s),
+                               y, n_codes, splits, seed=s, epochs=args.epochs,
+                               device=args.device)
+                ces.append(r["ce"]); preds.append(r["pred"])
+                if mode == "true" and s == 0:
+                    heads[(lvl, "true")] = r
+                if mode == "null" and s == 0:
+                    heads[(lvl, "null")] = r
+            acc[mode] = (np.mean(ces, axis=0), preds[0])
+        dce = acc["null"][0] - acc["true"][0]
+        dsh = acc["shuffled"][0] - acc["true"][0]
+        con = concentration(dce)
         res[f"level{lvl}"] = dict(
-            ce_conditional=ce_c.tolist(), ce_parallel=ce_p.tolist(),
-            gap=gap.tolist(), acc_conditional=acc_c.tolist(),
-            acc_parallel=acc_p.tolist())
-        print(f"\n=== уровень {lvl}: dH по позициям")
-        print("  " + " ".join(f"{g:5.2f}" for g in gap))
-        srt = np.sort(gap)[::-1]
-        print(f"  среднее {gap.mean():.3f}; пять худших позиций дают "
-              f"{srt[:5].sum() / max(gap.sum(), 1e-9):.0%} всего разрыва")
-        print(f"  точность: обусловленно {acc_c.mean():.1%}, "
-              f"параллельно {acc_p.mean():.1%}")
+            dce_mean=float(dce.mean()), dce_shuffled_mean=float(dsh.mean()),
+            per_position=dce.mean(axis=0).tolist(), **con)
+        print(f"\n=== уровень {lvl}")
+        print(f"  dCE (NULL−TRUE)      {dce.mean():+.3f}")
+        print(f"  контроль (SHUF−TRUE) {dsh.mean():+.3f}")
+        print(f"  по абсолютным позициям: " +
+              " ".join(f"{v:5.2f}" for v in dce.mean(axis=0)))
+        print(f"  ПОЭКЗЕМПЛЯРНО: медианная доля топ-5 позиций {con['top5_share']:.2f}, "
+              f"позиций до 80% разрыва {con['n80']:.0f}, "
+              f"наблюдений с зависимостью {con['frac_active']:.0%}")
 
-        # --- ОШИБКА ДЕЙСТВИЯ, главная метрика --------------------------------
-        def decode(codes):
-            fl = codes.reshape(codes.shape[0], -1).tolist()
-            d = proc.action_processor.decode(fl)
-            return np.asarray(d if isinstance(d, np.ndarray) else d[0], np.float64)
+    # --- полная сборка: главная метрика --------------------------------------
+    ite = splits[2]
 
-        Kv = K[idx].copy()
-        ref = decode(Kv)
-        for name, pred in (("обусловленно", pred_c), ("параллельно", pred_p)):
-            Kx = Kv.copy()
-            Kx[:, lvl, :] = pred
-            err = np.linalg.norm(decode(Kx)[..., :6] - ref[..., :6], axis=-1).mean()
-            res[f"level{lvl}"][f"action_err_{name}"] = float(err)
-            print(f"  ошибка действия при подмене уровня {lvl}, {name}: {err:.4f}")
+    def decode(codes):
+        d = proc.action_processor.decode(codes.reshape(len(codes), -1).tolist())
+        return np.asarray(d if isinstance(d, np.ndarray) else d[0], np.float64)
+
+    a_ref = a_codec[ite]
+    variants = {"эксперт (истинные коды)": K_true[ite],
+                "BAR последовательная": K_bar[ite]}
+    for name, mode in (("один проход, NULL-головы", "null"),
+                       ("дешёвые условные головы", "true")):
+        Kx = K_bar[ite].copy()                   # k0 из первого блока — он есть
+        for lvl in (1, 2):
+            Kx[:, lvl, :] = heads[(lvl, mode)]["pred"]
+        variants[name] = Kx
+    print("\n" + "=" * 74)
+    print(f"  {'вариант':<28}{'поза RMS':>11}{'схват, доля':>13}{'к эксперту':>12}")
+    dec_ref = decode(K_true[ite])
+    rng_pose = float(a_ref[..., :6].max() - a_ref[..., :6].min())
+    for name, Kx in variants.items():
+        d = decode(Kx)
+        pose = float(np.sqrt(((d[..., :6] - a_ref[..., :6]) ** 2).mean())) / rng_pose
+        grip = float((np.sign(d[..., 6]) != np.sign(a_ref[..., 6])).mean())
+        vs = float(np.sqrt(((d[..., :6] - dec_ref[..., :6]) ** 2).mean())) / rng_pose
+        res[name] = dict(pose_rms=pose, gripper_frac=grip, vs_expert=vs)
+        print(f"  {name:<28}{pose:>11.4f}{grip:>13.1%}{vs:>12.4f}")
 
     print("\n  ЧИТАТЬ ТАК, правило записано до запуска.")
-    print("  Ошибка действия параллельно ≈ обусловленно (< +10%) — блоки не")
-    print("  нужны, хватает голов на общем скрытом состоянии.")
-    print("  Ошибка хуже, но dH сосредоточена в немногих позициях — нужна")
-    print("  дешёвая голова на мягком coarse-эмбеддинге, а не проход башни.")
-    print("  Ошибка хуже и dH размазана — оправдан новый токенизатор.")
+    print("  «один проход, NULL» ≈ «дешёвые условные» — блоки не нужны.")
+    print("  Хуже, но поэкземплярная концентрация высока (топ-5 > ~0.6) —")
+    print("  нужна дешёвая голова на мягком coarse, а не проход башни.")
+    print("  Хуже и концентрация низка — оправдан новый токенизатор.")
+    print("  Сравнивать надо с «BAR последовательная», а не с экспертом:")
+    print("  эксперт недостижим, он видит истинные действия.")
 
     if args.out:
         os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-        res["meta"] = dict(ckpt=args.ckpt, n_obs=N, n_codes=n_codes,
-                           pos_offset=args.pos_offset, epochs=args.epochs,
-                           hidden_dim=int(H.shape[-1]))
+        res["meta"] = dict(ckpt=args.ckpt, n_obs=N, n_episodes=int(len(np.unique(epi))),
+                           n_codes=n_codes, seeds=args.seeds, epochs=args.epochs,
+                           image_hw=int(hw), offsets=sorted(set(offs.tolist())))
         json.dump(res, open(args.out, "w"), ensure_ascii=False, indent=1)
         print(f"\n  сохранено: {args.out}")
 
