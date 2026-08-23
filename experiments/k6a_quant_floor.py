@@ -77,8 +77,17 @@ def roundtrip(actions, encode, decode, chunk=CHUNK):
         return np.zeros((0, chunk, 7))
     wins = np.stack([actions[t:t + chunk] for t in range(n)])
     toks = encode(wins)
-    dec = np.asarray(decode(toks))
-    return dec.reshape(n, chunk, -1)
+    dec = decode(toks)
+    # ДЕКОД ВОЗВРАЩАЕТ КОНТЕЙНЕР, НЕ МАССИВ. Официальный код берёт из него
+    # первый элемент: eval_libero.py — `decode(toks.tolist())[0]`. Без этого
+    # np.asarray падает на неоднородной форме.
+    if not isinstance(dec, np.ndarray):
+        dec = dec[0]
+    dec = np.asarray(dec, np.float64)
+    assert dec.size == n * chunk * actions.shape[1], (
+        f"неожиданная форма после декода: {dec.shape}, ждали "
+        f"({n}, {chunk}, {actions.shape[1]})")
+    return dec.reshape(n, chunk, actions.shape[1])
 
 
 def selftest():
