@@ -189,9 +189,16 @@ def main() -> None:
             f = hf_hub_download(
                 rid, f"data/chunk-{e // 1000:03d}/episode_{e:06d}.parquet",
                 repo_type="dataset", revision=rev)
-            acts = np.stack(pq.read_table(f).column("action").to_pylist())
+            # столбец называется "actions", не "action" — см.
+            # k4b0_build_router_dataset.py:158. Первая версия молча пропускала
+            # ВСЕ эпизоды по KeyError, поэтому имена столбцов печатаются.
+            tab = pq.read_table(f)
+            acts = np.asarray(tab.column("actions").to_pylist(), np.float32)
         except Exception as ex:                      # noqa: BLE001
-            print(f"  эпизод {e}: пропуск ({type(ex).__name__})")
+            cols = locals().get("tab")
+            print(f"  эпизод {e}: пропуск ({type(ex).__name__}: {ex})"
+                  + (f"; столбцы: {cols.column_names}" if cols is not None
+                     else ""))
             continue
         if len(acts) <= CHUNK + 2:
             continue
@@ -215,7 +222,10 @@ def main() -> None:
             break
 
     if not curves:
-        raise SystemExit("ни одного эпизода не загрузилось")
+        raise SystemExit(
+            "ни одного эпизода не загрузилось — смотрите причины пропуска выше; "
+            "молчаливый пропуск ВСЕХ эпизодов уже случался из-за неверного "
+            "имени столбца")
 
     plan = np.nanmean([c["plan"] for c in curves], axis=0)
     hold = np.nanmean([c["hold"] for c in curves], axis=0)
