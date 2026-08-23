@@ -163,12 +163,32 @@ def prev_variant(prev, mode, n_codes, group, seed):
         return np.full_like(prev, n_codes)     # выделенный постоянный код
     if mode == "shuffled":
         # ПЕРЕМЕШИВАЕМ ВНУТРИ ГРУППЫ (задачи): код от другой задачи дал бы
-        # заведомо неестественный вход, и контроль стал бы слишком лёгким.
-        out = prev.copy()
+        # заведомо неестественный вход. НО при маленьких группах перестановка
+        # почти тождественна (группа из одного элемента — вовсе тождество), и
+        # контроль вырождается: на дымовом прогоне SHUF-TRUE вышло +0.004 при
+        # NULL-TRUE +0.127, то есть перемешанные коды работали КАК НАСТОЯЩИЕ.
+        # Поэтому доля реально сдвинутых записей ИЗМЕРЯЕТСЯ, и при вырождении
+        # контроль расширяется на всю выборку с явным предупреждением.
         rng = np.random.default_rng(seed)
-        for gv in np.unique(group):
-            m = np.where(group == gv)[0]
-            out[m] = prev[m[rng.permutation(len(m))]]
+
+        def _perm_within(g):
+            out = prev.copy()
+            moved = 0
+            for gv in np.unique(g):
+                m = np.where(g == gv)[0]
+                pm = m[rng.permutation(len(m))]
+                out[m] = prev[pm]
+                moved += int((pm != m).sum())
+            return out, moved / max(len(g), 1)
+
+        out, frac = _perm_within(group)
+        if frac < 0.5:
+            out2, frac2 = _perm_within(np.zeros(len(group), int))
+            print(f"    ВНИМАНИЕ: перестановка внутри задач сдвинула лишь "
+                  f"{frac:.0%} записей (группы слишком малы) — контроль "
+                  f"расширен на всю выборку, сдвинуто {frac2:.0%}. Вход стал "
+                  f"менее естественным, читать контроль с оговоркой.")
+            return out2
         return out
     raise ValueError(mode)
 
