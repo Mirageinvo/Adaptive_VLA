@@ -280,6 +280,27 @@ def selftest(epochs=25):
     print("  разбиение по эпизодам, test не участвует в отборе эпохи")
 
 
+class _Tee:
+    """Дублировать stdout в файл. Печать остаётся на экране, но прогон
+    полностью сохраняется: числа зонда рождаются один раз и переигрываются
+    дорого, поэтому терять вывод нельзя. Пишем с немедленным сбросом, чтобы
+    лог был читаем и у оборванного процесса."""
+
+    def __init__(self, path):
+        os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+        self.f = open(path, "a", encoding="utf-8")
+        self.out = sys.stdout
+
+    def write(self, s):
+        self.out.write(s)
+        self.f.write(s)
+        self.f.flush()
+
+    def flush(self):
+        self.out.flush()
+        self.f.flush()
+
+
 def split_by_episode(ep, seed=0, fr=(0.7, 0.15)):
     """train/val/test ПО ЭПИЗОДАМ. С одного эпизода берётся ~10 наблюдений,
     и случайное разбиение наблюдений пустило бы соседние состояния в обе
@@ -312,7 +333,18 @@ def main() -> None:
     ap.add_argument("--seeds", type=int, default=3)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--log", default=None,
+                    help="куда дублировать вывод; по умолчанию рядом с --out "
+                         "с расширением .log")
     args = ap.parse_args()
+
+    log_path = args.log or (os.path.splitext(args.out)[0] + ".log"
+                            if args.out else None)
+    if log_path:
+        import datetime
+        sys.stdout = _Tee(log_path)
+        print(f"\n===== {datetime.datetime.now():%Y-%m-%d %H:%M:%S} =====")
+        print("$ " + " ".join(sys.argv))
 
     if args.selftest:
         selftest()
