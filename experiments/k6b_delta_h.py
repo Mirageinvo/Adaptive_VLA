@@ -402,8 +402,17 @@ def main() -> None:
 
     # --- скрытые состояния и коды самой BAR ----------------------------------
     H, K_bar = [], []
-    st_n = ((process_state(np.asarray(st)) - STATE_Q01)
-            / (STATE_Q99 - STATE_Q01) * 2.0 - 1.0)
+    # СОСТОЯНИЕ ИЗ ДАТАСЕТА УЖЕ ОБРАБОТАНО. process_state нужен только сырым
+    # наблюдениям среды: он ждёт 9 измерений (схват 2, позиция 3, кватернион 4)
+    # и переводит кватернион в ось-угол. В LeRobot состояние уже в целевом
+    # 8-мерном виде, и k4b0_build_router_dataset.py:575 нормирует его напрямую.
+    ST_RAW = np.asarray(st, np.float64)
+    if ST_RAW.shape[1] == len(STATE_Q01) + 1:
+        ST_RAW = process_state(ST_RAW)           # на случай сырого формата
+    assert ST_RAW.shape[1] == len(STATE_Q01), (
+        f"состояние имеет {ST_RAW.shape[1]} измерений, нормировка ждёт "
+        f"{len(STATE_Q01)}")
+    st_n = (ST_RAW - STATE_Q01) / (STATE_Q99 - STATE_Q01) * 2.0 - 1.0
     # ГРУППИРОВКА ПО ОФСЕТУ: разные задачи требуют разного pos_offset, а он
     # передаётся на весь батч.
     offs = np.array([args.pos_offset if args.pos_offset is not None
