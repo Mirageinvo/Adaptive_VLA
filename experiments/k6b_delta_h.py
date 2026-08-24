@@ -530,17 +530,17 @@ def main() -> None:
         y = K_true[:, lvl, :]
         acc = {}
         for mode in ("true", "null", "shuffled"):
-            ces, preds = [], []
+            ces = []
+            # ХРАНИМ ВСЕ СИДЫ, а не нулевой: таблица действий раньше строилась
+            # по одному сиду, и разброс обучения головы попадал в неё целиком.
+            heads[(lvl, mode)] = []
             for s in range(args.seeds):
                 r = train_head(Hm, prev_variant(prev, mode, n_codes, grp, 7 + s),
                                y, n_codes, splits, seed=s, epochs=args.epochs,
                                device=args.device)
-                ces.append(r["ce"]); preds.append(r["pred"])
-                if mode == "true" and s == 0:
-                    heads[(lvl, "true")] = r
-                if mode == "null" and s == 0:
-                    heads[(lvl, "null")] = r
-            acc[mode] = (np.mean(ces, axis=0), preds[0])
+                ces.append(r["ce"])
+                heads[(lvl, mode)].append(r)
+            acc[mode] = (np.mean(ces, axis=0), heads[(lvl, mode)][0]["pred"])
         dce = acc["null"][0] - acc["true"][0]
         dsh = acc["shuffled"][0] - acc["true"][0]
         con = concentration(dce)
@@ -564,25 +564,59 @@ def main() -> None:
         return np.asarray(d if isinstance(d, np.ndarray) else d[0], np.float64)
 
     a_ref = a_codec[ite]
-    variants = {"эксперт (истинные коды)": K_true[ite],
-                "BAR последовательная": K_bar[ite]}
-    for name, mode in (("один проход, NULL-головы", "null"),
-                       ("дешёвые условные головы", "true")):
-        Kx = K_bar[ite].copy()                   # k0 из первого блока — он есть
+    Hte = torch.as_tensor(Hm[ite], dtype=torch.float32).to(dev)
+
+    def chain_predict(seed_i):
+        """Условная цепочка НА СВОИХ предсказаниях, а не на истинных кодах.
+
+        Прежняя версия подавала головам ИСТИННЫЕ k0,k1, недоступные на
+        инференсе, — то есть давала условному варианту фору. Здесь k0 берётся
+        из первого блока BAR (он в однопроходной схеме есть), а дальше каждый
+        уровень получает то, что предсказал предыдущий.
+        """
+        Kx = K_bar[ite].copy()
+        chain = K_bar[ite][:, :1, :].copy()          # (n, 1, POS)
         for lvl in (1, 2):
-            Kx[:, lvl, :] = heads[(lvl, mode)]["pred"]
-        variants[name] = Kx
-    print("\n" + "=" * 74)
-    print(f"  {'вариант':<28}{'поза RMS':>11}{'схват, доля':>13}{'к эксперту':>12}")
+            m = heads[(lvl, "true")][seed_i]["model"].eval()
+            inp = torch.as_tensor(np.transpose(chain, (0, 2, 1)),
+                                  dtype=torch.long).to(dev)
+            with torch.no_grad():
+                pr = m(Hte, inp).argmax(-1).cpu().numpy()
+            Kx[:, lvl, :] = pr
+            chain = np.concatenate([chain, pr[:, None, :]], axis=1)
+        return Kx
+
     dec_ref = decode(K_true[ite])
     rng_pose = float(a_ref[..., :6].max() - a_ref[..., :6].min())
-    for name, Kx in variants.items():
+
+    def score(Kx):
         d = decode(Kx)
-        pose = float(np.sqrt(((d[..., :6] - a_ref[..., :6]) ** 2).mean())) / rng_pose
-        grip = float((np.sign(d[..., 6]) != np.sign(a_ref[..., 6])).mean())
-        vs = float(np.sqrt(((d[..., :6] - dec_ref[..., :6]) ** 2).mean())) / rng_pose
-        res[name] = dict(pose_rms=pose, gripper_frac=grip, vs_expert=vs)
-        print(f"  {name:<28}{pose:>11.4f}{grip:>13.1%}{vs:>12.4f}")
+        return (float(np.sqrt(((d[..., :6] - a_ref[..., :6]) ** 2).mean())) / rng_pose,
+                float((np.sign(d[..., 6]) != np.sign(a_ref[..., 6])).mean()),
+                float(np.sqrt(((d[..., :6] - dec_ref[..., :6]) ** 2).mean())) / rng_pose)
+
+    print("\n" + "=" * 82)
+    print(f"  {'вариант':<28}{'поза RMS':>11}{'схват, доля':>13}{'к эксперту':>12}"
+          f"{'разброс сидов':>15}")
+    rows = [("эксперт (истинные коды)", [K_true[ite]]),
+            ("BAR последовательная", [K_bar[ite]])]
+    null_v, cond_v = [], []
+    for s_i in range(args.seeds):
+        Kn = K_bar[ite].copy()
+        for lvl in (1, 2):
+            Kn[:, lvl, :] = heads[(lvl, "null")][s_i]["pred"]
+        null_v.append(Kn)
+        cond_v.append(chain_predict(s_i))
+    rows += [("один проход, NULL-головы", null_v),
+             ("дешёвые условные (свои коды)", cond_v)]
+    for name, mats in rows:
+        sc = np.array([score(M) for M in mats])
+        m_, sd = sc.mean(axis=0), sc.std(axis=0)
+        res[name] = dict(pose_rms=float(m_[0]), gripper_frac=float(m_[1]),
+                         vs_expert=float(m_[2]), pose_rms_sd=float(sd[0]),
+                         n_seeds=len(mats))
+        print(f"  {name:<28}{m_[0]:>11.4f}{m_[1]:>13.1%}{m_[2]:>12.4f}"
+              f"{sd[0]:>15.4f}")
 
     print("\n  ЧИТАТЬ ТАК, правило записано до запуска.")
     print("  «один проход, NULL» ≈ «дешёвые условные» — блоки не нужны.")
