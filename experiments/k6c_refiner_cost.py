@@ -62,6 +62,8 @@ def main() -> None:
     ap.add_argument("--n-pos", type=int, default=16)
     ap.add_argument("--d-model", type=int, default=768)
     ap.add_argument("--n-codes", type=int, default=2048)
+    ap.add_argument("--ctx-len", type=int, default=171,
+                    help="длина закэшированного префикса VLM для cross-attention")
     ap.add_argument("--warmup", type=int, default=50)
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--out", default=None)
@@ -99,15 +101,42 @@ def main() -> None:
             x = self.enc(x)
             return [o(x) for o in self.out]
 
-    def timeit(m, x):
+    class RefinerXA(nn.Module):
+        """Уточнитель с доступом к ЗАКЭШИРОВАННОМУ префиксу VLM.
+
+        K-6b показал разрыв 30% у головы, видящей только h. K-6c показал, что
+        ёмкость тут ни при чём — влезает даже 24 слоя. Значит не хватает
+        ИНФОРМАЦИИ: блоки 2-3 перечитывают изображение, а голова нет.
+        Перекрёстное внимание к префиксу эту информацию возвращает, причём
+        БЕСПЛАТНО по кодированию: k5a_prefix_cost_probe доказал побитовую
+        идентичность кэша (расхождение 0.000e+00 по всем 24 слоям), значит
+        ключи и значения уже посчитаны в единственном тяжёлом проходе.
+        Платим только за само внимание 16 запросов к ctx ключам.
+        """
+
+        def __init__(self, layers, d, ctx, heads=8, ff=4):
+            super().__init__()
+            self.dec = nn.TransformerDecoder(
+                nn.TransformerDecoderLayer(d, heads, d * ff, batch_first=True,
+                                           norm_first=True, dropout=0.0),
+                num_layers=layers)
+            self.out = nn.ModuleList([nn.Linear(d, args.n_codes)
+                                      for _ in range(3)])
+            self.ctx = ctx
+
+        def forward(self, x, mem):
+            x = self.dec(x, mem)
+            return [o(x) for o in self.out]
+
+    def timeit(m, *xs):
         with torch.no_grad():
             for _ in range(args.warmup):
-                m(x)
+                m(*xs)
             if dev.type == "cuda":
                 torch.cuda.synchronize()
             t0 = time.perf_counter()
             for _ in range(args.iters):
-                m(x)
+                m(*xs)
             if dev.type == "cuda":
                 torch.cuda.synchronize()
         return (time.perf_counter() - t0) / args.iters * 1e3
@@ -118,25 +147,29 @@ def main() -> None:
           f"(24 слоя над 187 токенами)")
     print(f"  бюджет: {budget_for(1.4):.1f} мс на 1.4x, "
           f"{budget_for(1.3):.1f} мс на 1.3x\n")
-    print(f"  {'слоёв':>6}{'d':>6}{'мс':>9}{'доля прохода':>15}"
+    print(f"  {'слоёв':>6}{'d':>6}{'вход':>10}{'мс':>9}{'доля прохода':>15}"
           f"{'ускорение итого':>17}{'вердикт':>10}")
     rows = []
     for d in (args.d_model, args.d_model * 2):
         for L in (2, 4, 6, 12, 24):
-            m = Refiner(L, d).to(dev, dtype).eval()
             x = torch.randn(1, args.n_pos, d, device=dev, dtype=dtype)
-            ms = timeit(m, x)
-            total = ONE_PASS_MS + ms
-            sp = CACHED_BAR_MS / total
-            ok = "да" if ms <= budget_for(1.4) else (
-                "1.3x" if ms <= budget_for(1.3) else "нет")
-            rows.append(dict(layers=L, d_model=d, ms=ms, total_ms=total,
-                             speedup=sp))
-            print(f"  {L:>6}{d:>6}{ms:>9.3f}{ms / EXPERT_PASS_MS:>14.1%}"
-                  f"{sp:>16.2f}x{ok:>10}")
-            del m, x
-            if dev.type == "cuda":
-                torch.cuda.empty_cache()
+            mem = torch.randn(1, args.ctx_len, d, device=dev, dtype=dtype)
+            for kind in ("сам", "сам+кэш"):
+                m = (Refiner(L, d) if kind == "сам"
+                     else RefinerXA(L, d, args.ctx_len)).to(dev, dtype).eval()
+                ms = timeit(m, x) if kind == "сам" else timeit(m, x, mem)
+                total = ONE_PASS_MS + ms
+                sp = CACHED_BAR_MS / total
+                ok = "да" if ms <= budget_for(1.4) else (
+                    "1.3x" if ms <= budget_for(1.3) else "нет")
+                rows.append(dict(layers=L, d_model=d, kind=kind, ms=ms,
+                                 total_ms=total, speedup=sp))
+                print(f"  {L:>6}{d:>6}{kind:>10}{ms:>9.3f}"
+                      f"{ms / EXPERT_PASS_MS:>14.1%}{sp:>16.2f}x{ok:>10}")
+                del m
+                if dev.type == "cuda":
+                    torch.cuda.empty_cache()
+            del x, mem
 
     print("\n  ЧИТАТЬ ТАК, правило записано до запуска.")
     print("  Если время почти не растёт с глубиной — доминируют накладные")
@@ -145,6 +178,9 @@ def main() -> None:
     print("  Если растёт линейно — глубина стоит денег, и выбирать её надо")
     print("  по кривой качества из развёртки, а не по максимуму.")
     print("  Замер — НИЖНЯЯ оценка: интеграция добавит перекладывания.")
+    print("  Разница «сам» и «сам+кэш» — цена ДОСТУПА К ПРЕФИКСУ. Сам префикс")
+    print("  уже посчитан в единственном тяжёлом проходе и кэшируется точно")
+    print("  (k5a: расхождение 0.000e+00), поэтому платим только за внимание.")
 
     if args.out:
         os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".",
