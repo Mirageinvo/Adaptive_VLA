@@ -72,6 +72,7 @@ def build_refiner(layers, d, d_in, d_ctx, xa_at, n_codes, n_out, heads=8, ff=4):
     class Refiner(nn.Module):
         def __init__(self):
             super().__init__()
+            self.in_norm = nn.LayerNorm(d_in)
             self.inp = nn.Linear(d_in, d)
             self.pos = nn.Embedding(N_POS, d)
             self.blocks = nn.ModuleList([
@@ -80,6 +81,13 @@ def build_refiner(layers, d, d_in, d_ctx, xa_at, n_codes, n_out, heads=8, ff=4):
                 for _ in range(layers)])
             self.xa_at = set(xa_at)
             if self.xa_at:
+                # НОРМИРОВКА КОНТЕКСТА ОБЯЗАТЕЛЬНА. ctx снят как ВХОД
+                # input_layernorm последнего слоя VLM, то есть остаточный
+                # поток ДО нормализации: у языковых моделей там выбросы в
+                # сотни единиц. Без LayerNorm проекция взрывается, и вариант
+                # с доступом к префиксу оказывается ХУЖЕ варианта без него —
+                # ровно это и наблюдалось (0.0449 против 0.0320).
+                self.ctx_norm = nn.LayerNorm(d_ctx)
                 self.ctx_proj = nn.Linear(d_ctx, d)
                 self.xa = nn.ModuleDict({
                     str(i): nn.MultiheadAttention(d, heads, batch_first=True)
@@ -92,9 +100,9 @@ def build_refiner(layers, d, d_in, d_ctx, xa_at, n_codes, n_out, heads=8, ff=4):
 
         def forward(self, x, mem=None, mem_mask=None):
             b = x.shape[0]
-            x = self.inp(x) + self.pos(
+            x = self.inp(self.in_norm(x)) + self.pos(
                 torch.arange(N_POS, device=x.device)).unsqueeze(0).expand(b, -1, -1)
-            m = self.ctx_proj(mem) if self.xa_at else None
+            m = self.ctx_proj(self.ctx_norm(mem)) if self.xa_at else None
             for i, blk in enumerate(self.blocks):
                 x = blk(x)
                 if i in self.xa_at:
@@ -177,6 +185,13 @@ def main() -> None:
         d = proc.action_processor.decode(codes.reshape(len(codes), -1).tolist())
         return np.asarray(d if isinstance(d, np.ndarray) else d[0], np.float64)
 
+    # ДИАГНОСТИКА МАСШТАБОВ. Если ctx на порядки больше h, сырая проекция
+    # без нормировки заведомо неустойчива — это и была причина провала.
+    for nm, arr in (("h", h), ("ctx", ctx)):
+        a = np.asarray(arr[:200], np.float32)
+        print(f"  {nm:>4}: |avg| {np.abs(a).mean():8.3f}  max {np.abs(a).max():9.1f}  "
+              f"sd {a.std():8.3f}")
+
     splits = split_by_episode(epi, seed=args.seed)
     itr, iva, ite = splits
     print(f"разбиение по эпизодам: {len(itr)}/{len(iva)}/{len(ite)}")
@@ -218,6 +233,14 @@ def main() -> None:
             m = build_refiner(L, d, d_act, d_vlm, xa_at, n_codes,
                               len(levels)).to(dev)
             opt = torch.optim.AdamW(m.parameters(), lr=args.lr, weight_decay=1e-4)
+            # ПРОГРЕВ И КОСИНУС. Без прогрева глубокий трансформер с
+            # norm_first расходится на первых шагах, и глубина начинает
+            # ВРЕДИТЬ — что и наблюдалось (12 слоёв хуже 4).
+            steps = args.epochs * max(1, len(itr) // args.batch)
+            warm = max(1, steps // 20)
+            sched = torch.optim.lr_scheduler.LambdaLR(
+                opt, lambda t: (t + 1) / warm if t < warm
+                else 0.5 * (1 + np.cos(np.pi * (t - warm) / max(1, steps - warm))))
             lossf = nn.CrossEntropyLoss()
             g = torch.Generator().manual_seed(s_i)
             best = (1e9, None)
@@ -237,7 +260,9 @@ def main() -> None:
                                      y[:, k, :].reshape(-1))
                                for k in range(len(levels))) / len(levels)
                     loss.backward()
+                    nn.utils.clip_grad_norm_(m.parameters(), 1.0)
                     opt.step()
+                    sched.step()
                 m.eval()
                 with torch.no_grad():
                     vs = []
@@ -252,10 +277,29 @@ def main() -> None:
                         vs.append(sum(lossf(lg[k].reshape(-1, n_codes),
                                             y[:, k, :].reshape(-1)).item()
                                       for k in range(len(levels))))
-                    v = float(np.mean(vs))
+                    v_ce = float(np.mean(vs))
+                    # ОТБОР ПО ОШИБКЕ ДЕЙСТВИЯ, а не по кросс-энтропии.
+                    # Декодер принимает СУММУ латентов (§1), поэтому промах на
+                    # соседний по эмбеддингу код почти бесплатен, и токенная
+                    # энтропия с ошибкой действия расходятся.
+                    Kv = K_bar[iva].copy()
+                    for i in range(0, len(iva), 256):
+                        j = iva[i:i + 256]
+                        x = torch.as_tensor(h[j], dtype=torch.float32).to(dev)
+                        mem = (torch.as_tensor(ctx[j], dtype=torch.float32).to(dev)
+                               if xa_at else None)
+                        mm = (torch.as_tensor(pad_mask[j]).to(dev) if xa_at else None)
+                        lg = m(x, mem, mm)
+                        for k, lv in enumerate(levels):
+                            Kv[i:i + len(j), lv, :] = lg[k].argmax(-1).cpu().numpy()
+                    dv = decode(Kv)
+                    v = float(np.sqrt(((dv[..., :6] - act[iva][..., :6]) ** 2).mean()))
                 if v < best[0]:
                     best = (v, {k: p.detach().clone()
                                 for k, p in m.state_dict().items()})
+                if ep_i % 10 == 0 or ep_i == args.epochs - 1:
+                    print(f"      эпоха {ep_i:>3}: CE {v_ce:.3f}, "
+                          f"ошибка действия на val {v / rng_pose:.4f}", flush=True)
             m.load_state_dict(best[1])
             m.eval()
             Kx = K_bar[ite].copy()
