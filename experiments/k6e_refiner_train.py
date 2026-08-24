@@ -145,6 +145,9 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--ce-weight", type=float, default=0.01,
+                    help="вес кросс-энтропии как регуляризатора; основная "
+                         "цель — реконструкция суммы латентов")
     ap.add_argument("--seeds", type=int, default=2)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--predict-level0", action="store_true",
@@ -192,15 +195,47 @@ def main() -> None:
         print(f"  {nm:>4}: |avg| {np.abs(a).mean():8.3f}  max {np.abs(a).max():9.1f}  "
               f"sd {a.std():8.3f}")
 
+    dev = torch.device(args.device)
+
+    # --- КОДБУКИ: вектор, который код ДОБАВЛЯЕТ к сумме -----------------------
+    # k1_residual_cost.projected_codebooks: from_codes складывает
+    # out_project(decode_code(c)), и остаток живёт именно там.
+    ac = proc.action_processor
+    codec = getattr(ac, "vq", None) and ac or getattr(ac, "codec", None)
+    if codec is None or not hasattr(codec, "vq"):
+        raise SystemExit(
+            "не нашёл квантователь в action_processor: нужен объект с .vq."
+            " Посмотрите dir(proc.action_processor) и подставьте путь.")
+    with torch.no_grad():
+        idx = torch.arange(int(codec.vocab_size)).unsqueeze(0)
+        E = torch.stack([q.out_project(q.decode_code(idx))[0]
+                         for q in codec.vq.quantizers]).float()
+    assert E.shape[0] == N_LEVEL, f"уровней в кодбуке {E.shape[0]}"
+    print(f"  кодбуки: {tuple(E.shape)}  (уровни, коды, размерность латенты)")
+    E = E.to(dev)
+
+    def lat(codes_lp):
+        """Сумма латентов по кодам (N, L, P) -> (N, P, D)."""
+        c = torch.as_tensor(codes_lp).long().to(dev)
+        return sum(E[j][c[:, j, :]] for j in range(N_LEVEL))
+
     splits = split_by_episode(epi, seed=args.seed)
     itr, iva, ite = splits
     print(f"разбиение по эпизодам: {len(itr)}/{len(iva)}/{len(ite)}")
 
-    dev = torch.device(args.device)
     # МАСКА ПАДДИНГА ОБЯЗАТЕЛЬНА. Паддинг слева, значимая часть прижата
     # вправо; без маски перекрёстное внимание смотрело бы в нули.
     pad_mask = (np.arange(L_ctx)[None, :] < (L_ctx - ctx_len[:, None]))
     levels = list(range(N_LEVEL)) if args.predict_level0 else [1, 2]
+    # ЦЕЛЬ — сумма по ИСТИННЫМ кодам всех трёх уровней; БАЗА — вклад уровня 0
+    # от BAR, который на инференсе достаётся бесплатно из первого блока.
+    with torch.no_grad():
+        lat_t = torch.cat([lat(K_true[i:i + 512]).cpu()
+                           for i in range(0, N, 512)]).to(dev)
+        lat0 = torch.cat([(E[0][torch.as_tensor(K_bar[i:i + 512, 0, :]).long().to(dev)]).cpu()
+                          for i in range(0, N, 512)]).to(dev)
+    print(f"  целевая латента: {tuple(lat_t.shape)}, "
+          f"вклад уровня 0 от BAR: {tuple(lat0.shape)}")
     a_ref = act[ite]
     rng_pose = float(a_ref[..., :6].max() - a_ref[..., :6].min())
     dec_ref = decode(K_true[ite])
@@ -256,9 +291,25 @@ def main() -> None:
                     y = torch.as_tensor(K_true[j][:, levels, :]).long().to(dev)
                     opt.zero_grad()
                     lg = m(x, mem, mm)
-                    loss = sum(lossf(lg[k].reshape(-1, n_codes),
-                                     y[:, k, :].reshape(-1))
-                               for k in range(len(levels))) / len(levels)
+                    # ЛАТЕНТНЫЙ ЛОСС, А НЕ КРОСС-ЭНТРОПИЯ ПО КОДАМ.
+                    # Декодер принимает СУММУ латентов (§1): промах на
+                    # соседний по эмбеддингу код почти бесплатен для действия,
+                    # но кросс-энтропией штрафуется полностью. Отсюда и
+                    # наблюдавшееся CE выше равномерного (10.6-12.7 против
+                    # ln(2048)=7.62) при вполне приличном действии.
+                    # Мягкое ожидание по кодбуку дифференцируемо, argmax
+                    # обходится, цель совпадает с тем, что видит декодер.
+                    # ВАЖНО: в сумму входит и вклад уровня 0 ОТ BAR, поэтому
+                    # уточнитель может научиться компенсировать её грубые
+                    # промахи, а не только угадывать свои уровни.
+                    pred_lat = lat0[j].clone()
+                    for k, lv in enumerate(levels):
+                        pred_lat = pred_lat + torch.softmax(lg[k], -1) @ E[lv]
+                    loss = ((pred_lat - lat_t[j]) ** 2).mean()
+                    ce = sum(lossf(lg[k].reshape(-1, n_codes),
+                                   y[:, k, :].reshape(-1))
+                             for k in range(len(levels))) / len(levels)
+                    loss = loss + args.ce_weight * ce
                     loss.backward()
                     nn.utils.clip_grad_norm_(m.parameters(), 1.0)
                     opt.step()
@@ -298,8 +349,27 @@ def main() -> None:
                     best = (v, {k: p.detach().clone()
                                 for k, p in m.state_dict().items()})
                 if ep_i % 10 == 0 or ep_i == args.epochs - 1:
-                    print(f"      эпоха {ep_i:>3}: CE {v_ce:.3f}, "
-                          f"ошибка действия на val {v / rng_pose:.4f}", flush=True)
+                    # ОБЕ величины рядом намеренно. Их расхождение — измеренное
+                    # свойство кодека: декодер видит сумму, поэтому попадание в
+                    # код и попадание в действие суть разные цели.
+                    with torch.no_grad():
+                        pl = lat0[iva].clone()
+                        for i in range(0, len(iva), 256):
+                            jj = iva[i:i + 256]
+                            xx = torch.as_tensor(h[jj], dtype=torch.float32).to(dev)
+                            mmx = (torch.as_tensor(ctx[jj], dtype=torch.float32).to(dev)
+                                   if xa_at else None)
+                            mmk = (torch.as_tensor(pad_mask[jj]).to(dev)
+                                   if xa_at else None)
+                            lgx = m(xx, mmx, mmk)
+                            acc_l = lat0[jj].clone()
+                            for k, lv in enumerate(levels):
+                                acc_l = acc_l + torch.softmax(lgx[k], -1) @ E[lv]
+                            pl[i:i + len(jj)] = acc_l
+                        lat_err = float(((pl - lat_t[iva]) ** 2).mean())
+                    print(f"      эпоха {ep_i:>3}: латента {lat_err:.4f}, "
+                          f"CE {v_ce:.3f}, действие на val {v / rng_pose:.4f}",
+                          flush=True)
             m.load_state_dict(best[1])
             m.eval()
             Kx = K_bar[ite].copy()
