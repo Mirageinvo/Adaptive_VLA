@@ -244,8 +244,18 @@ def main() -> None:
                         np.int64).reshape(N, N_LEVEL, N_POS)
 
     # --- проход модели --------------------------------------------------------
+    # НИКАКОГО МОЛЧАЛИВОГО ОТКАТА НА 4: промах в сопоставлении названий
+    # незаметно превратился бы в неверный офсет, а он МЕНЯЕТ план
+    # (k4b0_padding_probe: оракул 0.941 против 0.872).
+    if args.pos_offset is None:
+        miss = sorted({t for t in tsk if t not in off_by_task})
+        if miss:
+            raise SystemExit(
+                f"в таблице офсетов нет {len(miss)} задач, например: "
+                f"{miss[:3]}. Пересоберите k4b0_offset_table.py или задайте "
+                f"--pos-offset явно (это АБЛЯЦИЯ).")
     offs = np.array([args.pos_offset if args.pos_offset is not None
-                     else off_by_task.get(tsk[i], 4) for i in range(N)])
+                     else off_by_task[tsk[i]] for i in range(N)])
     Hm = None
     K_bar = np.zeros((N, N_LEVEL, N_POS), np.int64)
     ctx_parts, ctx_idx, ctx_lens = [], [], np.zeros(N, np.int32)
@@ -273,6 +283,10 @@ def main() -> None:
                          images=[[image[j].numpy()] for j in range(b)],
                          return_tensors="pt", padding=True, padding_side="left",
                          action_processor_kwargs={"embodiment_ids": 0})
+            # ДЛИНЫ БЕРЁМ ДО ПЕРЕНОСА НА GPU. Раньше в ctx_len писалась
+            # длина ВСЕГО БАТЧА после паддинга, одинаковая для всех, и
+            # перекрёстное внимание считало бы паддинг настоящим контекстом.
+            real_lens = batch["attention_mask"].sum(dim=1).numpy().astype(np.int32)
             batch = dict_apply(lambda x: x.to(dev, dtype), batch)
             grab_h.clear(); grab_ctx.clear()
             with torch.no_grad():
@@ -290,8 +304,11 @@ def main() -> None:
             if not args.no_ctx:
                 assert len(grab_ctx) >= 1, "хук на слой VLM не сработал"
                 c = grab_ctx[0].numpy()          # ПЕРВЫЙ блок, как и h
+                assert c.shape[1] >= real_lens.max(), (
+                    f"контекст короче маски: {c.shape[1]} против "
+                    f"{real_lens.max()}")
                 ctx_parts.append(c); ctx_idx.append(sel)
-                ctx_lens[sel] = c.shape[1]
+                ctx_lens[sel] = real_lens
             if done_cnt % (args.batch * 50) < args.batch:
                 print(f"  {done_cnt}/{N} (офсет {po})", flush=True)
     assert done_cnt == N, f"обработано {done_cnt} из {N}"
@@ -306,8 +323,14 @@ def main() -> None:
         for c, sel in zip(ctx_parts, ctx_idx):
             ctx[sel, L - c.shape[1]:, :] = c      # левый паддинг, как в процессоре
         out["ctx"] = ctx
+        # ПРОВЕРКА, ЧТО ДЛИНЫ НАСТОЯЩИЕ, А НЕ ПАДДИНГ. Если бы писалась
+        # длина батча, разброс схлопнулся бы почти в точку.
+        assert ctx_lens.max() > ctx_lens.min(), (
+            "все длины контекста одинаковы — почти наверняка записана длина "
+            "батча, а не число значимых токенов")
         print(f"префикс: {ctx.shape}, {ctx.nbytes / 2**30:.2f} ГиБ; "
-              f"длины {ctx_lens.min()}–{ctx_lens.max()}")
+              f"значимых токенов {ctx_lens.min()}–{ctx_lens.max()} "
+              f"(медиана {int(np.median(ctx_lens))})")
     print(f"h: {Hm.shape}; совпадение кодов BAR с истинными: "
           f"{(K_bar == K_true).mean():.1%}")
 

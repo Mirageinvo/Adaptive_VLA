@@ -152,6 +152,12 @@ def train_head(X, prev, y, n_codes, splits, seed=0, epochs=30, hid=512,
                            Yte.reshape(-1)).reshape(Yte.shape)
             best = (v, ce.cpu().numpy(), lg.argmax(-1).cpu().numpy(),
                     {k: p.detach().clone() for k, p in m.state_dict().items()})
+    # ВЕРНУТЬ ЛУЧШУЮ ПО ВАЛИДАЦИИ, А НЕ ПОСЛЕДНЮЮ. Прежде `ce` и `pred`
+    # брались с лучшей эпохи, а объект модели отдавался после последней —
+    # значит цепочка chain_predict работала на другом чекпойнте, чем NULL, и
+    # их сравнение было некорректным.
+    m.load_state_dict(best[3])
+    m.eval()
     return dict(val=best[0], ce=best[1], pred=best[2], state=best[3], model=m)
 
 

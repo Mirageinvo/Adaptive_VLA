@@ -62,6 +62,11 @@ def main() -> None:
     ap.add_argument("--n-pos", type=int, default=16)
     ap.add_argument("--d-model", type=int, default=768)
     ap.add_argument("--n-codes", type=int, default=2048)
+    ap.add_argument("--d-action", type=int, default=768,
+                    help="размерность h (экспертная башня), из k6d")
+    ap.add_argument("--d-vlm", type=int, default=2048,
+                    help="размерность префикса VLM; ПРОВЕРИТЬ по выводу k6d, "
+                         "умолчание — догадка")
     ap.add_argument("--ctx-len", type=int, default=171,
                     help="длина закэшированного префикса VLM для cross-attention")
     ap.add_argument("--warmup", type=int, default=50)
@@ -85,47 +90,48 @@ def main() -> None:
         print(f"GPU: {torch.cuda.get_device_name(0)} (sm_{cc[0]}{cc[1]})")
 
     class Refiner(nn.Module):
-        """Уточнитель над позициями чанка: слои трансформера плюс три головы
-        кодов. Префикс НЕ читается — в этом весь смысл."""
+        """Уточнитель над позициями чанка с РАЗРЕЖЁННЫМ доступом к префиксу.
 
-        def __init__(self, layers, d, heads=8, ff=4):
-            super().__init__()
-            self.enc = nn.TransformerEncoder(
-                nn.TransformerEncoderLayer(d, heads, d * ff, batch_first=True,
-                                           norm_first=True, dropout=0.0),
-                num_layers=layers)
-            self.out = nn.ModuleList([nn.Linear(d, args.n_codes)
-                                      for _ in range(3)])
+        Три отличия от прежней прикидки, каждое стоит времени и потому меряется,
+        а не оценивается:
 
-        def forward(self, x):
-            x = self.enc(x)
-            return [o(x) for o in self.out]
-
-    class RefinerXA(nn.Module):
-        """Уточнитель с доступом к ЗАКЭШИРОВАННОМУ префиксу VLM.
-
-        K-6b показал разрыв 30% у головы, видящей только h. K-6c показал, что
-        ёмкость тут ни при чём — влезает даже 24 слоя. Значит не хватает
-        ИНФОРМАЦИИ: блоки 2-3 перечитывают изображение, а голова нет.
-        Перекрёстное внимание к префиксу эту информацию возвращает, причём
-        БЕСПЛАТНО по кодированию: k5a_prefix_cost_probe доказал побитовую
-        идентичность кэша (расхождение 0.000e+00 по всем 24 слоям), значит
-        ключи и значения уже посчитаны в единственном тяжёлом проходе.
-        Платим только за само внимание 16 запросов к ctx ключам.
+        1. ВХОДНАЯ И КОНТЕКСТНАЯ ПРОЕКЦИИ. h имеет размерность экспертной башни,
+           префикс — размерность VLM, и они РАЗНЫЕ. Прежний замер подавал обоим
+           одно d, то есть проекции не считал вовсе.
+        2. ПЕРЕКРЁСТНОЕ ВНИМАНИЕ НЕ В КАЖДОМ СЛОЕ. Префикс надо ВПРЫСНУТЬ, а не
+           перечитывать двадцать четыре раза. Раньше таблица разрежённых схем
+           получалась умножением «слои x 0.29 + внимания x 0.50» — то есть была
+           арифметикой, поданной рядом с измерениями.
+        3. ТРИ ВЫХОДНЫЕ ГОЛОВЫ на 2048 кодов каждая — тоже не бесплатны.
         """
 
-        def __init__(self, layers, d, ctx, heads=8, ff=4):
+        def __init__(self, layers, d, d_in, d_ctx, xa_at, heads=8, ff=4):
             super().__init__()
-            self.dec = nn.TransformerDecoder(
-                nn.TransformerDecoderLayer(d, heads, d * ff, batch_first=True,
-                                           norm_first=True, dropout=0.0),
-                num_layers=layers)
+            self.inp = nn.Linear(d_in, d)
+            self.blocks = nn.ModuleList([
+                nn.TransformerEncoderLayer(d, heads, d * ff, batch_first=True,
+                                           norm_first=True, dropout=0.0)
+                for _ in range(layers)])
+            self.xa_at = set(xa_at)
+            if self.xa_at:
+                self.ctx_proj = nn.Linear(d_ctx, d)
+                self.xa = nn.ModuleDict({
+                    str(i): nn.MultiheadAttention(d, heads, batch_first=True)
+                    for i in self.xa_at})
+                self.xa_norm = nn.ModuleDict({
+                    str(i): nn.LayerNorm(d) for i in self.xa_at})
             self.out = nn.ModuleList([nn.Linear(d, args.n_codes)
                                       for _ in range(3)])
-            self.ctx = ctx
 
-        def forward(self, x, mem):
-            x = self.dec(x, mem)
+        def forward(self, x, mem=None):
+            x = self.inp(x)
+            m = self.ctx_proj(mem) if self.xa_at else None
+            for i, blk in enumerate(self.blocks):
+                x = blk(x)
+                if i in self.xa_at:
+                    a, _ = self.xa[str(i)](self.xa_norm[str(i)](x), m, m,
+                                           need_weights=False)
+                    x = x + a
             return [o(x) for o in self.out]
 
     def timeit(m, *xs):
@@ -147,29 +153,34 @@ def main() -> None:
           f"(24 слоя над 187 токенами)")
     print(f"  бюджет: {budget_for(1.4):.1f} мс на 1.4x, "
           f"{budget_for(1.3):.1f} мс на 1.3x\n")
-    print(f"  {'слоёв':>6}{'d':>6}{'вход':>10}{'мс':>9}{'доля прохода':>15}"
+    print(f"  {'слоёв':>6}{'d':>6}{'вход':>12}{'мс':>9}{'доля прохода':>15}"
           f"{'ускорение итого':>17}{'вердикт':>10}")
     rows = []
+    x = torch.randn(1, args.n_pos, args.d_action, device=dev, dtype=dtype)
+    mem = torch.randn(1, args.ctx_len, args.d_vlm, device=dev, dtype=dtype)
+    # СХЕМЫ: (слоёв, где перекрёстное внимание). Пустой кортеж — только h.
+    schemes = []
+    for L in (2, 4, 6, 12, 24):
+        schemes.append((L, ()))
+    for L, k in ((6, 6), (12, 2), (12, 3), (24, 2), (24, 3)):
+        step = max(1, L // k)
+        schemes.append((L, tuple(range(0, L, step))[:k]))
     for d in (args.d_model, args.d_model * 2):
-        for L in (2, 4, 6, 12, 24):
-            x = torch.randn(1, args.n_pos, d, device=dev, dtype=dtype)
-            mem = torch.randn(1, args.ctx_len, d, device=dev, dtype=dtype)
-            for kind in ("сам", "сам+кэш"):
-                m = (Refiner(L, d) if kind == "сам"
-                     else RefinerXA(L, d, args.ctx_len)).to(dev, dtype).eval()
-                ms = timeit(m, x) if kind == "сам" else timeit(m, x, mem)
-                total = ONE_PASS_MS + ms
-                sp = CACHED_BAR_MS / total
-                ok = "да" if ms <= budget_for(1.4) else (
-                    "1.3x" if ms <= budget_for(1.3) else "нет")
-                rows.append(dict(layers=L, d_model=d, kind=kind, ms=ms,
-                                 total_ms=total, speedup=sp))
-                print(f"  {L:>6}{d:>6}{kind:>10}{ms:>9.3f}"
-                      f"{ms / EXPERT_PASS_MS:>14.1%}{sp:>16.2f}x{ok:>10}")
-                del m
-                if dev.type == "cuda":
-                    torch.cuda.empty_cache()
-            del x, mem
+        for L, xa in schemes:
+            m = Refiner(L, d, args.d_action, args.d_vlm, xa).to(dev, dtype).eval()
+            ms = timeit(m, x, mem) if xa else timeit(m, x)
+            total = ONE_PASS_MS + ms
+            sp = CACHED_BAR_MS / total
+            ok = "да" if ms <= budget_for(1.4) else (
+                "1.3x" if ms <= budget_for(1.3) else "нет")
+            tag = f"кэш x{len(xa)}" if xa else "только h"
+            rows.append(dict(layers=L, d_model=d, xa=list(xa), ms=ms,
+                             total_ms=total, speedup=sp))
+            print(f"  {L:>6}{d:>6}{tag:>12}{ms:>9.3f}"
+                  f"{ms / EXPERT_PASS_MS:>14.1%}{sp:>16.2f}x{ok:>10}")
+            del m
+            if dev.type == "cuda":
+                torch.cuda.empty_cache()
 
     print("\n  ЧИТАТЬ ТАК, правило записано до запуска.")
     print("  Если время почти не растёт с глубиной — доминируют накладные")
