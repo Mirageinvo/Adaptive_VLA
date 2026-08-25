@@ -159,10 +159,21 @@ def build_refiner(layers, d, d_in, d_ctx, xa_at, n_codes, n_out, heads=8, ff=4,
                                           for _ in range(n_out)])
             elif head in ("tied", "cont"):
                 # 2 x d x z_dim вместо 2 x d x n_codes: вчетверо меньше
-                self.out = nn.ModuleList([nn.Linear(d, z_dim)
-                                          for _ in range(n_out)])
+                # cont — ОДНА общая поправка: две складывающиеся
+                # неидентифицируемы, одна голова может дать +v, другая -v.
+                self.out = nn.ModuleList([
+                    nn.Linear(d, z_dim)
+                    for _ in range(n_out if head == "tied" else 1)])
                 if head == "tied":
-                    self.register_buffer("Ebook", E)      # (уровни, коды, z)
+                    # E ЗДЕСЬ — ТОЛЬКО КНИГИ ПРЕДСКАЗЫВАЕМЫХ УРОВНЕЙ. Раньше
+                    # передавался весь набор из трёх, а цикл шёл по g=0,1:
+                    # fine-1 сравнивался с ГРУБОЙ книгой E0, fine-2 с E1,
+                    # тогда как декодирование шло через E1 и E2. Код
+                    # выбирался по одной книге, а трактовался по другой.
+                    assert E is not None and E.shape[0] == n_out, (
+                        f"tied: книг {None if E is None else E.shape[0]}, "
+                        f"выходов {n_out} — должны совпадать")
+                    self.register_buffer("Ebook", E)
                     self.tau = tau
             elif head == "direct":
                 self.out = nn.ModuleList([nn.Linear(d * N_POS, n_steps * n_dim)])
@@ -224,9 +235,10 @@ def selftest():
     try:
         import torch
     except ImportError:
-        print("самопроверка пройдена (без torch): разбиение по эпизодам "
-              "без протечек, R корректен на известных точках")
-        return
+        raise SystemExit(
+            "torch отсутствует: формы голов и прохождение градиента НЕ "
+            "проверены. Считать это успехом нельзя — главная часть "
+            "самопроверки пропускается.")
     B, P, Z, C, D = 3, N_POS, 8, 16, 32
     Efake = torch.randn(N_LEVEL, C, Z)
     x = torch.randn(B, P, D)
@@ -234,10 +246,11 @@ def selftest():
     want = {"free": (B, P, C), "tied": (B, P, C), "cont": (B, P, Z),
             "direct": (B, 20, 7)}
     for hd in ("free", "tied", "cont", "direct"):
-        mm = build_refiner(2, 16, D, 4, (), C, 2, heads=2, head=hd, E=Efake,
-                           z_dim=Z, coarse_vec=Efake[0])
+        # книг СТОЛЬКО ЖЕ, сколько выходов — иначе tied сравнивает с чужими
+        mm = build_refiner(2, 16, D, 4, (), C, 2, heads=2, head=hd,
+                           E=Efake[[1, 2]], z_dim=Z, coarse_vec=Efake[0])
         out = mm(x, None, None, k0v)
-        n_out = 1 if hd == "direct" else 2
+        n_out = 1 if hd in ("direct", "cont") else 2
         assert len(out) == n_out, f"{hd}: выходов {len(out)}, ждали {n_out}"
         assert tuple(out[0].shape) == want[hd], \
             f"{hd}: форма {tuple(out[0].shape)}, ждали {want[hd]}"
@@ -261,9 +274,12 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--wd", type=float, default=1e-4)
-    ap.add_argument("--ce-weight", type=float, default=0.01,
-                    help="вес кросс-энтропии как регуляризатора; основная "
-                         "цель — реконструкция суммы латентов")
+    ap.add_argument("--ce-weight", type=float, default=0.0,
+                    help="вес кросс-энтропии. ПО УМОЛЧАНИЮ НОЛЬ: при 0.01 её "
+                         "вклад был ~0.043 против ~0.0038 у ошибки действия, "
+                         "то есть она ДОМИНИРОВАЛА вдесятеро. И cont/direct "
+                         "её не используют вовсе — при ненулевом весе "
+                         "лестница была бы нечестной")
     ap.add_argument("--seeds", type=int, default=2)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--predict-level0", action="store_true",
@@ -397,7 +413,12 @@ def main() -> None:
     # вправо; без маски перекрёстное внимание смотрело бы в нули.
     pad_mask = ((np.arange(L_ctx)[None, :] < (L_ctx - ctx_len[:, None]))
                 if has_ctx else None)
-    levels = list(range(N_LEVEL)) if args.predict_level0 else [1, 2]
+    if args.predict_level0:
+        raise SystemExit(
+            "--predict-level0 временно запрещён: lat0 уже содержит вклад "
+            "грубого уровня от BAR, и предсказанный уровень 0 добавился бы "
+            "ВТОРОЙ раз. Нужна отдельная ветка сборки латенты.")
+    levels = [1, 2]
     # ВСЕ ТРИ МЕСТА СОГЛАСОВАНЫ С --target: лосс действия, цель CE и отбор
     # чекпойнта. Прежде лосс имитировал BAR, CE учила коды ТОКЕНИЗАТОРА, а
     # чекпойнт выбирался по расстоянию до действия ДАТАСЕТА — три разные
@@ -429,7 +450,8 @@ def main() -> None:
 
     print("\n" + "=" * 84)
     print(f"  {'вариант':<26}{'поза RMS':>10}{'разброс':>10}"
-          f"{'к BAR':>10}{'парам.':>9}")
+          f"{('к BAR' if args.target == 'dataset' else 'имит./BAR'):>10}"
+          f"{'парам.':>9}")
     # БАЗЫ НА ТЕКУЩЕМ TEST. Слабая база — «уровень 0 от BAR, тонкие уровни
     # СЛУЧАЙНЫЕ»: она измеряется здесь же и не зависит от чужого прогона.
     # ЦЕЛЬ ОБУЧЕНИЯ. Разделение существенно: «воспроизвести BAR» и
@@ -441,6 +463,15 @@ def main() -> None:
     print(f"  цель обучения: {args.target}; все ошибки считаются относительно {_tn}")
 
     res = {}
+    # ЗНАМЕНАТЕЛЬ ВСЕГДА ОДИН: ошибка BAR относительно ДЕЙСТВИЯ ДАТАСЕТА.
+    # При --target bar целью служит decode(K_bar), поэтому ошибка BAR
+    # относительно СВОЕЙ ЖЕ цели равна ровно нулю, и деление на неё уронило бы
+    # прогон после нескольких часов обучения.
+    _aa = act[ite]
+    _rp = float(_aa[..., :6].max() - _aa[..., :6].min())
+    _dbar = np.concatenate([decode(K_bar[ite][i:i + 512])
+                            for i in range(0, len(ite), 512)])
+    e_bar_ds = float(np.sqrt(((_dbar[..., :6] - _aa[..., :6]) ** 2).mean())) / _rp
     tsk_all = z["task"] if "task" in z.files else np.zeros(N, int)
     rngb = np.random.default_rng(args.seed)
     Krnd = K_bar[ite].copy()
@@ -498,10 +529,7 @@ def main() -> None:
         if args.head == "direct":
             return decode_soft(base) + lg[0], lg
         if args.head == "cont":
-            z = base
-            for k in range(len(levels)):
-                z = z + lg[k]
-            return decode_soft(z), lg
+            return decode_soft(base + lg[0]), lg
         # free и tied: straight-through по кодам
         z = base.clone()
         for k, lv in enumerate(levels):
@@ -528,7 +556,7 @@ def main() -> None:
           for s_i in range(args.seeds):
               torch.manual_seed(s_i)
               m = build_refiner(L, d, d_act, d_vlm, xa_at, n_codes,
-                                len(levels), head=args.head, E=E,
+                                len(levels), head=args.head, E=E[levels],
                                 z_dim=E.shape[-1], tau=args.tau,
                                 coarse_vec=E[0]).to(dev)
               n_par = sum(pp.numel() for pp in m.parameters())
@@ -616,13 +644,17 @@ def main() -> None:
           # ОТСТАВАНИЕ ОТ BAR НАПРЯМУЮ — главное число. R с базой «случайные
           # тонкие» насыщался на 0.94-0.96 и был бесполезен.
           res[tag] = dict(pose_rms=p_, sd=float(sc.std()),
-                          vs_bar=p_ / per_split["test"]["bar"] - 1.0,
+                          vs_bar_dataset=float(p_ / e_bar_ds),
                           R=closed_fraction(p_, e_weak, e_bar),
                           layers=L, d_model=d, xa=nxa, head=args.head,
                           n_train=int(len(itr)), curves=curves)
+          # ПРИ target=bar ЭТО ОШИБКА ИМИТАЦИИ, и «+X% к BAR» тут
+          # бессмысленно: цель и есть выход BAR. Нормируем на ошибку BAR
+          # относительно датасета.
+          rel = (p_ / e_bar_ds - 1.0 if args.target == "dataset"
+                 else p_ / e_bar_ds)
           print(f"  {tag:<26}{p_:>10.4f}{sc.std():>10.4f}"
-                f"{p_ / per_split['test']['bar'] - 1.0:>+10.0%}"
-                f"{curves[0]['n_params'] / 1e6:>9.2f}M")
+                f"{rel:>10.1%}{curves[0]['n_params'] / 1e6:>9.2f}M")
 
     print("\n  ЧИТАТЬ ТАК, правило записано до запуска.")
     print("  R >= 0.8      уточнитель решает задачу — интегрировать и в симулятор")
