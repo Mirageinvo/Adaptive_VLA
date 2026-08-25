@@ -213,6 +213,21 @@ def main() -> None:
     assert E.shape[0] == N_LEVEL, f"уровней в кодбуке {E.shape[0]}"
     print(f"  кодбуки: {tuple(E.shape)}  (уровни, коды, размерность латенты)")
     E = E.to(dev)
+    # ДЕКОДЕР НУЖЕН ЦЕЛИКОМ И ДИФФЕРЕНЦИРУЕМЫМ. Латентный MSE оказался слеп:
+    # он стоял на 0.0006 с нулевой эпохи во всех вариантах. Причина — в нашем
+    # же замере: кодек размещает ёмкость НЕ там, где чувствителен декодер
+    # (§1), а декодер чувствителен к смещениям ВНУТРИ кодового подпространства
+    # (§2в). Остаточные уровни малы по норме, но бьют в чувствительные
+    # направления, поэтому равновзвешенный MSE их не видит. Единственная
+    # честная цель — ошибка ДЕКОДИРОВАННОГО действия, а _decode это обычный
+    # PerceiverDecoder, через него градиент идёт.
+    codec_t = codec.to(dev).eval()
+    for prm in codec_t.parameters():
+        prm.requires_grad_(False)
+
+    def decode_soft(z_q):
+        x, _ = codec_t._decode(z_q, embodiment_ids=0)
+        return x[..., :7]
 
     def lat(codes_lp):
         """Сумма латентов по кодам (N, L, P) -> (N, P, D)."""
@@ -305,7 +320,10 @@ def main() -> None:
                     pred_lat = lat0[j].clone()
                     for k, lv in enumerate(levels):
                         pred_lat = pred_lat + torch.softmax(lg[k], -1) @ E[lv]
-                    loss = ((pred_lat - lat_t[j]) ** 2).mean()
+                    # ОШИБКА ДЕЙСТВИЯ ЧЕРЕЗ ДЕКОДЕР, а не MSE в латенте.
+                    a_hat = decode_soft(pred_lat)
+                    a_tgt = torch.as_tensor(act[j], dtype=torch.float32).to(dev)
+                    loss = ((a_hat - a_tgt) ** 2).mean()
                     ce = sum(lossf(lg[k].reshape(-1, n_codes),
                                    y[:, k, :].reshape(-1))
                              for k in range(len(levels))) / len(levels)
