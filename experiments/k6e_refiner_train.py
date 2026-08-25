@@ -60,6 +60,26 @@ N_POS, N_LEVEL = 16, 3
 E_MLP_LEGACY, E_BAR_LEGACY = 0.0315, 0.0242
 
 
+class _Tee:
+    """Дублировать stdout в файл. Прогон длинный, идёт в tmux, и терять вывод
+    нельзя: числа рождаются один раз и переигрываются дорого. Пишем с
+    немедленным сбросом, чтобы лог был читаем и у прерванного процесса."""
+
+    def __init__(self, path):
+        os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+        self.f = open(path, "a", encoding="utf-8")
+        self.out = sys.stdout
+
+    def write(self, s):
+        self.out.write(s)
+        self.f.write(s)
+        self.f.flush()
+
+    def flush(self):
+        self.out.flush()
+        self.f.flush()
+
+
 def split_by_episode(ep, seed=0, fr=(0.7, 0.15)):
     u = np.unique(ep)
     r = np.random.default_rng(seed).permutation(len(u))
@@ -187,7 +207,18 @@ def main() -> None:
     ap.add_argument("--variants", default="4x768x0,12x768x0,12x768x2",
                     help="слои x ширина x число слоёв с доступом к префиксу")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--log", default=None,
+                    help="куда дублировать вывод; по умолчанию рядом с --out "
+                         "с расширением .log")
     args = ap.parse_args()
+
+    log_path = args.log or (os.path.splitext(args.out)[0] + ".log"
+                            if args.out else None)
+    if log_path:
+        import datetime
+        sys.stdout = _Tee(log_path)
+        print(f"\n===== {datetime.datetime.now():%Y-%m-%d %H:%M:%S} =====")
+        print("$ " + " ".join(sys.argv))
 
     selftest()
     if args.selftest:
