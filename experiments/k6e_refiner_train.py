@@ -173,12 +173,19 @@ def main() -> None:
 
     z = np.load(args.feats, allow_pickle=True)
     meta = json.loads(str(z["meta"]))
-    h, ctx, ctx_len = z["h"], z["ctx"], z["ctx_len"]
+    h, ctx_len = z["h"], z["ctx_len"]
+    has_ctx = "ctx" in z.files
+    ctx = z["ctx"] if has_ctx else None
+    if not has_ctx:
+        print("  ВНИМАНИЕ: в признаках нет ctx (извлечено с --no-ctx) — "
+              "варианты с перекрёстным вниманием будут пропущены")
     K_true, K_bar, act, epi = z["K_true"], z["K_bar"], z["act"], z["episode"]
     N, d_act = h.shape[0], h.shape[-1]
-    d_vlm, L_ctx = ctx.shape[-1], ctx.shape[1]
+    d_vlm = ctx.shape[-1] if has_ctx else 1
+    L_ctx = ctx.shape[1] if has_ctx else 1
     n_codes = int(meta["n_codes"])
-    print(f"признаки: h {h.shape}, ctx {ctx.shape}, {N} наблюдений, "
+    print(f"признаки: h {h.shape}, "
+          f"ctx {ctx.shape if has_ctx else 'нет'}, {N} наблюдений, "
           f"{len(np.unique(epi))} эпизодов")
 
     proc = VisionLanguageActionProcessor.from_pretrained(
@@ -190,7 +197,7 @@ def main() -> None:
 
     # ДИАГНОСТИКА МАСШТАБОВ. Если ctx на порядки больше h, сырая проекция
     # без нормировки заведомо неустойчива — это и была причина провала.
-    for nm, arr in (("h", h), ("ctx", ctx)):
+    for nm, arr in ((("h", h), ("ctx", ctx)) if has_ctx else (("h", h),)):
         a = np.asarray(arr[:200], np.float32)
         print(f"  {nm:>4}: |avg| {np.abs(a).mean():8.3f}  max {np.abs(a).max():9.1f}  "
               f"sd {a.std():8.3f}")
@@ -275,6 +282,9 @@ def main() -> None:
 
     for spec in args.variants.split(","):
         L, d, nxa = (int(v) for v in spec.strip().split("x"))
+        if nxa and not has_ctx:
+            print(f"  пропуск {spec}: нет ctx в признаках")
+            continue
         step = max(1, L // nxa) if nxa else 1
         xa_at = tuple(range(0, L, step))[:nxa]
         scores = []
@@ -385,8 +395,30 @@ def main() -> None:
                                 acc_l = acc_l + torch.softmax(lgx[k], -1) @ E[lv]
                             pl[i:i + len(jj)] = acc_l
                         lat_err = float(((pl - lat_t[iva]) ** 2).mean())
-                    print(f"      эпоха {ep_i:>3}: латента {lat_err:.4f}, "
-                          f"CE {v_ce:.3f}, действие на val {v / rng_pose:.4f}",
+                    # ОБУЧАЮЩАЯ ОШИБКА РЯДОМ С ВАЛИДАЦИОННОЙ. Без неё
+                    # утверждение «переобучение» ничем не подкреплено: расти
+                    # на валидации величина может и от расходящейся
+                    # оптимизации. Считается на подвыборке того же размера,
+                    # что валидация, чтобы числа были сравнимы.
+                    with torch.no_grad():
+                        sub = itr[:len(iva)]
+                        Kt = K_bar[sub].copy()
+                        for i in range(0, len(sub), 256):
+                            jj = sub[i:i + 256]
+                            xx = torch.as_tensor(h[jj], dtype=torch.float32).to(dev)
+                            mmx = (torch.as_tensor(ctx[jj], dtype=torch.float32).to(dev)
+                                   if xa_at else None)
+                            mmk = (torch.as_tensor(pad_mask[jj]).to(dev)
+                                   if xa_at else None)
+                            lgx = m(xx, mmx, mmk)
+                            for k, lv in enumerate(levels):
+                                Kt[i:i + len(jj), lv, :] = lgx[k].argmax(-1).cpu().numpy()
+                        dt = decode(Kt)
+                        v_tr = float(np.sqrt(
+                            ((dt[..., :6] - act[sub][..., :6]) ** 2).mean()))
+                    print(f"      эпоха {ep_i:>3}: действие train "
+                          f"{v_tr / rng_pose:.4f} / val {v / rng_pose:.4f}"
+                          f"   (CE {v_ce:.2f}, латента {lat_err:.4f})",
                           flush=True)
             m.load_state_dict(best[1])
             m.eval()
