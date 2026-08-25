@@ -97,7 +97,19 @@ def closed_fraction(e_ref, e_weak, e_bar):
     return float("nan") if abs(den) < 1e-12 else (e_weak - e_ref) / den
 
 
-def build_refiner(layers, d, d_in, d_ctx, xa_at, n_codes, n_out, heads=8, ff=4):
+def build_refiner(layers, d, d_in, d_ctx, xa_at, n_codes, n_out, heads=8, ff=4,
+                  head="free", E=None, z_dim=512, tau=1.0, coarse_vec=None,
+                  n_steps=20, n_dim=7):
+    """head:
+      free   — свободные классификаторы на n_codes (как было);
+      tied   — предсказать вектор в латенте, логиты из геометрии ЗАМОРОЖЕННОГО
+               кодбука: -||r - E_g[k]||^2 / tau. Отрезает возможность выучить
+               произвольное отображение в 2048 меток;
+      cont   — непрерывная поправка к латенте, без квантования вовсе;
+      direct — поправка прямо к действию, минуя декодер.
+    Диагностическая лестница: если cont догоняет BAR, а tied нет, мешает
+    дискретизация; если tied догоняет — новый токенизатор не нужен.
+    """
     import torch
     import torch.nn as nn
 
@@ -106,12 +118,21 @@ def build_refiner(layers, d, d_in, d_ctx, xa_at, n_codes, n_out, heads=8, ff=4):
             super().__init__()
             self.in_norm = nn.LayerNorm(d_in)
             self.inp = nn.Linear(d_in, d)
+            self.head = head
+            self.n_out = n_out
             # ГРУБЫЙ КОД ПОДАЁТСЯ ЯВНО. K_bar[:,0,:] известен бесплатно после
             # первого прохода; заставлять уточнитель выводить его заново из h
             # — значит тратить ограниченные данные на переоткрытие
             # 2048-классового отображения. Без этого вывод «информации нет в
             # h» преждевременен.
-            self.coarse_emb = nn.Embedding(n_codes, d)
+            # ЗАМОРОЖЕННЫЙ вектор кода вместо обучаемой таблицы: минус
+            # 1.57 млн параметров и правильная геометрия вместо случайной.
+            if coarse_vec is not None:
+                self.register_buffer("cvec", coarse_vec)
+                self.coarse_proj = nn.Linear(coarse_vec.shape[-1], d)
+                self.coarse_emb = None
+            else:
+                self.coarse_emb = nn.Embedding(n_codes, d)
             self.pos = nn.Embedding(N_POS, d)
             self.blocks = nn.ModuleList([
                 nn.TransformerEncoderLayer(d, heads, d * ff, batch_first=True,
@@ -133,15 +154,28 @@ def build_refiner(layers, d, d_in, d_ctx, xa_at, n_codes, n_out, heads=8, ff=4):
                 self.xa_norm = nn.ModuleDict({str(i): nn.LayerNorm(d)
                                               for i in self.xa_at})
             self.norm = nn.LayerNorm(d)
-            self.out = nn.ModuleList([nn.Linear(d, n_codes)
-                                      for _ in range(n_out)])
+            if head == "free":
+                self.out = nn.ModuleList([nn.Linear(d, n_codes)
+                                          for _ in range(n_out)])
+            elif head in ("tied", "cont"):
+                # 2 x d x z_dim вместо 2 x d x n_codes: вчетверо меньше
+                self.out = nn.ModuleList([nn.Linear(d, z_dim)
+                                          for _ in range(n_out)])
+                if head == "tied":
+                    self.register_buffer("Ebook", E)      # (уровни, коды, z)
+                    self.tau = tau
+            elif head == "direct":
+                self.out = nn.ModuleList([nn.Linear(d * N_POS, n_steps * n_dim)])
+            else:
+                raise ValueError(head)
 
         def forward(self, x, mem=None, mem_mask=None, k0=None):
             b = x.shape[0]
             x = self.inp(self.in_norm(x)) + self.pos(
                 torch.arange(N_POS, device=x.device)).unsqueeze(0).expand(b, -1, -1)
             if k0 is not None:
-                x = x + self.coarse_emb(k0)
+                x = x + (self.coarse_emb(k0) if self.coarse_emb is not None
+                         else self.coarse_proj(self.cvec[k0]))
             m = self.ctx_proj(self.ctx_norm(mem)) if self.xa_at else None
             for i, blk in enumerate(self.blocks):
                 x = blk(x)
@@ -151,7 +185,18 @@ def build_refiner(layers, d, d_in, d_ctx, xa_at, n_codes, n_out, heads=8, ff=4):
                                            need_weights=False)
                     x = x + a
             x = self.norm(x)
-            return [o(x) for o in self.out]
+            if self.head == "free":
+                return [o(x) for o in self.out]
+            if self.head == "tied":
+                out = []
+                for g, o in enumerate(self.out):
+                    r = o(x)                                    # (b, P, z)
+                    dist = ((r.unsqueeze(-2) - self.Ebook[g]) ** 2).sum(-1)
+                    out.append(-dist / self.tau)
+                return out
+            if self.head == "cont":
+                return [o(x) for o in self.out]                 # латенты
+            return [self.out[0](x.flatten(1)).view(x.shape[0], n_steps, n_dim)]
 
     return Refiner()
 
@@ -174,8 +219,35 @@ def selftest():
     assert math.isnan(closed_fraction(0.03, 0.02, 0.02)), \
         "вырожденные базы обязаны давать NaN, а не деление на ноль"
 
+    # ДЫМОВАЯ ПРОВЕРКА ЧЕТЫРЁХ ГОЛОВ. Пишутся они вслепую (torch есть не
+    # везде), а ошибка формы вскрылась бы только через час обучения.
+    try:
+        import torch
+    except ImportError:
+        print("самопроверка пройдена (без torch): разбиение по эпизодам "
+              "без протечек, R корректен на известных точках")
+        return
+    B, P, Z, C, D = 3, N_POS, 8, 16, 32
+    Efake = torch.randn(N_LEVEL, C, Z)
+    x = torch.randn(B, P, D)
+    k0v = torch.randint(0, C, (B, P))
+    want = {"free": (B, P, C), "tied": (B, P, C), "cont": (B, P, Z),
+            "direct": (B, 20, 7)}
+    for hd in ("free", "tied", "cont", "direct"):
+        mm = build_refiner(2, 16, D, 4, (), C, 2, heads=2, head=hd, E=Efake,
+                           z_dim=Z, coarse_vec=Efake[0])
+        out = mm(x, None, None, k0v)
+        n_out = 1 if hd == "direct" else 2
+        assert len(out) == n_out, f"{hd}: выходов {len(out)}, ждали {n_out}"
+        assert tuple(out[0].shape) == want[hd], \
+            f"{hd}: форма {tuple(out[0].shape)}, ждали {want[hd]}"
+        out[0].sum().backward()          # градиент обязан пройти
+        assert mm.inp.weight.grad is not None, f"{hd}: градиент не дошёл"
+        assert not hasattr(mm, "coarse_emb") or mm.coarse_emb is None, \
+            "при замороженном векторе обучаемой таблицы быть не должно"
     print("самопроверка пройдена: разбиение по эпизодам без протечек; "
-          "R=0 при уровне MLP, R=1 при уровне BAR, R=0.5 посередине")
+          "R корректен на известных точках; все четыре головы дают верные "
+          "формы и пропускают градиент")
 
 
 def main() -> None:
@@ -188,6 +260,7 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--wd", type=float, default=1e-4)
     ap.add_argument("--ce-weight", type=float, default=0.01,
                     help="вес кросс-энтропии как регуляризатора; основная "
                          "цель — реконструкция суммы латентов")
@@ -196,6 +269,14 @@ def main() -> None:
     ap.add_argument("--predict-level0", action="store_true",
                     help="предсказывать и уровень 0 тоже; по умолчанию он "
                          "берётся из первого блока BAR, как на инференсе")
+    ap.add_argument("--head", default="free",
+                    choices=["free", "tied", "cont", "direct"],
+                    help="лестница по параметризации выхода: free — свободные "
+                         "классификаторы; tied — латент плюс геометрия "
+                         "замороженного кодбука; cont — непрерывная поправка "
+                         "без квантования; direct — поправка прямо к действию")
+    ap.add_argument("--tau", type=float, default=1.0,
+                    help="температура расстояний в режиме tied")
     ap.add_argument("--train-sizes", default="0",
                     help="ВЛОЖЕННЫЕ подвыборки обучения при ОДНИХ И ТЕХ ЖЕ "
                          "val/test, через запятую; 0 = вся. Только так рост "
@@ -317,6 +398,16 @@ def main() -> None:
     pad_mask = ((np.arange(L_ctx)[None, :] < (L_ctx - ctx_len[:, None]))
                 if has_ctx else None)
     levels = list(range(N_LEVEL)) if args.predict_level0 else [1, 2]
+    # ВСЕ ТРИ МЕСТА СОГЛАСОВАНЫ С --target: лосс действия, цель CE и отбор
+    # чекпойнта. Прежде лосс имитировал BAR, CE учила коды ТОКЕНИЗАТОРА, а
+    # чекпойнт выбирался по расстоянию до действия ДАТАСЕТА — три разные
+    # задачи в одном прогоне, и он не отвечал ни на одну чисто.
+    if args.target == "dataset":
+        tgt_act, y_ce_full = act, K_true
+    else:
+        tgt_act = np.concatenate(
+            [decode(K_bar[i:i + 512]) for i in range(0, N, 512)])[..., :7]
+        y_ce_full = K_bar
     # ЦЕЛЬ — сумма по ИСТИННЫМ кодам всех трёх уровней; БАЗА — вклад уровня 0
     # от BAR, который на инференсе достаётся бесплатно из первого блока.
     with torch.no_grad():
@@ -326,7 +417,7 @@ def main() -> None:
                           for i in range(0, N, 512)]).to(dev)
     print(f"  целевая латента: {tuple(lat_t.shape)}, "
           f"вклад уровня 0 от BAR: {tuple(lat0.shape)}")
-    a_ref = act[ite]
+    a_ref = tgt_act[ite]
     rng_pose = float(a_ref[..., :6].max() - a_ref[..., :6].min())
     dec_ref = decode(K_true[ite])
 
@@ -337,8 +428,8 @@ def main() -> None:
                 float(np.sqrt(((d[..., :6] - dec_ref[..., :6]) ** 2).mean())) / rng_pose)
 
     print("\n" + "=" * 84)
-    print(f"  {'вариант':<22}{'поза RMS':>10}{'схват':>9}{'R':>8}"
-          f"{'разброс':>10}{'мс':>8}{'ускор.':>9}")
+    print(f"  {'вариант':<26}{'поза RMS':>10}{'разброс':>10}"
+          f"{'к BAR':>10}{'парам.':>9}")
     # БАЗЫ НА ТЕКУЩЕМ TEST. Слабая база — «уровень 0 от BAR, тонкие уровни
     # СЛУЧАЙНЫЕ»: она измеряется здесь же и не зависит от чужого прогона.
     # ЦЕЛЬ ОБУЧЕНИЯ. Разделение существенно: «воспроизвести BAR» и
@@ -346,27 +437,78 @@ def main() -> None:
     # её действие, дело в представлении или архитектуре. Если воспроизводит,
     # но датасетное действие не улучшает, дело уже не в параллельном
     # декодировании.
-    tgt_act = act if args.target == "dataset" else np.concatenate(
-        [decode(K_bar[i:i + 512]) for i in range(0, N, 512)])[..., :7]
-    print(f"  цель обучения: {args.target}")
+    _tn = "действия датасета" if args.target == "dataset" else "декода кодов BAR"
+    print(f"  цель обучения: {args.target}; все ошибки считаются относительно {_tn}")
 
+    res = {}
+    tsk_all = z["task"] if "task" in z.files else np.zeros(N, int)
     rngb = np.random.default_rng(args.seed)
     Krnd = K_bar[ite].copy()
     Krnd[:, 1:, :] = rngb.integers(0, n_codes, size=Krnd[:, 1:, :].shape)
     e_bar = score(K_bar[ite])[0]
     e_weak = score(Krnd)[0]
+    # БАЗЫ ОТДЕЛЬНО ПО ЧАСТЯМ. Сравнивать обучающую ошибку уточнителя с BAR,
+    # посчитанной на test, формально нельзя — части могут различаться по
+    # трудности. Считаем BAR и эксперта на каждой части.
+    print("\n  базы по частям (относительно цели обучения):")
+    print(f"    {'часть':<8}{'BAR':>9}{'эксперт':>10}{'эпизодов':>10}{'задач':>8}")
+    per_split = {}
+    for nm, ix in (("train", itr), ("val", iva), ("test", ite)):
+        aa = tgt_act[ix]
+        rp = float(aa[..., :6].max() - aa[..., :6].min())
+        def e_of(K):
+            d = decode(K)
+            return float(np.sqrt(((d[..., :6] - aa[..., :6]) ** 2).mean())) / rp
+        per_split[nm] = dict(bar=e_of(K_bar[ix]), expert=e_of(K_true[ix]),
+                             n_ep=int(len(np.unique(epi[ix]))),
+                             n_task=int(len(set(np.asarray(tsk_all)[ix]))))
+        v = per_split[nm]
+        print(f"    {nm:<8}{v['bar']:>9.4f}{v['expert']:>10.4f}"
+              f"{v['n_ep']:>10}{v['n_task']:>8}")
+    miss = (set(np.asarray(tsk_all)[itr]) | set(np.asarray(tsk_all)[iva])
+            | set(np.asarray(tsk_all)[ite]))
+    for nm, ix in (("train", itr), ("val", iva), ("test", ite)):
+        absent = miss - set(np.asarray(tsk_all)[ix])
+        if absent:
+            print(f"    ВНИМАНИЕ: в {nm} отсутствуют задачи: {len(absent)} шт.")
+    res["per_split_baselines"] = per_split
+
     print(f"\n  базы текущего test: BAR {e_bar:.4f}, случайные тонкие "
           f"{e_weak:.4f}  (прежний прогон: {E_BAR_LEGACY:.4f} / "
           f"{E_MLP_LEGACY:.4f} на ДРУГОМ разбиении)")
     ref_rows = [("эксперт (истинные)", K_true[ite]),
                 ("BAR последовательная", K_bar[ite]),
                 ("случайные тонкие (база)", Krnd)]
-    res = {}
     for name, Kx in ref_rows:
         pp, g, v = score(Kx)
         R = closed_fraction(pp, e_weak, e_bar)
         res[name] = dict(pose_rms=pp, gripper=g, R=R)
         print(f"  {name:<22}{pp:>10.4f}{g:>9.1%}{R:>8.2f}")
+
+    def to_action(mm_, idx):
+        """Признаки -> предсказанное действие. Одна точка ветвления по режиму
+        головы: раньше сборка латенты была вшита в цикл обучения, и добавить
+        режим без квантования было негде."""
+        xb = torch.as_tensor(h[idx], dtype=torch.float32).to(dev)
+        memb = (torch.as_tensor(ctx[idx], dtype=torch.float32).to(dev)
+                if mm_.xa_at else None)
+        mk = (torch.as_tensor(pad_mask[idx]).to(dev) if mm_.xa_at else None)
+        lg = mm_(xb, memb, mk, k0(idx))
+        base = lat0[idx]
+        if args.head == "direct":
+            return decode_soft(base) + lg[0], lg
+        if args.head == "cont":
+            z = base
+            for k in range(len(levels)):
+                z = z + lg[k]
+            return decode_soft(z), lg
+        # free и tied: straight-through по кодам
+        z = base.clone()
+        for k, lv in enumerate(levels):
+            ps = torch.softmax(lg[k], -1)
+            ph = torch.zeros_like(ps).scatter_(-1, ps.argmax(-1, keepdim=True), 1.0)
+            z = z + (ph + ps - ps.detach()) @ E[lv]
+        return decode_soft(z), lg
 
     itr_full = itr
     sizes = [int(v) for v in args.train_sizes.split(",")]
@@ -382,15 +524,18 @@ def main() -> None:
               continue
           step = max(1, L // nxa) if nxa else 1
           xa_at = tuple(range(0, L, step))[:nxa]
-          scores = []
+          scores, curves = [], []
           for s_i in range(args.seeds):
               torch.manual_seed(s_i)
               m = build_refiner(L, d, d_act, d_vlm, xa_at, n_codes,
-                                len(levels)).to(dev)
-              opt = torch.optim.AdamW(m.parameters(), lr=args.lr, weight_decay=1e-4)
-              # ПРОГРЕВ И КОСИНУС. Без прогрева глубокий трансформер с
-              # norm_first расходится на первых шагах, и глубина начинает
-              # ВРЕДИТЬ — что и наблюдалось (12 слоёв хуже 4).
+                                len(levels), head=args.head, E=E,
+                                z_dim=E.shape[-1], tau=args.tau,
+                                coarse_vec=E[0]).to(dev)
+              n_par = sum(pp.numel() for pp in m.parameters())
+              opt = torch.optim.AdamW(m.parameters(), lr=args.lr,
+                                      weight_decay=args.wd)
+              # ПРОГРЕВ И КОСИНУС: без прогрева глубокий трансформер с
+              # norm_first расходится на первых шагах.
               steps = args.epochs * max(1, len(itr) // args.batch)
               warm = max(1, steps // 20)
               sched = torch.optim.lr_scheduler.LambdaLR(
@@ -398,161 +543,86 @@ def main() -> None:
                   else 0.5 * (1 + np.cos(np.pi * (t - warm) / max(1, steps - warm))))
               lossf = nn.CrossEntropyLoss()
               g = torch.Generator().manual_seed(s_i)
-              best = (1e9, None)
+              best, curve = (1e9, None, -1), []
+
+              def err_on(idx, bs=256):
+                  """Ошибка действия на наборе, через ту же точку ветвления,
+                  что и обучение — иначе train и eval разойдутся по режиму."""
+                  m.eval()
+                  acc = []
+                  with torch.no_grad():
+                      for i2 in range(0, len(idx), bs):
+                          jj = idx[i2:i2 + bs]
+                          a_hat, _ = to_action(m, jj)
+                          tt = torch.as_tensor(tgt_act[jj],
+                                               dtype=torch.float32).to(dev)
+                          acc.append(((a_hat[..., :6] - tt[..., :6]) ** 2)
+                                     .mean().item() * len(jj))
+                  return float(np.sqrt(sum(acc) / len(idx))) / rng_pose
+
               for ep_i in range(args.epochs):
                   m.train()
                   order = itr[torch.randperm(len(itr), generator=g).numpy()]
                   for i in range(0, len(order), args.batch):
                       j = order[i:i + args.batch]
-                      x = torch.as_tensor(h[j], dtype=torch.float32).to(dev)
-                      mem = (torch.as_tensor(ctx[j], dtype=torch.float32).to(dev)
-                             if xa_at else None)
-                      mm = (torch.as_tensor(pad_mask[j]).to(dev) if xa_at else None)
-                      y = torch.as_tensor(K_true[j][:, levels, :]).long().to(dev)
                       opt.zero_grad()
-                      lg = m(x, mem, mm, k0(j))
-                      # ЛАТЕНТНЫЙ ЛОСС, А НЕ КРОСС-ЭНТРОПИЯ ПО КОДАМ.
-                      # Декодер принимает СУММУ латентов (§1): промах на
-                      # соседний по эмбеддингу код почти бесплатен для действия,
-                      # но кросс-энтропией штрафуется полностью. Отсюда и
-                      # наблюдавшееся CE выше равномерного (10.6-12.7 против
-                      # ln(2048)=7.62) при вполне приличном действии.
-                      # Мягкое ожидание по кодбуку дифференцируемо, argmax
-                      # обходится, цель совпадает с тем, что видит декодер.
-                      # ВАЖНО: в сумму входит и вклад уровня 0 ОТ BAR, поэтому
-                      # уточнитель может научиться компенсировать её грубые
-                      # промахи, а не только угадывать свои уровни.
-                      # STRAIGHT-THROUGH. Обучение на softmax-смеси даёт
-                      # латенту, НЕДОСТИЖИМУЮ ни одним дискретным кодом, а
-                      # инференс берёт argmax. Прямой проход теперь идёт по
-                      # жёсткому выбору, градиент — по мягкому.
-                      pred_lat = lat0[j].clone()
-                      for k, lv in enumerate(levels):
-                          ps = torch.softmax(lg[k], -1)
-                          ph = torch.zeros_like(ps).scatter_(
-                              -1, ps.argmax(-1, keepdim=True), 1.0)
-                          pst = ph + ps - ps.detach()
-                          pred_lat = pred_lat + pst @ E[lv]
-                      # ОШИБКА ДЕЙСТВИЯ ЧЕРЕЗ ДЕКОДЕР, а не MSE в латенте.
-                      a_hat = decode_soft(pred_lat)
-                      a_tgt = torch.as_tensor(tgt_act[j], dtype=torch.float32).to(dev)
-                      loss = ((a_hat - a_tgt) ** 2).mean()
-                      ce = sum(lossf(lg[k].reshape(-1, n_codes),
-                                     y[:, k, :].reshape(-1))
-                               for k in range(len(levels))) / len(levels)
-                      loss = loss + args.ce_weight * ce
+                      a_hat, lg = to_action(m, j)
+                      a_tgt = torch.as_tensor(tgt_act[j],
+                                              dtype=torch.float32).to(dev)
+                      l_act = ((a_hat - a_tgt) ** 2).mean()
+                      loss = l_act
+                      l_ce = None
+                      if args.ce_weight and args.head in ("free", "tied"):
+                          y = torch.as_tensor(
+                              y_ce_full[j][:, levels, :]).long().to(dev)
+                          l_ce = sum(lossf(lg[k].reshape(-1, n_codes),
+                                           y[:, k, :].reshape(-1))
+                                     for k in range(len(levels))) / len(levels)
+                          loss = loss + args.ce_weight * l_ce
                       loss.backward()
                       nn.utils.clip_grad_norm_(m.parameters(), 1.0)
                       opt.step()
                       sched.step()
-                  m.eval()
-                  with torch.no_grad():
-                      vs = []
-                      for i in range(0, len(iva), 256):
-                          j = iva[i:i + 256]
-                          x = torch.as_tensor(h[j], dtype=torch.float32).to(dev)
-                          mem = (torch.as_tensor(ctx[j], dtype=torch.float32).to(dev)
-                                 if xa_at else None)
-                          mm = (torch.as_tensor(pad_mask[j]).to(dev) if xa_at else None)
-                          y = torch.as_tensor(K_true[j][:, levels, :]).long().to(dev)
-                          lg = m(x, mem, mm, k0(j))
-                          # НА УРОВЕНЬ, А НЕ СУММА. Сумма по двум уровням
-                          # сравнивалась с ln(2048)=7.62, и 10.6 читалось как
-                          # «хуже равномерного», хотя это 5.3 на уровень, то
-                          # есть ЛУЧШЕ. В обучении деление было, в валидации нет.
-                          vs.append(sum(lossf(lg[k].reshape(-1, n_codes),
-                                              y[:, k, :].reshape(-1)).item()
-                                        for k in range(len(levels)))
-                                    / len(levels))
-                      v_ce = float(np.mean(vs))
-                      # ОТБОР ПО ОШИБКЕ ДЕЙСТВИЯ, а не по кросс-энтропии.
-                      # Декодер принимает СУММУ латентов (§1), поэтому промах на
-                      # соседний по эмбеддингу код почти бесплатен, и токенная
-                      # энтропия с ошибкой действия расходятся.
-                      Kv = K_bar[iva].copy()
-                      for i in range(0, len(iva), 256):
-                          j = iva[i:i + 256]
-                          x = torch.as_tensor(h[j], dtype=torch.float32).to(dev)
-                          mem = (torch.as_tensor(ctx[j], dtype=torch.float32).to(dev)
-                                 if xa_at else None)
-                          mm = (torch.as_tensor(pad_mask[j]).to(dev) if xa_at else None)
-                          lg = m(x, mem, mm, k0(j))
-                          for k, lv in enumerate(levels):
-                              Kv[i:i + len(j), lv, :] = lg[k].argmax(-1).cpu().numpy()
-                      dv = decode(Kv)
-                      v = float(np.sqrt(((dv[..., :6] - act[iva][..., :6]) ** 2).mean()))
+                      if i == 0 and ep_i % 10 == 0:
+                          # ВКЛАДЫ РАЗДЕЛЬНО: при ce_weight=0.01 CE давала
+                          # ~0.043 против ~0.0038 у действия, то есть
+                          # доминировала вдесятеро.
+                          ce_s = (f", CE·λ {args.ce_weight * l_ce.item():.5f}"
+                                  if l_ce is not None else "")
+                          print(f"        вклады: действие {l_act.item():.5f}"
+                                f"{ce_s}", flush=True)
+                  v = err_on(iva)
+                  v_tr = err_on(itr[:len(iva)])
+                  curve.append(dict(epoch=ep_i, train=v_tr, val=v))
                   if v < best[0]:
-                      best = (v, {k: p.detach().clone()
-                                  for k, p in m.state_dict().items()})
+                      best = (v, {k: pp.detach().clone()
+                                  for k, pp in m.state_dict().items()}, ep_i)
                   if ep_i % 10 == 0 or ep_i == args.epochs - 1:
-                      # ОБЕ величины рядом намеренно. Их расхождение — измеренное
-                      # свойство кодека: декодер видит сумму, поэтому попадание в
-                      # код и попадание в действие суть разные цели.
-                      with torch.no_grad():
-                          pl = lat0[iva].clone()
-                          for i in range(0, len(iva), 256):
-                              jj = iva[i:i + 256]
-                              xx = torch.as_tensor(h[jj], dtype=torch.float32).to(dev)
-                              mmx = (torch.as_tensor(ctx[jj], dtype=torch.float32).to(dev)
-                                     if xa_at else None)
-                              mmk = (torch.as_tensor(pad_mask[jj]).to(dev)
-                                     if xa_at else None)
-                              lgx = m(xx, mmx, mmk, k0(jj))
-                              acc_l = lat0[jj].clone()
-                              for k, lv in enumerate(levels):
-                                  acc_l = acc_l + torch.softmax(lgx[k], -1) @ E[lv]
-                              pl[i:i + len(jj)] = acc_l
-                          lat_err = float(((pl - lat_t[iva]) ** 2).mean())
-                      # ОБУЧАЮЩАЯ ОШИБКА РЯДОМ С ВАЛИДАЦИОННОЙ. Без неё
-                      # утверждение «переобучение» ничем не подкреплено: расти
-                      # на валидации величина может и от расходящейся
-                      # оптимизации. Считается на подвыборке того же размера,
-                      # что валидация, чтобы числа были сравнимы.
-                      with torch.no_grad():
-                          sub = itr[:len(iva)]
-                          Kt = K_bar[sub].copy()
-                          for i in range(0, len(sub), 256):
-                              jj = sub[i:i + 256]
-                              xx = torch.as_tensor(h[jj], dtype=torch.float32).to(dev)
-                              mmx = (torch.as_tensor(ctx[jj], dtype=torch.float32).to(dev)
-                                     if xa_at else None)
-                              mmk = (torch.as_tensor(pad_mask[jj]).to(dev)
-                                     if xa_at else None)
-                              lgx = m(xx, mmx, mmk, k0(jj))
-                              for k, lv in enumerate(levels):
-                                  Kt[i:i + len(jj), lv, :] = lgx[k].argmax(-1).cpu().numpy()
-                          dt = decode(Kt)
-                          v_tr = float(np.sqrt(
-                              ((dt[..., :6] - act[sub][..., :6]) ** 2).mean()))
-                      print(f"      эпоха {ep_i:>3}: действие train "
-                            f"{v_tr / rng_pose:.4f} / val {v / rng_pose:.4f}"
-                            f"   (CE {v_ce:.2f}, латента {lat_err:.4f})",
-                            flush=True)
+                      print(f"      эпоха {ep_i:>3}: действие train {v_tr:.4f}"
+                            f" / val {v:.4f}", flush=True)
               m.load_state_dict(best[1])
-              m.eval()
-              Kx = K_bar[ite].copy()
-              with torch.no_grad():
-                  for i in range(0, len(ite), 256):
-                      j = ite[i:i + 256]
-                      x = torch.as_tensor(h[j], dtype=torch.float32).to(dev)
-                      mem = (torch.as_tensor(ctx[j], dtype=torch.float32).to(dev)
-                             if xa_at else None)
-                      mm = (torch.as_tensor(pad_mask[j]).to(dev) if xa_at else None)
-                      lg = m(x, mem, mm, k0(j))
-                      for k, lv in enumerate(levels):
-                          Kx[i:i + len(j), lv, :] = lg[k].argmax(-1).cpu().numpy()
-              scores.append(score(Kx))
+              scores.append(err_on(ite))
+              curves.append(dict(seed=s_i, best_epoch=best[2],
+                                 best_val=best[0], last_val=curve[-1]["val"],
+                                 curve=curve, n_params=n_par))
               del m
               if dev.type == "cuda":
                   torch.cuda.empty_cache()
           sc = np.array(scores)
-          p, g_, v_ = sc.mean(axis=0)
-          R = closed_fraction(p, e_weak, e_bar)
-          tag = (f"{L}сл x{d}" + (f" кэш x{nxa}" if nxa else " только h")
+          p_ = float(sc.mean())
+          tag = (f"{args.head} {L}сл x{d}"
+                 + (f" кэш x{nxa}" if nxa else "")
                  + (f" n={len(itr)}" if len(sizes) > 1 else ""))
-          res[tag] = dict(pose_rms=float(p), gripper=float(g_), R=float(R),
-                          sd=float(sc[:, 0].std()), layers=L, d_model=d, xa=nxa)
-          print(f"  {tag:<22}{p:>10.4f}{g_:>9.1%}{R:>8.2f}{sc[:, 0].std():>10.4f}")
+          # ОТСТАВАНИЕ ОТ BAR НАПРЯМУЮ — главное число. R с базой «случайные
+          # тонкие» насыщался на 0.94-0.96 и был бесполезен.
+          res[tag] = dict(pose_rms=p_, sd=float(sc.std()),
+                          vs_bar=p_ / per_split["test"]["bar"] - 1.0,
+                          R=closed_fraction(p_, e_weak, e_bar),
+                          layers=L, d_model=d, xa=nxa, head=args.head,
+                          n_train=int(len(itr)), curves=curves)
+          print(f"  {tag:<26}{p_:>10.4f}{sc.std():>10.4f}"
+                f"{p_ / per_split['test']['bar'] - 1.0:>+10.0%}"
+                f"{curves[0]['n_params'] / 1e6:>9.2f}M")
 
     print("\n  ЧИТАТЬ ТАК, правило записано до запуска.")
     print("  R >= 0.8      уточнитель решает задачу — интегрировать и в симулятор")
