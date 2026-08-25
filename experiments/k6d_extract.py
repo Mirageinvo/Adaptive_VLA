@@ -315,7 +315,12 @@ def main() -> None:
 
     out = dict(h=Hm.astype(np.float16), K_true=K_true, K_bar=K_bar,
                act=a_codec.astype(np.float32), episode=epi,
-               task=np.asarray(tsk), pos_offset=offs, ctx_len=ctx_lens)
+               task=np.asarray(tsk), pos_offset=offs)
+    # ctx_len ПИШЕТСЯ ТОЛЬКО ВМЕСТЕ С ctx. При --no-ctx он остался бы целиком
+    # нулевым, и всякий, кто посчитает по нему маску паддинга, закроет ВСЁ.
+    # Лучше отсутствие ключа, чем правдоподобный ноль.
+    if not args.no_ctx:
+        out["ctx_len"] = ctx_lens
     if not args.no_ctx:
         d_vlm = ctx_parts[0].shape[-1]
         L = max(c.shape[1] for c in ctx_parts)
