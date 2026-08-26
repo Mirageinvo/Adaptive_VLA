@@ -107,7 +107,12 @@ def build_refiner(layers, d, d_in, d_ctx, xa_at, n_codes, n_out, heads=8, ff=4,
                   head="free", E=None, z_dim=512, tau=1.0, coarse_vec=None,
                   n_steps=20, n_dim=7):
     """head:
-      free   — свободные классификаторы на n_codes (как было);
+      free   — свободные классификаторы на n_codes, ЖЁСТКИЙ выбор;
+      soft   — те же классификаторы, но БЕЗ жёсткого выбора: логиты ->
+               softmax -> ожидаемый эмбеддинг -> декодер. Отделяет цену
+               ДИСКРЕТНОГО ВЫБОРА от цены самой параметризации: если
+               soft ~ cont, а free заметно хуже, помеха именно в округлении;
+               если soft тоже плох, дело в голове или кодбуках;
       tied   — предсказать вектор в латенте, логиты из геометрии ЗАМОРОЖЕННОГО
                кодбука: -||r - E_g[k]||^2 / tau. Отрезает возможность выучить
                произвольное отображение в 2048 меток;
@@ -160,7 +165,7 @@ def build_refiner(layers, d, d_in, d_ctx, xa_at, n_codes, n_out, heads=8, ff=4,
                 self.xa_norm = nn.ModuleDict({str(i): nn.LayerNorm(d)
                                               for i in self.xa_at})
             self.norm = nn.LayerNorm(d)
-            if head == "free":
+            if head in ("free", "soft"):
                 self.out = nn.ModuleList([nn.Linear(d, n_codes)
                                           for _ in range(n_out)])
             elif head in ("tied", "cont"):
@@ -202,7 +207,7 @@ def build_refiner(layers, d, d_in, d_ctx, xa_at, n_codes, n_out, heads=8, ff=4,
                                            need_weights=False)
                     x = x + a
             x = self.norm(x)
-            if self.head == "free":
+            if self.head in ("free", "soft"):
                 return [o(x) for o in self.out]
             if self.head == "tied":
                 out = []
@@ -306,7 +311,7 @@ def main() -> None:
                     help="предсказывать и уровень 0 тоже; по умолчанию он "
                          "берётся из первого блока BAR, как на инференсе")
     ap.add_argument("--head", default="free",
-                    choices=["free", "tied", "cont", "direct"],
+                    choices=["free", "soft", "tied", "cont", "direct"],
                     help="лестница по параметризации выхода: free — свободные "
                          "классификаторы; tied — латент плюс геометрия "
                          "замороженного кодбука; cont — непрерывная поправка "
@@ -456,12 +461,11 @@ def main() -> None:
         # 1.8 ГиБ всё время прогона, хотя нужны построчно по батчам.
         # lat_t к тому же после разделения лосса вообще не используется в
         # обучении — оставлен только как диагностика.
-        lat_t = torch.cat([lat(K_true[i:i + 512]).cpu()
-                           for i in range(0, N, 512)])
+        # lat_t УДАЛЁН: после перехода на лосс через декодер он не
+        # участвовал ни в обучении, ни в оценке, а занимал 0.9 ГиБ.
         lat0 = torch.cat([(E[0][torch.as_tensor(K_bar[i:i + 512, 0, :]).long().to(dev)]).cpu()
                           for i in range(0, N, 512)])
-    print(f"  целевая латента: {tuple(lat_t.shape)}, "
-          f"вклад уровня 0 от BAR: {tuple(lat0.shape)}")
+    print(f"  вклад уровня 0 от BAR: {tuple(lat0.shape)}")
     a_ref = tgt_act[ite]
     # РАЗМАХ ВСЕГДА ОТ ДЕЙСТВИЙ ДАТАСЕТА. При target=bar числитель нормировался
     # размахом decode(K_bar), а знаменатель — размахом датасета, и делились
@@ -478,7 +482,7 @@ def main() -> None:
     print("\n" + "=" * 84)
     print(f"  {'вариант':<26}{'поза RMS':>10}{'разброс':>10}"
           f"{('к BAR' if args.target == 'dataset' else 'имит./BAR'):>10}"
-          f"{'парам.':>9}")
+          f"{'R_уч':>9}{'парам.':>9}")
     # БАЗЫ НА ТЕКУЩЕМ TEST. Слабая база — «уровень 0 от BAR, тонкие уровни
     # СЛУЧАЙНЫЕ»: она измеряется здесь же и не зависит от чужого прогона.
     # ЦЕЛЬ ОБУЧЕНИЯ. Разделение существенно: «воспроизвести BAR» и
@@ -495,11 +499,29 @@ def main() -> None:
     # относительно СВОЕЙ ЖЕ цели равна ровно нулю, и деление на неё уронило бы
     # прогон после нескольких часов обучения.
     _aa = act[ite]
-    _rp = float(_aa[..., :6].max() - _aa[..., :6].min())
+    # ТОТ ЖЕ ГЛОБАЛЬНЫЙ РАЗМАХ, что у основной ошибки. Прежде числитель
+    # нормировался размахом по всему датасету, а знаменатель — по test;
+    # величины близки, но заявленная «одна шкала» кодом не гарантировалась.
+    _rp = float(act[..., :6].max() - act[..., :6].min())
     _dbar = np.concatenate([decode(K_bar[ite][i:i + 512])
                             for i in range(0, len(ite), 512)])
     e_bar_ds = float(np.sqrt(((_dbar[..., :6] - _aa[..., :6]) ** 2).mean())) / _rp
     tsk_all = z["task"] if "task" in z.files else np.zeros(N, int)
+    # ЗНАМЕНАТЕЛЬ ДЛЯ R_учителя: действие по ОДНОМУ грубому уровню, без
+    # всякого уточнения. Декодирование неполным набором уровней законно —
+    # кодек обучался с quantizer_dropout=0.25 (rvq.py:301).
+    with torch.no_grad():
+        a_coarse = torch.cat([decode_soft(lat0[ite][i:i + 256].to(dev)).cpu()
+                              for i in range(0, len(ite), 256)]).numpy()
+    e_coarse = float(np.sqrt(((a_coarse[..., :6] - tgt_act[ite][..., :6]) ** 2)
+                             .mean())) / rng_pose
+    print(f"  только грубый уровень, без уточнения: {e_coarse:.4f}")
+
+    def r_teacher(e):
+        """1 - MSE(предсказание, цель) / MSE(только грубый, цель).
+        0 — не лучше отсутствия уточнения, 1 — точное попадание."""
+        return float("nan") if e_coarse < 1e-12 else 1.0 - (e / e_coarse) ** 2
+
     rngb = np.random.default_rng(args.seed)
     Krnd = K_bar[ite].copy()
     Krnd[:, 1:, :] = rngb.integers(0, n_codes, size=Krnd[:, 1:, :].shape)
@@ -543,7 +565,9 @@ def main() -> None:
         pp, g, v = score(Kx)
         rel_r = (pp / e_bar_ds - 1.0 if args.target == "dataset"
                  else pp / e_bar_ds)
-        res[name] = dict(pose_rms=pp, gripper=g, vs_bar_dataset=float(rel_r))
+        res[name] = dict(pose_rms=pp, gripper=g,
+                         ratio_to_bar=float(pp / e_bar_ds),
+                         excess_over_bar=float(pp / e_bar_ds - 1.0))
         print(f"  {name:<26}{pp:>10.4f}{'':>10}{rel_r:>10.1%}")
 
     def to_action(mm_, idx):
@@ -560,12 +584,17 @@ def main() -> None:
             return decode_soft(base) + lg[0], lg
         if args.head == "cont":
             return decode_soft(base + lg[0]), lg
-        # free и tied: straight-through по кодам
+        # free и tied — straight-through (жёсткий выбор вперёд);
+        # soft — БЕЗ выбора вовсе, ожидаемый эмбеддинг по распределению.
         z = base.clone()
         for k, lv in enumerate(levels):
             ps = torch.softmax(lg[k], -1)
-            ph = torch.zeros_like(ps).scatter_(-1, ps.argmax(-1, keepdim=True), 1.0)
-            z = z + (ph + ps - ps.detach()) @ E[lv]
+            if args.head == "soft":
+                z = z + ps @ E[lv]
+            else:
+                ph = torch.zeros_like(ps).scatter_(
+                    -1, ps.argmax(-1, keepdim=True), 1.0)
+                z = z + (ph + ps - ps.detach()) @ E[lv]
         return decode_soft(z), lg
 
     itr_full = itr
@@ -602,6 +631,14 @@ def main() -> None:
               lossf = nn.CrossEntropyLoss()
               g = torch.Generator().manual_seed(s_i)
               best, curve = (1e9, None, -1), []
+
+              # ПОДВЫБОРКА ДЛЯ ОЦЕНКИ ОБУЧАЮЩЕЙ ОШИБКИ — фиксированная
+              # СЛУЧАЙНАЯ. Прежде брались первые len(iva) индексов, а они идут
+              # в порядке сбора, то есть это конкретный набор эпизодов, а не
+              # выборка из обучающей части. Диагноз «переобучение» на такой
+              # подвыборке формально не подтверждался.
+              itr_eval = np.random.default_rng(args.seed).choice(
+                  itr, size=min(len(itr), len(iva)), replace=False)
 
               def err_on(idx, bs=256):
                   """Ошибка действия на наборе, через ту же точку ветвления,
@@ -659,7 +696,7 @@ def main() -> None:
                                 f"схват·w {args.grip_weight * l_grip.item():.5f}"
                                 f"{ce_s}", flush=True)
                   v = err_on(iva)
-                  v_tr = err_on(itr[:len(iva)])
+                  v_tr = err_on(itr_eval)
                   curve.append(dict(epoch=ep_i, train=v_tr, val=v))
                   if v < best[0]:
                       best = (v, {k: pp.detach().clone()
@@ -683,7 +720,8 @@ def main() -> None:
           # ОТСТАВАНИЕ ОТ BAR НАПРЯМУЮ — главное число. R с базой «случайные
           # тонкие» насыщался на 0.94-0.96 и был бесполезен.
           res[tag] = dict(pose_rms=p_, sd=float(sc.std()),
-                          vs_bar_dataset=float(p_ / e_bar_ds),
+                          ratio_to_bar=float(p_ / e_bar_ds),
+                          excess_over_bar=float(p_ / e_bar_ds - 1.0),
                           R=closed_fraction(p_, e_weak, e_bar),
                           layers=L, d_model=d, xa=nxa, head=args.head,
                           n_train=int(len(itr)), curves=curves)
@@ -692,18 +730,24 @@ def main() -> None:
           # относительно датасета.
           rel = (p_ / e_bar_ds - 1.0 if args.target == "dataset"
                  else p_ / e_bar_ds)
+          res[tag]["r_teacher"] = r_teacher(p_)
           print(f"  {tag:<26}{p_:>10.4f}{sc.std():>10.4f}"
-                f"{rel:>10.1%}{curves[0]['n_params'] / 1e6:>9.2f}M")
+                f"{rel:>10.1%}{r_teacher(p_):>9.2f}"
+                f"{curves[0]['n_params'] / 1e6:>9.2f}M")
 
     # ВОРОТА ПО R УДАЛЕНЫ. С базой «случайные тонкие коды» он насыщается на
     # 0.94-0.96 и не различает хорошие модели от плохих. Решают абсолютные
     # величины и разрыв train/val.
     print("\n  ЧИТАТЬ ТАК, правило записано до запуска.")
     if args.target == "bar":
-        print("  Главное — ОШИБКА ИМИТАЦИИ как доля собственной ошибки BAR")
-        print("  относительно датасета. Ниже ~0.3 — уточнитель воспроизводит")
-        print("  учителя; выше ~0.6 — не воспроизводит, и разговор об обгоне")
-        print("  беспредметен.")
+        # ПОРОГИ 0.3/0.6 БЫЛИ ВЗЯТЫ С ПОТОЛКА и удалены. Осмысленная шкала —
+        # доля уточнения учителя, воспроизведённая относительно грубого кода:
+        #   R_teacher = 1 - MSE(предсказание, BAR) / MSE(только грубый, BAR)
+        # 0 — не лучше грубого кода без уточнения; 1 — точное воспроизведение
+        # BAR; отрицательное — уточнитель делает ХУЖЕ, чем отсутствие уточнения.
+        print("  Главное — R_учителя = 1 - MSE(предсказание, BAR) /")
+        print("  MSE(только грубый уровень, BAR). Ноль означает «не лучше,")
+        print("  чем вовсе без уточнения», единица — точное воспроизведение.")
     else:
         print("  Главное — отставание от BAR. Отрицательное значит ОБГОН.")
     print("  И отдельно train против val: сходятся — вопрос выразительности,")
