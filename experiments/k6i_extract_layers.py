@@ -16,6 +16,12 @@ BAR ПЕРЕЧИТЫВАЮТ изображение, а наш уточните�
 поднимать в память все четыре. Каждый слой пишется в свой .npy ЧЕРЕЗ MEMMAP,
 то есть на диск по батчам, а не через накопление 33 ГиБ в оперативной памяти.
 
+СТРОКИ ВЫРОВНЕНЫ ВЕЗДЕ ОДИНАКОВО. Строка k в любом файле — это наблюдение k.
+Обход идёт группами по офсету позиции, но запись ведётся по индексам, а не
+подряд, поэтому перестановки нет. Прежняя версия хранила `row_order` и требовала
+применять её вручную: формат, в котором забытая перестановка не падает, а даёт
+правдоподобно обучающуюся модель на перепутанных изображениях.
+
 НУМЕРАЦИЯ СЛОЁВ. `--ctx-layers 6,12,18,24` означает остаточный поток НА ВХОДЕ
 слоя с этим номером (единичная индексация), то есть состояние после
 предыдущих. Для последнего слоя это ровно то, что снимал k6d, поэтому данные
@@ -42,10 +48,25 @@ BAR ПЕРЕЧИТЫВАЮТ изображение, а наш уточните�
 import argparse
 import io
 import json
+import math
 import os
+import shutil
 import sys
 
 import numpy as np
+
+
+def check_disk(outdir, need_bytes, slack=0.15):
+    """Место проверяется ДО создания файлов. Иначе 37 ГиБ пишутся час и
+    падают на последнем батче, оставляя мусор и не оставляя признаков."""
+    free = shutil.disk_usage(outdir).free
+    need = need_bytes * (1.0 + slack)
+    if free < need:
+        raise SystemExit(
+            f"мало места в {outdir}: свободно {free / 2**30:.1f} ГиБ, "
+            f"нужно {need / 2**30:.1f} ГиБ (данные {need_bytes / 2**30:.1f} "
+            f"плюс {slack:.0%} запаса)")
+    return free
 
 N_POS, N_LEVEL, T_CHUNK = 16, 3, 20
 
@@ -65,17 +86,25 @@ def find_vlm_layers(vlm):
     return best
 
 
-def left_pad_into(dst, row0, block, lens, Lmax):
-    """Положить батч в memmap с ЛЕВЫМ паддингом.
+def left_pad_into(dst, rows, block, Lmax):
+    """Положить батч в memmap ПО ИНДЕКСАМ НАБЛЮДЕНИЙ, с левым паддингом.
 
-    Процессор дополняет слева, значимая часть прижата вправо. Кладём так же:
+    ПОЧЕМУ ПО ИНДЕКСАМ, А НЕ ПОДРЯД. Первая версия писала строки в порядке
+    обхода (группами по офсету позиции) и хранила перестановку `row_order`,
+    которую потребитель обязан был применить. Формат хрупкий до
+    неприемлемого: одна забытая перестановка не падает, а даёт правдоподобно
+    обучающуюся модель на перепутанных изображениях. Теперь строка k — это
+    наблюдение k во всех массивах разом, и перестановки нет вовсе.
+
+    Паддинг левый, как у процессора: значимая часть прижата вправо, поэтому
     позиция -1 всегда последний реальный токен независимо от длины подсказки.
     """
     b, l = block.shape[0], block.shape[1]
-    assert l <= Lmax, f"батч длиннее выделенного: {l} > {Lmax}"
-    dst[row0:row0 + b, Lmax - l:, :] = block
-    if Lmax - l:
-        dst[row0:row0 + b, :Lmax - l, :] = 0
+    assert l <= Lmax, (f"префикс длиннее выделенного: {l} > {Lmax}. "
+                       f"Поднимите --ctx-max.")
+    pad = np.zeros((b, Lmax, block.shape[2]), block.dtype)
+    pad[:, Lmax - l:, :] = block
+    dst[rows] = pad
     return b
 
 
@@ -83,10 +112,23 @@ def selftest():
     # 1. ЛЕВЫЙ ПАДДИНГ: значимое прижато вправо, нули слева.
     Lmax = 6
     dst = np.zeros((3, Lmax, 2), np.float16)
-    left_pad_into(dst, 0, np.ones((2, 4, 2), np.float16), None, Lmax)
-    left_pad_into(dst, 2, np.full((1, 6, 2), 3, np.float16), None, Lmax)
+    left_pad_into(dst, np.array([0, 1]), np.ones((2, 4, 2), np.float16), Lmax)
+    left_pad_into(dst, np.array([2]), np.full((1, 6, 2), 3, np.float16), Lmax)
     assert (dst[0, :2] == 0).all() and (dst[0, 2:] == 1).all(), dst[0]
     assert (dst[2] == 3).all(), "полная длина не должна паддиться"
+
+    # 1б. ЗАПИСЬ ПО ИНДЕКСАМ, а не подряд. Главная защита: строка k обязана
+    # быть наблюдением k при ЛЮБОМ порядке обхода. Имитируем обход группами
+    # по офсету и проверяем, что каждая строка получила своё значение.
+    N = 7
+    dst = np.zeros((N, 2, 1), np.float16)
+    offs = np.array([1, 0, 1, 0, 1, 0, 0])
+    for po in (0, 1):
+        sel = np.where(offs == po)[0]
+        blk = np.stack([np.full((2, 1), float(j)) for j in sel]).astype(np.float16)
+        left_pad_into(dst, sel, blk, 2)
+    assert (dst[:, 0, 0] == np.arange(N)).all(), (
+        f"строка не совпала с наблюдением: {dst[:, 0, 0]}")
 
     # 2. НУМЕРАЦИЯ СЛОЁВ единичная: слой 24 из 24 — последний.
     for total, want in ((24, [5, 11, 17, 23]),):
@@ -242,15 +284,22 @@ def main() -> None:
                      else off_by_task[tsk[i]] for i in range(N)])
 
     # --- memmap на диск, по файлу на слой ------------------------------------
-    os.makedirs(os.path.dirname(os.path.abspath(args.out_prefix)) or ".",
-                exist_ok=True)
+    outdir = os.path.dirname(os.path.abspath(args.out_prefix)) or "."
+    os.makedirs(outdir, exist_ok=True)
     Lmax = args.ctx_max
-    mm, d_vlm = {}, None
+    d_guess = int(layers[0].input_layernorm.weight.shape[0])
+    need = N * Lmax * d_guess * 2 * len(want_layers) + N * N_POS * 768 * 2
+    free = check_disk(outdir, need)
+    print(f"место в {outdir}: нужно {need / 2**30:.1f} ГиБ "
+          f"(+15% запаса), свободно {free / 2**30:.1f} ГиБ")
+    mm, paths, d_vlm = {}, {}, None
     Hm = None
     K_bar = np.zeros((N, N_LEVEL, N_POS), np.int64)
     ctx_len = np.zeros(N, np.int32)
-    row = {l: 0 for l in want_layers}
-    order_idx = []
+    # ПОТОКОВАЯ СТАТИСТИКА ПО ВСЕМ СТРОКАМ. Считать её по первым 200 значит не
+    # увидеть ни выброс, ни NaN в остальных 11800 — а NaN в признаках даёт
+    # обучение, которое молча не сходится.
+    stat = {l: dict(n=0, s=0.0, s2=0.0, mx=0.0, nonfinite=0) for l in want_layers}
 
     done_cnt = 0
     for po in sorted({int(v) for v in offs}):
@@ -294,34 +343,64 @@ def main() -> None:
         Hm[sel] = g0.numpy().astype(np.float16)
         K_bar[sel] = tk.cpu().numpy().reshape(b, N_LEVEL, N_POS)
         ctx_len[sel] = real_lens
-        order_idx.append(sel)
         for l in want_layers:
-            assert grab_ctx[l], f"хук слоя {l} не сработал"
+            # ХУК ОБЯЗАН СРАБОТАТЬ РОВНО ПО РАЗУ НА БЛОК. Если срабатываний не
+            # три, значит взят не тот модуль (или generate устроен иначе), и
+            # брать [0] вслепую нельзя.
+            assert len(grab_ctx[l]) == N_LEVEL, (
+                f"хук слоя {l} сработал {len(grab_ctx[l])} раз, ждали {N_LEVEL}")
             c = grab_ctx[l][0].numpy()          # ПЕРВЫЙ блок, как и h
             if l not in mm:
                 d_vlm = c.shape[-1]
-                path = f"{args.out_prefix}_L{l:02d}_ctx.npy"
+                paths[l] = f"{args.out_prefix}_L{l:02d}_ctx.npy"
+                # ПИШЕМ В .partial: упавший прогон иначе оставит внешне
+                # валидный .npy, заполненный лишь наполовину, и это невозможно
+                # отличить от целого файла.
                 mm[l] = np.lib.format.open_memmap(
-                    path, mode="w+", dtype=np.float16, shape=(N, Lmax, d_vlm))
-                print(f"  создан {path}: {(N * Lmax * d_vlm * 2) / 2**30:.1f} ГиБ")
-            left_pad_into(mm[l], row[l], c, real_lens, Lmax)
-            row[l] += b
+                    paths[l] + ".partial", mode="w+", dtype=np.float16,
+                    shape=(N, Lmax, d_vlm))
+                print(f"  создан {paths[l]}.partial: "
+                      f"{(N * Lmax * d_vlm * 2) / 2**30:.1f} ГиБ")
+            left_pad_into(mm[l], sel, c, Lmax)
+            a = c.astype(np.float32)
+            fin = np.isfinite(a)
+            st_ = stat[l]
+            st_["nonfinite"] += int(fin.size - fin.sum())
+            af = np.where(fin, a, 0.0)
+            st_["n"] += af.size
+            st_["s"] += float(af.sum())
+            st_["s2"] += float((af * af).sum())
+            st_["mx"] = max(st_["mx"], float(np.abs(af).max()))
+        # ПРЕФИКС ОДИНАКОВ ВО ВСЕХ ТРЁХ БЛОКАХ — проверяем на первом батче.
+        # Это проверяет и правильность хука, и предпосылку кэшируемости, на
+        # которой держится весь выигрыш в 1.31x.
+        if done_cnt <= args.batch:
+            for l in want_layers:
+                d01 = float(np.abs(grab_ctx[l][0].numpy().astype(np.float32)
+                                   - grab_ctx[l][1].numpy().astype(np.float32)).max())
+                print(f"    слой {l:>2}: |префикс блока 1 − блока 2| = {d01:.3e}")
+                if d01 > 1e-2:
+                    raise SystemExit(
+                        f"префикс слоя {l} различается между блоками на {d01:.3e}. "
+                        f"Либо хук ловит не префикс, либо контекст не кэшируем — "
+                        f"в обоих случаях сохранять признаки бессмысленно.")
         if done_cnt % (args.batch * 50) < args.batch:
             print(f"  {done_cnt}/{N} (офсет {po})", flush=True)
     assert done_cnt == N, f"обработано {done_cnt} из {N}"
 
-    # ВНИМАНИЕ: memmap заполнялся в порядке обхода по офсетам, а не в порядке
-    # наблюдений. Сохраняем перестановку, чтобы строка k в ctx соответствовала
-    # наблюдению row_order[k].
-    row_order = np.concatenate(order_idx)
-    assert len(row_order) == N and len(np.unique(row_order)) == N
-
     for l in want_layers:
         mm[l].flush()
-        a = np.asarray(mm[l][:200], np.float32)
-        print(f"  слой {l:>2}: |avg| {np.abs(a).mean():7.3f}  "
-              f"max {np.abs(a).max():9.1f}  sd {a.std():7.3f}")
         del mm[l]
+        st_ = stat[l]
+        mean = st_["s"] / st_["n"]
+        sd = math.sqrt(max(st_["s2"] / st_["n"] - mean * mean, 0.0))
+        print(f"  слой {l:>2}: sd {sd:8.3f}  max|x| {st_['mx']:9.1f}  "
+              f"не-конечных {st_['nonfinite']}")
+        if st_["nonfinite"]:
+            raise SystemExit(
+                f"в слое {l} {st_['nonfinite']} не-конечных значений — "
+                f"обучение на этом молча не сойдётся")
+        os.replace(paths[l] + ".partial", paths[l])
 
     assert ctx_len.max() > ctx_len.min(), \
         "все длины контекста одинаковы — вероятно записана длина батча"
@@ -334,18 +413,21 @@ def main() -> None:
     np.savez(base, h=Hm, K_true=K_true, K_bar=K_bar,
              act=a_codec.astype(np.float32), episode=epi,
              task=np.asarray(tsk), pos_offset=offs, ctx_len=ctx_len,
-             row_order=row_order,
              meta=json.dumps(dict(
                  ckpt=args.ckpt, n_obs=N, n_episodes=int(len(np.unique(epi))),
                  n_codes=n_codes, image_hw=int(hw), ctx_max=Lmax,
                  ctx_layers=want_layers, d_vlm=int(d_vlm),
                  ctx_source="вход input_layernorm указанных слоёв (единичная "
                             "нумерация), СЫРОЙ поток до нормализации",
-                 bar_code_match=float((K_bar == K_true).mean())),
+                 bar_code_match=float((K_bar == K_true).mean()),
+                 layer_stats={str(l): dict(
+                     sd=math.sqrt(max(stat[l]["s2"] / stat[l]["n"]
+                                      - (stat[l]["s"] / stat[l]["n"]) ** 2, 0.0)),
+                     max_abs=stat[l]["mx"]) for l in want_layers}),
                  ensure_ascii=False))
     print(f"\n  сохранено: {base} + {len(want_layers)} файлов контекста")
-    print("  ВАЖНО: строка k в *_ctx.npy соответствует наблюдению "
-          "row_order[k], а не k. Порядок обхода шёл по офсетам.")
+    print("  Строка k в *_ctx.npy — это наблюдение k во ВСЕХ массивах. "
+          "Перестановки нет.")
 
 
 if __name__ == "__main__":

@@ -21,30 +21,64 @@
 ТО ЖЕ, что официальный decode. Если нет — сравнение недействительно, и лучше
 узнать это на первом вызове, чем после ночи раскаток. Проверяется автоматически.
 
-ПРОТОКОЛ БЕРЁТСЯ ИЗ K-5b БЕЗ ИЗМЕНЕНИЙ: те же начальные состояния
-(init_state_id = i + k*n_envs), тот же учёт успеха (reward = clip(reward + r, 0, 1),
-while not all(done)), то же масштабирование действий и знак схвата. Одна
-конфигурация на процесс: среды нельзя переиспользовать (reset восстанавливает
-состояние не полностью), а пересоздать нельзя после загрузки модели (fork после
-CUDA вешает процесс).
+ОДИН РАУНД НА ПРОЦЕСС — ЖЁСТКО. Прежняя версия гоняла `--k-set 2`, то есть
+переиспользовала среды между раундами. Это ровно то, что K-5b запрещает и
+ИЗМЕРИЛ: ячейка ens=on,H=20 дала 10 успехов будучи восьмой в процессе и 9 будучи
+первой, при полностью детерминированной среде (k5b_fixed_horizon_eval.py:306).
+`reset` восстанавливает состояние не полностью, поэтому вторая десятка зависела
+бы от того, какие траектории шли перед ней, а они у режимов levels=1 и levels=3
+РАЗНЫЕ. Парность бы рассыпалась. И размер эффекта — один эпизод из десяти —
+ровно того же порядка, что разница, которую мы пытаемся поймать.
 
-ПРАВИЛО ЧТЕНИЯ, записано до запуска:
-  падение успеха в пределах доверительного интервала -> есть бесплатный метод:
-      1.53x против кэшированной базы без единой обученной детали;
-  падение до ~10 пунктов -> «только грубый» остаётся основой, но нужна
-      компенсация, и иерархический токенизатор получает мотивацию;
-  падение больше ~10 пунктов -> тонкая информация действительно нужна, и
-      мотивация переходит к тому, чтобы сделать её предсказуемой за один проход.
+Поэтому раунд один, а блок начальных состояний задаётся `--init-start`:
+init_state_id = init_start + i. Для 20 эпизодов запускается два процесса с
+--init-start 0 и 10, а не один процесс с двумя раундами.
 
-Запуск (одна задача и один режим на процесс):
+СВЕРКА ПАРНОСТИ. После холостых шагов пишется хеш начального наблюдения. Пара
+(levels=1, levels=3) на одном init_state_id обязана иметь одинаковый хеш; если
+нет, эпизоды стартовали из разных состояний и сравнивать их нельзя. Проверяет
+агрегатор, а не этот скрипт.
+
+УСРЕДНЕНИЕ ДЕЙСТВИЙ — ОТДЕЛЬНАЯ ОСЬ, НЕ УМОЛЧАНИЕ. ActionEnsembler копит планы
+на каждый абсолютный момент и усредняет их; официальный eval_libero.py включает
+его по умолчанию, и K-5b мерил ОБА режима. Прежняя версия молча работала только
+без усреднения и при этом заявляла «протокол K-5b без изменений» — неверно.
+Здесь режим задаётся явно, и мерить надо оба: ens=on отвечает на вопрос «сколько
+стоит отказ от тонких уровней в официальном протоколе», ens=off изолирует
+механизм. Это не праздная симметрия: усреднение по перекрывающимся планам гасит
+шум, а грубое квантование — это в первую очередь шум, так что coarse-only может
+терять при ens=off ЗАМЕТНО БОЛЬШЕ, чем при ens=on.
+
+Остальное из K-5b дословно: учёт успеха (reward = clip(reward + r, 0, 1),
+while not all(done)), масштабирование действий, знак схвата, сброс сида перед
+раундом, среды создаются ДО модели (fork после CUDA вешает процесс).
+
+ПРАВИЛО ЧТЕНИЯ, записано до запуска. Читается по ВЫХОДУ АГРЕГАТОРА
+(k6h_summarize.py), не по среднему успеху одного процесса:
+  односторонняя нижняя граница парной разности выше -10 пунктов -> тонкая
+      информация не нужна на этом чекпойнте, есть 1.53x без обученных деталей;
+  граница ниже -10 пунктов -> тонкая информация нужна, и мотивация переходит к
+      тому, чтобы сделать её предсказуемой за один проход.
+Утверждать «падение в пределах доверительного интервала = эквивалентность»
+нельзя: пересечение с нулём это отсутствие доказательства разницы, а не
+доказательство её отсутствия. Отсюда односторонняя граница, а не двусторонний
+интервал. Мощность при 10 задачах x 20 эпизодов и доле дискордантных пар 0.15:
+обнаруживается падение около 7 пунктов, а с поправкой на кластеризацию по
+задачам (DEFF~2) около 9-10. Заявить «не хуже 5 пунктов» на этой выборке
+НЕЛЬЗЯ, для этого нужно ~700 эпизодов.
+
+Запуск (одна задача, один режим уровней, один режим усреднения, один блок
+начальных состояний на процесс):
     python3 experiments/k6h_coarse_gate.py --selftest
     PYTHONPATH=$HOME/LIBERO MUJOCO_GL=egl \\
     python3 experiments/k6h_coarse_gate.py --ckpt <ckpt> \\
         --task-suite 10 --task-id 0 --levels 1 --horizon 8 \\
-        --n-envs 10 --k-set 2 --out data/k6h/10_t0_L1.json
+        --n-envs 10 --init-start 0 --ensemble on \\
+        --out data/k6h/10_t0_L1_ensON_s0.json
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -85,8 +119,15 @@ def selftest():
     K = toks.reshape(1, N_LEVEL, N_POS)
     assert (K[0, 0] == np.arange(0, 16)).all(), "первые 16 — уровень 0"
     assert (K[0, 2] == np.arange(32, 48)).all(), "последние 16 — уровень 2"
+
+    # Блоки начальных состояний обязаны быть НЕПЕРЕСЕКАЮЩИМИСЯ и покрывать
+    # диапазон без дыр: два процесса с --init-start 0 и 10 при n_envs=10 дают
+    # ровно 0..19. Смещение на единицу здесь стоило бы всей парности.
+    ids = [s + i for s in (0, 10) for i in range(10)]
+    assert ids == list(range(20)) and len(set(ids)) == 20, ids
     print("самопроверка пройдена: учёт вызовов нормирован на исполненные "
-          "действия, раскладка кодов поуровневая")
+          "действия, раскладка кодов поуровневая, блоки начальных состояний "
+          "не пересекаются")
 
 
 def main() -> None:
@@ -103,7 +144,17 @@ def main() -> None:
                     help="сколько уровней RVQ идёт в декодер; 3 = как BAR")
     ap.add_argument("--horizon", type=int, default=8)
     ap.add_argument("--n-envs", type=int, default=10)
-    ap.add_argument("--k-set", type=int, default=2)
+    ap.add_argument("--init-start", type=int, default=0,
+                    help="init_state_id = init_start + i; блок состояний. "
+                         "Переиспользовать среды для второго блока НЕЛЬЗЯ — "
+                         "запускайте второй процесс")
+    ap.add_argument("--ensemble", choices=["on", "off"], default=None,
+                    help="усреднение перекрывающихся планов; on = официальный "
+                         "протокол eval_libero, off = изоляция механизма. "
+                         "Умолчания нет намеренно: молчаливый выбор здесь уже "
+                         "приводил к ложному заявлению о воспроизведении K-5b")
+    ap.add_argument("--k-set", type=int, default=1,
+                    help=argparse.SUPPRESS)
     ap.add_argument("--pos-offset", type=int, default=None)
     ap.add_argument("--offset-table", default="data/pos_offset_table.json")
     ap.add_argument("--waiting-steps", type=int, default=10)
@@ -118,6 +169,19 @@ def main() -> None:
     selftest()
     if not args.ckpt:
         raise SystemExit("нужен --ckpt или --selftest")
+    if args.ensemble is None:
+        raise SystemExit(
+            "--ensemble on|off обязателен. Умолчания нет намеренно: "
+            "официальный\neval_libero.py усредняет по умолчанию, прежняя "
+            "версия этого скрипта\nмолча не усредняла и при этом заявляла "
+            "«протокол K-5b без изменений».")
+    if args.k_set != 1:
+        raise SystemExit(
+            "--k-set больше не поддерживается: переиспользование сред между\n"
+            "раундами ломает парность, потому что reset восстанавливает\n"
+            "состояние не полностью и результат зависит от того, какие\n"
+            "траектории шли раньше — а у levels=1 и levels=3 они разные.\n"
+            "Второй блок эпизодов — отдельный процесс с --init-start.")
 
     root = os.path.abspath(args.root)
     sys.path.insert(0, root)          # только корень, см. K-5b
@@ -127,8 +191,9 @@ def main() -> None:
     import actioncodec  # noqa: F401
     from smolvla.bar import SmolVLABlockwiseAR
     from utils import (ACTION_Q01, ACTION_Q99, STATE_Q01, STATE_Q99,
-                       VisionLanguageActionProcessor, dict_apply, get_cfg,
-                       get_envs, process_state, prompt_template, seed_everything)
+                       ActionEnsembler, VisionLanguageActionProcessor,
+                       dict_apply, get_cfg, get_envs, process_state,
+                       prompt_template, seed_everything)
 
     dev = torch.device(args.device)
     dtype = getattr(torch, args.dtype)
@@ -198,16 +263,29 @@ def main() -> None:
                     f"{d:.3e} — сравнение недействительно")
         return out
 
-    def rollout(k):
-        seed_everything(args.seed + 1000 * k)
+    def rollout():
+        # СИД СБРАСЫВАЕТСЯ ПЕРЕД РАУНДОМ, как в K-5b: иначе расход глобального
+        # ГСЧ различался бы между режимами и начальные состояния разошлись бы.
+        seed_everything(args.seed + 1000 * args.init_start)
         n = args.n_envs
-        obs = envs.reset(options=[{"init_state_id": i + k * n} for i in range(n)])
+        ens = ActionEnsembler() if args.ensemble == "on" else None
+        ts = 0
+        if ens is not None:
+            ens.reset()
+        obs = envs.reset(options=[{"init_state_id": args.init_start + i}
+                                  for i in range(n)])
         reward = np.zeros(n)
         done = np.zeros(n, bool)
         dummy = np.array([[0, 0, 0, 0, 0, 0, -1]] * n)
         for _ in range(args.waiting_steps):
             obs, r_, done, _ = envs.step(dummy)
             reward = np.clip(reward + r_, 0, 1)
+        # ХЕШ СТАРТА для сверки парности агрегатором: два режима на одном
+        # init_state_id обязаны стартовать из одного состояния.
+        init_hash = [hashlib.sha1(np.ascontiguousarray(
+            np.concatenate([obs["state"][i].ravel(),
+                            obs["agentview_image"][i].ravel() / 255.0])
+        ).astype(np.float32).tobytes()).hexdigest()[:16] for i in range(n)]
         calls = steps = 0
         while not np.all(done) and steps < args.max_steps:
             state = ((process_state(obs["state"]) - STATE_Q01)
@@ -242,24 +320,31 @@ def main() -> None:
             action = np.copy(act)
             action[..., :-1] = action[..., :-1] * max_act_q[..., :-1]
             action[..., -1] = -action[..., -1]
+            if ens is not None:
+                ens.add_actions(action, ts)
             for t in range(args.horizon):
                 if np.all(done) or steps >= args.max_steps:
                     break
-                obs, r_, done, _ = envs.step(action[:, t])
+                if ens is not None:
+                    a_t = ens.get_action(ts)
+                    ts += 1
+                else:
+                    a_t = action[:, t]
+                obs, r_, done, _ = envs.step(a_t)
                 reward = np.clip(reward + r_, 0, 1)
                 steps += 1
+        # env_steps — длина РАУНДА, а не эпизода: раунд идёт, пока не
+        # завершатся все среды. Для сравнения режимов этого достаточно.
         return [dict(success=bool(reward[i] >= 1.0), env_steps=steps,
-                     policy_calls=calls, init_state_id=i + k * args.n_envs,
-                     env_index=i) for i in range(args.n_envs)]
+                     policy_calls=calls, init_state_id=args.init_start + i,
+                     env_index=i, init_hash=init_hash[i])
+                for i in range(args.n_envs)]
 
     t0 = time.time()
-    eps = []
     try:
-        for k in range(args.k_set):
-            r = rollout(k)
-            eps += r
-            print(f"  раунд {k}: успех {sum(e['success'] for e in r)}/"
-                  f"{args.n_envs}, шагов {r[0]['env_steps']}", flush=True)
+        eps = rollout()
+        print(f"  успех {sum(e['success'] for e in eps)}/{args.n_envs}, "
+              f"шагов {eps[0]['env_steps']}", flush=True)
     finally:
         try:
             envs.close()
@@ -267,23 +352,32 @@ def main() -> None:
             pass
 
     s = summarize(eps)
-    print(f"\n  уровней {args.levels}, H={args.horizon}: успех "
-          f"{s['success_rate']:.1%} ({sum(e['success'] for e in eps)}/{len(eps)}), "
+    print(f"\n  уровней {args.levels}, H={args.horizon}, ens={args.ensemble}: "
+          f"успех {s['success_rate']:.1%} "
+          f"({sum(e['success'] for e in eps)}/{len(eps)}), "
           f"вызовов на действие {s['calls_per_action']:.3f}")
     print(f"  время: {(time.time() - t0) / 60:.1f} мин")
-    print("\n  ЧИТАТЬ ТАК: сравнивать с тем же прогоном при --levels 3 на ТЕХ ЖЕ")
-    print("  начальных состояниях. Латентность здесь НЕ меряется — она взята")
-    print("  из k5a/k6c: один проход 97.3 мс против 148.9 у BAR с кэшем.")
+    print("\n  ЧИТАТЬ ТАК: не по этому числу. Оно осмысленно только в паре с")
+    print("  --levels 3 при тех же init_state_id, ensemble и seed, и только")
+    print("  через k6h_summarize.py — одна ячейка из десяти эпизодов ничего не")
+    print("  решает. Латентность здесь НЕ меряется: она взята из k5a/k6c —")
+    print("  один проход 97.3 мс против 148.9 у BAR с кэшем.")
 
     if args.out:
         os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".",
                     exist_ok=True)
+        # ПОЛНЫЕ ПАРАМЕТРЫ И ХЕШ СКРИПТА: иначе через неделю не отличить, каким
+        # кодом получена ячейка, а ячейки живут в разных файлах и процессах.
+        sha = hashlib.sha1(open(__file__, "rb").read()).hexdigest()[:12]
         json.dump(dict(summary=s, episodes=eps, levels=args.levels,
                        horizon=args.horizon, task_id=args.task_id,
                        suite=args.task_suite, pos_offset=pos_off,
-                       task_description=task_desc, seed=args.seed),
+                       ensemble=args.ensemble, init_start=args.init_start,
+                       n_envs=args.n_envs, task_description=task_desc,
+                       seed=args.seed, ckpt=args.ckpt, script_sha1=sha,
+                       argv=vars(args)),
                   open(args.out, "w"), ensure_ascii=False, indent=1)
-        print(f"  сохранено: {args.out}")
+        print(f"  сохранено: {args.out}  (sha {sha})")
 
 
 if __name__ == "__main__":
