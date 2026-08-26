@@ -537,11 +537,14 @@ def main() -> None:
     ref_rows = [("эксперт (истинные)", K_true[ite]),
                 ("BAR последовательная", K_bar[ite]),
                 ("случайные тонкие (база)", Krnd)]
+    # ОРИЕНТИРЫ В ТОЙ ЖЕ КОЛОНКЕ, что и варианты. Прежде здесь печатался
+    # старый R, а ниже — отношение к BAR: одна колонка, два разных смысла.
     for name, Kx in ref_rows:
         pp, g, v = score(Kx)
-        R = closed_fraction(pp, e_weak, e_bar)
-        res[name] = dict(pose_rms=pp, gripper=g, R=R)
-        print(f"  {name:<22}{pp:>10.4f}{g:>9.1%}{R:>8.2f}")
+        rel_r = (pp / e_bar_ds - 1.0 if args.target == "dataset"
+                 else pp / e_bar_ds)
+        res[name] = dict(pose_rms=pp, gripper=g, vs_bar_dataset=float(rel_r))
+        print(f"  {name:<26}{pp:>10.4f}{'':>10}{rel_r:>10.1%}")
 
     def to_action(mm_, idx):
         """Признаки -> предсказанное действие. Одна точка ветвления по режиму
