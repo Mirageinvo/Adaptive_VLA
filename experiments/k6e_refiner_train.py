@@ -442,10 +442,14 @@ def main() -> None:
     # ЦЕЛЬ — сумма по ИСТИННЫМ кодам всех трёх уровней; БАЗА — вклад уровня 0
     # от BAR, который на инференсе достаётся бесплатно из первого блока.
     with torch.no_grad():
+        # ХРАНИМ НА CPU. Два таких тензора по 0.92 ГиБ занимали на карте
+        # 1.8 ГиБ всё время прогона, хотя нужны построчно по батчам.
+        # lat_t к тому же после разделения лосса вообще не используется в
+        # обучении — оставлен только как диагностика.
         lat_t = torch.cat([lat(K_true[i:i + 512]).cpu()
-                           for i in range(0, N, 512)]).to(dev)
+                           for i in range(0, N, 512)])
         lat0 = torch.cat([(E[0][torch.as_tensor(K_bar[i:i + 512, 0, :]).long().to(dev)]).cpu()
-                          for i in range(0, N, 512)]).to(dev)
+                          for i in range(0, N, 512)])
     print(f"  целевая латента: {tuple(lat_t.shape)}, "
           f"вклад уровня 0 от BAR: {tuple(lat0.shape)}")
     a_ref = tgt_act[ite]
@@ -538,7 +542,7 @@ def main() -> None:
                 if mm_.xa_at else None)
         mk = (torch.as_tensor(pad_mask[idx]).to(dev) if mm_.xa_at else None)
         lg = mm_(xb, memb, mk, k0(idx))
-        base = lat0[idx]
+        base = lat0[idx].to(dev)          # на карту только текущий батч
         if args.head == "direct":
             return decode_soft(base) + lg[0], lg
         if args.head == "cont":
