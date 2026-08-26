@@ -171,7 +171,9 @@ def main() -> None:
     for prm in codec.parameters():
         prm.requires_grad_(False)
     with torch.no_grad():
-        idx = torch.arange(int(codec.vocab_size)).unsqueeze(0)
+        # ИНДЕКСЫ НА ТОМ ЖЕ УСТРОЙСТВЕ, ЧТО КНИГИ: codec уже перенесён строкой
+        # выше, а arange по умолчанию создаётся на CPU, и F.embedding падает.
+        idx = torch.arange(int(codec.vocab_size), device=dev).unsqueeze(0)
         E = torch.stack([q.out_project(q.decode_code(idx))[0]
                          for q in codec.vq.quantizers]).float().to(dev)
     print(f"  кодбуки: {tuple(E.shape)}")
