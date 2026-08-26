@@ -208,7 +208,14 @@ def build_refiner(layers, d, d_in, d_ctx, xa_at, n_codes, n_out, heads=8, ff=4,
                 out = []
                 for g, o in enumerate(self.out):
                     r = o(x)                                    # (b, P, z)
-                    dist = ((r.unsqueeze(-2) - self.Ebook[g]) ** 2).sum(-1)
+                    # РАСКРЫТЫЙ КВАДРАТ, А НЕ ШИРОКОВЕЩАНИЕ. Разность
+                    # (b,P,1,z)-(V,z) материализует (b,P,V,z): при батче 256
+                    # это 17 ГБ и мгновенный OOM. Тождество
+                    # ||r-e||^2 = ||r||^2 - 2<r,e> + ||e||^2 даёт (b,P,V).
+                    Eb = self.Ebook[g]                          # (V, z)
+                    dist = ((r * r).sum(-1, keepdim=True)
+                            - 2.0 * (r @ Eb.t())
+                            + (Eb * Eb).sum(-1))
                     out.append(-dist / self.tau)
                 return out
             if self.head == "cont":
@@ -280,10 +287,13 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--wd", type=float, default=1e-4)
-    ap.add_argument("--grip-weight", type=float, default=1.0,
-                    help="вес схвата в лоссе. Отбор эпохи идёт ТОЛЬКО по позе, "
-                         "поэтому вес задаётся явно, а не растворяется в "
-                         "усреднении по семи каналам")
+    ap.add_argument("--grip-weight", type=float, default=1.0 / 6.0,
+                    help="вес схвата. Умолчание 1/6 воспроизводит прежнее "
+                         "усреднение по семи каналам. При весе 1.0 схват "
+                         "вносил в 5-20 раз больше позы (замерено на дыме: "
+                         "поза 0.08-0.29 против схвата 1.25-1.87), то есть "
+                         "оптимизировался в основном он, тогда как метрика и "
+                         "отбор эпохи идут по позе")
     ap.add_argument("--ce-weight", type=float, default=0.0,
                     help="вес кросс-энтропии. ПО УМОЛЧАНИЮ НОЛЬ: при 0.01 её "
                          "вклад был ~0.043 против ~0.0038 у ошибки действия, "
