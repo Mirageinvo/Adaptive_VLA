@@ -14,15 +14,23 @@
 действия. Точность кодов печатается, но решение принимается по ошибке позы.
 
 ОБЯЗАТЕЛЬНЫЕ ОПОРЫ В ТАБЛИЦЕ, без них цифры не читаются:
-  BAR direct   — сами коды BAR: нулевая ошибка по построению цели. ТОЧНАЯ
-                 сверка того, что признаки сняты с нужного вызова, делается не
-                 здесь, а в k7b: там argmax настоящего action_lm_head
-                 сравнивается с K_bar.
-  after_<N>    — обучаемая голова на состоянии после N слоёв. Последняя строка
-                 (вход action_lm_head) — ВЕРХНЯЯ ГРАНИЦА ЭТОЙ головы, а не
-                 проверка извлечения: она может не сойтись по причинам
-                 оптимизации, и тогда виновата голова, а не признаки.
+  BAR direct   — сами коды BAR: нулевая ошибка по построению цели.
+  БЕЗ ОБУЧЕНИЯ — настоящая замороженная action_lm_head, применённая прямо к
+                 состоянию каждой глубины. На полной глубине это тождество и
+                 ОБЯЗАНО дать 100%; если нет, признаки сняты не с того места и
+                 зонд недействителен — скрипт падает. Ни одного шага
+                 оптимизации не требует.
+  after_<N>    — обучаемый зонд на состоянии после N слоёв.
   случайные    — коды из равномерного распределения: пол ошибки.
+
+ГОЛОВА ЗОНДА ПРИВЯЗАНА К НАСТОЯЩЕЙ (--head tied-lm, по умолчанию): ствол
+отображает состояние в размерность головы, дальше идёт замороженная
+action_lm_head. Причина: первый прогон с собственным линейным слоем на 2048
+классов (--head free) дал на ПОЛНОЙ глубине лишь 69.2% точности, хотя настоящая
+голова — линейная функция ровно этого входа. Зонду приходилось заново выучивать
+768x2048 = 1.57 млн параметров по 45 тысячам примеров, и он просаживал
+собственный потолок, а вместе с ним и все промежуточные строки. Режим `free`
+оставлен, чтобы этот эффект можно было воспроизвести.
 
 ДВЕ ШКАЛЫ. Основная — расстояние до coarse-действия самой BAR (имитация). Но
 печатается и расстояние до действий ДАТАСЕТА: ранняя голова может не
@@ -153,6 +161,12 @@ def main() -> None:
     ap.add_argument("--ckpt")
     ap.add_argument("--root", default="third_party/actioncodec")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--head", choices=["tied-lm", "free"], default="tied-lm",
+                    help="tied-lm: ствол отображает состояние в размерность "
+                         "головы, дальше НАСТОЯЩАЯ замороженная action_lm_head. "
+                         "free: собственный линейный слой на 2048 классов — так "
+                         "зонд обязан заново выучить 1.57 млн параметров по 45к "
+                         "примеров и просаживает собственный потолок")
     ap.add_argument("--hidden", type=int, default=1024)
     ap.add_argument("--layers", type=int, default=2)
     ap.add_argument("--epochs", type=int, default=60)
@@ -193,6 +207,26 @@ def main() -> None:
         idx = torch.arange(n_codes, device=dev).unsqueeze(0)
         E = torch.stack([q.out_project(q.decode_code(idx))[0]
                          for q in codec.vq.quantizers]).float().to(dev)
+
+    # НАСТОЯЩАЯ ГОЛОВА КОДОВ. bar.py:1247-1248 нормирует состояние экспертной
+    # башни и подаёт в action_lm_head, а наш after_<полная глубина> — это её
+    # ВХОД. Значит голову можно взять отдельно, без всей модели.
+    from huggingface_hub import snapshot_download
+    local = (args.ckpt if os.path.isdir(args.ckpt)
+             else snapshot_download(args.ckpt))
+    comp = torch.load(os.path.join(local, "action_components.bin"),
+                      map_location="cpu")
+    if "action_lm_head" not in comp:
+        raise SystemExit(f"в action_components.bin нет action_lm_head: {list(comp)}")
+    sd_lm = comp["action_lm_head"]
+    W = sd_lm["weight"]
+    d_lm = int(W.shape[1])
+    lm_real = nn.Linear(d_lm, int(W.shape[0]), bias="bias" in sd_lm)
+    lm_real.load_state_dict(sd_lm)
+    lm_real = lm_real.to(dev).float().eval()
+    for p in lm_real.parameters():
+        p.requires_grad_(False)
+    print(f"  настоящая голова кодов: {tuple(W.shape)}")
 
     def decode_coarse(codes):
         """Действие ТОЛЬКО из грубого уровня — тот режим, ради которого всё."""
@@ -248,9 +282,17 @@ def main() -> None:
             mods += [nn.Linear(d, args.hidden), nn.GELU()]
             d = args.hidden
         trunk = nn.Sequential(*mods).to(dev)
-        head = nn.Linear(d, n_codes).to(dev)
-        opt = torch.optim.AdamW(list(trunk.parameters()) + list(head.parameters()),
-                                lr=args.lr, weight_decay=0.01)
+        if args.head == "tied-lm":
+            # Ствол отображает в размерность головы, дальше НАСТОЯЩАЯ
+            # замороженная голова. На полной глубине ствол может выучить
+            # тождество, поэтому потолок таблицы честный, а не просаженный
+            # необходимостью заново выучить 768x2048 по 45 тысячам примеров.
+            head = nn.Sequential(nn.Linear(d, d_lm), lm_real).to(dev)
+        else:
+            head = nn.Linear(d, n_codes).to(dev)
+        train_p = [p for p in list(trunk.parameters()) + list(head.parameters())
+                   if p.requires_grad]
+        opt = torch.optim.AdamW(train_p, lr=args.lr, weight_decay=0.01)
         Xt = torch.as_tensor(X, dtype=torch.float32)
         Yt = torch.as_tensor(tgt, dtype=torch.long)
         itr = np.where(tr)[0]
@@ -274,8 +316,7 @@ def main() -> None:
                 loss = nn.functional.cross_entropy(
                     lg.reshape(-1, n_codes), yb.reshape(-1))
                 opt.zero_grad(); loss.backward()
-                nn.utils.clip_grad_norm_(
-                    list(trunk.parameters()) + list(head.parameters()), 1.0)
+                nn.utils.clip_grad_norm_(train_p, 1.0)
                 opt.step(); sched.step()
             trunk.eval(); head.eval()
             pv = predict(trunk, head, Xt, va)
@@ -305,6 +346,42 @@ def main() -> None:
     def pose_rms_ds(pred, mask):
         d = decode_coarse(pred) - act[mask]
         return float(np.sqrt((d[..., :6] ** 2).mean())) / rng_pose
+
+    # СТРОКА БЕЗ ОБУЧЕНИЯ: настоящая голова прямо на состоянии глубины. Для
+    # полной глубины это тождество и обязано дать 100% — тогда признаки заведомо
+    # верны, и любой недобор обучаемого зонда есть недостаток ЗОНДА, а не
+    # глубины. Считается за секунды и не требует ни одного шага оптимизации.
+    def lm_direct(X, mask):
+        ii = np.where(mask)[0]
+        out = []
+        with torch.no_grad():
+            for i0 in range(0, len(ii), 512):
+                xb = torch.as_tensor(X[ii[i0:i0 + 512]], dtype=torch.float32).to(dev)
+                if xb.shape[-1] != d_lm:
+                    return None
+                out.append(lm_real(xb).argmax(-1).cpu().numpy())
+        return np.concatenate(out)
+
+    print("\n  настоящая голова БЕЗ обучения, прямо на состоянии глубины:")
+    direct = {}
+    for k_ in keys:
+        p = lm_direct(z[f"h_{k_}"].astype(np.float32), te)
+        if p is None:
+            continue
+        direct[str(k_)] = dict(code_acc=float((p == tgt[te]).mean()),
+                               pose_rms=float(np.sqrt(
+                                   ((decode_coarse(p) - a_ref[te])[..., :6] ** 2
+                                    ).mean())) / rng_pose)
+        print(f"    {str(k_):>10}: точность кодов {direct[str(k_)]['code_acc']:.1%}, "
+              f"ошибка {direct[str(k_)]['pose_rms']:.4f}")
+    full_direct = direct.get(str(keys[-1]), {}).get("code_acc", 0.0)
+    if full_direct < 0.999:
+        raise SystemExit(
+            f"настоящая голова на полной глубине даёт {full_direct:.1%}, а обязана\n"
+            f"дать 100%: это её собственный вход. Значит признаки сняты не с того\n"
+            f"места — зонд недействителен целиком.")
+    print(f"    полная глубина даёт {full_direct:.1%} — признаки верны, и любой "
+          f"недобор ниже\n    есть недостаток ЗОНДА, а не глубины")
 
     res = {}
     print(f"\n{'глубина':>10}{'имит. BAR':>12}{'от пола':>10}"
