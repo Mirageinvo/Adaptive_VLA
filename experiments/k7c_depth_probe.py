@@ -273,22 +273,50 @@ def main() -> None:
     print(f"    coarse-only от BAR:         {ds_bar:.4f}")
     print(f"    случайные коды:             {ds_floor:.4f}")
 
+    class ResidualAdapter(nn.Module):
+        """x + MLP(x), последний слой инициализирован нулём.
+
+        ПОЧЕМУ ИМЕННО ТАК. Прежний ствол начинался с LayerNorm, а тот вычитает
+        среднее по каналам, и величина среднего у каждого примера своя —
+        последующие линейные слои такую поправку не восстанавливают. То есть
+        зонд НЕ МОГ выразить тождество, хотя на полной глубине именно тождество
+        и есть верное решение: настоящая голова на нетронутом состоянии даёт
+        100%, а обученный зонд давал 73.2%, то есть обучение было хуже
+        бездействия.
+
+        Здесь на старте выход РОВНО равен входу, поэтому зонд стартует из
+        строки «без обучения» и может только улучшать её. LayerNorm остался, но
+        внутри ветви, а не на пути сигнала.
+        """
+
+        def __init__(self, d, hidden, n_layers):
+            super().__init__()
+            mods, cur = [nn.LayerNorm(d)], d
+            for _ in range(n_layers):
+                mods += [nn.Linear(cur, hidden), nn.GELU()]
+                cur = hidden
+            last = nn.Linear(cur, d)
+            nn.init.zeros_(last.weight); nn.init.zeros_(last.bias)
+            self.body = nn.Sequential(*mods, last)
+
+        def forward(self, x):
+            return x + self.body(x)
+
     def train_probe(X, seed):
         torch.manual_seed(seed)
         d_in = X.shape[-1]
-        mods, d = [], d_in
-        mods.append(nn.LayerNorm(d_in))        # масштабы глубин различаются
-        for _ in range(args.layers):
-            mods += [nn.Linear(d, args.hidden), nn.GELU()]
-            d = args.hidden
-        trunk = nn.Sequential(*mods).to(dev)
         if args.head == "tied-lm":
-            # Ствол отображает в размерность головы, дальше НАСТОЯЩАЯ
-            # замороженная голова. На полной глубине ствол может выучить
-            # тождество, поэтому потолок таблицы честный, а не просаженный
-            # необходимостью заново выучить 768x2048 по 45 тысячам примеров.
-            head = nn.Sequential(nn.Linear(d, d_lm), lm_real).to(dev)
+            assert d_in == d_lm, (
+                f"состояние {d_in} каналов, голова ждёт {d_lm}: остаточный "
+                f"адаптер требует совпадения размерностей")
+            trunk = ResidualAdapter(d_in, args.hidden, args.layers).to(dev)
+            head = lm_real                       # заморожена, обучению не подлежит
         else:
+            mods, d = [nn.LayerNorm(d_in)], d_in
+            for _ in range(args.layers):
+                mods += [nn.Linear(d, args.hidden), nn.GELU()]
+                d = args.hidden
+            trunk = nn.Sequential(*mods).to(dev)
             head = nn.Linear(d, n_codes).to(dev)
         train_p = [p for p in list(trunk.parameters()) + list(head.parameters())
                    if p.requires_grad]
@@ -304,7 +332,22 @@ def main() -> None:
         sched = torch.optim.lr_scheduler.LambdaLR(
             opt, lambda s: min(1.0, s / max(1, int(steps * args.warmup_frac)))
             * 0.5 * (1 + math.cos(math.pi * min(1.0, s / steps))))
-        best, best_state = None, None
+        def snapshot():
+            return ({k: v.detach().clone() for k, v in trunk.state_dict().items()},
+                    {k: v.detach().clone() for k, v in head.state_dict().items()})
+
+        if args.head == "tied-lm":
+            with torch.no_grad():
+                xb = torch.as_tensor(X[:64], dtype=torch.float32).to(dev)
+                d0 = float((trunk(xb) - xb).abs().max())
+            assert d0 == 0.0, f"адаптер на старте не тождество: max|Δ| = {d0}"
+
+        # СТАРТОВОЕ СОСТОЯНИЕ УЧАСТВУЕТ В ОТБОРЕ. Иначе обучение, которое всё
+        # только портит, всё равно вернуло бы обученный чекпойнт — ровно то, что
+        # произошло в прошлом прогоне, где зонд оказался хуже бездействия.
+        trunk.eval(); head.eval()
+        best = pose_rms_pred(predict(trunk, head, Xt, va), va)
+        best_state = snapshot()
         rg = np.random.default_rng(seed)
         for ep in range(args.epochs):
             trunk.train(); head.train()
@@ -323,10 +366,8 @@ def main() -> None:
             # ОТБОР ПО ТОЙ ЖЕ ВЕЛИЧИНЕ, ПО КОТОРОЙ ОТЧИТЫВАЕМСЯ. В K-6e отбор
             # шёл по CE, а отчёт по ошибке действия — разные чекпойнты.
             m = pose_rms_pred(pv, va)
-            if best is None or m < best:
-                best = m
-                best_state = ({k: v.detach().clone() for k, v in trunk.state_dict().items()},
-                              {k: v.detach().clone() for k, v in head.state_dict().items()})
+            if m < best:
+                best, best_state = m, snapshot()
         trunk.load_state_dict(best_state[0]); head.load_state_dict(best_state[1])
         return trunk, head
 
