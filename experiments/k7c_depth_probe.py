@@ -14,20 +14,38 @@
 действия. Точность кодов печатается, но решение принимается по ошибке позы.
 
 ОБЯЗАТЕЛЬНЫЕ ОПОРЫ В ТАБЛИЦЕ, без них цифры не читаются:
-  `final`   — вход action_lm_head, то есть ровно то, из чего BAR берёт коды.
-              Голова на нём обязана давать почти 100%. Если нет — сломан зонд,
-              а не модель, и остальные строки бессмысленны.
-  случайная — коды из равномерного распределения: пол ошибки.
-  BAR       — сами коды BAR, то есть нулевая ошибка по построению цели.
+  BAR direct   — сами коды BAR: нулевая ошибка по построению цели. ТОЧНАЯ
+                 сверка того, что признаки сняты с нужного вызова, делается не
+                 здесь, а в k7b: там argmax настоящего action_lm_head
+                 сравнивается с K_bar.
+  after_<N>    — обучаемая голова на состоянии после N слоёв. Последняя строка
+                 (вход action_lm_head) — ВЕРХНЯЯ ГРАНИЦА ЭТОЙ головы, а не
+                 проверка извлечения: она может не сойтись по причинам
+                 оптимизации, и тогда виновата голова, а не признаки.
+  случайные    — коды из равномерного распределения: пол ошибки.
 
-РАЗБИЕНИЕ ПО ЭПИЗОДАМ, не по наблюдениям: соседние наблюдения одного эпизода
-почти одинаковы, и разбиение по строкам дало бы утечку и оптимистичный зонд.
+ДВЕ ШКАЛЫ. Основная — расстояние до coarse-действия самой BAR (имитация). Но
+печатается и расстояние до действий ДАТАСЕТА: ранняя голова может не
+воспроизводить коды BAR и при этом давать не худшее действие. После K-6h, где
++18% ошибки реконструкции не стоили ни одного пункта успеха, это ожидаемый, а
+не экзотический исход.
+
+РАЗБИЕНИЕ ПО ЭПИЗОДАМ И СО СТРАТИФИКАЦИЕЙ ПО ЗАДАЧАМ. По строкам была бы
+утечка: соседние наблюдения эпизода почти одинаковы. Без стратификации задача
+целиком уходила бы в одну часть, и тест молча мерил бы обобщение на новые
+ЗАДАЧИ — другой и куда более трудный вопрос.
 
 ПРАВИЛО ЧТЕНИЯ, записано до запуска:
-  ошибка действия на глубине d в пределах ~10% от ошибки на `final` -> глубину
-      d можно считать достаточной, ранняя остановка осмысленна;
-  ошибка монотонно падает вплоть до последнего слоя -> ранняя остановка не
-      работает, многоглубинная архитектура лишается опоры.
+  ошибка на глубине N в пределах ~10% от последней строки -> ранний выход
+      берётся из существующего чекпойнта даром;
+  ошибка падает вплоть до последнего слоя -> post-hoc ранний выход не работает.
+
+ЧЕГО ЭТОТ ЗОНД НЕ РЕШАЕТ. Он спрашивает про грубый код УЖЕ ОБУЧЕННОЙ BAR в
+ЗАМОРОЖЕННОМ backbone. Отрицательный ответ не закрывает токенизатор, у которого
+ранний уровень обучается быть самостоятельным: там другие коды, промежуточные
+головы дают ранним слоям собственный сигнал, и backbone дообучается. Но цена
+такого варианта — совместное обучение 2.2B, то есть выход за рамки, которые
+план сам себе поставил. Отрицательный исход — сигнал о стоимости, не запрет.
 
 Запуск:
     python3 experiments/k7c_depth_probe.py --selftest
@@ -46,26 +64,59 @@ import numpy as np
 N_POS, N_LEVEL = 16, 3
 
 
-def split_by_episode(epi, seed=0, frac=(0.7, 0.15)):
-    """Разбиение ПО ЭПИЗОДАМ. Возвращает три булевы маски."""
-    ep = np.unique(epi)
+def split_by_episode(epi, task=None, seed=0, frac=(0.7, 0.15)):
+    """Разбиение ПО ЭПИЗОДАМ, стратифицированное ПО ЗАДАЧАМ.
+
+    Без стратификации задача может целиком попасть в одну часть, и тогда
+    тест меряет не «обобщение на новые эпизоды», а «обобщение на новые
+    задачи» — совсем другой и куда более трудный вопрос, причём молча.
+    Разбиение делается внутри каждой задачи отдельно.
+    """
     rng = np.random.default_rng(seed)
-    ep = rng.permutation(ep)
-    n1 = int(len(ep) * frac[0])
-    n2 = int(len(ep) * (frac[0] + frac[1]))
-    sets = (set(ep[:n1].tolist()), set(ep[n1:n2].tolist()), set(ep[n2:].tolist()))
-    return [np.array([e in s for e in epi]) for s in sets]
+    masks = [np.zeros(len(epi), bool) for _ in range(3)]
+    groups = ([np.arange(len(epi))] if task is None
+              else [np.where(task == t)[0] for t in np.unique(task)])
+    for g in groups:
+        ep = rng.permutation(np.unique(epi[g]))
+        n = len(ep)
+        if n < 3:
+            raise SystemExit(
+                f"задача с {n} эпизодами: на три части не делится. Увеличьте "
+                f"--n-ep при извлечении.")
+        # Доли считаются ОТ КОНЦА: сначала гарантируем непустые val и test, а
+        # остаток отдаём train. Иначе при малом числе эпизодов на задачу
+        # округление съедало тест целиком, и он оказывался пустым молча.
+        n_va = max(1, int(round(n * frac[1])))
+        n_te = max(1, int(round(n * (1.0 - frac[0] - frac[1]))))
+        if n - n_va - n_te < 1:
+            n_va, n_te = 1, 1
+        n_tr = n - n_va - n_te
+        parts = (ep[:n_tr], ep[n_tr:n_tr + n_va], ep[n_tr + n_va:])
+        assert all(len(p) for p in parts), (n, [len(p) for p in parts])
+        for m, p in zip(masks, parts):
+            m[g] = np.isin(epi[g], p)
+    return masks
 
 
 def selftest():
     # 1. Разбиение по эпизодам: ни один эпизод не попадает в две части.
     epi = np.repeat(np.arange(50), 8)
-    tr, va, te = split_by_episode(epi, seed=0)
+    tsk = np.array(["t%d" % (e // 5) for e in epi])
+    tr, va, te = split_by_episode(epi, tsk, seed=0)
     assert (tr | va | te).all() and not (tr & va).any() and not (tr & te).any()
     assert not (va & te).any()
     for a, b in ((tr, va), (tr, te), (va, te)):
         assert not (set(epi[a]) & set(epi[b])), "эпизод попал в две части"
-    assert 0.6 < tr.mean() < 0.8, tr.mean()
+    assert 0.55 < tr.mean() < 0.85, tr.mean()
+
+    # 1б. СТРАТИФИКАЦИЯ: каждая задача обязана быть во всех трёх частях.
+    #     Без неё задача уходит в одну часть целиком, и тест молча меряет
+    #     обобщение на НОВЫЕ ЗАДАЧИ — другой и куда более трудный вопрос.
+    for m, nm in ((tr, "train"), (va, "val"), (te, "test")):
+        assert set(tsk[m]) == set(tsk), f"{nm}: задачи потеряны"
+    tr2, va2, te2 = split_by_episode(epi, None, seed=0)
+    lost = max(len(set(tsk) - set(tsk[m])) for m in (tr2, va2, te2))
+    assert lost > 0, "без стратификации задачи должны теряться, иначе тест пуст"
 
     # 2. Разбиение по СТРОКАМ дало бы утечку — показываем, что это другое.
     rng = np.random.default_rng(0)
@@ -152,20 +203,40 @@ def main() -> None:
             outs.append(x[..., :7].float().cpu().numpy())
         return np.concatenate(outs)
 
-    tr, va, te = split_by_episode(epi, seed=0)
-    print(f"  train {tr.sum()}, val {va.sum()}, test {te.sum()}")
+    tsk = z["task"]
+    tr, va, te = split_by_episode(epi, tsk, seed=0)
+    print(f"  train {tr.sum()}, val {va.sum()}, test {te.sum()}; "
+          f"задач {len(np.unique(tsk))} / "
+          f"{len(np.unique(tsk[tr]))} / {len(np.unique(tsk[va]))} / "
+          f"{len(np.unique(tsk[te]))} (всего/tr/va/te)")
+    for m, nm in ((tr, "train"), (va, "val"), (te, "test")):
+        miss = sorted(set(np.unique(tsk)) - set(np.unique(tsk[m])))
+        if miss:
+            raise SystemExit(
+                f"в {nm} нет задач {miss[:3]}... — тогда зонд молча меряет "
+                f"обобщение на НОВЫЕ ЗАДАЧИ, а не на новые эпизоды")
+
     tgt = K_bar[:, 0, :]                       # цель: грубые коды самой BAR
     a_ref = decode_coarse(tgt)                 # эталон: coarse-only от BAR
     rng_pose = float(act[..., :6].max() - act[..., :6].min())
 
-    def pose_rms(codes, mask):
-        d = decode_coarse(codes[mask]) - a_ref[mask]
+    def rms_vs(codes, mask, ref):
+        d = decode_coarse(codes[mask] if codes.ndim > 1 else codes) - ref[mask]
         return float(np.sqrt((d[..., :6] ** 2).mean())) / rng_pose
 
     rnd = np.random.default_rng(0).integers(0, n_codes, size=tgt.shape)
-    floor = pose_rms(rnd, te)
-    print(f"\n  пол (случайные коды):     {floor:.4f}")
-    print(f"  цель (сами коды BAR):     0.0000 по построению")
+    floor = rms_vs(rnd, te, a_ref)
+    # ВТОРАЯ ШКАЛА: расстояние до ДЕЙСТВИЙ ДАТАСЕТА. Ранняя голова может не
+    # воспроизводить коды BAR и при этом давать не худшее действие — после
+    # K-6h это не умозрительная возможность, а ожидаемая.
+    ds_bar = rms_vs(tgt, te, act)
+    ds_floor = rms_vs(rnd, te, act)
+    print(f"\n  шкала 1, имитация BAR (цель зонда):")
+    print(f"    пол, случайные коды:        {floor:.4f}")
+    print(f"    сами коды BAR:              0.0000 по построению")
+    print(f"  шкала 2, расстояние до действий датасета:")
+    print(f"    coarse-only от BAR:         {ds_bar:.4f}")
+    print(f"    случайные коды:             {ds_floor:.4f}")
 
     def train_probe(X, seed):
         torch.manual_seed(seed)
@@ -182,7 +253,9 @@ def main() -> None:
         Xt = torch.as_tensor(X, dtype=torch.float32)
         Yt = torch.as_tensor(tgt, dtype=torch.long)
         itr = np.where(tr)[0]
-        steps = args.epochs * max(1, len(itr) // args.batch)
+        # ceil, а не //: цикл обрабатывает и последний неполный батч, и при
+        # делении нацело косинус доходил бы до нуля раньше конца обучения.
+        steps = args.epochs * max(1, math.ceil(len(itr) / args.batch))
         # ПРОГРЕВ ОБЯЗАТЕЛЕН: без него в K-6e глубокий вариант расходился, и
         # глубина ошибочно выглядела вредной.
         sched = torch.optim.lr_scheduler.LambdaLR(
@@ -228,43 +301,63 @@ def main() -> None:
         d = decode_coarse(pred) - a_ref[mask]
         return float(np.sqrt((d[..., :6] ** 2).mean())) / rng_pose
 
+    def pose_rms_ds(pred, mask):
+        d = decode_coarse(pred) - act[mask]
+        return float(np.sqrt((d[..., :6] ** 2).mean())) / rng_pose
+
     res = {}
-    print(f"\n{'глубина':>8}{'ошибка позы':>14}{'доля от пола':>14}"
-          f"{'точность кодов':>16}{'vs токенизатор':>16}")
+    print(f"\n{'глубина':>10}{'имит. BAR':>12}{'от пола':>10}"
+          f"{'до датасета':>13}{'точн. кодов':>13}{'vs токенайз.':>14}")
+    print(f"{'BAR direct':>10}{0.0:>12.4f}{0.0:>10.2f}{ds_bar:>13.4f}"
+          f"{1.0:>12.1%}{(K_bar[te][:, 0, :] == K_true[te][:, 0, :]).mean():>13.1%}")
     for k_ in keys:
         X = z[f"h_{k_}"].astype(np.float32)
-        errs, accs, accs_t = [], [], []
+        Xt = torch.as_tensor(X, dtype=torch.float32)
+        errs, errs_ds, accs, accs_t = [], [], [], []
         for s in range(args.seeds):
             trunk, head = train_probe(X, s)
-            p = predict(trunk, head, torch.as_tensor(X, dtype=torch.float32), te)
+            p = predict(trunk, head, Xt, te)
             errs.append(pose_rms_pred(p, te))
+            errs_ds.append(pose_rms_ds(p, te))
             accs.append(float((p == tgt[te]).mean()))
             accs_t.append(float((p == K_true[te][:, 0, :]).mean()))
         e = float(np.mean(errs))
         res[str(k_)] = dict(pose_rms=e, pose_rms_seeds=errs,
+                            pose_rms_vs_dataset=float(np.mean(errs_ds)),
                             code_acc=float(np.mean(accs)),
                             code_acc_vs_true=float(np.mean(accs_t)),
                             frac_of_floor=e / floor)
-        print(f"{str(k_):>8}{e:>14.4f}{e / floor:>14.2f}"
-              f"{np.mean(accs):>15.1%}{np.mean(accs_t):>16.1%}")
+        print(f"{str(k_):>10}{e:>12.4f}{e / floor:>10.2f}"
+              f"{np.mean(errs_ds):>13.4f}{np.mean(accs):>12.1%}"
+              f"{np.mean(accs_t):>13.1%}")
 
-    fin = res[str(keys[-1])]["pose_rms"]
+    full = str(keys[-1])
+    fin = res[full]["pose_rms"]
+    print("\n  ЧИТАТЬ ТАК, правило записано до запуска.")
     if fin > 0.25 * floor:
-        print(f"\n  ВНИМАНИЕ: на `final` ошибка {fin:.4f} при поле {floor:.4f}.")
-        print("  Голова на входе action_lm_head обязана почти точно "
-              "воспроизводить коды BAR.\n  Если не воспроизводит — сломан зонд, "
-              "и остальные строки читать нельзя.")
+        print(f"  Строка {full} — ОБУЧАЕМАЯ голова на входе action_lm_head, и")
+        print(f"  она дала {fin:.4f} при поле {floor:.4f}. Это НЕ означает, что")
+        print("  сломано извлечение: точную сверку делает k7b, сравнивая argmax")
+        print("  настоящей головы с K_bar. Значит не справилась ЭТА голова —")
+        print("  параметризация, объём данных или обучение. Промежуточные")
+        print("  глубины сравнивать не с чем, пока верхняя опора не работает.")
     else:
-        ok = [k_ for k_ in keys if k_ != "final"
+        ok = [k_ for k_ in keys if k_ != full
               and res[str(k_)]["pose_rms"] <= 1.1 * fin]
-        print("\n  ЧИТАТЬ ТАК, правило записано до запуска.")
         if ok:
-            print(f"  Достаточные глубины (в пределах 10% от `final`): {ok}")
-            print(f"  Самая ранняя: {ok[0]} — ранняя остановка осмысленна.")
+            print(f"  В пределах 10% от {full}: {ok}. Самая ранняя — {ok[0]}.")
+            print("  Ранний выход берётся из СУЩЕСТВУЮЩЕГО чекпойнта даром.")
         else:
-            print("  Ни одна промежуточная глубина не приблизилась к `final`:")
-            print("  ошибка падает до последнего слоя, ранняя остановка не "
-                  "работает,\n  и многоглубинная архитектура лишается опоры.")
+            print(f"  Ни одна промежуточная глубина не подошла к {full} ближе 10%.")
+        print()
+        print("  ЧЕГО ЭТОТ ЗОНД НЕ РЕШАЕТ. Он спрашивает только, лежит ли грубый")
+        print("  код УЖЕ ОБУЧЕННОЙ BAR в ранних слоях замороженного backbone.")
+        print("  Отрицательный ответ не закрывает токенизатор с ранними")
+        print("  уровнями: там код другой, головы дают промежуточным слоям")
+        print("  собственный сигнал обучения, и backbone дообучается. Но цена")
+        print("  такого варианта — совместное обучение 2.2B, а это выходит за")
+        print("  рамки, которые план сам себе поставил. Отрицательный исход —")
+        print("  сигнал о стоимости, а не запрет.")
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     json.dump(dict(depths=res, floor_random=floor, n_obs=int(N),

@@ -54,24 +54,34 @@ N_POS, N_LEVEL, T_CHUNK = 16, 3, 20
 CACHE_FACTOR_K5A = 148.9 / 195.0      # НЕ измеряется здесь, см. докстроку
 
 
-def diff_stats(a, b, scale=None):
-    """Различие двух наборов действий. Считается по позе и схвату отдельно:
-    у них разные диапазоны, и общий RMS прятал бы схват."""
+def _block(a, b, tag, out):
+    """Один набор показателей для среза. Поза и схват отдельно: у них разные
+    диапазоны, и общий RMS прятал бы схват."""
     d = a - b
-    out = dict(
-        pose_rms=float(np.sqrt((d[..., :6] ** 2).mean())),
-        pose_max=float(np.abs(d[..., :6]).max()),
-        grip_rms=float(np.sqrt((d[..., 6] ** 2).mean())),
-        grip_sign_flip=float((np.sign(a[..., 6]) != np.sign(b[..., 6])).mean()),
-        frac_steps_diff=float((np.abs(d).max(axis=-1) > 1e-6).mean()),
-        frac_rows_identical=float((np.abs(d).reshape(len(d), -1).max(axis=1)
-                                   <= 1e-6).mean()),
-    )
-    for H in (4, 8):
-        out[f"pose_rms_first{H}"] = float(
-            np.sqrt((d[:, :H, :6] ** 2).mean()))
+    out[f"pose_rms{tag}"] = float(np.sqrt((d[..., :6] ** 2).mean()))
+    out[f"pose_max{tag}"] = float(np.abs(d[..., :6]).max())
+    out[f"grip_rms{tag}"] = float(np.sqrt((d[..., 6] ** 2).mean()))
+    out[f"grip_sign_flip{tag}"] = float(
+        (np.sign(a[..., 6]) != np.sign(b[..., 6])).mean())
+    out[f"frac_steps_diff{tag}"] = float((np.abs(d).max(axis=-1) > 1e-6).mean())
+    out[f"frac_rows_identical{tag}"] = float(
+        (np.abs(d).reshape(len(d), -1).max(axis=1) <= 1e-6).mean())
+
+
+def diff_stats(a, b, scale=None, horizons=(4, 8)):
+    """Различие двух наборов действий, по всему чанку и по ИСПОЛНЯЕМЫМ позициям.
+
+    Различать надо именно исполняемое. Чанк содержит 20 шагов, но при H=8
+    среда видит только первые восемь, а остальные заменяются новым планом.
+    Совпадение хвоста ничего не говорит о том, различались ли режимы в
+    симуляторе; совпадение первых H — говорит.
+    """
+    out = {}
+    _block(a, b, "", out)
+    for H in horizons:
+        _block(a[:, :H], b[:, :H], f"_first{H}", out)
     if scale is not None:
-        ds = d * scale
+        ds = (a - b) * scale
         out["pose_rms_physical"] = float(np.sqrt((ds[..., :6] ** 2).mean()))
         out["pose_max_physical"] = float(np.abs(ds[..., :6]).max())
     return out
@@ -93,23 +103,31 @@ def selftest():
     assert s["pose_rms"] == 0.0 and s["frac_rows_identical"] == 1.0, s
 
     # 2. Различие ОБЯЗАНО обнаруживаться, даже если оно в одном шаге из двадцати.
-    #    Это ровно тот отказ, ради которого статистика и пишется: если бы
-    #    generate_coarse молча совпал с полной BAR, K-6h был бы артефактом.
     B = A.copy(); B[3, 7, 2] += 0.5
     s = diff_stats(A, B)
     assert s["frac_rows_identical"] == 49 / 50, s["frac_rows_identical"]
     assert s["pose_max"] == 0.5 and s["frac_steps_diff"] == 1 / (50 * T_CHUNK)
 
-    # 3. Ранние позиции считаются отдельно: правка на шаге 7 не видна в first4,
-    #    но видна в first8. Иначе «различие в первых H» ничего не измеряет.
-    assert s["pose_rms_first4"] == 0.0, s["pose_rms_first4"]
-    assert s["pose_rms_first8"] > 0.0
+    # 3. ИСПОЛНЯЕМЫЕ позиции считаются отдельно, и это не косметика: правка на
+    #    шаге 7 при H=4 не исполняется вовсе. Если бы режимы различались ТОЛЬКО
+    #    в хвосте чанка, симулятор их бы не различил.
+    assert s["pose_rms_first4"] == 0.0 and s["frac_rows_identical_first4"] == 1.0
+    assert s["pose_rms_first8"] > 0.0 and s["frac_rows_identical_first8"] < 1.0
 
-    # 4. Схват не тонет в позе: правка только схвата даёт pose_rms=0.
+    # 4. Схват не тонет в позе, и считается по срезам тоже.
     C = A.copy(); C[..., 6] = -A[..., 6]
     s = diff_stats(A, C)
     assert s["pose_rms"] == 0.0 and s["grip_rms"] > 0
-    assert s["grip_sign_flip"] > 0.9, s["grip_sign_flip"]
+    assert s["grip_sign_flip"] > 0.9 and s["grip_sign_flip_first4"] > 0.9
+    assert s["grip_rms_first8"] > 0 and s["frac_steps_diff_first8"] > 0.9
+
+    # 5. Хвост чанка не должен маскировать совпадение в исполняемой части:
+    #    различие только на шагах 10-19 даёт нулевые показатели first8.
+    D = A.copy(); D[:, 10:, :] += 1.0
+    s = diff_stats(A, D)
+    assert s["pose_rms"] > 0 and s["frac_rows_identical"] == 0.0
+    assert s["frac_rows_identical_first8"] == 1.0, (
+        "совпадение исполняемой части обязано быть видно отдельно")
 
     # 5. Сводка времён: медиана устойчива к выбросу, среднее нет.
     t = summarize_times([10.0] * 99 + [1000.0])
@@ -339,13 +357,23 @@ def main() -> None:
     scale = np.ones(7); scale[:6] = max_act_q[:6]
     st13 = diff_stats(a1, a3, scale=scale)
     print("\n    различие «уровень 1» и «уровни 1-3»:")
-    for k_, v in st13.items():
-        print(f"      {k_:<22}{v:.6f}")
-    if st13["frac_rows_identical"] > 0.01:
+    for k_ in sorted(st13):
+        print(f"      {k_:<30}{st13[k_]:.6f}")
+
+    # ОТКАЗ ФОРМУЛИРУЕТСЯ ПО ИСПОЛНЯЕМЫМ ПОЗИЦИЯМ. Доля совпавших чанков сама
+    # по себе ничего не решает: если тонкие уровни меняют лишь часть состояний,
+    # K-6h остаётся в силе — он и мерил успех, а не долю различий. Артефактом
+    # результат был бы только в одном случае: если режимы почти не различаются
+    # ИМЕННО в том, что доходит до среды.
+    fi8 = st13["frac_rows_identical_first8"]
+    if fi8 > 0.99 and st13["pose_rms_first8"] < 1e-6:
         raise SystemExit(
-            f"{st13['frac_rows_identical']:.1%} строк СОВПАДАЮТ побитово между\n"
-            f"одним и тремя уровнями. Это означало бы, что K-6h сравнивал\n"
-            f"режимы, которые почти не различаются, и его вывод — артефакт.")
+            f"{fi8:.1%} исполняемых префиксов (первые 8 шагов) совпадают при\n"
+            f"одном и трёх уровнях, ошибка позы там {st13['pose_rms_first8']:.2e}.\n"
+            f"Тогда K-6h сравнивал режимы, которые среда почти не различает,\n"
+            f"и его вывод об успехе ничего не говорит о тонких уровнях.")
+    print(f"\n    исполняемая часть (первые 8 шагов) различается в "
+          f"{1 - fi8:.1%} наблюдений")
 
     # --- 3. латентность -------------------------------------------------------
     print("\n  латентность (прогрев "
@@ -358,38 +386,57 @@ def main() -> None:
             continue
         batch = build_batch(sel)
         po = int(offs[sel[0]])
-        for name, fn in (("bar_3_blocks",
-                          lambda: model.generate(**batch, position_offset=po,
-                                                 do_sample=False,
-                                                 initial_position_shift=1)),
-                         ("coarse_1_block",
-                          lambda: model.generate_coarse(
-                              **batch, position_offset=po, do_sample=False,
-                              initial_position_shift=1))):
-            torch.cuda.reset_peak_memory_stats(dev)
+        fns = {
+            "bar_3_blocks": lambda: model.generate(
+                **batch, position_offset=po, do_sample=False,
+                initial_position_shift=1),
+            "coarse_1_block": lambda: model.generate_coarse(
+                **batch, position_offset=po, do_sample=False,
+                initial_position_shift=1),
+        }
+        with torch.no_grad():
+            for _ in range(args.warmup):
+                for fn in fns.values():
+                    fn()
+            torch.cuda.synchronize()
+
+        # ЧЕРЕДОВАНИЕ ПОРЯДКА. Замеры подряд в фиксированном порядке смешивают
+        # разницу режимов с дрейфом частоты и температуры GPU: второй всегда
+        # мерится на прогретой карте. Чередуем и считаем ускорение ПО РАУНДАМ,
+        # тогда дрейф попадает в разброс раундов, а не в саму оценку.
+        per_round, samples = [], {k: [] for k in fns}
+        n_rounds, per_iter = 4, max(1, args.iters // 4)
+        torch.cuda.reset_peak_memory_stats(dev)
+        for rd in range(n_rounds):
+            order_ = list(fns) if rd % 2 == 0 else list(fns)[::-1]
+            med = {}
             with torch.no_grad():
-                for _ in range(args.warmup):
-                    fn()
-                torch.cuda.synchronize()
-                ts = []
-                for _ in range(args.iters):
-                    t0 = time.perf_counter()
-                    fn()
-                    torch.cuda.synchronize()
-                    ts.append((time.perf_counter() - t0) * 1e3)
-            s = summarize_times(ts)
-            s["peak_mem_gib"] = torch.cuda.max_memory_allocated(dev) / 2 ** 30
+                for name in order_:
+                    ts = []
+                    for _ in range(per_iter):
+                        t0 = time.perf_counter()
+                        fns[name]()
+                        torch.cuda.synchronize()
+                        ts.append((time.perf_counter() - t0) * 1e3)
+                    samples[name] += ts
+                    med[name] = float(np.median(ts))
+            per_round.append(med["bar_3_blocks"] / med["coarse_1_block"])
+        peak = torch.cuda.max_memory_allocated(dev) / 2 ** 30
+
+        for name in fns:
+            s = summarize_times(samples[name])
             lat[f"b{bs}_{name}"] = s
             print(f"    батч {bs:>2} {name:<15} "
                   f"med {s['median']:7.2f} мс  ср {s['mean']:7.2f}  "
-                  f"sd {s['sd']:5.2f}  p95 {s['p95']:7.2f}  "
-                  f"пик {s['peak_mem_gib']:.2f} ГиБ")
-        f_, c_ = lat[f"b{bs}_bar_3_blocks"], lat[f"b{bs}_coarse_1_block"]
-        r = f_["median"] / c_["median"]
-        print(f"    батч {bs:>2}: ИЗМЕРЕНО {r:.2f}x против официальной BAR")
-        print(f"              пересчёт к BAR с кэшем ~{r * CACHE_FACTOR_K5A:.2f}x "
-              f"— НЕ измерено здесь, множитель из k5a")
+                  f"sd {s['sd']:5.2f}  p95 {s['p95']:7.2f}")
+        r = float(np.median(per_round))
         lat[f"b{bs}_speedup_vs_official"] = r
+        lat[f"b{bs}_speedup_per_round"] = per_round
+        lat[f"b{bs}_peak_mem_gib"] = peak
+        print(f"    батч {bs:>2}: ИЗМЕРЕНО {r:.2f}x против официальной BAR "
+              f"(по раундам: {', '.join(f'{x:.2f}' for x in per_round)})")
+        print(f"              пик памяти {peak:.2f} ГиБ; пересчёт к BAR с кэшем "
+              f"~{r * CACHE_FACTOR_K5A:.2f}x — НЕ измерено здесь, из k5a")
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     json.dump(dict(n_obs=N, ckpt=args.ckpt, coarse_tokens_match=bool(same.all()),

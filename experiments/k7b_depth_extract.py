@@ -48,10 +48,24 @@ import numpy as np
 N_POS, N_LEVEL, T_CHUNK = 16, 3, 20
 
 
+def hook_index(after_n, total):
+    """Куда ставить хук, чтобы снять состояние ПОСЛЕ ровно `after_n` слоёв.
+
+    Вход `input_layernorm` слоя k — это остаточный поток после k-1 слоёв.
+    Значит «после 6 слоёв» = вход слоя 7, то есть индекс 6 при нумерации с
+    нуля. Раньше здесь было `layers[d-1]`, что давало состояние после d-1
+    слоёв при подписи «глубина d»: смещение на один слой, из-за которого
+    заявленная экономия раннего выхода была бы систематически завышена.
+
+    Для after_n == total слоя-приёмника не существует: там берётся вход
+    action_lm_head, ключ `final`.
+    """
+    if not 1 <= after_n <= total:
+        raise SystemExit(f"«после {after_n} слоёв» вне диапазона 1..{total}")
+    return None if after_n == total else after_n
+
+
 def check_depths(want, total):
-    """Глубины задаются с единицы и обязаны лежать в диапазоне. Молчаливое
-    обрезание сюда пускать нельзя: «слой 24» из 12 означал бы совсем не то,
-    что написано в таблице результатов."""
     bad = [d for d in want if not 1 <= d <= total]
     if bad:
         raise SystemExit(f"глубины {bad} вне диапазона 1..{total}")
@@ -61,6 +75,20 @@ def check_depths(want, total):
 
 
 def selftest():
+    # ГЛАВНАЯ ПРОВЕРКА: «после N слоёв» это вход слоя N+1, а не слоя N.
+    # Прежняя версия ставила хук на layers[d-1] и подписывала строку «глубина
+    # d» — состояние после d-1 слоёв. Из такой таблицы экономия раннего выхода
+    # считалась бы завышенной ровно на один слой.
+    assert hook_index(6, 24) == 6, "после 6 слоёв = вход слоя 7 = индекс 6"
+    assert hook_index(1, 24) == 1
+    assert hook_index(24, 24) is None, "после всех слоёв — только голова"
+    for bad in (0, 25, -1):
+        try:
+            hook_index(bad, 24)
+            raise AssertionError(f"{bad} должно падать")
+        except SystemExit:
+            pass
+
     assert check_depths([24, 6, 12], 24) == [6, 12, 24]
     for bad, tot in (([0], 24), ([25], 24), ([13], 12)):
         try:
@@ -148,17 +176,41 @@ def main() -> None:
         raise SystemExit("у модели нет action_expert — глубины снимать не с чего")
     ex_layers = model.action_expert.layers
     depths = check_depths([int(v) for v in args.depths.split(",")], len(ex_layers))
-    print(f"слоёв эксперта: {len(ex_layers)}; снимаю входы слоёв {depths} "
-          f"плюс `final` (вход action_lm_head)")
-
-    grab = {d: [] for d in depths}
-    grab["final"] = []
-    model.action_lm_head.register_forward_hook(
-        lambda m, i, o: grab["final"].append(i[0].detach().float().cpu()))
+    print(f"слоёв эксперта: {len(ex_layers)}")
     for d in depths:
-        ex_layers[d - 1].input_layernorm.register_forward_hook(
-            (lambda dd: (lambda m, i, o:
-                         grab[dd].append(i[0].detach().float().cpu())))(d))
+        hi = hook_index(d, len(ex_layers))
+        where = ("вход action_lm_head" if hi is None
+                 else f"вход input_layernorm слоя {hi + 1} (индекс {hi})")
+        print(f"  after_{d:<3} = состояние ПОСЛЕ {d} слоёв -> {where}")
+
+    keys, grab = [], {}
+    for d in depths:
+        hi = hook_index(d, len(ex_layers))
+        k_ = f"after_{d}"
+        keys.append(k_)
+        grab[k_] = []
+        if hi is None:
+            continue          # снимется вместе с `final` ниже
+        ex_layers[hi].input_layernorm.register_forward_hook(
+            (lambda kk: (lambda m, i, o:
+                         grab[kk].append(i[0].detach().float().cpu())))(k_))
+    full_key = f"after_{len(ex_layers)}"
+    if full_key not in grab:
+        keys.append(full_key)
+        grab[full_key] = []
+
+    # ТОЧНАЯ СВЕРКА, а не обучаемая опора. Сохраняем и вход головы, и argmax её
+    # выхода. Обучаемая голова на «final» может не сойтись по причинам
+    # оптимизации, и тогда непонятно, сломано извлечение или обучение. Здесь
+    # проверяется прямо: коды, которые породила эта голова, обязаны совпасть с
+    # первым блоком K_bar.
+    grab["_lm_codes"] = []
+
+    def lm_hook(m, i, o):
+        grab[full_key].append(i[0].detach().float().cpu())
+        grab["_lm_codes"].append(o.detach().argmax(-1).cpu())
+
+    model.action_lm_head.register_forward_hook(lm_hook)
 
     # --- данные: ДАТАСЕТНЫЙ путь предобработки ------------------------------
     rid, rev = "physical-intelligence/libero", "v2.0"
@@ -222,10 +274,10 @@ def main() -> None:
     offs = np.array([args.pos_offset if args.pos_offset is not None
                      else off_by_task[tsk[i]] for i in range(N)])
 
-    keys = depths + ["final"]
     H = {}
     K_bar = np.zeros((N, N_LEVEL, N_POS), np.int64)
     done = 0
+    lm_checked = [False]
     for po in sorted({int(v) for v in offs}):
       idx_po = np.where(offs == po)[0]
       for i0 in range(0, len(idx_po), args.batch):
@@ -249,15 +301,29 @@ def main() -> None:
                      return_tensors="pt", padding=True, padding_side="left",
                      action_processor_kwargs={"embodiment_ids": 0})
         batch = dict_apply(lambda x: x.to(dev, dtype), batch)
-        for k_ in keys:
+        for k_ in list(grab):
             grab[k_].clear()
         with torch.no_grad():
             tk = model.generate(**batch, position_offset=po, do_sample=False,
                                 initial_position_shift=1)
         K_bar[sel] = tk.cpu().numpy().reshape(b, N_LEVEL, N_POS)
 
-        assert len(grab["final"]) == N_LEVEL, (
-            f"голова сработала {len(grab['final'])} раз, ждали {N_LEVEL}")
+        assert len(grab["_lm_codes"]) == N_LEVEL, (
+            f"голова сработала {len(grab['_lm_codes'])} раз, ждали {N_LEVEL}")
+        # СВЕРКА С НАСТОЯЩИМ ВЫХОДОМ ГОЛОВЫ. Если не совпало — сохранённое
+        # состояние относится не к тому вызову, который породил K_bar, и
+        # никакой зонд на нём не имеет смысла.
+        lm0 = grab["_lm_codes"][0].numpy()
+        bad = int((lm0 != K_bar[sel][:, 0, :]).sum())
+        if bad:
+            raise SystemExit(
+                f"argmax выхода action_lm_head на первом блоке расходится с\n"
+                f"K_bar[:,0,:] в {bad} из {lm0.size} позиций. Сохранённые\n"
+                f"состояния относятся не к тому вызову — зонд был бы ложным.")
+        if not lm_checked[0]:
+            lm_checked[0] = True
+            print(f"    сверка: argmax головы == K_bar[:,0,:] на всех "
+                  f"{lm0.size} позициях батча")
         for k_ in keys:
             # ПЕРВЫЙ блок: именно он даёт грубый уровень. Хуки эксперта
             # срабатывают по разу на блок, как и голова.
@@ -293,8 +359,13 @@ def main() -> None:
                  depths=depths, keys=[str(k_) for k_ in keys],
                  n_expert_layers=len(ex_layers), n_codes=n_codes,
                  d_model=int(H[keys[0]].shape[-1]),
-                 source="вход input_layernorm слоёв action_expert (нумерация с "
-                        "единицы) плюс `final` = вход action_lm_head; первый блок",
+                 source="after_N = состояние ПОСЛЕ N слоёв action_expert, то "
+                        "есть вход input_layernorm слоя N+1; для N = числа "
+                        "слоёв это вход action_lm_head (после финальной "
+                        "нормировки, поэтому эта строка иной природы, чем "
+                        "остальные). Первый блок BAR.",
+                 lm_head_check="argmax выхода action_lm_head на первом блоке "
+                               "совпал с K_bar[:,0,:] во всех батчах",
                  target_note="цель зонда — K_bar[:,0,:], то есть что выдаёт сама "
                              "BAR на полной глубине; K_true вторичен"),
                  ensure_ascii=False))
