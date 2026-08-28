@@ -175,10 +175,17 @@ def head_loss(a_hat, a_star, mu=1.0, eta=0.25, grip_scale=4.0):
     return pose8 + grip8 / 6.0 + mu * sign + eta * full
 
 
-def build_head(kind, d_in, hidden, layers, n_heads, codec_decode):
+def build_head(kind, d_in, hidden, layers, n_heads, codec_decode, dropout=0.0):
     """direct: h -> 20x7 напрямую. latent: h -> 16x512 -> замороженный декодер
-    кодека. Второй вариант проверяет, доступна ли ранней глубине та же латента,
-    из которой декодер и так строит действие."""
+    кодека.
+
+    ЁМКОСТЬ ЗАДАЁТСЯ ЯВНО, И ЭТО НЕ ДЕТАЛЬ. Первый прогон шёл с четырьмя
+    слоями трансформера при скрытом размере 1024 — около 35 млн параметров на
+    3230 обучающих примеров. `direct` на полной глубине запомнил их ДО НУЛЯ
+    (train 0.0000) при тесте 0.1818, то есть контроль провалился не из-за
+    глубины, а из-за ёмкости. `layers=0` убирает ствол совсем и оставляет
+    линейный зонд — им и надо мерить, пока данных мало.
+    """
     import torch
     import torch.nn as nn
 
@@ -187,15 +194,19 @@ def build_head(kind, d_in, hidden, layers, n_heads, codec_decode):
             super().__init__()
             self.norm = nn.LayerNorm(d_in)
             self.inp = nn.Linear(d_in, hidden)
-            if n_heads > 0:
+            self.drop = nn.Dropout(dropout)
+            if layers == 0:
+                self.trunk = nn.Identity()
+            elif n_heads > 0:
                 enc = nn.TransformerEncoderLayer(
                     hidden, n_heads, hidden * 2, batch_first=True,
-                    norm_first=True, dropout=0.0)
+                    norm_first=True, dropout=dropout)
                 self.trunk = nn.TransformerEncoder(enc, layers)
             else:
                 mods = []
                 for _ in range(layers):
-                    mods += [nn.Linear(hidden, hidden), nn.GELU()]
+                    mods += [nn.Linear(hidden, hidden), nn.GELU(),
+                             nn.Dropout(dropout)]
                 self.trunk = nn.Sequential(*mods)
             self.kind = kind
             if kind == "direct":
@@ -204,7 +215,7 @@ def build_head(kind, d_in, hidden, layers, n_heads, codec_decode):
                 self.out = nn.Linear(hidden, Z_DIM)
 
         def forward(self, h):
-            z = self.trunk(self.inp(self.norm(h)))
+            z = self.trunk(self.drop(self.inp(self.norm(h))))
             if self.kind == "direct":
                 return self.out(z.reshape(z.shape[0], -1)).reshape(
                     -1, T_CHUNK, 7)
@@ -226,6 +237,8 @@ def main() -> None:
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--n-heads", type=int, default=8,
                     help="0 = MLP вместо трансформера")
+    ap.add_argument("--dropout", type=float, default=0.0)
+    ap.add_argument("--weight-decay", type=float, default=0.01)
     ap.add_argument("--epochs", type=int, default=80)
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -323,9 +336,15 @@ def main() -> None:
             raise SystemExit(f"в файле нет {key}; доступно: {list(z.files)[:8]}")
         X = torch.as_tensor(z[key].astype(np.float32))
         head = build_head(kind, X.shape[-1], args.hidden, args.layers,
-                          args.n_heads, dec).to(dev)
+                          args.n_heads, dec, args.dropout).to(dev)
         ps = [p for p in head.parameters() if p.requires_grad]
-        opt = torch.optim.AdamW(ps, lr=args.lr, weight_decay=0.01)
+        if seed == 0 and depth == min(int(v) for v in args.depths.split(",")):
+            n_p = sum(p.numel() for p in ps)
+            print(f"    {kind}: {n_p / 1e6:.2f} млн параметров на "
+                  f"{int(tr.sum())} обучающих примеров "
+                  f"({n_p / max(int(tr.sum()), 1):.0f} на пример)")
+        opt = torch.optim.AdamW(ps, lr=args.lr,
+                                weight_decay=args.weight_decay)
         itr = np.where(tr)[0]
         spe = math.ceil(len(itr) / args.batch)
         total = args.epochs * spe
