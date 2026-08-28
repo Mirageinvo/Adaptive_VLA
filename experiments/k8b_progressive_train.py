@@ -58,6 +58,7 @@ N_POS, N_LEVEL, T_CHUNK, H_EXEC = 16, 3, 20, 8
 # Точность грубых кодов у зонда K-7c на ЗАМОРОЖЕННЫХ признаках слоя 12.
 # ДВЕ ВЕЛИЧИНЫ, И ПУТАТЬ ИХ НЕЛЬЗЯ: зонд целился в коды самой BAR, а обучение
 # целится в коды токенизатора, а BAR совпадает с токенизатором лишь на 87%.
+FULL_MARGIN = 1.05       # Full не хуже официальной BAR более чем на 5%
 PROBE_Q0_BAR = 0.272     # против кодов самой BAR
 PROBE_Q0_TRUE = 0.260    # против кодов токенизатора — вот с чем сравнимо k8b
 
@@ -353,35 +354,40 @@ def main() -> None:
     gap = float((A_star.numpy() - a_codec).__abs__().mean())
     print(f"неустранимая ошибка токенизатора (|цель − датасет|): {gap:.4f}")
 
+    tr, va, te = split_by_episode(epi, tsk_a, seed=args.seed)
+    print(f"train {tr.sum()}, val {va.sum()}, test {te.sum()}; "
+          f"задач {len(np.unique(tsk_a))}")
+    iv = np.where(va)[0]
+
     # ПОТОЛКИ РЕЖИМОВ. Без них числа обучения нечитаемы: непонятно, близко ли
     # Fast к пределу или далеко. Потолок — это ИСТИННЫЕ коды нужных уровней,
     # декодированные тем же путём. Ниже него модель с замороженным
     # токенизатором не опустится ни при каком обучении.
     with torch.no_grad():
         ceil = {}
+        # НА ТОЙ ЖЕ ВЫБОРКЕ, ЧТО И ОПОРЫ BAR. Потолки по всем наблюдениям, а
+        # BAR по валидации — это смешанное сравнение, публиковать такое нельзя.
+        Kt_va = Kt[torch.as_tensor(iv).to(dev)]
         for name, n_lv in (("fast", 1), ("medium", 2), ("full", N_LEVEL)):
             acc = []
-            for i0 in range(0, N, 256):
-                k = Kt[i0:i0 + 256]
+            for i0 in range(0, len(iv), 256):
+                k = Kt_va[i0:i0 + 256]
                 z = sum(E[j][k[:, j, :]] for j in range(n_lv))
                 x, _ = codec._decode(z, embodiment_ids=0)
                 acc.append(x[..., :7].float().cpu())
             a_c = torch.cat(acc)
-            d = a_c - A_star
+            d = a_c - A_star[iv]
             ceil[name] = dict(
                 pose8_rms=float(torch.sqrt((d[:, :H_EXEC, :6] ** 2).mean())),
                 grip8_rms=float(torch.sqrt((d[:, :H_EXEC, 6] ** 2).mean())),
                 grip8_flip=float((torch.sign(a_c[:, :H_EXEC, 6])
-                                  != torch.sign(A_star[:, :H_EXEC, 6])
+                                  != torch.sign(A_star[iv][:, :H_EXEC, 6])
                                   ).float().mean()))
-    print("потолки (истинные коды нужных уровней, ниже не опуститься):")
+    print("потолки на ВАЛИДАЦИИ (истинные коды нужных уровней):")
     for m_, r in ceil.items():
         print(f"    {m_:<7} поза8 {r['pose8_rms']:.4f}  схват8 "
               f"{r['grip8_rms']:.4f}  знак {r['grip8_flip']:.2%}")
 
-    tr, va, te = split_by_episode(epi, tsk_a, seed=args.seed)
-    print(f"train {tr.sum()}, val {va.sum()}, test {te.sum()}; "
-          f"задач {len(np.unique(tsk_a))}")
 
     # --- сборка батча --------------------------------------------------------
     def build(sel):
@@ -416,7 +422,6 @@ def main() -> None:
     # выше построены на ИСТИННЫХ кодах, а практический конкурент — это
     # ПРЕДСКАЗАННЫЙ моделью грубый уровень. Здесь снимается именно он.
     print("\nопорные числа официальной BAR на валидации (модель ещё не тронута):")
-    iv = np.where(va)[0]
     bar_ref, K_bar_va = {}, np.zeros((len(iv), N_LEVEL, N_POS), np.int64)
     acc_p = {1: [], 3: []}
     pos_in_va = {int(g): i for i, g in enumerate(iv)}
@@ -532,23 +537,30 @@ def main() -> None:
                     a_hat = decode_prefix(embs)
                     a_st = A_star[sel].to(dev)
                     d = (a_hat - a_st)
-                    pe.append(float((d[:, :H_EXEC, :6] ** 2).mean()))
-                    ge.append(float((d[:, :H_EXEC, 6] ** 2).mean()))
-                    gf.append(float((torch.sign(a_hat[:, :H_EXEC, 6])
-                                     != torch.sign(a_st[:, :H_EXEC, 6])).float().mean()))
-                    acc.append(float((out["pred_codes"][0] ==
-                                      torch.as_tensor(K_true[sel][:, 0, :]).to(dev)
-                                      ).float().mean()))
+                    # ВЕС — ЧИСЛО НАБЛЮДЕНИЙ. Неполный последний батч иначе
+                    # получал бы тот же вес, что полный, и метрика расходилась
+                    # бы с опорами BAR, которые взвешены правильно.
+                    w = len(sel)
+                    pe.append((float((d[:, :H_EXEC, :6] ** 2).mean()), w))
+                    ge.append((float((d[:, :H_EXEC, 6] ** 2).mean()), w))
+                    gf.append((float((torch.sign(a_hat[:, :H_EXEC, 6])
+                                      != torch.sign(a_st[:, :H_EXEC, 6])
+                                      ).float().mean()), w))
+                    acc.append((float((out["pred_codes"][0] ==
+                                       torch.as_tensor(K_true[sel][:, 0, :]).to(dev)
+                                       ).float().mean()), w))
                     kb = torch.as_tensor(
                         K_bar_va[[pos_in_va[int(g_)] for g_ in sel]][:, 0, :]
                     ).to(dev)
-                    acc_b.append(float((out["pred_codes"][0] == kb).float().mean()))
+                    acc_b.append((float((out["pred_codes"][0] == kb
+                                         ).float().mean()), w))
                     nb += 1
-            res[mode] = dict(pose8_rms=float(np.sqrt(np.mean(pe))),
-                             grip8_rms=float(np.sqrt(np.mean(ge))),
-                             grip8_flip=float(np.mean(gf)),
-                             q0_vs_true=float(np.mean(acc)),
-                             q0_vs_bar=float(np.mean(acc_b)), n_batches=nb)
+            wavg = lambda xs: sum(v * w for v, w in xs) / sum(w for _, w in xs)
+            res[mode] = dict(pose8_rms=float(math.sqrt(wavg(pe))),
+                             grip8_rms=float(math.sqrt(wavg(ge))),
+                             grip8_flip=float(wavg(gf)),
+                             q0_vs_true=float(wavg(acc)),
+                             q0_vs_bar=float(wavg(acc_b)), n_batches=nb)
         # ТОЧНОСТЬ q0 ПЕЧАТАЕТСЯ ПЕРВОЙ: это величина, отвечающая на вопрос
         # «создаётся ли информация на ранней глубине». Но одного её роста мало
         # для вывода о LoRA: одновременно учится и сама голова уровня 0.
@@ -590,18 +602,33 @@ def main() -> None:
         * 0.5 * (1 + math.cos(math.pi * min(1.0, s / total))))
     print(f"\n{spe} шагов на эпоху, всего {total}, прогрев {warm}")
 
+    # ПОДВЫБОРКА TRAIN РАЗМЕРОМ С ВАЛИДАЦИЮ. Без train-метрик нельзя отличить
+    # три разные причины плато: представление не содержит информации; данных
+    # мало и модель переобучилась; цель плохо параметризована. Все три дают
+    # одинаковую картину на валидации и РАЗНУЮ на обучающей выборке.
+    rng_tr = np.random.default_rng(args.seed)
+    itr_all = np.where(tr)[0]
+    tr_sub = np.zeros(len(tr), bool)
+    tr_sub[rng_tr.choice(itr_all, size=min(int(va.sum()), len(itr_all)),
+                         replace=False)] = True
+
     hist = []
     ev0 = evaluate(va, "эпоха 0, до обучения")
+    evt0 = evaluate(tr_sub, "эпоха 0, ОБУЧАЮЩАЯ")
     # ЭПОХА 0 — ПОЛНОПРАВНЫЙ КАНДИДАТ. Иначе обучение, которое всё портит, всё
     # равно вернуло бы обученный чекпойнт. Ту же ошибку уже чинили в k7c.
     sd0 = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()
            if k.startswith(("prog_heads", "prog_feedback"))
            or k.endswith((".A", ".B"))}
     torch.save(sd0, os.path.join(args.out, "best_fast.pt"))
-    torch.save(sd0, os.path.join(args.out, "best_pareto.pt"))
-    best = {"fast": (ev0["fast"]["pose8_rms"], 0),
-            "pareto": (sum(ev0[m_]["pose8_rms"]
-                           for m_ in ("fast", "medium", "full")), 0)}
+    best = {"fast": (ev0["fast"]["pose8_rms"], 0), "pareto": None}
+    # ЭПОХА 0 ИДЁТ В ПАРЕТО ТОЛЬКО ЕСЛИ ПРОХОДИТ ПОРОГ. У необученной головы
+    # Full около 0.36 против 0.035 у BAR — она порог не проходит, и сохранять
+    # её как парето-кандидата значило бы объявить лучшим заведомо негодное.
+    if ev0["full"]["pose8_rms"] <= bar_ref["BAR полная"]["pose8_rms"] * FULL_MARGIN:
+        torch.save(sd0, os.path.join(args.out, "best_pareto.pt"))
+        best["pareto"] = (sum(ev0[m_]["pose8_rms"]
+                              for m_ in ("fast", "medium", "full")), 0)
     step = 0
     for ep in range(args.epochs):
         p_tf = tf_prob(max(0, ep - args.fast_first_epochs))
@@ -631,11 +658,16 @@ def main() -> None:
 
         m = np.mean(agg, axis=0)
         model.eval()
-        ev = evaluate(va, f"эпоха {ep + 1}, "
-                          + ("ТОЛЬКО FAST" if fast_first
-                             else f"учитель {p_tf:.2f}"))
+        tag = ("ТОЛЬКО FAST" if fast_first else f"учитель {p_tf:.2f}")
+        ev = evaluate(va, f"эпоха {ep + 1}, {tag}")
+        evt = evaluate(tr_sub, f"эпоха {ep + 1}, ОБУЧАЮЩАЯ")
+        print(f"    q0 train−val: "
+              f"{evt['fast']['q0_vs_true'] - ev['fast']['q0_vs_true']:+.1%}; "
+              f"поза8 fast train {evt['fast']['pose8_rms']:.4f} против "
+              f"val {ev['fast']['pose8_rms']:.4f}")
         hist.append(dict(epoch=ep + 1, tf=p_tf, loss=float(m[0]),
                          l_code=float(m[1]), l_act=float(m[2]), val=ev,
+                         train=evt,
                          minutes=(time.time() - t0) / 60))
         print(f"    loss {m[0]:.4f} (коды {m[1]:.3f}, действие {m[2]:.4f}), "
               f"{(time.time() - t0) / 60:.1f} мин")
@@ -651,7 +683,7 @@ def main() -> None:
         s_now = sum(ev[m_]["pose8_rms"] for m_ in ("fast", "medium", "full"))
         # Ограничение на Full считается от ОФИЦИАЛЬНОЙ BAR: сравнение с
         # необученной прогрессивной головой (0.364) не значит ничего.
-        if ev["full"]["pose8_rms"] <= bar_ref["BAR полная"]["pose8_rms"] * 1.5:
+        if ev["full"]["pose8_rms"] <= bar_ref["BAR полная"]["pose8_rms"] * FULL_MARGIN:
             if best["pareto"] is None or s_now < best["pareto"][0]:
                 best["pareto"] = (s_now, ep + 1)
                 torch.save(sd, os.path.join(args.out, "best_pareto.pt"))
@@ -661,7 +693,8 @@ def main() -> None:
         print(f"лучший парето: эпоха {best['pareto'][1]}")
     else:
         print("ПАРЕТО НЕ НАЙДЕН: Full деградировал во всех эпохах более чем на 5%")
-    json.dump(dict(history=hist, before=ev0, ceilings=ceil,
+    json.dump(dict(history=hist, before=ev0, before_train=evt0,
+                   ceilings=ceil, bar_ref=bar_ref,
                    best_fast=best["fast"],
                    best_pareto=best["pareto"], exits=list(exits),
                    args=vars(args), trainable=rep, tokenizer_gap=gap),
