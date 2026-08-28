@@ -64,8 +64,14 @@ class LoRALinear(nn.Module):
             p.requires_grad_(False)
         self.r = r
         self.scale = alpha / r
-        self.A = nn.Parameter(torch.zeros(r, base.in_features, dtype=dtype))
-        self.B = nn.Parameter(torch.zeros(base.out_features, r, dtype=dtype))
+        # УСТРОЙСТВО БЕРЁТСЯ У БАЗОВОГО СЛОЯ. torch.zeros без device создаёт
+        # тензор на CPU, а обёртывание идёт уже после .to(dev) всей модели —
+        # тогда падение случается только на первом проходе, а не при сборке.
+        dvc = base.weight.device
+        self.A = nn.Parameter(torch.zeros(r, base.in_features,
+                                          dtype=dtype, device=dvc))
+        self.B = nn.Parameter(torch.zeros(base.out_features, r,
+                                          dtype=dtype, device=dvc))
         nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))   # B остаётся нулём
 
     def forward(self, x):

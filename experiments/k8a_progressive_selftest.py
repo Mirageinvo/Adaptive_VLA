@@ -401,9 +401,39 @@ def main() -> None:
         raise SystemExit("логиты поздних уровней не изменились — проводка "
                          "обратной связи не работает")
 
-    # --- 9. что именно обучается --------------------------------------------
-    model.init_progressive(exits=exits, head_dtype=torch.float32, lora_r=8)
+    # --- 9. что именно обучается, И ПРОХОД С ВКЛЮЧЁННОЙ LoRA -----------------
+    # Учёта параметров мало: прежняя версия проверяла только его и потому не
+    # заметила, что веса LoRA создаются на CPU — падало лишь на первом
+    # настоящем проходе, уже в обучении.
+    # Тот же dtype голов, что у эталона `base`, иначе расхождение логитов
+    # объяснялось бы точностью, а не LoRA.
+    model.init_progressive(exits=exits, head_dtype=dt, lora_r=8)
     print(f"\n  LoRA обернула слоёв: {len(model.lora_wrapped)}")
+    devs = {str(p.device) for p in model.progressive_parameters()}
+    print(f"  устройства обучаемых параметров: {devs}")
+    if len(devs) != 1:
+        raise SystemExit(
+            f"обучаемые параметры на разных устройствах: {devs}. Проход "
+            f"упадёт на первом же матричном умножении.")
+    with torch.no_grad():
+        o_lora = model.generate_progressive(**batch, mode="full", books=E,
+                                            position_offset=args.pos_offset)
+    assert len(o_lora["pred_codes"]) == len(exits)
+    dl = (o_lora["logits"][0] - base["logits"][0]).abs().max().item()
+    print(f"  логиты с LoRA против без неё: max|Δ| = {dl:.3e} (обязано 0)")
+    if dl != 0.0:
+        raise SystemExit("LoRA на старте меняет выход — B не нулевая")
+
+    # Отдельно: головы в float32 — так их создаёт обучение. Проверяем только,
+    # что проход не падает; побитового совпадения с fp16 тут ждать нельзя.
+    model.init_progressive(exits=exits, head_dtype=torch.float32, lora_r=8)
+    with torch.no_grad():
+        o32 = model.generate_progressive(**batch, mode="full", books=E,
+                                         position_offset=args.pos_offset)
+    agree = (o32["pred_codes"][0] == o_lora["pred_codes"][0]).float().mean()
+    print(f"  головы в float32: проход прошёл, коды совпали с fp16 на "
+          f"{agree:.1%}")
+
     rep = model.trainable_report()
     tot = sum(rep.values())
     for k_, v in sorted(rep.items()):
