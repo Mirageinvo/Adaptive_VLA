@@ -498,6 +498,7 @@ def main() -> None:
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     json.dump(dict(depths=res, floor_random=floor, n_obs=int(N),
+                   normed=bool(use_n), direct_no_training=direct,
                    feats=args.feats, epochs=args.epochs, seeds=args.seeds,
                    split="по эпизодам 70/15/15",
                    target="K_bar[:,0,:], грубые коды BAR на полной глубине"),

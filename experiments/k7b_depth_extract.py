@@ -21,10 +21,11 @@ K-6h обесценил: тонкие уровни не влияют на усп
 сохраняются тоже, как вторичная метрика.
 
 ГЛУБИНА d ОЗНАЧАЕТ ВХОД В СЛОЙ d при нумерации с единицы, то есть состояние
-после d-1 слоёв. Для последнего слоя дополнительно снимается вход
-`action_lm_head` — это состояние ПОСЛЕ всех слоёв и финальной нормировки, то
-есть ровно то, из чего BAR и получает коды. Оно сохраняется как глубина
-`final`, и служит верхней границей: голова на нём обязана давать почти 100%.
+после d-1 слоёв. Полная глубина снимается с самой `action_expert.norm`: её
+ВХОД идёт в `h_after_<N>`, а ВЫХОД — в `hn_after_<N>`, и выход обязан побитово
+совпадать со входом `action_lm_head` (проверяется). Так полная глубина не
+нормируется дважды, в отличие от промежуточных, к которым норму приходится
+применять отдельно.
 
 СТРОКИ ВЫРОВНЕНЫ: строка k в любом массиве — наблюдение k. Обход идёт группами
 по офсету позиции, но запись ведётся по индексам, а не подряд.
@@ -200,17 +201,26 @@ def main() -> None:
         keys.append(full_key)
         grab[full_key] = []
 
-    # ТОЧНАЯ СВЕРКА, а не обучаемая опора. Сохраняем и вход головы, и argmax её
-    # выхода. Обучаемая голова на «final» может не сойтись по причинам
-    # оптимизации, и тогда непонятно, сломано извлечение или обучение. Здесь
-    # проверяется прямо: коды, которые породила эта голова, обязаны совпасть с
-    # первым блоком K_bar.
-    grab["_lm_codes"] = []
+    # ПОЛНАЯ ГЛУБИНА СНИМАЕТСЯ С САМОЙ НОРМЫ, А НЕ СО ВХОДА ГОЛОВЫ. Вход
+    # action_lm_head — это уже результат action_expert.norm, и если положить
+    # его в общий массив, то последующая нормировка (которую мы применяем к
+    # промежуточным глубинам) выполнится по второму разу. Тогда строка полной
+    # глубины перестанет быть настоящим входом головы, а проверка 100% могла
+    # бы даже случайно пройти при неверной постановке.
+    # Хук на норме даёт обе величины сразу: вход = состояние до нормы, выход =
+    # ровно то, что потребляет голова.
+    grab_n = {full_key: []}
+    grab["_lm_codes"], grab["_lm_in"] = [], []
+
+    def norm_hook(m, i, o):
+        grab[full_key].append(i[0].detach().float().cpu())
+        grab_n[full_key].append(o.detach().float().cpu())
 
     def lm_hook(m, i, o):
-        grab[full_key].append(i[0].detach().float().cpu())
+        grab["_lm_in"].append(i[0].detach().float().cpu())
         grab["_lm_codes"].append(o.detach().argmax(-1).cpu())
 
+    model.action_expert.norm.register_forward_hook(norm_hook)
     model.action_lm_head.register_forward_hook(lm_hook)
 
     # --- данные: ДАТАСЕТНЫЙ путь предобработки ------------------------------
@@ -304,6 +314,8 @@ def main() -> None:
         batch = dict_apply(lambda x: x.to(dev, dtype), batch)
         for k_ in list(grab):
             grab[k_].clear()
+        for k_ in list(grab_n):
+            grab_n[k_].clear()
         with torch.no_grad():
             tk = model.generate(**batch, position_offset=po, do_sample=False,
                                 initial_position_shift=1)
@@ -321,10 +333,19 @@ def main() -> None:
                 f"argmax выхода action_lm_head на первом блоке расходится с\n"
                 f"K_bar[:,0,:] в {bad} из {lm0.size} позиций. Сохранённые\n"
                 f"состояния относятся не к тому вызову — зонд был бы ложным.")
+        # ВЫХОД НОРМЫ ОБЯЗАН БЫТЬ ВХОДОМ ГОЛОВЫ, побитово. Если нет — между
+        # ними есть ещё что-то, и «полная глубина» снята не оттуда.
+        dn = float((grab_n[full_key][0] - grab["_lm_in"][0]).abs().max())
+        if dn != 0.0:
+            raise SystemExit(
+                f"выход action_expert.norm не совпал со входом action_lm_head "
+                f"(max|Δ| = {dn:.3e}): между ними есть необлюдаемая операция, "
+                f"и строка полной глубины снята не оттуда.")
         if not lm_checked[0]:
             lm_checked[0] = True
             print(f"    сверка: argmax головы == K_bar[:,0,:] на всех "
-                  f"{lm0.size} позициях батча")
+                  f"{lm0.size} позициях батча; выход нормы == вход головы "
+                  f"побитово")
         for k_ in keys:
             # ПЕРВЫЙ блок: именно он даёт грубый уровень. Хуки эксперта
             # срабатывают по разу на блок, как и голова.
@@ -343,10 +364,18 @@ def main() -> None:
             # просто потому, что уже нормирована.
             if k_ + "_n" not in H:
                 H[k_ + "_n"] = np.zeros_like(H[k_])
-            with torch.no_grad():
-                cn = model.action_expert.norm(
-                    torch.as_tensor(c, dtype=torch.float32).to(dev))
-            H[k_ + "_n"][sel] = cn.float().cpu().numpy().astype(np.float16)
+            if k_ == full_key:
+                # Уже снято хуком на самой норме. Нормировать повторно нельзя.
+                cn_np = grab_n[full_key][0].numpy()
+            else:
+                # В ТОМ ЖЕ dtype, ЧТО У МОДЕЛИ: RMSNorm внутри поднимает до
+                # fp32 и возвращает во входной тип, поэтому вычисление в fp32
+                # дало бы не то, что делает сама модель.
+                with torch.no_grad():
+                    cn_np = model.action_expert.norm(
+                        torch.as_tensor(c, dtype=dtype, device=dev)
+                    ).float().cpu().numpy()
+            H[k_ + "_n"][sel] = cn_np.astype(np.float16)
         if done % (args.batch * 50) < args.batch:
             print(f"  {done}/{N} (офсет {po})", flush=True)
     assert done == N, f"обработано {done} из {N}"
@@ -385,7 +414,7 @@ def main() -> None:
                  target_note="цель зонда — K_bar[:,0,:], то есть что выдаёт сама "
                              "BAR на полной глубине; K_true вторичен"),
                  ensure_ascii=False))
-    sz = sum(H[k_].nbytes for k_ in keys) / 2 ** 20
+    sz = sum(H[k_].nbytes + H[k_ + "_n"].nbytes for k_ in keys) / 2 ** 20
     print(f"  сохранено: {args.out}  ({sz:.0f} МиБ)")
     print("  Строка k — наблюдение k во всех массивах, перестановки нет.")
 
