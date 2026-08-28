@@ -324,6 +324,30 @@ def main() -> None:
                                             size=K_true.shape)
     a = dec_codes(rnd, 1, ite)
     ref["случайный код"] = dict(pose8=m_pose8(a, ite), flip=m_flip(a, ite))
+    # ЧУВСТВИТЕЛЬНОСТЬ ДЕКОДЕРА К СХОДУ С РЕШЁТКИ. Точное решение на полной
+    # глубине идёт через argmax и выбор вектора из книги, то есть латента лежит
+    # в дискретном множестве. Непрерывная голова выдаёт точку МЕЖДУ узлами, а
+    # декодер обучался только на суммах кодбуковых векторов. Если малое
+    # отклонение от решётки уже портит действие, то `latent` проигрывает по
+    # построению, и требовать от него уровня BAR несправедливо.
+    with torch.no_grad():
+        k0 = torch.as_tensor(K_true[ite][:, 0, :]).long().to(dev)
+        z0 = E[0][k0]
+        scale = float(z0.std())
+        print(f"\nчувствительность декодера к сходу с решётки "
+              f"(sd латенты {scale:.3f}):")
+        for rel in (0.0, 0.01, 0.03, 0.1, 0.3):
+            zz = z0 + torch.randn_like(z0) * (scale * rel)
+            a_n = dec(zz).cpu()
+            print(f"    шум {rel:>4.0%} от sd: поза8 {m_pose8(a_n, ite):.4f}  "
+                  f"знак {m_flip(a_n, ite):.2%}")
+        # Расстояние до ближайшего соседа в книге: масштаб, на котором
+        # непрерывная голова обязана попадать, чтобы решение было эквивалентно.
+        sub = E[0][torch.randperm(E.shape[1], device=dev)[:512]]
+        dmat = torch.cdist(sub, sub) + torch.eye(len(sub), device=dev) * 1e9
+        print(f"    типичное расстояние до ближайшего кода: "
+              f"{float(dmat.min(dim=1).values.median()):.3f}")
+
     print("\nопоры на тестовой части:")
     for nm, r in ref.items():
         print(f"    {nm:<18} поза8 {r['pose8']:.4f}  знак {r['flip']:.2%}")
