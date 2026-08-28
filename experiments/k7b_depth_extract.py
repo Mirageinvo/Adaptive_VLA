@@ -209,12 +209,18 @@ def main() -> None:
     # бы даже случайно пройти при неверной постановке.
     # Хук на норме даёт обе величины сразу: вход = состояние до нормы, выход =
     # ровно то, что потребляет голова.
+    # ВНИМАНИЕ: этот модуль вызывается НЕ ТОЛЬКО из строки bar.py:1247. При
+    # первом прогоне хук сработал шесть раз вместо трёх. Гадать о причине
+    # нельзя — поэтому записываем ВСЕ вызовы вместе с формами, отбираем те, у
+    # которых 16 позиций (action-запросы), и печатаем формы остальных, чтобы
+    # причина стала видна из лога, а не осталась догадкой.
     grab_n = {full_key: []}
-    grab["_lm_codes"], grab["_lm_in"] = [], []
+    grab["_lm_codes"], grab["_lm_in"], grab["_norm_all"] = [], [], []
 
     def norm_hook(m, i, o):
-        grab[full_key].append(i[0].detach().float().cpu())
-        grab_n[full_key].append(o.detach().float().cpu())
+        grab["_norm_all"].append((tuple(i[0].shape),
+                                  i[0].detach().float().cpu(),
+                                  o.detach().float().cpu()))
 
     def lm_hook(m, i, o):
         grab["_lm_in"].append(i[0].detach().float().cpu())
@@ -313,9 +319,9 @@ def main() -> None:
                      action_processor_kwargs={"embodiment_ids": 0})
         batch = dict_apply(lambda x: x.to(dev, dtype), batch)
         for k_ in list(grab):
-            grab[k_].clear()
+            grab[k_] = []          # переприсваиваем: full_key заполняется отбором
         for k_ in list(grab_n):
-            grab_n[k_].clear()
+            grab_n[k_] = []
         with torch.no_grad():
             tk = model.generate(**batch, position_offset=po, do_sample=False,
                                 initial_position_shift=1)
@@ -323,6 +329,27 @@ def main() -> None:
 
         assert len(grab["_lm_codes"]) == N_LEVEL, (
             f"голова сработала {len(grab['_lm_codes'])} раз, ждали {N_LEVEL}")
+
+        # ОТБОР ВЫЗОВОВ НОРМЫ ПО ФОРМЕ: нас интересуют только те, где 16
+        # позиций action-запросов. Прочие вызовы того же модуля к делу не
+        # относятся, но их формы печатаются один раз — чтобы было видно, что
+        # это, а не осталось необъяснённым.
+        cand = [t for t in grab["_norm_all"] if t[0][1] == N_POS]
+        other = [t[0] for t in grab["_norm_all"] if t[0][1] != N_POS]
+        if not lm_checked[0]:
+            print(f"    вызовов action_expert.norm за generate: "
+                  f"{len(grab['_norm_all'])}, из них с {N_POS} позициями "
+                  f"{len(cand)}")
+            if other:
+                print(f"    прочие формы (к делу не относятся): "
+                      f"{sorted(set(other))}")
+        if len(cand) != N_LEVEL:
+            raise SystemExit(
+                f"вызовов нормы с {N_POS} позициями оказалось {len(cand)}, "
+                f"ждали {N_LEVEL}. Формы всех вызовов: "
+                f"{[t[0] for t in grab['_norm_all']]}")
+        grab[full_key] = [t[1] for t in cand]
+        grab_n[full_key] = [t[2] for t in cand]
         # СВЕРКА С НАСТОЯЩИМ ВЫХОДОМ ГОЛОВЫ. Если не совпало — сохранённое
         # состояние относится не к тому вызову, который породил K_bar, и
         # никакой зонд на нём не имеет смысла.
