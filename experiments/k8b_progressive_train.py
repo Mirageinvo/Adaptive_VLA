@@ -522,7 +522,11 @@ def main() -> None:
 
     # --- оценка --------------------------------------------------------------
     @torch.no_grad()
-    def evaluate(mask, tag):
+    def evaluate(mask, tag, with_bar=True):
+        # with_bar=False для ОБУЧАЮЩЕЙ подвыборки: коды BAR сняты только на
+        # валидации, и обращение к pos_in_va с train-индексами упало бы с
+        # KeyError. Гнать BAR ещё и по train ради одной колонки незачем.
+
         idxs = np.where(mask)[0]
         res = {}
         for mode, n_lv in (("fast", 1), ("medium", 2), ("full", N_LEVEL)):
@@ -549,18 +553,20 @@ def main() -> None:
                     acc.append((float((out["pred_codes"][0] ==
                                        torch.as_tensor(K_true[sel][:, 0, :]).to(dev)
                                        ).float().mean()), w))
-                    kb = torch.as_tensor(
-                        K_bar_va[[pos_in_va[int(g_)] for g_ in sel]][:, 0, :]
-                    ).to(dev)
-                    acc_b.append((float((out["pred_codes"][0] == kb
-                                         ).float().mean()), w))
+                    if with_bar:
+                        kb = torch.as_tensor(
+                            K_bar_va[[pos_in_va[int(g_)] for g_ in sel]][:, 0, :]
+                        ).to(dev)
+                        acc_b.append((float((out["pred_codes"][0] == kb
+                                             ).float().mean()), w))
                     nb += 1
             wavg = lambda xs: sum(v * w for v, w in xs) / sum(w for _, w in xs)
             res[mode] = dict(pose8_rms=float(math.sqrt(wavg(pe))),
                              grip8_rms=float(math.sqrt(wavg(ge))),
                              grip8_flip=float(wavg(gf)),
                              q0_vs_true=float(wavg(acc)),
-                             q0_vs_bar=float(wavg(acc_b)), n_batches=nb)
+                             q0_vs_bar=(float(wavg(acc_b)) if with_bar
+                                        else None), n_batches=nb)
         # ТОЧНОСТЬ q0 ПЕЧАТАЕТСЯ ПЕРВОЙ: это величина, отвечающая на вопрос
         # «создаётся ли информация на ранней глубине». Но одного её роста мало
         # для вывода о LoRA: одновременно учится и сама голова уровня 0.
@@ -572,9 +578,10 @@ def main() -> None:
         r0 = res["fast"]
         base = (f", эпоха 0 давала {hist[0]['val']['fast']['q0_vs_true']:.1%}"
                 if hist else "")
+        vs_bar = ("" if r0["q0_vs_bar"] is None else
+                  f"; {r0['q0_vs_bar']:.1%} против кодов BAR")
         print(f"  [{tag}] q0 на слое {model.exits[0]}: "
-              f"{r0['q0_vs_true']:.1%} против токенизатора{base}; "
-              f"{r0['q0_vs_bar']:.1%} против кодов BAR "
+              f"{r0['q0_vs_true']:.1%} против токенизатора{base}{vs_bar} "
               f"(зонд K-7c: {PROBE_Q0_TRUE:.1%} и {PROBE_Q0_BAR:.1%})")
         print("           " + "  ".join(
             f"{m}: поза8 {r['pose8_rms']:.4f} (потолок {ceil[m]['pose8_rms']:.4f}) "
@@ -614,7 +621,7 @@ def main() -> None:
 
     hist = []
     ev0 = evaluate(va, "эпоха 0, до обучения")
-    evt0 = evaluate(tr_sub, "эпоха 0, ОБУЧАЮЩАЯ")
+    evt0 = evaluate(tr_sub, "эпоха 0, ОБУЧАЮЩАЯ", with_bar=False)
     # ЭПОХА 0 — ПОЛНОПРАВНЫЙ КАНДИДАТ. Иначе обучение, которое всё портит, всё
     # равно вернуло бы обученный чекпойнт. Ту же ошибку уже чинили в k7c.
     sd0 = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()
@@ -660,7 +667,7 @@ def main() -> None:
         model.eval()
         tag = ("ТОЛЬКО FAST" if fast_first else f"учитель {p_tf:.2f}")
         ev = evaluate(va, f"эпоха {ep + 1}, {tag}")
-        evt = evaluate(tr_sub, f"эпоха {ep + 1}, ОБУЧАЮЩАЯ")
+        evt = evaluate(tr_sub, f"эпоха {ep + 1}, ОБУЧАЮЩАЯ", with_bar=False)
         print(f"    q0 train−val: "
               f"{evt['fast']['q0_vs_true'] - ev['fast']['q0_vs_true']:+.1%}; "
               f"поза8 fast train {evt['fast']['pose8_rms']:.4f} против "

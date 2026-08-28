@@ -119,9 +119,48 @@ def selftest():
         f"линейная голова не выучила линейную зависимость ({float(loss):.2e}) — "
         f"инструмент негоден, и его верхняя строка не будет опорой")
 
+    # НАСТОЯЩИЕ ГОЛОВЫ, А НЕ ОТДЕЛЬНЫЙ nn.Linear. Прежняя версия проверяла
+    # обучаемость постороннего слоя и ничего не говорила о build_head: ни форм,
+    # ни прохождения градиента через декодер кодека. Здесь вместо кодека
+    # подставляется произвольное дифференцируемое отображение 512 -> 20x7 —
+    # этого достаточно, чтобы проверить проводку latent-головы.
+    torch.manual_seed(0)
+    W = torch.randn(Z_DIM, T_CHUNK * 7) * 0.05
+
+    def stub_decode(zq):
+        return (zq.mean(dim=1) @ W).reshape(-1, T_CHUNK, 7)
+
+    B, d_in = 8, 64
+    hh = torch.randn(B, N_POS, d_in)
+    for kind in ("direct", "latent"):
+        head = build_head(kind, d_in, 32, 1, 0, stub_decode)
+        out = head(hh)
+        assert out.shape == (B, T_CHUNK, 7), (kind, out.shape)
+        out.sum().backward()
+        g = head.out.weight.grad
+        assert g is not None and torch.isfinite(g).all() and g.abs().sum() > 0, (
+            f"{kind}: градиент не дошёл до выходного слоя")
+
+    # ОБЕ ГОЛОВЫ ОБЯЗАНЫ ПЕРЕОБУЧАТЬСЯ НА КРОШЕЧНОЙ ВЫБОРКЕ. Голова, не
+    # способная запомнить восемь примеров, ничего не сможет сказать про h12.
+    for kind in ("direct", "latent"):
+        torch.manual_seed(0)
+        head = build_head(kind, d_in, 64, 1, 0, stub_decode)
+        y = torch.randn(B, T_CHUNK, 7) * 0.2
+        opt = torch.optim.Adam(head.parameters(), lr=3e-3)
+        first = None
+        for _ in range(600):
+            loss = F.mse_loss(head(hh), y)
+            first = float(loss) if first is None else first
+            opt.zero_grad(); loss.backward(); opt.step()
+        assert float(loss) < first * 0.2, (
+            f"{kind}: не переобучилась на восьми примерах "
+            f"({first:.4f} -> {float(loss):.4f}) — инструмент негоден")
+
     print("самопроверка k8c пройдена: разбиение по эпизодам со стратификацией, "
           "исполняемая часть чанка весит больше хвоста, знак схвата отдельно, "
-          "линейная голова выучивает линейную зависимость до 1e-3")
+          "обе НАСТОЯЩИЕ головы дают (B,20,7), пропускают градиент до выхода "
+          "и переобучаются на восьми примерах")
 
 
 def head_loss(a_hat, a_star, mu=1.0, eta=0.25, grip_scale=4.0):
@@ -202,6 +241,8 @@ def main() -> None:
         return
     if not args.ckpt:
         raise SystemExit("нужен --ckpt или --selftest")
+    import hashlib
+    print(f"k8c sha1 {hashlib.sha1(open(__file__, 'rb').read()).hexdigest()[:12]}")
 
     sys.path.insert(0, os.path.abspath(args.root))
     import torch
@@ -302,7 +343,11 @@ def main() -> None:
                     out.append(head(X[idxs[i0:i0 + 256]].to(dev)).cpu())
             return torch.cat(out)
 
-        best, best_state = None, None
+        # ОТБОР ПО ПОЛНОЙ ПОТЕРЕ, А НЕ ТОЛЬКО ПО ПОЗЕ. Обучение штрафует и
+        # знак схвата, а именно он в K-6h объяснял сохранность успеха. Отбор
+        # по одной позе мог бы предпочесть эпоху с лучшей позой и худшим
+        # схватом — и тогда зонд говорил бы только о позе, а не о действии.
+        best, best_state, best_ep = None, None, 0
         iva = np.where(va)[0]
         for ep in range(args.epochs):
             head.train()
@@ -314,57 +359,119 @@ def main() -> None:
                 opt.zero_grad(); loss.backward()
                 nn.utils.clip_grad_norm_(ps, 1.0)
                 opt.step(); sch.step()
-            v = m_pose8(predict(iva), iva)
+            pv = predict(iva)
+            v = float(head_loss(pv.to(dev), A_star[iva].to(dev)))
             if best is None or v < best:
-                best = v
+                best, best_ep = v, ep + 1
                 best_state = {k: t.detach().clone()
                               for k, t in head.state_dict().items()}
         head.load_state_dict(best_state)
         # ОБЕ ВЫБОРКИ: без train-метрики нельзя отличить «информации нет» от
         # «данных мало». Подвыборка train размером с тест.
         sub = rg.choice(itr, size=min(len(ite), len(itr)), replace=False)
-        return (m_pose8(predict(ite), ite), m_flip(predict(ite), ite),
-                m_pose8(predict(sub), sub))
+        pt, pv_, ps = predict(ite), predict(iva), predict(sub)
+        return dict(test_pose8=m_pose8(pt, ite), test_flip=m_flip(pt, ite),
+                    val_pose8=m_pose8(pv_, iva), train_pose8=m_pose8(ps, sub),
+                    train_flip=m_flip(ps, sub), best_epoch=best_ep,
+                    best_val_loss=best)
 
     res = {}
-    print(f"\n{'глубина':>8}{'голова':>9}{'тест поза8':>13}{'train поза8':>13}"
-          f"{'знак':>9}")
+    print(f"\n{'глубина':>8}{'голова':>9}{'тест':>10}{'вал':>10}{'train':>10}"
+          f"{'знак':>9}{'эпоха':>7}")
     for depth in [int(v) for v in args.depths.split(",")]:
         for kind in args.heads.split(","):
-            vals = [run(depth, kind, s) for s in range(args.seeds)]
-            t8 = float(np.mean([v[0] for v in vals]))
-            fl = float(np.mean([v[1] for v in vals]))
-            tr8 = float(np.mean([v[2] for v in vals]))
-            res[f"{depth}/{kind}"] = dict(test_pose8=t8, train_pose8=tr8,
-                                          flip=fl, seeds=[v[0] for v in vals])
-            print(f"{depth:>8}{kind:>9}{t8:>13.4f}{tr8:>13.4f}{fl:>9.2%}")
+            vals = [run(depth, kind, sd) for sd in range(args.seeds)]
+            agg = {k: float(np.mean([v[k] for v in vals]))
+                   for k in ("test_pose8", "val_pose8", "train_pose8",
+                             "test_flip", "train_flip", "best_epoch")}
+            # КАЖДЫЙ СИД СОХРАНЯЕТСЯ: усреднение скрывает, ведут ли они себя
+            # одинаково, а расхождение сидов — сам по себе диагноз.
+            agg["per_seed"] = vals
+            res[f"{depth}/{kind}"] = agg
+            spread = max(v["test_pose8"] for v in vals) - min(
+                v["test_pose8"] for v in vals)
+            print(f"{depth:>8}{kind:>9}{agg['test_pose8']:>10.4f}"
+                  f"{agg['val_pose8']:>10.4f}{agg['train_pose8']:>10.4f}"
+                  f"{agg['test_flip']:>9.2%}{agg['best_epoch']:>7.0f}"
+                  + (f"   разброс сидов {spread:.4f}" if spread > 0.005 else ""))
 
     print("\n  ЧИТАТЬ ТАК, правило записано до запуска.")
     goal = ref["BAR coarse-only"]["pose8"]
-    d12 = [v for k, v in res.items() if k.startswith("12/")]
-    d24 = [v for k, v in res.items() if k.startswith("24/")]
-    if d24 and min(v["test_pose8"] for v in d24) > goal * 1.5:
-        print(f"  ЗОНД НЕГОДЕН: на полной глубине он даёт "
-              f"{min(v['test_pose8'] for v in d24):.4f} против цели {goal:.4f}. "
-              f"Значит\n  плох инструмент, а не глубина, и строку 12 читать нельзя.")
-    elif d12:
-        b = min(v["test_pose8"] for v in d12)
-        gap = max(v["train_pose8"] - v["test_pose8"] for v in d12)
-        print(f"  лучший на слое 12: {b:.4f} при цели {goal:.4f}")
-        if b <= goal * 1.3:
-            print("  Дело было в ДИСКРЕТНОЙ ЦЕЛИ, а не в глубине: информация о "
-                  "действии\n  на слое 12 есть. Токенизатор под ранние выходы "
-                  "осмыслен.")
-        elif gap < -0.02:
-            print(f"  train лучше теста на {-gap:.4f}: не хватает ДАННЫХ, а не "
-                  f"глубины.\n  Вывод об отсутствии информации делать нельзя.")
+    full = max(int(v) for v in args.depths.split(","))
+    kinds = args.heads.split(",")
+
+    # КОНТРОЛЬ ОТДЕЛЬНО ДЛЯ КАЖДОЙ ГОЛОВЫ. Брать минимум по всем головам
+    # нельзя: одна удачная параметризация «легализовала» бы отрицательный
+    # результат другой, у которой могла быть своя беда с обучением. Порог
+    # 1.10, а не 1.5: на полной глубине решение с ошибкой coarse-only
+    # существует по построению (h -> настоящая голова -> q0 -> декодер),
+    # поэтому мягкий порог пропустил бы недоученную голову как исправную.
+    valid, verdict = {}, {}
+    for kind in kinds:
+        k24 = res.get(f"{full}/{kind}")
+        if k24 is None:
+            continue
+        ok = k24["test_pose8"] <= goal * 1.10
+        valid[kind] = ok
+        print(f"  контроль {kind:<7} на глубине {full}: "
+              f"{k24['test_pose8']:.4f} против цели {goal:.4f} — "
+              f"{'исправен' if ok else 'НЕ ПРОЙДЕН'}")
+
+    early = min(int(v) for v in args.depths.split(","))
+    for kind in kinds:
+        k = res.get(f"{early}/{kind}")
+        if k is None:
+            continue
+        if not valid.get(kind, False):
+            verdict[kind] = "инструмент негоден"
+            print(f"  {kind} на глубине {early}: {k['test_pose8']:.4f} — "
+                  f"ЧИТАТЬ НЕЛЬЗЯ, его контроль на {full} не пройден")
+            continue
+        gap = k["val_pose8"] - k["train_pose8"]     # >0 значит переобучение
+        if k["test_pose8"] <= goal * 1.3:
+            verdict[kind] = "информация есть"
+        elif gap > 0.02:
+            verdict[kind] = "не хватает данных"
         else:
-            print("  Информации о действии на слое 12 недостаточно, и это уже "
-                  "не\n  объясняется дискретной параметризацией. Дешёвая линия "
-                  "закрыта надёжно.")
+            verdict[kind] = "информации недостаточно"
+        print(f"  {kind} на глубине {early}: {k['test_pose8']:.4f} при цели "
+              f"{goal:.4f}, разрыв вал−train {gap:+.4f} -> {verdict[kind]}")
+
+    # РАЗВЁРНУТОЕ ЗАКЛЮЧЕНИЕ. Исходов пять, и они ведут к разным решениям —
+    # сводить их к «нужен новый токенизатор» или «не нужен» нельзя.
+    d, l = verdict.get("direct"), verdict.get("latent")
+    print()
+    if "не хватает данных" in (d, l):
+        print("  Ограничение по ДАННЫМ, а не по глубине. Вывод об отсутствии "
+              "информации делать нельзя; следующий шаг — больше наблюдений, "
+              "а не переобучение башни.")
+    elif d == "информация есть" and l == "информация есть":
+        print("  Действие извлекается из h12 и напрямую, и через латенту "
+              "кодека. Новый токенизатор НЕ обязателен: достаточно непрерывной "
+              "головы, и она становится обязательным baseline для любой "
+              "будущей архитектуры.")
+    elif d == "информация есть":
+        print("  Действие извлекается напрямую, но не через латенту кодека: "
+              "мешает геометрия существующего представления. Вот это и есть "
+              "основание для нового токенизатора под ранние выходы.")
+    elif l == "информация есть":
+        print("  Латента извлекается, а дискретный q0 — нет: дело в "
+              "квантовании. Основание для раннего НЕПРЕРЫВНОГО уровня или "
+              "другого кодбука.")
+    elif d == l == "информации недостаточно":
+        print("  Ни прямое действие, ни латента из замороженного h12 дёшево "
+              "не извлекаются. Дешёвая линия закрыта надёжно.")
+
+    print()
+    print("  ЧТО ЭТОТ ЗОНД НЕ ЗАКРЫВАЕТ в любом исходе: он говорит только о")
+    print("  post-hoc головах над ЗАМОРОЖЕННЫМ h12. Полное совместное")
+    print("  переобучение первых 12 слоёв им не опровергается — наоборот, его")
+    print("  исход подсказывает, какую раннюю цель там брать: дискретный код,")
+    print("  латенту или прямое действие.")
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
-    json.dump(dict(refs=ref, probes=res, feats=args.feats, normed=bool(use_n),
+    json.dump(dict(refs=ref, probes=res, verdict=verdict, control=valid,
+                   feats=args.feats, normed=bool(use_n),
                    epochs=args.epochs, seeds=args.seeds,
                    note="всё на одном разбиении из одного файла признаков"),
               open(args.out, "w"), ensure_ascii=False, indent=1)
