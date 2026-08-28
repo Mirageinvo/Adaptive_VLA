@@ -217,6 +217,13 @@ def main() -> None:
     if not args.ckpt:
         raise SystemExit("нужен --ckpt или --selftest")
 
+    # ОТПЕЧАТОК ФАЙЛА ПЕРВОЙ СТРОКОЙ. За сессию трижды случалось, что на
+    # кластере работала несинхронизированная версия, и это выяснялось только
+    # по косвенным признакам в выводе. Хеш сравнивается глазами за секунду.
+    import hashlib
+    _sha = hashlib.sha1(open(__file__, "rb").read()).hexdigest()[:12]
+    print(f"k8b sha1 {_sha}")
+
     root = os.path.abspath(args.root)
     sys.path.insert(0, root)
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -349,6 +356,32 @@ def main() -> None:
     gap = float((A_star.numpy() - a_codec).__abs__().mean())
     print(f"неустранимая ошибка токенизатора (|цель − датасет|): {gap:.4f}")
 
+    # ПОТОЛКИ РЕЖИМОВ. Без них числа обучения нечитаемы: непонятно, близко ли
+    # Fast к пределу или далеко. Потолок — это ИСТИННЫЕ коды нужных уровней,
+    # декодированные тем же путём. Ниже него модель с замороженным
+    # токенизатором не опустится ни при каком обучении.
+    with torch.no_grad():
+        ceil = {}
+        for name, n_lv in (("fast", 1), ("medium", 2), ("full", N_LEVEL)):
+            acc = []
+            for i0 in range(0, N, 256):
+                k = Kt[i0:i0 + 256]
+                z = sum(E[j][k[:, j, :]] for j in range(n_lv))
+                x, _ = codec._decode(z, embodiment_ids=0)
+                acc.append(x[..., :7].float().cpu())
+            a_c = torch.cat(acc)
+            d = a_c - A_star
+            ceil[name] = dict(
+                pose8_rms=float(torch.sqrt((d[:, :H_EXEC, :6] ** 2).mean())),
+                grip8_rms=float(torch.sqrt((d[:, :H_EXEC, 6] ** 2).mean())),
+                grip8_flip=float((torch.sign(a_c[:, :H_EXEC, 6])
+                                  != torch.sign(A_star[:, :H_EXEC, 6])
+                                  ).float().mean()))
+    print("потолки (истинные коды нужных уровней, ниже не опуститься):")
+    for m_, r in ceil.items():
+        print(f"    {m_:<7} поза8 {r['pose8_rms']:.4f}  схват8 "
+              f"{r['grip8_rms']:.4f}  знак {r['grip8_flip']:.2%}")
+
     tr, va, te = split_by_episode(epi, tsk_a, seed=args.seed)
     print(f"train {tr.sum()}, val {va.sum()}, test {te.sum()}; "
           f"задач {len(np.unique(tsk_a))}")
@@ -447,7 +480,7 @@ def main() -> None:
                              grip8_flip=float(np.mean(gf)),
                              q0_acc=float(np.mean(acc)), n_batches=nb)
         print(f"  [{tag}] " + "  ".join(
-            f"{m}: поза8 {r['pose8_rms']:.4f} схват8 {r['grip8_rms']:.4f} "
+            f"{m}: поза8 {r['pose8_rms']:.4f} (потолок {ceil[m]['pose8_rms']:.4f}) "
             f"знак {r['grip8_flip']:.2%}" for m, r in res.items()))
         return res
 
@@ -517,7 +550,8 @@ def main() -> None:
         print(f"лучший парето: эпоха {best['pareto'][1]}")
     else:
         print("ПАРЕТО НЕ НАЙДЕН: Full деградировал во всех эпохах более чем на 5%")
-    json.dump(dict(history=hist, before=ev0, best_fast=best["fast"],
+    json.dump(dict(history=hist, before=ev0, ceilings=ceil,
+                   best_fast=best["fast"],
                    best_pareto=best["pareto"], exits=list(exits),
                    args=vars(args), trainable=rep, tokenizer_gap=gap),
               open(os.path.join(args.out, "history.json"), "w"),
