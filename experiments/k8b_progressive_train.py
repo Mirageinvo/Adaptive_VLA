@@ -55,6 +55,10 @@ import time
 import numpy as np
 
 N_POS, N_LEVEL, T_CHUNK, H_EXEC = 16, 3, 20, 8
+# Точность грубых кодов, которую дал зонд K-7c на ЗАМОРОЖЕННЫХ
+# признаках слоя 12 (адаптер + настоящая голова). Опорная точка:
+# обучение обязано её превзойти, иначе оно не создаёт информации.
+PROBE_Q0 = 0.272
 
 
 def tf_prob(epoch, sched=(2, 4, 6, 8)):
@@ -479,7 +483,15 @@ def main() -> None:
                              grip8_rms=float(np.sqrt(np.mean(ge))),
                              grip8_flip=float(np.mean(gf)),
                              q0_acc=float(np.mean(acc)), n_batches=nb)
-        print(f"  [{tag}] " + "  ".join(
+        # ТОЧНОСТЬ q0 ПЕЧАТАЕТСЯ ОТДЕЛЬНО И ПЕРВОЙ. Это единственная величина,
+        # отвечающая на вопрос «создаётся ли информация на ранней глубине»:
+        # зонд на ЗАМОРОЖЕННЫХ признаках дал там PROBE_Q0. Рост выше означает,
+        # что LoRA делает то, чего зонд не мог; плато около PROBE_Q0 означает,
+        # что expert-only adaptation не хватает и узкое место в башне VLM.
+        q0 = res["fast"]["q0_acc"]
+        print(f"  [{tag}] q0 на слое {model.exits[0]}: {q0:.1%} "
+              f"(зонд на замороженных: {PROBE_Q0:.1%})")
+        print("           " + "  ".join(
             f"{m}: поза8 {r['pose8_rms']:.4f} (потолок {ceil[m]['pose8_rms']:.4f}) "
             f"знак {r['grip8_flip']:.2%}" for m, r in res.items()))
         return res
