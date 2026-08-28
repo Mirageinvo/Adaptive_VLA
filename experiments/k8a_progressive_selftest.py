@@ -77,19 +77,36 @@ def selftest_cpu():
     assert not isinstance(m.blk.other, LoRALinear), "обёрнут лишний слой"
     assert inject_lora(nn.Linear(2, 2), 2, ("nope",)) == []
 
-    # 2. Внедрение кода: при alpha=0 тождество, градиент доходит до проекции.
-    fb = CodeFeedback(6, 4, alpha_init=0.0)
+    # 2. Внедрение кода. Проверяем НАСТОЯЩУЮ начальную конфигурацию, ничего не
+    #    подкручивая руками: прежняя версия теста сама ставила alpha=1 и
+    #    случайные веса перед backward и потому не заметила бы, что при
+    #    штатном старте ветвь мертва.
+    fb = CodeFeedback(6, 4)                       # штатный alpha_init=1.0
     h = torch.randn(2, 16, 4)
     emb = torch.randn(2, 16, 6)
-    assert torch.equal(fb(h, emb), h), "при alpha=0 внедрение обязано быть пустым"
-    fb.alpha.data.fill_(1.0)
-    fb.proj.weight.data.normal_()
+    assert torch.equal(fb(h, emb), h), (
+        "на старте внедрение обязано быть тождеством: P(e)=0")
+    fb(h, emb).sum().backward()
+    assert fb.proj.weight.grad is not None, "нет градиента у проекции"
+    assert fb.proj.weight.grad.abs().sum() > 0, (
+        "градиент проекции нулевой при штатной инициализации — ветвь мертва "
+        "навсегда: так бывает, когда обнулены И alpha, И веса P")
+    # alpha на первом шаге градиента не имеет (P(e)=0) — это нормально, она
+    # оживает, как только P сдвинется. Проверяем именно это.
+    assert fb.alpha.grad is None or fb.alpha.grad.abs().item() == 0
+    fb.zero_grad()
+    fb.proj.weight.data.normal_(std=0.1)
     out = fb(h, emb)
-    assert not torch.equal(out, h), "при alpha!=0 состояние обязано меняться"
-    assert out.shape == h.shape
+    assert not torch.equal(out, h) and out.shape == h.shape
     out.sum().backward()
-    assert fb.proj.weight.grad is not None and fb.proj.weight.grad.abs().sum() > 0
-    assert fb.alpha.grad is not None and fb.alpha.grad.abs().item() > 0
+    assert fb.alpha.grad is not None and fb.alpha.grad.abs().item() > 0, (
+        "после сдвига P вентиль alpha обязан получать градиент")
+
+    # 2б. Двойное обнуление — тот самый отказ. Показываем, что он ловится.
+    dead = CodeFeedback(6, 4, alpha_init=0.0)
+    dead(h, emb).sum().backward()
+    assert dead.proj.weight.grad.abs().sum() == 0, (
+        "тест не воспроизводит мёртвую конфигурацию — проверка бессмысленна")
 
     # 3. Straight-through: вперёд жёсткий, назад мягкий.
     V, d = 7, 3
@@ -232,23 +249,26 @@ def main() -> None:
     print(f"батч {N} наблюдений, кадр {hw}")
 
     # --- счётчики слоёв ------------------------------------------------------
+    # ХУКИ НА input_layernorm, А НЕ НА МОДУЛЬ СЛОЯ. _shared_attention_forward
+    # не вызывает layer.forward(): он сам дёргает input_layernorm, q/k/v_proj,
+    # o_proj, post_attention_layernorm и mlp (bar.py:987-1061). Хук на слое
+    # целиком не сработал бы ни разу, и счётчик показал бы 0/0 при исправной
+    # модели. input_layernorm вызывается ровно раз на исполненный слой — это
+    # уже проверено в K-7b, где такой хук сработал ровно три раза.
     cnt = {"expert": 0, "vlm": 0}
-    hs = [model.action_expert.layers[i].register_forward_hook(
-        lambda m, i_, o: cnt.__setitem__("expert", cnt["expert"] + 1))
-        for i in range(n_layers)]
-    vlm_layers = model.vlm.model.text_model.layers if hasattr(
-        model.vlm, "model") else None
-    if vlm_layers is None:
-        for name, mod in model.vlm.named_modules():
-            if isinstance(mod, torch.nn.ModuleList) and len(mod) == n_layers \
-                    and hasattr(mod[0], "input_layernorm"):
-                vlm_layers = mod
-                break
-    if vlm_layers is None:
-        raise SystemExit("не нашёл слои башни VLM для счётчика")
-    hs += [vlm_layers[i].register_forward_hook(
-        lambda m, i_, o: cnt.__setitem__("vlm", cnt["vlm"] + 1))
-        for i in range(n_layers)]
+
+    def bump(key):
+        return lambda m, i_, o: cnt.__setitem__(key, cnt[key] + 1)
+
+    ex_layers = model.action_expert.layers
+    vlm_layers = model.vlm.text_model.layers        # путь из bar.py:987
+    assert len(ex_layers) == len(vlm_layers) == n_layers, (
+        f"{len(ex_layers)} слоёв эксперта, {len(vlm_layers)} слоёв VLM, "
+        f"ожидалось {n_layers}")
+    hs = [ex_layers[i].input_layernorm.register_forward_hook(bump("expert"))
+          for i in range(n_layers)]
+    hs += [vlm_layers[i].input_layernorm.register_forward_hook(bump("vlm"))
+           for i in range(n_layers)]
 
     def counted(fn):
         cnt["expert"] = cnt["vlm"] = 0
@@ -260,23 +280,54 @@ def main() -> None:
             **batch, position_offset=args.pos_offset, do_sample=False))
     K_bar = tk_bar.cpu().numpy().reshape(N, N_LEVEL, N_POS)
     print(f"\n  официальная BAR: слоёв эксперта {c_bar['expert']}, "
-          f"слоёв VLM {c_bar['vlm']}")
-    assert c_bar["expert"] == N_LEVEL * n_layers, c_bar
+          f"слоёв VLM {c_bar['vlm']} (ожидалось {N_LEVEL * n_layers} и "
+          f"{N_LEVEL * n_layers})")
+    if c_bar["expert"] != N_LEVEL * n_layers or c_bar["vlm"] != N_LEVEL * n_layers:
+        raise SystemExit(
+            f"счётчики на официальной BAR дали {c_bar}, а обязаны дать "
+            f"{N_LEVEL * n_layers}/{N_LEVEL * n_layers}. Хуки стоят не там, и "
+            f"дальнейшие замеры экономии слоёв ничего не значат.")
 
     # --- 5. ТОЖДЕСТВО при выходе только на полной глубине --------------------
     model.init_progressive(exits=(n_layers,), head_dtype=dt, lora_r=0)
     with torch.no_grad():
         out, c1_ = counted(lambda: model.generate_progressive(
             **batch, mode="full", books=E, position_offset=args.pos_offset))
-    q0 = out["codes"][0].cpu().numpy()
+    q0 = out["pred_codes"][0].cpu().numpy()
     same = (q0 == K_bar[:, 0, :])
-    print(f"  тождество (выход только на {n_layers}): совпадение "
+    print(f"  тождество (выход только на {n_layers}): совпадение токенов "
           f"{same.mean():.6%} ({int(same.sum())}/{same.size})")
     if not same.all():
         raise SystemExit(
             "токены сегментированного прохода НЕ совпали с первым блоком BAR.\n"
             "Значит проводка (маска, позиции, норма перед головой) расходится\n"
             "с официальной. Обучать такую модель бессмысленно.")
+
+    # Сравнение ЛОГИТОВ с официальным путём: argmax может совпасть при
+    # систематическом сдвиге, который проявится только при обучении.
+    with torch.no_grad():
+        B_ = batch["input_ids"].shape[0]
+        _, _, vemb, _ = model._build_vlm_inputs_embeds(
+            input_ids=batch.get("input_ids"), inputs_embeds=None,
+            pixel_values=batch.get("pixel_values"),
+            pixel_attention_mask=batch.get("pixel_attention_mask"),
+            image_hidden_states=None)
+        apos = model._build_action_pos_ids_strided(
+            batch_size=B_, base_pos=vemb.shape[1],
+            action_seq_len=model.block_size, device=dev,
+            position_offset=args.pos_offset)
+        pos = model._build_joint_position_ids(
+            batch_size=B_, vlm_seq_len=vemb.shape[1], action_pos_ids=apos,
+            device=dev)
+        lg_ref = model._predict_next_block_logits(
+            vlm_inputs_embeds=vemb, attention_mask=batch.get("attention_mask"),
+            history_tokens=None, position_ids=pos)
+    dlg = (out["logits"][0].float() - lg_ref.float()).abs().max().item()
+    print(f"  расхождение логитов с официальным путём: max|Δ| = {dlg:.3e}")
+    if dlg > 1e-2:
+        raise SystemExit(
+            f"логиты расходятся на {dlg:.3e} при совпавших argmax — проводка "
+            f"отличается, и при обучении это разойдётся дальше.")
     assert c1_["expert"] == n_layers and c1_["vlm"] == n_layers, c1_
     print(f"  слоёв: эксперт {c1_['expert']}, VLM {c1_['vlm']} "
           f"(против {c_bar['expert']}/{c_bar['vlm']} у BAR)")
@@ -314,24 +365,43 @@ def main() -> None:
             "ранний режим считает лишнее, и заявленная экономия ложная")
 
     # --- 8. внедрение действительно работает --------------------------------
+    # СУДИМ ПО ЛОГИТАМ, А НЕ ПО argmax. Состояние может измениться, а
+    # выбранный код остаться прежним — тогда проверка по argmax объявила бы
+    # исправную обратную связь сломанной.
     with torch.no_grad():
         base = model.generate_progressive(**batch, mode="full", books=E,
                                           position_offset=args.pos_offset)
         for fb in model.prog_feedback:
-            fb.alpha.data.fill_(1.0)
             torch.nn.init.normal_(fb.proj.weight, std=0.02)
         moved = model.generate_progressive(**batch, mode="full", books=E,
                                            position_offset=args.pos_offset)
-    same0 = (base["codes"][0] == moved["codes"][0]).float().mean().item()
-    same2 = (base["codes"][-1] == moved["codes"][-1]).float().mean().item()
-    print(f"\n  при включённом внедрении: уровень 0 совпал {same0:.1%} "
-          f"(обязан 100%), последний {same2:.1%} (обязан < 100%)")
-    if same0 < 1.0:
-        raise SystemExit("внедрение задело УЖЕ ВЫДАННЫЙ грубый уровень — "
-                         "значит оно применяется не после его головы")
-    if same2 >= 1.0:
-        raise SystemExit("внедрение ничего не изменило на поздних уровнях — "
-                         "проводка обратной связи не работает")
+    d0 = (base["logits"][0] - moved["logits"][0]).abs().max().item()
+    dl = (base["logits"][-1] - moved["logits"][-1]).abs().max().item()
+    f0 = (base["pred_codes"][0] != moved["pred_codes"][0]).float().mean().item()
+    fl = (base["pred_codes"][-1] != moved["pred_codes"][-1]).float().mean().item()
+    print(f"\n  внедрение включено: логиты уровня 0 сдвинулись на {d0:.3e} "
+          f"(обязано 0), последнего — на {dl:.3e} (обязано > 0)")
+    print(f"    для справки, доля сменившихся кодов: уровень 0 {f0:.1%}, "
+          f"последний {fl:.1%}")
+    if d0 != 0.0:
+        raise SystemExit(
+            "внедрение задело УЖЕ ВЫДАННЫЙ грубый уровень: значит оно "
+            "применяется не после его головы, и ранний выход загрязнён "
+            "информацией из поздних сегментов")
+    if dl == 0.0:
+        raise SystemExit("логиты поздних уровней не изменились — проводка "
+                         "обратной связи не работает")
+
+    # --- 9. что именно обучается --------------------------------------------
+    model.init_progressive(exits=exits, head_dtype=torch.float32, lora_r=8)
+    print(f"\n  LoRA обернула слоёв: {len(model.lora_wrapped)}")
+    rep = model.trainable_report()
+    tot = sum(rep.values())
+    for k_, v in sorted(rep.items()):
+        print(f"    {k_:<16}{v / 1e6:8.3f} млн")
+    print(f"    {'итого':<16}{tot / 1e6:8.3f} млн из "
+          f"{sum(p.numel() for p in model.parameters()) / 1e6:.0f} млн")
+
     for h in hs:
         h.remove()
     print("\n  все проверки с моделью пройдены: тождество на полной глубине "

@@ -161,6 +161,13 @@ def main() -> None:
     ap.add_argument("--ckpt")
     ap.add_argument("--root", default="third_party/actioncodec")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--normed", choices=["auto", "yes", "no"], default="auto",
+                    help="брать состояния ПОСЛЕ action_expert.norm. Голова "
+                         "кодов принимает вход после неё (bar.py:1246); "
+                         "промежуточные глубины снимаются до неё, и без "
+                         "нормировки полная глубина выигрывает просто потому, "
+                         "что уже нормирована. auto = взять нормированные, "
+                         "если они есть в файле")
     ap.add_argument("--head", choices=["tied-lm", "free"], default="tied-lm",
                     help="tied-lm: ствол отображает состояние в размерность "
                          "головы, дальше НАСТОЯЩАЯ замороженная action_lm_head. "
@@ -403,10 +410,21 @@ def main() -> None:
                 out.append(lm_real(xb).argmax(-1).cpu().numpy())
         return np.concatenate(out)
 
-    print("\n  настоящая голова БЕЗ обучения, прямо на состоянии глубины:")
+    have_n = f"hn_{keys[0]}" in z.files
+    if args.normed == "yes" and not have_n:
+        raise SystemExit("в файле нет нормированных состояний (hn_*): "
+                         "перезапустите k7b новой версией")
+    use_n = have_n if args.normed == "auto" else (args.normed == "yes")
+
+    def feat_key(k_):
+        return f"hn_{k_}" if use_n else f"h_{k_}"
+
+    print(f"\n  состояния: {'ПОСЛЕ action_expert.norm' if use_n else 'СЫРЫЕ'}"
+          f"{'' if have_n else ' (нормированных в файле нет)'}")
+    print("  настоящая голова БЕЗ обучения, прямо на состоянии глубины:")
     direct = {}
     for k_ in keys:
-        p = lm_direct(z[f"h_{k_}"].astype(np.float32), te)
+        p = lm_direct(z[feat_key(k_)].astype(np.float32), te)
         if p is None:
             continue
         direct[str(k_)] = dict(code_acc=float((p == tgt[te]).mean()),
@@ -430,7 +448,7 @@ def main() -> None:
     print(f"{'BAR direct':>10}{0.0:>12.4f}{0.0:>10.2f}{ds_bar:>13.4f}"
           f"{1.0:>12.1%}{(K_bar[te][:, 0, :] == K_true[te][:, 0, :]).mean():>13.1%}")
     for k_ in keys:
-        X = z[f"h_{k_}"].astype(np.float32)
+        X = z[feat_key(k_)].astype(np.float32)
         Xt = torch.as_tensor(X, dtype=torch.float32)
         errs, errs_ds, accs, accs_t = [], [], [], []
         for s in range(args.seeds):

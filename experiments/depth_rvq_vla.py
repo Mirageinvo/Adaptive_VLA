@@ -12,9 +12,15 @@
 
 ЧТО ЗДЕСЬ ПРОВЕРЕНО ПО КОДУ, А НЕ УГАДАНО (bar.py:1131-1247):
   * `_run_action_sequence` держит ОДИН цикл `for layer_idx in range(num_layers)`,
-    и `_shared_attention_forward` продвигает башню VLM и эксперта ВМЕСТЕ. Значит
-    остановка цикла экономит обе, а не только эксперта.
-  * слой возвращает тензор, не кортеж;
+    и `_shared_attention_forward` продвигает башню VLM и эксперта ВМЕСТЕ,
+    возвращая пару (vlm_hidden, action_hidden). Значит остановка цикла экономит
+    обе ветви, а не только эксперта;
+  * `_shared_attention_forward` НЕ вызывает `layer.forward()`: он сам дёргает
+    `layer.input_layernorm`, `layer.self_attn.q_proj`, `layer.mlp` и так далее
+    (bar.py:987-1061). Поэтому хук на модуле слоя не сработает — считать
+    исполненные слои надо по `input_layernorm`;
+  * пути к башням: `self.vlm.text_model.layers` и `self.action_expert.layers`
+    (bar.py:987-988), угадывать не требуется;
   * `num_layers` берётся из `config.vlm_config.text_config.num_hidden_layers`;
   * в конце идёт `self.action_expert.norm(...)`, и только потом
     `action_lm_head`. Поэтому на КАЖДОМ раннем выходе норму надо применять тоже,
@@ -91,13 +97,20 @@ class CodeFeedback(nn.Module):
 
         h <- h + alpha * P(LayerNorm(E_g[q_g]))
 
-    Последний слой P инициализирован нулём, alpha стартует с нуля, поэтому на
-    старте внедрение — тождественная операция. Так новая модель начинает жизнь
-    точной копией однопроходной исходной, и любое расхождение на старте есть
-    ошибка проводки, а не свойство метода.
+    ВНИМАНИЕ, alpha СТАРТУЕТ С ЕДИНИЦЫ, А НЕ С НУЛЯ. Обнулять надо ровно одну
+    вещь — веса проекции. Если обнулить и alpha, и P, ветвь умирает навсегда:
+
+        h' = h + alpha * P(e)
+        dh'/dP     = alpha * e = 0   (alpha нулевая)
+        dh'/dalpha = P(e)      = 0   (P нулевая)
+
+    Ни один из двух параметров не получит градиента ни на одном шаге. Прямой
+    проход при alpha=1 и нулевой P всё равно остаётся точным тождеством, потому
+    что P(e)=0, но производная по весам P уже ненулевая, и ветвь оживает с
+    первого шага. Сама alpha получит градиент, как только P сдвинется.
     """
 
-    def __init__(self, d_code, d_model, alpha_init=0.0, dtype=torch.float32):
+    def __init__(self, d_code, d_model, alpha_init=1.0, dtype=torch.float32):
         super().__init__()
         self.norm = nn.LayerNorm(d_code, dtype=dtype)
         self.proj = nn.Linear(d_code, d_model, dtype=dtype)
@@ -140,7 +153,7 @@ def make_depth_rvq_class(base_cls):
 
         # ---- настройка ----------------------------------------------------
         def init_progressive(self, exits=(12, 18, 24), d_code=512,
-                             alpha_init=0.0, head_dtype=torch.float32,
+                             alpha_init=1.0, head_dtype=torch.float32,
                              lora_r=0, lora_targets=("q_proj", "k_proj",
                                                      "v_proj", "o_proj",
                                                      "gate_proj", "up_proj",
@@ -159,6 +172,16 @@ def make_depth_rvq_class(base_cls):
             self.exits = exits
             self.n_levels = len(exits)
             self.use_feedback = bool(feedback)
+
+            # ЗАМОРОЗКА ВСЕГО ДО СОЗДАНИЯ НОВЫХ МОДУЛЕЙ. eval() не выключает
+            # градиенты, а inject_lora замораживает только те Linear, которые
+            # сама обернула. Без этой строки у 2.2B параметров остаётся
+            # requires_grad=True: autograd напрасно копит промежуточные
+            # значения, а случайный `model.parameters()` в оптимизаторе начал
+            # бы учить всю модель. На V100 это отказ по памяти в лучшем случае
+            # и молчаливое переобучение бэкбона в худшем.
+            for p in self.parameters():
+                p.requires_grad_(False)
 
             d_model = self.action_lm_head.in_features
             V = self.action_lm_head.out_features
@@ -199,6 +222,25 @@ def make_depth_rvq_class(base_cls):
                     ps += [m.A, m.B]
             return ps
 
+        def trainable_report(self):
+            """Что именно обучается. Печатать перед каждым запуском обучения:
+            это единственный способ заметить, что бэкбон разморожен."""
+            groups = {}
+            for name, p in self.named_parameters():
+                if not p.requires_grad:
+                    continue
+                key = ("prog_heads" if name.startswith("prog_heads") else
+                       "prog_feedback" if name.startswith("prog_feedback") else
+                       "lora" if name.endswith((".A", ".B")) else
+                       "ПОСТОРОННЕЕ:" + name)
+                groups[key] = groups.get(key, 0) + p.numel()
+            stray = [k for k in groups if k.startswith("ПОСТОРОННЕЕ")]
+            if stray:
+                raise RuntimeError(
+                    f"обучаемыми оказались параметры вне новых веток: "
+                    f"{stray[:5]} — бэкбон не заморожен")
+            return groups
+
         # ---- сегментированный проход ---------------------------------------
         def run_progressive(self, *, vlm_inputs_embeds, attention_mask,
                             position_ids, books=None, mode="full",
@@ -210,7 +252,12 @@ def make_depth_rvq_class(base_cls):
             `teacher_codes`: (n_levels, B, n) истинные коды; если заданы, в
             поток внедряются ОНИ, а не собственные предсказания.
 
-            Возвращает dict: logits (список), codes (список), layers_run.
+            ВОЗВРАЩАЕТ ПРЕДСКАЗАННЫЕ И ВНЕДРЁННЫЕ КОДЫ ОТДЕЛЬНО. При teacher
+            forcing это разные вещи, и склеивать их в одно поле опасно:
+            обучающий код посчитал бы точность по учительским кодам, собрал бы
+            действие из них же и не заметил бы, что ранние головы не учатся.
+            `pred_codes` — то, что выдала модель; `injected_codes` — то, что
+            ушло в следующий сегмент.
             """
             if mode not in ("fast", "medium", "full"):
                 raise ValueError(f"неизвестный режим {mode}")
@@ -233,7 +280,8 @@ def make_depth_rvq_class(base_cls):
                                            dtype=torch.long))
 
             n_layers = int(self.config.vlm_config.text_config.num_hidden_layers)
-            logits, codes, layers_run = [], [], 0
+            logits, pred_codes, inj_codes, embs = [], [], [], []
+            layers_run = 0
             for layer_idx in range(n_layers):
                 vlm_hidden, action_hidden = self._shared_attention_forward(
                     vlm_hidden_states=vlm_hidden,
@@ -253,21 +301,28 @@ def make_depth_rvq_class(base_cls):
                 hd = self.prog_heads[g].weight.dtype
                 lg = self.prog_heads[g](normed.to(hd))
                 logits.append(lg)
+                pred_codes.append(lg.argmax(-1))
                 if g >= stop_level:
-                    codes.append(lg.argmax(-1))
                     break
+                if books is None:
+                    raise ValueError("для продолжения нужны books")
+                # ЭМБЕДДИНГ ВСЕГДА ЧЕРЕЗ straight-through, даже при teacher
+                # forcing: жёсткий индекс подменяется учительским, но мягкая
+                # ветвь остаётся своей, иначе к ранней голове не придёт
+                # градиент от ошибки поздних уровней.
+                emb, idx, _ = straight_through(lg, books[g], tau)
                 if teacher_codes is not None:
-                    idx = teacher_codes[g].to(dev)
-                    emb = books[g].to(lg.dtype)[idx]
-                    codes.append(idx)
-                else:
-                    if books is None:
-                        raise ValueError("для feedback нужны books")
-                    emb, idx, _ = straight_through(lg, books[g], tau)
-                    codes.append(idx)
+                    t_idx = teacher_codes[g].to(dev)
+                    t_hard = books[g].to(emb.dtype)[t_idx]
+                    emb = emb + (t_hard - emb).detach()
+                    idx = t_idx
+                inj_codes.append(idx)
+                embs.append(emb)
                 if self.use_feedback:
                     action_hidden = self.prog_feedback[g](action_hidden, emb)
-            return dict(logits=logits, codes=codes, layers_run=layers_run)
+            return dict(logits=logits, pred_codes=pred_codes,
+                        injected_codes=inj_codes, embeddings=embs,
+                        layers_run=layers_run)
 
         # ---- удобная обёртка над generate ----------------------------------
         @torch.no_grad()

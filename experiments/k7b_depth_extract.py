@@ -336,6 +336,17 @@ def main() -> None:
             if k_ not in H:
                 H[k_] = np.zeros((N, N_POS, c.shape[-1]), np.float16)
             H[k_][sel] = c.astype(np.float16)
+            # НОРМИРОВАННАЯ ВЕРСИЯ ТОЖЕ. Голова кодов принимает вход ПОСЛЕ
+            # action_expert.norm (bar.py:1246). Промежуточные глубины
+            # снимаются до неё, и подавать их в голову напрямую — сравнивать
+            # величины разной природы: полная глубина оказывается в выигрыше
+            # просто потому, что уже нормирована.
+            if k_ + "_n" not in H:
+                H[k_ + "_n"] = np.zeros_like(H[k_])
+            with torch.no_grad():
+                cn = model.action_expert.norm(
+                    torch.as_tensor(c, dtype=torch.float32).to(dev))
+            H[k_ + "_n"][sel] = cn.float().cpu().numpy().astype(np.float16)
         if done % (args.batch * 50) < args.batch:
             print(f"  {done}/{N} (офсет {po})", flush=True)
     assert done == N, f"обработано {done} из {N}"
@@ -343,21 +354,25 @@ def main() -> None:
     print()
     for k_ in keys:
         a = H[k_].astype(np.float32)
-        if not np.isfinite(a).all():
+        an = H[k_ + "_n"].astype(np.float32)
+        if not (np.isfinite(a).all() and np.isfinite(an).all()):
             raise SystemExit(f"не-конечные значения на глубине {k_}")
-        print(f"  глубина {str(k_):>5}: форма {H[k_].shape}  "
-              f"sd {a.std():7.3f}  max|x| {np.abs(a).max():9.1f}")
+        print(f"  глубина {str(k_):>9}: сырое sd {a.std():7.3f} "
+              f"max|x| {np.abs(a).max():8.1f}   после нормы sd {an.std():7.3f} "
+              f"max|x| {np.abs(an).max():7.1f}")
     print(f"\n  совпадение кодов BAR с токенизатором, грубый уровень: "
           f"{(K_bar[:, 0, :] == K_true[:, 0, :]).mean():.1%}")
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     np.savez(args.out,
              **{f"h_{k_}": H[k_] for k_ in keys},
+             **{f"hn_{k_}": H[k_ + "_n"] for k_ in keys},
              K_true=K_true, K_bar=K_bar, act=a_codec.astype(np.float32),
              episode=epi, task=np.asarray(tsk), pos_offset=offs,
              meta=json.dumps(dict(
                  ckpt=args.ckpt, n_obs=N, n_episodes=int(len(np.unique(epi))),
                  depths=depths, keys=[str(k_) for k_ in keys],
+                 normed_keys=[f"hn_{k_}" for k_ in keys],
                  n_expert_layers=len(ex_layers), n_codes=n_codes,
                  d_model=int(H[keys[0]].shape[-1]),
                  source="after_N = состояние ПОСЛЕ N слоёв action_expert, то "
