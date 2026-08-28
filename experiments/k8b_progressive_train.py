@@ -55,10 +55,11 @@ import time
 import numpy as np
 
 N_POS, N_LEVEL, T_CHUNK, H_EXEC = 16, 3, 20, 8
-# Точность грубых кодов, которую дал зонд K-7c на ЗАМОРОЖЕННЫХ
-# признаках слоя 12 (адаптер + настоящая голова). Опорная точка:
-# обучение обязано её превзойти, иначе оно не создаёт информации.
-PROBE_Q0 = 0.272
+# Точность грубых кодов у зонда K-7c на ЗАМОРОЖЕННЫХ признаках слоя 12.
+# ДВЕ ВЕЛИЧИНЫ, И ПУТАТЬ ИХ НЕЛЬЗЯ: зонд целился в коды самой BAR, а обучение
+# целится в коды токенизатора, а BAR совпадает с токенизатором лишь на 87%.
+PROBE_Q0_BAR = 0.272     # против кодов самой BAR
+PROBE_Q0_TRUE = 0.260    # против кодов токенизатора — вот с чем сравнимо k8b
 
 
 def tf_prob(epoch, sched=(2, 4, 6, 8)):
@@ -202,8 +203,12 @@ def main() -> None:
                          "зрительная башня не учится выносить информацию раньше")
     ap.add_argument("--no-feedback", action="store_true",
                     help="АБЛЯЦИЯ: независимые головы без возврата кода")
-    ap.add_argument("--stage-a-steps", type=int, default=300,
-                    help="проводка: только головы и проекции, LoRA выключена")
+    ap.add_argument("--fast-first-epochs", type=int, default=3,
+                    help="эпохи, в которые обучается ТОЛЬКО нулевой уровень: "
+                         "режим fast, поздние потери не создаются вовсе. "
+                         "Иначе цели Medium/Full перекраивают раннее "
+                         "представление под удобство Full, а главный продукт "
+                         "— Fast")
     ap.add_argument("--w-code", default="1,0.5,0.5")
     ap.add_argument("--w-act", default="1,0.5,1")
     ap.add_argument("--beta", type=float, default=1.0)
@@ -260,21 +265,9 @@ def main() -> None:
     model = Cls.from_pretrained(**cfg.MODEL.vlm.kwargs).to(dev, dt).eval()
     proc = VisionLanguageActionProcessor.from_pretrained(
         args.ckpt, trust_remote_code=True, mode="discrete")
-    model.init_progressive(exits=exits, head_dtype=torch.float32,
-                           lora_r=args.lora_r,
-                           feedback=not args.no_feedback)
-    if args.lora_vlm:
-        vlm_l = model.vlm.text_model.layers
-        got = inject_lora(torch.nn.ModuleList(list(vlm_l[:exits[0]])),
-                          args.lora_r, ("q_proj", "k_proj", "v_proj", "o_proj"),
-                          dtype=torch.float32)
-        print(f"  LoRA в VLM (слои 1..{exits[0]}): {len(got)} слоёв")
-    rep = model.trainable_report()
-    print(f"обучаемое: " + ", ".join(f"{k} {v/1e6:.3f} млн"
-                                     for k, v in sorted(rep.items())))
-    print(f"итого {sum(rep.values())/1e6:.3f} млн, выходы {exits}, "
-          f"feedback {'выкл' if args.no_feedback else 'вкл'}")
-
+    # init_progressive НАМЕРЕННО ВЫЗЫВАЕТСЯ ПОЗЖЕ: он ставит LoRA в
+    # action_expert, а это меняет выход официального generate. Опорные числа
+    # BAR надо снять с НЕТРОНУТОЙ модели, иначе baseline окажется не тем.
     ac = proc.action_processor
     codec = (ac if hasattr(ac, "vq") else getattr(ac, "codec", None)).to(dev).eval()
     for p in codec.parameters():
@@ -409,6 +402,74 @@ def main() -> None:
                  action_processor_kwargs={"embodiment_ids": 0})
         return dict_apply(lambda x: x.to(dev, dt), b)
 
+    def metric(a_hat, sel):
+        d = a_hat - A_star[sel].to(a_hat.device)
+        return (float((d[:, :H_EXEC, :6] ** 2).mean()),
+                float((d[:, :H_EXEC, 6] ** 2).mean()),
+                float((torch.sign(a_hat[:, :H_EXEC, 6])
+                       != torch.sign(A_star[sel][:, :H_EXEC, 6].to(a_hat.device))
+                       ).float().mean()))
+
+    # --- ОПОРНЫЕ ЧИСЛА ОФИЦИАЛЬНОЙ BAR на валидации -------------------------
+    # Без них ограничение на Full не имеет смысла: сравнивать с необученной
+    # прогрессивной головой (0.364) — значит сравнивать ни с чем. И потолки
+    # выше построены на ИСТИННЫХ кодах, а практический конкурент — это
+    # ПРЕДСКАЗАННЫЙ моделью грубый уровень. Здесь снимается именно он.
+    print("\nопорные числа официальной BAR на валидации (модель ещё не тронута):")
+    iv = np.where(va)[0]
+    bar_ref, K_bar_va = {}, np.zeros((len(iv), N_LEVEL, N_POS), np.int64)
+    acc_p = {1: [], 3: []}
+    pos_in_va = {int(g): i for i, g in enumerate(iv)}
+    for po in sorted({int(v) for v in offs[iv]}):
+        ii = iv[offs[iv] == po]
+        for i0 in range(0, len(ii), args.batch):
+            sel = ii[i0:i0 + args.batch]
+            with torch.no_grad():
+                tk = model.generate(**build(sel), position_offset=po,
+                                    do_sample=False)
+            Kb = tk.cpu().numpy().reshape(len(sel), N_LEVEL, N_POS)
+            for j, gi in enumerate(sel):
+                K_bar_va[pos_in_va[int(gi)]] = Kb[j]
+            kb = torch.as_tensor(Kb).long().to(dev)
+            for n_lv in (1, 3):
+                with torch.no_grad():
+                    z = sum(E[j_][kb[:, j_, :]] for j_ in range(n_lv))
+                    x, _ = codec._decode(z, embodiment_ids=0)
+                acc_p[n_lv].append((metric(x[..., :7].float(), sel), len(sel)))
+    for n_lv, name in ((1, "BAR coarse-only"), (3, "BAR полная")):
+        w = sum(n for _, n in acc_p[n_lv])
+        p8 = math.sqrt(sum(m[0] * n for m, n in acc_p[n_lv]) / w)
+        g8 = math.sqrt(sum(m[1] * n for m, n in acc_p[n_lv]) / w)
+        fl = sum(m[2] * n for m, n in acc_p[n_lv]) / w
+        bar_ref[name] = dict(pose8_rms=p8, grip8_rms=g8, grip8_flip=fl)
+        print(f"    {name:<16} поза8 {p8:.4f}  схват8 {g8:.4f}  знак {fl:.2%}")
+    q0_bar_vs_true = float((K_bar_va[:, 0, :] == K_true[iv][:, 0, :]).mean())
+    print(f"    q0 самой BAR против токенизатора: {q0_bar_vs_true:.1%}")
+
+    # --- настройка прогрессивной модели -------------------------------------
+    model.init_progressive(exits=exits, head_dtype=torch.float32,
+                           lora_r=args.lora_r, feedback=not args.no_feedback)
+    if args.lora_vlm:
+        got = inject_lora(model.vlm.text_model, args.lora_r,
+                          ("q_proj", "k_proj", "v_proj", "o_proj"),
+                          dtype=torch.float32)
+        # Оставляем LoRA только на слоях ДО первого выхода: остальные всё равно
+        # не участвуют в Fast, а лишние обучаемые веса замусорили бы атрибуцию.
+        keep = [n for n in got
+                if int(n.split("layers.")[1].split(".")[0]) < exits[0]]
+        for n in [n for n in got if n not in keep]:
+            parent, parts = model.vlm.text_model, n.split(".")
+            for p_ in parts[:-1]:
+                parent = getattr(parent, p_)
+            setattr(parent, parts[-1], getattr(parent, parts[-1]).base)
+        print(f"  LoRA в VLM: обёрнуто {len(got)}, оставлено на слоях "
+              f"1..{exits[0]}: {len(keep)}")
+    rep = model.trainable_report()
+    print(f"обучаемое: " + ", ".join(f"{k} {v/1e6:.3f} млн"
+                                     for k, v in sorted(rep.items())))
+    print(f"итого {sum(rep.values())/1e6:.3f} млн, выходы {exits}, "
+          f"feedback {'выкл' if args.no_feedback else 'вкл'}")
+
     def forward(sel, mode, teacher_p):
         """Один проход. Батч собирается ИЗ ОДНОГО офсета: position_offset
         задаётся на весь вызов, и смешивать задачи с разными офсетами нельзя."""
@@ -460,7 +521,7 @@ def main() -> None:
         idxs = np.where(mask)[0]
         res = {}
         for mode, n_lv in (("fast", 1), ("medium", 2), ("full", N_LEVEL)):
-            pe, ge, gf, acc, nb = [], [], [], [], 0
+            pe, ge, gf, acc, acc_b, nb = [], [], [], [], [], 0
             for po in sorted({int(v) for v in offs[idxs]}):
                 ii = idxs[offs[idxs] == po]
                 for i0 in range(0, len(ii), args.batch):
@@ -478,26 +539,47 @@ def main() -> None:
                     acc.append(float((out["pred_codes"][0] ==
                                       torch.as_tensor(K_true[sel][:, 0, :]).to(dev)
                                       ).float().mean()))
+                    kb = torch.as_tensor(
+                        K_bar_va[[pos_in_va[int(g_)] for g_ in sel]][:, 0, :]
+                    ).to(dev)
+                    acc_b.append(float((out["pred_codes"][0] == kb).float().mean()))
                     nb += 1
             res[mode] = dict(pose8_rms=float(np.sqrt(np.mean(pe))),
                              grip8_rms=float(np.sqrt(np.mean(ge))),
                              grip8_flip=float(np.mean(gf)),
-                             q0_acc=float(np.mean(acc)), n_batches=nb)
-        # ТОЧНОСТЬ q0 ПЕЧАТАЕТСЯ ОТДЕЛЬНО И ПЕРВОЙ. Это единственная величина,
-        # отвечающая на вопрос «создаётся ли информация на ранней глубине»:
-        # зонд на ЗАМОРОЖЕННЫХ признаках дал там PROBE_Q0. Рост выше означает,
-        # что LoRA делает то, чего зонд не мог; плато около PROBE_Q0 означает,
-        # что expert-only adaptation не хватает и узкое место в башне VLM.
-        q0 = res["fast"]["q0_acc"]
-        print(f"  [{tag}] q0 на слое {model.exits[0]}: {q0:.1%} "
-              f"(зонд на замороженных: {PROBE_Q0:.1%})")
+                             q0_vs_true=float(np.mean(acc)),
+                             q0_vs_bar=float(np.mean(acc_b)), n_batches=nb)
+        # ТОЧНОСТЬ q0 ПЕЧАТАЕТСЯ ПЕРВОЙ: это величина, отвечающая на вопрос
+        # «создаётся ли информация на ранней глубине». Но одного её роста мало
+        # для вывода о LoRA: одновременно учится и сама голова уровня 0.
+        # Атрибуцию даёт только сравнение с прогоном --lora-r 0.
+        # ДВЕ ТОЧНОСТИ, ПОТОМУ ЧТО ЦЕЛИ РАЗНЫЕ. Зонд K-7c мерил совпадение с
+        # кодами САМОЙ BAR, а обучение целится в коды ТОКЕНИЗАТОРА, и BAR
+        # совпадает с ним лишь на 87%. Сравнивать одно с другим нельзя.
+        # Главная опора — эпоха 0 этого же прогона, она первой в истории.
+        r0 = res["fast"]
+        base = (f", эпоха 0 давала {hist[0]['val']['fast']['q0_vs_true']:.1%}"
+                if hist else "")
+        print(f"  [{tag}] q0 на слое {model.exits[0]}: "
+              f"{r0['q0_vs_true']:.1%} против токенизатора{base}; "
+              f"{r0['q0_vs_bar']:.1%} против кодов BAR "
+              f"(зонд K-7c: {PROBE_Q0_TRUE:.1%} и {PROBE_Q0_BAR:.1%})")
         print("           " + "  ".join(
             f"{m}: поза8 {r['pose8_rms']:.4f} (потолок {ceil[m]['pose8_rms']:.4f}) "
             f"знак {r['grip8_flip']:.2%}" for m, r in res.items()))
         return res
 
     # --- обучение ------------------------------------------------------------
-    params = model.progressive_parameters()
+    # ВСЕ обучаемые параметры, а не progressive_parameters(): та функция
+    # собирает LoRA только из action_expert, поэтому при --lora-vlm веса
+    # башни попадали бы в отчёт и получали градиент, но НЕ обновлялись.
+    params = [p for p in model.parameters() if p.requires_grad]
+    expert_only = model.progressive_parameters()
+    if len(params) != len(expert_only):
+        print(f"  оптимизатор: {len(params)} тензоров "
+              f"({len(params) - len(expert_only)} вне action_expert)")
+    n_grad = sum(1 for p in model.parameters() if p.requires_grad)
+    assert len(params) == n_grad, "оптимизатор получил не все обучаемые тензоры"
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.01)
     itr = np.where(tr)[0]
     spe = math.ceil(len(itr) / args.batch)
@@ -508,11 +590,21 @@ def main() -> None:
         * 0.5 * (1 + math.cos(math.pi * min(1.0, s / total))))
     print(f"\n{spe} шагов на эпоху, всего {total}, прогрев {warm}")
 
-    hist, best = [], {"fast": None, "pareto": None}
+    hist = []
     ev0 = evaluate(va, "эпоха 0, до обучения")
+    # ЭПОХА 0 — ПОЛНОПРАВНЫЙ КАНДИДАТ. Иначе обучение, которое всё портит, всё
+    # равно вернуло бы обученный чекпойнт. Ту же ошибку уже чинили в k7c.
+    sd0 = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+           if k.startswith(("prog_heads", "prog_feedback"))
+           or k.endswith((".A", ".B"))}
+    torch.save(sd0, os.path.join(args.out, "best_fast.pt"))
+    torch.save(sd0, os.path.join(args.out, "best_pareto.pt"))
+    best = {"fast": (ev0["fast"]["pose8_rms"], 0),
+            "pareto": (sum(ev0[m_]["pose8_rms"]
+                           for m_ in ("fast", "medium", "full")), 0)}
     step = 0
     for ep in range(args.epochs):
-        p_tf = tf_prob(ep)
+        p_tf = tf_prob(max(0, ep - args.fast_first_epochs))
         model.train()
         t0, agg = time.time(), []
         # БАТЧИ СОБИРАЮТСЯ ВНУТРИ ГРУППЫ ОФСЕТА: position_offset один на вызов.
@@ -522,21 +614,26 @@ def main() -> None:
             g = np.random.permutation(g)
             order += [g[i:i + args.batch] for i in range(0, len(g), args.batch)]
         np.random.shuffle(order)
+        fast_first = ep < args.fast_first_epochs
         for sel in order:
-            mode = "full"
-            out, used_tf = forward(sel, mode, p_tf)
+            # FAST-FIRST: в режиме "fast" исполняются только слои до первого
+            # выхода, поздних логитов не существует, и поздние потери не
+            # создаются. Значит нулевая голова учится без конкуренции — и
+            # заодно эпоха идёт вдвое быстрее.
+            mode = "fast" if fast_first else "full"
+            out, used_tf = forward(sel, mode, 0.0 if fast_first else p_tf)
             loss, lc, la, parts = losses(out, sel)
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step(); sched.step(); step += 1
             agg.append((float(loss), float(lc), float(la)))
-            if step == args.stage_a_steps:
-                print(f"  проводка пройдена: {args.stage_a_steps} шагов, "
-                      f"loss {np.mean([a[0] for a in agg[-50:]]):.4f}")
+
         m = np.mean(agg, axis=0)
         model.eval()
-        ev = evaluate(va, f"эпоха {ep + 1}, учитель {p_tf:.2f}")
+        ev = evaluate(va, f"эпоха {ep + 1}, "
+                          + ("ТОЛЬКО FAST" if fast_first
+                             else f"учитель {p_tf:.2f}"))
         hist.append(dict(epoch=ep + 1, tf=p_tf, loss=float(m[0]),
                          l_code=float(m[1]), l_act=float(m[2]), val=ev,
                          minutes=(time.time() - t0) / 60))
@@ -552,7 +649,9 @@ def main() -> None:
             torch.save(sd, os.path.join(args.out, "best_fast.pt"))
         # ПАРЕТО: сумма трёх режимов, но только если Full не хуже старта.
         s_now = sum(ev[m_]["pose8_rms"] for m_ in ("fast", "medium", "full"))
-        if ev["full"]["pose8_rms"] <= ev0["full"]["pose8_rms"] * 1.05:
+        # Ограничение на Full считается от ОФИЦИАЛЬНОЙ BAR: сравнение с
+        # необученной прогрессивной головой (0.364) не значит ничего.
+        if ev["full"]["pose8_rms"] <= bar_ref["BAR полная"]["pose8_rms"] * 1.5:
             if best["pareto"] is None or s_now < best["pareto"][0]:
                 best["pareto"] = (s_now, ep + 1)
                 torch.save(sd, os.path.join(args.out, "best_pareto.pt"))
