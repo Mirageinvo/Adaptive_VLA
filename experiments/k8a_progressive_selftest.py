@@ -53,7 +53,7 @@ def selftest_cpu():
             "Запускать на кластере.")
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from depth_rvq_vla import (CodeFeedback, LoRALinear, inject_lora,
-                               straight_through)
+                               straight_through, unwrap_lora)
 
     torch.manual_seed(0)
 
@@ -78,6 +78,21 @@ def selftest_cpu():
     assert isinstance(m.blk.q_proj, LoRALinear)
     assert not isinstance(m.blk.other, LoRALinear), "обёрнут лишний слой"
     assert inject_lora(nn.Linear(2, 2), 2, ("nope",)) == []
+
+    # 1в. ИДЕМПОТЕНТНОСТЬ: повторная обёртка невозможна, пока не снята
+    #     прежняя, потому что LoRALinear уже не nn.Linear. Значит настройка
+    #     обязана сначала разворачивать.
+    assert inject_lora(m, 2, ("q_proj",)) == [], (
+        "повторная обёртка нашла слой — значит обернула бы поверх обёртки")
+    y_before = m.blk.q_proj(torch.randn(2, 4))
+    dropped = unwrap_lora(m)
+    assert dropped == ["blk.q_proj"], dropped
+    assert isinstance(m.blk.q_proj, nn.Linear) and not isinstance(
+        m.blk.q_proj, LoRALinear), "разворот не вернул базовый слой"
+    assert inject_lora(m, 4, ("q_proj",)) == ["blk.q_proj"], (
+        "после разворота обёртка обязана ставиться заново")
+    assert m.blk.q_proj.r == 4, "новая обёртка получила чужой ранг"
+    del y_before
 
     # 2. Внедрение кода. Проверяем НАСТОЯЩУЮ начальную конфигурацию, ничего не
     #    подкручивая руками: прежняя версия теста сама ставила alpha=1 и

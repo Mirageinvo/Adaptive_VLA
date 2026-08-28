@@ -80,6 +80,26 @@ class LoRALinear(nn.Module):
         return out + (self.scale * lo).to(out.dtype)
 
 
+def unwrap_lora(module):
+    """Снять все обёртки LoRA, вернув базовые слои.
+
+    Нужна для идемпотентности `init_progressive`. Без неё повторный вызов не
+    находил ни одного nn.Linear (они уже обёрнуты) и падал с сообщением, из
+    которого причина не читается. Хуже: если бы проверка на пустой список
+    отсутствовала, второй вызов молча оставил бы LoRA от первого — с чужим
+    рангом и чужим dtype.
+    """
+    removed = []
+    for name, child in list(module.named_modules()):
+        if isinstance(child, LoRALinear):
+            parent, parts = module, name.split(".")
+            for p in parts[:-1]:
+                parent = getattr(parent, p)
+            setattr(parent, parts[-1], child.base)
+            removed.append(name)
+    return removed
+
+
 def inject_lora(module, r, targets, alpha=1.0, dtype=torch.float32):
     """Обернуть в LoRA все nn.Linear, чьё имя оканчивается на один из targets.
 
@@ -212,6 +232,11 @@ def make_depth_rvq_class(base_cls):
                 for _ in range(self.n_levels - 1)
             ]).to(self.action_lm_head.weight.device)
 
+            # ИДЕМПОТЕНТНОСТЬ: снимаем обёртки от прошлого вызова, иначе
+            # повторная настройка либо падает, либо тихо наследует чужую LoRA.
+            dropped = unwrap_lora(self.action_expert)
+            if dropped:
+                print(f"  снято обёрток LoRA от прошлой настройки: {len(dropped)}")
             self.lora_wrapped = []
             if lora_r > 0:
                 self.lora_wrapped = inject_lora(
