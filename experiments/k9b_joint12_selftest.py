@@ -276,9 +276,14 @@ def main() -> None:
         hh += [vl[i].input_layernorm.register_forward_hook(
             lambda m, i_, o: grab[tag[0] + "_v"].append(i_[0].detach().float().cpu()))
             for i in range(n_layers)]
-        hh.append(model.action_expert.norm.register_forward_hook(
-            lambda m, i_, o: (grab[tag[0] + "_ni"].append(i_[0].detach().float().cpu()),
-                              grab[tag[0] + "_no"].append(o.detach().float().cpu()))))
+        # ХУК ОБЯЗАН ВЕРНУТЬ None. Ненулевой возврат из forward-хука ПОДМЕНЯЕТ
+        # выход модуля: лямбда из двух append через запятую возвращала кортеж,
+        # и норма начинала отдавать кортеж вместо тензора.
+        def norm_hook(m, i_, o):
+            grab[tag[0] + "_ni"].append(i_[0].detach().float().cpu())
+            grab[tag[0] + "_no"].append(o.detach().float().cpu())
+
+        hh.append(model.action_expert.norm.register_forward_hook(norm_hook))
         with torch.no_grad():
             model._predict_next_block_logits(**ref_kw)
             tag[0] = "our"
