@@ -263,11 +263,22 @@ def main() -> None:
         # эксперта на обоих путях и ищем ПЕРВЫЙ слой, где они разошлись.
         # Расхождение на входе слоя 0 означает разную сборку BOS; на слое k —
         # что-то внутри предыдущего шага общего внимания.
-        grab = {"ref": [], "our": []}
+        # СНИМАЕМ ОБЕ БАШНИ И САМУ НОРМУ. Прежняя версия брала только входы
+        # слоёв эксперта: выход последнего слоя и вход нормы не покрывались
+        # ничем, а расхождение башни VLM на последнем слое проявилось бы у
+        # эксперта уже после всех хуков.
+        grab = {k: [] for k in ("ref_e", "our_e", "ref_v", "our_v",
+                                "ref_ni", "our_ni", "ref_no", "our_no")}
         tag = ["ref"]
         hh = [el[i].input_layernorm.register_forward_hook(
-            lambda m, i_, o: grab[tag[0]].append(i_[0].detach().float().cpu()))
+            lambda m, i_, o: grab[tag[0] + "_e"].append(i_[0].detach().float().cpu()))
             for i in range(n_layers)]
+        hh += [vl[i].input_layernorm.register_forward_hook(
+            lambda m, i_, o: grab[tag[0] + "_v"].append(i_[0].detach().float().cpu()))
+            for i in range(n_layers)]
+        hh.append(model.action_expert.norm.register_forward_hook(
+            lambda m, i_, o: (grab[tag[0] + "_ni"].append(i_[0].detach().float().cpu()),
+                              grab[tag[0] + "_no"].append(o.detach().float().cpu()))))
         with torch.no_grad():
             model._predict_next_block_logits(**ref_kw)
             tag[0] = "our"
@@ -277,17 +288,29 @@ def main() -> None:
                 position_ids=pos, depth=n_layers)
         for h in hh:
             h.remove()
-        print(f"\n  ЛОКАЛИЗАЦИЯ: снято {len(grab['ref'])} и {len(grab['our'])} "
-              f"состояний")
+        print(f"\n  ЛОКАЛИЗАЦИЯ")
         first = None
-        for i in range(min(len(grab["ref"]), len(grab["our"]))):
-            d = (grab["ref"][i] - grab["our"][i]).abs().max().item()
-            if i < 3 or d > 0 or i >= n_layers - 2:
-                print(f"    вход слоя {i:>2}: max|Δ| = {d:.3e}"
-                      + ("   <-- ПЕРВОЕ РАСХОЖДЕНИЕ" if d > 0 and first is None
-                         else ""))
-            if d > 0 and first is None:
-                first = i
+        for nm, kr, ko in (("эксперт", "ref_e", "our_e"),
+                           ("VLM    ", "ref_v", "our_v")):
+            bad = []
+            for i in range(min(len(grab[kr]), len(grab[ko]))):
+                d = (grab[kr][i] - grab[ko][i]).abs().max().item()
+                if d > 0:
+                    bad.append((i, d))
+                    if first is None or i < first:
+                        first = i
+            print(f"    входы слоёв, {nm}: расходятся на "
+                  + (f"слоях {[b[0] for b in bad[:5]]}, первое "
+                     f"max|Δ| = {bad[0][1]:.3e}" if bad else "НИ ОДНОМ"))
+        # Вход и выход самой нормы — то, что раньше не покрывалось.
+        for nm, kr, ko in (("вход нормы ", "ref_ni", "our_ni"),
+                           ("выход нормы", "ref_no", "our_no")):
+            if grab[kr] and grab[ko]:
+                # у официального пути норма зовётся трижды (блоки 0,1,2),
+                # у нашего — один раз; сравниваем ПЕРВЫЙ вызов, это блок 0
+                d = (grab[kr][0] - grab[ko][0]).abs().max().item()
+                print(f"    {nm}: вызовов {len(grab[kr])} и {len(grab[ko])}, "
+                      f"max|Δ| на первом = {d:.3e}")
         if first == 0:
             print("\n  Расходится УЖЕ НА ВХОДЕ ПЕРВОГО СЛОЯ: дело в сборке "
                   "action-запросов.\n  Официальный путь делает "
