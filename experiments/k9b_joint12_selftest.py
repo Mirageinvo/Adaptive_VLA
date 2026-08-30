@@ -475,7 +475,7 @@ def main() -> None:
         # которая пойдёт в обучение.
         teach = lg_ref[:mb].detach()
         loss = kd_loss(out["logits"], teach, 2.0)
-    print(f"\n  потеря дистилляции на возмущённом учителе: {float(loss):.4f}")
+    print(f"\n  потеря дистилляции на НАСТОЯЩЕМ учителе: {float(loss):.4f}")
     if float(loss) < 1e-4:
         raise SystemExit("потеря близка к нулю — возмущение не создало "
                          "расхождения, и замер памяти ничего не значит")
@@ -512,7 +512,35 @@ def main() -> None:
     print("  градиенты дошли до всех размороженных групп, "
           "у глубоких слоёв их нет")
 
-    scaler.step(opt); scaler.update()
+    # GradScaler НА ПЕРВОМ ШАГЕ ОБЫЧНО ПРОПУСКАЕТ. Он стартует с масштабом
+    # 65536, градиенты в fp16 переполняются, шаг не применяется, масштаб
+    # вдвое уменьшается. Это штатно, но проверка «веса изменились» такого не
+    # допускает. Повторяем, пока шаг действительно не применится, и печатаем,
+    # сколько попыток ушло: то же самое произойдёт и в начале обучения.
+    tries, applied = 0, False
+    while tries < 12 and not applied:
+        sc_before = scaler.get_scale()
+        scaler.step(opt); scaler.update()
+        applied = scaler.get_scale() >= sc_before
+        tries += 1
+        if not applied:
+            opt.zero_grad()
+            with torch.autocast(device_type=dev.type, dtype=dt,
+                                enabled=(dev.type == "cuda")):
+                v1, p1 = model.build_inputs(position_offset=args.pos_offset, **b1)
+                o = model.forward_joint_fast(
+                    vlm_inputs_embeds=v1, attention_mask=b1.get("attention_mask"),
+                    position_ids=p1)
+                l = kd_loss(o["logits"], lg_ref[:mb].detach(), 2.0)
+            scaler.scale(l).backward()
+            scaler.unscale_(opt)
+    if not applied:
+        raise SystemExit(
+            f"за {tries} попыток GradScaler ни разу не применил шаг: "
+            f"градиенты переполняются в fp16 даже при масштабе "
+            f"{scaler.get_scale():.0f}")
+    print(f"  шаг применён с {tries}-й попытки, масштаб "
+          f"{scaler.get_scale():.0f} (пропуски на старте штатны)")
     moved = [k for k, v in watch.items() if not torch.equal(v.detach(), before[k])]
     if set(moved) != set(watch):
         raise SystemExit(f"не изменились: {sorted(set(watch) - set(moved))}")
