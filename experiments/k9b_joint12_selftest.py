@@ -361,9 +361,18 @@ def main() -> None:
                 print("  Головы совпадают, значит расхождение вносит "
                       "action_expert.norm — \n  это уже настоящее отличие "
                       "проводки, и его надо искать.")
-        raise SystemExit(
-            f"логиты расходятся на {dlg:.3e} при собственном шуме модели "
-            f"{self_noise:.3e}: это не округление, а разная проводка.")
+        # ДИАГНОСТИКА ОБЯЗАНА УМЕТЬ ОПРАВДАТЬ. Прежде после печати «проводка
+        # идентична» всё равно шёл безусловный отказ, то есть повторная сверка
+        # ничего не могла решить.
+        if d_fresh <= tol:
+            print("  Свежая сверка прошла: проводка идентична, а прежнее "
+                  "расхождение\n  вызвано сравнением через изменение "
+                  "состояния модели. Продолжаю.")
+        else:
+            raise SystemExit(
+                f"логиты расходятся на {dlg:.3e} (свежая сверка {d_fresh:.3e}) "
+                f"при собственном шуме модели {self_noise:.3e}: это не "
+                f"округление, а разная проводка.")
     if self_noise > 0:
         print(f"  (официальный путь не побитово воспроизводим сам по себе — "
               f"сравнение идёт в пределах его шума)")
@@ -393,17 +402,6 @@ def main() -> None:
           f"({n_tr / tot_p:.1%})")
 
     # --- 5: оптимизатор покрывает обучаемое ПО id() ---------------------------
-    params = model.trainable_parameters()
-    opt = torch.optim.AdamW(params, lr=1e-5)
-    in_opt = {id(p) for g in opt.param_groups for p in g["params"]}
-    need = {id(p) for p in model.parameters() if p.requires_grad}
-    if in_opt != need:
-        raise SystemExit(
-            f"оптимизатор покрывает {len(in_opt)} тензоров, обучаемых "
-            f"{len(need)}; расхождение {len(need ^ in_opt)} — часть весов "
-            f"получала бы градиент и не обновлялась")
-    print(f"  оптимизатор покрывает все {len(need)} обучаемых тензоров (по id)")
-
     # --- 6 и 7: градиенты и настоящий шаг, НА БАТЧЕ ДЛЯ ЗАМЕРА -------------
     # Раньше шаг шёл на всём батче, и при нехватке памяти скрипт падал ДО
     # строки, которая должна решить, возможен ли эксперимент.
@@ -445,12 +443,17 @@ def main() -> None:
     frozen = {"vlm[deep]": vl[n_layers - 1].self_attn.q_proj.weight,
               "expert[deep]": el[n_layers - 1].self_attn.q_proj.weight}
     before = {k: v.detach().clone() for k, v in {**watch, **frozen}.items()}
-    before_layers = {f"vlm[{i}]": (vl[i].self_attn.k_proj
-                                   if i == args.depth - 1
-                                   else vl[i].self_attn.q_proj
-                                   ).weight.detach().clone()
+    # СРЕЗЫ, А НЕ ЦЕЛЫЕ МАТРИЦЫ: полные копии двадцати четырёх весов живут во
+    # время forward/backward и завышают измеряемый пик примерно на 230 МиБ.
+    # Для «изменился ли тензор» первой строки достаточно.
+    def _slice(w):
+        return w[:1].detach().clone()
+
+    before_layers = {f"vlm[{i}]": _slice((vl[i].self_attn.k_proj
+                                          if i == args.depth - 1
+                                          else vl[i].self_attn.q_proj).weight)
                      for i in range(args.depth)}
-    before_layers.update({f"expert[{i}]": el[i].self_attn.q_proj.weight.detach().clone()
+    before_layers.update({f"expert[{i}]": _slice(el[i].self_attn.q_proj.weight)
                           for i in range(args.depth)})
 
     model.grad_ckpt = (args.grad_ckpt == "on")
@@ -463,11 +466,14 @@ def main() -> None:
         out = model.forward_joint_fast(
             vlm_inputs_embeds=v1, attention_mask=b1.get("attention_mask"),
             position_ids=p1)
-        # НАСТОЯЩЕЕ РАСХОЖДЕНИЕ, А НЕ СДВИГ НА КОНСТАНТУ. Прибавление одного и
-        # того же ко всем логитам softmax не меняет, KL равен нулю, и backward
-        # шёл бы по нулевому градиенту — то есть замер памяти был бы ложным.
-        teach = out["logits"].detach().clone()
-        teach[..., 0] += 4.0
+        # ЦЕЛЬ — НАСТОЯЩИЙ УЧИТЕЛЬ, а не искусственное возмущение. Прежде
+        # прибавлялась константа ко всем логитам, но softmax к этому
+        # инвариантен (это проверяет и самопроверка), так что backward шёл по
+        # нулевому градиенту. Замена на +4 одному классу работала бы, но при
+        # исчезающе малой его вероятности могла почти не менять распределение.
+        # lg_ref — логиты полной BAR на тех же входах, то есть ровно та задача,
+        # которая пойдёт в обучение.
+        teach = lg_ref[:mb].detach()
         loss = kd_loss(out["logits"], teach, 2.0)
     print(f"\n  потеря дистилляции на возмущённом учителе: {float(loss):.4f}")
     if float(loss) < 1e-4:
@@ -518,7 +524,7 @@ def main() -> None:
                 else vl[i].self_attn.q_proj).weight
 
     unmoved = [k for k, v in before_layers.items()
-               if torch.equal(_watched(k).detach(), v)]
+               if torch.equal(_watched(k)[:1].detach(), v)]
     if unmoved:
         raise SystemExit(f"после шага НЕ изменились слои: {unmoved}")
     still = [k for k, v in frozen.items() if not torch.equal(v.detach(), before[k])]

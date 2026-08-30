@@ -225,23 +225,51 @@ def main() -> None:
     offs = np.array([off_by_task[t] for t in tsk])
 
     # --- MANIFEST: пишется один раз, дальше только читается -----------------
+    os.makedirs(os.path.dirname(os.path.abspath(args.manifest)) or ".",
+                exist_ok=True)
     if os.path.exists(args.manifest):
         mf = json.load(open(args.manifest))
-        key = {f"{e}": s for e, s in zip(mf["episodes"], mf["splits"])}
+        # ПРОВЕРЯЕТСЯ ВСЁ, ЧТО МОЖЕТ РАЗОЙТИСЬ МОЛЧА. Manifest фиксирован, и
+        # несоответствие сида или ревизии датасета означает, что выборка не та,
+        # на которой он строился, — а обнаружилось бы это только по странным
+        # результатам через несколько часов.
+        if int(mf.get("split_seed", -1)) != args.split_seed:
+            raise SystemExit(
+                f"manifest создан с сидом {mf.get('split_seed')}, а запрошен "
+                f"{args.split_seed}. Либо уберите --split-seed, либо возьмите "
+                f"новый файл: перезаписывать зафиксированное разбиение нельзя.")
+        if mf.get("dataset_revision", rev) != rev:
+            raise SystemExit(f"manifest строился на ревизии "
+                             f"{mf.get('dataset_revision')}, сейчас {rev}")
+        eps, sps = mf["episodes"], mf["splits"]
+        if len(eps) != len(set(eps)):
+            raise SystemExit("в manifest есть повторяющиеся эпизоды")
+        bad = sorted(set(sps) - {"train", "val", "test"})
+        if bad:
+            raise SystemExit(f"недопустимые метки частей: {bad}")
+        key = {str(int(e)): s for e, s in zip(eps, sps)}
         unknown = sorted({int(e) for e in epi if str(int(e)) not in key})
         if unknown:
             raise SystemExit(
                 f"в manifest нет {len(unknown)} эпизодов (например {unknown[:3]}). "
                 f"Manifest фиксирован и не дополняется: возьмите ту же выборку "
                 f"или создайте НОВЫЙ файл под другим именем.")
+        extra = sorted(set(key) - {str(int(e)) for e in epi})
+        if extra:
+            print(f"    ВНИМАНИЕ: в manifest {len(extra)} эпизодов, которых нет "
+                  f"в текущей выборке — сравнения с прошлыми прогонами будут "
+                  f"на разных данных")
         split = np.array([key[str(int(e))] for e in epi])
-        print(f"manifest прочитан: {args.manifest}")
+        print(f"manifest прочитан: {args.manifest} (сид {mf['split_seed']}, "
+              f"{len(eps)} эпизодов)")
     else:
         split = make_split(epi, tsk_a, seed=args.split_seed)
         json.dump(dict(episodes=[int(e) for e in np.unique(epi)],
                        splits=[str(split[np.where(epi == e)[0][0]])
                                for e in np.unique(epi)],
                        split_seed=args.split_seed, created_by=sha,
+                       dataset_revision=rev, dataset_repo=rid,
+                       n_obs=int(args.n_obs), n_ep=int(args.n_ep),
                        note="прежний тест использовался при отборе в K-8c и "
                             "стал development-выборкой; это разбиение новое и "
                             "перезаписи не подлежит"),

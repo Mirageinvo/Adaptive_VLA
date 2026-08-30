@@ -182,7 +182,16 @@ def make_joint12_class(base_cls):
             B = vlm_inputs_embeds.shape[0]
             dev, dt = vlm_inputs_embeds.device, vlm_inputs_embeds.dtype
             n = self.block_size
-            action_hidden = self.bos_embedding.expand(B, n, -1).to(dev, dt)
+            # ТОЧНО КАК В ОФИЦИАЛЬНОМ ПУТИ (bar.py:1188-1199): там идёт
+            # torch.cat([bos, пустой тензор], dim=1), и результат СПЛОШНОЙ,
+            # тогда как expand(...) оставляет вид с нулевыми шагами. Значения
+            # те же, раскладка в памяти разная. Разбор показал, что прежнее
+            # расхождение логитов вызывалось не этим, а порядком вызовов, — но
+            # повторить сборку дословно дешевле, чем в каждом будущем споре
+            # объяснять различия выбором ядра cuBLAS.
+            bos = self.bos_embedding.expand(B, n, -1).to(dev, dt)
+            empty = torch.empty((B, 0, bos.shape[-1]), device=dev, dtype=dt)
+            action_hidden = torch.cat([bos, empty], dim=1)
             vlm_hidden = vlm_inputs_embeds
             mask4d = self._build_joint_attention_mask_blockwise_ar(
                 attention_mask=attention_mask,
