@@ -219,6 +219,20 @@ def main() -> None:
         raise SystemExit(f"счётчики на официальной BAR дали {c_bar} — хуки "
                          f"стоят не там, замеры экономии ничего не значат")
 
+    # ПОРЯДОК ВАЖЕН: эталон считается ПОСЛЕ создания fast_head.
+    # Раньше он считался до, и сравнение шло через изменение состояния модели:
+    # создание нового модуля прямо на GPU сдвигает аллокатор, меняется
+    # выравнивание буферов и выбор ядра cuBLAS в финальном матмуле. Оба пути,
+    # посчитанные в ОДНОМ состоянии, совпадают побитово — это показала
+    # послойная локализация, где расхождение было нулевым везде, включая
+    # выход нормы и головы на одном входе.
+    # --- 1 и 3: тождество на полной глубине, голова = копия -------------------
+    model.init_joint_fast(depth=args.depth, head_dtype=dt)
+    dw = float((model.fast_head.weight - model.action_lm_head.weight).abs().max())
+    print(f"  голова стартует копией action_lm_head: max|Δ| = {dw:.3e}")
+    if dw != 0.0:
+        raise SystemExit("fast_head не является точной копией")
+
     # ЭТАЛОННЫЕ ЛОГИТЫ И СОБСТВЕННЫЙ ШУМ МОДЕЛИ. Порог для тождества нельзя
     # брать с потолка: официальный путь вызывается ДВАЖДЫ на одном и том же
     # входе, и его расхождение с самим собой задаёт нижнюю границу, ниже
@@ -235,13 +249,6 @@ def main() -> None:
     scale = lg_ref.float().abs().max().item()
     print(f"  собственный шум официального пути (два вызова на одном входе): "
           f"max|Δ| = {self_noise:.3e} при масштабе логитов {scale:.1f}")
-
-    # --- 1 и 3: тождество на полной глубине, голова = копия -------------------
-    model.init_joint_fast(depth=args.depth, head_dtype=dt)
-    dw = float((model.fast_head.weight - model.action_lm_head.weight).abs().max())
-    print(f"  голова стартует копией action_lm_head: max|Δ| = {dw:.3e}")
-    if dw != 0.0:
-        raise SystemExit("fast_head не является точной копией")
 
     with torch.no_grad():
         o24, c24 = counted(lambda: model.forward_joint_fast(
@@ -285,14 +292,20 @@ def main() -> None:
 
         hh.append(model.action_expert.norm.register_forward_hook(norm_hook))
         with torch.no_grad():
-            model._predict_next_block_logits(**ref_kw)
+            fresh_ref = model._predict_next_block_logits(**ref_kw)
             tag[0] = "our"
-            model.forward_joint_fast(
+            fresh_our = model.forward_joint_fast(
                 vlm_inputs_embeds=vemb,
                 attention_mask=batch.get("attention_mask"),
-                position_ids=pos, depth=n_layers)
+                position_ids=pos, depth=n_layers)["logits"]
         for h in hh:
             h.remove()
+        d_fresh = (fresh_ref.float() - fresh_our.float()).abs().max().item()
+        print(f"\n  оба пути, посчитанные ЗАНОВО в одном состоянии: "
+              f"max|Δ| = {d_fresh:.3e}")
+        if d_fresh == 0.0:
+            print("  Значит проводка идентична, а прежнее расхождение было "
+                  "следствием\n  сравнения через изменение состояния модели.")
         print(f"\n  ЛОКАЛИЗАЦИЯ")
         first = None
         for nm, kr, ko in (("эксперт", "ref_e", "our_e"),
