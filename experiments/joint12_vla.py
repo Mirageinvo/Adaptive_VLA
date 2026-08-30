@@ -66,8 +66,24 @@ def make_joint12_class(base_cls):
 
             # БЕЛЫЙ СПИСОК. Всё, что вне него, обязано остаться замороженным, и
             # trainable_report это проверяет отказом, а не предупреждением.
+            #
+            # НА ПОСЛЕДНЕМ ИСПОЛНЯЕМОМ СЛОЕ БАШНЯ VLM ЖИВА ЛИШЬ ЧАСТИЧНО.
+            # `_shared_attention_forward` возвращает пару, но выход башни после
+            # слоя depth-1 никуда не идёт: дальше берётся только поток
+            # действий. Запросы VLM дают `attn_output[:, :vlm_seq_len]`, то
+            # есть исключительно вывод башни, а действия смотрят на КЛЮЧИ и
+            # ЗНАЧЕНИЯ. Поэтому на последнем слое влияют только
+            # input_layernorm, k_proj и v_proj, а q_proj, o_proj,
+            # post_attention_layernorm и mlp не имеют пути к потере вообще.
+            # Измерено: норма градиента у vlm[depth-1].q_proj ровно нулевая при
+            # ненулевых у всех прочих. Держать их обучаемыми — это около 60 млн
+            # параметров впустую вместе с состояниями Adam.
+            last = depth - 1
             self.trainable_prefixes = tuple(
-                [f"vlm.text_model.layers.{i}." for i in range(depth)]
+                [f"vlm.text_model.layers.{i}." for i in range(last)]
+                + [f"vlm.text_model.layers.{last}.input_layernorm.",
+                   f"vlm.text_model.layers.{last}.self_attn.k_proj.",
+                   f"vlm.text_model.layers.{last}.self_attn.v_proj."]
                 + [f"action_expert.layers.{i}." for i in range(depth)]
                 + ["action_expert.norm.", "bos_embedding", "fast_head."])
             for name, p in self.named_parameters():
@@ -86,8 +102,10 @@ def make_joint12_class(base_cls):
                            for pf in self.trainable_prefixes):
                     stray.append(name)
                     continue
-                if name.startswith("vlm."):
-                    k = "vlm.layers[0:%d]" % self.fast_depth
+                if name.startswith(f"vlm.text_model.layers.{self.fast_depth - 1}."):
+                    k = "vlm.layers[%d] (только k/v)" % (self.fast_depth - 1)
+                elif name.startswith("vlm."):
+                    k = "vlm.layers[0:%d]" % (self.fast_depth - 1)
                 elif name.startswith("action_expert.layers"):
                     k = "expert.layers[0:%d]" % self.fast_depth
                 elif name.startswith("action_expert.norm"):

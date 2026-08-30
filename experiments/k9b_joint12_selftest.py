@@ -445,7 +445,10 @@ def main() -> None:
     frozen = {"vlm[deep]": vl[n_layers - 1].self_attn.q_proj.weight,
               "expert[deep]": el[n_layers - 1].self_attn.q_proj.weight}
     before = {k: v.detach().clone() for k, v in {**watch, **frozen}.items()}
-    before_layers = {f"vlm[{i}]": vl[i].self_attn.q_proj.weight.detach().clone()
+    before_layers = {f"vlm[{i}]": (vl[i].self_attn.k_proj
+                                   if i == args.depth - 1
+                                   else vl[i].self_attn.q_proj
+                                   ).weight.detach().clone()
                      for i in range(args.depth)}
     before_layers.update({f"expert[{i}]": el[i].self_attn.q_proj.weight.detach().clone()
                           for i in range(args.depth)})
@@ -476,11 +479,17 @@ def main() -> None:
 
     # ПОКАЗАТЬ НОРМУ ГРАДИЕНТА ПО КАЖДОМУ СЛОЮ, а не по двум крайним: иначе не
     # видно, доходит ли сигнал до середины стопки.
+    # НА ПОСЛЕДНЕМ СЛОЕ У БАШНИ VLM СМОТРИМ k_proj, А НЕ q_proj: её запросы
+    # там мертвы по построению (выход башни после последнего слоя не
+    # используется), и требовать от них градиента — ошибка проверки, а не
+    # модели. У эксперта живо всё, там q_proj везде.
     gn = {}
     for i in range(args.depth):
-        for tag, lay in (("vlm", vl), ("expert", el)):
-            g = lay[i].self_attn.q_proj.weight.grad
-            gn[f"{tag}[{i}]"] = 0.0 if g is None else float(g.norm())
+        g = el[i].self_attn.q_proj.weight.grad
+        gn[f"expert[{i}]"] = 0.0 if g is None else float(g.norm())
+        w = (vl[i].self_attn.k_proj if i == args.depth - 1
+             else vl[i].self_attn.q_proj).weight
+        gn[f"vlm[{i}]"] = 0.0 if w.grad is None else float(w.grad.norm())
     dead = [k for k, v in gn.items() if v == 0.0]
     print("  нормы градиента по слоям:")
     for tag in ("vlm", "expert"):
@@ -501,9 +510,15 @@ def main() -> None:
     moved = [k for k, v in watch.items() if not torch.equal(v.detach(), before[k])]
     if set(moved) != set(watch):
         raise SystemExit(f"не изменились: {sorted(set(watch) - set(moved))}")
+    def _watched(k):
+        i = int(k.split("[")[1][:-1])
+        if k.startswith("expert"):
+            return el[i].self_attn.q_proj.weight
+        return (vl[i].self_attn.k_proj if i == args.depth - 1
+                else vl[i].self_attn.q_proj).weight
+
     unmoved = [k for k, v in before_layers.items()
-               if torch.equal((vl if k.startswith("vlm") else el)
-                              [int(k.split("[")[1][:-1])].self_attn.q_proj.weight.detach(), v)]
+               if torch.equal(_watched(k).detach(), v)]
     if unmoved:
         raise SystemExit(f"после шага НЕ изменились слои: {unmoved}")
     still = [k for k, v in frozen.items() if not torch.equal(v.detach(), before[k])]
