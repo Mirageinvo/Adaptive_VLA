@@ -219,12 +219,22 @@ def main() -> None:
         raise SystemExit(f"счётчики на официальной BAR дали {c_bar} — хуки "
                          f"стоят не там, замеры экономии ничего не значат")
 
-    # эталонные логиты первого блока
+    # ЭТАЛОННЫЕ ЛОГИТЫ И СОБСТВЕННЫЙ ШУМ МОДЕЛИ. Порог для тождества нельзя
+    # брать с потолка: официальный путь вызывается ДВАЖДЫ на одном и том же
+    # входе, и его расхождение с самим собой задаёт нижнюю границу, ниже
+    # которой сравнивать бессмысленно. Тот же приём, что в K-5c, где D(0)=0
+    # было тавтологией индексации.
     with torch.no_grad():
         vemb, pos = model.build_inputs(position_offset=args.pos_offset, **batch)
-        lg_ref = model._predict_next_block_logits(
-            vlm_inputs_embeds=vemb, attention_mask=batch.get("attention_mask"),
-            history_tokens=None, position_ids=pos)
+        ref_kw = dict(vlm_inputs_embeds=vemb,
+                      attention_mask=batch.get("attention_mask"),
+                      history_tokens=None, position_ids=pos)
+        lg_ref = model._predict_next_block_logits(**ref_kw)
+        lg_ref2 = model._predict_next_block_logits(**ref_kw)
+    self_noise = (lg_ref.float() - lg_ref2.float()).abs().max().item()
+    scale = lg_ref.float().abs().max().item()
+    print(f"  собственный шум официального пути (два вызова на одном входе): "
+          f"max|Δ| = {self_noise:.3e} при масштабе логитов {scale:.1f}")
 
     # --- 1 и 3: тождество на полной глубине, голова = копия -------------------
     model.init_joint_fast(depth=args.depth, head_dtype=dt)
@@ -239,12 +249,22 @@ def main() -> None:
             position_ids=pos, depth=n_layers))
     same = (o24["pred_codes"].cpu().numpy() == K_bar[:, 0, :])
     dlg = (o24["logits"].float() - lg_ref.float()).abs().max().item()
+    # ПОРОГ ОТ СОБСТВЕННОГО ШУМА, а не абсолютный. Если официальный путь сам с
+    # собой расходится на N, то требовать от нашего меньше N бессмысленно.
+    tol = max(4.0 * self_noise, 1e-6 * max(scale, 1.0))
     print(f"  тождество при depth={n_layers}: токены {same.mean():.6%}, "
-          f"логиты max|Δ| = {dlg:.3e}")
-    if not same.all() or dlg > 1e-2:
+          f"логиты max|Δ| = {dlg:.3e} при допуске {tol:.3e}")
+    if not same.all():
         raise SystemExit(
-            "проход на полной глубине не воспроизводит первый блок BAR. "
-            "Проводка (маска, позиции, норма) расходится с официальной.")
+            "ТОКЕНЫ не совпали с первым блоком BAR — проводка (маска, позиции, "
+            "норма) расходится с официальной.")
+    if dlg > tol:
+        raise SystemExit(
+            f"логиты расходятся на {dlg:.3e} при собственном шуме модели "
+            f"{self_noise:.3e}: это не округление, а разная проводка.")
+    if self_noise > 0:
+        print(f"  (официальный путь не побитово воспроизводим сам по себе — "
+              f"сравнение идёт в пределах его шума)")
     if c24 != {"vlm": n_layers, "expert": n_layers}:
         raise SystemExit(f"depth={n_layers} исполнил {c24}")
 
