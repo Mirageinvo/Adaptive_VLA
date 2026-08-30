@@ -458,30 +458,50 @@ def main() -> None:
 
     model.grad_ckpt = (args.grad_ckpt == "on")
     model.train()
-    scaler = torch.cuda.amp.GradScaler(enabled=(dev.type == "cuda"))
-    torch.cuda.reset_peak_memory_stats(dev) if dev.type == "cuda" else None
-    with torch.autocast(device_type=dev.type, dtype=dt,
-                        enabled=(dev.type == "cuda")):
-        v1, p1 = model.build_inputs(position_offset=args.pos_offset, **b1)
-        out = model.forward_joint_fast(
-            vlm_inputs_embeds=v1, attention_mask=b1.get("attention_mask"),
-            position_ids=p1)
-        # ЦЕЛЬ — НАСТОЯЩИЙ УЧИТЕЛЬ, а не искусственное возмущение. Прежде
-        # прибавлялась константа ко всем логитам, но softmax к этому
-        # инвариантен (это проверяет и самопроверка), так что backward шёл по
-        # нулевому градиенту. Замена на +4 одному классу работала бы, но при
-        # исчезающе малой его вероятности могла почти не менять распределение.
-        # lg_ref — логиты полной BAR на тех же входах, то есть ровно та задача,
-        # которая пойдёт в обучение.
-        teach = lg_ref[:mb].detach()
-        loss = kd_loss(out["logits"], teach, 2.0)
-    print(f"\n  потеря дистилляции на НАСТОЯЩЕМ учителе: {float(loss):.4f}")
-    if float(loss) < 1e-4:
-        raise SystemExit("потеря близка к нулю — возмущение не создало "
-                         "расхождения, и замер памяти ничего не значит")
-    opt.zero_grad()
-    scaler.scale(loss).backward()
-    scaler.unscale_(opt)
+    # МАСШТАБ СТАРТУЕТ НИЖЕ ШТАТНОГО. При потере около 9 и стандартных 65536
+    # обратный проход переполняет fp16, и градиенты приходят как NaN у головы
+    # и самых ранних слоёв. Это не сбой, а то, ради чего существует
+    # GradScaler: он обязан пропустить шаг и уронить масштаб. Но разглядывать
+    # градиенты имеет смысл только на той попытке, где они КОНЕЧНЫ, — иначе
+    # проверка падает на штатном поведении.
+    scaler = torch.amp.GradScaler("cuda", init_scale=2. ** 12,
+                                  enabled=(dev.type == "cuda"))
+    if dev.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(dev)
+
+    def fwd_bwd():
+        opt.zero_grad(set_to_none=True)
+        with torch.autocast(device_type=dev.type, dtype=dt,
+                            enabled=(dev.type == "cuda")):
+            v1, p1 = model.build_inputs(position_offset=args.pos_offset, **b1)
+            o = model.forward_joint_fast(
+                vlm_inputs_embeds=v1, attention_mask=b1.get("attention_mask"),
+                position_ids=p1)
+            l = kd_loss(o["logits"], lg_ref[:mb].detach(), 2.0)
+        scaler.scale(l).backward()
+        scaler.unscale_(opt)
+        finite = all(p.grad is None or torch.isfinite(p.grad).all()
+                     for p in params)
+        return float(l), finite
+
+    loss_v, finite = fwd_bwd()
+    print(f"\n  потеря дистилляции на НАСТОЯЩЕМ учителе: {loss_v:.4f}")
+    if loss_v < 1e-4:
+        raise SystemExit("потеря близка к нулю — замер памяти ничего не значит")
+    tries = 1
+    while not finite and tries < 12:
+        # Масштаб роняем тем же механизмом, что и в обучении.
+        scaler.update(scaler.get_scale() / 2.0)
+        loss_v, finite = fwd_bwd()
+        tries += 1
+    if not finite:
+        raise SystemExit(
+            f"градиенты не стали конечными за {tries} попыток при масштабе "
+            f"{scaler.get_scale():.0f} — fp16 не тянет эту конфигурацию, "
+            f"нужен bf16 или меньший lr")
+    print(f"  конечные градиенты получены с {tries}-й попытки, масштаб "
+          f"{scaler.get_scale():.0f} (пропуски на старте штатны и в обучении "
+          f"будут теми же)")
 
     # ПОКАЗАТЬ НОРМУ ГРАДИЕНТА ПО КАЖДОМУ СЛОЮ, а не по двум крайним: иначе не
     # видно, доходит ли сигнал до середины стопки.
@@ -512,35 +532,11 @@ def main() -> None:
     print("  градиенты дошли до всех размороженных групп, "
           "у глубоких слоёв их нет")
 
-    # GradScaler НА ПЕРВОМ ШАГЕ ОБЫЧНО ПРОПУСКАЕТ. Он стартует с масштабом
-    # 65536, градиенты в fp16 переполняются, шаг не применяется, масштаб
-    # вдвое уменьшается. Это штатно, но проверка «веса изменились» такого не
-    # допускает. Повторяем, пока шаг действительно не применится, и печатаем,
-    # сколько попыток ушло: то же самое произойдёт и в начале обучения.
-    tries, applied = 0, False
-    while tries < 12 and not applied:
-        sc_before = scaler.get_scale()
-        scaler.step(opt); scaler.update()
-        applied = scaler.get_scale() >= sc_before
-        tries += 1
-        if not applied:
-            opt.zero_grad()
-            with torch.autocast(device_type=dev.type, dtype=dt,
-                                enabled=(dev.type == "cuda")):
-                v1, p1 = model.build_inputs(position_offset=args.pos_offset, **b1)
-                o = model.forward_joint_fast(
-                    vlm_inputs_embeds=v1, attention_mask=b1.get("attention_mask"),
-                    position_ids=p1)
-                l = kd_loss(o["logits"], lg_ref[:mb].detach(), 2.0)
-            scaler.scale(l).backward()
-            scaler.unscale_(opt)
-    if not applied:
-        raise SystemExit(
-            f"за {tries} попыток GradScaler ни разу не применил шаг: "
-            f"градиенты переполняются в fp16 даже при масштабе "
-            f"{scaler.get_scale():.0f}")
-    print(f"  шаг применён с {tries}-й попытки, масштаб "
-          f"{scaler.get_scale():.0f} (пропуски на старте штатны)")
+    gnorm = torch.nn.utils.clip_grad_norm_(params, 1.0)
+    print(f"  норма градиента до обрезки: {float(gnorm):.3f} (обрезка на 1.0, "
+          f"как в обучении)")
+    scaler.step(opt); scaler.update()
+
     moved = [k for k, v in watch.items() if not torch.equal(v.detach(), before[k])]
     if set(moved) != set(watch):
         raise SystemExit(f"не изменились: {sorted(set(watch) - set(moved))}")
