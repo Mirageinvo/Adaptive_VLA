@@ -157,28 +157,50 @@ def main() -> None:
                                      revision=rev)):
         r = json.loads(line)
         tasks_map[r["task_index"]] = r["task"]
+    # РОВНО n_ep ЭПИЗОДОВ И РОВНО n_obs НАБЛЮДЕНИЙ. Прежняя версия считала
+    # per_ep = n_obs // n_ep и шла по всем 1693 эпизодам, пока не наберёт
+    # n_obs: при 20000/1600 это давало около 1667 эпизодов и 20004 строки, то
+    # есть заявленное в команде расходилось с фактическим. Здесь эпизоды
+    # отбираются заранее, а остаток наблюдений распределяется по первым из них.
     rng = np.random.default_rng(args.seed)
-    per_ep = max(1, args.n_obs // max(args.n_ep, 1))
-    im1, im2, st, act, tsk, epi, stp = [], [], [], [], [], [], []
+    png = lambda c: np.asarray(Image.open(io.BytesIO(c["bytes"])).convert("RGB"))
+    base, extra = divmod(args.n_obs, args.n_ep)
+    if base < 1:
+        raise SystemExit(f"{args.n_obs} наблюдений на {args.n_ep} эпизодов — "
+                         f"меньше одного на эпизод")
+    chosen, tables = [], {}
     for e in rng.permutation(1693):
-        if len(tsk) >= args.n_obs:
+        if len(chosen) >= args.n_ep:
             break
         f = hf_hub_download(rid, f"data/chunk-{e // 1000:03d}/episode_{e:06d}.parquet",
                             repo_type="dataset", revision=rev)
         t = pq.read_table(f)
-        if t.num_rows < T_CHUNK + 1:
+        # Эпизод годится, только если из него можно взять нужную квоту без
+        # повторов: иначе итог опять «сколько получится».
+        if t.num_rows - T_CHUNK + 1 < base + 1:
             continue
+        chosen.append(int(e)); tables[int(e)] = f
+    if len(chosen) < args.n_ep:
+        raise SystemExit(f"годных эпизодов только {len(chosen)}, нужно {args.n_ep}")
+    quota = {e: base + (1 if i < extra else 0) for i, e in enumerate(chosen)}
+    assert sum(quota.values()) == args.n_obs, sum(quota.values())
+    print(f"отобрано {len(chosen)} эпизодов, квоты {base}–{base + 1}, "
+          f"суммарно {sum(quota.values())}")
+
+    im1, im2, st, act, tsk, epi, stp = [], [], [], [], [], [], []
+    for e in chosen:
+        t = pq.read_table(tables[e])
         A_ = np.asarray(t.column("actions").to_pylist(), np.float32)
         S_ = np.asarray(t.column("state").to_pylist(), np.float32)
         ti = t.column("task_index").to_pylist()
         c1, c2 = t.column("image").to_pylist(), t.column("wrist_image").to_pylist()
-        png = lambda c: np.asarray(Image.open(io.BytesIO(c["bytes"])).convert("RGB"))
         n_st = t.num_rows - T_CHUNK + 1
-        for s0 in rng.choice(n_st, size=min(per_ep, n_st), replace=False):
+        for s0 in rng.choice(n_st, size=quota[e], replace=False):
             im1.append(png(c1[int(s0)])); im2.append(png(c2[int(s0)]))
             st.append(S_[int(s0)]); act.append(A_[int(s0):int(s0) + T_CHUNK])
             tsk.append(tasks_map[ti[int(s0)]]); epi.append(int(e)); stp.append(int(s0))
     N = len(tsk)
+    assert N == args.n_obs and len(set(epi)) == args.n_ep, (N, len(set(epi)))
     epi, tsk_a, stp = np.asarray(epi), np.asarray(tsk), np.asarray(stp)
     hw = im1[0].shape[0]
     tf = Compose([CenterCrop(int(hw * 0.875)), Resize(224)])   # ДОЛЯ, не число
@@ -302,17 +324,29 @@ def main() -> None:
                 raise SystemExit(
                     "дешёвый путь (_predict_next_block_logits) разошёлся с "
                     "официальным generate по грубым кодам — кэш недействителен")
-            # 3. декодирование совпадает со сборкой coarse-only из K-7a/K-6h.
-            kk = torch.as_tensor(Kt[sel]).long().to(dev)
+            # 3. СБОРКА ЛАТЕНТЫ ПРОВЕРЯЕТСЯ НА ТРЁХ УРОВНЯХ, А НЕ НА ОДНОМ.
+            # Прежняя версия сравнивала свою сборку E0[q0] с официальным
+            # decode кодов [q0, 0, 0] — но индекс 0 во второй и третьей книгах
+            # это обычное кодовое слово, а не «уровень отсутствует», и decode
+            # складывал E0[q0]+E1[0]+E2[0]. Совпадать это не обязано, а
+            # результат только печатался и ничего не останавливал.
+            # Осмысленно проверять то, для чего официальный эталон есть:
+            # сборку ВСЕХ трёх уровней. Отсюда coarse-only следует по
+            # построению, тем же путём, что в K-6h и K-7a.
+            k3 = torch.as_tensor(K_true[sel]).long().to(dev)
             with torch.no_grad():
-                x, _ = codec._decode(E[0][kk], embodiment_ids=0)
+                z3 = sum(E[j][k3[:, j, :]] for j in range(N_LEVEL))
+                x3, _ = codec._decode(z3, embodiment_ids=0)
             ref = np.asarray(proc.action_processor.decode(
-                np.concatenate([Kt[sel][:, None, :],
-                                np.zeros((b, 2, N_POS), np.int64)],
-                               axis=1).reshape(b, -1).tolist())[0], np.float64)
+                K_true[sel].reshape(b, -1).tolist())[0], np.float64)
+            d3 = float(np.abs(x3[..., :7].float().cpu().numpy() - ref).max())
             print(f"    сверка на первом батче: argmax==коды, коды==generate, "
-                  f"своя сборка против decode с нулевыми уровнями "
-                  f"|Δ|={np.abs(x[..., :7].float().cpu().numpy() - ref).max():.3e}")
+                  f"сборка трёх уровней против официального decode "
+                  f"max|Δ| = {d3:.3e}")
+            if d3 > 1e-3:
+                raise SystemExit(
+                    f"своя сборка латенты расходится с официальным decode на "
+                    f"{d3:.3e} — кодбуки извлечены неверно, кэш недействителен")
         if done % (args.batch * 100) < args.batch:
             print(f"  {done}/{N} (офсет {po})", flush=True)
     assert done == N, f"обработано {done} из {N}"

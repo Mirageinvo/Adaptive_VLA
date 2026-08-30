@@ -116,6 +116,46 @@ def make_joint12_class(base_cls):
         def trainable_parameters(self):
             return [p for p in self.parameters() if p.requires_grad]
 
+        def to_fp32_trainable(self):
+            """Перевести ОБУЧАЕМЫЕ веса в fp32, замороженные оставить в fp16.
+
+            ЗАЧЕМ. Модель грузится в fp16, и AdamW на fp16-параметрах держит
+            состояния тоже в fp16. При lr=1e-5 и весах порядка 1e-2
+            относительный шаг около 1e-3 — ровно на границе разрешения fp16,
+            то есть часть обновлений просто не представима. Проверка «веса
+            изменились после шага» это не поймает: первый шаг Adam по величине
+            близок к lr и представим, а последующие мелкие — уже нет.
+
+            Правильный режим: обучаемые веса и состояния оптимизатора в fp32,
+            прямой проход под autocast fp16, масштабирование градиента через
+            GradScaler. Замороженная часть остаётся в fp16 и памяти не ест.
+
+            Вызывать ПОСЛЕ проверки структурного тождества: вне autocast
+            fp32-слой на fp16-входе упадёт по типам.
+            """
+            n = 0
+            for p in self.parameters():
+                if p.requires_grad and p.dtype != torch.float32:
+                    p.data = p.data.float()
+                    n += 1
+            return n
+
+        def memory_estimate(self):
+            """Сколько потребует конфигурация. Печатать ДО длинного запуска."""
+            tr = [p for p in self.parameters() if p.requires_grad]
+            fr = [p for p in self.parameters() if not p.requires_grad]
+            n_tr = sum(p.numel() for p in tr)
+            n_fr = sum(p.numel() for p in fr)
+            bt = 4 if (tr and tr[0].dtype == torch.float32) else 2
+            g = 2 ** 30
+            return dict(
+                trainable=n_tr, frozen=n_fr,
+                weights_trainable_gib=n_tr * bt / g,
+                weights_frozen_gib=n_fr * 2 / g,
+                grads_gib=n_tr * bt / g,
+                adam_states_gib=n_tr * 8 / g,      # exp_avg + exp_avg_sq, fp32
+                total_static_gib=(n_tr * bt * 2 + n_fr * 2 + n_tr * 8) / g)
+
         # ---- проход --------------------------------------------------------
         def forward_joint_fast(self, *, vlm_inputs_embeds, attention_mask,
                                position_ids, depth=None):

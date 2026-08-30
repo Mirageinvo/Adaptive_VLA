@@ -16,10 +16,23 @@
   3. Голова стартует копией `action_lm_head`.
   4. Белый список: обучаемо только заявленное, глубокие слои заморожены.
   5. Оптимизатор покрывает обучаемое ПО id(), а не по количеству.
-  6. Градиенты доходят до всех размороженных групп, у глубоких слоёв None.
-  7. Шаг оптимизатора реально меняет голову, слой VLM и слой эксперта, а
-     замороженные веса остаются побитово теми же.
-  8. Память: один полный шаг на V100, с чекпойнтингом и без.
+  6. Градиенты доходят до КАЖДОГО из размороженных слоёв (печатается норма по
+     каждому), у глубоких слоёв None.
+  7. Шаг оптимизатора реально меняет все 2*depth слоёв и голову, а замороженные
+     веса остаются побитово теми же.
+  8. Память на один полный шаг при батче 1.
+
+ТОЧНОСТЬ. Тождество проверяется в fp16, как модель и загружена. Дальше
+обучаемые веса переводятся в fp32, проход идёт под autocast fp16 с GradScaler:
+AdamW на fp16-параметрах держал бы состояния в fp16, а при lr=1e-5 и весах
+порядка 1e-2 относительный шаг около 1e-3 — на границе разрешения fp16. Замер
+памяти в таком режиме показал бы привлекательную, но численно негодную
+конфигурацию.
+
+ПОРЯДОК. Всё после проверки тождества идёт на батче 1: иначе нехватка памяти
+роняла бы скрипт ДО строки, ради которой он написан. Режимы чекпойнтинга
+меряются отдельными процессами через --grad-ckpt: после OOM состояние
+аллокатора уже загрязнено.
 
 Запуск:
     python3 experiments/k9b_joint12_selftest.py --selftest
@@ -83,6 +96,14 @@ def main() -> None:
     ap.add_argument("--dtype", default="float16")
     ap.add_argument("--depth", type=int, default=12)
     ap.add_argument("--n-obs", type=int, default=8)
+    ap.add_argument("--mem-batch", type=int, default=1,
+                    help="батч для замера памяти; проверки проводки идут на "
+                         "нём же, чтобы падение по памяти не случилось ДО "
+                         "строки, ради которой всё")
+    ap.add_argument("--grad-ckpt", choices=["off", "on"], default="off",
+                    help="режим чекпойнтинга. Замерять надо ОТДЕЛЬНЫМИ "
+                         "процессами: после OOM состояние аллокатора уже "
+                         "загрязнено, и empty_cache этого не чинит")
     ap.add_argument("--pos-offset", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -261,71 +282,122 @@ def main() -> None:
             f"получала бы градиент и не обновлялась")
     print(f"  оптимизатор покрывает все {len(need)} обучаемых тензоров (по id)")
 
-    # --- 6 и 7: градиенты и настоящий шаг -------------------------------------
+    # --- 6 и 7: градиенты и настоящий шаг, НА БАТЧЕ ДЛЯ ЗАМЕРА -------------
+    # Раньше шаг шёл на всём батче, и при нехватке памяти скрипт падал ДО
+    # строки, которая должна решить, возможен ли эксперимент.
+    mb = max(1, min(args.mem_batch, N))
+    b1 = {k: (v[:mb] if torch.is_tensor(v) and v.shape[0] == N else v)
+          for k, v in batch.items()}
+    print(f"\n  дальше всё на батче {mb}")
+
+    # ТОЧНОСТЬ: обучаемые веса в fp32, проход под autocast fp16, GradScaler.
+    # Тождество выше проверено ДО этой смены — вне autocast fp32-слой на
+    # fp16-входе упал бы по типам.
+    n_cast = model.to_fp32_trainable()
+    est = model.memory_estimate()
+    print(f"  переведено в fp32: {n_cast} тензоров")
+    print(f"  оценка статической памяти: веса обучаемые "
+          f"{est['weights_trainable_gib']:.2f} + замороженные "
+          f"{est['weights_frozen_gib']:.2f} + градиенты {est['grads_gib']:.2f} "
+          f"+ состояния Adam {est['adam_states_gib']:.2f} = "
+          f"{est['total_static_gib']:.2f} ГиБ")
+
+    params = model.trainable_parameters()
+    opt = torch.optim.AdamW(params, lr=1e-5)
+    in_opt = {id(p) for g in opt.param_groups for p in g["params"]}
+    need = {id(p) for p in model.parameters() if p.requires_grad}
+    if in_opt != need:
+        raise SystemExit(
+            f"оптимизатор покрывает {len(in_opt)} тензоров, обучаемых "
+            f"{len(need)}; расхождение {len(need ^ in_opt)} — часть весов "
+            f"получала бы градиент и не обновлялась")
+    print(f"  оптимизатор покрывает все {len(need)} обучаемых тензоров (по id)")
+    assert all(p.dtype == torch.float32 for p in params), \
+        "не все обучаемые тензоры в fp32 — Adam будет держать состояния в fp16"
+
     watch = {
         "fast_head": model.fast_head.weight,
         "bos_embedding": model.bos_embedding,
         "expert.norm": model.action_expert.norm.weight,
-        "vlm[0]": vl[0].self_attn.q_proj.weight,
-        f"vlm[{args.depth - 1}]": vl[args.depth - 1].self_attn.q_proj.weight,
-        "expert[0]": el[0].self_attn.q_proj.weight,
-        f"expert[{args.depth - 1}]": el[args.depth - 1].self_attn.q_proj.weight,
     }
     frozen = {"vlm[deep]": vl[n_layers - 1].self_attn.q_proj.weight,
               "expert[deep]": el[n_layers - 1].self_attn.q_proj.weight}
     before = {k: v.detach().clone() for k, v in {**watch, **frozen}.items()}
+    before_layers = {f"vlm[{i}]": vl[i].self_attn.q_proj.weight.detach().clone()
+                     for i in range(args.depth)}
+    before_layers.update({f"expert[{i}]": el[i].self_attn.q_proj.weight.detach().clone()
+                          for i in range(args.depth)})
 
+    model.grad_ckpt = (args.grad_ckpt == "on")
     model.train()
-    out = model.forward_joint_fast(
-        vlm_inputs_embeds=vemb.detach(),
-        attention_mask=batch.get("attention_mask"), position_ids=pos)
-    loss = kd_loss(out["logits"], lg_ref.detach(), 2.0)
-    print(f"\n  потеря дистилляции до шага: {float(loss):.4f}")
-    opt.zero_grad(); loss.backward()
-    bad = [k for k, v in watch.items()
-           if v.grad is None or not torch.isfinite(v.grad).all()
-           or v.grad.abs().sum() == 0]
-    if bad:
-        raise SystemExit(f"нет ненулевого конечного градиента у: {bad}")
-    print("  градиенты дошли до: " + ", ".join(watch))
+    scaler = torch.cuda.amp.GradScaler(enabled=(dev.type == "cuda"))
+    torch.cuda.reset_peak_memory_stats(dev) if dev.type == "cuda" else None
+    with torch.autocast(device_type=dev.type, dtype=dt,
+                        enabled=(dev.type == "cuda")):
+        v1, p1 = model.build_inputs(position_offset=args.pos_offset, **b1)
+        out = model.forward_joint_fast(
+            vlm_inputs_embeds=v1, attention_mask=b1.get("attention_mask"),
+            position_ids=p1)
+        # НАСТОЯЩЕЕ РАСХОЖДЕНИЕ, А НЕ СДВИГ НА КОНСТАНТУ. Прибавление одного и
+        # того же ко всем логитам softmax не меняет, KL равен нулю, и backward
+        # шёл бы по нулевому градиенту — то есть замер памяти был бы ложным.
+        teach = out["logits"].detach().clone()
+        teach[..., 0] += 4.0
+        loss = kd_loss(out["logits"], teach, 2.0)
+    print(f"\n  потеря дистилляции на возмущённом учителе: {float(loss):.4f}")
+    if float(loss) < 1e-4:
+        raise SystemExit("потеря близка к нулю — возмущение не создало "
+                         "расхождения, и замер памяти ничего не значит")
+    opt.zero_grad()
+    scaler.scale(loss).backward()
+    scaler.unscale_(opt)
+
+    # ПОКАЗАТЬ НОРМУ ГРАДИЕНТА ПО КАЖДОМУ СЛОЮ, а не по двум крайним: иначе не
+    # видно, доходит ли сигнал до середины стопки.
+    gn = {}
+    for i in range(args.depth):
+        for tag, lay in (("vlm", vl), ("expert", el)):
+            g = lay[i].self_attn.q_proj.weight.grad
+            gn[f"{tag}[{i}]"] = 0.0 if g is None else float(g.norm())
+    dead = [k for k, v in gn.items() if v == 0.0]
+    print("  нормы градиента по слоям:")
+    for tag in ("vlm", "expert"):
+        row = "  ".join(f"{gn[f'{tag}[{i}]']:.1e}" for i in range(args.depth))
+        print(f"    {tag:<7}{row}")
+    if dead:
+        raise SystemExit(f"нулевой градиент у слоёв: {dead}")
+    for k, v in watch.items():
+        if v.grad is None or not torch.isfinite(v.grad).all() or v.grad.abs().sum() == 0:
+            raise SystemExit(f"нет ненулевого конечного градиента у {k}")
     for k, v in frozen.items():
         if v.grad is not None:
             raise SystemExit(f"у замороженного {k} появился градиент")
-    print("  у глубоких слоёв градиента нет, как и должно быть")
+    print("  градиенты дошли до всех размороженных групп, "
+          "у глубоких слоёв их нет")
 
-    opt.step()
+    scaler.step(opt); scaler.update()
     moved = [k for k, v in watch.items() if not torch.equal(v.detach(), before[k])]
-    still = [k for k, v in frozen.items() if not torch.equal(v.detach(), before[k])]
-    print(f"  после шага изменились: {', '.join(moved)}")
     if set(moved) != set(watch):
         raise SystemExit(f"не изменились: {sorted(set(watch) - set(moved))}")
+    unmoved = [k for k, v in before_layers.items()
+               if torch.equal((vl if k.startswith("vlm") else el)
+                              [int(k.split("[")[1][:-1])].self_attn.q_proj.weight.detach(), v)]
+    if unmoved:
+        raise SystemExit(f"после шага НЕ изменились слои: {unmoved}")
+    still = [k for k, v in frozen.items() if not torch.equal(v.detach(), before[k])]
     if still:
         raise SystemExit(f"замороженные веса ИЗМЕНИЛИСЬ: {still}")
+    print(f"  шаг изменил все {2 * args.depth} наблюдаемых слоёв и не тронул "
+          f"глубокие")
 
-    # --- 8: память ------------------------------------------------------------
     if dev.type == "cuda":
-        print("\n  память на один полный шаг (батч 1):")
-        b1 = {k: (v[:1] if torch.is_tensor(v) and v.shape[:1] == (N,) else v)
-              for k, v in batch.items()}
-        for ckpt_on in (False, True):
-            try:
-                model.grad_ckpt = ckpt_on
-                torch.cuda.empty_cache()
-                torch.cuda.reset_peak_memory_stats(dev)
-                v1, p1 = model.build_inputs(position_offset=args.pos_offset, **b1)
-                o = model.forward_joint_fast(
-                    vlm_inputs_embeds=v1,
-                    attention_mask=b1.get("attention_mask"), position_ids=p1)
-                l = kd_loss(o["logits"], o["logits"].detach() + 0.1, 2.0)
-                opt.zero_grad(); l.backward(); opt.step()
-                peak = torch.cuda.max_memory_allocated(dev) / 2 ** 30
-                print(f"    чекпойнтинг {'вкл ' if ckpt_on else 'выкл'}: "
-                      f"пик {peak:.2f} ГиБ")
-            except torch.cuda.OutOfMemoryError:
-                print(f"    чекпойнтинг {'вкл ' if ckpt_on else 'выкл'}: "
-                      f"НЕ ХВАТИЛО ПАМЯТИ")
-                torch.cuda.empty_cache()
-        model.grad_ckpt = False
+        peak = torch.cuda.max_memory_allocated(dev) / 2 ** 30
+        res = torch.cuda.memory_reserved(dev) / 2 ** 30
+        print(f"\n  ПАМЯТЬ: батч {mb}, чекпойнтинг {args.grad_ckpt}, "
+              f"пик {peak:.2f} ГиБ, зарезервировано {res:.2f}, "
+              f"всего на карте {tot:.1f}")
+        print(f"  Второй режим запускать ОТДЕЛЬНЫМ процессом: "
+              f"--grad-ckpt {'on' if args.grad_ckpt == 'off' else 'off'}")
 
     for h in hs:
         h.remove()
