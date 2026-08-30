@@ -259,6 +259,67 @@ def main() -> None:
             "ТОКЕНЫ не совпали с первым блоком BAR — проводка (маска, позиции, "
             "норма) расходится с официальной.")
     if dlg > tol:
+        # ЛОКАЛИЗАЦИЯ, А НЕ ДОГАДКИ. Снимаем вход input_layernorm каждого слоя
+        # эксперта на обоих путях и ищем ПЕРВЫЙ слой, где они разошлись.
+        # Расхождение на входе слоя 0 означает разную сборку BOS; на слое k —
+        # что-то внутри предыдущего шага общего внимания.
+        grab = {"ref": [], "our": []}
+        tag = ["ref"]
+        hh = [el[i].input_layernorm.register_forward_hook(
+            lambda m, i_, o: grab[tag[0]].append(i_[0].detach().float().cpu()))
+            for i in range(n_layers)]
+        with torch.no_grad():
+            model._predict_next_block_logits(**ref_kw)
+            tag[0] = "our"
+            model.forward_joint_fast(
+                vlm_inputs_embeds=vemb,
+                attention_mask=batch.get("attention_mask"),
+                position_ids=pos, depth=n_layers)
+        for h in hh:
+            h.remove()
+        print(f"\n  ЛОКАЛИЗАЦИЯ: снято {len(grab['ref'])} и {len(grab['our'])} "
+              f"состояний")
+        first = None
+        for i in range(min(len(grab["ref"]), len(grab["our"]))):
+            d = (grab["ref"][i] - grab["our"][i]).abs().max().item()
+            if i < 3 or d > 0 or i >= n_layers - 2:
+                print(f"    вход слоя {i:>2}: max|Δ| = {d:.3e}"
+                      + ("   <-- ПЕРВОЕ РАСХОЖДЕНИЕ" if d > 0 and first is None
+                         else ""))
+            if d > 0 and first is None:
+                first = i
+        if first == 0:
+            print("\n  Расходится УЖЕ НА ВХОДЕ ПЕРВОГО СЛОЯ: дело в сборке "
+                  "action-запросов.\n  Официальный путь делает "
+                  "torch.cat([bos, пустой тензор]) и получает СПЛОШНОЙ "
+                  "тензор,\n  а expand(...) оставляет вид с нулевыми шагами. "
+                  "Значения те же, раскладка\n  в памяти разная, и матмул "
+                  "суммирует в другом порядке.")
+        elif first is not None:
+            print(f"\n  Первое расхождение на входе слоя {first}: значит "
+                  f"разошлось внутри шага\n  общего внимания слоя {first - 1}, "
+                  f"а не в подготовке входов.")
+        else:
+            # ГОЛОВЫ НА ОДНОМ ВХОДЕ. Веса совпадают побитово (проверено выше),
+            # значит любое расхождение здесь — выбор ядра cuBLAS из-за разной
+            # раскладки в памяти: fast_head создана сразу на GPU, исходная
+            # перенесена. Значения те же, порядок суммирования другой.
+            with torch.no_grad():
+                probe = torch.randn(4, N_POS, model.fast_head.in_features,
+                                    device=dev, dtype=dt)
+                dh = (model.fast_head(probe).float()
+                      - model.action_lm_head(probe).float()).abs().max().item()
+            print(f"\n  Промежуточные состояния совпали ВЕЗДЕ. Две головы с "
+                  f"побитово равными\n  весами на одном входе расходятся на "
+                  f"{dh:.3e}.")
+            if dh > 0:
+                print("  Значит проводка идентична, а разница — выбор ядра "
+                      "cuBLAS из-за разной\n  раскладки в памяти. Числено это "
+                      "не ошибка: токены совпали на 100%.")
+            else:
+                print("  Головы совпадают, значит расхождение вносит "
+                      "action_expert.norm — \n  это уже настоящее отличие "
+                      "проводки, и его надо искать.")
         raise SystemExit(
             f"логиты расходятся на {dlg:.3e} при собственном шуме модели "
             f"{self_noise:.3e}: это не округление, а разная проводка.")
