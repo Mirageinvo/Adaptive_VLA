@@ -144,8 +144,9 @@ def main() -> None:
     ap.add_argument("--init-scale", type=float, default=4096.0)
     ap.add_argument("--grad-ckpt", action="store_true")
     ap.add_argument("--grip-gate", type=float, default=0.005,
-                    help="чекпойнт принимается, только если знак схвата на "
-                         "первых 8 шагах ошибается не чаще этого")
+                    help="допуск по знаку схвата ОТНОСИТЕЛЬНО УЧИТЕЛЯ: "
+                         "принимается чекпойнт с ошибкой не хуже, чем у "
+                         "учителя плюс это значение")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="data/k9c")
     args = ap.parse_args()
@@ -433,10 +434,20 @@ def main() -> None:
                      for pf in model.trainable_prefixes)}
         torch.save(dict(state=sd, depth=args.depth, sha1=sha, args=vars(args)),
                    os.path.join(args.out, name))
-    best = None
-    if ev0["grip_flip8"] <= args.grip_gate:
-        best = (ev0["imit_pose8"], 0)
-        save("best_imitation.pt")
+    # ГЕЙТ ОТНОСИТЕЛЬНО УЧИТЕЛЯ, А НЕ АБСОЛЮТНЫЙ. В плане было «не хуже
+    # учителя плюс 0.5 пункта», а стояло абсолютное 0.5% — при учителе с 0.43%
+    # это почти то же самое, но при другом учителе разошлось бы молча.
+    gate = (t_flip if t_flip is not None else 0.0) + args.grip_gate
+    print(f"гейт по знаку схвата: {gate:.2%} "
+          f"(учитель {t_flip:.2%} плюс допуск {args.grip_gate:.2%})")
+    # ЛУЧШИЙ ПО ИМИТАЦИИ СОХРАНЯЕТСЯ ВСЕГДА, отдельно от гейта. Иначе прогон,
+    # где гейт не проходит ни разу, оставляет нас вовсе без чекпойнта — что и
+    # случилось на первом запуске.
+    best, best_gated = (ev0["imit_pose8"], 0), None
+    save("best_imitation.pt")
+    if ev0["grip_flip8"] <= gate:
+        best_gated = (ev0["imit_pose8"], 0)
+        save("best_gated.pt")
     step = 0
     for ep in range(args.epochs):
         model.train()
@@ -484,22 +495,29 @@ def main() -> None:
         save("last.pt")
         # ГЕЙТ ПО СХВАТУ: чекпойнт с лучшей позой, но испорченным знаком схвата
         # брать нельзя — именно знак объяснял сохранность успеха в K-6h.
-        if ev["grip_flip8"] <= args.grip_gate and (
-                best is None or ev["imit_pose8"] < best[0]):
+        if ev["imit_pose8"] < best[0]:
             best = (ev["imit_pose8"], ep + 1)
             save("best_imitation.pt")
+        if ev["grip_flip8"] <= gate and (
+                best_gated is None or ev["imit_pose8"] < best_gated[0]):
+            best_gated = (ev["imit_pose8"], ep + 1)
+            save("best_gated.pt")
         json.dump(dict(history=hist, before=ev0, before_train=evt0,
-                       best=best, teacher_ref=
+                       best=best, best_gated=best_gated, gate=gate,
+                       teacher_ref=
                        dict(pose8=t_pose, grip_flip8=t_flip),
                        cache=args.cache, args=vars(args), sha1=sha),
                   open(os.path.join(args.out, "history.json"), "w"),
                   ensure_ascii=False, indent=1)
         torch.save(opt.state_dict(), os.path.join(args.out, "optimizer.pt"))
 
-    if best is None:
-        print("\nНИ ОДНА ЭПОХА НЕ ПРОШЛА ГЕЙТ ПО СХВАТУ — эксперимент неуспешен")
+    print(f"\nлучший по имитации: эпоха {best[1]}, поза8 {best[0]:.4f}")
+    if best_gated is None:
+        print(f"НИ ОДНА ЭПОХА НЕ ПРОШЛА ГЕЙТ ПО СХВАТУ ({gate:.2%}) — по "
+              f"пре-регистрированному критерию эксперимент неуспешен, хотя "
+              f"чекпойнт сохранён")
     else:
-        print(f"\nлучший по имитации: эпоха {best[1]}, поза8 {best[0]:.4f}")
+        print(f"лучший с гейтом: эпоха {best_gated[1]}, поза8 {best_gated[0]:.4f}")
     print(f"сохранено в {args.out}/")
 
 
