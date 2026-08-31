@@ -122,8 +122,12 @@ def main() -> None:
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="float16")
     ap.add_argument("--batch", type=int, default=64)
-    ap.add_argument("--check-batches", type=int, default=4,
-                    help="сколько батчей сверить кэш против живого прохода")
+    ap.add_argument("--check-batches", type=int, default=-1,
+                    help="сколько батчей сверить кэш против живого прохода; "
+                         "-1 значит ВСЕ. Проверка стоит одну норму и одну "
+                         "линейную голову на батч — против двенадцати слоёв "
+                         "трансформера это ничто, а четыре батча из начала "
+                         "первой группы офсета покрывали 0.17% токенов.")
     ap.add_argument("--out", required=False)
     args = ap.parse_args()
 
@@ -166,7 +170,7 @@ def main() -> None:
     if meta["ckpt"] != args.ckpt:
         raise SystemExit(f"кэш собран на {meta['ckpt']}, а задан {args.ckpt}")
     epi, stp, tsk = z["episode"], z["step"], z["task"]
-    offs = z["pos_offset"]
+    offs, split = z["pos_offset"], z["split"]
     N = len(epi)
     print(f"кэш: {N} наблюдений, {len(np.unique(epi))} эпизодов")
 
@@ -224,19 +228,48 @@ def main() -> None:
         if int(obj["depth"]) != args.depth:
             raise SystemExit(f"чекпойнт глубины {obj['depth']}, задано "
                              f"{args.depth}")
+        # ЗАГРУЗКА СТРОГАЯ, как в K-9d. Частично применённый чекпойнт даёт
+        # правдоподобные, но неверные числа, и таблица этого не покажет.
+        state = obj["state"]
+        stray = [k for k in state
+                 if not any(k.startswith(p) or k == p.rstrip(".")
+                            for p in model.trainable_prefixes)]
+        if stray:
+            raise SystemExit(f"{len(stray)} ключей вне белого списка: "
+                             f"{stray[:5]}")
         own = dict(model.named_parameters())
+        missing = [k for k in own if own[k].requires_grad and k not in state]
+        if missing:
+            raise SystemExit(f"нет {len(missing)} обучаемых весов: "
+                             f"{missing[:5]}")
         with torch.no_grad():
-            for k, v in obj["state"].items():
+            for k, v in state.items():
                 if tuple(own[k].shape) != tuple(v.shape):
-                    raise SystemExit(f"форма {k}")
+                    raise SystemExit(f"форма {k}: {tuple(own[k].shape)} "
+                                     f"против {tuple(v.shape)}")
+                if not torch.isfinite(v).all():
+                    raise SystemExit(f"в {k} есть nan или inf")
                 own[k].data = v.to(dev, torch.float32)
+        ca = (obj.get("args") or {}).get("cache")
+        if ca and os.path.abspath(ca) != os.path.abspath(args.cache):
+            print(f"  ВНИМАНИЕ: чекпойнт обучен на кэше {ca}, а h12 снимается "
+                  f"с {args.cache}")
         trunk = "trained"
         print(f"ствол обученный: {args.joint_ckpt}, веса sha {weights_sha}, "
-              f"тензоров {len(obj['state'])}")
+              f"тензоров {len(state)}")
     else:
         print("ствол исходный, из BAR")
+
+    # РЕЖИМ ВЫЧИСЛЕНИЯ ОДИНАКОВ ДЛЯ ОБОИХ СТВОЛОВ И СОВПАДАЕТ С K-9c: там
+    # перед оценкой эпохи 0 вызывался to_fp32_trainable, а проход шёл под
+    # autocast fp16. Если исходный ствол считать в чистом fp16 без autocast,
+    # первая клетка перестанет воспроизводить эпоху 0 буквально — и допуск
+    # просто спрячет расхождение вместо того, чтобы его показать.
+    n32 = model.to_fp32_trainable()
+    use_ac = True
+    print(f"режим как в K-9c: {n32} тензоров переведены в fp32, "
+          f"проход под autocast {args.dtype}")
     model.eval()
-    use_ac = args.joint_ckpt is not None      # fp32-веса требуют autocast
 
     # --- хук на вход нормы ----------------------------------------------------
     cap = []
@@ -251,7 +284,16 @@ def main() -> None:
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".",
                 exist_ok=True)
     need = N * N_POS * D * 2 / 2 ** 30
-    print(f"h12: ({N}, {N_POS}, {D}) fp16 = {need:.2f} ГиБ -> {out_h12}")
+    # МЕСТО ПРОВЕРЯЕТСЯ ДО ЗАПИСИ. Диск заполнен, а извлечение идёт около часа;
+    # падение на последнем батче стоило бы всего прогона.
+    st_fs = os.statvfs(os.path.dirname(os.path.abspath(out_h12)) or ".")
+    free = st_fs.f_bavail * st_fs.f_frsize / 2 ** 30
+    print(f"h12: ({N}, {N_POS}, {D}) fp16 = {need:.2f} ГиБ -> {out_h12}; "
+          f"свободно {free:.1f} ГиБ")
+    if free < need * 1.1 + 1.0:
+        raise SystemExit(
+            f"на диске {free:.1f} ГиБ, нужно {need:.2f} ГиБ с запасом. "
+            f"Освободите место или снимайте h12 только для val и test.")
     H = np.lib.format.open_memmap(out_h12, mode="w+", dtype=np.float16,
                                   shape=(N, N_POS, D))
 
@@ -285,7 +327,14 @@ def main() -> None:
             groups.append((po, ipo[i:j]))
     print(f"батчей {len(groups)} по {args.batch}")
 
+    # ПОСЧИТАННЫЙ ШУМ РАЗБИТ ПО ЧАСТЯМ И ПО ОФСЕТАМ. Единственное среднее по
+    # первым четырём батчам сказало бы только про начало первой группы; здесь
+    # покрытие полное, и разбивка показывает, не сосредоточен ли шум в одной
+    # части — валидация решает исход, и её погрешность нужна отдельно.
     n_mis, n_tok, checked = 0, 0, 0
+    per_split = {s: [0, 0] for s in ("train", "val", "test")}
+    per_off = {}
+    worst = (0.0, None)
     done = 0
     for gi, (po, sel) in enumerate(groups):
         b = build(sel)
@@ -308,7 +357,7 @@ def main() -> None:
         # СВЕРКА КЭША ПРОТИВ ЖИВОГО ПРОХОДА. Считается на первых батчах: если
         # fp16-хранение сдвигает argmax, это обязано быть числом в отчёте, а
         # не молчаливым допущением.
-        if checked < args.check_batches:
+        if args.check_batches < 0 or checked < args.check_batches:
             checked += 1
             back = torch.from_numpy(np.asarray(H[sel])).to(dev)
             with torch.no_grad(), torch.autocast(
@@ -316,9 +365,19 @@ def main() -> None:
                 lg = model.fast_head(
                     model.action_expert.norm(back.to(h12.dtype)).to(
                         model.fast_head.weight.dtype))
-            mis = int((lg.argmax(-1) != o["pred_codes"]).sum())
-            n_mis += mis
-            n_tok += int(o["pred_codes"].numel())
+            bad = (lg.argmax(-1) != o["pred_codes"])
+            mis, tok = int(bad.sum()), int(bad.numel())
+            n_mis += mis; n_tok += tok
+            if tok and mis / tok > worst[0]:
+                worst = (mis / tok, int(sel[0]))
+            per_off.setdefault(po, [0, 0])
+            per_off[po][0] += mis; per_off[po][1] += tok
+            rows = bad.sum(-1).cpu().numpy()
+            for s in per_split:
+                m = split[sel] == s
+                if m.any():
+                    per_split[s][0] += int(rows[m].sum())
+                    per_split[s][1] += int(m.sum()) * N_POS
         done += len(sel)
         if gi % 100 == 0:
             print(f"  {done}/{N} наблюдений", flush=True)
@@ -327,9 +386,19 @@ def main() -> None:
     H.flush()
     del H
     rate = (n_mis / n_tok) if n_tok else None
+    if not n_tok:
+        raise SystemExit("сверка не выполнялась — шум хранения неизвестен, "
+                         "кэш непригоден для таблицы")
+    cover = n_tok / (N * N_POS)
     print(f"\nсверка кэша против живого прохода: расходится {n_mis} токенов "
-          f"из {n_tok} ({rate:.4%})" if n_tok else "\nсверка не выполнялась")
-    if rate is not None and rate > 0.005:
+          f"из {n_tok} ({rate:.4%}), покрыто {cover:.1%} всех токенов")
+    for s, (m, t) in per_split.items():
+        if t:
+            print(f"    {s:<6}{m / t:.4%}  ({m} из {t})")
+    ow = max((v[0] / v[1], k) for k, v in per_off.items() if v[1])
+    print(f"    худший офсет {ow[1]}: {ow[0]:.4%}; худший батч "
+          f"{worst[0]:.4%} (строка {worst[1]})")
+    if rate > 0.005:
         raise SystemExit(
             f"fp16-хранение сдвигает {rate:.2%} токенов — это соизмеримо с "
             f"различиями, которые таблица должна различать. Храните fp32.")
@@ -351,8 +420,12 @@ def main() -> None:
               cache=os.path.abspath(args.cache), n=N, dim=D,
               h12_file=os.path.abspath(out_h12),
               readout_file=os.path.abspath(rd),
-              cache_vs_live_token_mismatch=rate, ckpt=args.ckpt,
-              argv=vars(args))
+              cache_vs_live_token_mismatch=rate, checked_fraction=cover,
+              mismatch_by_split={s: (v[0] / v[1] if v[1] else None)
+                                 for s, v in per_split.items()},
+              mismatch_worst_offset=[ow[1], ow[0]],
+              mismatch_worst_batch=worst[0],
+              ckpt=args.ckpt, argv=vars(args))
     json.dump(md, open(args.out + ".json", "w"), ensure_ascii=False, indent=1)
     print(f"сохранено: {out_h12}, {rd}, {args.out}.json")
     print(f"  ствол {trunk}, sha скрипта {sha}")

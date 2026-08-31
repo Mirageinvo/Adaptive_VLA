@@ -1,40 +1,57 @@
-"""K-9f: факториальная таблица «ствол x голова» и контроль head-only.
+"""K-9f: факториальная таблица «ствол x голова» и отдельный контроль head-only.
 
-ВОПРОС. Прирост согласия 23.1 -> 33.0 получен обучением ствола и головы
-вместе. Отсюда не следует, что информация переехала на слой 12: голова могла
-просто научиться лучше читать то же самое представление. Пока это не
-разделено, фразу «первые 12 слоёв научились нести грубый код» писать нельзя.
+ЗДЕСЬ ДВА РАЗНЫХ ВОПРОСА, И ИХ НЕЛЬЗЯ СМЕШИВАТЬ В ОДНОЙ ТАБЛИЦЕ.
 
-ЧЕТЫРЕ КЛЕТКИ.
+ВОПРОС 1 — ИЗМЕНИЛОСЬ ЛИ ПРЕДСТАВЛЕНИЕ. Отвечает настоящий факториал: два
+ствола на две КОНКРЕТНЫЕ головы, все четыре клетки без единого шага обучения.
 
-    ствол      голова      что это
-    исходный   исходная    опора, ожидается 23.1%
-    исходный   ОБУЧЕННАЯ   head-only: сколько даёт одна голова
-    ОБУЧЕННЫЙ  исходная    вклад изменения представления
-    ОБУЧЕННЫЙ  ОБУЧЕННАЯ   Joint-12, ожидается 33.0%
+                    голова R0 (исходная)   голова R1 (из Joint-12)
+    ствол T0 (исх.)      T0+R0                  T0+R1
+    ствол T1 (Joint)     T1+R0                  T1+R1
 
-ЧИТАЕТСЯ ТАК, и это записано ДО запуска:
-  * head-only около 33% -> весь прирост принадлежит голове, переноса не было,
-    и главное утверждение K-9 закрывается отрицательно;
-  * head-only около 24-26% -> прирост принадлежит стволу;
-  * клетка «обученный ствол + исходная голова» доказательна АСИММЕТРИЧНО:
-    высокое значение — сильное свидетельство переноса, низкое не значит
-    ничего, потому что ствол и голова со-адаптировались и исходная голова
-    просто не умеет читать новое кодирование. Отрицательный вывод по этой
-    клетке делать нельзя.
+Ранняя версия этого файла ставила во вторую клетку ТРЕТЬЮ голову — заново
+обученную R*. Это был не факториал, а сравнение трёх разных голов, и вывод по
+нему был бы неверен.
+
+ВОПРОС 2 — БЫЛО ЛИ ИЗМЕНЕНИЕ СТВОЛА НЕОБХОДИМО. Отвечает отдельный контроль
+T0+R*, где R* обучается с нуля на замороженном исходном стволе. Это НЕ «доля
+вклада головы»: ствол и голова адаптируются совместно, и причинную долю такое
+сравнение не даёт. Корректная формулировка — доля прироста Joint-12,
+воспроизводимая отдельно обученным считывателем.
+
+ПРЕ-РЕГИСТРИРОВАННОЕ ЧТЕНИЕ, записано ДО запуска.
+  Контроль T0+R*, доля прироста:
+    * >= 85%  -> обновление ствола не требуется: тот же результат
+                 воспроизводится одним считывателем;
+    * <= 35%  -> одного считывателя недостаточно: изменение ствола необходимо
+                 в проверенной постановке;
+    * между   -> результат обеспечивается совместной адаптацией.
+  Внедиагональные клетки:
+    * T0+R1 близко к T1+R1 -> голова Joint-12 читает и ИСХОДНОЕ представление,
+      то есть менявшийся ствол ей не нужен;
+    * обе внедиагональные низкие -> сильная со-адаптация: представление
+      изменилось так, что исходная голова его не читает, а новая требует
+      именно его. Это свидетельство ИЗМЕНЕНИЯ, но не улучшения.
+  Клетка T1+R0 доказательна АСИММЕТРИЧНО: высокое значение — сильное
+  свидетельство переноса, низкое не значит ничего.
 
 ДВЕ КЛЕТКИ ИЗ ЧЕТЫРЁХ ИМЕЮТ ИЗВЕСТНЫЙ ОТВЕТ, и это главная защита от ошибки в
-самом конвейере: первая обязана воспроизвести согласие эпохи 0, четвёртая —
-эпохи 3. Если они не сходятся, таблица недействительна целиком, и остальные
-две клетки читать нельзя. Числа задаются --expect-* и сверяются, а не
-подразумеваются.
+конвейере: T0+R0 обязана воспроизвести эпоху 0, T1+R1 — эпоху 3. Сверяются не
+только по согласию, но и по поза8 и знаку схвата: совпадение одной маргинальной
+точности не гарантирует, что строки сопоставлены верно. Порог отказа — один
+пункт, потому что весь исследуемый эффект составляет около десяти, и допуск в
+три пункта прятал бы треть эффекта.
 
-ЧЕСТНОСТЬ КОНТРОЛЯ. head-only должен быть НЕ СЛАБЕЕ, ЧЕМ МОЖЕТ БЫТЬ: он здесь
-опровергает нашу же гипотезу, и поддавки ему в нашу пользу обесценили бы
-вывод. Поэтому те же данные, цели, разбиение и потеря, что у Joint-12, но
-перебор шага обучения и выбор лучшей эпохи по валидации — на кэше h12 это
-минуты. Прежнее сравнение 33.4% против 26.5% было нечестным: там разом
-менялись объём данных, цель, разбиение и потеря.
+ЭПОХА 0 — ПОЛНОПРАВНЫЙ КАНДИДАТ у R*. Если всякий шаг обучения только портит
+голову, контроль обязан вернуть исходную, а не худшую из восьми. Эта же ошибка
+уже ловилась в K-7c и K-8b.
+
+ОТБОР НА ВАЛИДАЦИИ, ИТОГ НА TEST. Шаг обучения, эпоха и сид выбираются по
+валидации; доля воспроизводимого прироста считается на нетронутом test, иначе
+она получила бы фору от того же отбора.
+
+ЧЕСТНОСТЬ КОНТРОЛЯ. R* опровергает нашу же гипотезу, и поддавки ему в нашу
+пользу обесценили бы вывод: перебор шага обучения, два сида, лучшая эпоха.
 
 Запуск:
     python3 experiments/k9f_readout_table.py --selftest
@@ -42,7 +59,7 @@
     python3 experiments/k9f_readout_table.py --ckpt <base> \\
         --cache data/k9_teacher_150k.npz \\
         --orig data/k9e_orig --trained data/k9e_ep3 \\
-        --expect-cell1 0.231 --expect-cell4 0.330 --out data/k9f
+        --expect-cell-t0r0 0.231 --expect-cell-t1r1 0.330 --out data/k9f
 """
 
 import argparse
@@ -57,47 +74,86 @@ import numpy as np
 N_POS, N_LEVEL, T_CHUNK, H_EXEC = 16, 3, 20, 8
 
 
-def read_rule(head_only, joint, base):
-    """Пре-регистрированное чтение. Отдельной функцией ради самопроверки."""
+def gain_fraction(control, joint, base):
+    """Доля прироста Joint-12, воспроизводимая отдельным считывателем."""
     span = joint - base
     if span <= 0:
+        return None
+    return (control - base) / span
+
+
+def read_control(frac):
+    if frac is None:
         return "прирост не воспроизведён, таблица недействительна"
-    frac = (head_only - base) / span
     if frac >= 0.85:
-        return "прирост принадлежит ГОЛОВЕ: переноса на слой 12 не было"
+        return ("обновление ствола НЕ ТРЕБУЕТСЯ: результат воспроизводится "
+                "одним считывателем")
     if frac <= 0.35:
-        return "прирост принадлежит СТВОЛУ: перенос состоялся"
-    return "вклад разделён, однозначного вывода нет"
+        return ("одного считывателя НЕДОСТАТОЧНО: изменение ствола необходимо "
+                "в проверенной постановке")
+    return "результат обеспечивается совместной адаптацией"
+
+
+def read_offdiag(t0r1, t1r0, base, joint):
+    """Чтение внедиагональных клеток. Пороги записаны до запуска."""
+    span = joint - base
+    if span <= 0:
+        return "недействительно"
+    near = joint - 0.02                    # «близко к совместному»
+    low = base + 0.2 * span                # «низко»
+    if t0r1 >= near:
+        return ("голова Joint-12 читает и ИСХОДНОЕ представление: менявшийся "
+                "ствол ей не нужен")
+    if t0r1 <= low and t1r0 <= low:
+        return ("сильная со-адаптация: представление ИЗМЕНИЛОСЬ (но это не "
+                "значит, что улучшилось)")
+    if t1r0 >= near:
+        return "перенос: исходная голова читает новое представление"
+    return "промежуточный случай, однозначного чтения нет"
 
 
 def selftest():
-    assert "ГОЛОВЕ" in read_rule(0.330, 0.330, 0.231)
-    assert "СТВОЛУ" in read_rule(0.255, 0.330, 0.231)
-    assert "разделён" in read_rule(0.290, 0.330, 0.231)
-    assert "недействительна" in read_rule(0.25, 0.20, 0.231)
+    assert abs(gain_fraction(0.330, 0.330, 0.231) - 1.0) < 1e-12
+    assert gain_fraction(0.25, 0.20, 0.231) is None
+    f = gain_fraction(0.26, 0.330, 0.231)
+    assert 0.25 < f < 0.35, f          # доля от ПРИРОСТА, не от результата
+    assert "НЕ ТРЕБУЕТСЯ" in read_control(0.9)
+    assert "НЕДОСТАТОЧНО" in read_control(0.2)
+    assert "совместной" in read_control(0.6)
+    assert "недействительна" in read_control(None)
 
-    # Доля считается от ПРИРОСТА, а не от абсолютного значения: head-only 26%
-    # при опоре 23% и совместном 33% — это 29% прироста, а не 79% результата.
-    f = (0.26 - 0.231) / (0.330 - 0.231)
-    assert 0.25 < f < 0.35, f
+    b, j = 0.231, 0.330
+    assert "ИСХОДНОЕ" in read_offdiag(0.325, 0.10, b, j)
+    assert "со-адаптация" in read_offdiag(0.24, 0.24, b, j)
+    assert "перенос" in read_offdiag(0.28, 0.329, b, j)
+    assert "промежуточный" in read_offdiag(0.29, 0.28, b, j)
 
-    # Взвешенное усреднение метрик по батчам разного размера обязано совпасть
-    # с усреднением по всем строкам сразу.
+    # Взвешенное усреднение по батчам разного размера равно усреднению сразу.
     rng = np.random.default_rng(0)
     x = rng.random(1000)
     parts = [x[:300], x[300:700], x[700:]]
     w = sum(float(p.mean()) * len(p) for p in parts) / len(x)
     assert abs(w - float(x.mean())) < 1e-12
-
-    # RMS складывается по КВАДРАТАМ, а не по значениям: частая ошибка при
-    # усреднении поза8 между батчами.
-    a, b = rng.random(400), rng.random(600)
+    # RMS складывается по КВАДРАТАМ.
+    a, c = rng.random(400), rng.random(600)
     rms = math.sqrt((float((a ** 2).mean()) * 400
-                     + float((b ** 2).mean()) * 600) / 1000)
-    assert abs(rms - float(np.sqrt((np.concatenate([a, b]) ** 2).mean()))) < 1e-12
-    print("самопроверка k9f пройдена (версия «доля прироста»): правило чтения "
-          "на четырёх исходах, доля считается от прироста, взвешенные "
-          "средние и RMS складываются верно")
+                     + float((c ** 2).mean()) * 600) / 1000)
+    assert abs(rms - float(np.sqrt((np.concatenate([a, c]) ** 2).mean()))) < 1e-12
+
+    # Эпоха 0 — кандидат: если все эпохи хуже, побеждает она.
+    cands = [("эпоха 0", 0.231), ("эпоха 1", 0.20), ("эпоха 2", 0.19)]
+    assert max(cands, key=lambda t: t[1])[0] == "эпоха 0"
+
+    # Адресация внутри train: itr[pos] эквивалентна прямой и монотонна.
+    sp = np.array(["train"] * 7 + ["val"] * 3)[rng.permutation(10)]
+    itr = np.where(sp == "train")[0]
+    TL = np.arange(10) * 10
+    pos = np.sort(rng.permutation(len(itr))[:3])
+    assert (TL[itr][pos] == TL[itr[pos]]).all()
+    assert (np.diff(itr[pos]) > 0).all()
+    print("самопроверка k9f пройдена (версия «факториал на двух головах»): "
+          "доля прироста, чтение контроля и внедиагоналей, эпоха 0 в "
+          "кандидатах, взвешенные средние и RMS, адресация train")
 
 
 def main() -> None:
@@ -111,26 +167,26 @@ def main() -> None:
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--batch", type=int, default=512)
     ap.add_argument("--epochs", type=int, default=8)
-    ap.add_argument("--lrs", default="3e-4,1e-3,3e-3",
-                    help="перебор шага для head-only; контроль обязан быть "
-                         "не слабее, чем может быть")
+    ap.add_argument("--lrs", default="3e-4,1e-3,3e-3")
+    ap.add_argument("--seeds", default="0,1",
+                    help="контроль обязан быть не слабее, чем может быть")
     ap.add_argument("--temperature", type=float, default=2.0)
     ap.add_argument("--hard-weight", type=float, default=0.25)
     ap.add_argument("--weight-decay", type=float, default=0.0)
-    # ЛОГИТЫ УЧИТЕЛЯ В ПАМЯТЬ. Перебор из трёх шагов по восемь эпох — это 24
-    # полных прохода по файлу логитов; при 9.8 ГиБ выходит около 235 ГиБ
-    # случайных чтений с диска, заполненного на 95%. Обучающая часть занимает
-    # порядка 8 ГиБ и помещается в оперативную память целиком.
     ap.add_argument("--preload-logits", choices=["auto", "on", "off"],
                     default="auto")
     ap.add_argument("--preload-limit-gib", type=float, default=16.0)
     ap.add_argument("--fit-trained", action="store_true",
-                    help="дополнительно дообучить голову на ОБУЧЕННОМ стволе")
-    ap.add_argument("--expect-cell1", type=float, default=None)
-    ap.add_argument("--expect-cell4", type=float, default=None)
-    ap.add_argument("--tol-warn", type=float, default=0.01)
-    ap.add_argument("--tol-fail", type=float, default=0.03)
-    ap.add_argument("--seed", type=int, default=0)
+                    help="дополнительно обучить считыватель на ОБУЧЕННОМ "
+                         "стволе: показывает, ограничена ли клетка T1+R0 "
+                         "со-адаптацией")
+    ap.add_argument("--expect-cell-t0r0", type=float, default=None)
+    ap.add_argument("--expect-cell-t1r1", type=float, default=None)
+    ap.add_argument("--expect-pose-t0r0", type=float, default=None)
+    ap.add_argument("--expect-pose-t1r1", type=float, default=None)
+    ap.add_argument("--tol-warn", type=float, default=0.0025)
+    ap.add_argument("--tol-fail", type=float, default=0.01)
+    ap.add_argument("--tol-pose-fail", type=float, default=0.004)
     ap.add_argument("--out", default="data/k9f")
     args = ap.parse_args()
 
@@ -158,7 +214,6 @@ def main() -> None:
     from utils import VisionLanguageActionProcessor
 
     dev = torch.device(args.device)
-    torch.manual_seed(args.seed)
 
     # --- кэш учителя ----------------------------------------------------------
     z = np.load(args.cache, allow_pickle=True)
@@ -169,24 +224,26 @@ def main() -> None:
     N, V = len(q_teach), int(meta["vocab"])
     T_LOG = np.load(args.cache + ".logits.npy", mmap_mode="r")
     assert T_LOG.shape == (N, N_POS, V), T_LOG.shape
-    itr, iva = np.where(split == "train")[0], np.where(split == "val")[0]
-    print(f"кэш: {N} наблюдений, обучение {len(itr)}, валидация {len(iva)}")
+    itr = np.where(split == "train")[0]
+    iva = np.where(split == "val")[0]
+    ite = np.where(split == "test")[0]
+    print(f"кэш: {N} наблюдений; обучение {len(itr)}, валидация {len(iva)}, "
+          f"test {len(ite)}")
+    if len(ite) == 0:
+        print("  ВНИМАНИЕ: части test нет, итог будет посчитан на валидации "
+              "и получит фору от отбора")
 
-    # itr отсортирован по возрастанию (np.where), поэтому сортировка позиций
-    # внутри itr совпадает с сортировкой глобальных индексов — и обращение к
-    # memmap остаётся монотонным, когда предзагрузки нет.
     tl_gib = len(itr) * N_POS * V * T_LOG.dtype.itemsize / 2 ** 30
+    n_runs = args.epochs * len(args.lrs.split(",")) * len(args.seeds.split(","))
     pre = (args.preload_logits == "on" or
            (args.preload_logits == "auto" and tl_gib <= args.preload_limit_gib))
     TL_tr = None
     if pre:
         print(f"логиты учителя обучающей части в память: {tl_gib:.1f} ГиБ "
-              f"(иначе {args.epochs * len(args.lrs.split(','))} проходов по "
-              f"диску)", flush=True)
+              f"(иначе до {n_runs} проходов по диску)", flush=True)
         TL_tr = np.asarray(T_LOG[itr])
     else:
-        print(f"логиты учителя остаются на диске: {tl_gib:.1f} ГиБ больше "
-              f"порога {args.preload_limit_gib:.0f} ГиБ")
+        print(f"логиты остаются на диске: {tl_gib:.1f} ГиБ больше порога")
 
     # --- два кэша h12 ---------------------------------------------------------
     def load_side(prefix, want_trunk):
@@ -195,26 +252,43 @@ def main() -> None:
             raise SystemExit(f"{prefix}: ствол «{md['trunk']}», ожидался "
                              f"«{want_trunk}»")
         if md["n"] != N:
-            raise SystemExit(f"{prefix}: {md['n']} строк против {N} в кэше")
+            raise SystemExit(f"{prefix}: {md['n']} строк против {N}")
         if os.path.abspath(md["cache"]) != os.path.abspath(args.cache):
             raise SystemExit(f"{prefix} снят с другого кэша: {md['cache']}")
         h = np.load(md["h12_file"], mmap_mode="r")
+        # ФОРМА И ТИП ПРОВЕРЯЮТСЯ ПО ФАКТУ, а не по метаданным: файл мог быть
+        # оборван, перезаписан другим прогоном или снят другой версией.
+        if h.shape != (N, N_POS, md["dim"]) or h.dtype != np.float16:
+            raise SystemExit(f"{md['h12_file']}: форма {h.shape} тип "
+                             f"{h.dtype}, ожидалось "
+                             f"{(N, N_POS, md['dim'])} float16")
         rd = torch.load(md["readout_file"], map_location="cpu",
                         weights_only=False)
         mm = md.get("cache_vs_live_token_mismatch")
-        print(f"  {want_trunk}: {md['h12_file']}, шум хранения "
-              + (f"{mm:.4%}" if mm is not None else "не мерился")
-              + f", голова из {md['readout_file']}")
+        cov = md.get("checked_fraction")
+        if mm is None or cov is None:
+            raise SystemExit(f"{prefix}: шум хранения не измерен, кэш снят "
+                             f"старой версией k9e")
+        if cov < 0.99:
+            raise SystemExit(
+                f"{prefix}: сверено лишь {cov:.1%} токенов. Порог 0.5% на "
+                f"такой доле ничего не гарантирует; пересоберите с "
+                f"--check-batches -1.")
+        print(f"  {want_trunk}: {md['h12_file']}, шум хранения {mm:.4%} "
+              f"на {cov:.1%} токенов, голова из {md['readout_file']}")
         return md, h, rd
 
     print("кэши h12:")
     md_o, H_o, rd_o = load_side(args.orig, "original")
     md_t, H_t, rd_t = load_side(args.trained, "trained")
-    if md_o["joint12_vla_sha1"] != md_t["joint12_vla_sha1"]:
-        raise SystemExit(
-            f"кэши сняты разными версиями joint12_vla.py: "
-            f"{md_o['joint12_vla_sha1']} и {md_t['joint12_vla_sha1']}")
+    for k in ("joint12_vla_sha1", "script_sha1", "depth", "dim", "ckpt"):
+        if md_o[k] != md_t[k]:
+            raise SystemExit(
+                f"кэши расходятся по «{k}»: {md_o[k]} против {md_t[k]}. "
+                f"Клетки посчитаны разным кодом и несравнимы.")
     D = md_o["dim"]
+    print(f"  оба кэша: глубина {md_o['depth']}, dim {D}, k9e sha "
+          f"{md_o['script_sha1']}, joint12_vla sha {md_o['joint12_vla_sha1']}")
 
     # --- кодек и опорные действия --------------------------------------------
     proc = VisionLanguageActionProcessor.from_pretrained(
@@ -254,14 +328,13 @@ def main() -> None:
             outs.append(x[..., :7].float().cpu())
         A_star = torch.cat(outs)
 
-    # --- голова как отдельный модуль -----------------------------------------
+    # --- считыватель ----------------------------------------------------------
     class Readout(nn.Module):
-        """Норма плюс линейная голова. ВСЁ В FP32.
+        """Норма плюс линейная голова, всё в fp32.
 
-        Живой путь шёл под autocast fp16, здесь считается точнее. Разница
-        обязана быть мала, и это не предположение: клетки 1 и 4 сверяются с
-        известными числами, и расхождение больше --tol-fail останавливает
-        разбор.
+        Живой путь шёл под autocast fp16, здесь точнее. Разница обязана быть
+        мала — и это не предположение: клетки T0+R0 и T1+R1 сверяются с
+        известными числами при пороге в один пункт.
         """
 
         def __init__(self, norm, head):
@@ -278,7 +351,7 @@ def main() -> None:
 
     # --- оценка ---------------------------------------------------------------
     @torch.no_grad()
-    def evaluate(Hc, ro, idxs, tag):
+    def evaluate(Hc, ro, idxs, tag, quiet=False):
         ro.eval()
         acc_t = acc_k = 0.0
         se_i = sg_i = se_e = fl4 = fl8 = 0.0
@@ -307,26 +380,98 @@ def main() -> None:
                  grip_flip4=fl4 / wsum, grip_flip8=fl8 / wsum,
                  expert_pose8=(math.sqrt(se_e / wsum)
                                if A_star is not None else None), n=wsum)
-        print(f"  [{tag}] согласие {r['acc_teacher']:.1%} "
-              f"(с токенизатором {r['acc_ktrue']:.1%}); поза8 "
-              f"{r['imit_pose8']:.4f}, знак8 {r['grip_flip8']:.2%}"
-              + (f"; до эксперта {r['expert_pose8']:.4f}"
-                 if r['expert_pose8'] is not None else ""))
+        if not quiet:
+            print(f"  [{tag}] согласие {r['acc_teacher']:.1%} "
+                  f"(с токенизатором {r['acc_ktrue']:.1%}); поза8 "
+                  f"{r['imit_pose8']:.4f}, знак8 {r['grip_flip8']:.2%}"
+                  + (f"; до эксперта {r['expert_pose8']:.4f}"
+                     if r['expert_pose8'] is not None else ""))
         return r
 
-    # --- обучение головы ------------------------------------------------------
-    def fit(Hc, rd, lr, tag):
-        """Одна голова, один шаг обучения. Возвращает лучшее по валидации."""
+    # =========================================================================
+    # ВОПРОС 1: факториал на двух КОНКРЕТНЫХ головах, без обучения
+    # =========================================================================
+    print(f"\n{'=' * 70}\n  ВОПРОС 1: изменилось ли представление "
+          f"(четыре клетки без обучения)")
+    cells = {}
+    for key, Hc, rd, tag in (
+            ("T0R0", H_o, rd_o, "T0+R0 ствол исходный, голова исходная"),
+            ("T0R1", H_o, rd_t, "T0+R1 ствол исходный, голова Joint-12"),
+            ("T1R0", H_t, rd_o, "T1+R0 ствол Joint-12, голова исходная"),
+            ("T1R1", H_t, rd_t, "T1+R1 ствол Joint-12, голова Joint-12")):
+        cells[key] = evaluate(Hc, fresh(rd), iva, tag)
+
+    # --- сверка клеток с известным ответом ------------------------------------
+    print("\n  клетки с известным ответом:")
+    bad = []
+    for nm, r, ea, ep in (("T0+R0", cells["T0R0"], args.expect_cell_t0r0,
+                           args.expect_pose_t0r0),
+                          ("T1+R1", cells["T1R1"], args.expect_cell_t1r1,
+                           args.expect_pose_t1r1)):
+        if ea is not None:
+            d = abs(r["acc_teacher"] - ea)
+            print(f"    {nm} согласие: {r['acc_teacher']:.1%} против "
+                  f"{ea:.1%}, расхождение {d * 100:.2f} пп")
+            if d > args.tol_fail:
+                bad.append(f"{nm} согласие {d * 100:.2f} пп")
+            elif d > args.tol_warn:
+                print(f"      ВНИМАНИЕ: больше {args.tol_warn * 100:.2f} пп; "
+                      f"вероятно, fp32 против autocast fp16")
+        else:
+            print(f"    {nm} согласие: ожидание не задано, сверки нет")
+        if ep is not None:
+            d = abs(r["imit_pose8"] - ep)
+            print(f"    {nm} поза8: {r['imit_pose8']:.4f} против {ep:.4f}, "
+                  f"расхождение {d:.4f}")
+            if d > args.tol_pose_fail:
+                bad.append(f"{nm} поза8 {d:.4f}")
+    if bad:
+        raise SystemExit(
+            "клетки с известным ответом не воспроизведены (" + "; ".join(bad)
+            + ").\nЭто отказ конвейера, а не результат: остальные клетки "
+            "читать нельзя.")
+
+    base, joint = cells["T0R0"]["acc_teacher"], cells["T1R1"]["acc_teacher"]
+    print(f"\n  {'':<6}{'R0 исходная':>14}{'R1 Joint-12':>14}")
+    print(f"  {'T0':<6}{cells['T0R0']['acc_teacher']:>13.1%}"
+          f"{cells['T0R1']['acc_teacher']:>14.1%}")
+    print(f"  {'T1':<6}{cells['T1R0']['acc_teacher']:>13.1%}"
+          f"{cells['T1R1']['acc_teacher']:>14.1%}")
+    od = read_offdiag(cells["T0R1"]["acc_teacher"],
+                      cells["T1R0"]["acc_teacher"], base, joint)
+    print(f"  ЧТЕНИЕ: {od}")
+    print(f"  напоминание: T1+R0 доказательна только если ВЫСОКА")
+
+    # =========================================================================
+    # ВОПРОС 2: контроль head-only, единственный требующий обучения
+    # =========================================================================
+    def fit(Hc, rd, lr, seed, tag):
+        """Считыватель с нуля на замороженном стволе.
+
+        ЭПОХА 0 — ПОЛНОПРАВНЫЙ КАНДИДАТ. Если обучение только портит, контроль
+        обязан вернуть исходную голову, а не худшую из восьми: иначе контроль
+        окажется ниже бездействия и мы объявим прирост принадлежащим стволу по
+        артефакту отбора.
+        """
+        torch.manual_seed(seed)
         ro = fresh(rd)
         opt = torch.optim.AdamW(ro.parameters(), lr=lr,
                                 weight_decay=args.weight_decay)
-        rng = np.random.default_rng(args.seed)
-        best, best_state, hist = None, None, []
+        rng = np.random.default_rng(seed)
+        # ПОДВЫБОРКА ОБУЧЕНИЯ РАЗМЕРОМ С ВАЛИДАЦИЮ. Без неё «контроль встал»
+        # неотличимо от трёх разных причин: переобучение, нехватка ёмкости
+        # считывателя, плохая цель. У Joint-12 разрыв дошёл до +40.8 пункта, и
+        # у контроля его надо мерить тем же способом, а не предполагать.
+        tr_sub = rng.choice(itr, size=min(len(iva), len(itr)), replace=False)
+        ev0 = evaluate(Hc, ro, iva, f"{tag} эпоха 0", quiet=True)
+        best = dict(ev0, epoch=0)
+        best_state = {k: v.detach().clone() for k, v in ro.state_dict().items()}
+        hist = [dict(epoch=0, loss=None,
+                     **{k: v for k, v in ev0.items() if k != "n"})]
         for ep in range(1, args.epochs + 1):
             ro.train()
-            # ПЕРЕМЕШИВАЮТСЯ ПОЗИЦИИ ВНУТРИ itr, а не глобальные индексы:
-            # тогда одна и та же выборка адресует и предзагруженный массив, и
-            # memmap, и порядок обращения остаётся монотонным.
+            # ПЕРЕМЕШИВАЮТСЯ ПОЗИЦИИ ВНУТРИ itr: одна выборка адресует и
+            # предзагруженный массив, и memmap, порядок остаётся монотонным.
             order = rng.permutation(len(itr))
             tot, nb = 0.0, 0
             for i0 in range(0, len(order), args.batch):
@@ -345,97 +490,95 @@ def main() -> None:
                 loss.backward()
                 opt.step()
                 tot += float(loss); nb += 1
-            ev = evaluate(Hc, ro, iva, f"{tag} lr={lr:g} эпоха {ep}")
-            hist.append(dict(epoch=ep, loss=tot / max(nb, 1), **{
-                k: v for k, v in ev.items() if k != "n"}))
-            if best is None or ev["acc_teacher"] > best["acc_teacher"]:
-                best = ev
+            ev = evaluate(Hc, ro, iva, f"{tag} lr={lr:g} сид {seed} эпоха {ep}")
+            evt = evaluate(Hc, ro, tr_sub, "", quiet=True)
+            gap = evt["acc_teacher"] - ev["acc_teacher"]
+            print(f"      разрыв обучение−валидация: согласие {gap * 100:+.1f} "
+                  f"пп, поза8 {evt['imit_pose8'] - ev['imit_pose8']:+.4f}")
+            hist.append(dict(epoch=ep, loss=tot / max(nb, 1), gap=gap,
+                             train_acc=evt["acc_teacher"],
+                             train_pose8=evt["imit_pose8"],
+                             **{k: v for k, v in ev.items() if k != "n"}))
+            if ev["acc_teacher"] > best["acc_teacher"]:
+                best = dict(ev, epoch=ep)
                 best_state = {k: v.detach().clone()
                               for k, v in ro.state_dict().items()}
         ro.load_state_dict(best_state)
         return ro, best, hist
 
-    results, all_hist = {}, {}
-
-    # Клетка 1 и клетка 4 — известные ответы, считаются ПЕРВЫМИ. Если они не
-    # сходятся, дальше идти незачем.
-    print("\n=== клетки с известным ответом ===")
-    c1 = evaluate(H_o, fresh(rd_o), iva, "1: ствол исходный, голова исходная")
-    c4 = evaluate(H_t, fresh(rd_t), iva, "4: ствол обученный, голова обученная")
-    results["cell1_orig_orig"], results["cell4_trained_trained"] = c1, c4
-
-    bad = []
-    for nm, got, want in (("клетка 1", c1["acc_teacher"], args.expect_cell1),
-                          ("клетка 4", c4["acc_teacher"], args.expect_cell4)):
-        if want is None:
-            print(f"  {nm}: ожидание не задано, сверка не выполнена")
-            continue
-        d = abs(got - want)
-        print(f"  {nm}: получено {got:.1%}, ожидалось {want:.1%}, "
-              f"расхождение {d * 100:.2f} пп")
-        if d > args.tol_fail:
-            bad.append(f"{nm}: {d * 100:.2f} пп")
-        elif d > args.tol_warn:
-            print(f"    ВНИМАНИЕ: больше {args.tol_warn * 100:.0f} пп; "
-                  f"вероятно, разница fp32 против autocast fp16")
-    if bad:
-        raise SystemExit(
-            "клетки с известным ответом не воспроизведены (" + "; ".join(bad)
-            + f") при пороге {args.tol_fail * 100:.0f} пп.\nЭто отказ "
-            f"конвейера, а не результат: остальные две клетки читать нельзя.")
-
-    # Клетка 3 — бесплатная, без обучения.
-    print("\n=== клетка 3: обученный ствол, ИСХОДНАЯ голова ===")
-    print("  напоминание: высокое значение доказательно, низкое — нет "
-          "(со-адаптация)")
-    c3 = evaluate(H_t, fresh(rd_o), iva, "3: ствол обученный, голова исходная")
-    results["cell3_trained_orig"] = c3
-
-    # Клетка 2 — head-only, единственная требующая обучения.
-    print("\n=== клетка 2: head-only на ИСХОДНОМ стволе ===")
-    best2, best2_lr = None, None
-    for lr in [float(x) for x in args.lrs.split(",")]:
-        ro, ev, hist = fit(H_o, rd_o, lr, "head-only")
-        all_hist[f"head_only_lr{lr:g}"] = hist
-        print(f"  lr={lr:g}: лучшее согласие {ev['acc_teacher']:.1%}")
-        if best2 is None or ev["acc_teacher"] > best2["acc_teacher"]:
-            best2, best2_lr = ev, lr
-            torch.save(ro.state_dict(),
-                       os.path.join(args.out, "head_only.pt"))
-    results["cell2_orig_headonly"] = dict(lr=best2_lr, **best2)
-
-    if args.fit_trained:
-        print("\n=== дополнительно: голова заново на ОБУЧЕННОМ стволе ===")
-        bt, bt_lr = None, None
+    def sweep(Hc, rd, tag):
+        best_ro = best_ev = None
+        best_cfg, hists = None, {}
         for lr in [float(x) for x in args.lrs.split(",")]:
-            ro, ev, hist = fit(H_t, rd_o, lr, "refit")
-            all_hist[f"refit_lr{lr:g}"] = hist
-            if bt is None or ev["acc_teacher"] > bt["acc_teacher"]:
-                bt, bt_lr = ev, lr
-        results["extra_trained_refit"] = dict(lr=bt_lr, **bt)
+            for sd in [int(x) for x in args.seeds.split(",")]:
+                ro, ev, hist = fit(Hc, rd, lr, sd, tag)
+                hists[f"lr{lr:g}_seed{sd}"] = hist
+                print(f"  {tag} lr={lr:g} сид {sd}: лучшее "
+                      f"{ev['acc_teacher']:.1%} на эпохе {ev['epoch']}")
+                if best_ev is None or ev["acc_teacher"] > best_ev["acc_teacher"]:
+                    best_ro, best_ev = ro, ev
+                    best_cfg = dict(lr=lr, seed=sd, epoch=ev["epoch"])
+        return best_ro, best_ev, best_cfg, hists
 
-    # --- таблица --------------------------------------------------------------
-    base, joint, ho = c1["acc_teacher"], c4["acc_teacher"], best2["acc_teacher"]
-    print(f"\n{'=' * 70}")
-    print(f"  {'ствол':<11}{'голова':<11}{'согласие':>10}{'поза8':>9}"
+    print(f"\n{'=' * 70}\n  ВОПРОС 2: было ли изменение ствола необходимо")
+    print("  контроль T0+R*: считыватель с нуля на ЗАМОРОЖЕННОМ исходном "
+          "стволе")
+    ro_star, ev_star, cfg_star, hist_star = sweep(H_o, rd_o, "T0+R*")
+    torch.save(ro_star.state_dict(), os.path.join(args.out, "head_only.pt"))
+    print(f"  выбрано по валидации: {cfg_star}")
+
+    extra = None
+    if args.fit_trained:
+        print(f"\n  дополнительно T1+R*: считыватель с нуля на ОБУЧЕННОМ "
+              f"стволе (ограничена ли T1+R0 со-адаптацией)")
+        _, ev_x, cfg_x, hist_x = sweep(H_t, rd_o, "T1+R*")
+        extra = dict(best=ev_x, cfg=cfg_x)
+        hist_star.update({f"trained_{k}": v for k, v in hist_x.items()})
+
+    # =========================================================================
+    # ИТОГ НА TEST
+    # =========================================================================
+    fin = ite if len(ite) else iva
+    fin_name = "test" if len(ite) else "валидация (test отсутствует)"
+    print(f"\n{'=' * 70}\n  ИТОГ на {fin_name}: {len(fin)} наблюдений")
+    t_base = evaluate(H_o, fresh(rd_o), fin, "T0+R0")
+    t_joint = evaluate(H_t, fresh(rd_t), fin, "T1+R1")
+    t_star = evaluate(H_o, ro_star, fin, "T0+R*")
+    t_t0r1 = evaluate(H_o, fresh(rd_t), fin, "T0+R1")
+    t_t1r0 = evaluate(H_t, fresh(rd_o), fin, "T1+R0")
+
+    b, j, s = (t_base["acc_teacher"], t_joint["acc_teacher"],
+               t_star["acc_teacher"])
+    frac = gain_fraction(s, j, b)
+    print(f"\n  {'ствол':<8}{'голова':<12}{'согласие':>10}{'поза8':>9}"
           f"{'знак8':>8}")
-    for lab_s, lab_h, r in (("исходный", "исходная", c1),
-                            ("исходный", "head-only", best2),
-                            ("обученный", "исходная", c3),
-                            ("обученный", "обученная", c4)):
-        print(f"  {lab_s:<11}{lab_h:<11}{r['acc_teacher']:>9.1%}"
+    for ls, lh, r in (("исходный", "исходная", t_base),
+                      ("исходный", "Joint-12", t_t0r1),
+                      ("Joint-12", "исходная", t_t1r0),
+                      ("Joint-12", "Joint-12", t_joint),
+                      ("исходный", "R* обуч.", t_star)):
+        print(f"  {ls:<8}{lh:<12}{r['acc_teacher']:>9.1%}"
               f"{r['imit_pose8']:>9.4f}{r['grip_flip8']:>8.2%}")
-    span = joint - base
-    frac = (ho - base) / span if span > 0 else float("nan")
-    print(f"\n  прирост всего {span * 100:+.1f} пп; головой одной "
-          f"{(ho - base) * 100:+.1f} пп = {frac:.0%} прироста")
-    print(f"  ВЫВОД: {read_rule(ho, joint, base)}")
-    print("  Клетка «обученный ствол + исходная голова» "
-          f"{c3['acc_teacher']:.1%}: доказательна только если высока.")
+    print(f"\n  прирост Joint-12: {(j - b) * 100:+.1f} пп")
+    print(f"  воспроизведено отдельным считывателем: {(s - b) * 100:+.1f} пп"
+          + (f" = {frac:.0%} прироста" if frac is not None else ""))
+    print(f"  ВОПРОС 1 (изменилось ли представление): "
+          f"{read_offdiag(t_t0r1['acc_teacher'], t_t1r0['acc_teacher'], b, j)}")
+    print(f"  ВОПРОС 2 (нужно ли было менять ствол): {read_control(frac)}")
+    print("\n  Это НЕ причинная «доля вклада головы»: ствол и голова "
+          "адаптируются\n  совместно. Корректно — доля прироста Joint-12, "
+          "воспроизводимая\n  отдельно обученным считывателем.")
 
-    md = dict(script_sha1=sha, cells=results, history=all_hist,
-              base=base, joint=joint, head_only=ho, head_only_lr=best2_lr,
-              gain_fraction_head=frac, verdict=read_rule(ho, joint, base),
+    md = dict(script_sha1=sha,
+              val_cells={k: v for k, v in cells.items()},
+              test_cells=dict(T0R0=t_base, T0R1=t_t0r1, T1R0=t_t1r0,
+                              T1R1=t_joint, T0Rstar=t_star),
+              control_val=ev_star, control_cfg=cfg_star, extra=extra,
+              history=hist_star, final_split=fin_name,
+              base=b, joint=j, control=s, gain_fraction=frac,
+              verdict_representation=read_offdiag(
+                  t_t0r1["acc_teacher"], t_t1r0["acc_teacher"], b, j),
+              verdict_control=read_control(frac),
               orig=md_o, trained=md_t, argv=vars(args))
     p = os.path.join(args.out, "table.json")
     json.dump(md, open(p, "w"), ensure_ascii=False, indent=1)
