@@ -17,8 +17,11 @@ horizon, init_state_id) — то есть один и тот же эпизод �
     чем на δ», тогда как пересечение двустороннего интервала с нулём означает
     лишь отсутствие доказательства разницы.
 
-ПРАВИЛО ЧТЕНИЯ записано в k6h_coarse_gate.py до запуска: граница выше -10
-пунктов -> тонкие уровни не нужны; ниже -> нужны.
+ПРАВИЛО ЧТЕНИЯ записано в докстроке соответствующего гейта ДО запуска, и оно
+ТРЁХСТОРОННЕЕ: нижняя односторонняя граница выше -margin доказывает
+не-худшесть; ВЕРХНЯЯ ниже -margin доказывает ухудшение более чем на margin;
+между ними не доказано ничего. Прежняя версия печатала «ХУЖЕ или неясно» одной
+строкой и тем склеивала второй исход с третьим.
 
 ПОЛЕ РАЗДЕЛЕНИЯ РУК ОБОБЩЕНО. Изначально руки различались по `levels` (1 против
 3). K-9d сравнивает Joint-12 с грубым выходом полной глубины и кладёт в файлы
@@ -131,6 +134,13 @@ def main() -> None:
     ap.add_argument("--allow-hash-mismatch", action="store_true",
                     help="НЕ используйте: расхождение хешей означает, что "
                          "эпизоды стартовали из разных состояний")
+    # НЕПАРНЫЕ ЯЧЕЙКИ — ОТКАЗ, А НЕ СТРОЧКА В ОТЧЁТЕ. Ячейка пропадает, когда
+    # процесс упал или не дошёл; падать чаще может именно испытуемая рука, и
+    # тогда из выборки систематически исчезают её худшие эпизоды. Прежняя
+    # версия печатала «НЕПАРНЫХ n» и всё равно выдавала вердикт.
+    ap.add_argument("--allow-unpaired", action="store_true",
+                    help="считать по неполной развёртке. Вердикт при этом "
+                         "недействителен: потеря ячеек не случайна.")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -153,9 +163,16 @@ def main() -> None:
         raise SystemExit(f"нет файлов по {args.glob}")
     cells = defaultdict(dict)     # (tag,suite,task,ens,H,init_id) -> {рука: ep}
     shas, ckpts = set(), set()
+    wsha = set()
     for f in files:
         d = json.load(open(f))
         shas.add(d.get("script_sha1", "?")); ckpts.add(d.get("ckpt", "?"))
+        # SHA ВЕСОВ И SHA МОДУЛЯ ИНФЕРЕНСА. Путь к чекпойнту не удостоверяет
+        # ничего: best_imitation.pt перезаписывается каждой лучшей эпохой.
+        j = d.get("joint")
+        if isinstance(j, dict):
+            wsha.add((j.get("weights_sha1", "?"),
+                      j.get("joint12_vla_sha1", "?")))
         if args.field not in d:
             raise SystemExit(
                 f"в {f} нет поля «{args.field}» — файл получен другим "
@@ -177,6 +194,15 @@ def main() -> None:
         print(f"  ВНИМАНИЕ: файлы получены РАЗНЫМИ версиями скрипта: {shas}")
     if len(ckpts) > 1:
         raise SystemExit(f"разные чекпойнты в одном сравнении: {ckpts}")
+    if len(wsha) > 1:
+        raise SystemExit(
+            f"в одном сравнении смешаны разные веса или разные версии "
+            f"joint12_vla.py: {sorted(wsha)}.\nЭто значит, что часть ячеек "
+            f"посчитана другой сетью. Развёртку надо вести в каталоге, "
+            f"привязанном к sha весов.")
+    if wsha:
+        print(f"  Joint: веса sha {sorted(wsha)[0][0]}, "
+              f"joint12_vla sha {sorted(wsha)[0][1]}")
 
     print(f"  файлов {len(files)}, ячеек {len(cells)}; "
           f"{args.field}: испытуемая {A}, опора {B}")
@@ -190,14 +216,34 @@ def main() -> None:
         unpaired = [k for k in sub if len(cells[k]) < 2]
         if not keys:
             continue
+        # ПОЛНЫЙ ХЕШ ПРОВЕРЯЕТСЯ ТАМ, ГДЕ ОН ЕСТЬ У ОБЕИХ РУК. Он включает
+        # камеру на запястье, в которую политика тоже смотрит; совпадение
+        # только по agentview — более слабое условие, чем требуется.
         bad = [k for k in keys
                if cells[k][A].get("init_hash") != cells[k][B].get("init_hash")]
-        if bad and not args.allow_hash_mismatch:
+        badf = [k for k in keys
+                if cells[k][A].get("init_hash_full") is not None
+                and cells[k][B].get("init_hash_full") is not None
+                and (cells[k][A]["init_hash_full"]
+                     != cells[k][B]["init_hash_full"])]
+        if (bad or badf) and not args.allow_hash_mismatch:
             raise SystemExit(
-                f"ens={ens} H={H}: у {len(bad)} из {len(keys)} пар РАЗНЫЕ хеши "
-                f"начального наблюдения, например {bad[0]}.\nЭто значит, что "
-                f"эпизоды с одним init_state_id стартовали из разных состояний "
-                f"и парное сравнение недействительно.")
+                f"{run} ens={ens} H={H}: у {len(bad)} из {len(keys)} пар "
+                f"РАЗНЫЕ хеши начального наблюдения ({len(badf)} по полному "
+                f"хешу с камерой запястья), например {(bad or badf)[0]}.\n"
+                f"Это значит, что эпизоды с одним init_state_id стартовали из "
+                f"разных состояний и парное сравнение недействительно.")
+        n_full = sum(1 for k in keys
+                     if cells[k][A].get("init_hash_full") is not None
+                     and cells[k][B].get("init_hash_full") is not None)
+        if unpaired and not args.allow_unpaired:
+            raise SystemExit(
+                f"{run} ens={ens} H={H}: {len(unpaired)} ячеек без пары при "
+                f"{len(keys)} полных. Развёртка неполная, и вердикт по ней\n"
+                f"недействителен: падать чаще может именно испытуемая рука, и "
+                f"тогда из выборки систематически исчезают её худшие эпизоды.\n"
+                f"Досчитайте недостающие ячейки или, понимая последствия, "
+                f"--allow-unpaired.")
 
         by_task = defaultdict(list)
         b = c = 0
@@ -211,6 +257,7 @@ def main() -> None:
         macro = float(np.mean([v.mean() for v in by_task.values()])) * 100
         boot = cluster_bootstrap(by_task, args.n_boot, args.seed) * 100
         lo1 = float(np.percentile(boot, 5))
+        hi1 = float(np.percentile(boot, 95))
         lo2, hi2 = (float(np.percentile(boot, 2.5)),
                     float(np.percentile(boot, 97.5)))
         p = mcnemar_exact(b, c)
@@ -228,20 +275,34 @@ def main() -> None:
         print(f"    дискордантных пар: {A} лучше {b}, {B} лучше {c}; "
               f"Макнемар p = {p:.3f}")
         print(f"    кластерный бутстрап по задачам: "
-              f"95% ДИ [{lo2:+.1f}, {hi2:+.1f}] пп")
-        print(f"    односторонняя нижняя граница (5%): {lo1:+.1f} пп")
-        verdict = ("НЕ ХУЖЕ" if lo1 > -args.margin else "ХУЖЕ или неясно")
+              f"95% ДИ [{lo2:+.1f}, {hi2:+.1f}] пп"
+              + (f", полный хеш сверен у {n_full}" if n_full else ""))
+        print(f"    односторонние границы (5%/95%): "
+              f"нижняя {lo1:+.1f}, верхняя {hi1:+.1f} пп")
+        # ТРИ ИСХОДА, А НЕ ДВА. Не-худшесть доказывает нижняя граница выше
+        # -margin; ухудшение более чем на margin доказывает ВЕРХНЯЯ граница
+        # ниже -margin. Между ними не доказано ничего, и читать «нижняя ниже
+        # порога» как доказанное ухудшение — та же ошибка, что читать
+        # неотвергнутую нулевую гипотезу как доказанное равенство.
+        non_inf = bool(lo1 > -args.margin)
+        inferior = bool(hi1 < -args.margin)
+        verdict = ("НЕ ХУЖЕ (доказано)" if non_inf else
+                   "ХУЖЕ более чем на границу (доказано)" if inferior else
+                   "НЕ ДОКАЗАНО НИЧЕГО")
         print(f"    при границе {args.margin:.0f} пп: {verdict}")
-        if lo1 <= -args.margin and micro > -args.margin:
-            print(f"    (точечная оценка выше границы, но выборки не хватает — "
-                  f"это НЕ подтверждение)")
+        if not non_inf and not inferior:
+            print(f"    ни одна из двух односторонних гипотез не подтверждена; "
+                  f"точечная оценка {micro:+.1f} пп сама по себе НЕ вывод")
         res[tag] = dict(n_pairs=len(keys), n_tasks=len(by_task),
-                        n_unpaired=len(unpaired), field=args.field,
-                        arm_test=str(A), arm_ref=str(B),
+                        n_unpaired=len(unpaired), n_full_hash=n_full,
+                        field=args.field, arm_test=str(A), arm_ref=str(B),
                         rate_l1=r1, rate_l3=r3,
                         micro=micro, macro=macro, disc_1=b, disc_3=c,
-                        mcnemar_p=p, ci95=[lo2, hi2], lower_1s=lo1,
-                        margin=args.margin, non_inferior=bool(lo1 > -args.margin))
+                        mcnemar_p=p, ci95=[lo2, hi2],
+                        lower_1s=lo1, upper_1s=hi1,
+                        margin=args.margin, non_inferior=non_inf,
+                        inferior=inferior,
+                        undetermined=bool(not non_inf and not inferior))
 
     if not res:
         raise SystemExit(

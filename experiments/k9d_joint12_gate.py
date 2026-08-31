@@ -23,12 +23,18 @@
 нельзя. Сравнение с coarse24 изолирует ровно глубину.
 
 ПРЕ-РЕГИСТРИРОВАННОЕ ПРАВИЛО ЧТЕНИЯ. Записано ДО запуска, читается через
-k6h_summarize.py --field arm --test fast12 --ref coarse24 --margin 5:
-  * односторонняя нижняя граница разности выше -5 пунктов -> половинная
-    глубина сохраняет успех, результат положительный;
-  * граница ниже -5 -> не сохраняет; это тоже результат, и он закрывает ветку;
-  * граница пересекает -5 -> мощности не хватило, добираются блоки через
-    --init-start, а не переинтерпретируется имеющееся.
+k6h_summarize.py --field arm --test fast12 --ref coarse24 --margin 5. Границы
+ОДНОСТОРОННИЕ, по 5% с каждого края кластерного бутстрапа:
+  * НИЖНЯЯ выше -5 пунктов -> не-худшесть ДОКАЗАНА, ветка положительная;
+  * ВЕРХНЯЯ ниже -5 пунктов -> ухудшение более чем на 5 пунктов ДОКАЗАНО,
+    ветка закрывается отрицательно;
+  * иначе -> НЕ ДОКАЗАНО НИЧЕГО, добираются блоки через --init-start.
+
+Две границы здесь не симметричная придирка, а разные утверждения. «Нижняя
+граница ниже -5» означает лишь отсутствие доказательства не-худшести, и
+принимать по ней отрицательное решение — та же ошибка, что читать
+неотвергнутую нулевую гипотезу как доказанное равенство. Ранняя версия этой
+докстроки такую ошибку содержала.
 Отдельно: офлайновое согласие с учителем (33.4% на отложенных эпизодах) НЕ
 является предсказанием этого числа. Связь кода и успеха уже мерилась и вышла
 слабой: coarse-only имел на 32% худшую реконструкцию действия при нулевой
@@ -69,7 +75,11 @@ import numpy as np
 
 N_POS, N_LEVEL = 16, 3
 ARMS = ("coarse24", "fast12")
-REFERENCE_K6H = {"on": 89.0, "off": 89.5}      # K-6h, грубый выход, 400 пар
+# K-6h, грубый выход. ПО 200 ПАР НА ПРОТОКОЛ (10 задач x 2 блока по 10 сред),
+# а не 400 на каждый: 400 — это сумма двух протоколов. Здесь развёртка идёт на
+# четырёх блоках при ens=on, то есть 400 пар на основном протоколе — вдвое
+# больше опорного, а не «ровно как в K-6h».
+REFERENCE_K6H = {"on": 89.0, "off": 89.5}
 
 
 def summarize(eps):
@@ -148,6 +158,10 @@ def main() -> None:
                     help="coarse24 — опора K-6h; fast12 — Joint-12")
     ap.add_argument("--joint-ckpt", default=None,
                     help="best_imitation.pt от k9c; только для fast12")
+    ap.add_argument("--expect-depth", type=int, default=12,
+                    help="глубина, которую обязан объявить чекпойнт. Рука "
+                         "называется fast12, и без этой проверки она молча "
+                         "приняла бы чекпойнт глубины 18.")
     ap.add_argument("--root", default="third_party/actioncodec")
     ap.add_argument("--cfg-path", default="config/eval/bar.yaml")
     ap.add_argument("--device", default="cuda")
@@ -244,8 +258,22 @@ def main() -> None:
     # --- комплектация руки ---------------------------------------------------
     joint_meta, orig_weights, depth = None, None, 24
     if args.arm == "fast12":
+        # SHA САМИХ ВЕСОВ, а не обучавшего скрипта. Путь к файлу ничего не
+        # удостоверяет: best_imitation.pt перезаписывается каждой лучшей
+        # эпохой, и две ячейки с одинаковым путём могут быть посчитаны разными
+        # весами. Агрегатор отказывается смешивать разные sha.
+        h = hashlib.sha1()
+        with open(args.joint_ckpt, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 22), b""):
+                h.update(chunk)
+        weights_sha = h.hexdigest()[:12]
         obj = torch.load(args.joint_ckpt, map_location="cpu")
         depth = ckpt_depth(obj)
+        if depth != args.expect_depth:
+            raise SystemExit(
+                f"чекпойнт объявляет глубину {depth}, ожидалась "
+                f"{args.expect_depth}. Рука называется fast{args.expect_depth}; "
+                f"если это намеренно, задайте --expect-depth {depth}.")
         model.init_joint_fast(depth=depth)
         state = obj["state"]
         # ЗАГРУЗКА СТРОГАЯ И ПРОВЕРЯЕМАЯ. Чекпойнт содержит только обучаемые
@@ -279,11 +307,19 @@ def main() -> None:
                 p.data = v.to(dev, torch.float32)
                 loaded += 1
         model.eval()
+        # SHA joint12_vla.py тоже в файле: forward_joint_fast определяет
+        # инференс не меньше, чем веса, и его правка меняет исполняемую сеть
+        # при неизменном чекпойнте.
+        import joint12_vla as _jv
+        vla_sha = hashlib.sha1(
+            open(_jv.__file__, "rb").read()).hexdigest()[:12]
         joint_meta = dict(path=os.path.abspath(args.joint_ckpt),
-                          depth=depth, tensors=loaded,
+                          weights_sha1=weights_sha, depth=depth,
+                          tensors=loaded, joint12_vla_sha1=vla_sha,
                           train_sha1=obj.get("sha1"),
                           train_args=obj.get("args"))
         print(f"  Joint-12: загружено {loaded} тензоров, глубина {depth}, "
+              f"веса sha {weights_sha}, joint12_vla sha {vla_sha}, "
               f"обучено скриптом sha {obj.get('sha1')}")
     else:
         # У ОПОРЫ init_joint_fast НЕ ВЫЗЫВАЕТСЯ. Он создаёт fast_head и
@@ -422,10 +458,25 @@ def main() -> None:
             reward = np.clip(reward + r_, 0, 1)
         # ХЕШ СТАРТА для сверки парности агрегатором: две руки на одном
         # init_state_id обязаны стартовать из одного состояния.
-        init_hash = [hashlib.sha1(np.ascontiguousarray(
-            np.concatenate([obs["state"][i].ravel(),
-                            obs["agentview_image"][i].ravel() / 255.0])
-        ).astype(np.float32).tobytes()).hexdigest()[:16] for i in range(n)]
+        #
+        # ДВА ХЕША, А НЕ ОДИН. init_hash повторяет формулу K-6h дословно
+        # (состояние и agentview), чтобы ячейки, посчитанные до этой правки,
+        # продолжали сопоставляться. init_hash_full добавляет камеру на
+        # запястье: политика смотрит в обе, и совпадение только по одной —
+        # более слабое условие, чем нужно. Агрегатор сверяет полный хеш там,
+        # где он есть у обеих рук, и это строго усиливает проверку, ничего не
+        # ломая.
+        def _h(parts):
+            return hashlib.sha1(np.ascontiguousarray(
+                np.concatenate(parts).astype(np.float32)).tobytes()
+            ).hexdigest()[:16]
+        init_hash = [_h([obs["state"][i].ravel(),
+                         obs["agentview_image"][i].ravel() / 255.0])
+                     for i in range(n)]
+        init_hash_full = [_h([obs["state"][i].ravel(),
+                              obs["agentview_image"][i].ravel() / 255.0,
+                              obs["robot0_eye_in_hand_image"][i].ravel() / 255.0])
+                          for i in range(n)]
         calls = steps = 0
         while not np.all(done) and steps < args.max_steps:
             state = ((process_state(obs["state"]) - STATE_Q01)
@@ -474,7 +525,8 @@ def main() -> None:
         # завершатся все среды. Для сравнения рук этого достаточно.
         return [dict(success=bool(reward[i] >= 1.0), env_steps=steps,
                      policy_calls=calls, init_state_id=args.init_start + i,
-                     env_index=i, init_hash=init_hash[i])
+                     env_index=i, init_hash=init_hash[i],
+                     init_hash_full=init_hash_full[i])
                 for i in range(args.n_envs)]
 
     t0 = time.time()
@@ -501,8 +553,9 @@ def main() -> None:
     print("\n  ЧИТАТЬ ТАК: не по этому числу. Оно осмысленно только в паре с")
     print(f"  другой рукой при тех же task-id, init-start, seed и ensemble, и")
     print("  только через k6h_summarize.py --field arm --test fast12")
-    print("  --ref coarse24 --margin 5. Опора K-6h на 400 парах: "
-          f"{REFERENCE_K6H[args.ensemble]:.1f}% при ens={args.ensemble}.")
+    print(f"  --ref coarse24 --margin 5. Опора K-6h: "
+          f"{REFERENCE_K6H[args.ensemble]:.1f}% при ens={args.ensemble} "
+          f"(200 пар на протокол, не 400).")
     print("  Латентность здесь НЕ меряется — для неё k7a на фиксированных")
     print("  входах; оценка 1.48x к coarse24 остаётся арифметикой.")
 
