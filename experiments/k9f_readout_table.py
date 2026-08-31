@@ -53,9 +53,13 @@ T0+R*, где R* обучается с нуля на замороженном и
 ЧЕСТНОСТЬ КОНТРОЛЯ. R* опровергает нашу же гипотезу, и поддавки ему в нашу
 пользу обесценили бы вывод: перебор шага обучения, два сида, лучшая эпоха.
 
+PYTHONPATH ОБЯЗАТЕЛЕН, ХОТЯ СИМУЛЯТОР ЗДЕСЬ НЕ ЗАПУСКАЕТСЯ: `utils` тянет
+`libero.libero.benchmark` на импорте.
+
 Запуск:
     python3 experiments/k9f_readout_table.py --selftest
 
+    PYTHONPATH=$HOME/LIBERO MUJOCO_GL=egl \\
     python3 experiments/k9f_readout_table.py --ckpt <base> \\
         --cache data/k9_teacher_150k.npz \\
         --orig data/k9e_orig --trained data/k9e_ep3 \\

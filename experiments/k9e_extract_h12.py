@@ -29,14 +29,20 @@
 числа таблица из четырёх клеток читалась бы так, будто у неё нет собственной
 погрешности.
 
+PYTHONPATH ОБЯЗАТЕЛЕН, ХОТЯ СИМУЛЯТОР ЗДЕСЬ НЕ ЗАПУСКАЕТСЯ. `utils` тянет
+`libero.libero.benchmark` на импорте, поэтому без переменной падает раньше
+любой полезной работы.
+
 Запуск:
     python3 experiments/k9e_extract_h12.py --selftest
 
     # исходный ствол
+    PYTHONPATH=$HOME/LIBERO MUJOCO_GL=egl \\
     python3 experiments/k9e_extract_h12.py --ckpt <base> \\
         --cache data/k9_teacher_150k.npz --out data/k9e_orig
 
     # обученный ствол (эпоха 3)
+    PYTHONPATH=$HOME/LIBERO MUJOCO_GL=egl \\
     python3 experiments/k9e_extract_h12.py --ckpt <base> \\
         --cache data/k9_teacher_150k.npz \\
         --joint-ckpt data/k9d_ep3.pt --out data/k9e_ep3
