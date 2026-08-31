@@ -169,31 +169,65 @@ def main() -> None:
     # отбираются заранее, а остаток наблюдений распределяется по первым из них.
     rng = np.random.default_rng(args.seed)
     png = lambda c: np.asarray(Image.open(io.BytesIO(c["bytes"])).convert("RGB"))
-    base, extra = divmod(args.n_obs, args.n_ep)
-    if base < 1:
-        raise SystemExit(f"{args.n_obs} наблюдений на {args.n_ep} эпизодов — "
-                         f"меньше одного на эпизод")
-    chosen, tables = [], {}
-    for e in rng.permutation(1693):
-        if len(chosen) >= args.n_ep:
-            break
+    # КВОТЫ ПРОПОРЦИОНАЛЬНЫ ВМЕСТИМОСТИ ЭПИЗОДА, А НЕ РАВНЫ. Прежняя схема
+    # требовала от каждого эпизода одинаковой квоты и отбраковывала короткие.
+    # При 12 наблюдениях это ни на что не влияло, но при 94 (150000 на 1600)
+    # эпизоду нужно уже 114 кадров, а в среднем их 162 — короткие выпали бы, и
+    # 1600 могло не набраться вовсе.
+    #
+    # ЭПИЗОДЫ БЕРУТСЯ ИЗ MANIFEST, ЕСЛИ ОН ЕСТЬ. Иначе разные по размеру кэши
+    # строились бы на разных наборах демонстраций, и сравнивать прогоны было бы
+    # нельзя — при том что разбиение идёт как раз по эпизодам.
+    def _rows(e):
         f = hf_hub_download(rid, f"data/chunk-{e // 1000:03d}/episode_{e:06d}.parquet",
                             repo_type="dataset", revision=rev)
-        t = pq.read_table(f)
-        # Эпизод годится, только если из него можно взять нужную квоту без
-        # повторов: иначе итог опять «сколько получится».
-        if t.num_rows - T_CHUNK + 1 < base + 1:
+        return f, pq.read_metadata(f).num_rows      # без разбора всей таблицы
+
+    fixed = None
+    if os.path.exists(args.manifest):
+        fixed = [int(e) for e in json.load(open(args.manifest))["episodes"]]
+        print(f"эпизоды берутся из manifest: {len(fixed)}")
+
+    chosen, tables, cap = [], {}, {}
+    order = fixed if fixed is not None else list(rng.permutation(1693))
+    for e in order:
+        e = int(e)
+        if fixed is None and len(chosen) >= args.n_ep:
+            break
+        f, nr = _rows(e)
+        c = nr - T_CHUNK + 1
+        if c < 1:
             continue
-        chosen.append(int(e)); tables[int(e)] = f
-    if len(chosen) < args.n_ep:
-        raise SystemExit(f"годных эпизодов только {len(chosen)}, нужно {args.n_ep}")
-    quota = {e: base + (1 if i < extra else 0) for i, e in enumerate(chosen)}
-    assert sum(quota.values()) == args.n_obs, sum(quota.values())
-    print(f"отобрано {len(chosen)} эпизодов, квоты {base}–{base + 1}, "
-          f"суммарно {sum(quota.values())}")
+        chosen.append(e); tables[e] = f; cap[e] = c
+    if fixed is None and len(chosen) < args.n_ep:
+        raise SystemExit(f"годных эпизодов {len(chosen)}, нужно {args.n_ep}")
+    total_cap = sum(cap.values())
+    if total_cap < args.n_obs:
+        raise SystemExit(
+            f"во всех {len(chosen)} эпизодах {total_cap} стартовых позиций, "
+            f"а запрошено {args.n_obs}. Больше в LIBERO взять неоткуда.")
+
+    # Пропорционально вместимости, потом добираем остаток по эпизодам с
+    # наибольшим запасом — так суммарно выходит РОВНО n_obs.
+    quota = {e: min(cap[e], int(args.n_obs * cap[e] / total_cap))
+             for e in chosen}
+    left = args.n_obs - sum(quota.values())
+    for e in sorted(chosen, key=lambda x: cap[x] - quota[x], reverse=True):
+        if left <= 0:
+            break
+        add = min(left, cap[e] - quota[e])
+        quota[e] += add; left -= add
+    if left:
+        raise SystemExit(f"не удалось разложить {left} наблюдений")
+    qs = np.array([quota[e] for e in chosen])
+    print(f"отобрано {len(chosen)} эпизодов, квоты {qs.min()}–{qs.max()} "
+          f"(медиана {int(np.median(qs))}), суммарно {int(qs.sum())}; "
+          f"использовано {qs.sum() / total_cap:.0%} доступных стартов")
 
     im1, im2, st, act, tsk, epi, stp = [], [], [], [], [], [], []
     for e in chosen:
+        if quota[e] == 0:
+            continue
         t = pq.read_table(tables[e])
         A_ = np.asarray(t.column("actions").to_pylist(), np.float32)
         S_ = np.asarray(t.column("state").to_pylist(), np.float32)
@@ -205,7 +239,7 @@ def main() -> None:
             st.append(S_[int(s0)]); act.append(A_[int(s0):int(s0) + T_CHUNK])
             tsk.append(tasks_map[ti[int(s0)]]); epi.append(int(e)); stp.append(int(s0))
     N = len(tsk)
-    assert N == args.n_obs and len(set(epi)) == args.n_ep, (N, len(set(epi)))
+    assert N == args.n_obs and len(set(epi)) == len(chosen), (N, len(set(epi)))
     epi, tsk_a, stp = np.asarray(epi), np.asarray(tsk), np.asarray(stp)
     hw = im1[0].shape[0]
     tf = Compose([CenterCrop(int(hw * 0.875)), Resize(224)])   # ДОЛЯ, не число
