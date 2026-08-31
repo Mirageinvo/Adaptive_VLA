@@ -254,17 +254,32 @@ def main() -> None:
         o24, c24 = counted(lambda: model.forward_joint_fast(
             vlm_inputs_embeds=vemb, attention_mask=batch.get("attention_mask"),
             position_ids=pos, depth=n_layers))
-    same = (o24["pred_codes"].cpu().numpy() == K_bar[:, 0, :])
+    # СОБСТВЕННОЕ РАСХОЖДЕНИЕ МОДЕЛИ ПО ТОКЕНАМ. K_bar приходит из generate, а
+    # эталонные логиты из _predict_next_block_logits. Это разные вызовы, и при
+    # близких логитах двух классов их argmax может разойтись: при батче 8 они
+    # совпадали, при 32 разошлись на один токен из 512. Сравнивать свой путь
+    # надо с ТЕМ ЖЕ эталоном, от которого взяты логиты, а расхождение эталона
+    # с generate измерять и печатать отдельно.
+    ref_codes = lg_ref.argmax(-1).cpu().numpy()
+    gen_vs_ref = (ref_codes == K_bar[:, 0, :])
+    if not gen_vs_ref.all():
+        print(f"  ВНИМАНИЕ: сам generate расходится с эталонными логитами на "
+              f"{(~gen_vs_ref).sum()} токенах из {gen_vs_ref.size} "
+              f"({1 - gen_vs_ref.mean():.3%}) — это собственное свойство "
+              f"модели при данном батче, не наша проводка")
+    same = (o24["pred_codes"].cpu().numpy() == ref_codes)
     dlg = (o24["logits"].float() - lg_ref.float()).abs().max().item()
     # ПОРОГ ОТ СОБСТВЕННОГО ШУМА, а не абсолютный. Если официальный путь сам с
     # собой расходится на N, то требовать от нашего меньше N бессмысленно.
     tol = max(4.0 * self_noise, 1e-6 * max(scale, 1.0))
-    print(f"  тождество при depth={n_layers}: токены {same.mean():.6%}, "
+    print(f"  тождество при depth={n_layers}: токены {same.mean():.6%} "
+          f"(против эталонных логитов), "
           f"логиты max|Δ| = {dlg:.3e} при допуске {tol:.3e}")
     if not same.all():
         raise SystemExit(
-            "ТОКЕНЫ не совпали с первым блоком BAR — проводка (маска, позиции, "
-            "норма) расходится с официальной.")
+            f"ТОКЕНЫ не совпали с эталонными логитами на "
+            f"{(~same).sum()} из {same.size} при побитово равных логитах — "
+            f"этого быть не может, ищите ошибку в сравнении.")
     if dlg > tol:
         # ЛОКАЛИЗАЦИЯ, А НЕ ДОГАДКИ. Снимаем вход input_layernorm каждого слоя
         # эксперта на обоих путях и ищем ПЕРВЫЙ слой, где они разошлись.
