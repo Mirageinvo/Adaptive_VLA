@@ -205,11 +205,23 @@ def main() -> None:
               f"{len(np.unique(tsk[m])):>3} задач")
     itr, iva = np.where(split == "train")[0], np.where(split == "val")[0]
 
-    # --- изображения ПО (эпизод, шаг) из кэша -------------------------------
-    rid, rev = "physical-intelligence/libero", "v2.0"
-    im1 = [None] * N
-    im2 = [None] * N
+    # --- кадры ---------------------------------------------------------------
+    # ЕСЛИ РЯДОМ ЕСТЬ MEMMAP — берём из него. Держать кадры в оперативной
+    # памяти нельзя при большой выборке: 20000 наблюдений это 5.6 ГиБ, а
+    # 96000 уже 27, и именно нехватка данных упёрла первый прогон в плато.
+    img_path = args.cache + ".images.npy"
+    IMG = None
+    if os.path.exists(img_path):
+        IMG = np.load(img_path, mmap_mode="r")
+        assert IMG.shape[0] == N, (IMG.shape, N)
+        print(f"кадры из memmap: {img_path}, {IMG.shape}, "
+              f"{IMG.nbytes / 2**30:.1f} ГиБ на диске")
     st = None
+    im1 = im2 = None
+    if IMG is None:
+        print("кадров в кэше нет — собираю из parquet в оперативную память")
+        im1, im2 = [None] * N, [None] * N
+    rid, rev = "physical-intelligence/libero", "v2.0"
     png = lambda c: np.asarray(Image.open(io.BytesIO(c["bytes"])).convert("RGB"))
     uniq = np.unique(epi)
     for j, e in enumerate(uniq):
@@ -217,7 +229,6 @@ def main() -> None:
                             f"episode_{int(e):06d}.parquet",
                             repo_type="dataset", revision=rev)
         t = pq.read_table(f)
-        c1, c2 = t.column("image").to_pylist(), t.column("wrist_image").to_pylist()
         S_ = np.asarray(t.column("state").to_pylist(), np.float32)
         if st is None:
             st = np.zeros((N, S_.shape[1]), np.float64)
@@ -225,19 +236,23 @@ def main() -> None:
             raise SystemExit(f"эпизод {e}: состояние {S_.shape[1]}-мерное, "
                              f"а раньше было {st.shape[1]}-мерное")
         rows = np.where(epi == e)[0]
+        if IMG is None:
+            c1 = t.column("image").to_pylist()
+            c2 = t.column("wrist_image").to_pylist()
         for r in rows:
             s0 = int(stp[r])
-            im1[r] = png(c1[s0]); im2[r] = png(c2[s0])
             st[r] = S_[s0]
-        if j % 200 == 0:
+            if IMG is None:
+                im1[r] = png(c1[s0]); im2[r] = png(c2[s0])
+        if j % 400 == 0:
             print(f"  эпизодов {j}/{len(uniq)}", flush=True)
-    assert all(x is not None for x in im1), "не все строки получили изображение"
-    hw = im1[0].shape[0]
-    tf = Compose([CenterCrop(int(hw * 0.875)), Resize(224)])   # ДОЛЯ, не число
+    hw = 256 if IMG is None else None
+    tf = (Compose([CenterCrop(int(hw * 0.875)), Resize(224)])   # ДОЛЯ, не число
+          if IMG is None else None)
     if st.shape[1] == len(STATE_Q01) + 1:
         st = process_state(st)
     st_n = (st - STATE_Q01) / (STATE_Q99 - STATE_Q01) * 2.0 - 1.0
-    print(f"изображения собраны, кадр {hw}")
+    print("состояния собраны")
 
     # --- модель --------------------------------------------------------------
     Cls = make_joint12_class(SmolVLABlockwiseAR)
@@ -285,9 +300,12 @@ def main() -> None:
         A_star = torch.cat(outs)
 
     def build(sel):
-        i1 = tf(torch.tensor(np.stack([im1[j] for j in sel])).permute(0, 3, 1, 2))
-        i2 = tf(torch.tensor(np.stack([im2[j] for j in sel])).permute(0, 3, 1, 2))
-        image = torch.cat([i1, i2], dim=-1)
+        if IMG is not None:
+            image = torch.from_numpy(np.asarray(IMG[sel]))
+        else:
+            i1 = tf(torch.tensor(np.stack([im1[j] for j in sel])).permute(0, 3, 1, 2))
+            i2 = tf(torch.tensor(np.stack([im2[j] for j in sel])).permute(0, 3, 1, 2))
+            image = torch.cat([i1, i2], dim=-1)
         msgs = []
         for gi in sel:
             m = prompt_template(st_n[gi], None, str(tsk[gi]),
@@ -394,8 +412,18 @@ def main() -> None:
     print(f"\n{spe} шагов на эпоху, всего {total}, прогрев {warm}; "
           f"микробатч {args.micro_batch} × накопление {args.accum}")
 
+    # ПОДВЫБОРКА ОБУЧЕНИЯ РАЗМЕРОМ С ВАЛИДАЦИЮ. Без неё «валидация встала»
+    # неотличимо от трёх разных причин: переобучение, исчерпание ёмкости,
+    # плохая цель. Тот же пробел уже ловили в K-8b, и здесь он повторился.
+    tr_sub = rng.choice(itr, size=min(len(iva), len(itr)), replace=False)
+    n_par = sum(rep.values())
+    print(f"\nпараметров на обучающий пример: {n_par / len(itr):.0f} "
+          f"({n_par / 1e6:.0f} млн на {len(itr)}) — при десятках тысяч на "
+          f"пример переобучение почти неизбежно")
+
     hist = []
     ev0 = evaluate(iva, "эпоха 0, до обучения")
+    evt0 = evaluate(tr_sub, "эпоха 0, ОБУЧАЮЩАЯ")
     # ЭПОХА 0 — ПОЛНОПРАВНЫЙ КАНДИДАТ: если обучение всё портит, результатом
     # обязан остаться исходный чекпойнт.
     def save(name):
@@ -443,8 +471,13 @@ def main() -> None:
                           f"норма до обрезки {float(gn):.2f}", flush=True)
         m = np.mean(agg, axis=0)
         ev = evaluate(iva, f"эпоха {ep + 1}")
+        evt = evaluate(tr_sub, f"эпоха {ep + 1}, ОБУЧАЮЩАЯ")
+        print(f"    разрыв обучение−валидация: согласие "
+              f"{evt['acc_teacher'] - ev['acc_teacher']:+.1%}, поза8 "
+              f"{evt['imit_pose8'] - ev['imit_pose8']:+.4f} "
+              f"(растущий разрыв = переобучение, а не исчерпание глубины)")
         hist.append(dict(epoch=ep + 1, kd=float(m[0]), hard=float(m[1]),
-                         val=ev, skipped_steps=skipped,
+                         val=ev, train=evt, skipped_steps=skipped,
                          minutes=(time.time() - t0) / 60))
         print(f"    KD {m[0]:.3f}, hard {m[1]:.3f}, пропущено шагов {skipped}, "
               f"{(time.time() - t0) / 60:.1f} мин")
@@ -455,7 +488,8 @@ def main() -> None:
                 best is None or ev["imit_pose8"] < best[0]):
             best = (ev["imit_pose8"], ep + 1)
             save("best_imitation.pt")
-        json.dump(dict(history=hist, before=ev0, best=best, teacher_ref=
+        json.dump(dict(history=hist, before=ev0, before_train=evt0,
+                       best=best, teacher_ref=
                        dict(pose8=t_pose, grip_flip8=t_flip),
                        cache=args.cache, args=vars(args), sha1=sha),
                   open(os.path.join(args.out, "history.json"), "w"),

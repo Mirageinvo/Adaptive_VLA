@@ -104,6 +104,11 @@ def main() -> None:
                          "использовался при отборе в K-8c")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="data/k9_teacher_20k.npz")
+    ap.add_argument("--no-images", action="store_true",
+                    help="не сохранять кадры. По умолчанию рядом пишется "
+                         "memmap уже подготовленных изображений: при большой "
+                         "выборке держать их в оперативной памяти нельзя "
+                         "(96000 наблюдений это 38 ГиБ)")
     args = ap.parse_args()
 
     selftest()
@@ -287,15 +292,28 @@ def main() -> None:
     outdir = os.path.dirname(os.path.abspath(args.out)) or "."
     os.makedirs(outdir, exist_ok=True)
     need = N * N_POS * V * 2
+    IMG_HW, IMG_W = 224, 448
+    if not args.no_images:
+        need += N * 3 * IMG_HW * IMG_W
     import shutil
     free = shutil.disk_usage(outdir).free
     if free < need * 1.3:
         raise SystemExit(f"мало места: нужно {need * 1.3 / 2**30:.1f} ГиБ, "
                          f"свободно {free / 2**30:.1f}")
-    print(f"логиты учителя: {need / 2**30:.2f} ГиБ")
+    print(f"логиты учителя плюс кадры: {need / 2**30:.2f} ГиБ")
     tmp = args.out + ".partial.npy"
     L = np.lib.format.open_memmap(tmp, mode="w+", dtype=np.float16,
                                   shape=(N, N_POS, V))
+    # КАДРЫ СОХРАНЯЮТСЯ УЖЕ ПОДГОТОВЛЕННЫМИ, ровно в том виде, в каком уходят
+    # в процессор: два вида, склеенные по ширине, после кропа и приведения
+    # размера. Так между сбором кэша и обучением не остаётся ни одного шага,
+    # где предобработка могла бы разойтись, — а она у нас уже трижды
+    # расходилась между датасетным и средовым путями.
+    IMG = None
+    img_tmp = args.out + ".partial.images.npy"
+    if not args.no_images:
+        IMG = np.lib.format.open_memmap(
+            img_tmp, mode="w+", dtype=np.uint8, shape=(N, 3, IMG_HW, IMG_W))
     Kt = np.zeros((N, N_POS), np.int64)
     checked = [False]
     done = 0
@@ -338,6 +356,11 @@ def main() -> None:
                 history_tokens=None, position_ids=pos)
         L[sel] = lg.detach().to(torch.float16).cpu().numpy()
         Kt[sel] = lg.argmax(-1).cpu().numpy()
+        if IMG is not None:
+            arr = image.numpy()
+            assert arr.dtype == np.uint8 and arr.shape[1:] == (3, IMG_HW, IMG_W), \
+                f"кадр {arr.dtype} {arr.shape[1:]}, ждали uint8 (3,{IMG_HW},{IMG_W})"
+            IMG[sel] = arr
 
         if not checked[0]:
             checked[0] = True
@@ -395,10 +418,16 @@ def main() -> None:
                  vocab=V, image_hw=int(hw),
                  teacher_agreement_with_tokenizer=ag,
                  logits_file=os.path.basename(args.out) + ".logits.npy",
+                 images_file=(None if args.no_images
+                              else os.path.basename(args.out) + ".images.npy"),
+                 image_shape=[3, IMG_HW, IMG_W],
                  target="coarse-выход полной BAR (учитель), НЕ коды токенизатора",
                  preprocessing="датасетный путь: без разворота каналов, кроп "
                                "0.875 от фактического размера, состояние уже 8-мерное"),
                  ensure_ascii=False))
+    if IMG is not None:
+        IMG.flush(); del IMG
+        os.replace(img_tmp, args.out + ".images.npy")
     os.replace(tmp, args.out + ".logits.npy")
     os.replace(args.out + ".partial.npz", args.out)
     print(f"сохранено: {args.out} и {args.out}.logits.npy")
