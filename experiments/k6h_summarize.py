@@ -20,9 +20,18 @@ horizon, init_state_id) — то есть один и тот же эпизод �
 ПРАВИЛО ЧТЕНИЯ записано в k6h_coarse_gate.py до запуска: граница выше -10
 пунктов -> тонкие уровни не нужны; ниже -> нужны.
 
+ПОЛЕ РАЗДЕЛЕНИЯ РУК ОБОБЩЕНО. Изначально руки различались по `levels` (1 против
+3). K-9d сравнивает Joint-12 с грубым выходом полной глубины и кладёт в файлы
+поле `arm`. Статистика для обоих случаев одна и та же, поэтому обобщён только
+ключ: --field/--test/--ref. Умолчания воспроизводят прежнее поведение
+дословно, а `run_tag` вошёл в ключ ячейки, чтобы файлы K-6h и K-9d,
+совпадающие по (suite, task, ens, H, init_id), не склеились в одну пару.
+
 Запуск:
     python3 experiments/k6h_summarize.py --selftest
     python3 experiments/k6h_summarize.py --glob 'data/k6h/*.json' --margin 10
+    python3 experiments/k6h_summarize.py --glob 'data/k9d/*.json' \\
+        --field arm --test fast12 --ref coarse24 --margin 5
 """
 
 import argparse
@@ -107,6 +116,16 @@ def main() -> None:
     ap.add_argument("--glob", default="data/k6h/*.json")
     ap.add_argument("--margin", type=float, default=10.0,
                     help="граница не-хуже-чем, в пунктах успеха")
+    # ПОЛЕ РАЗДЕЛЕНИЯ РУК. По умолчанию — levels 1 против 3, то есть K-6h без
+    # изменений. K-9d кладёт в файлы поле arm, и та же статистика применяется к
+    # паре fast12/coarse24. Обобщается ТОЛЬКО ключ; тесты, бутстрап и правило
+    # чтения не трогаются, иначе пришлось бы заново подтверждать оценщик.
+    ap.add_argument("--field", default="levels",
+                    help="поле файла, различающее руки (levels или arm)")
+    ap.add_argument("--test", default=None,
+                    help="значение --field у ИСПЫТУЕМОЙ руки (по умолчанию 1)")
+    ap.add_argument("--ref", default=None,
+                    help="значение --field у ОПОРНОЙ руки (по умолчанию 3)")
     ap.add_argument("--n-boot", type=int, default=20000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--allow-hash-mismatch", action="store_true",
@@ -119,40 +138,60 @@ def main() -> None:
     if args.selftest:
         return
 
+    if args.field == "levels":
+        A = int(args.test) if args.test is not None else 1
+        B = int(args.ref) if args.ref is not None else 3
+    else:
+        if args.test is None or args.ref is None:
+            raise SystemExit(f"при --field {args.field} нужны --test и --ref")
+        A, B = args.test, args.ref
+    if A == B:
+        raise SystemExit("--test и --ref обязаны различаться")
+
     files = sorted(globmod.glob(args.glob))
     if not files:
         raise SystemExit(f"нет файлов по {args.glob}")
-    cells = defaultdict(dict)          # (suite,task,ens,H,init_id) -> {levels: ep}
+    cells = defaultdict(dict)     # (tag,suite,task,ens,H,init_id) -> {рука: ep}
     shas, ckpts = set(), set()
     for f in files:
         d = json.load(open(f))
         shas.add(d.get("script_sha1", "?")); ckpts.add(d.get("ckpt", "?"))
+        if args.field not in d:
+            raise SystemExit(
+                f"в {f} нет поля «{args.field}» — файл получен другим "
+                f"скриптом. Проверьте --glob и --field.")
+        # run_tag В КЛЮЧЕ: ячейки K-6h и K-9d могут лежать рядом и совпадать по
+        # (suite, task, ens, H, init_id). Без тега они молча склеились бы в
+        # одну пару, и сравнивались бы эпизоды из разных экспериментов.
         for e in d["episodes"]:
-            key = (d["suite"], d["task_id"], d.get("ensemble", "?"),
-                   d["horizon"], e["init_state_id"])
-            lv = d["levels"]
+            key = (d.get("run_tag", "k6h"), d["suite"], d["task_id"],
+                   d.get("ensemble", "?"), d["horizon"], e["init_state_id"])
+            lv = d[args.field]
             if lv in cells[key]:
                 raise SystemExit(
-                    f"дубль ячейки {key} уровень {lv}: два файла описывают один "
-                    f"эпизод. Проверьте, не запущен ли один блок дважды.")
+                    f"дубль ячейки {key}, {args.field}={lv}: два файла "
+                    f"описывают один эпизод. Проверьте, не запущен ли один "
+                    f"блок дважды.")
             cells[key][lv] = e
     if len(shas) > 1:
         print(f"  ВНИМАНИЕ: файлы получены РАЗНЫМИ версиями скрипта: {shas}")
     if len(ckpts) > 1:
         raise SystemExit(f"разные чекпойнты в одном сравнении: {ckpts}")
 
-    print(f"  файлов {len(files)}, ячеек {len(cells)}")
+    print(f"  файлов {len(files)}, ячеек {len(cells)}; "
+          f"{args.field}: испытуемая {A}, опора {B}")
     res = {}
-    for ens in sorted({k[2] for k in cells}):
-      for H in sorted({k[3] for k in cells if k[2] == ens}):
-        keys = [k for k in cells if k[2] == ens and k[3] == H
-                and 1 in cells[k] and 3 in cells[k]]
-        unpaired = [k for k in cells if k[2] == ens and k[3] == H
-                    and len(cells[k]) < 2]
+    for run in sorted({k[0] for k in cells}):
+     for ens in sorted({k[3] for k in cells if k[0] == run}):
+      for H in sorted({k[4] for k in cells
+                       if k[0] == run and k[3] == ens}):
+        sub = [k for k in cells if k[0] == run and k[3] == ens and k[4] == H]
+        keys = [k for k in sub if A in cells[k] and B in cells[k]]
+        unpaired = [k for k in sub if len(cells[k]) < 2]
         if not keys:
             continue
         bad = [k for k in keys
-               if cells[k][1].get("init_hash") != cells[k][3].get("init_hash")]
+               if cells[k][A].get("init_hash") != cells[k][B].get("init_hash")]
         if bad and not args.allow_hash_mismatch:
             raise SystemExit(
                 f"ens={ens} H={H}: у {len(bad)} из {len(keys)} пар РАЗНЫЕ хеши "
@@ -163,8 +202,8 @@ def main() -> None:
         by_task = defaultdict(list)
         b = c = 0
         for k in keys:
-            s1 = int(cells[k][1]["success"]); s3 = int(cells[k][3]["success"])
-            by_task[k[1]].append(s1 - s3)
+            s1 = int(cells[k][A]["success"]); s3 = int(cells[k][B]["success"])
+            by_task[k[2]].append(s1 - s3)
             b += (s1 == 1 and s3 == 0); c += (s1 == 0 and s3 == 1)
         by_task = {t: np.asarray(v, float) for t, v in by_task.items()}
         flat = np.concatenate(list(by_task.values()))
@@ -175,17 +214,18 @@ def main() -> None:
         lo2, hi2 = (float(np.percentile(boot, 2.5)),
                     float(np.percentile(boot, 97.5)))
         p = mcnemar_exact(b, c)
-        r1 = np.mean([int(cells[k][1]["success"]) for k in keys]) * 100
-        r3 = np.mean([int(cells[k][3]["success"]) for k in keys]) * 100
+        r1 = np.mean([int(cells[k][A]["success"]) for k in keys]) * 100
+        r3 = np.mean([int(cells[k][B]["success"]) for k in keys]) * 100
 
-        tag = f"ens={ens}, H={H}"
+        tag = f"{run}, ens={ens}, H={H}"
         print(f"\n{'=' * 68}\n  {tag}: {len(keys)} пар, "
               f"{len(by_task)} задач" + (f", НЕПАРНЫХ {len(unpaired)}"
                                          if unpaired else ""))
-        print(f"    успех levels=1: {r1:5.1f}%     levels=3: {r3:5.1f}%")
-        print(f"    парная разность (1 минус 3): micro {micro:+.1f} пп, "
+        print(f"    успех {args.field}={A}: {r1:5.1f}%     "
+              f"{args.field}={B}: {r3:5.1f}%")
+        print(f"    парная разность ({A} минус {B}): micro {micro:+.1f} пп, "
               f"macro {macro:+.1f} пп")
-        print(f"    дискордантных пар: 1 лучше {b}, 3 лучше {c}; "
+        print(f"    дискордантных пар: {A} лучше {b}, {B} лучше {c}; "
               f"Макнемар p = {p:.3f}")
         print(f"    кластерный бутстрап по задачам: "
               f"95% ДИ [{lo2:+.1f}, {hi2:+.1f}] пп")
@@ -196,13 +236,16 @@ def main() -> None:
             print(f"    (точечная оценка выше границы, но выборки не хватает — "
                   f"это НЕ подтверждение)")
         res[tag] = dict(n_pairs=len(keys), n_tasks=len(by_task),
-                        n_unpaired=len(unpaired), rate_l1=r1, rate_l3=r3,
+                        n_unpaired=len(unpaired), field=args.field,
+                        arm_test=str(A), arm_ref=str(B),
+                        rate_l1=r1, rate_l3=r3,
                         micro=micro, macro=macro, disc_1=b, disc_3=c,
                         mcnemar_p=p, ci95=[lo2, hi2], lower_1s=lo1,
                         margin=args.margin, non_inferior=bool(lo1 > -args.margin))
 
     if not res:
-        raise SystemExit("не нашлось ни одной пары levels=1 / levels=3")
+        raise SystemExit(
+            f"не нашлось ни одной пары {args.field}={A} / {args.field}={B}")
     print(f"\n  ЧИТАТЬ по односторонней границе, правило записано в докстроке")
     print(f"  k6h_coarse_gate.py ДО запуска. «ДИ пересекает ноль» — не вывод.")
     if args.out:
