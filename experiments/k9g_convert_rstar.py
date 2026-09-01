@@ -119,9 +119,15 @@ def selftest():
         print("самопроверка k9g пройдена частично (torch недоступен): "
               "перенос ключей и граница ствол/голова")
         return
-    a = torch.tensor([1.0, 2.0], dtype=torch.float16)
+    # ОДИН ULP СТРОИТСЯ ЧЕРЕЗ ЦЕЛОЧИСЛЕННОЕ ПРЕДСТАВЛЕНИЕ, а не nextafter в
+    # другой точности: nextafter(1.0) в float32 даёт 1.0000001, и обратное
+    # приведение к float16 округляет его назад к 1.0 — разницы не остаётся.
+    # В float32, а не в float16, намеренно: у fp16 один ULP при 1.0 равен
+    # 9.8e-4 и выходит за умолчания allclose, то есть демонстрация «equal
+    # ловит то, что allclose пропускает» на нём не получилась бы.
+    a = torch.tensor([1.0, 2.0], dtype=torch.float32)
     b = a.clone()
-    b[0] = torch.nextafter(b[0].float(), torch.tensor(2.0)).half()
+    b.view(torch.int32)[0] += 1
     assert torch.equal(a, a.clone())
     assert not torch.equal(a, b), "один ULP обязан ломать равенство"
     assert torch.allclose(a, b), "allclose такую разницу пропускает"
