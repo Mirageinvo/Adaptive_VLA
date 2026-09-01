@@ -145,9 +145,16 @@ for spec in $ARMS; do
 
     # ГЛУБИНА И SOURCE ПРОВЕРЯЮТСЯ У КАЖДОЙ ЯЧЕЙКИ. Чекпойнт глубины 18 под
     # меткой fast12_rstar загрузился бы без единой жалобы.
+    # ПУСТОЙ EXPECT_SOURCE — ОСОЗНАННОЕ ОСЛАБЛЕНИЕ. Чекпойнты k9c (Joint-12)
+    # старше полей source/trunk_digest/joint12_vla_sha1, и требовать их у них
+    # значит требовать пересборки. Тогда --expect-source не передаётся вовсе,
+    # строгий режим в гейте не включается, и происхождение подтверждено
+    # слабее — это надо писать в отчёте, а не умалчивать.
     extra=""
-    [ -n "${CK:-}" ] && extra="--policy-ckpt $CK --expect-depth $EXPECT_DEPTH \
---expect-source $EXPECT_SOURCE"
+    if [ -n "${CK:-}" ]; then
+      extra="--policy-ckpt $CK --expect-depth $EXPECT_DEPTH"
+      [ -n "${EXPECT_SOURCE:-}" ] && extra="$extra --expect-source $EXPECT_SOURCE"
+    fi
 
     el=$(( $(date +%s) - t0 ))
     echo "[$done_n/$total] $(date '+%T') прошло $((el / 60)) мин :: $name"
