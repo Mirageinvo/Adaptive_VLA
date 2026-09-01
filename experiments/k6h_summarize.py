@@ -141,6 +141,19 @@ def main() -> None:
     ap.add_argument("--allow-unpaired", action="store_true",
                     help="считать по неполной развёртке. Вердикт при этом "
                          "недействителен: потеря ячеек не случайна.")
+    # ОЖИДАЕМЫЙ РАЗМЕР ЗАДАЁТСЯ ЗАРАНЕЕ. «Столько пар, сколько нашлось» —
+    # это молчаливое согласие на любую развёртку, включая ту, где половина
+    # ячеек не запускалась вовсе. Непарность ловит пропажу ОДНОЙ руки, а
+    # пропажу ЦЕЛОЙ ячейки — только сверка с ожидаемым числом.
+    ap.add_argument("--expect-pairs", type=int, default=None)
+    ap.add_argument("--expect-tasks", type=int, default=None)
+    ap.add_argument("--require-full-hash", action="store_true",
+                    help="требовать init_hash_full у ОБЕИХ рук каждой пары: "
+                         "он включает камеру запястья, в которую политика "
+                         "тоже смотрит")
+    ap.add_argument("--allow-extra-arms", action="store_true",
+                    help="НЕ используйте: третья метка в ячейке означает, что "
+                         "в сравнение попал посторонний прогон")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -213,7 +226,16 @@ def main() -> None:
                        if k[0] == run and k[3] == ens}):
         sub = [k for k in cells if k[0] == run and k[3] == ens and k[4] == H]
         keys = [k for k in sub if A in cells[k] and B in cells[k]]
-        unpaired = [k for k in sub if len(cells[k]) < 2]
+        # НЕПАРНОСТЬ ОПРЕДЕЛЯЕТСЯ ПО НАЛИЧИЮ НУЖНЫХ МЕТОК, а не по числу
+        # записей: ячейка с тремя посторонними метками и без A имеет длину 3 и
+        # прошла бы проверку `len(cells[k]) < 2`, хотя пары в ней нет.
+        unpaired = [k for k in sub if not (A in cells[k] and B in cells[k])]
+        extra = {lab for k in sub for lab in cells[k] if lab not in (A, B)}
+        if extra and not args.allow_extra_arms:
+            raise SystemExit(
+                f"{run} ens={ens} H={H}: в ячейках есть посторонние метки "
+                f"{sorted(extra)} помимо {A} и {B}.\nВ сравнение попал чужой "
+                f"прогон — уточните --glob или --field/--test/--ref.")
         if not keys:
             continue
         # ПОЛНЫЙ ХЕШ ПРОВЕРЯЕТСЯ ТАМ, ГДЕ ОН ЕСТЬ У ОБЕИХ РУК. Он включает
@@ -236,6 +258,11 @@ def main() -> None:
         n_full = sum(1 for k in keys
                      if cells[k][A].get("init_hash_full") is not None
                      and cells[k][B].get("init_hash_full") is not None)
+        if args.require_full_hash and n_full < len(keys):
+            raise SystemExit(
+                f"{run} ens={ens} H={H}: полный хеш есть только у {n_full} из "
+                f"{len(keys)} пар. Часть ячеек снята версией без камеры "
+                f"запястья, и парность у них проверена слабее требуемого.")
         if unpaired and not args.allow_unpaired:
             raise SystemExit(
                 f"{run} ens={ens} H={H}: {len(unpaired)} ячеек без пары при "
@@ -244,6 +271,18 @@ def main() -> None:
                 f"тогда из выборки систематически исчезают её худшие эпизоды.\n"
                 f"Досчитайте недостающие ячейки или, понимая последствия, "
                 f"--allow-unpaired.")
+
+        if args.expect_pairs is not None and len(keys) != args.expect_pairs:
+            raise SystemExit(
+                f"{run} ens={ens} H={H}: {len(keys)} полных пар, ожидалось "
+                f"{args.expect_pairs}. Развёртка не того размера, который "
+                f"планировался.")
+        n_tasks_here = len({k[2] for k in keys})
+        if args.expect_tasks is not None and n_tasks_here != args.expect_tasks:
+            raise SystemExit(
+                f"{run} ens={ens} H={H}: {n_tasks_here} задач, ожидалось "
+                f"{args.expect_tasks}. Кластерный бутстрап по задачам на "
+                f"неполном наборе занижает ширину интервала.")
 
         by_task = defaultdict(list)
         b = c = 0
@@ -272,8 +311,21 @@ def main() -> None:
               f"{args.field}={B}: {r3:5.1f}%")
         print(f"    парная разность ({A} минус {B}): micro {micro:+.1f} пп, "
               f"macro {macro:+.1f} пп")
-        print(f"    дискордантных пар: {A} лучше {b}, {B} лучше {c}; "
-              f"Макнемар p = {p:.3f}")
+        # ДОЛЯ ДИСКОРДАНТНЫХ ПАР — главное число для контроля собственного
+        # шума. У пары «глубина 12 против 24» она составила 58/400 = 14.5%.
+        # Если тот же показатель у пары «одна и та же политика при другой
+        # форме батча» окажется сопоставимым, различие рук объясняется
+        # хаотическим расхождением траекторий, а не глубиной.
+        disc = (b + c) / max(len(keys), 1)
+        print(f"    дискордантных пар: {A} лучше {b}, {B} лучше {c}, "
+              f"всего {b + c} = {disc:.1%}; Макнемар p = {p:.3f}")
+        # Оракул постфактум: он знает исход и потому не доказывает, что
+        # выбор предсказуем заранее. Печатается как верхняя граница запаса.
+        both_fail = sum(1 for k in keys if not cells[k][A]["success"]
+                        and not cells[k][B]["success"])
+        print(f"    оракул постфактум {100 * (1 - both_fail / len(keys)):.1f}% "
+              f"(обе провалились в {both_fail}) — ЗНАЕТ ИСХОД, запасом "
+              f"адаптивности НЕ является")
         print(f"    кластерный бутстрап по задачам: "
               f"95% ДИ [{lo2:+.1f}, {hi2:+.1f}] пп"
               + (f", полный хеш сверен у {n_full}" if n_full else ""))
@@ -298,7 +350,9 @@ def main() -> None:
                         field=args.field, arm_test=str(A), arm_ref=str(B),
                         rate_l1=r1, rate_l3=r3,
                         micro=micro, macro=macro, disc_1=b, disc_3=c,
-                        mcnemar_p=p, ci95=[lo2, hi2],
+                        mcnemar_p=p, ci95=[lo2, hi2], discordant_frac=disc,
+                        both_fail=both_fail,
+                        hindsight_oracle=1 - both_fail / len(keys),
                         lower_1s=lo1, upper_1s=hi1,
                         margin=args.margin, non_inferior=non_inf,
                         inferior=inferior,
