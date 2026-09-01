@@ -152,8 +152,20 @@ def main() -> None:
                          "он включает камеру запястья, в которую политика "
                          "тоже смотрит")
     ap.add_argument("--allow-extra-arms", action="store_true",
-                    help="НЕ используйте: третья метка в ячейке означает, что "
-                         "в сравнение попал посторонний прогон")
+                    help="разрешить в ячейке метки помимо --test и --ref. "
+                         "НУЖЕН при намеренно многоруком эксперименте: три "
+                         "руки разбираются тремя попарными вызовами, и в "
+                         "каждом третья метка законно лишняя. Без флага "
+                         "посторонняя метка — признак чужого прогона.")
+    # PROVENANCE FAIL-CLOSED. Проверки, работающие «если поле есть», открыты
+    # настежь: ячейки старой версии без rollout_seed проходят их молча, а
+    # раннер пропускает готовые JSON — так частично выполненный прежний прогон
+    # смешивается с новым незаметно. Разные script_sha1 по той же причине
+    # больше не предупреждение.
+    ap.add_argument("--allow-legacy-provenance", action="store_true",
+                    help="читать ячейки без rollout_seed и смешивать версии "
+                         "скрипта. Гарантии при этом слабее заявленных; "
+                         "нужен для файлов, снятых до введения поля (K-9d).")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -204,6 +216,13 @@ def main() -> None:
                     f"блок дважды.")
             cells[key][lv] = e
     if len(shas) > 1:
+        if not args.allow_legacy_provenance:
+            raise SystemExit(
+                f"файлы получены РАЗНЫМИ версиями скрипта: {sorted(shas)}.\n"
+                f"Раннер пропускает готовые JSON, поэтому так незаметно "
+                f"смешивается частично выполненный прежний прогон с новым.\n"
+                f"Считайте в чистом каталоге под новым --run-tag или, понимая "
+                f"последствия, --allow-legacy-provenance.")
         print(f"  ВНИМАНИЕ: файлы получены РАЗНЫМИ версиями скрипта: {shas}")
     if len(ckpts) > 1:
         raise SystemExit(f"разные чекпойнты в одном сравнении: {ckpts}")
@@ -263,6 +282,16 @@ def main() -> None:
         # РАЗНЫЕ сиды на одном init_state_id, и сравнение мерило бы размер
         # батча вместе с сидом. Для таких пар в гейте есть режим `fixed`;
         # здесь проверяется, что им действительно воспользовались.
+        noseed = [k for k in keys
+                  if cells[k][A].get("rollout_seed") is None
+                  or cells[k][B].get("rollout_seed") is None]
+        if noseed and not args.allow_legacy_provenance:
+            raise SystemExit(
+                f"{run} ens={ens} H={H}: у {len(noseed)} из {len(keys)} пар "
+                f"нет rollout_seed хотя бы у одной руки, например "
+                f"{noseed[0]}.\nСверить сиды невозможно, а именно они отличают "
+                f"разницу рук от разницы раскатки. Пересчитайте эти ячейки "
+                f"или, понимая последствия, --allow-legacy-provenance.")
         badseed = [k for k in keys
                    if cells[k][A].get("rollout_seed") is not None
                    and cells[k][B].get("rollout_seed") is not None

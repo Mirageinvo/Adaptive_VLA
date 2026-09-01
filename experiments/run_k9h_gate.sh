@@ -48,6 +48,12 @@ HORIZON="${HORIZON:-8}"
 SEED_MODE="${SEED_MODE:-auto}"
 EXPECT_DEPTH="${EXPECT_DEPTH:-12}"
 EXPECT_SOURCE="${EXPECT_SOURCE:-frozen12_rstar}"
+# УСТРОЙСТВО ЗАДАЁТСЯ ЯВНО, А НЕ МАСКИРОВКОЙ. CUDA_VISIBLE_DEVICES=1 ломает
+# рендеринг: robosuite выводит из него MUJOCO_EGL_DEVICE_ID, а маскировка
+# оставляет процессу одно устройство с индексом 0. Здесь модель кладётся на
+# DEVICE, рендеринг — на MUJOCO_EGL_DEVICE_ID, и обе переменные независимы,
+# потому что CUDA_VISIBLE_DEVICES остаётся незаданным.
+DEVICE="${DEVICE:-cuda}"
 TIMEOUT="${TIMEOUT:-2400}"
 OUT="${OUT:-data/$RUN_TAG}"
 LOGS="${LOGS:-logs/$RUN_TAG}"
@@ -99,6 +105,14 @@ fi
 
 echo "эксперимент $RUN_TAG, ячеек $total, ens=$ENS, состояний на задачу $STATES"
 echo "режим сида раскатки: $SEED_MODE (число сред: $(printf '%s' "$nes"))"
+echo "устройство модели: $DEVICE, рендеринг: MUJOCO_EGL_DEVICE_ID=${MUJOCO_EGL_DEVICE_ID:-по умолчанию}"
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+  echo "ОТКАЗ: задан CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES. robosuite"
+  echo "  выводит из него MUJOCO_EGL_DEVICE_ID, и EGL падает на каждой ячейке"
+  echo "  (80 падений за 11 минут). Используйте DEVICE=cuda:N и"
+  echo "  MUJOCO_EGL_DEVICE_ID=N вместо маскировки."
+  exit 1
+fi
 for spec in $ARMS; do
   IFS=: read -r LAB POL CK NE <<< "$spec"
   s=""
@@ -140,7 +154,7 @@ for spec in $ARMS; do
     timeout "$TIMEOUT" python3 experiments/k9h_multiarm_gate.py \
         --ckpt "$CKPT" --policy "$POL" $extra \
         --arm-label "$LAB" --run-tag "$RUN_TAG" \
-        --rollout-seed-mode "$SEED_MODE" \
+        --rollout-seed-mode "$SEED_MODE" --device "$DEVICE" \
         --task-suite "$SUITE" --task-id "$T" --init-start "$I" \
         --n-envs "$NE" --horizon "$HORIZON" --ensemble "$ENS" \
         --out "$json" > "$log" 2>&1

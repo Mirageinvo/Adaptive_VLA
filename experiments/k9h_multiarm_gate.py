@@ -346,8 +346,17 @@ def main() -> None:
         if args.expect_source is not None and src != args.expect_source:
             raise SystemExit(f"чекпойнт source={src!r}, ожидалось "
                              f"{args.expect_source!r}")
+        # ПРИ ЗАДАННОМ --expect-source ОТСУТСТВИЕ ПОЛЯ САМО ЕСТЬ ОШИБКА.
+        # Условная проверка «сверить, если поле есть» открыта настежь: старый
+        # чекпойнт с правильным source, но без доказательств происхождения,
+        # прошёл бы её молча.
+        strict = args.expect_source is not None
         cur_vla = hashlib.sha1(open(jv.__file__, "rb").read()).hexdigest()[:12]
         ck_vla = obj.get("joint12_vla_sha1")
+        if strict and ck_vla is None:
+            raise SystemExit(
+                "в чекпойнте нет joint12_vla_sha1, а --expect-source задан: "
+                "происхождение не подтверждено. Пересоберите через k9g.")
         if ck_vla is not None and ck_vla != cur_vla:
             raise SystemExit(
                 f"чекпойнт собран на joint12_vla.py sha {ck_vla}, а сейчас "
@@ -357,6 +366,11 @@ def main() -> None:
         # конвертером: «замороженный» — утверждение о весах, а не о названии.
         dig = trunk_digest(state)
         ck_dig = obj.get("trunk_digest")
+        if strict and ck_dig is None:
+            raise SystemExit(
+                "в чекпойнте нет trunk_digest, а --expect-source задан: "
+                "«замороженность» ствола ничем не подтверждена. "
+                "Пересоберите через k9g.")
         if ck_dig is not None and ck_dig != dig:
             raise SystemExit(
                 f"отпечаток ствола {dig} против {ck_dig} в чекпойнте — веса "
