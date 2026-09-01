@@ -39,6 +39,15 @@ TASKS="${TASKS:-0 1 2 3 4 5 6 7 8 9}"
 STATES="${STATES:-40}"           # начальных состояний на задачу
 ENS="${ENS:-on}"
 HORIZON="${HORIZON:-8}"
+# РЕЖИМ СИДА РАСКАТКИ. `block` повторяет K-6h/K-9d и годится, пока у всех рук
+# одно число сред. Как только в сетке появляется рука с другим n_envs, режим
+# ОБЯЗАН быть `fixed`: иначе один и тот же init_state_id получит разные сиды
+# (при n_envs=10 состояние 5 лежит в блоке 0 и получает сид 0, при n_envs=5 —
+# в блоке 5 и сид 5000), и сравнение измерит размер батча вместе с сидом.
+# Ниже это проверяется и навязывается автоматически.
+SEED_MODE="${SEED_MODE:-auto}"
+EXPECT_DEPTH="${EXPECT_DEPTH:-12}"
+EXPECT_SOURCE="${EXPECT_SOURCE:-frozen12_rstar}"
 TIMEOUT="${TIMEOUT:-2400}"
 OUT="${OUT:-data/$RUN_TAG}"
 LOGS="${LOGS:-logs/$RUN_TAG}"
@@ -71,9 +80,25 @@ for spec in $ARMS; do
     echo "рука $LAB: нет файла $CK"; exit 1
   fi
   total=$((total + $(echo $TASKS | wc -w) * (STATES / NE)))
+  nes="${nes:-} $NE"
 done
 
+# РАЗНОЕ ЧИСЛО СРЕД -> РЕЖИМ fixed ОБЯЗАТЕЛЕН. Решается здесь, а не оставляется
+# на внимательность запускающего: именно эта деталь превращает контроль шума в
+# смесь «размер батча плюс другой сид».
+uniq_ne=$(printf '%s\n' $nes | sort -u | wc -l)
+if [ "$SEED_MODE" = "auto" ]; then
+  if [ "$uniq_ne" -gt 1 ]; then SEED_MODE=fixed; else SEED_MODE=block; fi
+fi
+if [ "$uniq_ne" -gt 1 ] && [ "$SEED_MODE" != "fixed" ]; then
+  echo "ОТКАЗ: у рук разное число сред ($(printf '%s' "$nes")), а SEED_MODE="
+  echo "  $SEED_MODE. В режиме block один init_state_id получит разные сиды,"
+  echo "  и сравнение измерит размер батча вместе с сидом. Нужен fixed."
+  exit 1
+fi
+
 echo "эксперимент $RUN_TAG, ячеек $total, ens=$ENS, состояний на задачу $STATES"
+echo "режим сида раскатки: $SEED_MODE (число сред: $(printf '%s' "$nes"))"
 for spec in $ARMS; do
   IFS=: read -r LAB POL CK NE <<< "$spec"
   s=""
@@ -104,14 +129,18 @@ for spec in $ARMS; do
       I=$((I + NE)); continue
     fi
 
+    # ГЛУБИНА И SOURCE ПРОВЕРЯЮТСЯ У КАЖДОЙ ЯЧЕЙКИ. Чекпойнт глубины 18 под
+    # меткой fast12_rstar загрузился бы без единой жалобы.
     extra=""
-    [ -n "${CK:-}" ] && extra="--policy-ckpt $CK"
+    [ -n "${CK:-}" ] && extra="--policy-ckpt $CK --expect-depth $EXPECT_DEPTH \
+--expect-source $EXPECT_SOURCE"
 
     el=$(( $(date +%s) - t0 ))
     echo "[$done_n/$total] $(date '+%T') прошло $((el / 60)) мин :: $name"
     timeout "$TIMEOUT" python3 experiments/k9h_multiarm_gate.py \
         --ckpt "$CKPT" --policy "$POL" $extra \
         --arm-label "$LAB" --run-tag "$RUN_TAG" \
+        --rollout-seed-mode "$SEED_MODE" \
         --task-suite "$SUITE" --task-id "$T" --init-start "$I" \
         --n-envs "$NE" --horizon "$HORIZON" --ensemble "$ENS" \
         --out "$json" > "$log" 2>&1

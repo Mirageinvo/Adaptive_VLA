@@ -67,6 +67,28 @@ def map_key(k):
     raise KeyError(f"неожиданный ключ считывателя: {k}")
 
 
+def trunk_digest(state, head_prefix=("action_expert.norm.", "fast_head.")):
+    """Отпечаток весов ствола: sha1 по именам, формам и байтам.
+
+    ЗАЧЕМ. «Frozen-12» — утверждение о ВЕСАХ, а не о названии файла. Здесь
+    отпечаток записывается, в k9h пересчитывается у загруженного чекпойнта и
+    сверяется. Функция ПОВТОРЕНА в k9h_multiarm_gate.py дословно и обязана
+    совпадать; вынести её в joint12_vla.py нельзя — sha этого модуля уже
+    входит в законченный результат K-9d.
+    """
+    import torch
+    h = hashlib.sha1()
+    for k in sorted(state):
+        if any(k.startswith(p) for p in head_prefix):
+            continue
+        v = state[k].detach().cpu().contiguous()
+        h.update(k.encode())
+        h.update(str(tuple(v.shape)).encode())
+        h.update(str(v.dtype).encode())
+        h.update(v.view(torch.uint8).numpy().tobytes())
+    return h.hexdigest()[:16]
+
+
 def selftest():
     assert map_key("norm.weight") == "action_expert.norm.weight"
     assert map_key("head.weight") == "fast_head.weight"
@@ -103,8 +125,22 @@ def selftest():
     assert torch.equal(a, a.clone())
     assert not torch.equal(a, b), "один ULP обязан ломать равенство"
     assert torch.allclose(a, b), "allclose такую разницу пропускает"
-    print("самопроверка k9g пройдена (версия «побитовый ствол»): перенос "
-          "ключей, граница ствол/голова, equal против allclose")
+
+    # ОТПЕЧАТОК СТВОЛА обязан игнорировать голову и ловить правку ствола.
+    import torch.nn as nn  # noqa: F401
+    st = {"vlm.text_model.layers.0.w": torch.ones(4, dtype=torch.float16),
+          "bos_embedding": torch.zeros(2, dtype=torch.float16),
+          "fast_head.weight": torch.ones(3, dtype=torch.float16)}
+    d0 = trunk_digest(st)
+    st2 = dict(st); st2["fast_head.weight"] = torch.zeros(3, dtype=torch.float16)
+    assert trunk_digest(st2) == d0, "голова не должна влиять на отпечаток"
+    st3 = dict(st)
+    st3["bos_embedding"] = st3["bos_embedding"].clone()
+    st3["bos_embedding"][0] = 1
+    assert trunk_digest(st3) != d0, "правка ствола обязана менять отпечаток"
+    print("самопроверка k9g пройдена (версия «отпечаток ствола»): перенос "
+          "ключей, граница ствол/голова, equal против allclose, отпечаток "
+          "игнорирует голову и ловит ствол")
 
 
 def main() -> None:
@@ -279,9 +315,14 @@ def main() -> None:
             f"{args.tol_acc * 100:.1f} пп). Ключи перенесены неверно.")
 
     # --- запись ---------------------------------------------------------------
+    # ОТПЕЧАТОК СТВОЛА вместо «sha исходной модели»: имя чекпойнта на Hugging
+    # Face ничего не удостоверяет, а отпечаток фиксирует ровно те веса,
+    # которые исполнялись. Гейт пересчитает его и сверит.
+    dig = trunk_digest(state)
+    print(f"  отпечаток ствола: {dig}")
     obj = dict(state=state, depth=args.depth, sha1=sha,
                source="frozen12_rstar",
-               base_ckpt=args.ckpt,
+               base_ckpt=args.ckpt, trunk_digest=dig,
                rstar_file=os.path.abspath(args.rstar),
                rstar_sha1=file_sha(args.rstar),
                table_file=os.path.abspath(args.table),

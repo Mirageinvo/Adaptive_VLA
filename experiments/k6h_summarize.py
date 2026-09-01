@@ -258,6 +258,23 @@ def main() -> None:
         n_full = sum(1 for k in keys
                      if cells[k][A].get("init_hash_full") is not None
                      and cells[k][B].get("init_hash_full") is not None)
+        # СИД РАСКАТКИ У ПАРЫ ОБЯЗАН СОВПАДАТЬ. Режим `block` в гейте даёт
+        # seed + 1000 * init_start, поэтому руки с разным числом сред получают
+        # РАЗНЫЕ сиды на одном init_state_id, и сравнение мерило бы размер
+        # батча вместе с сидом. Для таких пар в гейте есть режим `fixed`;
+        # здесь проверяется, что им действительно воспользовались.
+        badseed = [k for k in keys
+                   if cells[k][A].get("rollout_seed") is not None
+                   and cells[k][B].get("rollout_seed") is not None
+                   and cells[k][A]["rollout_seed"] != cells[k][B]["rollout_seed"]]
+        if badseed:
+            raise SystemExit(
+                f"{run} ens={ens} H={H}: у {len(badseed)} из {len(keys)} пар "
+                f"РАЗНЫЕ сиды раскатки, например {badseed[0]}:\n"
+                f"  {A}: {cells[badseed[0]][A]['rollout_seed']}, "
+                f"{B}: {cells[badseed[0]][B]['rollout_seed']}.\n"
+                f"Сравнение измерило бы разницу рук вместе с разницей сида. "
+                f"Перезапустите с --rollout-seed-mode fixed у ОБЕИХ рук.")
         if args.require_full_hash and n_full < len(keys):
             raise SystemExit(
                 f"{run} ens={ens} H={H}: полный хеш есть только у {n_full} из "

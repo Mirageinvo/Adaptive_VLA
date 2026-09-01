@@ -102,6 +102,44 @@ def levels_of(policy):
     return N_LEVEL if policy == "fullbar" else 1
 
 
+def rollout_seed(seed, init_start, mode):
+    """Сид раскатки. См. пояснение у --rollout-seed-mode.
+
+    `block` воспроизводит K-6h/K-9d; `fixed` нужен, когда руки идут с разным
+    числом сред, иначе один и тот же init_state_id получит разные сиды.
+    """
+    if mode == "fixed":
+        return seed
+    return seed + 1000 * init_start
+
+
+def trunk_digest(state, head_prefix=("action_expert.norm.", "fast_head.")):
+    """Отпечаток весов ствола: sha1 по именам, формам и байтам.
+
+    ЗАЧЕМ. «Frozen-12» — утверждение о весах, а не о названии файла. Конвертер
+    записывает отпечаток, гейт пересчитывает его у загруженного чекпойнта и
+    сверяет. Без этого чекпойнт с подменённым стволом принялся бы молча.
+    Функция ПОВТОРЕНА в k9g_convert_rstar.py дословно и обязана совпадать;
+    вынести её в joint12_vla.py нельзя — sha этого модуля уже входит в
+    законченный результат K-9d.
+    """
+    h = hashlib.sha1()
+    for k in sorted(state):
+        if any(k.startswith(p) for p in head_prefix):
+            continue
+        v = state[k].detach().cpu().contiguous()
+        h.update(k.encode())
+        h.update(str(tuple(v.shape)).encode())
+        h.update(str(v.dtype).encode())
+        h.update(v.view(torch_uint8()).numpy().tobytes())
+    return h.hexdigest()[:16]
+
+
+def torch_uint8():
+    import torch
+    return torch.uint8
+
+
 def selftest():
     for H, want in ((4, 0.25), (8, 0.125)):
         eps = [dict(success=True, env_steps=40, policy_calls=40 // H)
@@ -113,6 +151,19 @@ def selftest():
 
     assert levels_of("fullbar") == 3
     assert levels_of("coarse24") == 1 and levels_of("fast") == 1
+
+    # СИД РАСКАТКИ. Именно здесь прячется конфаундер контроля шума: в режиме
+    # block один и тот же init_state_id получает РАЗНЫЕ сиды при разном числе
+    # сред, и сравнение b10 против b5 мерило бы размер батча вместе с сидом.
+    assert rollout_seed(0, 0, "block") == 0
+    assert rollout_seed(0, 10, "block") == 10000
+    assert rollout_seed(0, 5, "block") == 5000
+    # состояние 5: блок 0 при n_envs=10, блок 5 при n_envs=5
+    assert rollout_seed(0, 0, "block") != rollout_seed(0, 5, "block"), \
+        "конфаундер существует — ради этого и введён режим fixed"
+    assert rollout_seed(0, 0, "fixed") == rollout_seed(0, 5, "fixed") == 0
+    for s in (0, 10, 20, 30):
+        assert rollout_seed(7, s, "fixed") == 7
 
     # Раскладка кодов поуровневая: первые 16 из 48 — уровень 0 (bar.py:1500).
     K = np.arange(N_POS * N_LEVEL)[None].reshape(1, N_LEVEL, N_POS)
@@ -179,6 +230,18 @@ def main() -> None:
     ap.add_argument("--waiting-steps", type=int, default=10)
     ap.add_argument("--max-steps", type=int, default=600)
     ap.add_argument("--seed", type=int, default=0)
+    # СИД РАСКАТКИ. Режим `block` повторяет K-5b/K-6h/K-9d дословно:
+    # seed + 1000 * init_start. Он корректен, пока все руки идут с одним
+    # числом сред, и НЕПРИГОДЕН для контроля численного шума: при n_envs=10
+    # состояние 5 лежит в блоке init_start=0 и получает сид 0, а при n_envs=5
+    # — в блоке init_start=5 и сид 5000. Сравнение b10 против b5 тогда
+    # мерило бы размер батча ВМЕСТЕ с другим сидом. Режим `fixed` берёт один
+    # args.seed на все блоки и снимает конфаундер.
+    ap.add_argument("--rollout-seed-mode", choices=["block", "fixed"],
+                    default="block")
+    ap.add_argument("--expect-source", default=None,
+                    help="обязательное значение поля source в --policy-ckpt, "
+                         "например frozen12_rstar")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -276,15 +339,36 @@ def main() -> None:
                     raise SystemExit(f"в {k} есть nan или inf")
                 own[k].data = v.to(dev, torch.float32)
         model.eval()
+        # SOURCE, ГЛУБИНА И ВЕРСИЯ РЕАЛИЗАЦИИ — обязательные, а не справочные.
+        # Чекпойнт глубины 18 под меткой fast12_rstar загрузился бы без
+        # единой жалобы и исполнил бы другую сеть.
+        src = obj.get("source")
+        if args.expect_source is not None and src != args.expect_source:
+            raise SystemExit(f"чекпойнт source={src!r}, ожидалось "
+                             f"{args.expect_source!r}")
+        cur_vla = hashlib.sha1(open(jv.__file__, "rb").read()).hexdigest()[:12]
+        ck_vla = obj.get("joint12_vla_sha1")
+        if ck_vla is not None and ck_vla != cur_vla:
+            raise SystemExit(
+                f"чекпойнт собран на joint12_vla.py sha {ck_vla}, а сейчас "
+                f"{cur_vla}. forward_joint_fast определяет исполняемую сеть "
+                f"не меньше, чем веса.")
+        # ОТПЕЧАТОК СТВОЛА. Для frozen12_rstar он обязан совпасть с записанным
+        # конвертером: «замороженный» — утверждение о весах, а не о названии.
+        dig = trunk_digest(state)
+        ck_dig = obj.get("trunk_digest")
+        if ck_dig is not None and ck_dig != dig:
+            raise SystemExit(
+                f"отпечаток ствола {dig} против {ck_dig} в чекпойнте — веса "
+                f"ствола изменились после сборки")
         policy_meta = dict(path=os.path.abspath(args.policy_ckpt),
                            weights_sha1=weights_sha, depth=depth,
-                           tensors=len(state), source=obj.get("source"),
+                           tensors=len(state), source=src,
                            built_by_sha1=obj.get("sha1"),
                            rstar_sha1=obj.get("rstar_sha1"),
-                           joint12_vla_sha1=hashlib.sha1(
-                               open(jv.__file__, "rb").read()).hexdigest()[:12])
+                           trunk_digest=dig, joint12_vla_sha1=cur_vla)
         print(f"  политика fast: {len(state)} тензоров, глубина {depth}, "
-              f"веса sha {weights_sha}, source={obj.get('source')}")
+              f"веса sha {weights_sha}, source={src}, ствол {dig}")
     else:
         # init_joint_fast НЕ ВЫЗЫВАЕТСЯ: он создаёт fast_head и сдвигает
         # аллокатор, а в K-9b именно сдвиг аллокатора давал расхождение
@@ -375,11 +459,15 @@ def main() -> None:
             check_assembly(np.concatenate([codes] * N_LEVEL, axis=1))
         return codes
 
+    roll_seed = rollout_seed(args.seed, args.init_start,
+                             args.rollout_seed_mode)
+    print(f"    сид раскатки {roll_seed} (режим {args.rollout_seed_mode})")
+
     def rollout():
         # СИД СБРАСЫВАЕТСЯ ПЕРЕД РАУНДОМ, как в K-5b/K-6h/K-9d: иначе расход
         # глобального ГСЧ различался бы между руками и начальные состояния
         # разошлись бы, а вся статистика здесь парная.
-        seed_everything(args.seed + 1000 * args.init_start)
+        seed_everything(roll_seed)
         n = args.n_envs
         ens = ActionEnsembler() if args.ensemble == "on" else None
         ts = 0
@@ -452,10 +540,14 @@ def main() -> None:
                 obs, r_, done, _ = envs.step(a_t)
                 reward = np.clip(reward + r_, 0, 1)
                 steps += 1
+        # rollout_seed ЛЕЖИТ В КАЖДОМ ЭПИЗОДЕ, а не только в шапке файла:
+        # агрегатор сверяет его у обеих рук пары и отказывается сравнивать
+        # эпизоды, раскатанные с разными сидами.
         return [dict(success=bool(reward[i] >= 1.0), env_steps=steps,
                      policy_calls=calls, init_state_id=args.init_start + i,
                      env_index=i, init_hash=init_hash[i],
-                     init_hash_full=init_hash_full[i])
+                     init_hash_full=init_hash_full[i],
+                     rollout_seed=roll_seed)
                 for i in range(args.n_envs)]
 
     t0 = time.time()
@@ -497,7 +589,9 @@ def main() -> None:
                        suite=args.task_suite, pos_offset=pos_off,
                        ensemble=args.ensemble, init_start=args.init_start,
                        n_envs=args.n_envs, task_description=task_desc,
-                       seed=args.seed, ckpt=args.ckpt, joint=policy_meta,
+                       seed=args.seed, rollout_seed=roll_seed,
+                       rollout_seed_mode=args.rollout_seed_mode,
+                       ckpt=args.ckpt, joint=policy_meta,
                        script_sha1=sha, argv=vars(args)),
                   open(args.out, "w"), ensure_ascii=False, indent=1)
         print(f"  сохранено: {args.out}  (sha {sha})")
