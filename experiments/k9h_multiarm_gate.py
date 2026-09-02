@@ -292,6 +292,49 @@ def main() -> None:
         tb = json.load(open(args.offset_table))
         pos_off = int(tb["offsets_by_suite"][args.task_suite][args.task_id])
 
+    # ЧЕКПОЙНТ ПРОВЕРЯЕТСЯ ДО СОЗДАНИЯ СРЕД. Раньше эти проверки стояли после
+    # get_envs, и сообщение об отказе тонуло в десятках предупреждений
+    # robosuite от десяти процессов сред — на поиск строки «чекпойнт
+    # source=None» ушло больше времени, чем на саму ошибку. torch.load с
+    # map_location="cpu" CUDA не инициализирует, поэтому порядок «среды до
+    # модели» не нарушается.
+    ck_obj, weights_sha = None, None
+    if args.policy == "fast":
+        if not os.path.exists(args.policy_ckpt):
+            raise SystemExit(f"нет файла {args.policy_ckpt}")
+        h = hashlib.sha1()
+        with open(args.policy_ckpt, "rb") as fh:
+            for c in iter(lambda: fh.read(1 << 22), b""):
+                h.update(c)
+        weights_sha = h.hexdigest()[:12]
+        ck_obj = torch.load(args.policy_ckpt, map_location="cpu",
+                            weights_only=False)
+        d_ck = int(ck_obj["depth"])
+        if args.expect_depth is not None and d_ck != args.expect_depth:
+            raise SystemExit(f"чекпойнт глубины {d_ck}, ожидалась "
+                             f"{args.expect_depth}")
+        src = ck_obj.get("source")
+        if args.expect_source is not None and src != args.expect_source:
+            raise SystemExit(
+                f"чекпойнт source={src!r}, ожидалось {args.expect_source!r}. "
+                f"Чекпойнты k9c старше поля source: для них --expect-source "
+                f"не задают вовсе (в раннере это EXPECT_SOURCE= пустой).")
+        cur_vla = hashlib.sha1(open(jv.__file__, "rb").read()).hexdigest()[:12]
+        if args.expect_source is not None:
+            for fld in ("joint12_vla_sha1", "trunk_digest"):
+                if ck_obj.get(fld) is None:
+                    raise SystemExit(
+                        f"в чекпойнте нет {fld}, а --expect-source задан: "
+                        f"происхождение не подтверждено. Пересоберите k9g.")
+        if ck_obj.get("joint12_vla_sha1") not in (None, cur_vla):
+            raise SystemExit(
+                f"чекпойнт собран на joint12_vla.py sha "
+                f"{ck_obj['joint12_vla_sha1']}, а сейчас {cur_vla}. "
+                f"forward_joint_fast определяет исполняемую сеть не меньше, "
+                f"чем веса.")
+        print(f"  чекпойнт проверен: глубина {d_ck}, source={src}, "
+              f"веса sha {weights_sha}", flush=True)
+
     # СРЕДЫ ДО МОДЕЛИ: fork после инициализации CUDA вешает процесс. Порядок
     # тот же, что в K-6h/K-9d, и от него зависит расход глобального ГСЧ, то
     # есть начальные состояния. Менять нельзя.
@@ -307,17 +350,9 @@ def main() -> None:
 
     policy_meta, depth = None, 24
     if args.policy == "fast":
-        h = hashlib.sha1()
-        with open(args.policy_ckpt, "rb") as fh:
-            for c in iter(lambda: fh.read(1 << 22), b""):
-                h.update(c)
-        weights_sha = h.hexdigest()[:12]
-        obj = torch.load(args.policy_ckpt, map_location="cpu",
-                         weights_only=False)
+        # Метаданные уже проверены до создания сред; здесь только веса.
+        obj = ck_obj
         depth = int(obj["depth"])
-        if args.expect_depth is not None and depth != args.expect_depth:
-            raise SystemExit(f"чекпойнт глубины {depth}, ожидалась "
-                             f"{args.expect_depth}")
         model.init_joint_fast(depth=depth)
         state = obj["state"]
         stray = [k for k in state
@@ -346,43 +381,27 @@ def main() -> None:
         if args.expect_source is not None and src != args.expect_source:
             raise SystemExit(f"чекпойнт source={src!r}, ожидалось "
                              f"{args.expect_source!r}")
-        # ПРИ ЗАДАННОМ --expect-source ОТСУТСТВИЕ ПОЛЯ САМО ЕСТЬ ОШИБКА.
-        # Условная проверка «сверить, если поле есть» открыта настежь: старый
-        # чекпойнт с правильным source, но без доказательств происхождения,
-        # прошёл бы её молча.
-        strict = args.expect_source is not None
-        cur_vla = hashlib.sha1(open(jv.__file__, "rb").read()).hexdigest()[:12]
-        ck_vla = obj.get("joint12_vla_sha1")
-        if strict and ck_vla is None:
-            raise SystemExit(
-                "в чекпойнте нет joint12_vla_sha1, а --expect-source задан: "
-                "происхождение не подтверждено. Пересоберите через k9g.")
-        if ck_vla is not None and ck_vla != cur_vla:
-            raise SystemExit(
-                f"чекпойнт собран на joint12_vla.py sha {ck_vla}, а сейчас "
-                f"{cur_vla}. forward_joint_fast определяет исполняемую сеть "
-                f"не меньше, чем веса.")
-        # ОТПЕЧАТОК СТВОЛА. Для frozen12_rstar он обязан совпасть с записанным
-        # конвертером: «замороженный» — утверждение о весах, а не о названии.
+        # ОТПЕЧАТОК СТВОЛА считается только здесь: он требует загруженного
+        # state, а сверять его есть с чем лишь у чекпойнтов от k9g.
         dig = trunk_digest(state)
         ck_dig = obj.get("trunk_digest")
-        if strict and ck_dig is None:
-            raise SystemExit(
-                "в чекпойнте нет trunk_digest, а --expect-source задан: "
-                "«замороженность» ствола ничем не подтверждена. "
-                "Пересоберите через k9g.")
         if ck_dig is not None and ck_dig != dig:
             raise SystemExit(
                 f"отпечаток ствола {dig} против {ck_dig} в чекпойнте — веса "
                 f"ствола изменились после сборки")
         policy_meta = dict(path=os.path.abspath(args.policy_ckpt),
                            weights_sha1=weights_sha, depth=depth,
-                           tensors=len(state), source=src,
+                           tensors=len(state), source=obj.get("source"),
                            built_by_sha1=obj.get("sha1"),
                            rstar_sha1=obj.get("rstar_sha1"),
-                           trunk_digest=dig, joint12_vla_sha1=cur_vla)
+                           trunk_digest=dig,
+                           trunk_digest_verified=ck_dig is not None,
+                           joint12_vla_sha1=hashlib.sha1(
+                               open(jv.__file__, "rb").read()).hexdigest()[:12])
         print(f"  политика fast: {len(state)} тензоров, глубина {depth}, "
-              f"веса sha {weights_sha}, source={src}, ствол {dig}")
+              f"веса sha {weights_sha}, source={obj.get('source')}, "
+              f"ствол {dig}"
+              + ("" if ck_dig is not None else " (в чекпойнте не записан)"))
     else:
         # init_joint_fast НЕ ВЫЗЫВАЕТСЯ: он создаёт fast_head и сдвигает
         # аллокатор, а в K-9b именно сдвиг аллокатора давал расхождение
