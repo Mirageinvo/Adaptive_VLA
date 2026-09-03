@@ -188,20 +188,26 @@ def main() -> None:
         raise SystemExit(f"нет файлов по {args.glob}")
     cells = defaultdict(dict)     # (tag,suite,task,ens,H,init_id) -> {рука: ep}
     shas, ckpts = set(), set()
-    wsha = set()
+    # SHA ВЕСОВ ПРОВЕРЯЕТСЯ ПО КАЖДОЙ РУКЕ ОТДЕЛЬНО, а не глобально. Разные
+    # веса у РАЗНЫХ меток — это и есть смысл многорукого сравнения
+    # (frozen12_rstar и joint12 обязаны отличаться). Ошибка — два разных
+    # набора весов у ОДНОЙ метки: тогда часть её ячеек посчитана другой сетью.
+    # Первая версия этой проверки была глобальной и падала на законных данных.
+    wsha_by_arm = defaultdict(set)
+    vlasha = set()
     for f in files:
         d = json.load(open(f))
         shas.add(d.get("script_sha1", "?")); ckpts.add(d.get("ckpt", "?"))
-        # SHA ВЕСОВ И SHA МОДУЛЯ ИНФЕРЕНСА. Путь к чекпойнту не удостоверяет
-        # ничего: best_imitation.pt перезаписывается каждой лучшей эпохой.
-        j = d.get("joint")
-        if isinstance(j, dict):
-            wsha.add((j.get("weights_sha1", "?"),
-                      j.get("joint12_vla_sha1", "?")))
         if args.field not in d:
             raise SystemExit(
                 f"в {f} нет поля «{args.field}» — файл получен другим "
                 f"скриптом. Проверьте --glob и --field.")
+        # Путь к чекпойнту не удостоверяет ничего: best_imitation.pt
+        # перезаписывается каждой лучшей эпохой. Удостоверяет sha весов.
+        j = d.get("joint")
+        if isinstance(j, dict):
+            wsha_by_arm[str(d[args.field])].add(j.get("weights_sha1", "?"))
+            vlasha.add(j.get("joint12_vla_sha1", "?"))
         # run_tag В КЛЮЧЕ: ячейки K-6h и K-9d могут лежать рядом и совпадать по
         # (suite, task, ens, H, init_id). Без тега они молча склеились бы в
         # одну пару, и сравнивались бы эпизоды из разных экспериментов.
@@ -226,15 +232,23 @@ def main() -> None:
         print(f"  ВНИМАНИЕ: файлы получены РАЗНЫМИ версиями скрипта: {shas}")
     if len(ckpts) > 1:
         raise SystemExit(f"разные чекпойнты в одном сравнении: {ckpts}")
-    if len(wsha) > 1:
+    mixed = {a: s for a, s in wsha_by_arm.items() if len(s) > 1}
+    if mixed:
         raise SystemExit(
-            f"в одном сравнении смешаны разные веса или разные версии "
-            f"joint12_vla.py: {sorted(wsha)}.\nЭто значит, что часть ячеек "
+            f"у одной и той же руки смешаны РАЗНЫЕ веса: "
+            f"{ {a: sorted(s) for a, s in mixed.items()} }.\nЧасть её ячеек "
             f"посчитана другой сетью. Развёртку надо вести в каталоге, "
             f"привязанном к sha весов.")
-    if wsha:
-        print(f"  Joint: веса sha {sorted(wsha)[0][0]}, "
-              f"joint12_vla sha {sorted(wsha)[0][1]}")
+    # ВЕРСИЯ МОДУЛЯ ИНФЕРЕНСА обязана быть одна у всех рук: forward_joint_fast
+    # определяет исполняемую сеть не меньше, чем веса.
+    if len(vlasha) > 1:
+        raise SystemExit(
+            f"руки исполнены разными версиями joint12_vla.py: "
+            f"{sorted(vlasha)}. Сравнение недействительно.")
+    for a in sorted(wsha_by_arm):
+        print(f"  рука {a}: веса sha {sorted(wsha_by_arm[a])[0]}")
+    if vlasha:
+        print(f"  joint12_vla sha {sorted(vlasha)[0]}")
 
     print(f"  файлов {len(files)}, ячеек {len(cells)}; "
           f"{args.field}: испытуемая {A}, опора {B}")
