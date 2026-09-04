@@ -267,6 +267,8 @@ def main() -> None:
     ap.add_argument("--horizons", default="4,8,12,16")
     ap.add_argument("--gate-horizon", type=int, default=8)
     ap.add_argument("--min-travel", type=float, default=0.02)
+    ap.add_argument("--speed-frac", type=float, default=0.3)
+    ap.add_argument("--min-dwell", type=int, default=3)
     ap.add_argument("--good", type=float, default=2.5)
     ap.add_argument("--bad", type=float, default=1.5)
     ap.add_argument("--seed", type=int, default=0)
@@ -305,8 +307,15 @@ def main() -> None:
             continue
         if len(acts) < 40:
             continue
+        # ТОЛЬКО ИМЕНОВАННЫЕ АРГУМЕНТЫ. Позиционный вызов
+        # `stop_events(xyz, args.min_travel)` клал 0.02 в speed_frac, то есть
+        # порог был 2% медианной скорости вместо 30% — в пятнадцать раз
+        # строже. Самопроверка не поймала: в синтетике паузы идеальные, там
+        # любой порог срабатывает.
         ev = dict(grip=grip_events(acts),
-                  stop=stop_events(st[:, :3], args.min_travel))
+                  stop=stop_events(st[:, :3], speed_frac=args.speed_frac,
+                                   min_dwell=args.min_dwell,
+                                   min_travel=args.min_travel))
         for d in acc:
             for h in hz:
                 r = persistence(ev[d], len(acts), h)
@@ -325,7 +334,7 @@ def main() -> None:
     for d in ("grip", "stop"):
         name = "схват" if d == "grip" else "остановка"
         print(f"  событие «{name}»:")
-        print(f"    {'H':>4}{'вызовов/целей':>15}{'NO_EDIT':>10}"
+        print(f"    {'H':>4}{'micro':>9}{'macro':>9}{'NO_EDIT':>10}"
               f"{'событий':>10}{'хвост':>9}")
         res[d] = {}
         for h in hz:
@@ -335,9 +344,18 @@ def main() -> None:
                  for k in ("no_edit", "phase_calls_mean", "phase_calls_median",
                            "n_events", "n_calls", "s_max", "n_goals",
                            "tail_calls", "tail_frac")}
+            # MICRO — ОБЩЕЕ СОКРАЩЕНИЕ, macro — среднее отношений по
+            # эпизодам. Для «во сколько раз меньше обращений суммарно» верно
+            # micro; macro завышает, потому что короткие эпизоды с одной
+            # целью дают большие отношения и тянут среднее вверх.
+            m["s_macro"] = m.pop("s_max")
+            m["s_micro"] = (sum(r["n_calls"] for r in acc[d][h])
+                            / max(sum(r["n_goals"] for r in acc[d][h]), 1))
+            m["s_max"] = m["s_micro"]
             res[d][str(h)] = m
-            print(f"    {h:>4}{m['s_max']:>14.2f}{m['no_edit']:>9.1%}"
-                  f"{m['n_events']:>10.1f}{m['tail_frac']:>8.1%}")
+            print(f"    {h:>4}{m['s_micro']:>9.2f}{m['s_macro']:>9.2f}"
+                  f"{m['no_edit']:>9.1%}{m['n_events']:>10.1f}"
+                  f"{m['tail_frac']:>8.1%}")
         print()
 
     g = res["grip"].get(str(args.gate_horizon))
@@ -351,7 +369,8 @@ def main() -> None:
     for d, r in (("схват", g), ("остановка", s)):
         if r is None:
             continue
-        print(f"  событие «{d}»: вызовов/целей {r['s_max']:.2f}, "
+        print(f"  событие «{d}»: micro {r['s_micro']:.2f} "
+              f"(macro {r['s_macro']:.2f}), "
               f"NO_EDIT {r['no_edit']:.1%}, хвост {r['tail_frac']:.1%} — "
               f"{read_rule(r['s_max'], r['n_events'], r['tail_frac'], args.good, args.bad)}")
     print("\n  ЭТО ВЕРХНЯЯ ОЦЕНКА. Она предполагает монитор, который узнаёт")
