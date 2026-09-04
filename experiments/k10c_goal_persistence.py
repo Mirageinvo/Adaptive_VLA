@@ -17,20 +17,26 @@
 ДВА ОПРЕДЕЛЕНИЯ СОБЫТИЯ, оба проверяются:
   * СХВАТ — смена знака команды схвата. Их немного (обычно 2-4 за эпизод), они
     надёжны и именно знак схвата объяснял сохранность успеха в K-6h;
-  * ОСТАНОВКА — локальный минимум скорости после значимого перемещения. Их
-    больше, они дробят эпизод мельче и дают нижнюю оценку персистентности.
+  * ОСТАНОВКА — участок низкой скорости достаточной длительности после
+    значимого перемещения. Их больше, они дробят эпизод мельче и дают нижнюю
+    оценку персистентности.
 
-ЧТО ПЕЧАТАЕТСЯ И КАК ЧИТАТЬ. Главная величина — доля вызовов, на которых цель
-ТА ЖЕ, что на предыдущем вызове; это и есть предельная доля `NO_EDIT`. Рядом —
-средняя длина фазы в вызовах, то есть во сколько раз можно было бы сократить
-обращения к VLA при идеальном мониторе.
+ЧТО ПЕЧАТАЕТСЯ И КАК ЧИТАТЬ. Главная величина — отношение числа вызовов к
+числу целей: во сколько раз можно было бы сократить обращения к VLA при
+идеальном мониторе. Доля `NO_EDIT` печатается рядом СПРАВОЧНО и систематически
+завышает выигрыш. Отдельно печатается доля вызовов после последнего события:
+там цель одна по построению, и большой хвост означает, что весь выигрыш держится
+на конце эпизода.
 
 ПРЕ-РЕГИСТРИРОВАННОЕ ЧТЕНИЕ, записано ДО запуска (горизонт H=8):
-  * доля NO_EDIT >= 0.60 -> цель переживает в среднем более двух вызовов,
-    направление живо;
-  * <= 0.30 -> цель меняется почти каждый вызов, экономии нет,
+  * отношение «вызовов к целям» >= 2.5 -> обращений к VLA можно было бы
+    сделать в 2.5 раза меньше, направление живо;
+  * <= 1.5 -> цель меняется почти каждый вызов, экономии нет,
     направление закрывается;
   * между -> не доказано ничего.
+Вердикт выносится по ЭТОМУ отношению, а не по доле NO_EDIT: последняя
+считается на сетке вызовов и теряет события, попавшие между двумя вызовами,
+поэтому систематически завышает выигрыш.
 
 ЧЕГО ЭТО НЕ ДОКАЗЫВАЕТ. Верхнюю оценку, а не достижимую: она предполагает
 идеальный дешёвый монитор, который распознаёт достижение цели, не запуская
@@ -59,22 +65,45 @@ def grip_events(actions):
     return np.where(np.diff(s) != 0)[0] + 1
 
 
-def stop_events(state_xyz, min_travel=0.02, win=3):
-    """Локальные минимумы скорости после значимого перемещения.
+def stop_events(state_xyz, speed_frac=0.3, min_dwell=3, min_travel=0.02):
+    """Остановки: участки НИЗКОЙ скорости достаточной длительности.
 
-    Событием считается точка, где скорость локально минимальна И с прошлого
-    события пройдено не меньше min_travel. Порог нужен, иначе каждая пауза в
-    шуме объявляется целью и персистентность занижается искусственно.
+    ПОЧЕМУ НЕ «ЛОКАЛЬНЫЙ МИНИМУМ». Первая версия искала точки, где скорость
+    не больше соседних с допуском 1e-12. При РАВНОМЕРНОМ движении все скорости
+    равны, значит каждая точка проходит проверку: на прямой из 300 шагов
+    находилось 73 несуществующие остановки. Самопроверка это пропустила,
+    потому что была написана как `assert len(...) >= 0` — истинное всегда.
+
+    Здесь остановка определяется абсолютно, а не относительно соседей:
+    скорость ниже доли `speed_frac` от медианной по эпизоду, подряд не менее
+    `min_dwell` шагов. При равномерном движении скорость РАВНА медианной и
+    порога не пересекает ни разу — ровно ноль событий.
+
+    Дополнительно требуется перемещение не меньше `min_travel` с прошлого
+    принятого события: иначе дрожание на месте дробится на много «целей».
     """
-    v = np.linalg.norm(np.diff(state_xyz, axis=0), axis=1)
-    if len(v) < 2 * win + 1:
+    xyz = np.asarray(state_xyz, np.float64)
+    v = np.linalg.norm(np.diff(xyz, axis=0), axis=1)
+    if len(v) < min_dwell:
         return np.array([], np.int64)
-    ev, last = [], 0
-    for i in range(win, len(v) - win):
-        if v[i] <= v[i - win:i + win + 1].min() + 1e-12:
-            travel = np.linalg.norm(state_xyz[i] - state_xyz[last])
-            if travel >= min_travel:
-                ev.append(i); last = i
+    med = float(np.median(v))
+    if med <= 0:
+        return np.array([], np.int64)          # робот не двигался вовсе
+    slow = v < speed_frac * med
+    ev, last, i = [], 0, 0
+    n = len(slow)
+    while i < n:
+        if not slow[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and slow[j]:
+            j += 1
+        if j - i >= min_dwell:
+            c = (i + j) // 2                   # середина остановки
+            if np.linalg.norm(xyz[c] - xyz[last]) >= min_travel:
+                ev.append(c); last = c
+        i = j
     return np.asarray(ev, np.int64)
 
 
@@ -102,18 +131,36 @@ def persistence(events, n_steps, horizon):
         else:
             lens.append(cur); cur = 1
     lens.append(cur)
+    # ТОЧНЫЙ ВЕРХНИЙ ПРЕДЕЛ СОКРАЩЕНИЯ. Доля NO_EDIT меряет разреженность
+    # ВЫБРАННЫХ СОБЫТИЙ на сетке вызовов и может завышать выигрыш: события,
+    # попавшие между двумя вызовами, в ней теряются. Прямой учёт числа целей
+    # от этого свободен: целей ровно на одну больше, чем событий.
+    n_goal = int(len(ev)) + 1
+    s_max = len(calls) / n_goal
+    # ХВОСТ ПОСЛЕ ПОСЛЕДНЕГО СОБЫТИЯ автоматически объявляется одной целью и
+    # тянет результат вверх. Печатается отдельно, чтобы это было видно.
+    tail = int((calls > (ev[-1] if len(ev) else -1)).sum())
     return dict(n_calls=int(len(calls)), n_events=int(len(ev)),
+                n_goals=n_goal, s_max=float(s_max),
+                tail_calls=int(tail),
+                tail_frac=float(tail / max(len(calls), 1)),
                 no_edit=float(same.mean()),
                 phase_calls_mean=float(np.mean(lens)),
                 phase_calls_median=float(np.median(lens)))
 
 
-def read_rule(no_edit, good=0.60, bad=0.30):
-    if no_edit is None:
+def read_rule(s_max, good=2.5, bad=1.5):
+    """Вердикт по ПРЯМОМУ УЧЁТУ целей, а не по доле NO_EDIT.
+
+    NO_EDIT считается на сетке вызовов и теряет события, попавшие между двумя
+    вызовами, поэтому завышает выигрыш. Отношение «вызовов к целям» от этого
+    свободно: целей ровно на одну больше, чем событий.
+    """
+    if s_max is None:
         return "недействительно"
-    if no_edit >= good:
-        return "ЦЕЛЬ ПЕРЕЖИВАЕТ ВЫЗОВЫ: направление живо"
-    if no_edit <= bad:
+    if s_max >= good:
+        return f"ЦЕЛЬ ПЕРЕЖИВАЕТ ВЫЗОВЫ: до {s_max:.1f}x меньше обращений"
+    if s_max <= bad:
         return "ЦЕЛЬ МЕНЯЕТСЯ ПОЧТИ КАЖДЫЙ ВЫЗОВ: экономии нет"
     return "НЕ ДОКАЗАНО НИЧЕГО"
 
@@ -144,16 +191,48 @@ def selftest():
     ev = list(range(0, 200, 20))
     assert persistence(ev, 200, 4)["no_edit"] > persistence(ev, 200, 16)["no_edit"]
 
-    # Порог перемещения не даёт объявлять целью каждую паузу в шуме.
-    rng = np.random.default_rng(0)
-    xyz = np.cumsum(rng.normal(0, 1e-4, size=(300, 3)), axis=0)
-    assert len(stop_events(xyz, min_travel=0.02)) == 0
+    # РАВНОМЕРНОЕ ДВИЖЕНИЕ — РОВНО НОЛЬ СОБЫТИЙ. Прежняя реализация искала
+    # локальный минимум с допуском и находила здесь 73 остановки, а прежняя
+    # самопроверка была написана как `assert len(...) >= 0` и не могла упасть.
     line = np.stack([np.linspace(0, 1, 300)] * 3, 1)
-    assert len(stop_events(line, min_travel=0.02)) >= 0   # монотонное движение
+    assert len(stop_events(line)) == 0, len(stop_events(line))
 
-    assert "ПЕРЕЖИВАЕТ" in read_rule(0.7)
-    assert "экономии нет" in read_rule(0.2)
-    assert "НЕ ДОКАЗАНО" in read_rule(0.45)
+    # ДРОЖАНИЕ НА МЕСТЕ — тоже ноль: перемещения нет, порог travel не пройден.
+    rng = np.random.default_rng(0)
+    assert len(stop_events(np.cumsum(rng.normal(0, 1e-4, (300, 3)), 0))) == 0
+
+    # НЕПОДВИЖНОСТЬ — ноль, а не деление на ноль.
+    assert len(stop_events(np.zeros((300, 3)))) == 0
+
+    # СИНТЕТИЧЕСКОЕ stop-go: три паузы в известных местах, три события.
+    seg, pause = 40, 10
+    parts = []
+    pos = np.zeros(3)
+    for k in range(4):
+        step = np.array([0.01, 0.0, 0.0])
+        parts.append(pos + np.arange(1, seg + 1)[:, None] * step)
+        pos = parts[-1][-1]
+        if k < 3:
+            parts.append(np.repeat(pos[None], pause, axis=0))
+    xyz = np.concatenate(parts)
+    ev = stop_events(xyz, min_travel=0.05)
+    assert len(ev) == 3, f"ждали 3 остановки, нашли {len(ev)}: {ev}"
+    for e, want in zip(ev, [seg, 2 * seg + pause, 3 * seg + 2 * pause]):
+        assert abs(int(e) - want) <= pause, (e, want)
+
+    # ПОРОГ ПЕРЕМЕЩЕНИЯ работает: при огромном min_travel событий нет.
+    assert len(stop_events(xyz, min_travel=10.0)) == 0
+
+    # УЧЁТ СОКРАЩЕНИЯ. Целей на одну больше, чем событий; хвост считается.
+    p = persistence([50], 100, 8)
+    assert p["n_goals"] == 2 and abs(p["s_max"] - 13 / 2) < 1e-12, p
+    assert p["tail_calls"] == 6, p            # вызовы 56,64,...,96
+    assert persistence([], 100, 8)["tail_frac"] == 1.0
+
+    assert "ПЕРЕЖИВАЕТ" in read_rule(4.0)
+    assert "экономии нет" in read_rule(1.1)
+    assert "НЕ ДОКАЗАНО" in read_rule(2.0)
+    assert read_rule(None) == "недействительно"
     print("самопроверка k10c пройдена (версия «фаза в вызовах»): события "
           "схвата, персистентность на четырёх случаях, зависимость от "
           "горизонта, порог перемещения")
@@ -166,8 +245,8 @@ def main() -> None:
     ap.add_argument("--horizons", default="4,8,12,16")
     ap.add_argument("--gate-horizon", type=int, default=8)
     ap.add_argument("--min-travel", type=float, default=0.02)
-    ap.add_argument("--good", type=float, default=0.60)
-    ap.add_argument("--bad", type=float, default=0.30)
+    ap.add_argument("--good", type=float, default=2.5)
+    ap.add_argument("--bad", type=float, default=1.5)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
@@ -224,32 +303,35 @@ def main() -> None:
     for d in ("grip", "stop"):
         name = "схват" if d == "grip" else "остановка"
         print(f"  событие «{name}»:")
-        print(f"    {'H':>4}{'NO_EDIT':>10}{'фаза, вызовов':>16}"
-              f"{'событий/эпизод':>17}")
+        print(f"    {'H':>4}{'вызовов/целей':>15}{'NO_EDIT':>10}"
+              f"{'событий':>10}{'хвост':>9}")
         res[d] = {}
         for h in hz:
             if not acc[d][h]:
                 continue
             m = {k: float(np.mean([r[k] for r in acc[d][h]]))
                  for k in ("no_edit", "phase_calls_mean", "phase_calls_median",
-                           "n_events", "n_calls")}
+                           "n_events", "n_calls", "s_max", "n_goals",
+                           "tail_calls", "tail_frac")}
             res[d][str(h)] = m
-            print(f"    {h:>4}{m['no_edit']:>9.1%}{m['phase_calls_mean']:>15.2f}"
-                  f"{m['n_events']:>16.1f}")
+            print(f"    {h:>4}{m['s_max']:>14.2f}{m['no_edit']:>9.1%}"
+                  f"{m['n_events']:>10.1f}{m['tail_frac']:>8.1%}")
         print()
 
     g = res["grip"].get(str(args.gate_horizon))
     s = res["stop"].get(str(args.gate_horizon))
     print(f"  ЧИТАТЬ по горизонту {args.gate_horizon} — наше исполняемое окно.")
-    print(f"  NO_EDIT это доля вызовов, где цель ТА ЖЕ, что на предыдущем;")
-    print(f"  «фаза, вызовов» — во сколько раз можно было бы сократить")
-    print(f"  обращения к VLA при ИДЕАЛЬНОМ дешёвом мониторе.\n")
+    print(f"  «вызовов/целей» — во сколько раз можно было бы сократить")
+    print(f"  обращения к VLA при ИДЕАЛЬНОМ дешёвом мониторе. NO_EDIT дан")
+    print(f"  для справки и завышает выигрыш. «Хвост» — доля вызовов после")
+    print(f"  последнего события: там цель одна по построению, и большой")
+    print(f"  хвост означает, что выигрыш держится на конце эпизода.\n")
     for d, r in (("схват", g), ("остановка", s)):
         if r is None:
             continue
-        print(f"  событие «{d}»: NO_EDIT {r['no_edit']:.1%}, фаза "
-              f"{r['phase_calls_mean']:.2f} вызова — "
-              f"{read_rule(r['no_edit'], args.good, args.bad)}")
+        print(f"  событие «{d}»: вызовов/целей {r['s_max']:.2f}, "
+              f"NO_EDIT {r['no_edit']:.1%}, хвост {r['tail_frac']:.1%} — "
+              f"{read_rule(r['s_max'], args.good, args.bad)}")
     print("\n  ЭТО ВЕРХНЯЯ ОЦЕНКА. Она предполагает монитор, который узнаёт")
     print("  достижение цели НЕ ЗАПУСКАЯ VLA. Без такого монитора пропустить")
     print("  вызов нельзя вовсе, и этот вопрос здесь не решается.")
