@@ -257,7 +257,14 @@ def main() -> None:
                               zip(epi[sel], stp[sel])],
                    eval_remaining=[int(x) for x in rem],
                    cache=os.path.abspath(args.cache), ckpt=args.ckpt,
-                   script_sha1=sha, argv=vars(args)),
+                   script_sha1=sha,
+                   goal_events_sha1=hashlib.sha1(
+                       open(ge.__file__, "rb").read()).hexdigest()[:12],
+                   event_params=dict(speed_frac=args.speed_frac,
+                                     min_dwell=args.min_dwell,
+                                     min_travel=args.min_travel,
+                                     merge_tol=args.merge_tol),
+                   argv=vars(args)),
               open(args.out, "w"), ensure_ascii=False, indent=1)
     print(f"\n  сохранено: {args.out}  (sha {sha})")
 

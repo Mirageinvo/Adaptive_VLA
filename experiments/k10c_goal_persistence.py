@@ -57,77 +57,8 @@ import sys
 
 import numpy as np
 
-
-def grip_events(actions):
-    """Индексы смены знака команды схвата (канал 6)."""
-    s = np.sign(actions[:, 6])
-    s[s == 0] = 1.0
-    return np.where(np.diff(s) != 0)[0] + 1
-
-
-def stop_events(state_xyz, speed_frac=0.3, min_dwell=3, min_travel=0.02):
-    """Остановки: участки НИЗКОЙ скорости достаточной длительности.
-
-    ПОЧЕМУ НЕ «ЛОКАЛЬНЫЙ МИНИМУМ». Первая версия искала точки, где скорость
-    не больше соседних с допуском 1e-12. При РАВНОМЕРНОМ движении все скорости
-    равны, значит каждая точка проходит проверку: на прямой из 300 шагов
-    находилось 73 несуществующие остановки. Самопроверка это пропустила,
-    потому что была написана как `assert len(...) >= 0` — истинное всегда.
-
-    Здесь остановка определяется абсолютно, а не относительно соседей:
-    скорость ниже доли `speed_frac` от медианной по эпизоду, подряд не менее
-    `min_dwell` шагов. При равномерном движении скорость РАВНА медианной и
-    порога не пересекает ни разу — ровно ноль событий.
-
-    Дополнительно требуется перемещение не меньше `min_travel` с прошлого
-    принятого события: иначе дрожание на месте дробится на много «целей».
-    """
-    xyz = np.asarray(state_xyz, np.float64)
-    v = np.linalg.norm(np.diff(xyz, axis=0), axis=1)
-    if len(v) < min_dwell:
-        return np.array([], np.int64)
-    med = float(np.median(v))
-    if med <= 0:
-        return np.array([], np.int64)          # робот не двигался вовсе
-    slow = v < speed_frac * med
-    ev, last, i = [], 0, 0
-    n = len(slow)
-    while i < n:
-        if not slow[i]:
-            i += 1
-            continue
-        j = i
-        while j < n and slow[j]:
-            j += 1
-        if j - i >= min_dwell:
-            c = (i + j) // 2                   # середина остановки
-            if np.linalg.norm(xyz[c] - xyz[last]) >= min_travel:
-                ev.append(c); last = c
-        i = j
-    return np.asarray(ev, np.int64)
-
-
-def merge_events(a, b, tol):
-    """Объединение двух наборов событий со слиянием близких.
-
-    ЗАЧЕМ. Схват и остановка могут отмечать ОДИН И ТОТ ЖЕ момент: рука
-    замедляется, чтобы схватить. Тогда согласие двух чисел не является
-    независимым подтверждением. А если контроллеру надо перепланировать при
-    любом из событий, целей столько, сколько в ОБЪЕДИНЕНИИ, и выигрыш меньше.
-
-    События, отстоящие не больше чем на tol шагов, считаются одним.
-    """
-    all_ev = np.sort(np.concatenate([np.asarray(a, np.int64),
-                                     np.asarray(b, np.int64)]))
-    if len(all_ev) == 0:
-        return all_ev, 0
-    keep, dup = [all_ev[0]], 0
-    for e in all_ev[1:]:
-        if e - keep[-1] <= tol:
-            dup += 1
-        else:
-            keep.append(e)
-    return np.asarray(keep, np.int64), dup
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import goal_events as ge  # noqa: E402
 
 
 def persistence(events, n_steps, horizon):
@@ -204,103 +135,31 @@ def read_rule(s_max, n_events=None, tail_frac=None,
 
 
 def selftest():
-    # Смена знака схвата ловится ровно на переходе, а не на каждом шаге.
-    a = np.zeros((20, 7)); a[:, 6] = 1.0; a[7:, 6] = -1.0
-    assert list(grip_events(a)) == [7], grip_events(a)
-    a2 = np.zeros((20, 7)); a2[:, 6] = 1.0
-    assert len(grip_events(a2)) == 0
+    ge.selftest()
 
-    # ПЕРСИСТЕНТНОСТЬ. Одно событие в середине: все вызовы кроме одного
-    # делят цель, значит доля NO_EDIT высокая.
+    # ПЕРСИСТЕНТНОСТЬ. Одно событие в середине: почти все вызовы делят цель.
     r = persistence([50], 100, 8)
-    assert r["n_calls"] == 13
-    assert r["no_edit"] > 0.9, r
-
-    # События на каждом вызове: цель меняется всегда, NO_EDIT равен нулю.
-    r2 = persistence(list(range(0, 100, 8)), 100, 8)
-    assert r2["no_edit"] < 0.1, r2
-
-    # Событий нет вовсе: цель одна на весь эпизод.
+    assert r["n_calls"] == 13 and r["no_edit"] > 0.9, r
+    assert persistence(list(range(0, 100, 8)), 100, 8)["no_edit"] < 0.1
     r3 = persistence([], 100, 8)
     assert r3["no_edit"] == 1.0 and r3["phase_calls_mean"] == r3["n_calls"]
-
-    # ГОРИЗОНТ ВЛИЯЕТ В ПРАВИЛЬНУЮ СТОРОНУ: чем реже вызовы, тем чаще цель
-    # успевает смениться между ними.
     ev = list(range(0, 200, 20))
     assert persistence(ev, 200, 4)["no_edit"] > persistence(ev, 200, 16)["no_edit"]
 
-    # РАВНОМЕРНОЕ ДВИЖЕНИЕ — РОВНО НОЛЬ СОБЫТИЙ. Прежняя реализация искала
-    # локальный минимум с допуском и находила здесь 73 остановки, а прежняя
-    # самопроверка была написана как `assert len(...) >= 0` и не могла упасть.
-    line = np.stack([np.linspace(0, 1, 300)] * 3, 1)
-    assert len(stop_events(line)) == 0, len(stop_events(line))
-
-    # ДРОЖАНИЕ НА МЕСТЕ — тоже ноль: перемещения нет, порог travel не пройден.
-    rng = np.random.default_rng(0)
-    assert len(stop_events(np.cumsum(rng.normal(0, 1e-4, (300, 3)), 0))) == 0
-
-    # НЕПОДВИЖНОСТЬ — ноль, а не деление на ноль.
-    assert len(stop_events(np.zeros((300, 3)))) == 0
-
-    # СИНТЕТИЧЕСКОЕ stop-go: три паузы в известных местах, три события.
-    seg, pause = 40, 10
-    parts = []
-    pos = np.zeros(3)
-    for k in range(4):
-        step = np.array([0.01, 0.0, 0.0])
-        parts.append(pos + np.arange(1, seg + 1)[:, None] * step)
-        pos = parts[-1][-1]
-        if k < 3:
-            parts.append(np.repeat(pos[None], pause, axis=0))
-    xyz = np.concatenate(parts)
-    ev = stop_events(xyz, min_travel=0.05)
-    assert len(ev) == 3, f"ждали 3 остановки, нашли {len(ev)}: {ev}"
-    for e, want in zip(ev, [seg, 2 * seg + pause, 3 * seg + 2 * pause]):
-        assert abs(int(e) - want) <= pause, (e, want)
-
-    # ПОРОГ ПЕРЕМЕЩЕНИЯ работает: при огромном min_travel событий нет.
-    assert len(stop_events(xyz, min_travel=10.0)) == 0
-
-    # ПАУЗА С НЕНУЛЕВОЙ СКОРОСТЬЮ — тест, различающий значение speed_frac.
-    # Прежняя синтетика останавливалась РОВНО в ноль, и любой порог её ловил;
-    # поэтому она не поймала вызов с 0.02 вместо 0.3 (порог в пятнадцать раз
-    # строже), и вывод «остановок нет» полдня считался свойством данных.
-    # Здесь пауза идёт на 10% крейсерской скорости: 0.3 её видит, 0.02 нет.
-    parts, pos = [], np.zeros(3)
-    fast, slow_v = np.array([0.01, 0.0, 0.0]), np.array([0.001, 0.0, 0.0])
-    for k in range(4):
-        parts.append(pos + np.arange(1, seg + 1)[:, None] * fast)
-        pos = parts[-1][-1]
-        if k < 3:
-            parts.append(pos + np.arange(1, pause + 1)[:, None] * slow_v)
-            pos = parts[-1][-1]
-    soft = np.concatenate(parts)
-    n_ok = len(stop_events(soft, speed_frac=0.3, min_travel=0.05))
-    n_bad = len(stop_events(soft, speed_frac=0.02, min_travel=0.05))
-    assert n_ok == 3, f"при верном пороге ждали 3, нашли {n_ok}"
-    assert n_bad == 0, f"порог 0.02 обязан НЕ видеть паузу, нашёл {n_bad}"
-
-    # УЧЁТ СОКРАЩЕНИЯ. Целей на одну больше, чем событий; хвост считается.
+    # УЧЁТ СОКРАЩЕНИЯ: целей на одну больше, чем событий; хвост считается.
     p = persistence([50], 100, 8)
     assert p["n_goals"] == 2 and abs(p["s_max"] - 13 / 2) < 1e-12, p
-    assert p["tail_calls"] == 6, p            # вызовы 56,64,...,96
-    assert persistence([], 100, 8)["tail_frac"] == 1.0
+    assert p["tail_calls"] == 6 and persistence([], 100, 8)["tail_frac"] == 1.0
 
+    # ВЫРОЖДЕННЫЕ СЛУЧАИ ОТСЕКАЮТСЯ РАНЬШЕ ПОРОГОВ.
     assert "ПЕРЕЖИВАЕТ" in read_rule(4.0, n_events=2.2, tail_frac=0.17)
     assert "экономии нет" in read_rule(1.1, n_events=2.2, tail_frac=0.17)
     assert "НЕ ДОКАЗАНО" in read_rule(2.0, n_events=2.2, tail_frac=0.17)
     assert read_rule(None) == "недействительно"
-    # ВЫРОЖДЕННЫЕ СЛУЧАИ ОТСЕКАЮТСЯ РАНЬШЕ ПОРОГОВ. Прогон 200 эпизодов дал
-    # у детектора остановок 0.0 событий и хвост 98%, а правило выдало
-    # «до 19.4x меньше обращений» — успехом был объявлен отказ детектора.
     assert "НИЧЕГО НЕ НАШЁЛ" in read_rule(19.4, n_events=0.0, tail_frac=0.98)
     assert "ХВОСТ" in read_rule(19.4, n_events=3.0, tail_frac=0.98)
-    # Настоящий результат при тех же порогах читается как успех.
-    assert "ПЕРЕЖИВАЕТ" in read_rule(6.74, n_events=2.2, tail_frac=0.174)
-    print("самопроверка k10c пройдена (версия «фаза в вызовах»): события "
-          "схвата, персистентность на четырёх случаях, зависимость от "
-          "горизонта, порог перемещения")
-
+    print("самопроверка k10c пройдена (версия «общая разметка»): "
+          "персистентность, учёт целей, отсечение вырожденных случаев")
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -334,7 +193,7 @@ def main() -> None:
     order = rng.permutation(1693)[: args.n_ep * 2]
     hz = [int(x) for x in args.horizons.split(",")]
     acc = {d: {h: [] for h in hz} for d in ("grip", "stop", "union")}
-    overlap = []
+    ov_stop, ov_grip = [], []
     ep_len, n_used = [], 0
 
     for e in order:
@@ -357,15 +216,23 @@ def main() -> None:
         # порог был 2% медианной скорости вместо 30% — в пятнадцать раз
         # строже. Самопроверка не поймала: в синтетике паузы идеальные, там
         # любой порог срабатывает.
-        _g = grip_events(acts)
-        _s = stop_events(st[:, :3], speed_frac=args.speed_frac,
-                         min_dwell=args.min_dwell, min_travel=args.min_travel)
-        _u, _dup = merge_events(_g, _s, args.merge_tol)
-        n_pair = min(len(_g), len(_s))
-        if n_pair:
-            overlap.append(_dup / n_pair)
+        # РАЗМЕТКА ИЗ ОБЩЕГО МОДУЛЯ, тем же вызовом, что в K-10d и K-10e.
+        # Прежняя локальная копия сливала близкие события ОДНОГО типа и
+        # привязывала объединение к самому раннему, а не к схвату, поэтому
+        # число 4.54x относилось к другой сегментации, чем будет у гейта.
+        par = dict(speed_frac=args.speed_frac, min_dwell=args.min_dwell,
+                   min_travel=args.min_travel, merge_tol=args.merge_tol)
+        _g, _, _ = ge.label(acts, st[:, :3], kind="grip", **par)
+        _s, _, _ = ge.label(acts, st[:, :3], kind="stop", **par)
+        _u, _, _dup = ge.label(acts, st[:, :3], kind="union", **par)
+        # ДВЕ ДОЛИ, А НЕ ОДНА. `dup` — число остановок, слитых со схватом,
+        # причём каждая сливается не более чем в один схват. Делить его на
+        # min(n_grip, n_stop) значило бы смешивать два разных вопроса.
+        if len(_s):
+            ov_stop.append(_dup / len(_s))
+        if len(_g):
+            ov_grip.append(min(_dup, len(_g)) / len(_g))
         ev = dict(grip=_g, stop=_s, union=_u)
-        del _g, _s, _u
 
         for d in acc:
             for h in hz:
@@ -382,11 +249,17 @@ def main() -> None:
     print(f"\nэпизодов {n_used}, средняя длина {np.mean(ep_len):.0f} шагов\n")
 
     res = {}
-    if overlap:
-        print(f"  СОВПАДЕНИЕ СОБЫТИЙ: {float(np.mean(overlap)):.1%} слились "
-              f"при допуске {args.merge_tol} шагов.\n  Высокое совпадение "
-              f"означает, что два определения отмечают одно и то же, и\n  их "
-              f"согласие НЕ является независимым подтверждением.\n")
+    if ov_stop or ov_grip:
+        print(f"  СОВПАДЕНИЕ СОБЫТИЙ при допуске {args.merge_tol} шагов:")
+        if ov_stop:
+            print(f"    остановок, рядом с которыми есть схват: "
+                  f"{float(np.mean(ov_stop)):.1%}")
+        if ov_grip:
+            print(f"    схватов, рядом с которыми есть остановка: "
+                  f"{float(np.mean(ov_grip)):.1%}")
+        print(f"  Высокое совпадение означает, что два определения отмечают "
+              f"одно и то же,\n  и их согласие НЕ является независимым "
+              f"подтверждением.\n")
     for d in ("grip", "stop", "union"):
         name = {"grip": "схват", "stop": "остановка",
                 "union": "ОБЪЕДИНЕНИЕ"}[d]
@@ -440,8 +313,12 @@ def main() -> None:
                     exist_ok=True)
         json.dump(dict(by_event=res, n_episodes=n_used,
                        mean_episode_len=float(np.mean(ep_len)),
-                       overlap_frac=(float(np.mean(overlap)) if overlap
-                                     else None),
+                       overlap_stop_near_grip=(float(np.mean(ov_stop))
+                                               if ov_stop else None),
+                       overlap_grip_near_stop=(float(np.mean(ov_grip))
+                                               if ov_grip else None),
+                       goal_events_sha1=hashlib.sha1(
+                           open(ge.__file__, "rb").read()).hexdigest()[:12],
                        gate_horizon=args.gate_horizon, script_sha1=sha,
                        argv=vars(args)),
                   open(args.out, "w"), ensure_ascii=False, indent=1)

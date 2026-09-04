@@ -226,6 +226,9 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=1024)
     ap.add_argument("--max-train-ep", type=int, default=400)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--report-seed", type=int, default=0,
+                    help="сид, чей вердикт объявляется заголовочным; назначен "
+                         "ЗАРАНЕЕ, чтобы лучший сид не выбирался по test")
     ap.add_argument("--out", default="data/k10d")
     args = ap.parse_args()
 
@@ -278,6 +281,24 @@ def main() -> None:
                          f"и {bases['test']['event']}")
     if bases["val"]["edges"] != bases["test"]["edges"]:
         raise SystemExit("опоры по разным границам бакетов")
+    # ОПОРЫ ОБЯЗАНЫ БЫТЬ ОДНОГО ПРОИСХОЖДЕНИЯ. Разные чекпойнт, кэш,
+    # параметры событий или версия разметчика означают, что кривые val и test
+    # относятся к разным вещам, а отбор по одной и вердикт по другой
+    # недействительны.
+    for f in ("ckpt", "cache", "goal_events_sha1", "event_params"):
+        if bases["val"].get(f) != bases["test"].get(f):
+            raise SystemExit(f"опоры расходятся по «{f}»: "
+                             f"{bases['val'].get(f)} и {bases['test'].get(f)}")
+    ge_sha = hashlib.sha1(open(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "goal_events.py"), "rb").read()).hexdigest()[:12]
+    if bases["val"].get("goal_events_sha1") not in (None, ge_sha):
+        raise SystemExit(
+            f"опоры собраны разметчиком sha {bases['val']['goal_events_sha1']}, "
+            f"а сейчас {ge_sha}. Пересоберите опоры: разметка изменилась.")
+    if os.path.abspath(bases["val"]["cache"]) != os.path.abspath(args.cache):
+        raise SystemExit(f"опоры собраны на кэше {bases['val']['cache']}, "
+                         f"а задан {args.cache}")
     kind = bases["val"]["event"]
     edges = [int(x) for x in bases["val"]["edges"]]
     names = ge.bucket_names(edges)
@@ -363,6 +384,16 @@ def main() -> None:
         bj = bases[part]
         keys = [(int(a_), int(b_)) for a_, b_ in bj["eval_keys"]]
         want = np.asarray(bj["eval_remaining"], np.int64)
+        # КЛЮЧИ: длины совпадают, дублей нет, все принадлежат своей части.
+        if len(keys) != len(want):
+            raise SystemExit(f"«{part}»: {len(keys)} ключей против "
+                             f"{len(want)} остатков")
+        if len(set(keys)) != len(keys):
+            raise SystemExit(f"«{part}»: ключи (эпизод, шаг) не уникальны")
+        wrong = [k for k in keys if ep_split.get(k[0]) != part]
+        if wrong:
+            raise SystemExit(f"«{part}»: {len(wrong)} ключей принадлежат "
+                             f"другой части манифеста, например {wrong[0]}")
         by_ep = {}
         for e, s_ in keys:
             by_ep.setdefault(e, []).append(s_)
@@ -438,7 +469,17 @@ def main() -> None:
                            grip=float(m["grip"][k].mean()))
         return out
 
-    best = None
+    def val_flags(cv):
+        """Те же флаги гейта, что в вердикте, но на валидации."""
+        bv = bases["val"]["buckets"]
+        return [gate(cv[nm], bv[nm], args.margin_pose, args.margin_grip)
+                if (nm in cv and nm in bv) else False for nm in names]
+
+    # СИД НЕ ЯВЛЯЕТСЯ ГИПЕРПАРАМЕТРОМ. Для каждого сида отбираются lr и эпоха
+    # по валидации, а на test показываются ОБА, и заголовочным объявляется
+    # заранее назначенный --report-seed. Иначе лучший сид выбирался бы по
+    # тому же test, на котором потом заявляется результат.
+    per_seed = {}
     for lr in [float(x) for x in args.lrs.split(",")]:
         for sd in [int(x) for x in args.seeds.split(",")]:
             torch.manual_seed(sd)
@@ -447,6 +488,8 @@ def main() -> None:
             rg = np.random.default_rng(sd)
             local = None
             for ep in range(0, args.epochs + 1):
+                ep_pose = ep_grip = 0.0
+                nb = 0
                 if ep:                       # ЭПОХА 0 — ПОЛНОПРАВНЫЙ КАНДИДАТ
                     net.train()
                     o = rg.permutation(len(S))
@@ -462,31 +505,64 @@ def main() -> None:
                                 g, (y[:, 6] > 0).float())
                         opt.zero_grad(set_to_none=True)
                         loss.backward(); opt.step()
+                        ep_pose += float(((p - y[:, :6]) ** 2).mean())
+                        ep_grip += float(
+                            nn.functional.binary_cross_entropy_with_logits(
+                                g, (y[:, 6] > 0).float()))
+                        nb += 1
                 mv = metrics(net, ev_sets["val"])
                 cv = curve(mv, ev_sets["val"])
-                # ОТБОР: сначала ЖЁСТКИЙ гейт по схвату на валидации, среди
-                # прошедших — лучший по позе. Вес схвата в потере на отбор не
-                # влияет: он не должен подменять условие.
-                passed = sum(
-                    1 for nm in names if nm in cv
-                    and cv[nm]["grip"] <= bases["val"]["buckets"][nm]["grip"]
-                    + args.margin_grip)
+                # ОТБОР ТЕМ ЖЕ КРИТЕРИЕМ, ЧТО И ВЕРДИКТ. Прежний ключ считал
+                # ЧИСЛО прошедших по схвату бакетов, а итог — НЕПРЕРЫВНЫЙ
+                # ПРЕФИКС по трём величинам. Модель, провалившая ближний
+                # бакет и прошедшая четыре дальних, побеждала бы при итоговом
+                # размахе ноль.
+                # ОБЕ ПОТЕРИ ПЕЧАТАЮТСЯ. Ствол общий, и если BCE на
+                # порядок крупнее MSE позы, схват тянет представление на себя
+                # даже при отдельных головах.
+                if nb and ep in (1, args.epochs):
+                    print(f"      эпоха {ep}: поза {ep_pose / nb:.5f}, "
+                          f"схват {ep_grip / nb:.5f}", flush=True)
+                val_span = prefix_ok(val_flags(cv), edges) / H_CALL
                 pose_v = float(np.sqrt((mv["pos"] ** 2 + mv["rot"] ** 2).mean()))
-                key = (-passed, pose_v)
+                key = (-val_span, pose_v)
                 if local is None or key < local[0]:
                     local = (key, ep)
-                if best is None or key < best[0]:
-                    best = (key, dict(lr=lr, seed=sd, epoch=ep),
-                            {k: v.detach().clone()
-                             for k, v in net.state_dict().items()})
+                if per_seed.get(sd) is None or key < per_seed[sd][0]:
+                    per_seed[sd] = (key, dict(lr=lr, seed=sd, epoch=ep),
+                                    {k: v.detach().clone()
+                                     for k, v in net.state_dict().items()})
             print(f"    lr={lr:g} сид={sd}: лучшая эпоха {local[1]}, "
-                  f"бакетов по схвату {-local[0][0]}/{len(names)}, "
+                  f"размах на валидации {-local[0][0]:.1f}x, "
                   f"поза {local[0][1]:.4f}", flush=True)
 
-    _, cfg, state = best
+    seeds = sorted(per_seed)
+    if args.report_seed not in per_seed:
+        raise SystemExit(f"--report-seed {args.report_seed} отсутствует "
+                         f"среди {seeds}")
+    all_seeds = {}
+    for sd in seeds:
+        _, cfg_s, st_s = per_seed[sd]
+        n_ = Ctrl(din, args.hidden).to(dev)
+        n_.load_state_dict(st_s)
+        c_ = curve(metrics(n_, ev_sets["test"]), ev_sets["test"])
+        f_ = [gate(c_[nm], bases["test"]["buckets"][nm], args.margin_pose,
+                   args.margin_grip)
+              if (nm in c_ and nm in bases["test"]["buckets"]) else False
+              for nm in names]
+        all_seeds[sd] = dict(cfg=cfg_s, curve=c_,
+                             span=prefix_ok(f_, edges) / H_CALL)
+        print(f"  сид {sd}: конфигурация {cfg_s}, размах на test "
+              f"{all_seeds[sd]['span']:.1f}x")
+
+    _, cfg, state = per_seed[args.report_seed]
     net = Ctrl(din, args.hidden).to(dev)
     net.load_state_dict(state)
-    print(f"\n  выбрано по валидации: {cfg}")
+    torch.save(dict(state=state, cfg=cfg, din=din, hidden=args.hidden,
+                    event=kind, edges=edges, script_sha1=sha),
+               os.path.join(args.out, "controller.pt"))
+    print(f"\n  ЗАГОЛОВОЧНЫЙ сид {args.report_seed} (назначен заранее): "
+          f"{cfg}\n  контроллер сохранён в {args.out}/controller.pt")
 
     # --- вердикт на test ------------------------------------------------------
     ct = curve(metrics(net, ev_sets["test"]), ev_sets["test"])
@@ -523,6 +599,9 @@ def main() -> None:
 
     p = os.path.join(args.out, "table.json")
     json.dump(dict(buckets=rows, ok_upto=ok_upto, offline_span=span,
+                   per_seed={str(k): dict(cfg=v["cfg"], span=v["span"])
+                             for k, v in all_seeds.items()},
+                   report_seed=args.report_seed,
                    verdict=v, cfg=cfg, event=kind, edges=edges,
                    n_train=int(len(S)), n_train_ep=len(train_ep),
                    baseline_val=args.baseline_val,
