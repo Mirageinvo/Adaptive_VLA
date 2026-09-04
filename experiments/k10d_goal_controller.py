@@ -248,6 +248,10 @@ def main() -> None:
     ap.add_argument("--i-know-threshold-is-not-matched", action="store_true",
                     help="НЕ используйте: вердикт по перенесённому числу "
                          "недействителен")
+    ap.add_argument("--grip-weight", type=float, default=0.1,
+                    help="вес ошибки знака схвата при отборе чекпойнта: без "
+                         "него чекпойнт выбирался бы только по позе, а знак "
+                         "схвата — наш самый обоснованный механизм успеха")
     ap.add_argument("--hidden", type=int, default=256)
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--lrs", default="1e-3,3e-3")
@@ -363,7 +367,11 @@ def main() -> None:
             nxt = np.searchsorted(ev, t, side="right")
             tau = np.where(nxt < len(ev), ev[np.minimum(nxt, len(ev) - 1)],
                            len(a) - 1)
+        # ЦЕЛЬ НЕСЁТ И ЗНАК СХВАТА, который должен быть в момент события.
+        # Без него контроллер не знает, чем фаза заканчивается — сжатием или
+        # разжатием, — а именно это решает исход.
         g = rel_goal(st[t, :3], st[t, 3:6], st[tau, :3], st[tau, 3:6])
+        g = np.concatenate([g, np.sign(a[tau, 6:7])], axis=1)
         sn = ((st[t] - STATE_Q01) / (STATE_Q99 - STATE_Q01) * 2 - 1
               if st.shape[1] == len(STATE_Q01) else st[t])
         # ОДНО ДЕЙСТВИЕ, А НЕ ЧАНК. Чанк a[t:t+H] при трёх шагах до
@@ -491,7 +499,15 @@ def main() -> None:
                 return np.concatenate(out)
 
             # ЭПОХА 0 — ПОЛНОПРАВНЫЙ КАНДИДАТ.
-            cur = (pose_err(predict(idx["val"]), idx["val"]), 0)
+            # ОТБОР ПО ДВУМ ВЕЛИЧИНАМ. Знак схвата — самый обоснованный
+            # у нас механизм успеха (K-6h), и выбирать чекпойнт только по
+            # позе значит игнорировать его. Комбинация: поза плюс штраф за
+            # ошибку знака, вес подобран так, чтобы один процент ошибки знака
+            # стоил столько же, сколько 0.001 позы.
+            def sel_metric(pr, ix):
+                return pose_err(pr, ix) + args.grip_weight * grip_err(pr, ix)
+
+            cur = (sel_metric(predict(idx["val"]), idx["val"]), 0)
             st_best = {k: v.detach().clone() for k, v in net.state_dict().items()}
             for ep in range(1, args.epochs + 1):
                 net.train()
@@ -501,7 +517,7 @@ def main() -> None:
                     loss = ((fwd(s) - torch.from_numpy(Y[s]).to(dev)) ** 2).mean()
                     opt.zero_grad(set_to_none=True)
                     loss.backward(); opt.step()
-                e = pose_err(predict(idx["val"]), idx["val"])
+                e = sel_metric(predict(idx["val"]), idx["val"])
                 if e < cur[0]:
                     cur = (e, ep)
                     st_best = {k: v.detach().clone()
@@ -531,6 +547,19 @@ def main() -> None:
     if args.baseline:
         bj = json.load(open(args.baseline))
         base_curve = bj["buckets"] if "buckets" in bj else bj
+        # ОЦЕНКА НА ТЕХ ЖЕ СТРОКАХ, А НЕ НА ПОХОЖИХ. Опора несёт точный
+        # список (эпизод, шаг) и остаток до события; собственное случайное
+        # разбиение здесь запрещено — иначе контроллер и опора считались бы
+        # на разных наблюдениях и сравнение было бы недействительным.
+        if "eval_keys" not in bj:
+            raise SystemExit(
+                "в опоре нет eval_keys — она собрана старой версией k10e. "
+                "Пересоберите: без точного списка строк сравнение "
+                "недействительно.")
+        if bj.get("edges") and [int(x) for x in bj["edges"]] != edges:
+            raise SystemExit(
+                f"границы бакетов опоры {bj['edges']} не совпадают с "
+                f"{edges}")
         missing = [n for n in names if n not in base_curve]
         if missing:
             raise SystemExit(
