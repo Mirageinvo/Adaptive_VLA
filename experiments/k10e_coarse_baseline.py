@@ -26,9 +26,11 @@
 кривую, но и ТОЧНЫЙ СПИСОК строк для оценки, чтобы K-10d считался ровно на
 тех же наблюдениях, а не на «похожих».
 
-СОБЫТИЯ БЕРУТСЯ ИЗ K-10c без изменений: смена знака схвата, остановка и их
-объединение. По умолчанию объединение — консервативный выбор: если контроллеру
-надо перепланировать при любом из событий, целей столько, сколько в нём.
+СОБЫТИЯ БЕРУТСЯ ИЗ ОБЩЕГО МОДУЛЯ `goal_events`, тем же вызовом, что в K-10d.
+Раньше разметка была продублирована в трёх скриптах и разъехалась: здесь
+объединение и `side="left"`, там схват и `side="right"`. По умолчанию
+объединение — консервативный выбор: если контроллеру надо перепланировать при
+любом из событий, целей столько, сколько в нём.
 
 Запуск:
     python3 experiments/k10e_coarse_baseline.py --selftest
@@ -49,30 +51,6 @@ import numpy as np
 N_POS, N_LEVEL = 16, 3
 
 
-def bucket_names(edges):
-    return ([f"<= {edges[0]}"]
-            + [f"{edges[i]}-{edges[i + 1]}" for i in range(len(edges) - 1)]
-            + [f"> {edges[-1]}"])
-
-
-def remaining_to_event(events, n_steps):
-    """Сколько шагов до следующего события для каждого момента.
-
-    ГРАНИЧНОЕ ДЕЙСТВИЕ ПРИНАДЛЕЖИТ ЗАВЕРШАЮЩЕЙСЯ ФАЗЕ. При side="right" сам
-    момент переключения схвата получал бы уже СЛЕДУЮЩУЮ цель, то есть
-    действие, которым цель достигается, обучалось бы на другой цели. Здесь
-    берётся side="left", и в момент события остаток равен нулю.
-    """
-    ev = np.asarray(events, np.int64)
-    t = np.arange(n_steps)
-    if len(ev) == 0:
-        return (n_steps - 1) - t
-    nxt = np.searchsorted(ev, t, side="left")
-    tau = np.where(nxt < len(ev), ev[np.minimum(nxt, len(ev) - 1)],
-                   n_steps - 1)
-    return tau - t
-
-
 def curve(err_pos, err_rot, err_pose, grip_bad, bi, names):
     """Кривые по бакетам. Взвешивание по числу строк, а не по бакетам."""
     out = {}
@@ -90,32 +68,23 @@ def curve(err_pos, err_rot, err_pose, grip_bad, bi, names):
 
 
 def selftest():
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import goal_events as ge
+    ge.selftest()
     ed = [8, 16, 32, 48]
-    assert bucket_names(ed)[0] == "<= 8" and bucket_names(ed)[-1] == "> 48"
-    assert len(bucket_names(ed)) == len(ed) + 1
-
-    # ГРАНИЦА ФАЗЫ. В момент события остаток равен НУЛЮ, а не длине до
-    # следующего: действие переключения принадлежит завершающейся фазе.
-    r = remaining_to_event([5, 12], 15)
-    assert r[5] == 0 and r[12] == 0, list(r)
-    assert r[0] == 5 and r[6] == 6, list(r)
-    # После последнего события целью становится конец эпизода.
-    assert r[13] == 1 and r[14] == 0, list(r)
-    # Без событий — тоже конец эпизода.
-    assert list(remaining_to_event([], 4)) == [3, 2, 1, 0]
+    bucket_names = ge.bucket_names
 
     # Кривые считаются по строкам, а не по бакетам: бакет из одной строки не
     # весит столько же, сколько бакет из тысячи.
     bi = np.array([0, 0, 0, 1])
     ep = np.array([0.0, 0.0, 0.0, 10.0])
-    c = curve(ep, ep, ep, np.zeros(4), bi, bucket_names([8, 16, 32, 48]))
+    c = curve(ep, ep, ep, np.zeros(4), bi, bucket_names(ed))
     assert c["<= 8"]["n"] == 3 and c["<= 8"]["pose"] == 0.0
     assert abs(c["8-16"]["pose"] - 10.0) < 1e-12
 
     # RMS складывается по квадратам.
     x = np.array([3.0, 4.0])
-    c2 = curve(x, x, x, np.zeros(2), np.zeros(2, int),
-               bucket_names([8, 16, 32, 48]))
+    c2 = curve(x, x, x, np.zeros(2), np.zeros(2, int), bucket_names(ed))
     assert abs(c2["<= 8"]["pose"] - np.sqrt(12.5)) < 1e-12
     print("самопроверка k10e пройдена (версия «граница у завершающейся "
           "фазы»): имена бакетов, остаток в момент события ноль, взвешивание "
@@ -159,7 +128,7 @@ def main() -> None:
     from huggingface_hub import hf_hub_download
 
     import actioncodec  # noqa: F401
-    from k10c_goal_persistence import grip_events, merge_events, stop_events
+    import goal_events as ge
     from utils import (ACTION_Q01, ACTION_Q99, VisionLanguageActionProcessor,
                        STATE_Q01, process_state)
 
@@ -214,7 +183,7 @@ def main() -> None:
 
     rid, rev = "physical-intelligence/libero", "v2.0"
     edges = [int(x) for x in args.bucket_edges.split(",")]
-    names = bucket_names(edges)
+    names = ge.bucket_names(edges)
 
     demo = np.full((len(sel), 7), np.nan)
     rem = np.full(len(sel), -1, np.int64)
@@ -234,12 +203,13 @@ def main() -> None:
         if stt.shape[1] == len(STATE_Q01) + 1:
             stt = process_state(stt)
         a = to_codec_space(acts)
-        g = grip_events(acts)
-        s_ = stop_events(stt[:, :3], speed_frac=args.speed_frac,
-                         min_dwell=args.min_dwell, min_travel=args.min_travel)
-        ev = {"grip": g, "stop": s_,
-              "union": merge_events(g, s_, args.merge_tol)[0]}[args.event]
-        r = remaining_to_event(ev, len(a))
+        # РАЗМЕТКА ИЗ ОБЩЕГО МОДУЛЯ, тем же вызовом, что в K-10d.
+        ev, typ, _ = ge.label(a, stt[:, :3], kind=args.event,
+                              speed_frac=args.speed_frac,
+                              min_dwell=args.min_dwell,
+                              min_travel=args.min_travel,
+                              merge_tol=args.merge_tol)
+        _, _, r = ge.targets(a, ev, typ)
         st_rows = stp[sel][rows]
         if st_rows.max() >= len(a):
             raise SystemExit(f"эпизод {e}: шаг {st_rows.max()} вне длины "
