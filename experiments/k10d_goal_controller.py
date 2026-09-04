@@ -233,9 +233,21 @@ def main() -> None:
     ap.add_argument("--n-ep", type=int, default=300)
     ap.add_argument("--horizon", type=int, default=H_EXEC)
     ap.add_argument("--bucket-edges", default="8,16,32,48")
-    ap.add_argument("--threshold", type=float, default=0.0478,
-                    help="порог достаточности: ошибка позы грубого выхода, "
-                         "про который измерено, что он сохраняет успех")
+    # ПОРОГА ПО УМОЛЧАНИЮ НЕТ НАМЕРЕННО. Прежняя версия предупреждала о
+    # несопоставимости 0.0478 и тут же выносила по нему вердикт. Число
+    # измерено на другой выборке и как расхождение модели с УЧИТЕЛЕМ, а здесь
+    # считается расхождение с ДЕМОНСТРАЦИЕЙ; пол токенизатора этого не чинит,
+    # потому что контроллер через кодек не проходит.
+    ap.add_argument("--baseline", default=None,
+                    help="ОБЯЗАТЕЛЕН: json с кривой coarse24 по тем же "
+                         "(эпизод, шаг) и тем же бакетам удалённости. Без "
+                         "него сравнивать не с чем и скрипт откажется считать.")
+    ap.add_argument("--threshold", type=float, default=None,
+                    help="ручной порог; допускается только вместе с "
+                         "--i-know-threshold-is-not-matched")
+    ap.add_argument("--i-know-threshold-is-not-matched", action="store_true",
+                    help="НЕ используйте: вердикт по перенесённому числу "
+                         "недействителен")
     ap.add_argument("--hidden", type=int, default=256)
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--lrs", default="1e-3,3e-3")
@@ -252,6 +264,14 @@ def main() -> None:
     selftest()
     if not args.ckpt:
         raise SystemExit("нужен --ckpt или --selftest")
+    if not args.baseline and not (args.threshold
+                                  and args.i_know_threshold_is_not_matched):
+        raise SystemExit(
+            "нужен --baseline: кривая coarse24 по тем же (эпизод, шаг) и тем "
+            "же бакетам.\nБез сопоставимой опоры вердикт недействителен — "
+            "0.0478 измерено на другой\nвыборке и против учителя, а здесь "
+            "сравнение с демонстрацией.\nЕсли всё же нужен ручной порог: "
+            "--threshold X --i-know-threshold-is-not-matched.")
 
     sha = hashlib.sha1(open(__file__, "rb").read()).hexdigest()[:12]
     print(f"k10d sha1 {sha}")
@@ -277,10 +297,15 @@ def main() -> None:
     max_act_q = np.maximum(np.abs(ACTION_Q99), np.abs(ACTION_Q01))
 
     def to_codec_space(a):
+        """Обратное тому, что делает eval_libero после декода.
+
+        ОБРЕЗКА ОБЯЗАТЕЛЬНА: K-9a после нормировки применяет clip[-1, 1], и
+        без неё цели здесь несовместимы с исходным конвейером.
+        """
         a = np.asarray(a, np.float64).copy()
         a[..., :-1] = a[..., :-1] / max_act_q[..., :-1]
         a[..., -1] = -a[..., -1]
-        return a
+        return np.clip(a, -1.0, 1.0)
 
     rid, rev = "physical-intelligence/libero", "v2.0"
     rng = np.random.default_rng(args.seed)
@@ -358,7 +383,10 @@ def main() -> None:
                 d = ap_.decode(ap_.encode(w))
                 d = np.asarray(d if isinstance(d, np.ndarray) else d[0],
                                np.float64).reshape(len(w), 20, 7)
-                e2 = (d[:, :H_CALL, :6] - w[:, :H_CALL, :6]) ** 2
+                # ТОЛЬКО ПОЗИЦИЯ 0: контроллер предсказывает одно
+                # следующее действие, поэтому опора обязана считаться на той
+                # же позиции, а не усредняться по восьми.
+                e2 = (d[:, 0:1, :6] - w[:, 0:1, :6]) ** 2
                 floor_num += float(e2.sum()); floor_den += int(e2.size)
                 floor_ok[0] += 1
         except Exception as ex:                      # noqa: BLE001
@@ -494,8 +522,27 @@ def main() -> None:
     names = ([f"<= {edges[0]}"]
              + [f"{edges[i]}-{edges[i + 1]}" for i in range(len(edges) - 1)]
              + [f"> {edges[-1]}"])
-    print(f"\n  {'удалённость':>14}{'троек':>9}{'контроллер':>13}"
-          f"{'П-рег.':>10}{'знак схвата':>13}")
+    print(f"\n  {'удалённость':>13}{'троек':>8}{'позиция':>10}"
+          f"{'вращение':>11}{'смесь':>9}{'П-рег.':>9}{'знак':>8}")
+    # ОПОРА ПОБАКЕТНО, а не одним числом. coarse24 на удалении 8 шагов и на
+    # удалении 48 — разные величины, и сравнивать обе с одним порогом значит
+    # завышать требование вблизи и занижать вдали.
+    base_curve = None
+    if args.baseline:
+        bj = json.load(open(args.baseline))
+        base_curve = bj["buckets"] if "buckets" in bj else bj
+        missing = [n for n in names if n not in base_curve]
+        if missing:
+            raise SystemExit(
+                f"в опоре нет бакетов {missing}; она обязана быть посчитана "
+                f"на тех же границах {edges}")
+        print(f"\n  опора coarse24 из {args.baseline}")
+
+    def thr_for(name):
+        if base_curve is not None:
+            return float(base_curve[name]["pose"])
+        return float(args.threshold)
+
     rows, flags = {}, []
     for b in range(len(edges) + 1):
         m = bi == b
@@ -504,34 +551,49 @@ def main() -> None:
             continue
         sel = idx["test"][m]
         pe = pose_err(pred[m], sel)
+        pos_e, rot_e = pos_err(pred[m], sel), rot_err(pred[m], sel)
         pp = pose_err(p_pred[m], sel)
         ge = grip_err(pred[m], sel)
-        ok = bool(pe <= args.threshold)
+        thr = thr_for(names[b])
+        ok = bool(pe <= thr)
         flags.append(ok)
-        rows[names[b]] = dict(n=int(m.sum()), ctrl=pe, p_ctrl=pp, grip=ge,
-                              ok=ok)
-        print(f"  {names[b]:>14}{int(m.sum()):>9}{pe:>13.4f}"
-              f"{pp:>10.4f}{ge:>12.1%}" + ("  ok" if ok else "  --"))
+        rows[names[b]] = dict(n=int(m.sum()), ctrl=pe, pos=pos_e, rot=rot_e,
+                              p_ctrl=pp, grip=ge, thr=thr, ok=ok)
+        print(f"  {names[b]:>13}{int(m.sum()):>8}{pos_e:>10.4f}"
+              f"{rot_e:>11.4f}{pe:>9.4f}{pp:>9.4f}{ge:>7.1%}"
+              + ("  ok" if ok else "  --"))
 
     ok_upto = prefix_ok(flags, edges)
-    s_real = ok_upto / H_CALL if H_CALL else 0.0
-    print(f"\n  ПОРОГ {args.threshold:.4f} — ошибка позы грубого выхода, про "
-          f"который\n  измерено, что он сохраняет успех. Пол токенизатора на "
-          f"этих данных {floor:.4f}.")
+    # НЕ «РЕАЛЬНОЕ СОКРАЩЕНИЕ». Это офлайновый размах при истинной цели и
+    # без накопления ошибки. Реальное измерит только замкнутый симулятор.
+    offline_span = ok_upto / H_CALL if H_CALL else 0.0
+    if base_curve is not None:
+        print(f"\n  ПОРОГ — побакетная кривая coarse24 на тех же (эпизод, шаг).")
+    else:
+        print(f"\n  ПОРОГ {args.threshold:.4f} задан вручную и НЕ сопоставим: "
+              f"он измерен на\n  другой выборке и против учителя. Вердикт "
+              f"недействителен.")
+    print(f"  Пол токенизатора на этих данных (позиция 0): {floor:.4f}.")
     print(f"  Контроллер достаточен вплоть до {ok_upto} шагов до события.")
-    print(f"  РЕАЛЬНОЕ сокращение вызовов: {s_real:.1f}x против верхней "
-          f"оценки 6.7x из K-10c.")
-    if s_real >= 4:
-        v = "направление подтверждено"
-    elif s_real <= 1:
+    print(f"  ОФЛАЙНОВЫЙ РАЗМАХ при истинной цели: {offline_span:.1f}x "
+          f"(K-10c дал 6.1x по сегментации).")
+    print(f"  Это НЕ сокращение вызовов: цель здесь oracle, ошибка не "
+          f"накапливается,\n  замкнутого цикла нет. Его измерит только "
+          f"симулятор.")
+    if offline_span >= 4:
+        v = "офлайновый гейт пройден, идём в симулятор с oracle-целью"
+    elif offline_span <= 1:
         v = "экономии нет, направление закрывается"
     else:
-        v = f"сокращение {s_real:.1f}x — это и есть результат"
+        v = f"офлайновый размах {offline_span:.1f}x — это и есть результат"
     print(f"  ВЕРДИКТ: {v}")
 
     p = os.path.join(args.out, "table.json")
-    json.dump(dict(buckets=rows, floor=floor, threshold=args.threshold,
-                   ok_upto=ok_upto, s_real=s_real, verdict=v, cfg=cfg,
+    json.dump(dict(buckets=rows, floor=floor,
+                   threshold=args.threshold, baseline=args.baseline,
+                   matched=bool(base_curve is not None),
+                   ok_upto=ok_upto, offline_span=offline_span,
+                   verdict=v, cfg=cfg,
                    kp=float(kp), n_triples=int(len(S)), n_episodes=n_used,
                    script_sha1=sha, argv=vars(args)),
               open(p, "w"), ensure_ascii=False, indent=1)

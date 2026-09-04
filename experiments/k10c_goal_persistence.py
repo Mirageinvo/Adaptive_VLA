@@ -107,6 +107,29 @@ def stop_events(state_xyz, speed_frac=0.3, min_dwell=3, min_travel=0.02):
     return np.asarray(ev, np.int64)
 
 
+def merge_events(a, b, tol):
+    """Объединение двух наборов событий со слиянием близких.
+
+    ЗАЧЕМ. Схват и остановка могут отмечать ОДИН И ТОТ ЖЕ момент: рука
+    замедляется, чтобы схватить. Тогда согласие двух чисел не является
+    независимым подтверждением. А если контроллеру надо перепланировать при
+    любом из событий, целей столько, сколько в ОБЪЕДИНЕНИИ, и выигрыш меньше.
+
+    События, отстоящие не больше чем на tol шагов, считаются одним.
+    """
+    all_ev = np.sort(np.concatenate([np.asarray(a, np.int64),
+                                     np.asarray(b, np.int64)]))
+    if len(all_ev) == 0:
+        return all_ev, 0
+    keep, dup = [all_ev[0]], 0
+    for e in all_ev[1:]:
+        if e - keep[-1] <= tol:
+            dup += 1
+        else:
+            keep.append(e)
+    return np.asarray(keep, np.int64), dup
+
+
 def persistence(events, n_steps, horizon):
     """Доля вызовов с той же целью и длина фазы в вызовах.
 
@@ -238,6 +261,25 @@ def selftest():
     # ПОРОГ ПЕРЕМЕЩЕНИЯ работает: при огромном min_travel событий нет.
     assert len(stop_events(xyz, min_travel=10.0)) == 0
 
+    # ПАУЗА С НЕНУЛЕВОЙ СКОРОСТЬЮ — тест, различающий значение speed_frac.
+    # Прежняя синтетика останавливалась РОВНО в ноль, и любой порог её ловил;
+    # поэтому она не поймала вызов с 0.02 вместо 0.3 (порог в пятнадцать раз
+    # строже), и вывод «остановок нет» полдня считался свойством данных.
+    # Здесь пауза идёт на 10% крейсерской скорости: 0.3 её видит, 0.02 нет.
+    parts, pos = [], np.zeros(3)
+    fast, slow_v = np.array([0.01, 0.0, 0.0]), np.array([0.001, 0.0, 0.0])
+    for k in range(4):
+        parts.append(pos + np.arange(1, seg + 1)[:, None] * fast)
+        pos = parts[-1][-1]
+        if k < 3:
+            parts.append(pos + np.arange(1, pause + 1)[:, None] * slow_v)
+            pos = parts[-1][-1]
+    soft = np.concatenate(parts)
+    n_ok = len(stop_events(soft, speed_frac=0.3, min_travel=0.05))
+    n_bad = len(stop_events(soft, speed_frac=0.02, min_travel=0.05))
+    assert n_ok == 3, f"при верном пороге ждали 3, нашли {n_ok}"
+    assert n_bad == 0, f"порог 0.02 обязан НЕ видеть паузу, нашёл {n_bad}"
+
     # УЧЁТ СОКРАЩЕНИЯ. Целей на одну больше, чем событий; хвост считается.
     p = persistence([50], 100, 8)
     assert p["n_goals"] == 2 and abs(p["s_max"] - 13 / 2) < 1e-12, p
@@ -269,6 +311,8 @@ def main() -> None:
     ap.add_argument("--min-travel", type=float, default=0.02)
     ap.add_argument("--speed-frac", type=float, default=0.3)
     ap.add_argument("--min-dwell", type=int, default=3)
+    ap.add_argument("--merge-tol", type=int, default=4,
+                    help="события ближе этого числа шагов считаются одним")
     ap.add_argument("--good", type=float, default=2.5)
     ap.add_argument("--bad", type=float, default=1.5)
     ap.add_argument("--seed", type=int, default=0)
@@ -289,7 +333,8 @@ def main() -> None:
     rng = np.random.default_rng(args.seed)
     order = rng.permutation(1693)[: args.n_ep * 2]
     hz = [int(x) for x in args.horizons.split(",")]
-    acc = {d: {h: [] for h in hz} for d in ("grip", "stop")}
+    acc = {d: {h: [] for h in hz} for d in ("grip", "stop", "union")}
+    overlap = []
     ep_len, n_used = [], 0
 
     for e in order:
@@ -312,10 +357,16 @@ def main() -> None:
         # порог был 2% медианной скорости вместо 30% — в пятнадцать раз
         # строже. Самопроверка не поймала: в синтетике паузы идеальные, там
         # любой порог срабатывает.
-        ev = dict(grip=grip_events(acts),
-                  stop=stop_events(st[:, :3], speed_frac=args.speed_frac,
-                                   min_dwell=args.min_dwell,
-                                   min_travel=args.min_travel))
+        _g = grip_events(acts)
+        _s = stop_events(st[:, :3], speed_frac=args.speed_frac,
+                         min_dwell=args.min_dwell, min_travel=args.min_travel)
+        _u, _dup = merge_events(_g, _s, args.merge_tol)
+        n_pair = min(len(_g), len(_s))
+        if n_pair:
+            overlap.append(_dup / n_pair)
+        ev = dict(grip=_g, stop=_s, union=_u)
+        del _g, _s, _u
+
         for d in acc:
             for h in hz:
                 r = persistence(ev[d], len(acts), h)
@@ -331,8 +382,14 @@ def main() -> None:
     print(f"\nэпизодов {n_used}, средняя длина {np.mean(ep_len):.0f} шагов\n")
 
     res = {}
-    for d in ("grip", "stop"):
-        name = "схват" if d == "grip" else "остановка"
+    if overlap:
+        print(f"  СОВПАДЕНИЕ СОБЫТИЙ: {float(np.mean(overlap)):.1%} слились "
+              f"при допуске {args.merge_tol} шагов.\n  Высокое совпадение "
+              f"означает, что два определения отмечают одно и то же, и\n  их "
+              f"согласие НЕ является независимым подтверждением.\n")
+    for d in ("grip", "stop", "union"):
+        name = {"grip": "схват", "stop": "остановка",
+                "union": "ОБЪЕДИНЕНИЕ"}[d]
         print(f"  событие «{name}»:")
         print(f"    {'H':>4}{'micro':>9}{'macro':>9}{'NO_EDIT':>10}"
               f"{'событий':>10}{'хвост':>9}")
@@ -360,13 +417,14 @@ def main() -> None:
 
     g = res["grip"].get(str(args.gate_horizon))
     s = res["stop"].get(str(args.gate_horizon))
+    u = res["union"].get(str(args.gate_horizon))
     print(f"  ЧИТАТЬ по горизонту {args.gate_horizon} — наше исполняемое окно.")
     print(f"  «вызовов/целей» — во сколько раз можно было бы сократить")
     print(f"  обращения к VLA при ИДЕАЛЬНОМ дешёвом мониторе. NO_EDIT дан")
     print(f"  для справки и завышает выигрыш. «Хвост» — доля вызовов после")
     print(f"  последнего события: там цель одна по построению, и большой")
     print(f"  хвост означает, что выигрыш держится на конце эпизода.\n")
-    for d, r in (("схват", g), ("остановка", s)):
+    for d, r in (("схват", g), ("остановка", s), ("ОБЪЕДИНЕНИЕ", u)):
         if r is None:
             continue
         print(f"  событие «{d}»: micro {r['s_micro']:.2f} "
@@ -382,6 +440,8 @@ def main() -> None:
                     exist_ok=True)
         json.dump(dict(by_event=res, n_episodes=n_used,
                        mean_episode_len=float(np.mean(ep_len)),
+                       overlap_frac=(float(np.mean(overlap)) if overlap
+                                     else None),
                        gate_horizon=args.gate_horizon, script_sha1=sha,
                        argv=vars(args)),
                   open(args.out, "w"), ensure_ascii=False, indent=1)
