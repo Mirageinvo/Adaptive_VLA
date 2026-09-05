@@ -145,6 +145,78 @@ def build(a, st, tau, ttyp, rem, steps, state_norm=None, task_id=None,
     return sn.astype(np.float32), g.astype(np.float32), a[t].astype(np.float32)
 
 
+def make_ctrl():
+    """Сеть контроллера. Общая, потому что её строят и K-10d, и K-10h.
+
+    Раньше класс был объявлен внутри `main()` K-10d, и замкнутый цикл обязан
+    был бы повторить его своей копией. Копии архитектуры расходятся молча:
+    веса грузятся, ключи совпадают, поведение другое. Torch импортируется
+    внутри, чтобы numpy-путь модуля оставался лёгким.
+    """
+    import torch.nn as nn
+
+    class Ctrl(nn.Module):
+        """Общий ствол, отдельные головы позы и знака схвата."""
+
+        def __init__(self, din, hid):
+            super().__init__()
+            self.body = nn.Sequential(nn.Linear(din, hid), nn.GELU(),
+                                      nn.Linear(hid, hid), nn.GELU())
+            self.pose = nn.Linear(hid, 6)
+            self.grip = nn.Linear(hid, 1)
+
+        def forward(self, x):
+            h = self.body(x)
+            return self.pose(h), self.grip(h).squeeze(-1)
+
+    return Ctrl
+
+
+def online_features(state, prev_state, prev_act, goal_pose, goal_grip_sign,
+                    goal_type, parts, state_norm=None, task_id=None,
+                    n_task=64, remaining=None):
+    """Вход контроллера для ОДНОГО шага замкнутого цикла.
+
+    СОБИРАЕТСЯ ТЕМ ЖЕ `build`, а не своей формулой. Порядок столбцов,
+    обнуление отсутствующего предыдущего действия, кодирование типа события и
+    перевод вращений через матрицы — всё это должно совпасть с обучением
+    побитово, а повторённая вручную сборка разошлась бы при первой же правке
+    одной из сторон. Поэтому здесь строится микроэпизод из трёх строк, где
+    строка 0 — предыдущий шаг, строка 1 — текущий, строка 2 — цель, и у него
+    запрашивается ровно один шаг.
+
+    ОСТАТОК — ВЕЛИЧИНА ИЗ БУДУЩЕГО. Если он входит в `parts`, вызывающий
+    обязан передать `remaining`; в замкнутом цикле честного источника у него
+    нет, и рука превращается в верхнюю границу.
+    """
+    parts = tuple(parts)
+    if "remaining" in parts and remaining is None:
+        raise ValueError("часть «remaining» запрошена, но значение не "
+                         "передано: в замкнутом цикле её неоткуда взять")
+    cur = np.asarray(state, np.float64)
+    gp = np.asarray(goal_pose, np.float64)
+    if gp.shape[-1] < 6:
+        raise ValueError(f"поза цели короче шести чисел: {gp.shape}")
+    prev = cur if prev_state is None else np.asarray(prev_state, np.float64)
+    st = np.zeros((3, len(cur)))
+    st[0], st[1] = prev, cur
+    st[2, :6] = gp[:6]
+    a = np.zeros((3, 7))
+    a[0] = np.zeros(7) if prev_act is None else np.asarray(prev_act,
+                                                           np.float64)
+    a[2, 6] = float(goal_grip_sign)
+    t = 0 if prev_state is None else 1
+    tau = np.full(3, 2, np.int64)
+    ttyp = np.full(3, int(goal_type), np.int64)
+    rem = np.zeros(3, np.int64)
+    if remaining is not None:
+        rem[:] = int(remaining)
+    s_, g_, _ = build(a, st, tau, ttyp, rem, np.array([t]),
+                      state_norm=state_norm, parts=parts, task_id=task_id,
+                      n_task=n_task)
+    return np.concatenate([s_[0], g_[0]]).astype(np.float32)
+
+
 def selftest():
     rng = np.random.default_rng(0)
     v = rng.normal(0, 0.5, size=(40, 3))
@@ -173,6 +245,35 @@ def selftest():
     assert np.allclose(g0, g1) and np.allclose(y0, y1)
     assert s1.shape[1] == s0.shape[1] + 8 + 7 + 1 + 1 + 64, s1.shape
     assert np.allclose(s1[:, :s0.shape[1]], s0)
+
+    # --- онлайновая сборка обязана совпасть с обучающей ---------------------
+    # ЭТО ГЛАВНАЯ ПРОВЕРКА МОДУЛЯ ДЛЯ ЗАМКНУТОГО ЦИКЛА: если вход разойдётся,
+    # контроллер загрузится и будет работать, выдавая осмысленные с виду, но
+    # чужие команды.
+    for pset in ((), ("dstate",), ("dstate", "prevact"),
+                 ("dstate", "prevact", "task"),
+                 ("dstate", "prevact", "remaining", "task")):
+        tid = 3 if "task" in pset else None
+        S_, G_, _ = build(a, st, tau, ttyp, rem, np.arange(n - 1),
+                          parts=pset, task_id=tid, n_task=64)
+        for tt in (0, 1, 5, n - 2):
+            want = np.concatenate([S_[tt], G_[tt]])
+            got = online_features(
+                st[tt], None if tt == 0 else st[tt - 1],
+                None if tt == 0 else a[tt - 1],
+                st[int(tau[tt]), :6], np.sign(a[int(tau[tt]), 6]),
+                int(ttyp[tt]), pset, task_id=tid, n_task=64,
+                remaining=int(rem[tt]) if "remaining" in pset else None)
+            assert got.shape == want.shape, (pset, tt, got.shape, want.shape)
+            assert np.abs(got - want).max() < 1e-6, (
+                pset, tt, float(np.abs(got - want).max()))
+    # Остаток без значения — отказ, а не молчаливый ноль.
+    try:
+        online_features(st[1], st[0], a[0], st[-1, :6], 1.0, 0,
+                        ("remaining",))
+        raise AssertionError("remaining без значения прошёл")
+    except ValueError:
+        pass
     # Идентификатор задачи попал в свою позицию и только в неё.
     oh = s1[:, -64:]
     assert oh.sum() == len(s1) and oh[:, 3].all()
@@ -221,9 +322,10 @@ def selftest():
         raise AssertionError("неизвестная часть входа должна отвергаться")
     assert "remaining" in ORACLE_PARTS, "привилегированная часть помечена"
 
-    print("самопроверка goal_dataset пройдена: перегон axis-angle с pi, "
-          "инвариантность цели к сдвигу, rich расширяет вход не меняя цель "
-          "и таргет")
+    print("самопроверка goal_dataset пройдена (версия «онлайновый вход»): "
+          "перегон axis-angle с pi, инвариантность цели к сдвигу, rich "
+          "расширяет вход не меняя цель и таргет, онлайновая сборка "
+          "совпадает с обучающей на пяти наборах частей")
 
 
 if __name__ == "__main__":

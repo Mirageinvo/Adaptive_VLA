@@ -111,6 +111,28 @@ def selftest():
     ge.selftest()
     gd.selftest()
 
+    # СЕТЬ ПРОВЕРЯЕТСЯ ТАМ, ГДЕ ЕСТЬ TORCH. Без него проверка пропускается с
+    # явной отметкой, а не считается пройденной: молчаливый пропуск был бы
+    # ровно тем «всегда истинным assert», который уже пропустил 73 ложных
+    # остановки.
+    net_ok = "torch нет, сеть НЕ проверена"
+    try:
+        import torch as _t
+    except ImportError:
+        _t = None
+    if _t is not None:
+        net_ = gd.make_ctrl()(11, 8)
+        p_, g_ = net_(_t.zeros(2, 11))
+        assert tuple(p_.shape) == (2, 6) and tuple(g_.shape) == (2,), (
+            p_.shape, g_.shape)
+        # Ключи весов обязаны совпасть с теми, что лежат в старых
+        # controller.pt, иначе вынос класса сломал бы загрузку.
+        assert set(net_.state_dict()) == {
+            "body.0.weight", "body.0.bias", "body.2.weight", "body.2.bias",
+            "pose.weight", "pose.bias", "grip.weight", "grip.bias"}, \
+            sorted(net_.state_dict())
+        net_ok = "сеть из общего модуля, ключи весов прежние"
+
     ed = [8, 16, 32, 48]
     assert prefix_ok([True, True, False, True, True], ed) == 16
     assert prefix_ok([False] + [True] * 4, ed) == 0
@@ -140,9 +162,10 @@ def selftest():
                       0.005) for n in names]
     assert "запаса нет" in verdict(prefix_ok(only_pose, ed) / H_CALL)
 
-    print("самопроверка k10d пройдена (версия «общая разметка, жёсткий "
-          "гейт»): pi, инвариантность цели, вращения не вычитаются, префикс, "
-          "гейт по трём величинам, сквозной проход опора->вердикт")
+    print("самопроверка k10d пройдена (версия «общая сеть, чекпойнт со "
+          "сборкой входа»): pi, инвариантность цели, вращения не вычитаются, "
+          "префикс, гейт по трём величинам, сквозной проход опора->вердикт, "
+          + net_ok)
 
 
 def main() -> None:
@@ -400,24 +423,10 @@ def main() -> None:
     # --- контроллер: отдельная голова схвата ---------------------------------
     din = S.shape[1] + G.shape[1]
 
-    class Ctrl(nn.Module):
-        """Общий ствол, отдельные головы позы и знака схвата.
-
-        Раньше был общий MSE по семи каналам: схват со значениями около +-1
-        доминировал над малыми приращениями позы, а знак при этом в вердикт
-        не входил вовсе.
-        """
-
-        def __init__(self, din, hid):
-            super().__init__()
-            self.body = nn.Sequential(nn.Linear(din, hid), nn.GELU(),
-                                      nn.Linear(hid, hid), nn.GELU())
-            self.pose = nn.Linear(hid, 6)
-            self.grip = nn.Linear(hid, 1)
-
-        def forward(self, x):
-            h = self.body(x)
-            return self.pose(h), self.grip(h).squeeze(-1)
+    # СЕТЬ БЕРЁТСЯ ИЗ ОБЩЕГО МОДУЛЯ. Своё объявление здесь означало бы, что
+    # замкнутый цикл K-10h обязан держать копию архитектуры; копии расходятся
+    # молча — веса грузятся, ключи совпадают, поведение другое.
+    Ctrl = gd.make_ctrl()
 
     def metrics(net, d):
         net.eval()
@@ -537,8 +546,19 @@ def main() -> None:
     _, cfg, state = per_seed[args.report_seed]
     net = Ctrl(din, args.hidden).to(dev)
     net.load_state_dict(state)
+    # ЧЕКПОЙНТ ОБЯЗАН НЕСТИ СБОРКУ ВХОДА. Без `parts`, `tmap` и `n_task`
+    # замкнутый цикл не может воспроизвести признаки: индекс задачи здесь —
+    # позиция в `tmap`, а не task_id LIBERO, и «отсутствующий» список частей
+    # прочитался бы как пустой, молча собрав другой вход той же ширины.
     torch.save(dict(state=state, cfg=cfg, din=din, hidden=args.hidden,
-                    event=kind, edges=edges, script_sha1=sha),
+                    event=kind, edges=edges, script_sha1=sha,
+                    parts=list(parts), rich=bool(args.rich),
+                    tmap={str(k): int(v) for k, v in tmap.items()},
+                    n_task=max(len(tmap), 1),
+                    goal_dataset_sha1=hashlib.sha1(
+                        open(gd.__file__, "rb").read()).hexdigest()[:12],
+                    goal_events_sha1=hashlib.sha1(
+                        open(ge.__file__, "rb").read()).hexdigest()[:12]),
                os.path.join(args.out, "controller.pt"))
     print(f"\n  ЗАГОЛОВОЧНЫЙ сид {args.report_seed} (назначен заранее): "
           f"{cfg}\n  контроллер сохранён в {args.out}/controller.pt")
