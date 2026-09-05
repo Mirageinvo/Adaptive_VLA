@@ -36,6 +36,12 @@ A[:, :8], а ранг выбирается по доле возвращённо�
 G = sum r^T r размера (D, D), и его собственные векторы дают базис без
 хранения самого остатка.
 
+ПРО h18: ЕГО СЕЙЧАС НИКТО НЕ ЧИТАЕТ, И ЭТО СОЗНАТЕЛЬНО. HiCoRA-D устроена как
+h12 -> q0 и h24 -> поправка; средний отвод нужен только будущей HiCoRA-V с
+двумя ступенями. Он снимается проходом (это бесплатно), но по умолчанию НЕ
+СОХРАНЯЕТСЯ — см. `--save-taps`. Хранить треть кэша под ветку, которой ещё
+нет, значило бы платить за неё диском заранее.
+
 ЧТО ЕЩЁ МЕРЯЕТСЯ. Наложение весов Joint12 меняет вход слоёв 13-24:
 перезаписываются не только слои 1-12, но и `bos_embedding`, участвующий во
 всех шагах внимания. Печатаются ЧЕТЫРЕ разные величины, которые легко
@@ -103,6 +109,68 @@ def file_sha1(path):
         for chunk in iter(lambda: fh.read(1 << 22), b""):
             h.update(chunk)
     return h.hexdigest()[:12]
+
+
+DATASET_REV = "v2.0"
+
+
+def check_manifest(man, cache_meta, epi, split, rev=DATASET_REV):
+    """Сверка манифеста K-9a. Отдельной функцией — ради самопроверки.
+
+    ФОРМАТ ИМЕННО ТОТ, ЧТО ПИШЕТ K-9a: параллельные списки `episodes` и
+    `splits`, плюс `split_seed`, `dataset_revision`, `dataset_repo`. Поле
+    ревизии называется `dataset_revision`, а НЕ `revision`: чтение по
+    неверному имени давало None и молча пропускало сравнение — ошибка,
+    которую видно только на настоящем файле, поэтому её и проверяет
+    самопроверка.
+
+    Возвращает справку о манифесте; при любом расхождении бросает SystemExit.
+    """
+    if not (isinstance(man, dict) and "episodes" in man and "splits" in man):
+        raise SystemExit("манифест: ожидались поля «episodes» и «splits»; "
+                         "формат не тот, что пишет K-9a, и сверка частей "
+                         "была бы пропущена")
+    eps = [int(e) for e in man["episodes"]]
+    sp = [str(x) for x in man["splits"]]
+    if len(eps) != len(sp):
+        raise SystemExit("манифест: длины episodes и splits не совпадают")
+    if len(eps) != len(set(eps)):
+        raise SystemExit("манифест: эпизоды дублируются")
+    bad = sorted(set(sp) - {"train", "val", "test"})
+    if bad:
+        raise SystemExit(f"манифест: недопустимые метки частей {bad}")
+    if int(man.get("split_seed", -1)) != int(cache_meta.get("split_seed", -2)):
+        raise SystemExit(f"манифест: сид разбиения {man.get('split_seed')} "
+                         f"против {cache_meta.get('split_seed')} в meta кэша")
+    got_rev = man.get("dataset_revision")
+    if got_rev != rev:
+        raise SystemExit(f"манифест собран на ревизии {got_rev!r}, а "
+                         f"состояния читаются с {rev!r}: это разные данные")
+    sp_of = dict(zip(eps, sp))
+    uniq = [int(e) for e in np.unique(epi)]
+    miss = sorted(set(uniq) - set(eps))
+    if miss:
+        raise SystemExit(f"эпизоды {miss[:5]} есть в кэше, но не в манифесте")
+    # ЧАСТЬ КАЖДОГО ЭПИЗОДА СВЕРЯЕТСЯ ПОШТУЧНО, и заодно проверяется, что
+    # внутри эпизода она одна: смешение означало бы утечку между train и val
+    # на уровне наблюдений.
+    mixed, wrong = [], []
+    sp_arr = np.asarray(split).astype(str)
+    for e in uniq:
+        vals = set(sp_arr[np.where(epi == e)[0]].tolist())
+        if len(vals) != 1:
+            mixed.append(e)
+        elif sp_of[e] != next(iter(vals)):
+            wrong.append(e)
+    if mixed:
+        raise SystemExit(f"эпизоды {mixed[:5]} размечены разными частями "
+                         f"внутри себя — утечка между train и val")
+    if wrong:
+        raise SystemExit(f"часть не совпала с манифестом у эпизодов "
+                         f"{wrong[:5]}")
+    return dict(n_episodes=len(eps), split_seed=int(man["split_seed"]),
+                dataset_revision=got_rev, dataset_repo=man.get("dataset_repo"),
+                n_checked=len(uniq))
 
 
 def gram_basis(G, rank):
@@ -317,6 +385,51 @@ def selftest():
                            for i, j in plan_batches(len(A), 5)]))
     assert abs(naive - whole["pos"]) > 1e-9, "тест инвариантности вырожден"
 
+    # --- МАНИФЕСТ В НАСТОЯЩЕМ ФОРМАТЕ K-9a ----------------------------------
+    # Формат я один раз угадал неверно (ждал словарь episode->split и поле
+    # `revision` вместо `dataset_revision`), и на реальном файле сверка
+    # молча вырождалась. Поэтому здесь именно тот словарь, который пишет
+    # K-9a, и каждое искажение обязано приводить к отказу.
+    good_man = dict(episodes=[1, 2, 3], splits=["train", "val", "test"],
+                    split_seed=17, created_by="abc",
+                    dataset_revision="v2.0",
+                    dataset_repo="physical-intelligence/libero")
+    cm = dict(split_seed=17)
+    epi_t = np.array([1, 1, 2, 3])
+    sp_t = np.array(["train", "train", "val", "test"])
+    info = check_manifest(good_man, cm, epi_t, sp_t)
+    assert info["dataset_revision"] == "v2.0" and info["n_checked"] == 3, info
+
+    def must_fail(man, cmeta, e_, s_, frag, rev="v2.0"):
+        try:
+            check_manifest(man, cmeta, e_, s_, rev=rev)
+        except SystemExit as ex:
+            assert frag in str(ex), (frag, str(ex))
+            return
+        raise AssertionError(f"пропущено: {frag}")
+
+    must_fail(dict(good_man, episodes=[1, 1, 3]), cm, epi_t, sp_t, "дублируются")
+    must_fail(dict(good_man, splits=["train", "val"]), cm, epi_t, sp_t, "длины")
+    must_fail(dict(good_man, splits=["train", "val", "trian"]), cm, epi_t,
+              sp_t, "недопустимые")
+    must_fail(good_man, dict(split_seed=99), epi_t, sp_t, "сид разбиения")
+    must_fail({"eps": [1]}, cm, epi_t, sp_t, "episodes")
+    # ПЕРЕСТАВЛЕННЫЙ SPLIT — главный случай: списки той же длины, метки
+    # допустимые, но эпизод 2 объявлен тестовым, а в кэше он валидационный.
+    must_fail(dict(good_man, splits=["train", "test", "val"]), cm, epi_t,
+              sp_t, "не совпала")
+    # НЕВЕРНАЯ РЕВИЗИЯ обязана отвергаться, а не читаться как None.
+    must_fail(dict(good_man, dataset_revision="v1.0"), cm, epi_t, sp_t,
+              "ревизии")
+    must_fail({k: v for k, v in good_man.items() if k != "dataset_revision"},
+              cm, epi_t, sp_t, "ревизии")
+    # Смешанная часть внутри эпизода — утечка между train и val.
+    must_fail(good_man, cm, epi_t, np.array(["train", "val", "val", "test"]),
+              "разными частями")
+    # Эпизод кэша вне манифеста.
+    must_fail(good_man, cm, np.array([1, 2, 3, 9]),
+              np.array(["train", "val", "test", "train"]), "не в манифесте")
+
     # --- ошибки по каналам --------------------------------------------------
     a = np.zeros((4, T_CHUNK, 7)); ref = np.zeros((4, T_CHUNK, 7))
     a[:, :, 0] = 0.3
@@ -332,13 +445,42 @@ def selftest():
     assert action_err(a2, ref)["pos"] == 0.0, "срез взял хвост"
     assert a2.shape[1] != N_POS, "ось времени спутана с латентными позициями"
 
-    print("самопроверка k11a пройдена (версия «rho до ранга, схват отдельным гейтом»): "
+    print("самопроверка k11a пройдена (версия «манифест до дорогого, отпечаток декодера»): "
           "базис из нецентрированного грамиана восстанавливает подпространство, "
           "центрирование теряет смещение, доля улучшения не определена при "
           "идеальном черновике и отрицательна при ухудшении, ранг требует "
           "порога по обоим каналам, схват отвергает ранг отдельным условием, "
           "агрегирование не зависит от размера батча, префикс режется по "
           "шагам чанка")
+
+
+def decoder_probe(codec, E, dev):
+    """Отпечаток ПОВЕДЕНИЯ декодера, а не только кодовых книг.
+
+    Совпадение книг не доказывает совпадение нейронного декодера: книги — это
+    выход `out_project(decode_code(...))`, а `_decode` содержит ещё и всю
+    остальную сеть. Здесь на фиксированном псевдослучайном латенте берётся
+    выход декодера и хешируется — если сменится что угодно в декодере, отпечаток
+    изменится.
+    """
+    import torch
+    g = torch.Generator(device="cpu").manual_seed(20260905)
+    z = torch.randn(4, N_POS, int(E.shape[-1]), generator=g).to(dev)
+    with torch.no_grad():
+        y = codec._decode(z, embodiment_ids=0)[0][..., :7].float().cpu()
+    a = np.ascontiguousarray(np.round(y.numpy(), 5).astype(np.float32))
+    return hashlib.sha1(a.tobytes()).hexdigest()[:12]
+
+
+def state_sha1(module):
+    """SHA всего state_dict модуля, в фиксированном порядке ключей."""
+    h = hashlib.sha1()
+    for k in sorted(module.state_dict()):
+        v = module.state_dict()[k]
+        h.update(k.encode())
+        h.update(np.ascontiguousarray(
+            v.detach().float().cpu().numpy()).tobytes())
+    return h.hexdigest()[:12]
 
 
 def load_codec(args):
@@ -388,8 +530,25 @@ def diagnose(args):
             f"{args.codebook_tol:.0e}: декодер не тот, которым собран кэш")
     cb_sha = hashlib.sha1(np.ascontiguousarray(
         Esav.astype(np.float32)).tobytes()).hexdigest()[:12]
-    print(f"  книги сверены с сохранёнными: max|Δ| = {dmax:.3e}, sha "
-          f"{cb_sha}")
+    # SHA СРАВНИВАЕТСЯ С ЗАПИСАННЫМ, а не просто печатается: иначе он был бы
+    # справкой, а не проверкой.
+    if meta.get("codebooks_sha1") not in (None, cb_sha):
+        raise SystemExit(f"sha книг {cb_sha} против {meta['codebooks_sha1']} "
+                         f"в кэше")
+    # И ОТДЕЛЬНО — ПОВЕДЕНИЕ ДЕКОДЕРА: книги могут совпасть, а сеть за ними
+    # смениться, и остаток считался бы в одних координатах, а декодировался
+    # в других.
+    probe = decoder_probe(codec, E, dev)
+    st_sha = state_sha1(codec)
+    if meta.get("decoder_probe") not in (None, probe):
+        raise SystemExit(
+            f"отпечаток декодера {probe} против {meta['decoder_probe']} в "
+            f"кэше: книги те же, но сеть декодера другая")
+    if meta.get("codec_state_sha1") not in (None, st_sha):
+        raise SystemExit(f"sha весов кодека {st_sha} против "
+                         f"{meta['codec_state_sha1']}")
+    print(f"  книги сверены: max|Δ| = {dmax:.3e}, sha {cb_sha}; декодер "
+          f"сверен: проба {probe}, веса {st_sha}")
 
     q0 = np.load(prefix + ".q0hat.npy")
     Kt = np.load(prefix + ".ktrue.npy")
@@ -457,8 +616,8 @@ def diagnose(args):
     print(f"\n  насыщение на train (процентиль по КАЖДОЙ координате не значит "
           f"{100 - args.rho_pct:.0f}%\n  векторов вне предела: при r "
           f"координатах хотя бы одна выходит гораздо чаще):")
-    print(f"    {'ранг':>8}{'коэфф.вне':>12}{'токенов вне':>14}"
-          f"{'координат':>12}{'||rho||':>10}")
+    print(f"    {'ранг':>8}{'коэфф.вне':>12}{'токенов вне':>13}"
+          f"{'наблюд.вне':>13}{'координат':>11}{'||rho||':>10}")
     sat_stats = {}
     for rk in ranks:
         c_ = coef[:, :rk]
@@ -473,8 +632,9 @@ def diagnose(args):
                              mean_clamped=float(over.sum(1).mean()),
                              rho_norm=float(np.linalg.norm(rr)))
         st_ = sat_stats[rk]
-        print(f"    {rk:>8}{st_['coef_frac']:>11.1%}{st_['token_frac']:>13.1%}"
-              f"{st_['mean_clamped']:>12.2f}{st_['rho_norm']:>10.4f}")
+        print(f"    {rk:>8}{st_['coef_frac']:>11.1%}"
+              f"{st_['token_frac']:>12.1%}{st_['obs_frac']:>12.1%}"
+              f"{st_['mean_clamped']:>11.2f}{st_['rho_norm']:>10.4f}")
     print(f"    (столбец «координат» — сколько в среднем координат из r "
           f"обрезается)")
 
@@ -512,7 +672,7 @@ def diagnose(args):
 
     e_z0 = err_finish(acc0)
     e_st = dict(pos=0.0, rot=0.0, grip=0.0)
-    gains, gains_u, grips = {}, {}, {}
+    gains, gains_u, grips, grips_u = {}, {}, {}, {}
     print(f"    {'ранг':>8}{'поз.огр':>10}{'доля':>8}{'доля неогр':>12}"
           f"{'вр.огр':>10}{'доля':>8}{'знак':>8}")
     for rk in ranks:
@@ -522,6 +682,10 @@ def diagnose(args):
         gains_u[rk] = {k: gain(e_z0[k], eu[k], e_st[k])
                        for k in ("pos", "rot")}
         grips[rk] = ec["grip"]
+        # СХВАТ У НЕОГРАНИЧЕННОЙ ВЕТКИ СВОЙ. Подстановка сюда `grips`
+        # означала бы, что «без ограничения выбрали бы ранг X» посчитано с
+        # чужим гейтом по схвату, и вывод мог оказаться неверным.
+        grips_u[rk] = eu["grip"]
         f = lambda x: "—" if x is None else f"{x:.1%}"
         print(f"    {rk:>8}{ec['pos']:>10.5f}{f(gains[rk]['pos']):>8}"
               f"{f(gains_u[rk]['pos']):>12}{ec['rot']:>10.5f}"
@@ -530,7 +694,7 @@ def diagnose(args):
           f"{e_z0['rot']:>10.5f}{'0.0%':>8}{e_z0['grip']:>7.1%}")
 
     rank = pick_rank(gains, grip=grips, grip_draft=e_z0["grip"], d_latent=D)
-    rank_u = pick_rank(gains_u, grip=grips, grip_draft=e_z0["grip"],
+    rank_u = pick_rank(gains_u, grip=grips_u, grip_draft=e_z0["grip"],
                        d_latent=D)
     print(f"\n  {read_rank(rank, gains, grip=grips, grip_draft=e_z0['grip'])}")
     if rank_u != rank:
@@ -549,12 +713,14 @@ def diagnose(args):
                gains={str(k): v for k, v in gains.items()},
                gains_unclamped={str(k): v for k, v in gains_u.items()},
                grip={str(k): v for k, v in grips.items()},
+               grip_unclamped={str(k): v for k, v in grips_u.items()},
                saturation={str(k): v for k, v in sat_stats.items()},
                err_draft=e_z0, rank=rank, rank_unclamped=rank_u,
                gain_target=GAIN_TARGET, grip_delta=GRIP_DELTA,
                rho=None if rho is None else rho.tolist(),
                rho_pct=args.rho_pct, prefix=prefix,
-               cache_meta_sha1=meta.get("script_sha1"),
+               cache_script_sha1=meta.get("script_sha1"),
+               cache_meta_sha1=file_sha1(prefix + ".meta.json"),
                script_sha1=file_sha1(__file__))
     json.dump(out, open(prefix + ".diag.json", "w"), ensure_ascii=False,
               indent=1)
@@ -587,9 +753,20 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--diag-n", type=int, default=20000)
     ap.add_argument("--rho-pct", type=float, default=95.0)
+    ap.add_argument("--dataset-revision", default=DATASET_REV,
+                    help="ревизия датасета; обязана совпасть с той, на "
+                         "которой собран манифест")
     ap.add_argument("--codebook-tol", type=float, default=1e-5,
                     help="допуск сверки книг кэша с текущим кодеком")
     ap.add_argument("--drift-n", type=int, default=2000)
+    # ОТВОДЫ СНИМАЮТСЯ ВСЕ, СОХРАНЯЮТСЯ НЕ ВСЕ. Голове HiCoRA-D нужен только
+    # h24: черновик берётся из уже сохранённых кодов q0hat, а h18 понадобится
+    # лишь будущей HiCoRA-V. Каждый лишний отвод — это N*16*D*2 байт на диске,
+    # и хранить их «на всякий случай» стоило бы втрое дороже.
+    ap.add_argument("--save-taps", default="12,24",
+                    help="какие отводы писать на диск через запятую; проход "
+                         "всё равно полный. Для HiCoRA-D достаточно 24, "
+                         "12 нужен для проверки шума fp16 и тождеств K-11b")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -597,6 +774,13 @@ def main() -> None:
         selftest()
         return
     selftest()
+    save_taps = tuple(int(x) for x in str(args.save_taps).split(",") if x)
+    bad = [t for t in save_taps if t not in TAPS]
+    if bad:
+        raise SystemExit(f"отводы {bad} вне {TAPS}")
+    if max(TAPS) not in save_taps:
+        raise SystemExit(f"отвод {max(TAPS)} обязателен: именно его читает "
+                         f"голова поправки")
 
     # ПУТИ АБСОЛЮТИЗИРУЮТСЯ СРАЗУ. Прежняя версия делала chdir в каталог
     # actioncodec, и все относительные пути начинали разрешаться от него:
@@ -659,7 +843,14 @@ def main() -> None:
         raise SystemExit("ключи (episode, step) в исходном кэше не уникальны")
     tsk, offs = d["task"][:N], d["pos_offset"][:N].astype(np.int64)
     split = np.asarray(d["split"][:N]).astype(str)
-    Ktrue = d["K_true"][:N].astype(np.int16)
+    # ДИАПАЗОН ПРОВЕРЯЕТСЯ ДО ПРИВЕДЕНИЯ ТИПА: код 40000 при int16 стал бы
+    # отрицательным и прошёл бы проверку «>= 0» после каста.
+    Ktrue_raw = d["K_true"][:N]
+    if int(Ktrue_raw.min()) < 0:
+        raise SystemExit(f"в K_true отрицательный код {int(Ktrue_raw.min())}")
+    if int(Ktrue_raw.max()) >= 2 ** 15:
+        raise SystemExit(f"код {int(Ktrue_raw.max())} не помещается в int16")
+    Ktrue = Ktrue_raw.astype(np.int16)
     cache_meta = json.loads(str(d["meta"]))
     print(f"кэш K-9a: {len(d['episode'])} наблюдений, берём {N}")
     if cache_meta.get("ckpt") != args.ckpt:
@@ -682,11 +873,28 @@ def main() -> None:
     vals = set(np.unique(split).tolist())
     if not vals <= {"train", "val", "test"} or not vals:
         raise SystemExit(f"недопустимые значения split: {sorted(vals)}")
-    if int(Ktrue.min()) < 0:
-        raise SystemExit(f"в K_true отрицательный код {int(Ktrue.min())}")
     print(f"  происхождение кэша: манифест {cache_meta.get('manifest')}, "
           f"сид разбиения {cache_meta.get('split_seed')}, словарь "
           f"{cache_meta.get('vocab')}, части {sorted(vals)}")
+
+    # --- МАНИФЕСТ СВЕРЯЕТСЯ ДО ВСЕГО ДОРОГОГО -----------------------------
+    # Раньше эта проверка стояла ПОСЛЕ загрузки состояний из parquet и после
+    # создания модели, то есть отказ наступал минут через сорок. Здесь она
+    # первая после чтения npz.
+    man_path = cache_meta.get("manifest")
+    if not man_path or not os.path.exists(man_path):
+        raise SystemExit(
+            f"манифест {man_path!r} из meta кэша не найден. Сборка без сверки "
+            f"списка эпизодов и разбиения запрещена: часовой прогон дал бы "
+            f"кэш, происхождение которого нечем подтвердить")
+    man_info = check_manifest(json.load(open(man_path)), cache_meta, epi,
+                              split, rev=args.dataset_revision)
+    man_info.update(path=man_path, sha1=file_sha1(man_path))
+    print(f"  манифест сверен: {man_info['n_episodes']} эпизодов, сид "
+          f"{man_info['split_seed']}, ревизия "
+          f"{man_info['dataset_revision']}, репозиторий "
+          f"{man_info['dataset_repo']}, sha {man_info['sha1']}; части "
+          f"совпали у всех {man_info['n_checked']} эпизодов кэша")
 
     # --- кадры: ИМЯ ФАЙЛА ТОЧНО КАК В K-9a ---------------------------------
     # K-9a пишет `<cache>.images.npy`, где <cache> уже содержит `.npz`.
@@ -715,7 +923,7 @@ def main() -> None:
 
     # --- состояния: ИЗ PARQUET, в NPZ их нет -------------------------------
     st = None
-    rid, rev = "physical-intelligence/libero", "v2.0"
+    rid, rev = "physical-intelligence/libero", args.dataset_revision
     uniq = np.unique(epi)
     for j, e in enumerate(uniq):
         f = hf_hub_download(rid, f"data/chunk-{int(e) // 1000:03d}/"
@@ -759,49 +967,12 @@ def main() -> None:
     if int(cache_meta.get("vocab", V)) != V:
         raise SystemExit(f"словарь кэша {cache_meta.get('vocab')} против "
                          f"{V} у кодека")
-    if int(Ktrue.max()) >= V:
-        raise SystemExit(f"в K_true код {int(Ktrue.max())} при словаре {V}")
+    if int(Ktrue_raw.max()) >= V:
+        raise SystemExit(f"в K_true код {int(Ktrue_raw.max())} при словаре "
+                         f"{V}")
     if int(E.shape[0]) != N_LEVEL:
         raise SystemExit(f"уровней в кодеке {int(E.shape[0])}, ожидалось "
                          f"{N_LEVEL}")
-
-    # --- МАНИФЕСТ ОТКРЫВАЕТСЯ И СВЕРЯЕТСЯ ----------------------------------
-    man_path = cache_meta.get("manifest")
-    man_info = None
-    if man_path and os.path.exists(man_path):
-        man = json.load(open(man_path))
-        eps_man = man.get("episodes") if isinstance(man, dict) else man
-        if isinstance(eps_man, dict):
-            eps_ids = sorted(int(k) for k in eps_man)
-            sp_man = {int(k): v for k, v in eps_man.items()}
-        else:
-            eps_ids = sorted(int(x) for x in eps_man)
-            sp_man = None
-        if len(eps_ids) != len(set(eps_ids)):
-            raise SystemExit(f"{man_path}: эпизоды дублируются")
-        miss = sorted(set(int(x) for x in np.unique(epi)) - set(eps_ids))
-        if miss:
-            raise SystemExit(f"эпизоды {miss[:5]} есть в кэше, но не в "
-                             f"манифесте {man_path}")
-        if sp_man is not None:
-            bad = [int(e) for e in np.unique(epi)
-                   if sp_man.get(int(e)) is not None
-                   and sp_man[int(e)] != split[np.where(epi == e)[0][0]]]
-            if bad:
-                raise SystemExit(f"часть не совпала с манифестом у эпизодов "
-                                 f"{bad[:5]}")
-        rev_man = man.get("revision") if isinstance(man, dict) else None
-        man_info = dict(path=man_path, sha1=file_sha1(man_path),
-                        n_episodes=len(eps_ids), revision=rev_man)
-        print(f"  манифест сверен: {len(eps_ids)} эпизодов, sha "
-              f"{man_info['sha1']}, revision {rev_man}")
-    else:
-        # ОТКАЗ, А НЕ ПРЕДУПРЕЖДЕНИЕ: без манифеста нечем подтвердить, что
-        # части не пересекаются и что кэш собран по тому же списку эпизодов.
-        raise SystemExit(
-            f"манифест {man_path!r} из meta кэша не найден. Сборка без "
-            f"сверки списка эпизодов и разбиения запрещена: часовой прогон "
-            f"дал бы кэш, происхождение которого нечем подтвердить")
 
     # ИСХОДНАЯ ФИНАЛЬНАЯ НОРМА СНИМАЕТСЯ ДО НАЛОЖЕНИЯ ВЕСОВ: чекпойнт Joint12
     # перезапишет `action_expert.norm`, обученную читать h12, а поздняя ветвь
@@ -885,17 +1056,22 @@ def main() -> None:
 
     outdir = os.path.dirname(args.out) or "."
     os.makedirs(outdir, exist_ok=True)
-    need = len(TAPS) * N * N_POS * D_H * 2 / 2 ** 30
+    need = len(save_taps) * N * N_POS * D_H * 2 / 2 ** 30
     stfs = os.statvfs(outdir)
     free = stfs.f_bavail * stfs.f_frsize / 2 ** 30
-    print(f"  отводы: {len(TAPS)} x ({N}, {N_POS}, {D_H}) fp16 = "
+    print(f"  сохраняются отводы {save_taps} (проход полный, снимаются все "
+          f"{TAPS}): {len(save_taps)} x ({N}, {N_POS}, {D_H}) fp16 = "
           f"{need:.2f} ГиБ, свободно {free:.1f} ГиБ")
     if free < need * 1.15:
-        raise SystemExit("места не хватит с запасом")
+        raise SystemExit(
+            f"места не хватит с запасом: нужно {need * 1.15:.1f} ГиБ, есть "
+            f"{free:.1f}. Уменьшите --save-taps до 24, возьмите --limit или "
+            f"освободите диск — падение на последнем батче стоило бы всего "
+            f"прогона")
 
     taps_mm = {t: np.lib.format.open_memmap(
         f"{args.out}.h{t}.npy", mode="w+", dtype=np.float16,
-        shape=(N, N_POS, D_H)) for t in TAPS}
+        shape=(N, N_POS, D_H)) for t in save_taps}
     q0hat = np.zeros((N, N_POS), np.int16)
 
     groups = []
@@ -934,12 +1110,12 @@ def main() -> None:
                 position_ids=pp)
             _, q0 = model.q0_from(tp[args.depth])
         seen.add(int(tp["layers_run"]))
-        for t in TAPS:
+        for t in save_taps:
             taps_mm[t][sel] = tp[t].float().cpu().numpy().astype(np.float16)
         q0hat[sel] = q0.cpu().numpy().astype(np.int16)
         if gi % 50 == 0:
             print(f"    батч {gi}/{len(groups)}", flush=True)
-    for t in TAPS:
+    for t in save_taps:
         taps_mm[t].flush()
     if seen != {model.n_layers_total}:
         raise SystemExit(f"глубина прохода {sorted(seen)} вместо "
@@ -947,6 +1123,10 @@ def main() -> None:
     print(f"  проход: ровно {model.n_layers_total} слоёв во всех батчах")
 
     # --- ШУМ ХРАНЕНИЯ FP16 ИЗМЕРЯЕТСЯ, А НЕ ПРЕДПОЛАГАЕТСЯ -----------------
+    if args.depth not in save_taps:
+        raise SystemExit(
+            f"отвод {args.depth} не сохраняется, а без него нечем измерить "
+            f"шум fp16 на черновике: добавьте его в --save-taps")
     chk = np.random.default_rng(0).choice(N, min(2048, N), replace=False)
     with torch.no_grad(), torch.autocast(device_type=dev.type, dtype=dt):
         hb = torch.from_numpy(np.asarray(taps_mm[args.depth][chk])).to(dev, dt)
@@ -972,7 +1152,9 @@ def main() -> None:
         sub = np.random.default_rng(1).choice(N, min(args.drift_n, N),
                                               replace=False)
         rel, ag12, agc, ntok = [], 0, 0, 0
-        dp, dr_, dg = [], [], []
+        # СУММЫ, А НЕ СРЕДНЕЕ RMS ПО БАТЧАМ — та же поправка, что в основной
+        # диагностике; здесь она была пропущена.
+        acc_d = {}
         for po in sorted({int(offs[i]) for i in sub}):
             ipo = np.asarray([i for i in sub if int(offs[i]) == po])
             for i, j in plan_batches(len(ipo), args.batch):
@@ -1010,15 +1192,15 @@ def main() -> None:
                     Ac = codec._decode(
                         E[0][torch.as_tensor(qc).long().to(dev)],
                         embodiment_ids=0)[0][..., :7].float().cpu().numpy()
-                e_ = action_err(Aj, Ac)
-                dp.append(e_["pos"]); dr_.append(e_["rot"]); dg.append(e_["grip"])
+                err_add(acc_d, err_sums(Aj, Ac))
         rel = np.concatenate(rel)
+        e_d = err_finish(acc_d)
         drift = dict(n=int(len(sub)), h24_rel_mean=float(rel.mean()),
                      h24_rel_p95=float(np.percentile(rel, 95)),
                      q0_vs_clean_h12=float(ag12 / max(ntok, 1)),
                      q0_vs_coarse24=float(agc / max(ntok, 1)),
-                     act_pos=float(np.mean(dp)), act_rot=float(np.mean(dr_)),
-                     act_grip=float(np.mean(dg)))
+                     act_pos=e_d["pos"], act_rot=e_d["rot"],
+                     act_grip=e_d["grip"])
         print(f"    1. q0 Joint12 против исходной головы на h12: "
               f"{drift['q0_vs_clean_h12']:.1%} совпадений")
         print(f"    2. q0 Joint12 против НАСТОЯЩЕГО coarse24 (generate, "
@@ -1042,21 +1224,26 @@ def main() -> None:
     np.save(f"{args.out}.split.npy", split)
     np.save(f"{args.out}.codebooks.npy", E.cpu().numpy().astype(np.float32))
     meta = dict(n_obs=int(N), q0_source=args.q0_source, taps=list(TAPS),
+                saved_taps=list(save_taps),
                 depth=args.depth, d_hidden=D_H, d_latent=D_Z, ckpt=args.ckpt,
                 cache=args.cache, source=src_meta, fp16_q0_mismatch=mism,
                 drift=drift, script_sha1=sha, cache_meta=cache_meta,
                 manifest=man_info, vocab=V,
+                dataset_revision=args.dataset_revision,
                 codebooks_sha1=hashlib.sha1(np.ascontiguousarray(
                     E.cpu().numpy().astype(np.float32)).tobytes()
                 ).hexdigest()[:12],
+                decoder_probe=decoder_probe(codec, E, dev),
+                codec_state_sha1=state_sha1(codec),
                 hicora_vla_sha1=file_sha1(hv.__file__),
                 joint12_vla_sha1=file_sha1(jv.__file__),
                 keys_sha1=hashlib.sha1(np.ascontiguousarray(
                     np.stack([epi, stp])).tobytes()).hexdigest()[:12])
     json.dump(meta, open(f"{args.out}.meta.json", "w"), ensure_ascii=False,
               indent=1)
-    print(f"\n  сохранено: {args.out}.{{h12,h18,h24,q0hat,ktrue,split,"
-          f"codebooks}}.npy и .meta.json")
+    hs = ",".join(f"h{t}" for t in save_taps)
+    print(f"\n  сохранено: {args.out}.{{{hs},q0hat,ktrue,split,codebooks}}"
+          f".npy и .meta.json")
     print(f"  ключи sha {meta['keys_sha1']}")
     print("\n  ДАЛЬШЕ: --diagnose для выбора ранга и rho, затем K-11b с "
           "проверками\n  тождества. Обучение головы не начинать до "
