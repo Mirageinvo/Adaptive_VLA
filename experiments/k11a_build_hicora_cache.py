@@ -1116,9 +1116,25 @@ def main() -> None:
         print(f"  голова-читалка: {len(state)} тензоров, файл sha {wsha}")
 
     # РЕЖИМ ВЫЧИСЛЕНИЯ КАК В K-9c/K-9e: обучаемое в fp32, проход под autocast.
+    # ПРОВЕРКА ПРЯМАЯ, А НЕ ПО СЧЁТЧИКУ. `to_fp32_trainable` возвращает число
+    # ПЕРЕВЕДЁННЫХ тензоров, и ноль означает либо «все уже в fp32» (наш
+    # случай: веса грузятся как fp32 сразу), либо «обучаемых нет вовсе».
+    # Различить это по счётчику нельзя, а разница — между той моделью, у
+    # которой измерены 89.5%, и другой.
     n32 = model.to_fp32_trainable()
-    print(f"  режим как в K-9c: {n32} тензоров в fp32, проход под autocast "
-          f"{args.dtype}")
+    own_now = dict(model.named_parameters())
+    loaded = [k for k in state if k in own_now]
+    not32 = [k for k in loaded if own_now[k].dtype != torch.float32]
+    if not loaded:
+        raise SystemExit("ни один загруженный ключ не найден в модели")
+    if not32:
+        raise SystemExit(
+            f"{len(not32)} загруженных весов не в fp32 ({not32[:3]}): "
+            f"обученные веса округлены до fp16, исполнялась бы ДРУГАЯ модель")
+    n_tr = sum(1 for p_ in model.parameters() if p_.requires_grad)
+    print(f"  режим как в K-9c: все {len(loaded)} загруженных весов в fp32 "
+          f"(переведено сейчас {n32}, остальные загружены такими), обучаемых "
+          f"тензоров {n_tr}, проход под autocast {args.dtype}")
     model.eval()
 
     model.__class__ = hv.make_hicora_class(type(model))
