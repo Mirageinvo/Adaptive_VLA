@@ -545,6 +545,7 @@ def state_sha1(module):
 def load_codec(args):
     """Только процессор и кодек: для диагностики VLM не нужен."""
     import torch
+    import actioncodec  # noqa: F401  регистрирует action_codec
     from utils import VisionLanguageActionProcessor
     proc = VisionLanguageActionProcessor.from_pretrained(
         args.ckpt, trust_remote_code=True, mode="discrete")
@@ -884,6 +885,11 @@ def main() -> None:
     import torch
     import pyarrow.parquet as pq
     from huggingface_hub import hf_hub_download
+    # РЕГИСТРИРУЕТ ТИП `action_codec` в AutoConfig/AutoModel. Без этого
+    # импорта `VisionLanguageActionProcessor.from_pretrained` падает с
+    # «Transformers does not recognize this architecture» — и падает уже
+    # ПОСЛЕ сбора состояний из parquet, то есть через двадцать минут.
+    import actioncodec  # noqa: F401
     from smolvla.bar import SmolVLABlockwiseAR
     from utils import (STATE_Q01, STATE_Q99, VisionLanguageActionProcessor,
                        dict_apply, get_cfg, process_state, prompt_template,
@@ -897,6 +903,15 @@ def main() -> None:
     cfg = get_cfg(os.path.join(args.root, args.cfg_path))
     cfg.TRAINING.ckpt_dir = args.ckpt
     cfg.MODEL.vlm.kwargs.pretrained_model_name_or_path = args.ckpt
+
+    # РЕГИСТРАЦИЯ ПРОВЕРЯЕТСЯ СРАЗУ, до сбора состояний: сам импорт может
+    # молча не зарегистрировать тип, если модуль подменён или обрезан, и
+    # тогда отказ наступил бы через двадцать минут работы.
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+    if "action_codec" not in CONFIG_MAPPING:
+        raise SystemExit(
+            "тип «action_codec» не зарегистрирован после import actioncodec: "
+            "процессор не загрузится. Проверьте third_party/actioncodec")
 
     d = np.load(args.cache, allow_pickle=True)
     N = len(d["episode"]) if args.limit is None else min(args.limit,
