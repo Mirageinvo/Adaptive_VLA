@@ -244,13 +244,25 @@ def main() -> None:
     # параметры событий или версия разметчика означают, что кривые val и test
     # относятся к разным вещам, а отбор по одной и вердикт по другой
     # недействительны.
-    for f in ("ckpt", "cache", "goal_events_sha1", "event_params"):
+    for f in ("ckpt", "cache", "goal_events_sha1", "event_params",
+              "predictor"):
         if bases["val"].get(f) != bases["test"].get(f):
             raise SystemExit(f"опоры расходятся по «{f}»: "
                              f"{bases['val'].get(f)} и {bases['test'].get(f)}")
     ge_sha = hashlib.sha1(open(
         os.path.join(os.path.dirname(os.path.abspath(__file__)),
                      "goal_events.py"), "rb").read()).hexdigest()[:12]
+    # ОПОРОЙ МОЖЕТ БЫТЬ ТОЛЬКО coarse24. K-10e умеет считать и `copy-prev` —
+    # тривиальный повтор предыдущей команды, — и без этой проверки его файл
+    # молча стал бы «опорой», а вердикт K-10d означал бы «контроллер не хуже
+    # копировщика» при неизменных подписях в выводе.
+    for part_, bj_ in bases.items():
+        pr = bj_.get("predictor")
+        if pr != "coarse24":
+            raise SystemExit(
+                f"опора «{part_}» посчитана предсказателем «{pr}», нужен "
+                f"«coarse24»; файлы copy-prev/zero — отрицательный контроль "
+                f"для K-10g, а не опора")
     if bases["val"].get("goal_events_sha1") not in (None, ge_sha):
         raise SystemExit(
             f"опоры собраны разметчиком sha {bases['val']['goal_events_sha1']}, "

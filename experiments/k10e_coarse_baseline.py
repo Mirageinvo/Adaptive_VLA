@@ -86,9 +86,23 @@ def selftest():
     x = np.array([3.0, 4.0])
     c2 = curve(x, x, x, np.zeros(2), np.zeros(2, int), bucket_names(ed))
     assert abs(c2["<= 8"]["pose"] - np.sqrt(12.5)) < 1e-12
-    print("самопроверка k10e пройдена (версия «граница у завершающейся "
-          "фазы»): имена бакетов, остаток в момент события ноль, взвешивание "
-          "по строкам, RMS по квадратам")
+    # ГРАНИЦЫ СЧИТАЕТ ТОТ ЖЕ КОД, ЧТО И K-10d. Проверка через goal_events
+    # существовала и раньше, но основной путь k10e её обходил, поэтому тест
+    # обращается к тому, что реально вызывается в main.
+    ed = [8, 16, 32, 48]
+    nm_b = ge.bucket_names(ed)
+    for r, want in ((8, "<= 8"), (16, "8-16"), (32, "16-32"), (48, "32-48")):
+        got = nm_b[int(ge.bucketize(np.array([r]), ed)[0])]
+        assert got == want, f"остаток {r}: бакет «{got}», ожидался «{want}»"
+    # Сторож против повторения ошибки. Литерал собран из частей, иначе он
+    # находил бы сам себя.
+    banned = "searchsorted(" + "np.asarray(edges)"
+    assert banned not in open(__file__).read(), \
+        "k10e снова считает бакеты сам, в обход ge.bucketize"
+
+    print("самопроверка k10e пройдена (версия «общая бакетизация»): имена "
+          "бакетов, остаток в момент события ноль, взвешивание по строкам, "
+          "RMS по квадратам, границы 8/16/32/48 считает ge.bucketize")
 
 
 def main() -> None:
@@ -243,7 +257,12 @@ def main() -> None:
     err_rot = np.linalg.norm(d[:, 3:6], axis=1) / np.sqrt(3)
     err_pose = np.linalg.norm(d[:, :6], axis=1) / np.sqrt(6)
     grip_bad = (np.sign(pred[:, 6]) != np.sign(demo[:, 6])).astype(float)
-    bi = np.searchsorted(np.asarray(edges), rem, side="right")
+    # ЧЕРЕЗ ОБЩИЙ МОДУЛЬ. Здесь стояло собственное searchsorted(side="right"),
+    # и остаток, равный границе, уходил в СЛЕДУЮЩИЙ бакет, тогда как K-10d
+    # через ge.bucketize оставлял его в текущем. Остаток целочисленный, такие
+    # строки есть у каждого длинного сегмента, поэтому одноимённые бакеты у
+    # опоры и у контроллера содержали РАЗНЫЕ множества строк.
+    bi = ge.bucketize(rem, edges)
     cur = curve(err_pos, err_rot, err_pose, grip_bad, bi, names)
 
     print(f"\n  предсказатель «{args.predictor}», событие «{args.event}», "
