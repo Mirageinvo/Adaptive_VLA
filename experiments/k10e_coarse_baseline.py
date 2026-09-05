@@ -100,6 +100,12 @@ def main() -> None:
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--event", choices=["grip", "stop", "union"],
                     default="union")
+    # ПРЕДСКАЗАТЕЛЬ ВЫБИРАЕТСЯ ЯВНО. `copy-prev` — тривиальная временная
+    # экстраполяция: повторить предыдущую команду демонстрации. Она нужна как
+    # ОТРИЦАТЕЛЬНЫЙ КОНТРОЛЬ гейта: если она проходит те же бакеты, что и
+    # coarse24, значит критерий вознаграждает экстраполяцию, а не управление.
+    ap.add_argument("--predictor", choices=["coarse24", "copy-prev", "zero"],
+                    default="coarse24")
     ap.add_argument("--bucket-edges", default="8,16,32,48")
     ap.add_argument("--split", default="test")
     ap.add_argument("--speed-frac", type=float, default=0.3)
@@ -163,14 +169,16 @@ def main() -> None:
         E = torch.stack([qq.out_project(qq.decode_code(ii))[0]
                          for qq in codec.vq.quantizers]).float().to(dev)
 
-    # ПРЕДСКАЗАНИЕ coarse24: уровень 0, позиция 0 чанка.
+    # ПРЕДСКАЗАНИЕ coarse24: уровень 0, позиция 0 чанка. Для остальных
+    # предсказателей заполняется ниже, при загрузке эпизодов.
     pred = np.zeros((len(sel), 7), np.float64)
-    for i0 in range(0, len(sel), args.batch):
-        b = sel[i0:i0 + args.batch]
-        with torch.no_grad():
-            k = torch.as_tensor(q[b]).long().to(dev)
-            x, _ = codec._decode(E[0][k], embodiment_ids=0)
-        pred[i0:i0 + len(b)] = x[:, 0, :7].float().cpu().numpy()
+    if args.predictor == "coarse24":
+        for i0 in range(0, len(sel), args.batch):
+            b = sel[i0:i0 + args.batch]
+            with torch.no_grad():
+                k = torch.as_tensor(q[b]).long().to(dev)
+                x, _ = codec._decode(E[0][k], embodiment_ids=0)
+            pred[i0:i0 + len(b)] = x[:, 0, :7].float().cpu().numpy()
 
     max_act_q = np.maximum(np.abs(ACTION_Q99), np.abs(ACTION_Q01))
 
@@ -216,6 +224,12 @@ def main() -> None:
                              f"{len(a)}")
         demo[rows] = a[st_rows]
         rem[rows] = r[st_rows]
+        if args.predictor == "copy-prev":
+            # Повтор предыдущей команды; на нулевом шаге предыдущей нет.
+            prev = np.maximum(st_rows - 1, 0)
+            pred[rows] = a[prev] * (st_rows > 0)[:, None]
+        elif args.predictor == "zero":
+            pred[rows] = 0.0
         n_ep += 1
         if n_ep % 100 == 0:
             print(f"  эпизодов {n_ep}/{len(pos_in_sel)}", flush=True)
@@ -232,7 +246,8 @@ def main() -> None:
     bi = np.searchsorted(np.asarray(edges), rem, side="right")
     cur = curve(err_pos, err_rot, err_pose, grip_bad, bi, names)
 
-    print(f"\n  опора coarse24, событие «{args.event}», часть «{args.split}»")
+    print(f"\n  предсказатель «{args.predictor}», событие «{args.event}», "
+          f"часть «{args.split}»")
     print(f"  {'удалённость':>13}{'строк':>9}{'позиция':>10}{'вращение':>11}"
           f"{'смесь':>9}{'знак':>8}")
     for nm in names:
@@ -256,6 +271,7 @@ def main() -> None:
                    eval_keys=[[int(a_), int(b_)] for a_, b_ in
                               zip(epi[sel], stp[sel])],
                    eval_remaining=[int(x) for x in rem],
+                   predictor=args.predictor,
                    cache=os.path.abspath(args.cache), ckpt=args.ckpt,
                    script_sha1=sha,
                    goal_events_sha1=hashlib.sha1(
