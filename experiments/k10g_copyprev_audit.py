@@ -106,13 +106,39 @@ def audit(base, copy, margin_pose, margin_grip):
         ok = k10d.gate(c, b, margin_pose, margin_grip)
         flags.append(ok)
         rows.append((nm, b, c, ok))
-    return rows, flags, k10d.prefix_ok(flags, edges) / k10d.H_CALL
+    # РАЗЛОЖЕНИЕ ПО КАНАЛАМ. Полный размах ноль ещё не значит, что критерий
+    # различает управление и повтор: он может отвергать копию одним каналом
+    # при полностью вырожденных остальных. Позный размах считается тем же
+    # гейтом с заведомо проходным допуском по знаку, знаковый — наоборот.
+    pose_flags = [k10d.gate(c, b, margin_pose, 1e9) for _, b, c, _ in rows]
+    grip_flags = [k10d.gate(c, b, 1e9, margin_grip) for _, b, c, _ in rows]
+    spans = dict(
+        full=k10d.prefix_ok(flags, edges) / k10d.H_CALL,
+        pose=k10d.prefix_ok(pose_flags, edges) / k10d.H_CALL,
+        grip=k10d.prefix_ok(grip_flags, edges) / k10d.H_CALL)
+    return rows, flags, spans
 
 
-def read_span(span):
-    """Чтение в ВЫЗОВАХ VLA. Пороги те же, что у вердикта K-10d."""
+def read_span(span, pose_span=None):
+    """Чтение в ВЫЗОВАХ VLA. Пороги те же, что у вердикта K-10d.
+
+    ПОЗНЫЙ РАЗМАХ ЧИТАЕТСЯ ОТДЕЛЬНО. Нулевой полный размах при большом позном
+    означает, что критерий держится на ОДНОМ канале, а позная его часть
+    тривиальный повтор проходит насквозь. Называть такой гейт различающим
+    нельзя: он не отвергнет ни один контроллер, умеющий экстраполировать позу.
+    """
     if span <= 0:
-        return ("копировщик отвергнут сразу: гейт отличает управление от "
+        base = ("копировщик отвергнут полным гейтом")
+        if pose_span is not None and pose_span >= 4:
+            return (base + f", но ТОЛЬКО каналом знака схвата: позный размах "
+                    f"копировщика {pose_span:g}x — позная часть критерия "
+                    f"вырождена, повтор проходит её насквозь. Гейт способен "
+                    f"отвергать, но не способен подтверждать: положительный "
+                    f"вердикт по позе ничего не значит")
+        if pose_span is not None and pose_span > 0:
+            return (base + f"; позный размах {pose_span:g}x — вырождена "
+                    f"ближняя часть позного критерия")
+        return (base + " по всем каналам: критерий отличает управление от "
                 "повтора, побакетные выводы K-10d остаются осмысленными")
     if span < 4:
         return (f"размах копировщика {span:g}x: ближняя часть критерия "
@@ -144,6 +170,9 @@ def selftest():
     # диапазон «1-2x» недостижим, и любой единичный успех читался бы как
     # полный разгром гейта.
     def span_for(flags_vals):
+        return audit(base, mk("copy-prev", flags_vals), 0.0, 0.005)[2]["full"]
+
+    def spans_for(flags_vals):
         return audit(base, mk("copy-prev", flags_vals), 0.0, 0.005)[2]
 
     good, bad = (0.05, 0.05, 0.01), (0.9, 0.9, 0.9)
@@ -159,7 +188,17 @@ def selftest():
     # ровно то, чего ждём от повтора в момент переключения.
     grip_bad = mk("copy-prev", [(0.05, 0.05, 0.30)] + [good] * 4)
     _, _, sp = audit(base, grip_bad, 0.0, 0.005)
-    assert sp == 0, f"провал знака в ближнем бакете обязан давать 0, дал {sp}"
+    assert sp["full"] == 0, f"провал знака обязан давать 0, дал {sp['full']}"
+    # ИМЕННО ЭТОТ СЛУЧАЙ ИЗМЕРЕН: поза копии лучше опоры везде, знак хуже в
+    # ближнем бакете. Полный размах ноль, позный — полный, и вердикт обязан
+    # называть критерий не различающим, а лишь отвергающим.
+    assert sp["pose"] == 6 and sp["grip"] == 0, sp
+    txt = read_span(sp["full"], sp["pose"])
+    assert "вырождена" in txt and "не способен подтверждать" in txt, txt
+    # Отказ по позе — другое дело: тогда критерий работает всеми каналами.
+    sp2 = spans_for([(0.9, 0.9, 0.0)] * 5)
+    assert sp2["full"] == 0 and sp2["pose"] == 0
+    assert "по всем каналам" in read_span(sp2["full"], sp2["pose"])
 
     # Поза хуже опоры — тоже отказ, даже при идеальном знаке.
     assert span_for([(0.09, 0.05, 0.0)] * 5) == 0
@@ -218,10 +257,10 @@ def selftest():
         raise AssertionError
     except SystemExit:
         pass
-    print("самопроверка k10g пройдена (версия «размах в вызовах»): "
+    print("самопроверка k10g пройдена (версия «размах по каналам»): "
           "1/2/4/6x по префиксу, ближний бакет = 1 вызов, провал знака даёт "
           "ноль, пропуск и пустота бакета останавливают, несовпадение строк "
-          "и события останавливает")
+          "и события останавливает, позный и знаковый размах разделены")
 
 
 def main():
@@ -252,7 +291,9 @@ def main():
           f"{base['n_episodes']} эпизодов, событие «{base['event']}», "
           f"часть «{args.split}»")
 
-    rows, flags, span = audit(base, copy, args.margin_pose, args.margin_grip)
+    rows, flags, spans = audit(base, copy, args.margin_pose,
+                               args.margin_grip)
+    span = spans["full"]
     print(f"\n  {'удалённость':>13}{'строк':>8}"
           f"{'поз.оп':>9}{'поз.коп':>9}"
           f"{'вр.оп':>9}{'вр.коп':>9}"
@@ -264,17 +305,20 @@ def main():
               f"{b['grip']:>7.1%}{c['grip']:>8.1%}"
               f"{'  да' if ok else '  нет':>4}")
 
-    print(f"\nразмах копировщика: {span:g}x "
-          f"(вызовов VLA; префикс {span * k10d.H_CALL:g} шагов)")
-    print(read_span(span))
+    print(f"\nразмах копировщика: полный {spans['full']:g}x, "
+          f"по позе {spans['pose']:g}x, по знаку схвата {spans['grip']:g}x "
+          f"(вызовов VLA)")
+    print(read_span(spans["full"], spans["pose"]))
     print("\nЭто утверждение о ПРИГОДНОСТИ КРИТЕРИЯ, а не о работоспособности "
           "в замкнутом цикле: пошаговая ошибка считается на состояниях "
           "демонстрации, где ошибка не накапливается.")
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".",
                 exist_ok=True)
-    json.dump(dict(copy_span=float(span),
-                   copy_span_steps=float(span * k10d.H_CALL), split=args.split,
+    json.dump(dict(copy_span=float(spans["full"]),
+                   copy_span_steps=float(spans["full"] * k10d.H_CALL),
+                   copy_span_pose=float(spans["pose"]),
+                   copy_span_grip=float(spans["grip"]), split=args.split,
                    event=base["event"], edges=base["edges"],
                    n_rows=base["n_rows"], n_episodes=base["n_episodes"],
                    margin_pose=args.margin_pose, margin_grip=args.margin_grip,
