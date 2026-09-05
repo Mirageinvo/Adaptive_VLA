@@ -78,56 +78,6 @@ import numpy as np
 H_CALL = 8
 
 
-def aa_to_R(v):
-    """Axis-angle -> матрица поворота (Родриг), пакетно."""
-    v = np.asarray(v, np.float64)
-    th = np.linalg.norm(v, axis=-1, keepdims=True)
-    k = np.divide(v, np.where(th > 1e-12, th, 1.0))
-    K = np.zeros(v.shape[:-1] + (3, 3))
-    K[..., 0, 1], K[..., 0, 2] = -k[..., 2], k[..., 1]
-    K[..., 1, 0], K[..., 1, 2] = k[..., 2], -k[..., 0]
-    K[..., 2, 0], K[..., 2, 1] = -k[..., 1], k[..., 0]
-    I = np.broadcast_to(np.eye(3), K.shape).copy()
-    s, c = np.sin(th)[..., None], np.cos(th)[..., None]
-    return I + s * K + (1 - c) * (K @ K)
-
-
-def R_to_aa(R):
-    """Матрица поворота -> axis-angle, с устойчивой ветвью около pi."""
-    R = np.asarray(R, np.float64)
-    tr = np.clip((np.trace(R, axis1=-2, axis2=-1) - 1) / 2, -1.0, 1.0)
-    th = np.arccos(tr)
-    v = np.stack([R[..., 2, 1] - R[..., 1, 2],
-                  R[..., 0, 2] - R[..., 2, 0],
-                  R[..., 1, 0] - R[..., 0, 1]], axis=-1)
-    n = np.linalg.norm(v, axis=-1, keepdims=True)
-    out = v / np.where(n > 1e-12, n, 1.0) * th[..., None]
-    # ДВА ВЫРОЖДЕНИЯ, А НЕ ОДНО: кососимметричная часть равна нулю и при
-    # theta=0, и при theta=pi. Одна ветка «малый угол» возвращала бы для
-    # поворота на pi нулевой вектор.
-    flat, Rf = out.reshape(-1, 3), R.reshape(-1, 3, 3)
-    trf, nf, vf = tr.reshape(-1), n.reshape(-1), v.reshape(-1, 3)
-    for i in np.where(nf < 1e-8)[0]:
-        if trf[i] > 0:
-            flat[i] = vf[i] / 2.0
-            continue
-        A = (Rf[i] + np.eye(3)) / 2.0        # при theta=pi это a a^T
-        k = int(np.argmax(np.diag(A)))
-        ak = math.sqrt(max(A[k, k], 0.0))
-        if ak < 1e-12:
-            flat[i] = 0.0
-            continue
-        u = A[:, k] / ak
-        flat[i] = u / max(np.linalg.norm(u), 1e-12) * np.pi
-    return flat.reshape(out.shape)
-
-
-def rel_goal(pos_t, aa_t, pos_g, aa_g):
-    """Цель относительно текущей позы: смещение и поворот R_g * R_t^T."""
-    dR = aa_to_R(aa_g) @ np.swapaxes(aa_to_R(aa_t), -1, -2)
-    return np.concatenate([pos_g - pos_t, R_to_aa(dR)], axis=-1)
-
-
 def prefix_ok(flags, edges):
     """До какого удаления контроллер годен — НЕПРЕРЫВНЫМ префиксом."""
     d = 0
@@ -155,31 +105,11 @@ def verdict(span):
 
 def selftest():
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import goal_dataset as gd
+    import goal_dataset as gd
     import goal_events as ge
     ge.selftest()
-
-    rng = np.random.default_rng(0)
-    v = rng.normal(0, 0.5, size=(50, 3))
-    v = v / np.linalg.norm(v, axis=-1, keepdims=True) * rng.uniform(
-        0.05, 2.5, size=(50, 1))
-    assert np.abs(R_to_aa(aa_to_R(v)) - v).max() < 1e-8
-    R = aa_to_R(v)
-    assert np.abs(R @ np.swapaxes(R, -1, -2) - np.eye(3)).max() < 1e-9
-    # ПОВОРОТ РОВНО НА PI: прежняя версия возвращала здесь почти ноль.
-    for ax in ([0, 0, 1.0], [1.0, 0, 0], [0.6, 0.8, 0.0]):
-        w = np.array([ax]) * np.pi
-        got = R_to_aa(aa_to_R(w))
-        assert abs(np.linalg.norm(got) - np.pi) < 1e-6
-        assert np.abs(aa_to_R(got) - aa_to_R(w)).max() < 1e-9
-
-    p = rng.normal(size=(10, 3)); a = rng.normal(0, 0.3, size=(10, 3))
-    assert np.abs(rel_goal(p, a, p, a)).max() < 1e-8
-    sh = rng.normal(size=(1, 3))
-    assert np.abs(rel_goal(p, a, p + 1.0, a)
-                  - rel_goal(p + sh, a, p + sh + 1.0, a)).max() < 1e-9
-    a1, a2 = np.array([[0.0, 0.0, 3.0]]), np.array([[0.0, 3.0, 0.0]])
-    honest = rel_goal(np.zeros((1, 3)), a1, np.zeros((1, 3)), a2)[:, 3:]
-    assert np.abs(honest - (a2 - a1)).max() > 0.5, "вращения не вычитаются"
+    gd.selftest()
 
     ed = [8, 16, 32, 48]
     assert prefix_ok([True, True, False, True, True], ed) == 16
@@ -234,6 +164,10 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=1024)
     ap.add_argument("--max-train-ep", type=int, default=400)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--rich", action="store_true",
+                    help="полный вход: приращение, прошлое действие, остаток; "
+                         "без флага воспроизводится вход отрицательного "
+                         "результата")
     ap.add_argument("--report-seed", type=int, default=0,
                     help="сид, чей вердикт объявляется заголовочным; назначен "
                          "ЗАРАНЕЕ, чтобы лучший сид не выбирался по test")
@@ -265,6 +199,7 @@ def main() -> None:
     from huggingface_hub import hf_hub_download
 
     import actioncodec  # noqa: F401
+    import goal_dataset as gd
     import goal_events as ge
     from utils import (ACTION_Q01, ACTION_Q99, STATE_Q01, STATE_Q99,
                        process_state)
@@ -360,18 +295,19 @@ def main() -> None:
         cache_ep[e] = (a, st, tau, ttyp, rem)
         return cache_ep[e]
 
+    def norm_state(x):
+        return ((x - STATE_Q01) / (STATE_Q99 - STATE_Q01) * 2 - 1
+                if x.shape[1] == len(STATE_Q01) else x)
+
     def build(e, steps):
+        """Сборка через ОБЩИЙ модуль. Своих копий здесь больше нет: они
+        дважды расходились с K-10e и K-10f, а заявление об унификации
+        опережало код."""
         a, st, tau, ttyp, rem = load_ep(e)
         t = np.asarray(steps, np.int64)
-        g = rel_goal(st[t, :3], st[t, 3:6], st[tau[t], :3], st[tau[t], 3:6])
-        # ЦЕЛЬ НЕСЁТ ЗНАК СХВАТА И ТИП СОБЫТИЯ одним горячим вектором.
-        oh = np.zeros((len(t), 3))
-        oh[np.arange(len(t)), np.clip(ttyp[t], 0, 2)] = 1.0
-        g = np.concatenate([g, np.sign(a[tau[t], 6:7]), oh], 1)
-        sn = ((st[t] - STATE_Q01) / (STATE_Q99 - STATE_Q01) * 2 - 1
-              if st.shape[1] == len(STATE_Q01) else st[t])
-        return (sn.astype(np.float32), g.astype(np.float32),
-                a[t].astype(np.float32), rem[t])
+        s_, g_, y_ = gd.build(a, st, tau, ttyp, rem, t,
+                              state_norm=norm_state, rich=args.rich)
+        return s_, g_, y_, rem[t]
 
     # --- обучающая выборка: все шаги обучающих эпизодов -----------------------
     S, G, Y = [], [], []

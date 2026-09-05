@@ -100,28 +100,54 @@ def lag_r2(disp, act, lag):
     return (1.0 - ss_res / ss_tot) if ss_tot > 0 else None
 
 
-def read_alignment(best_lag, r2):
+def read_alignment(best_lag, r2, margin=None):
+    """Лаг ПЕЧАТАЕТСЯ, но вывод про границу фазы отсюда НЕ делается.
+
+    Прежняя версия заключала «лаг +1 -> side=left». Это смешивало две разные
+    вещи: какому действию соответствует переход состояния и к какой ФАЗЕ
+    относится метка действия. `action[e]` — первый шаг с новым знаком схвата,
+    и он принадлежит новой фазе независимо от задержки робота. Задержка может
+    потребовать сдвинуть индекс целевой ПОЗЫ, но не переводит новое действие в
+    старую фазу.
+
+    Плюс действия сильно автокоррелированы: соседние лаги дают близкие R^2, и
+    победитель без запаса ничего не значит.
+    """
     if r2 is None or r2 < 0.3:
-        return ("СВЯЗЬ СЛАБАЯ: команда плохо объясняет движение, постановка "
-                "под вопросом")
-    if best_lag == 0:
-        return ("ЛАГ 0: action[t] порождает state[t+1]-state[t]; согласованная "
-                "граница — side=\"right\", строки с нулевым остатком при "
-                "side=\"left\" противоречивы")
-    if best_lag == 1:
-        return ("ЛАГ +1: команда исполняется с задержкой, событие сдвигается "
-                "на шаг назад, side=\"left\" согласован")
-    return f"ЛУЧШИЙ ЛАГ {best_lag:+d}: неожиданно, разбираться отдельно"
+        return ("СВЯЗЬ СЛАБАЯ: команда плохо объясняет движение, вся "
+                "постановка «контроллер выдаёт приращение позы» под вопросом")
+    if margin is not None and margin < 0.05:
+        return (f"ЛУЧШИЙ ЛАГ {best_lag:+d}, но отрыв от второго всего "
+                f"{margin:.3f} — действия автокоррелированы, выбор ненадёжен")
+    return (f"ЛУЧШИЙ ЛАГ {best_lag:+d}, R^2 {r2:.3f}, отрыв "
+            + (f"{margin:.3f}" if margin is not None else "н/д")
+            + ". Это про ЗАДЕРЖКУ ИСПОЛНЕНИЯ, а не про принадлежность "
+              "действия фазе: вывод о границе делается отдельно и вручную.")
 
 
-def read_capacity(small_rms, thr=0.02):
+def read_capacity(small_rms, cap_curve=None, thr=0.02):
+    """Четыре исхода, а не два.
+
+    Запоминание 256 строк доказывает лишь отсутствие грубой ошибки в
+    оптимизации. Оно НЕ доказывает, что 72 тысячи параметров достаточно для
+    отображения на десятках тысяч разнообразных состояний. Прежнее правило
+    делало именно такой вывод.
+    """
     if small_rms is None:
         return "недействительно"
-    if small_rms <= thr:
-        return ("ЁМКОСТИ ХВАТАЕТ: малая выборка переобучается, значит причина "
-                "провала во ВХОДЕ, а не в сети")
-    return ("ЁМКОСТИ НЕ ХВАТАЕТ или оптимизация не сходится: вывод K-10d об "
-            "информации неправомерен")
+    if small_rms > thr:
+        return ("МАЛАЯ ВЫБОРКА НЕ ЗАПОМИНАЕТСЯ: реализация или оптимизация "
+                "невалидна, и вывод K-10d об информации неправомерен вовсе")
+    base = "Проверка вменяемости пройдена: 256 строк запоминаются. "
+    if not cap_curve:
+        return base + "Причина плато пока НЕ установлена."
+    tr = [v["train"] for v in cap_curve.values()]
+    if max(tr) - min(tr) > 0.02:
+        return base + ("Рост сети СНИЖАЕТ ошибку на обучении — ёмкость была "
+                       "ограничением, а не информация.")
+    return base + ("Рост сети ошибку не снижает — довод за информационный "
+                   "предел, но окончательным его делает только сравнение "
+                   "plain против rich.")
 
 
 def selftest():
@@ -150,11 +176,29 @@ def selftest():
     rn = {l: lag_r2(noise, a, l) for l in (-1, 0, 1)}
     assert max(v for v in rn.values() if v is not None) < 0.1, rn
 
-    assert "side=\"right\"" in read_alignment(0, 0.9)
-    assert "side=\"left\"" in read_alignment(1, 0.9)
-    assert "СЛАБАЯ" in read_alignment(0, 0.1)
-    assert "ХВАТАЕТ" in read_capacity(0.01)
-    assert "НЕ ХВАТАЕТ" in read_capacity(0.2)
+    # ВЫВОД ПРО ГРАНИЦУ ФАЗЫ ОТСЮДА НЕ ДЕЛАЕТСЯ. Прежняя версия заключала
+    # «лаг +1 -> side=left», смешивая задержку исполнения с принадлежностью
+    # действия фазе. Проверяется, что таких заключений в тексте НЕТ.
+    for lag in (0, 1, -1):
+        txt = read_alignment(lag, 0.9, margin=0.4)
+        assert "side=" not in txt, txt
+        assert "ЗАДЕРЖКУ ИСПОЛНЕНИЯ" in txt
+    assert "СЛАБАЯ" in read_alignment(0, 0.1, margin=0.4)
+    # МАЛЫЙ ОТРЫВ ОТ ВТОРОГО ЛАГА обязан помечаться как ненадёжный выбор:
+    # действия автокоррелированы, соседние лаги дают близкие R^2.
+    assert "ненадёжен" in read_alignment(0, 0.9, margin=0.01)
+
+    # ЁМКОСТЬ: четыре исхода, и запоминание малой выборки САМО ПО СЕБЕ не
+    # доказывает достаточности ёмкости — только отсутствие грубой ошибки.
+    assert "НЕ ЗАПОМИНАЕТСЯ" in read_capacity(0.2)
+    t0 = read_capacity(0.01)
+    assert "вменяемости" in t0 and "НЕ установлена" in t0
+    grow = {"256x2": dict(train=0.20, val=0.21),
+            "1024x4": dict(train=0.05, val=0.09)}
+    assert "ёмкость была" in read_capacity(0.01, grow)
+    flat = {"256x2": dict(train=0.20, val=0.21),
+            "1024x4": dict(train=0.195, val=0.205)}
+    assert "информационный предел" in read_capacity(0.01, flat)
     print("самопроверка k10f пройдена: лаг находится там, где заложен, шум "
           "не даёт ложного лага, правила чтения на четырёх исходах")
 
@@ -231,7 +275,7 @@ def main() -> None:
     lags = [-2, -1, 0, 1, 2]
     lag_num = {l: 0.0 for l in lags}
     lag_den = {l: 0.0 for l in lags}
-    S, G, Y = [], [], []
+    S, G, Y, EP = [], [], [], []
     zero_rem, near_rows = 0, 0
 
     for i, e in enumerate(train_ep):
@@ -265,19 +309,23 @@ def main() -> None:
                               task_id=tmap[ep_task[e]], rich=args.rich,
                               n_task=len(tasks))
         S.append(s_); G.append(g_); Y.append(y_)
+        EP.append(np.full(len(s_), e))
         if (i + 1) % 50 == 0:
             print(f"  эпизодов {i + 1}/{len(train_ep)}", flush=True)
 
     S, G, Y = np.concatenate(S), np.concatenate(G), np.concatenate(Y)
+    EP = np.concatenate(EP)
     r2 = {l: (lag_num[l] / lag_den[l] if lag_den[l] else None) for l in lags}
-    best = max((l for l in lags if r2[l] is not None), key=lambda l: r2[l])
+    ok = sorted((l for l in lags if r2[l] is not None), key=lambda l: -r2[l])
+    best = ok[0]
+    margin = (r2[ok[0]] - r2[ok[1]]) if len(ok) > 1 else None
 
     print(f"\n=== ПРОБА 1: временное выравнивание ===")
     for l in lags:
         mark = "  <-- лучший" if l == best else ""
         print(f"  лаг {l:+d}: R^2 = "
               + (f"{r2[l]:.4f}" if r2[l] is not None else "н/д") + mark)
-    print(f"\n  {read_alignment(best, r2[best])}")
+    print(f"\n  {read_alignment(best, r2[best], margin)}")
     print(f"\n  строк с нулевым остатком: {zero_rem} "
           f"({zero_rem / max(len(S), 1):.2%} всех, "
           f"{zero_rem / max(near_rows, 1):.2%} ближнего бакета)")
@@ -304,7 +352,8 @@ def main() -> None:
 
     res = dict(alignment=dict(r2={str(k): v for k, v in r2.items()},
                               best_lag=int(best),
-                              verdict=read_alignment(best, r2[best]),
+                              margin=margin,
+                              verdict=read_alignment(best, r2[best], margin),
                               zero_remaining=zero_rem,
                               zero_frac=zero_rem / max(len(S), 1)),
                overfit={}, capacity={})
@@ -327,13 +376,21 @@ def main() -> None:
         print(f"  переобучение на {n} строках: RMS позы {e:.4f}")
         if small_rms is None:
             small_rms = e
-    print(f"\n  {read_capacity(small_rms)}")
+    cap_note = None
 
     # развёртка по ёмкости на полной выборке, та же метрика
-    cut = int(0.85 * len(X))
-    per = np.random.default_rng(1).permutation(len(X))
-    tr, va = per[:cut], per[cut:]
-    print(f"\n  развёртка по ёмкости (обучение {len(tr)}, отложено {len(va)}):")
+    # РАЗБИЕНИЕ ПО ЭПИЗОДАМ, а не по строкам. Соседние кадры одного эпизода
+    # почти одинаковы; деление по строкам сажает их и в обучение, и в
+    # отложенную часть, и разрыв искусственно исчезает.
+    ue = np.unique(EP)
+    peu = np.random.default_rng(1).permutation(len(ue))
+    cut_ep = max(1, int(0.85 * len(ue)))
+    tr_ep = set(ue[peu[:cut_ep]].tolist())
+    tr = np.where(np.isin(EP, list(tr_ep)))[0]
+    va = np.where(~np.isin(EP, list(tr_ep)))[0]
+    print(f"\n  развёртка по ёмкости, разбиение ПО ЭПИЗОДАМ "
+          f"({cut_ep} обучение / {len(ue) - cut_ep} отложено; "
+          f"строк {len(tr)} / {len(va)}):")
     for spec in args.caps.split(","):
         hid, depth = (int(v) for v in spec.split("x"))
         torch.manual_seed(0)
@@ -352,6 +409,7 @@ def main() -> None:
         res["capacity"][spec] = dict(train=etr, val=eva)
         print(f"    {spec:>9}: обучение {etr:.4f}, отложено {eva:.4f}")
 
+    print(f"\n  {read_capacity(small_rms, res['capacity'])}")
     print(f"\n  ЧИТАТЬ ТАК: если малая выборка переобучается, а развёртка по "
           f"ёмкости\n  ошибку не снижает — предел информационный. Если малая "
           f"НЕ переобучается —\n  вывод K-10d об информации неправомерен "

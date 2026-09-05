@@ -85,14 +85,24 @@ def build(a, st, tau, ttyp, rem, steps, state_norm=None, task_id=None,
     sn = state_norm(st[t]) if state_norm is not None else st[t]
     if not rich:
         return sn.astype(np.float32), g.astype(np.float32), a[t].astype(np.float32)
+    # НУЛЕВАЯ СТРОКА НЕ ИМЕЕТ ПРЕДЫДУЩЕГО ДЕЙСТВИЯ. При `prev = max(t-1, 0)`
+    # на t=0 получалось `предыдущее действие = a[0] = таргет`, то есть прямая
+    # утечка целевой величины во вход. Здесь такие строки получают нули и
+    # отдельный признак «предыдущего нет».
+    has_prev = (t > 0).astype(np.float64)[:, None]
     prev = np.maximum(t - 1, 0)
-    dst = st[t] - st[prev]
-    pact = a[prev]
+    # ВРАЩЕНИЕ НЕ ВЫЧИТАЕТСЯ: приращение позы считается через матрицы, как и
+    # цель. Прямое вычитание axis-angle — та же ошибка, которую мы уже
+    # исправляли в определении цели.
+    dpose = rel_goal(st[prev, :3], st[prev, 3:6], st[t, :3], st[t, 3:6])
+    dst = np.concatenate([dpose, st[t, 6:] - st[prev, 6:]], 1)
+    dst = dst * has_prev
+    pact = a[prev] * has_prev
     # ОСТАТОК ДАЁТСЯ ЯВНО: без него контроллер не знает, сколько у него шагов,
     # и не может распределить движение — величина команды в демонстрации от
     # этого зависит напрямую.
     rr = rem[t][:, None].astype(np.float64)
-    extra = [dst, pact, np.log1p(rr)]
+    extra = [dst, pact, has_prev, np.log1p(rr)]
     if task_id is not None:
         oh_t = np.zeros((len(t), n_task))
         oh_t[np.arange(len(t)), int(task_id) % n_task] = 1.0
@@ -127,11 +137,21 @@ def selftest():
     s1, g1, y1 = build(a, st, tau, ttyp, rem, np.arange(n - 1), rich=True,
                        task_id=3, n_task=64)
     assert np.allclose(g0, g1) and np.allclose(y0, y1)
-    assert s1.shape[1] == s0.shape[1] + 8 + 7 + 1 + 64, s1.shape
+    assert s1.shape[1] == s0.shape[1] + 8 + 7 + 1 + 1 + 64, s1.shape
     assert np.allclose(s1[:, :s0.shape[1]], s0)
     # Идентификатор задачи попал в свою позицию и только в неё.
     oh = s1[:, -64:]
     assert oh.sum() == len(s1) and oh[:, 3].all()
+    # НЕТ УТЕЧКИ ТАРГЕТА В НУЛЕВОЙ СТРОКЕ: предыдущего действия там нет.
+    d0 = s0.shape[1]
+    prev_act = s1[:, d0 + 8:d0 + 8 + 7]
+    assert np.abs(prev_act[0]).max() == 0.0, "нулевая строка несёт таргет"
+    assert not np.allclose(prev_act[1], y1[1]), "сдвиг на шаг потерян"
+    assert np.allclose(prev_act[1], y1[0]), "предыдущее действие не то"
+    has_prev = s1[:, d0 + 8 + 7]
+    assert has_prev[0] == 0.0 and has_prev[1:].all()
+    # ПРИРАЩЕНИЕ СОСТОЯНИЯ в нулевой строке тоже обнулено.
+    assert np.abs(s1[0, d0:d0 + 8]).max() == 0.0
     print("самопроверка goal_dataset пройдена: перегон axis-angle с pi, "
           "инвариантность цели к сдвигу, rich расширяет вход не меняя цель "
           "и таргет")
