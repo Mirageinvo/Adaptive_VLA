@@ -387,7 +387,7 @@ def main() -> None:
     from utils import (STATE_Q01, STATE_Q99, VisionLanguageActionProcessor,
                        dict_apply, get_envs, process_state, prompt_template,
                        seed_everything)
-    from models import SmolVLABlockwiseAR
+    from smolvla.bar import SmolVLABlockwiseAR
 
     dev = torch.device(args.device)
     dtype = getattr(torch, args.dtype)

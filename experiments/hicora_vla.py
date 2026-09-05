@@ -16,21 +16,28 @@ q0 через себя: без stop-gradient градиент поправки �
 предсказывает самостоятельно. Кодовые книги при этом заморожены и так, но
 sg делает независимость свойством архитектуры, а не режима обучения.
 
-ПОЧЕМУ tanh И rho. Без ограничения амплитуды голова может увести латент в
-область, где декодер не обучался, и офлайновая ошибка улучшится, а поведение
-развалится. rho считается на обучающей части как процентиль коэффициентов
-проекции реального остатка и КЛАДЁТСЯ В ЧЕКПОЙНТ; доля насыщенных
-коэффициентов печатается при каждом разборе — постоянное насыщение есть
-стоп-условие ветки, а не деталь.
+ПОЧЕМУ tanh, rho И ЗАМОРОЖЕННЫЙ БАЗИС. Ограничение коэффициентов само по
+себе НИЧЕГО НЕ ОГРАНИЧИВАЕТ, если базис обучаемый: |c| <= 1 и |rho*c| <= rho,
+но линейный слой волен увеличить веса во сто раз и обойти любой предел.
+Поэтому базис здесь ФИКСИРОВАН и ОРТОНОРМИРОВАН: строится на обучающей части,
+загружается через `set_basis`, замораживается. Тогда ||dz|| = ||rho .* c|| <=
+||rho|| — это настоящая граница, а не тавтология. Обучаются только
+коэффициенты. rho считается на обучающей части в координатах ЭТОГО базиса и
+кладётся в чекпойнт; доля насыщенных коэффициентов печатается при каждом
+разборе — постоянное насыщение есть стоп-условие ветки, а не деталь.
 
 ПОСЛЕДНИЙ ЛИНЕЙНЫЙ СЛОЙ ИНИЦИАЛИЗИРОВАН НУЛЯМИ. Это делает нулевое тождество
 проверяемым: до обучения модель обязана побитово совпадать с базовым coarse
 выходом головы q0. Тождество проверяет K-11b.
 
-СХВАТ НЕ ИСПРАВЛЯЕТСЯ. В HiCoRA-D он целиком берётся из q0. Канал схвата
-дискретный и редкий; смешивать его ошибку с позиционной в одну величину
-нельзя — это ровно та ошибка, из-за которой офлайновый гейт K-10d оказался
-неспособен подтверждать (см. K-10g).
+СХВАТ МЕНЯТЬСЯ МОЖЕТ, И ЭТО ИЗМЕРЯЕТСЯ. Ранее здесь стояло «схват берётся из
+q0» — утверждение неверное: декодер ActionCodec отображает латент СОВМЕСТНО во
+все семь каналов, поэтому любое изменение z меняет и схват. Механизма,
+удерживающего схват от D(z0), в латентном варианте нет. Принято: HiCoRA-D
+остаётся ЛАТЕНТНОЙ поправкой, схват считается изменяемым, его согласие с
+D(z0) измеряется отдельной величиной и входит в стоп-условия. Смешивать
+ошибку схвата с позиционной в одно число по-прежнему нельзя — ровно из-за
+этого офлайновый гейт K-10d оказался неспособен подтверждать (K-10g).
 
 `joint12_vla.py` НЕ ИЗМЕНЯЕТСЯ. Его sha записан в каждой ячейке симуляторного
 гейта K-9; правка расколола бы развёртку. Здесь отдельный класс с собственным
@@ -73,7 +80,10 @@ def make_residual_head():
                 nn.Linear(d_hidden + proj, hidden), nn.GELU(),
                 nn.Linear(hidden, hidden), nn.GELU(),
                 nn.Linear(hidden, self.rank))
-            self.basis = nn.Linear(self.rank, d_latent, bias=False)
+            # БАЗИС — БУФЕР, А НЕ СЛОЙ. Обучаемый базис обесценил бы rho:
+            # предел на коэффициенты обходится масштабированием столбцов.
+            self.register_buffer("basis", torch.zeros(d_latent, self.rank))
+            self.register_buffer("basis_set", torch.zeros(1))
             # НУЛЕВАЯ ИНИЦИАЛИЗАЦИЯ ПОСЛЕДНЕГО СЛОЯ: до обучения поправка
             # строго нулевая, и нулевое тождество проверяемо.
             nn.init.zeros_(self.net[-1].weight)
@@ -81,6 +91,31 @@ def make_residual_head():
             # rho — БУФЕР, а не параметр: предел амплитуды задаётся данными в
             # K-11a и не должен подстраиваться градиентом под потерю.
             self.register_buffer("rho", torch.ones(self.rank))
+
+        def set_basis(self, B):
+            """Ортонормированный базис поправок, построенный на train.
+
+            ОРТОНОРМИРОВАННОСТЬ ПРОВЕРЯЕТСЯ, А НЕ ПРЕДПОЛАГАЕТСЯ: только при
+            B^T B = I выполняется ||dz|| = ||rho .* c||, то есть граница
+            амплитуды становится настоящей.
+            """
+            b = torch.as_tensor(B, dtype=self.basis.dtype)
+            if tuple(b.shape) != tuple(self.basis.shape):
+                raise ValueError(f"базис формы {tuple(b.shape)}, ожидалась "
+                                 f"{tuple(self.basis.shape)}")
+            if not torch.isfinite(b).all():
+                raise ValueError("в базисе есть nan или inf")
+            g = b.T @ b
+            off = float((g - torch.eye(self.rank, dtype=g.dtype)).abs().max())
+            if off > 1e-4:
+                raise ValueError(f"базис не ортонормирован: max|B^T B - I| = "
+                                 f"{off:.2e}")
+            self.basis.data = b.to(self.basis.device)
+            self.basis_set.data = torch.ones_like(self.basis_set)
+
+        def bound(self):
+            """Гарантированный предел ||dz||_2. Настоящий, а не тавтология."""
+            return float(torch.linalg.norm(self.rho))
 
         def set_rho(self, rho):
             r = torch.as_tensor(rho, dtype=self.rho.dtype)
@@ -99,8 +134,13 @@ def make_residual_head():
 
         def forward(self, h, z0):
             """Поправка и коэффициенты — вторые нужны для учёта насыщения."""
+            if float(self.basis_set) == 0.0:
+                raise RuntimeError(
+                    "базис не задан: сначала set_basis по обучающей части. "
+                    "Нулевой базис дал бы тождественно нулевую поправку и "
+                    "обучение «сошлось» бы, ничего не выучив")
             c = self.coeffs(h, z0)
-            return self.basis(self.rho * c), c
+            return (self.rho * c) @ self.basis.T, c
 
     return ResidualHead
 
@@ -192,6 +232,18 @@ def make_hicora_class(base_cls):
             out["layers_run"] = seen
             return out
 
+        def set_res_norm(self, module):
+            """Норма для ПОЗДНЕЙ ветви, отдельная от нормы черновика.
+
+            Чекпойнт Joint12 перезаписывает `action_expert.norm`, а она
+            обучалась читать h12. Позняя ветвь должна читать h24 исходной
+            финальной нормой, иначе вход головы поправки нормируется
+            статистикой другой глубины. Здесь исходная норма сохраняется до
+            наложения весов и подставляется явно.
+            """
+            self.res_norm = module
+            return self
+
         def q0_from(self, h):
             """Черновик из отвода: та же норма и голова, что у Joint12."""
             normed = self.action_expert.norm(h)
@@ -205,7 +257,12 @@ def make_hicora_class(base_cls):
                                      position_ids=position_ids)
             logits, q0 = self.q0_from(taps[self.q0_depth])
             z0 = self.codebooks[0][q0]
-            h24 = self.action_expert.norm(taps[max(self.taps)]).float()
+            if not hasattr(self, "res_norm"):
+                raise RuntimeError(
+                    "не задана res_norm: поздняя ветвь читала бы h24 нормой "
+                    "Joint12, обученной на h12. Вызовите set_res_norm с "
+                    "ИСХОДНОЙ финальной нормой, снятой до наложения весов")
+            h24 = self.res_norm(taps[max(self.taps)]).float()
             dz, c = self.hicora_head(h24, z0)
             return dict(q0=q0, q0_logits=logits, z0=z0, dz=dz, z=z0 + dz,
                         coeffs=c, layers_run=taps["layers_run"],
@@ -274,44 +331,79 @@ def selftest():
     h = torch.randn(3, N_POS, d_h)
     z0 = torch.randn(3, N_POS, d_z, requires_grad=True)
 
-    # --- НУЛЕВОЕ ТОЖДЕСТВО -------------------------------------------------
+    # --- БЕЗ БАЗИСА ГОЛОВА ОТКАЗЫВАЕТ ---------------------------------------
+    # Нулевой базис дал бы тождественно нулевую поправку, и обучение
+    # «сошлось» бы, не выучив ничего.
+    try:
+        head(h, z0)
+        raise AssertionError("голова без базиса не отказала")
+    except RuntimeError:
+        pass
+    B = torch.linalg.qr(torch.randn(d_z, rank))[0]
+    head.set_basis(B)
+    for bad in (torch.randn(d_z, rank), B[:, :rank - 1], B * 2.0):
+        try:
+            head.set_basis(bad)
+            raise AssertionError("неортонормированный базис принят")
+        except ValueError:
+            pass
+    head.set_basis(B)
+
+    # --- НУЛЕВОЕ ТОЖДЕСТВО --------------------------------------------------
     dz, c0 = head(h, z0)
-    assert float(dz.abs().max()) == 0.0, "поправка до обучения не нулевая"
+    assert float(dz.detach().abs().max()) == 0.0, "поправка не нулевая"
     assert float(c0.abs().max()) == 0.0
 
-    # --- ГОЛОВА ЖИВАЯ ------------------------------------------------------
-    # Нулевая инициализация не должна означать нулевой градиент: иначе
-    # тождество достигалось бы мёртвой головой и обучение не стронулось бы.
+    # --- ГОЛОВА ЖИВАЯ -------------------------------------------------------
+    # ПРЕЖНЯЯ ВЕРСИЯ ЭТОГО ТЕСТА БЫЛА ПУСТОЙ: потеря вида sum(y^2) при
+    # нулевом выходе даёт нулевой градиент по построению, и тест проходил бы
+    # и на мёртвой голове. Здесь линейная потеря.
     head.zero_grad()
-    head.net(torch.cat([h, head.proj(z0.detach())], -1)).pow(2).sum().backward()
+    head.net(torch.cat([h, head.proj(z0.detach())], -1)).sum().backward()
     g = head.net[-1].weight.grad
     assert g is not None and float(g.abs().sum()) > 0, "голова мертва"
 
-    # --- ГРАДИЕНТ НЕ ТЕЧЁТ В ЧЕРНОВИК --------------------------------------
+    # --- ГРАДИЕНТ НЕ ТЕЧЁТ В ЧЕРНОВИК ---------------------------------------
+    # ПРЕЖНЯЯ ВЕРСИЯ БЫЛА ВЫРОЖДЕННОЙ: при нулевом последнем слое градиент по
+    # z0 равен нулю и с detach, и без него. Сначала делаем голову ненулевой,
+    # затем требуем ОДНОВРЕМЕННО: по h градиент есть, по параметрам есть, по
+    # черновику нет.
+    torch.nn.init.normal_(head.net[-1].weight, std=0.5)
+    torch.nn.init.normal_(head.net[-1].bias, std=0.5)
     head.zero_grad()
+    h1 = torch.randn(3, N_POS, d_h, requires_grad=True)
     z1 = torch.randn(3, N_POS, d_z, requires_grad=True)
-    dz1, _ = head(h, z1)
-    (dz1.sum() + head.net[-1].weight.sum()).backward()
+    head(h1, z1)[0].sum().backward()
+    assert h1.grad is not None and float(h1.grad.abs().sum()) > 0, \
+        "градиент по представлению не идёт — голова ничего не читает"
+    assert float(head.net[-1].weight.grad.abs().sum()) > 0
     assert z1.grad is None or float(z1.grad.abs().sum()) == 0.0, \
         "stop-gradient не работает: поправка переучивает черновик"
+    # Контроль самого теста: без detach градиент по черновику ОБЯЗАН появиться,
+    # иначе проверка снова ничего не различала бы.
+    head.zero_grad()
+    z2 = torch.randn(3, N_POS, d_z, requires_grad=True)
+    ((head.rho * torch.tanh(head.net(torch.cat([h1, head.proj(z2)], -1))))
+     @ head.basis.T).sum().backward()
+    assert z2.grad is not None and float(z2.grad.abs().sum()) > 0, \
+        "тест на stop-gradient вырожден: без detach градиента тоже нет"
 
-    # --- ОГРАНИЧЕНИЕ АМПЛИТУДЫ ДЕЙСТВУЕТ -----------------------------------
-    torch.nn.init.normal_(head.net[-1].weight, std=3.0)
-    torch.nn.init.normal_(head.net[-1].bias, std=3.0)
+    # --- ГРАНИЦА АМПЛИТУДЫ НАСТОЯЩАЯ ----------------------------------------
+    # При ортонормированном базисе ||dz|| = ||rho .* c|| <= ||rho||, и это
+    # не зависит от того, чему обучились коэффициенты.
+    torch.nn.init.normal_(head.net[-1].weight, std=50.0)
+    torch.nn.init.normal_(head.net[-1].bias, std=50.0)
     rho = torch.full((rank,), 0.5)
     head.set_rho(rho)
     with torch.no_grad():
         dz2, c2 = head(h, z0)
-        lim = float((head.basis.weight.abs() @ rho).max())
-        assert float(dz2.abs().max()) <= lim + 1e-5, (
-            float(dz2.abs().max()), lim)
+        nrm = torch.linalg.norm(dz2, dim=-1).max()
+        assert float(nrm) <= head.bound() + 1e-4, (float(nrm), head.bound())
         assert float(c2.abs().max()) <= 1.0, "tanh не ограничил коэффициенты"
-    # Насыщение при большом масштабе обязано БЫТЬ ЗАМЕТНЫМ, иначе метрика
-    # насыщения не измеряла бы ничего.
     assert saturation_report(c2.numpy())["frac"] > 0.5, \
         saturation_report(c2.numpy())
 
-    # --- rho ПРОВЕРЯЕТСЯ, А НЕ ПРИНИМАЕТСЯ ---------------------------------
+    # --- rho ПРОВЕРЯЕТСЯ, А НЕ ПРИНИМАЕТСЯ ----------------------------------
     for bad in (torch.zeros(rank), torch.full((rank,), -1.0),
                 torch.ones(rank + 1)):
         try:
@@ -320,10 +412,11 @@ def selftest():
         except ValueError:
             pass
 
-    print("самопроверка hicora_vla пройдена (версия «нулевое тождество, sg "
-          "на черновике»): доля насыщения, процентиль устойчив к выбросу, "
-          "нулевая инициализация даёт строго нулевую поправку, голова живая, "
-          "градиент в черновик не течёт, rho ограничивает и проверяется")
+    print("самопроверка hicora_vla пройдена (версия «замороженный базис»): доля насыщения, процентиль устойчив к выбросу, "
+          "нулевая инициализация даёт строго нулевую поправку, голова живая "
+          "при линейной потере, градиент по h есть а по черновику нет и тест "
+          "это различает, базис ортонормирован и заморожен, ||dz|| <= ||rho|| "
+          "при любых весах")
 
 
 if __name__ == "__main__":

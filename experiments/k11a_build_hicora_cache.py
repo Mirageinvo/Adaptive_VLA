@@ -1,41 +1,56 @@
-"""K-11a: кэш скрытых состояний h12/h18/h24 и диагностика пространства поправок.
+"""K-11a: кэш отводов h12/h18/h24 и выбор размерности поправки.
 
 ЗАЧЕМ. HiCoRA-D исправляет НЕ произвольный черновик, а тот код q0, который
-модель действительно предсказала на слое 12. Значит и остаток, который учится
-предсказывать голова, обязан считаться от предсказанного q0_hat, а не от
-истинного q0*. Разница между этими двумя величинами и есть весь смысл метода,
-поэтому кэш собирается один раз и содержит именно предсказанные коды.
+модель действительно предсказала на слое 12. Поэтому остаток считается от
+предсказанного q0_hat, а не от истинного q0*, и кэш хранит именно
+предсказанные коды.
 
 ОДИН ПРОХОД, ТРИ ОТВОДА. Двадцать четыре слоя исполняются ровно один раз;
-состояние потока действий снимается после слоёв 12, 18 и 24. Отводы берутся
-хуками, а `joint12_vla.py` не правится: его sha записан в каждую ячейку
-симуляторного гейта K-9, и правка расколола бы развёртку на две несовместимые
-половины.
+состояние потока действий снимается после слоёв 12, 18 и 24. `joint12_vla.py`
+не правится: его sha записан в каждой ячейке симуляторного гейта K-9.
 
-ЧТО ЗДЕСЬ ПРОВЕРЯЕТСЯ СВЕРХ ПЛАНА, И ПОЧЕМУ. Наложение весов Joint12 на слои
-1-12 меняет ВХОД слоёв 13-24: они обучались читать выход исходного
-двенадцатого слоя, а получат выход дообученного. Это предположение, а не
-данность, и стоит оно ровно одного дополнительного прохода на подвыборке.
-Поэтому скрипт всегда меряет:
-  * согласие q0_hat с coarse24 исходной модели;
-  * относительный дрейф h24 против чистого исходного прохода;
-  * долю расхождений действия после декодера.
-Если дрейф велик, поздние слои работают вне своего распределения, и это надо
-знать ДО обучения головы, а не после симуляторного гейта.
+РАЗМЕРНОСТЬ ВЫБИРАЕТСЯ ПОСЛЕ ДЕКОДЕРА, А НЕ В ЛАТЕНТЕ. Шестнадцать позиций
+ActionCodec — это ГЛОБАЛЬНЫЕ ЗАПРОСЫ Perceiver, а не двадцать шагов чанка:
+позиция 0 не соответствует действию 0, и каждый запрос влияет на весь чанк.
+Прежняя версия называла первые восемь ЛАТЕНТНЫХ позиций «исполняемым
+префиксом» — величина не имела заявленного смысла. Здесь префикс определяется
+только в пространстве действий, после единственного декодирования, как
+A[:, :8], а ранг выбирается по доле возвращённого улучшения
 
-ИСТОЧНИК q0 ВЫБИРАЕТСЯ ЯВНО, потому что вариантов три и они не равнозначны:
-  joint12   веса K-9c на слоях 1-12 плюс его голова. q0 сильнее (89.5%), но
-            вход поздних слоёв смещён.
-  readout   исходный ствол, голова-читалка K-9f/K-9g поверх h12. Поздние слои
-            строго в своём распределении, q0 слабее (86.5%).
-  coarse24  q0 с ПОСЛЕДНЕГО слоя, как в опоре. Поправку с h24 строить не от
-            чего — вариант существует только как верхняя граница качества q0
-            и для отладки; для HiCoRA он бессмыслен.
+    G_r = [E(D(z0), A*) - E(D(z0 + P_r r), A*)] / [E(D(z0), A*) - E(D(z*), A*)]
 
-ХРАНЕНИЕ FP16 — ЭТО ШУМ, И ОН ИЗМЕРЯЕТСЯ. После записи кэш прогоняется
-обратно через ту же голову, и доля разошедшихся токенов печатается. Без этого
-числа все дальнейшие таблицы читались бы так, будто у них нет собственной
-погрешности.
+отдельно по положению и по вращению. Объяснённая дисперсия латентного остатка
+остаётся описательной: крупная латентная компонента может почти не влиять на
+декодер, а малая — сильно.
+
+БАЗИС СТРОИТСЯ ТОЛЬКО НА TRAIN, РАНГ ВЫБИРАЕТСЯ НА VAL, TEST НЕ ТРОГАЕТСЯ.
+Иначе архитектурное решение принимается по тем же данным, на которых потом
+объявляется результат.
+
+БАЗИС НЕЦЕНТРИРОВАННЫЙ. Голова задаёт подпространство через ноль (dz = B c),
+собственного вектора среднего у неё нет. Центрированная PCA показала бы 90%
+объяснённой дисперсии и при среднем остатке, лежащем вне базиса.
+
+ПАМЯТЬ: НАКАПЛИВАЕТСЯ ГРАМИАН, А НЕ ОСТАТОК. Массив (150000, 16, 512) в fp64
+весит 9 ГиБ, а одновременно их нужно несколько. Здесь потоком копится
+G = sum r^T r размера (D, D), и его собственные векторы дают базис без
+хранения самого остатка.
+
+ЧТО ЕЩЁ МЕРЯЕТСЯ. Наложение весов Joint12 меняет вход слоёв 13-24:
+перезаписываются не только слои 1-12, но и `bos_embedding`, участвующий во
+всех шагах внимания. Печатаются ЧЕТЫРЕ разные величины, которые легко
+перепутать:
+  1. q0 Joint12 против исходной головы на чистом h12 — что изменило
+     дообучение;
+  2. q0 Joint12 против НАСТОЯЩЕГО coarse24 (generate на 24 слоях) —
+     расстояние до опоры, у которой измерены 90.0%;
+  3. расхождение ДЕКОДИРОВАННЫХ действий этих двух черновиков, отдельно по
+     положению, вращению и знаку схвата;
+  4. относительный дрейф h24 против чистого прохода.
+
+СХВАТ. Утверждение «схват берётся из q0» было бы неверным: декодер отображает
+латент совместно во все семь каналов, и любое изменение z меняет схват. Он
+измеряется отдельным столбцом и в одну величину с позой не сводится.
 
 Запуск:
     python3 experiments/k11a_build_hicora_cache.py --selftest
@@ -45,8 +60,9 @@
         --cache data/k9_teacher_150k.npz --q0-source joint12 \\
         --joint-ckpt data/k9c_joint12.pt --out data/k11a_joint12
 
-    # диагностика пространства поправок по уже собранному кэшу
-    python3 experiments/k11a_build_hicora_cache.py --diagnose data/k11a_joint12
+    PYTHONPATH=$HOME/LIBERO MUJOCO_GL=egl \\
+    python3 experiments/k11a_build_hicora_cache.py --ckpt <base> \\
+        --diagnose data/k11a_joint12
 """
 
 import argparse
@@ -60,218 +76,370 @@ import numpy as np
 N_POS, N_LEVEL, T_CHUNK, H_EXEC = 16, 3, 20, 8
 TAPS = (12, 18, 24)
 Q0_SOURCES = ("joint12", "readout", "coarse24")
-# Ранги, по которым считается объяснённая дисперсия остатка. Порог выбора
-# зафиксирован здесь, ДО прогона: ранг принимается наименьший, объясняющий
-# не меньше PCA_TARGET.
 PCA_RANKS = (4, 8, 16, 32, 64)
-PCA_TARGET = 0.90
+# Порог зафиксирован ДО прогона: принимается наименьший ранг, возвращающий
+# столько доступного улучшения ПОСЛЕ ДЕКОДЕРА одновременно по положению и по
+# вращению на исполняемых шагах.
+GAIN_TARGET = 0.90
 
 
 def plan_batches(n, batch):
     return [(i, min(i + batch, n)) for i in range(0, n, batch)]
 
 
-def explained(sv, ranks, total=None):
-    """Доля объяснённой дисперсии по сингулярным числам."""
-    e = np.asarray(sv, np.float64) ** 2
-    tot = float(e.sum()) if total is None else float(total)
+def file_sha1(path):
+    """SHA самого файла, а не имён ключей.
+
+    Прежняя версия хешировала `str(sorted(state))`, то есть СПИСОК ИМЁН: все
+    эпохи одной архитектуры получали один отпечаток, и происхождение
+    переставало что-либо значить.
+    """
+    h = hashlib.sha1()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 22), b""):
+            h.update(chunk)
+    return h.hexdigest()[:12]
+
+
+def gram_basis(G, rank):
+    """Ортонормированный базис из НЕЦЕНТРИРОВАННОГО грамиана."""
+    w, V = np.linalg.eigh(np.asarray(G, np.float64))
+    o = np.argsort(w)[::-1]
+    return V[:, o[:int(rank)]], w[o]
+
+
+def explained(eigvals, ranks, d_latent=None):
+    e = np.clip(np.asarray(eigvals, np.float64), 0, None)
+    tot = float(e.sum())
     if tot <= 0:
         return {int(r): 0.0 for r in ranks}
-    return {int(r): float(e[:int(r)].sum() / tot) for r in ranks}
+    return {int(r): float(e[:int(r)].sum() / tot) for r in ranks
+            if d_latent is None or int(r) <= int(d_latent)}
 
 
-def pick_rank(exp, ranks=PCA_RANKS, target=PCA_TARGET, d_latent=None):
-    """Наименьший ранг, объясняющий target. Правило зафиксировано заранее.
+def action_err(a, ref):
+    """Ошибки на ИСПОЛНЯЕМЫХ ШАГАХ 0-7, раздельно по трём каналам.
 
-    РАНГ, РАВНЫЙ РАЗМЕРНОСТИ, — НЕ СЖАТИЕ. Любой набор точек в d измерениях
-    «объясняется» d компонентами на 100%, и без этой оговорки правило
-    выбирало бы наибольший ранг всегда, когда он дотягивает до размерности
-    латента, объявляя низкоранговость там, где её нет.
+    Ось времени здесь — шаги чанка (их двадцать), а не латентные позиции
+    Perceiver (их шестнадцать). Смешение позы со схватом в одно число уже
+    стоило нам гейта, неспособного подтверждать (K-10g).
+    """
+    A = np.asarray(a, np.float64)[:, :H_EXEC]
+    R = np.asarray(ref, np.float64)[:, :H_EXEC]
+    d = A - R
+    return dict(pos=float(np.sqrt((d[..., :3] ** 2).mean())),
+                rot=float(np.sqrt((d[..., 3:6] ** 2).mean())),
+                grip=float((np.sign(A[..., 6]) != np.sign(R[..., 6])).mean()))
+
+
+def gain(err_z0, err_r, err_star, eps=1e-12):
+    """Доля ДОСТУПНОГО улучшения, возвращённая поправкой ранга r.
+
+    Знаменатель — расстояние от черновика до полного трёхуровневого
+    восстановления: это всё, что поправка вообще может вернуть. Отношение
+    сырых ошибок польстило бы рангу тем сильнее, чем хуже черновик.
+    """
+    denom = err_z0 - err_star
+    if denom <= eps:
+        return None
+    return float((err_z0 - err_r) / denom)
+
+
+def pick_rank(gains, ranks=PCA_RANKS, target=GAIN_TARGET, d_latent=None):
+    """Наименьший ранг, возвращающий target И по положению, И по вращению.
+
+    ОБА КАНАЛА ОБЯЗАТЕЛЬНЫ: среднее по ним спрятало бы ранг, вытягивающий
+    положение и проваливающий вращение. РАНГ, РАВНЫЙ РАЗМЕРНОСТИ ЛАТЕНТА, —
+    не сжатие: d компонент описывают d измерений полностью.
     """
     for r in sorted(int(x) for x in ranks):
         if d_latent is not None and r >= int(d_latent):
             break
-        if exp.get(r, 0.0) >= target:
+        g = gains.get(r)
+        if not g:
+            continue
+        if (g.get("pos") is not None and g.get("rot") is not None
+                and g["pos"] >= target and g["rot"] >= target):
             return r
     return None
 
 
-def read_rank(rank, exp, ranks=PCA_RANKS, target=PCA_TARGET, d_latent=None):
+def read_rank(rank, gains, ranks=PCA_RANKS, target=GAIN_TARGET):
     top = max(int(x) for x in ranks)
-    if d_latent is not None:
-        usable = [int(x) for x in ranks if int(x) < int(d_latent)]
-        top = max(usable) if usable else 0
-        if not usable:
-            return (f"размерность латента {d_latent} не больше наименьшего "
-                    f"рассматриваемого ранга: сжимать нечего")
     if rank is not None:
-        return (f"ранг {rank} объясняет {exp[rank]:.1%} остатка (порог "
-                f"{target:.0%}, зафиксирован до прогона) — низкоранговый "
-                f"базис оправдан, брать r={rank}")
-    return (f"даже ранг {top} объясняет лишь {exp.get(top, 0.0):.1%} — "
-            f"остаток не низкоранговый. По плану это стоп-условие ветки: "
-            f"сравнить с поправкой прямо в пространстве действий как "
-            f"КОНТРОЛЕМ, а не переходить к ней молча")
-
-
-def residual_stats(r, exec_mask=None):
-    """Нормы остатка: целиком, по исполняемому префиксу и по хвосту.
-
-    ИСПОЛНЯЕМЫЙ ПРЕФИКС СЧИТАЕТСЯ ОТДЕЛЬНО. Из двадцати шагов чанка среда
-    исполняет восемь; ошибка на хвосте в успех не переходит вовсе, и общее
-    среднее по всем позициям систематически размывает то, что важно.
-    """
-    n = np.linalg.norm(np.asarray(r, np.float64), axis=-1)
-    out = dict(mean=float(n.mean()), median=float(np.median(n)),
-               p95=float(np.percentile(n, 95)), max=float(n.max()))
-    if exec_mask is not None:
-        m = np.asarray(exec_mask, bool)
-        out["exec_mean"] = float(n[:, m].mean())
-        out["tail_mean"] = float(n[:, ~m].mean()) if (~m).any() else None
-    return out
+        g = gains[rank]
+        return (f"ранг {rank} возвращает {g['pos']:.1%} доступного улучшения "
+                f"по положению и {g['rot']:.1%} по вращению на шагах 0-7 "
+                f"(порог {target:.0%}, зафиксирован до прогона) — брать "
+                f"r={rank}")
+    best = gains.get(top) or {}
+    gp = best.get("pos") or 0.0
+    gr = best.get("rot") or 0.0
+    return (f"даже ранг {top} возвращает лишь {gp:.1%} по положению и "
+            f"{gr:.1%} по вращению — остаток не описывается низкоранговым "
+            f"латентным базисом. По плану это стоп-условие ветки: сравнить с "
+            f"поправкой прямо в пространстве действий как КОНТРОЛЕМ, а не "
+            f"переходить к ней молча")
 
 
 def selftest():
-    # --- разбивка батчей ---------------------------------------------------
     assert plan_batches(5, 2) == [(0, 2), (2, 4), (4, 5)]
     assert sum(b - a for a, b in plan_batches(1000, 64)) == 1000
 
-    # --- объяснённая дисперсия на матрице с ИЗВЕСТНЫМ рангом ---------------
+    # --- базис из грамиана на матрице ИЗВЕСТНОГО ранга ---------------------
     rng = np.random.default_rng(0)
-    B = rng.normal(size=(8, 40))
-    X = rng.normal(size=(500, 8)) @ B          # ранг ровно 8
-    sv = np.linalg.svd(X - X.mean(0), compute_uv=False)
-    exp = explained(sv, PCA_RANKS)
-    assert exp[8] > 0.999, exp[8]
-    assert exp[4] < 0.95, exp[4]
-    assert pick_rank(exp) == 8, exp
-    assert "r=8" in read_rank(8, exp)
+    Bt = np.linalg.qr(rng.normal(size=(40, 6)))[0]
+    X = rng.normal(size=(500, 6)) @ Bt.T
+    Bh, w = gram_basis(X.T @ X, 6)
+    assert np.abs(Bh.T @ Bh - np.eye(6)).max() < 1e-9, "базис не ортонормирован"
+    # Восстановленное подпространство совпадает с истинным: проекция
+    # сохраняет длину каждого столбца истинного базиса.
+    assert np.abs(np.linalg.norm(Bh @ Bh.T @ Bt, axis=0) - 1).max() < 1e-8
+    e = explained(w, PCA_RANKS)
+    assert e[8] > 0.999 and e[4] < 0.999
 
-    # Полноранговый шум низкоранговым базисом не описывается — и правило
-    # обязано это СКАЗАТЬ, а не выбрать наибольший ранг молча.
-    Xn = rng.normal(size=(500, 128))
-    expn = explained(np.linalg.svd(Xn - Xn.mean(0), compute_uv=False),
-                     PCA_RANKS)
-    assert pick_rank(expn, d_latent=128) is None, expn
-    txt = read_rank(None, expn, d_latent=128)
-    assert "стоп-условие" in txt and "КОНТРОЛЕМ" in txt
+    # --- НЕЦЕНТРИРОВАННОСТЬ ЗНАЧИМА ----------------------------------------
+    # Остаток со смещением: центрированная PCA нашла бы шум, но голова,
+    # задающая подпространство через ноль, среднее не представит.
+    mu = rng.normal(size=40) * 5.0
+    Y = mu[None] + rng.normal(size=(500, 40)) * 0.01
+    e_unc = explained(gram_basis(Y.T @ Y, 1)[1], (1,))[1]
+    Yc = Y - Y.mean(0)
+    e_cen = explained(gram_basis(Yc.T @ Yc, 1)[1], (1,))[1]
+    assert e_unc > 0.99 > e_cen, (e_unc, e_cen)
 
-    # РАНГ, РАВНЫЙ РАЗМЕРНОСТИ, НЕ СЧИТАЕТСЯ УСПЕХОМ. На шуме в 64
-    # измерениях ранг 64 объясняет ровно 100%, и без оговорки правило
-    # объявило бы низкоранговость там, где её нет.
-    X64 = rng.normal(size=(500, 64))
-    e64 = explained(np.linalg.svd(X64 - X64.mean(0), compute_uv=False),
-                    PCA_RANKS)
-    assert e64[64] > 0.999, e64
-    assert pick_rank(e64) == 64, "без d_latent правило и должно поверить"
-    assert pick_rank(e64, d_latent=64) is None, "ранг = размерность принят"
+    # --- доля возвращённого улучшения --------------------------------------
+    assert abs(gain(1.0, 0.5, 0.0) - 0.5) < 1e-12
+    assert abs(gain(1.0, 0.1, 0.0) - 0.9) < 1e-12
+    # Черновик уже идеален — улучшать нечего, и правило обязано сказать «не
+    # определено», а не «100%».
+    assert gain(0.3, 0.3, 0.3) is None
+    # Поправка ХУЖЕ черновика даёт отрицательную долю, и это должно быть видно.
+    assert gain(1.0, 1.5, 0.0) < 0
 
-    # --- нормы остатка -----------------------------------------------------
-    r = np.zeros((10, N_POS, 4))
-    r[:, :H_EXEC] = 1.0                        # префикс единичный
-    r[:, H_EXEC:] = 3.0                        # хвост втрое больше
-    m = np.zeros(N_POS, bool); m[:H_EXEC] = True
-    st = residual_stats(r, m)
-    assert abs(st["exec_mean"] - 2.0) < 1e-9      # норма вектора из четырёх 1
-    assert abs(st["tail_mean"] - 6.0) < 1e-9
-    # СРЕДНЕЕ ПО ВСЕМ ПОЗИЦИЯМ ЛЕЖИТ МЕЖДУ НИМИ и потому непригодно как
-    # единственное число: ровно из-за этого префикс считается отдельно.
-    assert st["exec_mean"] < st["mean"] < st["tail_mean"]
+    # --- выбор ранга --------------------------------------------------------
+    gs = {4: dict(pos=0.5, rot=0.5), 8: dict(pos=0.95, rot=0.4),
+          16: dict(pos=0.96, rot=0.93), 32: dict(pos=0.99, rot=0.99),
+          64: dict(pos=0.99, rot=0.99)}
+    # РАНГ 8 НЕ ГОДИТСЯ, хотя положение вытягивает: вращение обязано пройти
+    # порог тоже, иначе среднее спрятало бы провал канала.
+    assert pick_rank(gs) == 16, pick_rank(gs)
+    low = {r: dict(pos=0.2, rot=0.2) for r in PCA_RANKS}
+    assert pick_rank(low) is None
+    assert "стоп-условие" in read_rank(None, low)
+    assert "r=16" in read_rank(16, gs)
+    assert pick_rank(gs, d_latent=16) is None, "ранг = размерность принят"
 
-    print("самопроверка k11a пройдена (версия «ранг не равен размерности»): разбивка батчей, объяснённая дисперсия на матрице известного "
-          "ранга, отказ выбирать ранг для полнорангового шума, префикс и "
-          "хвост считаются раздельно")
+    # --- ошибки по каналам --------------------------------------------------
+    a = np.zeros((4, T_CHUNK, 7)); ref = np.zeros((4, T_CHUNK, 7))
+    a[:, :, 0] = 0.3
+    a[:, :, 6] = 1.0; ref[:, :, 6] = -1.0
+    er = action_err(a, ref)
+    assert abs(er["pos"] - 0.3 / np.sqrt(3)) < 1e-9, er
+    assert er["rot"] == 0.0 and er["grip"] == 1.0
+    # ПРЕФИКС РЕЖЕТСЯ ПО ШАГАМ ЧАНКА. Ось времени длиной 20; ошибка, лежащая
+    # целиком в хвосте, обязана дать ноль. Прежняя версия резала ось из 16
+    # латентных позиций Perceiver, и величина не значила заявленного.
+    a2 = np.zeros((4, T_CHUNK, 7)); a2[:, H_EXEC:, 0] = 100.0
+    a2[:, :, 6] = -1.0
+    assert action_err(a2, ref)["pos"] == 0.0, "срез взял хвост"
+    assert a2.shape[1] != N_POS, "ось времени спутана с латентными позициями"
+
+    print("самопроверка k11a пройдена (версия «выбор ранга после декодера»): "
+          "базис из нецентрированного грамиана восстанавливает подпространство, "
+          "центрирование теряет смещение, доля улучшения не определена при "
+          "идеальном черновике и отрицательна при ухудшении, ранг требует "
+          "порога по обоим каналам, префикс режется по шагам чанка")
 
 
-def diagnose(prefix):
-    """Диагностика пространства поправок по собранному кэшу.
+def load_codec(args):
+    """Только процессор и кодек: для диагностики VLM не нужен."""
+    import torch
+    from utils import VisionLanguageActionProcessor
+    proc = VisionLanguageActionProcessor.from_pretrained(
+        args.ckpt, trust_remote_code=True, mode="discrete")
+    ac = proc.action_processor
+    codec = ac if hasattr(ac, "vq") else getattr(ac, "codec", None)
+    if codec is None or not hasattr(codec, "vq"):
+        raise SystemExit("не нашёл квантователь")
+    dev = torch.device(args.device)
+    codec = codec.to(dev).eval()
+    with torch.no_grad():
+        idx = torch.arange(int(codec.vocab_size), device=dev).unsqueeze(0)
+        E = torch.stack([q.out_project(q.decode_code(idx))[0]
+                         for q in codec.vq.quantizers]).float()
+    return proc, codec, E, dev
 
-    ОСТАТОК СЧИТАЕТСЯ ОТ ПРЕДСКАЗАННОГО q0_hat. Рядом печатается обычный
-    RVQ-остаток от истинного q0* — как СПРАВКА о том, насколько задача
-    HiCoRA отличается от задачи кодека, а не как цель обучения.
-    """
+
+def diagnose(args):
+    import torch
+    prefix = args.diagnose
     meta = json.load(open(prefix + ".meta.json"))
-    # ЛАТЕНТЫ НЕ ХРАНЯТСЯ, А ВОССТАНАВЛИВАЮТСЯ ИЗ КОДОВ И КНИГ: три массива
-    # (N, 16, D) в fp32 весили бы втрое больше самих отводов и ничего бы не
-    # добавили — книги детерминированы и лежат рядом.
-    E = np.load(prefix + ".codebooks.npy")      # (уровней, кодов, D)
-    q0 = np.load(prefix + ".q0hat.npy")         # (N, 16) предсказанные коды
-    Kt = np.load(prefix + ".ktrue.npy")         # (N, 3, 16) истинные коды
-    z0 = E[0][q0]
-    z0t = E[0][Kt[:, 0, :]]
-    zs = sum(E[l][Kt[:, l, :]] for l in range(E.shape[0]))
-    r = (zs - z0).astype(np.float64)
-    r_rvq = (zs - z0t).astype(np.float64)
-    m = np.zeros(N_POS, bool); m[:H_EXEC] = True
+    _, codec, E, dev = load_codec(args)
+    D = int(E.shape[-1])
+    if D != int(meta["d_latent"]):
+        raise SystemExit(f"размерность латента {D} против {meta['d_latent']} "
+                         f"в кэше: другой чекпойнт")
+    if meta.get("ckpt") != args.ckpt:
+        raise SystemExit(f"кэш собран чекпойнтом {meta.get('ckpt')}, а "
+                         f"декодер берётся из {args.ckpt}")
 
-    print(f"\nдиагностика: {meta['n_obs']} наблюдений, источник q0 "
-          f"«{meta['q0_source']}», D={r.shape[-1]}")
-    st = residual_stats(r, m)
-    st_r = residual_stats(r_rvq, m)
-    print(f"  остаток от ПРЕДСКАЗАННОГО q0_hat: среднее {st['mean']:.4f}, "
-          f"медиана {st['median']:.4f}, p95 {st['p95']:.4f}")
-    print(f"    префикс 0-7 {st['exec_mean']:.4f}, хвост "
-          f"{st['tail_mean']:.4f}")
-    print(f"  остаток от ИСТИННОГО q0* (обычный RVQ, справочно): среднее "
-          f"{st_r['mean']:.4f}, префикс {st_r['exec_mean']:.4f}")
-    ratio = st["mean"] / max(st_r["mean"], 1e-12)
-    print(f"  отношение {ratio:.2f}x — во столько раз задача HiCoRA больше "
-          f"задачи кодека:\n    голова обязана вычистить ещё и ОШИБКУ "
-          f"предсказания q0, а не только квантование")
+    q0 = np.load(prefix + ".q0hat.npy")
+    Kt = np.load(prefix + ".ktrue.npy")
+    split = np.load(prefix + ".split.npy", allow_pickle=True).astype(str)
+    N = len(q0)
+    tr = np.where(split == "train")[0]
+    va = np.where(split == "val")[0]
+    if len(tr) == 0 or len(va) == 0:
+        raise SystemExit("нет train или val: базис строится на train, ранг "
+                         "выбирается на val, test не трогается")
+    print(f"диагностика: {N} наблюдений, train {len(tr)}, val {len(va)}, "
+          f"test {int((split == 'test').sum())} (НЕ используется)")
 
-    flat = r.reshape(-1, r.shape[-1])
-    flat = flat - flat.mean(0, keepdims=True)
-    sv = np.linalg.svd(flat, compute_uv=False) if len(flat) <= 20000 else None
-    if sv is None:
-        idx = np.random.default_rng(0).choice(len(flat), 20000, replace=False)
-        sv = np.linalg.svd(flat[idx], compute_uv=False)
-        print("  PCA по подвыборке 20000 строк")
-    d_lat = int(r.shape[-1])
-    exp = explained(sv, PCA_RANKS)
-    print(f"\n  объяснённая дисперсия остатка (размерность латента {d_lat}):")
+    def z_of(codes0, all_levels=None):
+        z = E[0][torch.as_tensor(np.asarray(codes0)).long().to(dev)]
+        if all_levels is not None:
+            k = torch.as_tensor(np.asarray(all_levels)).long().to(dev)
+            for l in range(1, E.shape[0]):
+                z = z + E[l][k[:, l, :]]
+        return z
+
+    # --- ГРАМИАН ПОТОКОМ, ТОЛЬКО TRAIN -------------------------------------
+    G = np.zeros((D, D), np.float64)
+    n_rows = 0
+    for i, j in plan_batches(len(tr), args.batch * 16):
+        s = tr[i:j]
+        with torch.no_grad():
+            r = (z_of(Kt[s, 0, :], Kt[s]) - z_of(q0[s])).reshape(-1, D)
+            G += (r.double().T @ r.double()).cpu().numpy()
+        n_rows += int(r.shape[0])
+    print(f"  грамиан по {n_rows} строкам train, размер {G.shape}: сам "
+          f"остаток не хранится")
+    Bfull, w = gram_basis(G, min(max(PCA_RANKS), D))
+    exp = explained(w, PCA_RANKS, d_latent=D)
+    print(f"\n  объяснённая дисперсия латентного остатка (ОПИСАТЕЛЬНО, "
+          f"размерность {D}):")
     for rk in PCA_RANKS:
-        mark = "  (= размерность, не сжатие)" if rk >= d_lat else ""
-        print(f"    ранг {rk:>3}: {exp[rk]:.1%}{mark}")
-    rank = pick_rank(exp, d_latent=d_lat)
-    print(f"\n  {read_rank(rank, exp, d_latent=d_lat)}")
+        if rk in exp:
+            mark = "  (= размерность, не сжатие)" if rk >= D else ""
+            print(f"    ранг {rk:>3}: {exp[rk]:.1%}{mark}")
 
-    # Насыщение: какая доля коэффициентов упрётся в границу при выбранной
-    # rho. Считается на train и печатается заранее, чтобы предел не
-    # подбирался потом по результату.
-    out = dict(n_obs=int(meta["n_obs"]), q0_source=meta["q0_source"],
-               residual=st, residual_rvq=st_r, ratio=float(ratio),
+    # --- ДОЛЯ УЛУЧШЕНИЯ НА VAL, ПОСЛЕ ДЕКОДЕРА -----------------------------
+    va_s = va if not args.diag_n else va[:args.diag_n]
+    print(f"\n  доля возвращённого улучшения на val ({len(va_s)} "
+          f"наблюдений), ПОСЛЕ единственного декодирования:")
+    ranks = [r for r in PCA_RANKS if r <= Bfull.shape[1]]
+    acc = {r: {k: [] for k in ("pos", "rot", "grip")} for r in ranks}
+    e0 = []
+    for i, j in plan_batches(len(va_s), args.batch):
+        s = va_s[i:j]
+        with torch.no_grad():
+            z0b = z_of(q0[s])
+            zsb = z_of(Kt[s, 0, :], Kt[s])
+            A0 = codec._decode(z0b, embodiment_ids=0)[0][..., :7].float()
+            As = codec._decode(zsb, embodiment_ids=0)[0][..., :7].float()
+            As_n = As.cpu().numpy()
+            e0.append(action_err(A0.cpu().numpy(), As_n))
+            rb = zsb - z0b
+            for rk in ranks:
+                Br = torch.as_tensor(Bfull[:, :rk], dtype=rb.dtype,
+                                     device=rb.device)
+                zr = z0b + (rb @ Br) @ Br.T
+                Ar = codec._decode(zr, embodiment_ids=0)[0][..., :7].float()
+                er = action_err(Ar.cpu().numpy(), As_n)
+                for k_ in ("pos", "rot", "grip"):
+                    acc[rk][k_].append(er[k_])
+
+    e_z0 = {k: float(np.mean([x[k] for x in e0]))
+            for k in ("pos", "rot", "grip")}
+    # ЭТАЛОН — САМО D(z*), поэтому его ошибка относительно себя ровно ноль.
+    e_st = dict(pos=0.0, rot=0.0, grip=0.0)
+    gains = {}
+    print(f"    {'ранг':>8}{'поз.ошибка':>13}{'доля':>9}"
+          f"{'вр.ошибка':>12}{'доля':>9}{'знак':>9}")
+    for rk in ranks:
+        er = {k: float(np.mean(acc[rk][k])) for k in ("pos", "rot", "grip")}
+        g = {k: gain(e_z0[k], er[k], e_st[k]) for k in ("pos", "rot")}
+        gains[rk] = g
+        gp = "—" if g["pos"] is None else f"{g['pos']:.1%}"
+        gr = "—" if g["rot"] is None else f"{g['rot']:.1%}"
+        print(f"    {rk:>8}{er['pos']:>13.5f}{gp:>9}"
+              f"{er['rot']:>12.5f}{gr:>9}{er['grip']:>8.1%}")
+    print(f"    {'черновик':>8}{e_z0['pos']:>13.5f}{'0.0%':>9}"
+          f"{e_z0['rot']:>12.5f}{'0.0%':>9}{e_z0['grip']:>8.1%}")
+
+    rank = pick_rank(gains, d_latent=D)
+    print(f"\n  {read_rank(rank, gains)}")
+    print("  СТОЛБЕЦ «знак» — доля шагов, где схват после поправки разошёлся "
+          "с полным\n  восстановлением. Он НЕ входит в выбор ранга и в одно "
+          "число с позой не сводится:\n  латентная поправка схват меняет, и "
+          "это отдельный предмет наблюдения.")
+
+    # --- rho В КООРДИНАТАХ ВЫБРАННОГО БАЗИСА, ТОЛЬКО TRAIN -----------------
+    rho = None
+    if rank is not None:
+        Br = torch.as_tensor(Bfull[:, :rank], dtype=torch.float32, device=dev)
+        take = tr if not args.diag_n else tr[:args.diag_n * 4]
+        coef = []
+        for i, j in plan_batches(len(take), args.batch * 16):
+            s = take[i:j]
+            with torch.no_grad():
+                r = (z_of(Kt[s, 0, :], Kt[s]) - z_of(q0[s])).reshape(-1, D)
+                coef.append((r @ Br).abs().cpu().numpy())
+        coef = np.concatenate(coef)
+        rho = np.percentile(coef, args.rho_pct, axis=0)
+        if not np.isfinite(rho).all() or (rho <= 0).any():
+            raise SystemExit("процентиль дал ноль или бесконечность: остаток "
+                             "вырожден хотя бы по одной координате базиса")
+        out_frac = float((coef > rho[None]).mean())
+        print(f"\n  rho: процентиль {args.rho_pct} по {len(coef)} строкам "
+              f"TRAIN в координатах выбранного базиса")
+        print(f"    ||rho|| = {float(np.linalg.norm(rho)):.4f} — это и есть "
+              f"ГАРАНТИРОВАННЫЙ предел ||dz|| при ортонормированном "
+              f"замороженном базисе")
+        print(f"    доля коэффициентов вне предела на train: {out_frac:.1%}")
+
+    out = dict(n_obs=int(N), q0_source=meta["q0_source"], d_latent=D,
+               n_train=int(len(tr)), n_val=int(len(va_s)),
                explained={str(k): v for k, v in exp.items()},
-               rank=rank, pca_target=PCA_TARGET, d_latent=d_lat,
-               prefix=os.path.abspath(prefix))
+               gains={str(k): v for k, v in gains.items()},
+               err_draft=e_z0, rank=rank, gain_target=GAIN_TARGET,
+               rho=None if rho is None else rho.tolist(),
+               rho_pct=args.rho_pct, prefix=prefix,
+               cache_meta_sha1=meta.get("script_sha1"),
+               script_sha1=file_sha1(__file__))
     json.dump(out, open(prefix + ".diag.json", "w"), ensure_ascii=False,
               indent=1)
-    print(f"\n  сохранено: {prefix}.diag.json")
-    print("\n  ЧИТАТЬ ТАК: это выбор размерности, а не свидетельство того, "
-          "что поправка\n  улучшит успех. Ранг говорит лишь, что остаток "
-          "УМЕЩАЕТСЯ в базис.")
+    if rank is not None:
+        np.save(prefix + ".basis.npy", Bfull[:, :rank].astype(np.float32))
+        np.save(prefix + ".rho.npy", rho.astype(np.float32))
+        print(f"\n  базис и rho сохранены: {prefix}.{{basis,rho}}.npy")
+    print(f"  сохранено: {prefix}.diag.json")
+    print("\n  ЧИТАТЬ ТАК: это ВЫБОР РАЗМЕРНОСТИ на val, а не свидетельство, "
+          "что обученная\n  голова улучшит успех. Доля улучшения посчитана по "
+          "ИСТИННОМУ остатку,\n  спроецированному на базис, то есть это "
+          "ВЕРХНЯЯ граница для ранга r,\n  обученной головой недостижимая.")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
-    ap.add_argument("--diagnose", default=None,
-                    help="префикс собранного кэша: только диагностика")
+    ap.add_argument("--diagnose", default=None)
     ap.add_argument("--ckpt")
     ap.add_argument("--cache", default="data/k9_teacher_150k.npz")
     ap.add_argument("--q0-source", choices=Q0_SOURCES, default=None)
-    ap.add_argument("--joint-ckpt", default=None,
-                    help="чекпойнт K-9c: веса слоёв 1-12 и голова q0")
-    ap.add_argument("--readout", default=None,
-                    help="голова-читалка K-9g для --q0-source readout")
+    ap.add_argument("--joint-ckpt", default=None)
+    ap.add_argument("--readout", default=None)
     ap.add_argument("--root", default="third_party/actioncodec")
     ap.add_argument("--cfg-path", default="config/eval/bar.yaml")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="float16")
+    ap.add_argument("--depth", type=int, default=12)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--limit", type=int, default=None)
-    ap.add_argument("--drift-n", type=int, default=2000,
-                    help="сколько наблюдений прогнать ВТОРЫМ, чистым "
-                         "проходом ради измерения дрейфа поздних слоёв")
+    ap.add_argument("--diag-n", type=int, default=20000)
+    ap.add_argument("--rho-pct", type=float, default=95.0)
+    ap.add_argument("--drift-n", type=int, default=2000)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -279,12 +447,28 @@ def main() -> None:
         selftest()
         return
     selftest()
+
+    # ПУТИ АБСОЛЮТИЗИРУЮТСЯ СРАЗУ. Прежняя версия делала chdir в каталог
+    # actioncodec, и все относительные пути начинали разрешаться от него:
+    # `data/k9_teacher_150k.npz` искался в third_party/actioncodec/data.
+    # chdir убран совсем — K-9e работает без него.
+    for f in ("cache", "joint_ckpt", "readout", "out", "diagnose"):
+        v = getattr(args, f)
+        if v:
+            setattr(args, f, os.path.abspath(v))
+    args.root = os.path.abspath(args.root)
+    sys.path.insert(0, args.root)
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    sha = file_sha1(__file__)
+    print(f"k11a sha1 {sha}")
+
     if args.diagnose:
-        diagnose(args.diagnose)
+        if not args.ckpt:
+            raise SystemExit("диагностике нужен --ckpt: доля улучшения "
+                             "считается ПОСЛЕ декодера")
+        diagnose(args)
         return
 
-    sha = hashlib.sha1(open(__file__, "rb").read()).hexdigest()[:12]
-    print(f"k11a sha1 {sha}")
     for need, why in ((args.ckpt, "--ckpt"), (args.out, "--out"),
                       (args.q0_source, "--q0-source")):
         if not need:
@@ -294,42 +478,97 @@ def main() -> None:
     if args.q0_source == "readout" and not args.readout:
         raise SystemExit("источник readout требует --readout")
     if args.q0_source == "coarse24":
-        # ОТКАЗ, А НЕ ПРЕДУПРЕЖДЕНИЕ. q0 с последнего слоя не оставляет слоёв,
-        # на которых считать поправку: h24 уже израсходован на сам q0.
         raise SystemExit(
             "источник coarse24 несовместим с HiCoRA: q0 берётся с последнего "
             "слоя, и поправку строить не на чем. Он существует только как "
             "верхняя граница качества q0 в отдельных сравнениях")
 
-    root = os.path.abspath(args.root)
-    sys.path.insert(0, root)
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    os.chdir(root)
+    import copy
     import torch
-    from omegaconf import OmegaConf
-    from utils import VisionLanguageActionProcessor, dict_apply
-    from models import SmolVLABlockwiseAR
+    import pyarrow.parquet as pq
+    from huggingface_hub import hf_hub_download
+    from smolvla.bar import SmolVLABlockwiseAR
+    from utils import (STATE_Q01, STATE_Q99, VisionLanguageActionProcessor,
+                       dict_apply, get_cfg, process_state, prompt_template,
+                       seed_everything)
+    from joint12_vla import make_joint12_class
     import joint12_vla as jv
     import hicora_vla as hv
 
-    dev = torch.device(args.device)
-    dtype = getattr(torch, args.dtype)
-    cfg = OmegaConf.load(args.cfg_path)
+    seed_everything(0)
+    dev, dt = torch.device(args.device), getattr(torch, args.dtype)
+    cfg = get_cfg(os.path.join(args.root, args.cfg_path))
+    cfg.TRAINING.ckpt_dir = args.ckpt
     cfg.MODEL.vlm.kwargs.pretrained_model_name_or_path = args.ckpt
 
-    d = np.load(os.path.join(os.path.dirname(root), args.cache),
-                allow_pickle=True)
+    d = np.load(args.cache, allow_pickle=True)
     N = len(d["episode"]) if args.limit is None else min(args.limit,
                                                          len(d["episode"]))
-    print(f"кэш K-9a: {len(d['episode'])} наблюдений, берём {N}")
-    keys = list(zip(d["episode"][:N].tolist(), d["step"][:N].tolist()))
-    if len(set(keys)) != len(keys):
+    epi, stp = d["episode"][:N], d["step"][:N]
+    if len(set(zip(epi.tolist(), stp.tolist()))) != N:
         raise SystemExit("ключи (episode, step) в исходном кэше не уникальны")
+    tsk, offs = d["task"][:N], d["pos_offset"][:N].astype(np.int64)
+    split = np.asarray(d["split"][:N]).astype(str)
+    Ktrue = d["K_true"][:N].astype(np.int16)
+    cache_meta = json.loads(str(d["meta"]))
+    print(f"кэш K-9a: {len(d['episode'])} наблюдений, берём {N}")
+    if cache_meta.get("ckpt") != args.ckpt:
+        raise SystemExit(
+            f"кэш собран чекпойнтом {cache_meta.get('ckpt')}, а сейчас "
+            f"{args.ckpt}: коды K_true и черновик относились бы к разным "
+            f"моделям")
+    if tuple(Ktrue.shape[1:]) != (N_LEVEL, N_POS):
+        raise SystemExit(f"K_true формы {Ktrue.shape}, ожидалось "
+                         f"(N, {N_LEVEL}, {N_POS})")
+    print(f"  происхождение кэша: манифест {cache_meta.get('manifest')}, "
+          f"сид разбиения {cache_meta.get('split_seed')}, словарь "
+          f"{cache_meta.get('vocab')}")
 
-    Joint = jv.make_joint12_class(SmolVLABlockwiseAR)
-    model = Joint.from_pretrained(**cfg.MODEL.vlm.kwargs).to(dev, dtype).eval()
+    # --- кадры: ИМЯ ФАЙЛА ТОЧНО КАК В K-9a ---------------------------------
+    # K-9a пишет `<cache>.images.npy`, где <cache> уже содержит `.npz`.
+    # Замена расширения давала бы несуществующий путь.
+    img_path = args.cache + ".images.npy"
+    if not os.path.exists(img_path):
+        raise SystemExit(f"нет {img_path}: сборка кадров из parquet в память "
+                         f"на {N} наблюдений уже убивала прогон")
+    IMG = np.load(img_path, mmap_mode="r")
+    if IMG.shape[0] != len(d["episode"]):
+        raise SystemExit(f"кадров {IMG.shape[0]}, наблюдений "
+                         f"{len(d['episode'])}")
+    print(f"  кадры: {IMG.shape}, {IMG.nbytes / 2 ** 30:.1f} ГиБ")
+
+    # --- состояния: ИЗ PARQUET, в NPZ их нет -------------------------------
+    st = None
+    rid, rev = "physical-intelligence/libero", "v2.0"
+    uniq = np.unique(epi)
+    for j, e in enumerate(uniq):
+        f = hf_hub_download(rid, f"data/chunk-{int(e) // 1000:03d}/"
+                            f"episode_{int(e):06d}.parquet",
+                            repo_type="dataset", revision=rev)
+        t = pq.read_table(f)
+        S_ = np.asarray(t.column("state").to_pylist(), np.float32)
+        if st is None:
+            st = np.zeros((N, S_.shape[1]), np.float64)
+        elif st.shape[1] != S_.shape[1]:
+            raise SystemExit(f"эпизод {e}: состояние {S_.shape[1]}-мерное, "
+                             f"раньше было {st.shape[1]}-мерное")
+        for r_ in np.where(epi == e)[0]:
+            st[r_] = S_[int(stp[r_])]
+        if j % 400 == 0:
+            print(f"  эпизодов {j}/{len(uniq)}", flush=True)
+    if st.shape[1] == len(STATE_Q01) + 1:
+        st = process_state(st)
+    if not np.isfinite(st).all():
+        raise SystemExit("в состояниях есть nan или inf")
+    st_n = (st - STATE_Q01) / (STATE_Q99 - STATE_Q01) * 2.0 - 1.0
+    print("  состояния собраны")
+
+    # --- модель -------------------------------------------------------------
+    Cls = make_joint12_class(SmolVLABlockwiseAR)
+    model = Cls.from_pretrained(**cfg.MODEL.vlm.kwargs).to(dev, dt).eval()
     proc = VisionLanguageActionProcessor.from_pretrained(
         args.ckpt, trust_remote_code=True, mode="discrete")
+    model.init_joint_fast(depth=args.depth, head_dtype=dt)
 
     ac = proc.action_processor
     codec = ac if hasattr(ac, "vq") else getattr(ac, "codec", None)
@@ -340,51 +579,55 @@ def main() -> None:
         idx = torch.arange(int(codec.vocab_size), device=dev).unsqueeze(0)
         E = torch.stack([q.out_project(q.decode_code(idx))[0]
                          for q in codec.vq.quantizers]).float()
-    print(f"кодовые книги: {tuple(E.shape)} (уровней, кодов, размерность)")
 
-    print("\nЭТОТ СКРИПТ СОБИРАЕТ КЭШ. Ни одного вывода о качестве поправки "
-          "из него\nне следует: он фиксирует ВХОДЫ будущей головы и "
-          "размерность её выхода.")
+    # ИСХОДНАЯ ФИНАЛЬНАЯ НОРМА СНИМАЕТСЯ ДО НАЛОЖЕНИЯ ВЕСОВ: чекпойнт Joint12
+    # перезапишет `action_expert.norm`, обученную читать h12, а поздняя ветвь
+    # обязана читать h24 своей нормой.
+    res_norm = copy.deepcopy(model.action_expert.norm)
 
-    # --- наложение весов источника q0 ---------------------------------------
-    model.init_joint_fast(depth=12)
-    src_meta = None
     if args.q0_source == "joint12":
-        obj = torch.load(os.path.join(os.path.dirname(root), args.joint_ckpt)
-                         if not os.path.isabs(args.joint_ckpt)
-                         else args.joint_ckpt, map_location="cpu",
+        wsha = file_sha1(args.joint_ckpt)
+        obj = torch.load(args.joint_ckpt, map_location="cpu",
                          weights_only=False)
+        if int(obj.get("depth", -1)) != args.depth:
+            raise SystemExit(f"чекпойнт глубины {obj.get('depth')}, задано "
+                             f"{args.depth}")
         state = obj["state"]
-        own = dict(model.named_parameters())
-        stray = [k for k in state if k not in own]
+        # СТРОГО, КАК В K-9d/K-9e: частично применённый чекпойнт даёт
+        # правдоподобные, но неверные числа, и таблица этого не покажет.
+        stray = [k for k in state
+                 if not any(k.startswith(p) or k == p.rstrip(".")
+                            for p in model.trainable_prefixes)]
         if stray:
-            raise SystemExit(f"{len(stray)} ключей нет в модели: {stray[:5]}")
+            raise SystemExit(f"{len(stray)} ключей вне белого списка: "
+                             f"{stray[:5]}")
+        own = dict(model.named_parameters())
+        missing = [k for k in own if own[k].requires_grad and k not in state]
+        if missing:
+            raise SystemExit(f"нет {len(missing)} обучаемых весов: "
+                             f"{missing[:5]}")
         with torch.no_grad():
             for k, v in state.items():
                 if tuple(own[k].shape) != tuple(v.shape):
                     raise SystemExit(f"форма {k}")
                 if not torch.isfinite(v).all():
                     raise SystemExit(f"в {k} есть nan или inf")
-                own[k].data = v.to(dev, own[k].dtype)
-        # ЧТО ИМЕННО ПЕРЕЗАПИСАНО — В ОТЧЁТ. `action_expert.norm` и
-        # `bos_embedding` общие для всей глубины: их подмена меняет и вход
-        # слоёв 13-24, а не только голову q0. Это и есть источник дрейфа,
-        # который меряется ниже.
+                # FP32, А НЕ dtype МОДЕЛИ. Прежняя версия писала
+                # `own[k].dtype`, то есть fp16, и округляла обученные веса:
+                # исполнялась бы ДРУГАЯ модель, не та, у которой измерены
+                # 89.5%.
+                own[k].data = v.to(dev, torch.float32)
         touched = sorted({k.split(".layers.")[0] if ".layers." in k
                           else k.rsplit(".", 1)[0] for k in state})
-        src_meta = dict(path=os.path.abspath(args.joint_ckpt),
-                        depth=int(obj.get("depth", 12)),
+        src_meta = dict(path=args.joint_ckpt, depth=int(obj["depth"]),
                         tensors=len(state), touched=touched,
-                        weights_sha1=hashlib.sha1(
-                            str(sorted(state)).encode()).hexdigest()[:12])
-        print(f"  наложены веса Joint12: {len(state)} тензоров, затронуты "
-              f"{len(touched)} групп")
+                        weights_sha1=wsha)
+        print(f"  веса Joint12: {len(state)} тензоров, файл sha {wsha}")
         print(f"  ОБЩИЕ ДЛЯ ВСЕЙ ГЛУБИНЫ И ПЕРЕЗАПИСАННЫЕ: "
               f"{[t for t in touched if 'layers' not in t]}")
     else:
-        obj = torch.load(os.path.join(os.path.dirname(root), args.readout)
-                         if not os.path.isabs(args.readout) else args.readout,
-                         map_location="cpu", weights_only=False)
+        wsha = file_sha1(args.readout)
+        obj = torch.load(args.readout, map_location="cpu", weights_only=False)
         state = {k: v for k, v in obj["state"].items()
                  if k.startswith(("fast_head.", "action_expert.norm."))}
         if not state:
@@ -392,52 +635,45 @@ def main() -> None:
         own = dict(model.named_parameters())
         with torch.no_grad():
             for k, v in state.items():
-                own[k].data = v.to(dev, own[k].dtype)
-        src_meta = dict(path=os.path.abspath(args.readout),
-                        tensors=len(state), touched=sorted(state),
+                own[k].data = v.to(dev, torch.float32)
+        src_meta = dict(path=args.readout, tensors=len(state),
+                        weights_sha1=wsha, touched=sorted(state),
                         note="ствол ИСХОДНЫЙ, поздние слои в своём "
                              "распределении")
-        print(f"  наложена голова-читалка: {len(state)} тензоров, ствол "
-              f"исходный")
+        print(f"  голова-читалка: {len(state)} тензоров, файл sha {wsha}")
+
+    # РЕЖИМ ВЫЧИСЛЕНИЯ КАК В K-9c/K-9e: обучаемое в fp32, проход под autocast.
+    n32 = model.to_fp32_trainable()
+    print(f"  режим как в K-9c: {n32} тензоров в fp32, проход под autocast "
+          f"{args.dtype}")
     model.eval()
 
-    HiCoRA = hv.make_hicora_class(type(model))
-    model.__class__ = HiCoRA
+    model.__class__ = hv.make_hicora_class(type(model))
     model.set_codebooks(E)
-    model.init_hicora(q0_depth=12, taps=TAPS)
-    D_H = int(model.fast_head.in_features)
-    D_Z = int(E.shape[-1])
-    print(f"  отводы {TAPS}, h={D_H}, латент={D_Z}")
+    model.set_res_norm(res_norm.to(dev))
+    model.taps, model.q0_depth = TAPS, args.depth
+    model.n_layers_total = len(model.action_expert.layers)
+    D_H, D_Z = int(model.fast_head.in_features), int(E.shape[-1])
+    if max(TAPS) != model.n_layers_total:
+        raise SystemExit(f"последний отвод {max(TAPS)} против "
+                         f"{model.n_layers_total} слоёв: проход неполный")
+    print(f"  отводы {TAPS}, h={D_H}, латент={D_Z}, слоёв "
+          f"{model.n_layers_total}")
 
-    # --- место на диске проверяется ДО записи --------------------------------
-    outdir = os.path.dirname(os.path.abspath(
-        os.path.join(os.path.dirname(root), args.out)))
+    outdir = os.path.dirname(args.out) or "."
     os.makedirs(outdir, exist_ok=True)
     need = len(TAPS) * N * N_POS * D_H * 2 / 2 ** 30
-    st_fs = os.statvfs(outdir)
-    free = st_fs.f_bavail * st_fs.f_frsize / 2 ** 30
+    stfs = os.statvfs(outdir)
+    free = stfs.f_bavail * stfs.f_frsize / 2 ** 30
     print(f"  отводы: {len(TAPS)} x ({N}, {N_POS}, {D_H}) fp16 = "
           f"{need:.2f} ГиБ, свободно {free:.1f} ГиБ")
     if free < need * 1.15:
-        raise SystemExit("места не хватит с запасом; сбор идёт долго, и "
-                         "падение на последнем батче стоило бы всего прогона")
+        raise SystemExit("места не хватит с запасом")
 
-    base = os.path.join(os.path.dirname(root), args.out)
     taps_mm = {t: np.lib.format.open_memmap(
-        f"{base}.h{t}.npy", mode="w+", dtype=np.float16,
+        f"{args.out}.h{t}.npy", mode="w+", dtype=np.float16,
         shape=(N, N_POS, D_H)) for t in TAPS}
     q0hat = np.zeros((N, N_POS), np.int16)
-
-    # --- входы из кэша K-9a ---------------------------------------------------
-    IMG = np.load(os.path.join(os.path.dirname(root), args.cache).replace(
-        ".npz", ".images.npy"), mmap_mode="r")
-    st_n = d["state"][:N] if "state" in d.files else None
-    if st_n is None:
-        raise SystemExit("в кэше K-9a нет состояний: пересоберите его или "
-                         "укажите кэш с полем state")
-    tsk = d["task"][:N]
-    offs = d["pos_offset"][:N].astype(np.int64)
-    Ktrue = d["K_true"][:N].astype(np.int16)
 
     groups = []
     for po in sorted({int(v) for v in offs}):
@@ -447,7 +683,7 @@ def main() -> None:
     print(f"  батчей {len(groups)} по {args.batch}; порядок по офсету — "
           f"position_offset задаётся на весь вызов")
 
-    def build(sel, po):
+    def build(sel):
         image = torch.from_numpy(np.asarray(IMG[sel]))
         msgs = []
         for gi in sel:
@@ -463,112 +699,141 @@ def main() -> None:
                                      for k in range(len(sel))],
                  return_tensors="pt", padding=True, padding_side="left",
                  action_processor_kwargs={"embodiment_ids": 0})
-        return dict_apply(lambda x: x.to(dev, dtype), b)
+        return dict_apply(lambda x: x.to(dev, dt), b)
 
-    seen_layers = set()
+    seen = set()
     for gi, (po, sel) in enumerate(groups):
-        b = build(sel, po)
-        with torch.no_grad():
+        b = build(sel)
+        with torch.no_grad(), torch.autocast(device_type=dev.type, dtype=dt):
             v, pp = model.build_inputs(position_offset=po, **b)
-            taps = model.forward_taps(
+            tp = model.forward_taps(
                 vlm_inputs_embeds=v, attention_mask=b.get("attention_mask"),
                 position_ids=pp)
-            _, q0 = model.q0_from(taps[12])
-        seen_layers.add(int(taps["layers_run"]))
+            _, q0 = model.q0_from(tp[args.depth])
+        seen.add(int(tp["layers_run"]))
         for t in TAPS:
-            taps_mm[t][sel] = taps[t].float().cpu().numpy().astype(np.float16)
+            taps_mm[t][sel] = tp[t].float().cpu().numpy().astype(np.float16)
         q0hat[sel] = q0.cpu().numpy().astype(np.int16)
         if gi % 50 == 0:
             print(f"    батч {gi}/{len(groups)}", flush=True)
     for t in TAPS:
         taps_mm[t].flush()
-    if seen_layers != {24}:
-        raise SystemExit(f"глубина прохода {sorted(seen_layers)} вместо 24 — "
-                         f"заявление «один проход по 24 слоям» неверно")
-    print(f"  проход: ровно 24 слоя во всех {len(groups)} батчах")
+    if seen != {model.n_layers_total}:
+        raise SystemExit(f"глубина прохода {sorted(seen)} вместо "
+                         f"{model.n_layers_total}")
+    print(f"  проход: ровно {model.n_layers_total} слоёв во всех батчах")
 
-    # --- ШУМ ХРАНЕНИЯ FP16 ИЗМЕРЯЕТСЯ, А НЕ ПРЕДПОЛАГАЕТСЯ -------------------
+    # --- ШУМ ХРАНЕНИЯ FP16 ИЗМЕРЯЕТСЯ, А НЕ ПРЕДПОЛАГАЕТСЯ -----------------
     chk = np.random.default_rng(0).choice(N, min(2048, N), replace=False)
-    with torch.no_grad():
-        h_back = torch.from_numpy(np.asarray(taps_mm[12][chk])).to(dev, dtype)
-        _, q_back = model.q0_from(h_back)
-    mism = float((q_back.cpu().numpy().astype(np.int16)
-                  != q0hat[chk]).mean())
-    print(f"  шум fp16: {mism:.3%} токенов q0 расходятся при перегоне через "
-          f"голову из кэша")
+    with torch.no_grad(), torch.autocast(device_type=dev.type, dtype=dt):
+        hb = torch.from_numpy(np.asarray(taps_mm[args.depth][chk])).to(dev, dt)
+        _, qb = model.q0_from(hb)
+    mism = float((qb.cpu().numpy().astype(np.int16) != q0hat[chk]).mean())
+    print(f"  шум fp16: {mism:.3%} токенов q0 расходятся при перегоне из кэша")
     if mism > 0.005:
-        raise SystemExit(f"расхождение {mism:.3%} выше 0.5% — кэш непригоден "
+        raise SystemExit(f"расхождение {mism:.3%} выше 0.5%: кэш непригоден "
                          f"как источник черновика")
 
-    # --- ДРЕЙФ ПОЗДНИХ СЛОЁВ ОТ НАЛОЖЕНИЯ ВЕСОВ ------------------------------
+    # --- ЧЕТЫРЕ РАЗНЫЕ ВЕЛИЧИНЫ ДРЕЙФА -------------------------------------
     drift = None
     if args.q0_source == "joint12" and args.drift_n > 0:
-        print(f"\n  измеряю дрейф поздних слоёв на {args.drift_n} "
-              f"наблюдениях вторым, ЧИСТЫМ проходом")
-        clean = Joint.from_pretrained(**cfg.MODEL.vlm.kwargs).to(
-            dev, dtype).eval()
+        print(f"\n  дрейф на {args.drift_n} наблюдениях ЧИСТЫМ проходом")
+        clean = Cls.from_pretrained(**cfg.MODEL.vlm.kwargs).to(dev, dt).eval()
+        clean.init_joint_fast(depth=args.depth, head_dtype=dt)
+        clean_norm = copy.deepcopy(clean.action_expert.norm).to(dev)
         clean.__class__ = hv.make_hicora_class(type(clean))
-        clean.init_joint_fast(depth=12)
         clean.set_codebooks(E)
-        clean.init_hicora(q0_depth=12, taps=TAPS)
+        clean.set_res_norm(clean_norm)
+        clean.taps, clean.q0_depth = TAPS, args.depth
+        clean.n_layers_total = len(clean.action_expert.layers)
         sub = np.random.default_rng(1).choice(N, min(args.drift_n, N),
                                               replace=False)
-        rel, agree, tot = [], 0, 0
+        rel, ag12, agc, ntok = [], 0, 0, 0
+        dp, dr_, dg = [], [], []
         for po in sorted({int(offs[i]) for i in sub}):
             ipo = np.asarray([i for i in sub if int(offs[i]) == po])
             for i, j in plan_batches(len(ipo), args.batch):
                 s_ = ipo[i:j]
-                b = build(s_, po)
-                with torch.no_grad():
+                b = build(s_)
+                with torch.no_grad(), torch.autocast(device_type=dev.type,
+                                                     dtype=dt):
                     v, pp = clean.build_inputs(position_offset=po, **b)
                     tp = clean.forward_taps(
                         vlm_inputs_embeds=v,
                         attention_mask=b.get("attention_mask"),
                         position_ids=pp)
-                a = tp[24].float().cpu().numpy()
-                bb = np.asarray(taps_mm[24][s_], np.float32)
-                rel.append(np.linalg.norm(bb - a, axis=-1)
-                           / np.maximum(np.linalg.norm(a, axis=-1), 1e-6))
-                _, qc = clean.q0_from(tp[12])
-                agree += int((qc.cpu().numpy().astype(np.int16)
-                              == q0hat[s_]).sum())
-                tot += q0hat[s_].size
-        rel = np.concatenate([r.ravel() for r in rel])
+                    _, q12 = clean.q0_from(tp[args.depth])
+                    # НАСТОЯЩИЙ coarse24 — это generate на полной глубине, а
+                    # не голова-читалка на отводе. Именно у него измерены
+                    # 90.0%, и сравнивать надо с ним.
+                    toks = clean.generate(**b, position_offset=po,
+                                          do_sample=False,
+                                          initial_position_shift=1)
+                    qc = toks.cpu().numpy().reshape(
+                        -1, N_LEVEL, N_POS)[:, 0, :].astype(np.int16)
+                a = tp[max(TAPS)].float().cpu().numpy()
+                bb = np.asarray(taps_mm[max(TAPS)][s_], np.float32)
+                rel.append((np.linalg.norm(bb - a, axis=-1)
+                            / np.maximum(np.linalg.norm(a, axis=-1),
+                                         1e-6)).ravel())
+                ag12 += int((q12.cpu().numpy().astype(np.int16)
+                             == q0hat[s_]).sum())
+                agc += int((qc == q0hat[s_]).sum())
+                ntok += int(q0hat[s_].size)
+                with torch.no_grad():
+                    Aj = codec._decode(
+                        E[0][torch.as_tensor(q0hat[s_]).long().to(dev)],
+                        embodiment_ids=0)[0][..., :7].float().cpu().numpy()
+                    Ac = codec._decode(
+                        E[0][torch.as_tensor(qc).long().to(dev)],
+                        embodiment_ids=0)[0][..., :7].float().cpu().numpy()
+                e_ = action_err(Aj, Ac)
+                dp.append(e_["pos"]); dr_.append(e_["rot"]); dg.append(e_["grip"])
+        rel = np.concatenate(rel)
         drift = dict(n=int(len(sub)), h24_rel_mean=float(rel.mean()),
                      h24_rel_p95=float(np.percentile(rel, 95)),
-                     q0_agreement=float(agree / max(tot, 1)))
-        print(f"  дрейф h24: относительный {drift['h24_rel_mean']:.3f} в "
-              f"среднем, p95 {drift['h24_rel_p95']:.3f}")
-        print(f"  согласие q0 с чистым проходом: {drift['q0_agreement']:.1%}")
-        print("  ЧИТАТЬ ТАК: большой дрейф означает, что слои 13-24 читают "
-              "вход вне\n  своего распределения. Это не запрет на HiCoRA, но "
-              "объяснение, если\n  поправка окажется бесполезной, и повод "
-              "сравнить с источником readout.")
+                     q0_vs_clean_h12=float(ag12 / max(ntok, 1)),
+                     q0_vs_coarse24=float(agc / max(ntok, 1)),
+                     act_pos=float(np.mean(dp)), act_rot=float(np.mean(dr_)),
+                     act_grip=float(np.mean(dg)))
+        print(f"    1. q0 Joint12 против исходной головы на h12: "
+              f"{drift['q0_vs_clean_h12']:.1%} совпадений")
+        print(f"    2. q0 Joint12 против НАСТОЯЩЕГО coarse24 (generate, "
+              f"{model.n_layers_total} слоёв): {drift['q0_vs_coarse24']:.1%}")
+        print(f"    3. декодированные действия, шаги 0-7: положение "
+              f"{drift['act_pos']:.5f}, вращение {drift['act_rot']:.5f}, "
+              f"знак схвата {drift['act_grip']:.1%}")
+        print(f"    4. дрейф h24: относительный {drift['h24_rel_mean']:.3f}, "
+              f"p95 {drift['h24_rel_p95']:.3f}")
+        print("    ЧИТАТЬ ТАК: 1 и 2 — РАЗНЫЕ величины. Первая о том, что "
+              "изменило\n    дообучение головы, вторая о расстоянии до опоры "
+              "с известными 90.0%.\n    Большой дрейф h24 означает, что слои "
+              "13-24 читают вход вне своего\n    распределения — это не "
+              "запрет на HiCoRA, но объяснение на случай,\n    если поправка "
+              "окажется бесполезной, и повод сравнить с источником readout.")
         del clean
         torch.cuda.empty_cache()
 
-    np.save(f"{base}.q0hat.npy", q0hat)
-    np.save(f"{base}.ktrue.npy", Ktrue)
-    np.save(f"{base}.codebooks.npy", E.cpu().numpy().astype(np.float32))
+    np.save(f"{args.out}.q0hat.npy", q0hat)
+    np.save(f"{args.out}.ktrue.npy", Ktrue)
+    np.save(f"{args.out}.split.npy", split)
+    np.save(f"{args.out}.codebooks.npy", E.cpu().numpy().astype(np.float32))
     meta = dict(n_obs=int(N), q0_source=args.q0_source, taps=list(TAPS),
-                d_hidden=D_H, d_latent=D_Z, ckpt=args.ckpt,
-                cache=os.path.abspath(args.cache), source=src_meta,
-                fp16_q0_mismatch=mism, drift=drift, script_sha1=sha,
-                hicora_vla_sha1=hashlib.sha1(
-                    open(hv.__file__, "rb").read()).hexdigest()[:12],
-                keys_sha1=hashlib.sha1(
-                    np.ascontiguousarray(
-                        np.stack([d["episode"][:N], d["step"][:N]])
-                    ).tobytes()).hexdigest()[:12])
-    json.dump(meta, open(f"{base}.meta.json", "w"), ensure_ascii=False,
+                depth=args.depth, d_hidden=D_H, d_latent=D_Z, ckpt=args.ckpt,
+                cache=args.cache, source=src_meta, fp16_q0_mismatch=mism,
+                drift=drift, script_sha1=sha, cache_meta=cache_meta,
+                hicora_vla_sha1=file_sha1(hv.__file__),
+                joint12_vla_sha1=file_sha1(jv.__file__),
+                keys_sha1=hashlib.sha1(np.ascontiguousarray(
+                    np.stack([epi, stp])).tobytes()).hexdigest()[:12])
+    json.dump(meta, open(f"{args.out}.meta.json", "w"), ensure_ascii=False,
               indent=1)
-    print(f"\n  сохранено: {base}.{{h12,h18,h24,q0hat,ktrue,codebooks}}.npy "
-          f"и .meta.json")
-    print(f"  ключи (episode, step) sha {meta['keys_sha1']} — совпадение с "
-          f"K-9a обязано проверяться в K-11c")
-    print("\n  ДАЛЬШЕ: диагностика ранга (--diagnose), затем K-11b с "
-          "проверками тождества.\n  Обучение головы не начинать, пока "
-          "тождество не пройдено.")
+    print(f"\n  сохранено: {args.out}.{{h12,h18,h24,q0hat,ktrue,split,"
+          f"codebooks}}.npy и .meta.json")
+    print(f"  ключи sha {meta['keys_sha1']}")
+    print("\n  ДАЛЬШЕ: --diagnose для выбора ранга и rho, затем K-11b с "
+          "проверками\n  тождества. Обучение головы не начинать до "
+          "тождества.")
 
 
 if __name__ == "__main__":
