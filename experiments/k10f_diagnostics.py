@@ -141,10 +141,17 @@ def read_capacity(small_rms, cap_curve=None, thr=0.02):
     base = "Проверка вменяемости пройдена: 256 строк запоминаются. "
     if not cap_curve:
         return base + "Причина плато пока НЕ установлена."
-    tr = [v["train"] for v in cap_curve.values()]
-    if max(tr) - min(tr) > 0.02:
+    # НАПРАВЛЕНИЕ, А НЕ ТОЛЬКО РАЗБРОС. Прежняя проверка `max-min > 0.02`
+    # объявляла бы «рост сети снизил ошибку» даже если большая сеть стала
+    # ХУЖЕ.
+    keys = list(cap_curve)
+    tr = [cap_curve[k]["train"] for k in keys]
+    if tr[0] - tr[-1] > 0.02:
         return base + ("Рост сети СНИЖАЕТ ошибку на обучении — ёмкость была "
                        "ограничением, а не информация.")
+    if tr[-1] - tr[0] > 0.02:
+        return base + ("Рост сети УХУДШАЕТ обучение — проблема в оптимизации "
+                       "или регуляризации, а не в информации.")
     return base + ("Рост сети ошибку не снижает — довод за информационный "
                    "предел, но окончательным его делает только сравнение "
                    "plain против rich.")
@@ -291,7 +298,7 @@ def main() -> None:
     lags = [-2, -1, 0, 1, 2]
     lag_num = {l: 0.0 for l in lags}
     lag_den = {l: 0.0 for l in lags}
-    S, G, Y, EP = [], [], [], []
+    S, G, Y, EP, PA = [], [], [], [], []
     zero_rem, near_rows = 0, 0
 
     for i, e in enumerate(train_ep):
@@ -326,11 +333,16 @@ def main() -> None:
                               n_task=len(tasks))
         S.append(s_); G.append(g_); Y.append(y_)
         EP.append(np.full(len(s_), e))
+        # ПРЕДЫДУЩЕЕ ДЕЙСТВИЕ ХРАНИТСЯ ОТДЕЛЬНО от входа: оно нужно как
+        # контрольная база независимо от того, включено ли оно в признаки.
+        prev = np.maximum(t - 1, 0)
+        pa = a[prev] * (t > 0)[:, None]
+        PA.append(pa.astype(np.float32))
         if (i + 1) % 50 == 0:
             print(f"  эпизодов {i + 1}/{len(train_ep)}", flush=True)
 
     S, G, Y = np.concatenate(S), np.concatenate(G), np.concatenate(Y)
-    EP = np.concatenate(EP)
+    EP, PA = np.concatenate(EP), np.concatenate(PA)
     r2 = {l: (lag_num[l] / lag_den[l] if lag_den[l] else None) for l in lags}
     ok = sorted((l for l in lags if r2[l] is not None), key=lambda l: -r2[l])
     best = ok[0]
@@ -350,8 +362,9 @@ def main() -> None:
     din, dout = S.shape[1] + G.shape[1], 6
     X = np.concatenate([S, G], 1)
     print(f"\n=== ПРОБА 2: ёмкость против информации ===")
-    print(f"  троек {len(X)}, вход {din} признаков"
-          + (" (полный)" if args.rich else " (как в K-10d)"))
+    cfg_name = ("plain" if not parts and not args.rich
+                else ("full" if parts is None else "+".join(parts)))
+    print(f"  троек {len(X)}, вход {din} признаков, конфигурация «{cfg_name}»")
 
     def mk(hid, depth):
         layers, d = [], din
@@ -425,13 +438,59 @@ def main() -> None:
         res["capacity"][spec] = dict(train=etr, val=eva)
         print(f"    {spec:>9}: обучение {etr:.4f}, отложено {eva:.4f}")
 
+    # --- КОНТРОЛЬНЫЕ БАЗЫ ---------------------------------------------------
+    # Действия гладкие, поэтому «повторить прошлую команду» может объяснить
+    # почти всё. Без этой базы низкая ошибка ничего не доказывает о пользе
+    # целевой архитектуры.
+    def rms_pred(pred, idx):
+        return float(np.sqrt(((pred - Y[idx][:, :6]) ** 2).mean()))
+
+    mean_a = Y[tr][:, :6].mean(0)
+    bases = {
+        "ноль": rms_pred(np.zeros((len(va), 6)), va),
+        "среднее по обучению": rms_pred(np.broadcast_to(mean_a, (len(va), 6)),
+                                        va),
+        "копия прошлой команды": rms_pred(PA[va][:, :6], va),
+    }
+    print(f"\n  контрольные базы на отложенных эпизодах:")
+    for k, v in bases.items():
+        print(f"    {k:<24}{v:.4f}")
+    res["baselines"] = bases
+
+    # ПЕРЕМЕШАННАЯ ЦЕЛЬ: если ошибка почти не растёт, цель не используется.
+    torch.manual_seed(0)
+    net = mk(512, 2)
+    opt = torch.optim.AdamW(net.parameters(), lr=args.lr)
+    rg = np.random.default_rng(0)
+    Xs = X.copy()
+    perm_g = rg.permutation(len(tr))
+    Xs[tr, S.shape[1]:] = G[tr][perm_g]
+    for _ in range(args.epochs):
+        net.train()
+        o = rg.permutation(tr)
+        for i0 in range(0, len(o), args.batch):
+            s_ = o[i0:i0 + args.batch]
+            loss = ((net(torch.from_numpy(Xs[s_]).to(dev))
+                     - torch.from_numpy(Y[s_][:, :6]).to(dev)) ** 2).mean()
+            opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
+    sh_va = rms(net, Xs[va], Y[va])
+    real = res["capacity"].get("512x2", {}).get("val")
+    res["shuffled_goal_val"] = sh_va
+    print(f"\n  перемешанная цель (512x2): отложено {sh_va:.4f}"
+          + (f" против {real:.4f} с настоящей" if real else ""))
+    if real and sh_va - real < 0.005:
+        print("    ЦЕЛЬ ПОЧТИ НЕ ИСПОЛЬЗУЕТСЯ: результат держится на истории, "
+              "а не на\n    целевой архитектуре")
+
     print(f"\n  {read_capacity(small_rms, res['capacity'])}")
     print(f"\n  ЧИТАТЬ ТАК: если малая выборка переобучается, а развёртка по "
           f"ёмкости\n  ошибку не снижает — предел информационный. Если малая "
           f"НЕ переобучается —\n  вывод K-10d об информации неправомерен "
           f"вовсе.")
     res["script_sha1"] = sha
-    res["rich"] = bool(args.rich)
+    res["config"] = cfg_name
+    res["parts"] = list(parts) if parts else (list(gd.RICH_PARTS)
+                                              if args.rich else [])
     res["argv"] = vars(args)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".",
                 exist_ok=True)

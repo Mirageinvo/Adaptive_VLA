@@ -267,9 +267,14 @@ def main() -> None:
 
     # --- разбиение из манифеста K-9a -----------------------------------------
     z = np.load(args.cache, allow_pickle=True)
-    ep_split = {}
-    for e, s in zip(z["episode"], z["split"]):
+    ep_split, ep_task = {}, {}
+    for e, s, tk in zip(z["episode"], z["split"], z["task"]):
         ep_split[int(e)] = str(s)
+        ep_task[int(e)] = str(tk)
+    # ИДЕНТИФИКАТОР ЗАДАЧИ ОБЯЗАН ПЕРЕДАВАТЬСЯ. Без него часть «task» молча
+    # исчезала, и одинаковые флаги в K-10d и K-10f означали разные задачи.
+    tmap = {t_: i for i, t_ in enumerate(sorted(set(ep_task.values())))}
+    print(f"различных задач в кэше: {len(tmap)}")
     train_ep = sorted({e for e, s in ep_split.items() if s == "train"})
     rng = np.random.default_rng(args.seed)
     if len(train_ep) > args.max_train_ep:
@@ -322,7 +327,9 @@ def main() -> None:
         a, st, tau, ttyp, rem = load_ep(e)
         t = np.asarray(steps, np.int64)
         s_, g_, y_ = gd.build(a, st, tau, ttyp, rem, t,
-                              state_norm=norm_state, rich=args.rich, parts=parts)
+                              state_norm=norm_state, rich=args.rich,
+                              parts=parts, task_id=tmap.get(ep_task.get(e)),
+                              n_task=max(len(tmap), 1))
         return s_, g_, y_, rem[t]
 
     # --- обучающая выборка: все шаги обучающих эпизодов -----------------------

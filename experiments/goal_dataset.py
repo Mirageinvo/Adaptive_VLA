@@ -124,9 +124,20 @@ def build(a, st, tau, ttyp, rem, steps, state_norm=None, task_id=None,
         extra += [pact, has_prev]
     if "remaining" in parts:
         extra.append(np.log1p(rr))
-    if "task" in parts and task_id is not None:
+    if "task" in parts:
+        # ОТКАЗ, А НЕ МОЛЧАЛИВЫЙ ПРОПУСК. Прежде при `task_id is None` признак
+        # просто исчезал, и K-10f с task давал вход шириной как без него, а
+        # K-10d — тем более, потому что вовсе не передавал идентификатор.
+        # Две конфигурации с одинаковыми флагами решали разные задачи.
+        if task_id is None:
+            raise ValueError("запрошена часть «task», но task_id не передан")
+        ti = int(task_id)
+        # ОСТАТОК ОТ ДЕЛЕНИЯ УБРАН: он молча склеивал бы разные задачи в один
+        # столбец при n_task меньше числа задач.
+        if not 0 <= ti < n_task:
+            raise ValueError(f"task_id {ti} вне диапазона [0, {n_task})")
         oh_t = np.zeros((len(t), n_task))
-        oh_t[np.arange(len(t)), int(task_id) % n_task] = 1.0
+        oh_t[np.arange(len(t)), ti] = 1.0
         extra.append(oh_t)
     if not extra:
         return sn.astype(np.float32), g.astype(np.float32), a[t].astype(np.float32)
@@ -177,6 +188,21 @@ def selftest():
     assert np.abs(s1[0, d0:d0 + 8]).max() == 0.0
     # ЧАСТИ ВКЛЮЧАЮТСЯ ПО ОТДЕЛЬНОСТИ и дают предсказуемую ширину входа.
     w0 = s0.shape[1]
+    # ЗАПРОС task БЕЗ ИДЕНТИФИКАТОРА — ОТКАЗ.
+    try:
+        build(a, st, tau, ttyp, rem, np.arange(n - 1), parts=("task",))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("«task» без task_id должен отвергаться")
+    try:
+        build(a, st, tau, ttyp, rem, np.arange(n - 1), parts=("task",),
+              task_id=99, n_task=64)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("task_id вне диапазона должен отвергаться")
+
     for pp, add in ((("dstate",), 8), (("prevact",), 8), (("remaining",), 1),
                     (("task",), 64), (("dstate", "remaining"), 9)):
         sp, gp, yp = build(a, st, tau, ttyp, rem, np.arange(n - 1), parts=pp,
