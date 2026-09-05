@@ -112,9 +112,30 @@ def file_sha1(path):
 
 
 DATASET_REV = "v2.0"
+DATASET_REPO = "physical-intelligence/libero"
+# Поля происхождения кодека. ОТСУТСТВИЕ ЛЮБОГО — ОТКАЗ, а не «нечего
+# сравнивать»: идиома `meta.get(k) not in (None, got)` пропускала кэш с
+# удалённым полем и печатала «декодер сверен».
+FINGERPRINTS = ("codebooks_sha1", "decoder_probe", "codec_state_sha1")
 
 
-def check_manifest(man, cache_meta, epi, split, rev=DATASET_REV):
+def check_fingerprints(meta, got):
+    """Строгая сверка отпечатков кодека: наличие, затем точное равенство."""
+    miss = [k for k in FINGERPRINTS if not meta.get(k)]
+    if miss:
+        raise SystemExit(
+            f"в meta кэша нет полей {miss}: кэш собран версией, которая их не "
+            f"писала, и совпадение декодера подтвердить нечем. Пересоберите "
+            f"кэш текущей версией")
+    bad = [(k, meta[k], got[k]) for k in FINGERPRINTS if meta[k] != got[k]]
+    if bad:
+        lines = "; ".join(f"{k}: в кэше {a}, сейчас {b}" for k, a, b in bad)
+        raise SystemExit(f"декодер не тот, которым собран кэш — {lines}")
+    return True
+
+
+def check_manifest(man, cache_meta, epi, split, rev=DATASET_REV,
+                   repo=DATASET_REPO):
     """Сверка манифеста K-9a. Отдельной функцией — ради самопроверки.
 
     ФОРМАТ ИМЕННО ТОТ, ЧТО ПИШЕТ K-9a: параллельные списки `episodes` и
@@ -146,6 +167,10 @@ def check_manifest(man, cache_meta, epi, split, rev=DATASET_REV):
     if got_rev != rev:
         raise SystemExit(f"манифест собран на ревизии {got_rev!r}, а "
                          f"состояния читаются с {rev!r}: это разные данные")
+    got_repo = man.get("dataset_repo")
+    if got_repo != repo:
+        raise SystemExit(f"манифест собран по репозиторию {got_repo!r}, а "
+                         f"состояния читаются из {repo!r}: другой датасет")
     sp_of = dict(zip(eps, sp))
     uniq = [int(e) for e in np.unique(epi)]
     miss = sorted(set(uniq) - set(eps))
@@ -421,6 +446,12 @@ def selftest():
     # НЕВЕРНАЯ РЕВИЗИЯ обязана отвергаться, а не читаться как None.
     must_fail(dict(good_man, dataset_revision="v1.0"), cm, epi_t, sp_t,
               "ревизии")
+    # РЕПОЗИТОРИЙ ТОЖЕ ЧАСТЬ ПРОИСХОЖДЕНИЯ: подменённый и отсутствующий
+    # проходили молча.
+    must_fail(dict(good_man, dataset_repo="someone/else"), cm, epi_t, sp_t,
+              "репозиторию")
+    must_fail({k: v for k, v in good_man.items() if k != "dataset_repo"},
+              cm, epi_t, sp_t, "репозиторию")
     must_fail({k: v for k, v in good_man.items() if k != "dataset_revision"},
               cm, epi_t, sp_t, "ревизии")
     # Смешанная часть внутри эпизода — утечка между train и val.
@@ -429,6 +460,33 @@ def selftest():
     # Эпизод кэша вне манифеста.
     must_fail(good_man, cm, np.array([1, 2, 3, 9]),
               np.array(["train", "val", "test", "train"]), "не в манифесте")
+
+    # --- ОТПЕЧАТКИ КОДЕКА: НАЛИЧИЕ И РАВЕНСТВО ------------------------------
+    # Идиома `meta.get(k) not in (None, got)` была FAIL-OPEN: кэш с удалённым
+    # полем проходил, и печаталось «декодер сверен». Шесть случаев — удаление
+    # и подмена каждого из трёх отпечатков.
+    fp = dict(codebooks_sha1="aaa", decoder_probe="bbb",
+              codec_state_sha1="ccc")
+    assert check_fingerprints(dict(fp), fp) is True
+    for k in FINGERPRINTS:
+        gone = {x: v for x, v in fp.items() if x != k}
+        try:
+            check_fingerprints(gone, fp)
+            raise AssertionError(f"пропущено отсутствие поля {k}")
+        except SystemExit as ex:
+            assert k in str(ex) and "нет полей" in str(ex), str(ex)
+        wrong = dict(fp, **{k: "zzz"})
+        try:
+            check_fingerprints(wrong, fp)
+            raise AssertionError(f"пропущена подмена поля {k}")
+        except SystemExit as ex:
+            assert k in str(ex) and "не тот" in str(ex), str(ex)
+    # Пустая строка — тоже отсутствие, а не значение.
+    try:
+        check_fingerprints(dict(fp, decoder_probe=""), fp)
+        raise AssertionError("пустой отпечаток принят")
+    except SystemExit:
+        pass
 
     # --- ошибки по каналам --------------------------------------------------
     a = np.zeros((4, T_CHUNK, 7)); ref = np.zeros((4, T_CHUNK, 7))
@@ -445,13 +503,14 @@ def selftest():
     assert action_err(a2, ref)["pos"] == 0.0, "срез взял хвост"
     assert a2.shape[1] != N_POS, "ось времени спутана с латентными позициями"
 
-    print("самопроверка k11a пройдена (версия «манифест до дорогого, отпечаток декодера»): "
+    print("самопроверка k11a пройдена (версия «fail-closed отпечатки, rho по случайной выборке»): "
           "базис из нецентрированного грамиана восстанавливает подпространство, "
           "центрирование теряет смещение, доля улучшения не определена при "
           "идеальном черновике и отрицательна при ухудшении, ранг требует "
           "порога по обоим каналам, схват отвергает ранг отдельным условием, "
           "агрегирование не зависит от размера батча, префикс режется по "
-          "шагам чанка")
+          "шагам чанка, манифест и отпечатки декодера отвергают и подмену, "
+          "и отсутствие поля")
 
 
 def decoder_probe(codec, E, dev):
@@ -530,23 +589,13 @@ def diagnose(args):
             f"{args.codebook_tol:.0e}: декодер не тот, которым собран кэш")
     cb_sha = hashlib.sha1(np.ascontiguousarray(
         Esav.astype(np.float32)).tobytes()).hexdigest()[:12]
-    # SHA СРАВНИВАЕТСЯ С ЗАПИСАННЫМ, а не просто печатается: иначе он был бы
-    # справкой, а не проверкой.
-    if meta.get("codebooks_sha1") not in (None, cb_sha):
-        raise SystemExit(f"sha книг {cb_sha} против {meta['codebooks_sha1']} "
-                         f"в кэше")
-    # И ОТДЕЛЬНО — ПОВЕДЕНИЕ ДЕКОДЕРА: книги могут совпасть, а сеть за ними
-    # смениться, и остаток считался бы в одних координатах, а декодировался
-    # в других.
+    # НАЛИЧИЕ И РАВЕНСТВО. Отдельно от книг проверяется ПОВЕДЕНИЕ декодера:
+    # книги могут совпасть, а сеть за ними смениться, и остаток считался бы в
+    # одних координатах, а декодировался в других.
     probe = decoder_probe(codec, E, dev)
     st_sha = state_sha1(codec)
-    if meta.get("decoder_probe") not in (None, probe):
-        raise SystemExit(
-            f"отпечаток декодера {probe} против {meta['decoder_probe']} в "
-            f"кэше: книги те же, но сеть декодера другая")
-    if meta.get("codec_state_sha1") not in (None, st_sha):
-        raise SystemExit(f"sha весов кодека {st_sha} против "
-                         f"{meta['codec_state_sha1']}")
+    check_fingerprints(meta, dict(codebooks_sha1=cb_sha, decoder_probe=probe,
+                                  codec_state_sha1=st_sha))
     print(f"  книги сверены: max|Δ| = {dmax:.3e}, sha {cb_sha}; декодер "
           f"сверен: проба {probe}, веса {st_sha}")
 
@@ -597,7 +646,16 @@ def diagnose(args):
     # архитектурой. Теперь rho определяется для координат полного базиса на
     # train, а на val оценивается уже ОГРАНИЧЕННАЯ поправка.
     Bt = torch.as_tensor(Bfull, dtype=torch.float32, device=dev)
-    take = tr if not args.diag_n else tr[:args.diag_n * 4]
+    # ВЫБОРКА СЛУЧАЙНАЯ И ВОСПРОИЗВОДИМАЯ, А НЕ ПРЕФИКС. Кэш K-9a упорядочен
+    # по эпизодам, поэтому `tr[:n]` — это первые эпизоды и, скорее всего,
+    # первые задачи: rho оказалась бы смещённой по задачам, а по ней
+    # обрезается поправка и выносится вердикт о ранге.
+    take = tr
+    if args.diag_n and len(tr) > args.diag_n * 4:
+        take = np.sort(np.random.default_rng(11).choice(
+            tr, args.diag_n * 4, replace=False))
+        print(f"  rho считается по случайной выборке {len(take)} из "
+              f"{len(tr)} строк train (сид 11), а не по префиксу эпизодов")
     coef = []
     for i, j in plan_batches(len(take), args.batch * 16):
         s_ = take[i:j]
@@ -639,7 +697,11 @@ def diagnose(args):
           f"обрезается)")
 
     # --- ДОЛЯ УЛУЧШЕНИЯ НА VAL, ПОСЛЕ ДЕКОДЕРА, С ОГРАНИЧЕНИЕМ -------------
-    va_s = va if not args.diag_n else va[:args.diag_n]
+    va_s = va
+    if args.diag_n and len(va) > args.diag_n:
+        # Та же причина: префикс val — это первые эпизоды, а не val целиком.
+        va_s = np.sort(np.random.default_rng(12).choice(
+            va, args.diag_n, replace=False))
     print(f"\n  доля возвращённого улучшения на val ({len(va_s)} "
           f"наблюдений), ПОСЛЕ единственного декодирования.")
     print(f"  «огр.» — поправка в пределах rho, то есть достижимая головой; "
@@ -753,6 +815,7 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--diag-n", type=int, default=20000)
     ap.add_argument("--rho-pct", type=float, default=95.0)
+    ap.add_argument("--dataset-repo", default=DATASET_REPO)
     ap.add_argument("--dataset-revision", default=DATASET_REV,
                     help="ревизия датасета; обязана совпасть с той, на "
                          "которой собран манифест")
@@ -888,7 +951,8 @@ def main() -> None:
             f"списка эпизодов и разбиения запрещена: часовой прогон дал бы "
             f"кэш, происхождение которого нечем подтвердить")
     man_info = check_manifest(json.load(open(man_path)), cache_meta, epi,
-                              split, rev=args.dataset_revision)
+                              split, rev=args.dataset_revision,
+                              repo=args.dataset_repo)
     man_info.update(path=man_path, sha1=file_sha1(man_path))
     print(f"  манифест сверен: {man_info['n_episodes']} эпизодов, сид "
           f"{man_info['split_seed']}, ревизия "
@@ -923,7 +987,7 @@ def main() -> None:
 
     # --- состояния: ИЗ PARQUET, в NPZ их нет -------------------------------
     st = None
-    rid, rev = "physical-intelligence/libero", args.dataset_revision
+    rid, rev = args.dataset_repo, args.dataset_revision
     uniq = np.unique(epi)
     for j, e in enumerate(uniq):
         f = hf_hub_download(rid, f"data/chunk-{int(e) // 1000:03d}/"

@@ -97,6 +97,12 @@ def make_residual_head():
             # rho — БУФЕР, а не параметр: предел амплитуды задаётся данными в
             # K-11a и не должен подстраиваться градиентом под потерю.
             self.register_buffer("rho", torch.ones(self.rank))
+            self.register_buffer("rho_set", torch.zeros(1))
+            # ЕДИНИЧНАЯ rho — НЕ «ПРЕДЕЛ ПО УМОЛЧАНИЮ», А ОТСУТСТВИЕ ПРЕДЕЛА.
+            # Забытая загрузка дала бы ||dz|| <= sqrt(rank) вместо измеренного
+            # значения, и ограничение молча перестало бы соответствовать
+            # данным.
+            self._rho_ready = False
 
         def set_basis(self, B):
             """Ортонормированный базис поправок, построенный на train.
@@ -131,7 +137,9 @@ def make_residual_head():
                                  f"{tuple(self.rho.shape)}")
             if not torch.isfinite(r).all() or bool((r <= 0).any()):
                 raise ValueError("rho обязана быть конечной и положительной")
-            self.rho.data = r.to(self.rho.device)
+                self.rho.data = r.to(self.rho.device)
+            self.rho_set.data = torch.ones_like(self.rho_set)
+            self._rho_ready = True
 
         def coeffs(self, h, z0):
             # STOP-GRADIENT НА ЧЕРНОВИКЕ: голова исправляет то, что модель
@@ -148,7 +156,15 @@ def make_residual_head():
                     "базис не задан: сначала set_basis по обучающей части. "
                     "Нулевой базис дал бы тождественно нулевую поправку, и "
                     "обучение «сошлось» бы, ничего не выучив")
-            self._basis_ready = True
+            rho_ok = self._rho_ready or bool(
+                self.rho_set.detach().cpu().item())
+            if not rho_ok:
+                raise RuntimeError(
+                    "rho не задана: без set_rho предел равен единицам, то "
+                    "есть ||dz|| <= sqrt(rank) вместо измеренного на train "
+                    "значения — ограничение перестало бы соответствовать "
+                    "данным молча")
+            self._basis_ready = self._rho_ready = True
             return self
 
         def forward(self, h, z0):
@@ -161,9 +177,10 @@ def make_residual_head():
             чтение синхронизации не вызывает, а без проверки забытый
             `set_basis` дал бы тождественно нулевую поправку молча.
             """
-            if not self._basis_ready:
+            if not (self._basis_ready and self._rho_ready):
                 raise RuntimeError(
-                    "базис не задан: сначала set_basis по обучающей части. "
+                    "не заданы базис или rho: нужны set_basis и set_rho по "
+                    "обучающей части. "
                     "Нулевой базис дал бы тождественно нулевую поправку, и "
                     "обучение «сошлось» бы, ничего не выучив. После загрузки "
                     "state_dict вызовите check_ready")
@@ -420,13 +437,24 @@ def selftest(numpy_only=False):
         pass
     B = torch.linalg.qr(torch.randn(d_z, rank))[0]
     head.set_basis(B)
+    # ОДНОГО БАЗИСА МАЛО: без rho предел равен единицам, то есть отсутствует.
+    try:
+        head(h, z0)
+        raise AssertionError("голова без rho не отказала")
+    except RuntimeError:
+        pass
+    try:
+        head.check_ready()
+        raise AssertionError("check_ready без rho прошёл")
+    except RuntimeError:
+        pass
+    head.set_rho(torch.full((rank,), 0.5))
     for bad in (torch.randn(d_z, rank), B[:, :rank - 1], B * 2.0):
         try:
             head.set_basis(bad)
             raise AssertionError("неортонормированный базис принят")
         except ValueError:
             pass
-    head.set_basis(B)
 
     # --- НУЛЕВОЕ ТОЖДЕСТВО --------------------------------------------------
     dz, c0 = head(h, z0)
@@ -472,8 +500,7 @@ def selftest(numpy_only=False):
     # не зависит от того, чему обучились коэффициенты.
     torch.nn.init.normal_(head.net[-1].weight, std=50.0)
     torch.nn.init.normal_(head.net[-1].bias, std=50.0)
-    rho = torch.full((rank,), 0.5)
-    head.set_rho(rho)
+    rho = head.rho.clone()
     with torch.no_grad():
         dz2, c2 = head(h, z0)
         nrm = torch.linalg.norm(dz2, dim=-1).max()
@@ -501,9 +528,9 @@ def selftest(numpy_only=False):
     # ПОСЛЕ load_state_dict булев флаг остаётся ложным, а буфер уже заполнен:
     # check_ready обязан это распознать и поднять флаг.
     fresh.load_state_dict(head.state_dict())
-    assert not fresh._basis_ready
+    assert not fresh._basis_ready and not fresh._rho_ready
     fresh.check_ready()
-    assert fresh._basis_ready
+    assert fresh._basis_ready and fresh._rho_ready
     fresh(h, z0)
     # СРЕЗ ИМЕННО ТЕЛА forward: прежняя граница захватывала и check_ready,
     # где переход на CPU законен и делается ровно один раз.
@@ -538,6 +565,8 @@ def selftest(numpy_only=False):
     H = make_hicora_class(Fake)
     m = H()
     m.hicora_head.set_basis(B)
+    # configure_hicora_d1 зовёт check_ready, а он теперь требует и rho.
+    m.hicora_head.set_rho(torch.full((rank,), 0.5))
     n_par = m.configure_hicora_d1(verbose=False)
     tr = {n for n, p_ in m.named_parameters() if p_.requires_grad}
     assert tr == {"hicora_head.proj.weight", "hicora_head.proj.bias"} | {
@@ -564,12 +593,13 @@ def selftest(numpy_only=False):
     finally:
         assert stray_ok, "сторож не заметил постороннего обучаемого веса"
 
-    print("самопроверка hicora_vla пройдена (версия «forward требует базис»): доля насыщения, процентиль устойчив к выбросу, "
+    print("самопроверка hicora_vla пройдена (версия «forward требует базис и rho»): доля насыщения, процентиль устойчив к выбросу, "
           "нулевая инициализация даёт строго нулевую поправку, голова живая "
           "при линейной потере, градиент по h есть а по черновику нет и тест "
           "это различает, базис ортонормирован и заморожен, ||dz|| <= ||rho|| "
           "при любых весах, forward без переходов на CPU, D1 замораживает "
-          "всё кроме коэффициентной части и ловит посторонние веса")
+          "всё кроме коэффициентной части и ловит посторонние веса, "
+          "забытая rho не проходит как предел по умолчанию")
 
 
 if __name__ == "__main__":
