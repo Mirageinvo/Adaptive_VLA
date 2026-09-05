@@ -91,21 +91,40 @@ class CallCounter:
         setattr(self.obj, self.name, self.orig)
 
 
-def layer_counter(model):
+class LayerCounter:
     """Сколько раз исполнился КАЖДЫЙ слой за проход, а не сколько всего.
 
-    Общее число вызовов не различает «24 слоя по разу» и «12 слоёв по два»,
-    а это ровно та разница, которую заявление «один проход» и утверждает.
+    ХУК НА `action_expert.layers[i]` НЕ СРАБАТЫВАЕТ. `_shared_attention_forward`
+    НЕ вызывает `layer.forward()`: он дёргает дочерние модули напрямую —
+    `input_layernorm`, проекции, `mlp`. Forward-хук родительского модуля при
+    этом молчит, и словарь счётчиков оставался бы ПУСТЫМ, а проверка «каждый
+    слой по разу» падала бы с «слои не исполнились» на исправном коде.
+    Поэтому считаем по `layer_idx`, который передаётся в сам метод.
+
+    Общее число вызовов не годится: оно не различает «24 слоя по разу» и
+    «12 слоёв по два», а это ровно то, что утверждает фраза «один проход».
     """
-    counts = {}
-    hooks = []
-    for i, layer in enumerate(model.action_expert.layers):
-        def mk(idx):
-            def hook(mod, inp, out):
-                counts[idx] = counts.get(idx, 0) + 1
-            return hook
-        hooks.append(layer.register_forward_hook(mk(i)))
-    return counts, hooks
+
+    def __init__(self, model, name="_shared_attention_forward"):
+        self.model, self.name = model, name
+        self.counts = {}
+        self.orig = getattr(model, name)
+
+        def wrapped(*a, **kw):
+            idx = kw.get("layer_idx")
+            if idx is None and a:
+                idx = a[2] if len(a) > 2 else None
+            self.counts[int(idx)] = self.counts.get(int(idx), 0) + 1
+            return self.orig(*a, **kw)
+
+        setattr(model, name, wrapped)
+
+    def reset(self):
+        self.counts = {}
+        return self
+
+    def close(self):
+        setattr(self.model, self.name, self.orig)
 
 
 def check_layer_counts(counts, n_layers):
@@ -173,6 +192,45 @@ def selftest():
     except SystemExit:
         pass
 
+    # --- САМ МЕХАНИЗМ ПОДСЧЁТА, А НЕ ТОЛЬКО ГОТОВЫЙ СЛОВАРЬ ----------------
+    # Прежняя версия ставила forward-хуки на `action_expert.layers[i]`, но
+    # `_shared_attention_forward` их не вызывает — он дёргает дочерние модули
+    # напрямую. Словарь оставался ПУСТЫМ, и проверка падала бы на исправном
+    # коде. Здесь проверяется именно обёртка метода.
+    class FakeModel:
+        def __init__(self):
+            self.calls = []
+
+        def _shared_attention_forward(self, *, vlm_hidden_states,
+                                      action_hidden_states, layer_idx, **kw):
+            self.calls.append(layer_idx)
+            return vlm_hidden_states, action_hidden_states
+
+    fm = FakeModel()
+    lc = LayerCounter(fm)
+    for i in range(24):
+        fm._shared_attention_forward(vlm_hidden_states=1,
+                                     action_hidden_states=2, layer_idx=i)
+    assert lc.counts == {i: 1 for i in range(24)}, lc.counts
+    assert check_layer_counts(lc.counts, 24) is True
+    assert fm.calls == list(range(24)), "обёртка не пропустила вызовы"
+    # ДВА ПРОХОДА ПО ДВЕНАДЦАТИ СЛОЯМ обязаны быть отвергнуты.
+    lc.reset()
+    for _ in range(2):
+        for i in range(12):
+            fm._shared_attention_forward(vlm_hidden_states=1,
+                                         action_hidden_states=2, layer_idx=i)
+    try:
+        check_layer_counts(lc.counts, 24)
+        raise AssertionError("два прохода по 12 слоям прошли")
+    except SystemExit:
+        pass
+    lc.close()
+    lc.reset()
+    fm._shared_attention_forward(vlm_hidden_states=1, action_hidden_states=2,
+                                 layer_idx=0)
+    assert lc.counts == {}, "снятие обёртки не вернуло метод"
+
     # --- сравнение действий -------------------------------------------------
     a = np.zeros((2, T_CHUNK, 7)); b = np.zeros((2, T_CHUNK, 7))
     a[..., 6] = 1.0; b[..., 6] = 1.0
@@ -193,9 +251,10 @@ def selftest():
     txt = read_identity({"a": True, "q0_bitwise": False})
     assert "НЕ ВЫПОЛНЕНО" in txt and "q0_bitwise" in txt
 
-    print("самопроверка k11b пройдена (версия «слои по разу»): обёртка не "
-          "меняет выход и снимается, подсчёт слоёв отвергает двенадцать по "
-          "два при тех же 24 вызовах, знак схвата считается отдельно от позы, "
+    print("самопроверка k11b пройдена (версия «счётчик на "
+          "_shared_attention_forward»): обёртка не меняет выход и снимается, "
+          "счётчик слоёв считает по layer_idx и отвергает двенадцать по два "
+          "при тех же 24 вызовах, знак схвата считается отдельно от позы, "
           "вердикт называет провалившийся пункт")
 
 
@@ -330,6 +389,34 @@ def main() -> None:
     if not (np.allclose(got_B, B, atol=1e-6)
             and np.allclose(got_r, rho, atol=1e-6)):
         raise SystemExit("базис или rho в модели не совпали с файлами")
+    # СОВПАДЕНИЕ С ФАЙЛАМИ ПОДТВЕРЖДАЕТ ТОЛЬКО КОПИРОВАНИЕ. Чужие basis.npy и
+    # rho.npy подходящего размера прошли бы ту же проверку, поэтому файлы
+    # сверяются с ДИАГНОСТИКОЙ, которая их и породила.
+    diag_p = args.cache + ".diag.json"
+    if not os.path.exists(diag_p):
+        raise SystemExit(f"нет {diag_p}: происхождение базиса и rho нечем "
+                         f"подтвердить")
+    diag = json.load(open(diag_p))
+    if diag.get("prefix") != args.cache:
+        raise SystemExit(f"диагностика собрана для {diag.get('prefix')}, а "
+                         f"кэш {args.cache}")
+    if int(diag.get("rank") or -1) != int(B.shape[1]):
+        raise SystemExit(f"ранг в диагностике {diag.get('rank')}, а в "
+                         f"basis.npy {B.shape[1]}")
+    if diag.get("cache_meta_sha1") != k11a.file_sha1(args.cache +
+                                                     ".meta.json"):
+        raise SystemExit("meta кэша изменилась после диагностики: базис и "
+                         "rho относятся к другому кэшу")
+    if not np.allclose(np.asarray(diag["rho"], np.float64), rho, atol=1e-6):
+        raise SystemExit("rho.npy не совпадает с rho из диагностики")
+    detail_prov = dict(diag_sha1=k11a.file_sha1(diag_p),
+                       basis_sha1=k11a.file_sha1(basis_p),
+                       rho_sha1=k11a.file_sha1(rho_p),
+                       gain_target=diag.get("gain_target"),
+                       grip_delta=diag.get("grip_delta"))
+    print(f"  происхождение базиса подтверждено диагностикой: ранг "
+          f"{diag['rank']}, порог {diag.get('gain_target')}, допуск схвата "
+          f"{diag.get('grip_delta')}")
     print(f"  базис r={B.shape[1]} и rho загружены и сверены с файлами; "
           f"||rho|| = {float(np.linalg.norm(rho)):.4f}")
 
@@ -383,21 +470,27 @@ def main() -> None:
     res, detail = {}, {}
     gen_cnt = CallCounter(model, "generate")
     dec_cnt = CallCounter(codec, "_decode")
+    lay_cnt = LayerCounter(model)
 
     for k in sizes:
         tag = f"b{k}"
         b, sel = build(k)
-        counts, hooks = layer_counter(model)
+        lay_cnt.reset()
         gen_cnt.reset(); dec_cnt.reset()
         with torch.no_grad(), torch.autocast(device_type=dev.type, dtype=dt):
             v, pp = model.build_inputs(position_offset=po, **b)
             out = model.forward_hicora(
                 vlm_inputs_embeds=v, attention_mask=b.get("attention_mask"),
                 position_ids=pp)
-        for h in hooks:
-            h.remove()
+        # 7. ДЕКОДИРОВАНИЙ ВНУТРИ forward_hicora БЫТЬ НЕ ДОЛЖНО, а на выдачу
+        # действия — ровно одно. Счётчик снимается СРАЗУ после прохода:
+        # прежняя версия сбрасывала его ПОСЛЕ forward_hicora и потом считала
+        # собственную явную строку `_decode`, то есть проверяла тавтологию и
+        # забывала любые скрытые декодирования внутри прохода.
+        dec_inside = dec_cnt.n
+        detail[f"decode_inside_forward_{tag}"] = dec_inside
         # 5. каждый слой ровно один раз
-        res[f"layers_once_{tag}"] = check_layer_counts(counts,
+        res[f"layers_once_{tag}"] = check_layer_counts(lay_cnt.counts,
                                                        model.n_layers_total)
         # 6. никакого спрятанного generate
         res[f"no_generate_{tag}"] = (gen_cnt.n == 0)
@@ -420,12 +513,14 @@ def main() -> None:
         res[f"zero_delta_{tag}"] = bool(torch.equal(out["z"], out["z0"]))
         detail[f"dz_max_{tag}"] = float(out["dz"].abs().max())
 
-        # 3-4, 7. одно декодирование, действия и знак совпадают
-        dec_cnt.reset()
+        # 3-4. действия и знак совпадают
         with torch.no_grad():
             A_h = codec._decode(out["z"], embodiment_ids=0)[0][..., :7].float()
-        res[f"decode_once_{tag}"] = (dec_cnt.n == 1)
-        detail[f"decode_calls_{tag}"] = dec_cnt.n
+        # ЧИСЛО ФИКСИРУЕТСЯ ДО базового декодирования: иначе оно неизбежно
+        # станет двойкой, и печать «decode 2» уже наблюдалась.
+        total_dec = dec_cnt.n
+        res[f"decode_once_{tag}"] = (dec_inside == 0 and total_dec == 1)
+        detail[f"decode_calls_{tag}"] = total_dec
         with torch.no_grad():
             A_0 = codec._decode(out["z0"], embodiment_ids=0)[0][..., :7].float()
         dd = act_diff(A_h.cpu().numpy(), A_0.cpu().numpy())
@@ -433,9 +528,10 @@ def main() -> None:
         res[f"grip_match_{tag}"] = bool(dd["grip_mismatch"] == 0.0)
         detail[f"act_max_abs_{tag}"] = dd["max_abs"]
         detail[f"grip_mismatch_{tag}"] = dd["grip_mismatch"]
-        print(f"  {tag}: слои по разу, generate {gen_cnt.n}, decode "
-              f"{dec_cnt.n}, |dz| {detail[f'dz_max_{tag}']:.2e}, |ΔA| "
-              f"{dd['max_abs']:.2e}, знак {dd['grip_mismatch']:.1%}")
+        print(f"  {tag}: слои по разу, generate {gen_cnt.n}, decode внутри "
+              f"прохода {dec_inside} и на выдачу {total_dec}, |dz| "
+              f"{detail[f'dz_max_{tag}']:.2e}, |ΔA| {dd['max_abs']:.2e}, "
+              f"знак {dd['grip_mismatch']:.1%}")
 
     # --- КОНТРФАКТИЧЕСКАЯ ПРОВЕРКА ------------------------------------------
     # Подменяем черновик и требуем, чтобы изменились И вход головы, И цель.
@@ -463,28 +559,59 @@ def main() -> None:
     res["counterfactual_input"] = bool(
         float((p_real - p_fake).abs().max()) > 0)
     detail["counterfactual_input_delta"] = float((p_real - p_fake).abs().max())
+    # ЦЕЛЬ СТРОИТСЯ ТЕМ ЖЕ ВЫРАЖЕНИЕМ, ЧТО ПОЙДЁТ В ОБУЧЕНИЕ: r = z* - z0.
+    # Прежняя версия сравнивала только z_real и z_fake — вывод верен
+    # математически, но код построения actual-draft target не проверялся.
+    Kt = np.load(args.cache + ".ktrue.npy")[sel]
+    kt = torch.as_tensor(Kt).long().to(dev)
+    z_star = sum(model.codebooks[l][kt[:, l, :]] for l in range(N_LEVEL))
+    r_real = z_star - z_real
+    r_fake = z_star - z_fake
     res["counterfactual_target"] = bool(
-        float((z_real - z_fake).abs().max()) > 0)
+        float((r_real - r_fake).abs().max()) > 0)
+    detail["counterfactual_target_delta"] = float((r_real - r_fake).abs().max())
+    # И ЦЕЛЬ ДОЛЖНА ОТЛИЧАТЬСЯ ОТ ОБЫЧНОГО RVQ-ОСТАТКА: если q0_hat совпадает
+    # с q0* на всех позициях, задача HiCoRA вырождается в задачу кодека.
+    z0_true = model.codebooks[0][kt[:, 0, :]]
+    detail["draft_vs_true_q0_delta"] = float((z_real - z0_true).abs().max())
     print(f"  контрфакт: вход головы меняется на "
           f"{detail['counterfactual_input_delta']:.3e}, цель тоже")
 
     # --- 9-10. ГРАДИЕНТЫ -----------------------------------------------------
     n_par = model.configure_hicora_d1(verbose=True)
+    # КОДЕК ЗАМОРАЖИВАЕТСЯ ЯВНО. `codec.eval()` параметры не замораживает, а
+    # прежняя проверка вела градиент от `dz.sum()`, где декодера в графе нет
+    # вовсе: «в кодек не течёт» выполнялось бы и при полностью обучаемом
+    # кодеке. Здесь потеря идёт ЧЕРЕЗ декодер, поэтому проверка настоящая.
+    codec.requires_grad_(False)
+    unfrozen = [n for n, p_ in codec.named_parameters() if p_.requires_grad]
+    res["codec_frozen"] = (len(unfrozen) == 0)
+    detail["codec_unfrozen"] = unfrozen[:5]
     model.zero_grad(set_to_none=True)
+    codec.zero_grad(set_to_none=True)
     b, sel = build(min(sizes))
     with torch.autocast(device_type=dev.type, dtype=dt):
         v, pp = model.build_inputs(position_offset=po, **b)
         out = model.forward_hicora(
             vlm_inputs_embeds=v, attention_mask=b.get("attention_mask"),
             position_ids=pp)
-    # ЛИНЕЙНАЯ ПОТЕРЯ, А НЕ КВАДРАТИЧНАЯ: при нулевом выходе градиент от
-    # sum(y^2) равен нулю по построению, и проверка прошла бы на мёртвой
-    # голове. Эту ошибку мы уже допускали.
-    out["dz"].sum().backward()
+    # ПОТЕРЯ В ПРОСТРАНСТВЕ ДЕЙСТВИЙ, ЧЕРЕЗ ЕДИНСТВЕННОЕ ДЕКОДИРОВАНИЕ — та
+    # самая цепочка, по которой пойдёт обучение D1. И цель НЕНУЛЕВАЯ: ни
+    # `sum(y^2)` при нулевом выходе (градиент ноль по построению), ни
+    # `dz.sum()` (может сократиться, если столбцы базиса ортогональны вектору
+    # из единиц) надёжной проверкой не являются.
+    A = codec._decode(out["z"], embodiment_ids=0)[0][..., :7].float()
+    target = torch.full_like(A, 0.1)
+    loss = torch.nn.functional.smooth_l1_loss(A, target)
+    loss.backward()
+    if not bool(torch.isfinite(loss)):
+        raise SystemExit("потеря не конечна: проверка градиентов "
+                         "недействительна")
     g_head = sum(float(p_.grad.abs().sum()) for p_ in
                  model.hicora_head.parameters() if p_.grad is not None)
-    res["head_grad_nonzero"] = bool(g_head > 0)
+    res["head_grad_nonzero"] = bool(g_head > 0 and np.isfinite(g_head))
     detail["head_grad_sum"] = g_head
+    detail["loss"] = float(loss)
     frozen_grad = [n for n, p_ in model.named_parameters()
                    if not n.startswith(("hicora_head.proj.",
                                         "hicora_head.net."))
@@ -495,15 +622,18 @@ def main() -> None:
     cod_grad = [n for n, p_ in codec.named_parameters()
                 if p_.grad is not None and float(p_.grad.abs().sum()) > 0]
     res["no_grad_into_codec"] = (len(cod_grad) == 0)
-    print(f"  градиент головы {g_head:.3e}, обучаемых параметров {n_par}; "
-          f"в замороженное течёт: {len(frozen_grad)}, в кодек: "
-          f"{len(cod_grad)}")
+    detail["codec_with_grad"] = cod_grad[:5]
+    print(f"  потеря через декодер {float(loss):.4e}, градиент головы "
+          f"{g_head:.3e}, обучаемых параметров {n_par}; в замороженное "
+          f"течёт: {len(frozen_grad)}, в кодек: {len(cod_grad)}, "
+          f"незамороженных весов кодека: {len(unfrozen)}")
 
-    gen_cnt.close(); dec_cnt.close()
+    gen_cnt.close(); dec_cnt.close(); lay_cnt.close()
 
     print(f"\n  {read_identity(res)}")
     ok = all(v is not False for v in res.values())
     out_j = dict(ok=ok, checks=res, detail=detail, batches=sizes,
+                 provenance=detail_prov,
                  rank=int(B.shape[1]), rho_norm=float(np.linalg.norm(rho)),
                  act_tol=ACT_TOL, cache=args.cache,
                  cache_meta_sha1=k11a.file_sha1(args.cache + ".meta.json"),

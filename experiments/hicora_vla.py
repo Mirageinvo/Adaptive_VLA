@@ -137,7 +137,11 @@ def make_residual_head():
                                  f"{tuple(self.rho.shape)}")
             if not torch.isfinite(r).all() or bool((r <= 0).any()):
                 raise ValueError("rho обязана быть конечной и положительной")
-                self.rho.data = r.to(self.rho.device)
+            # ЗАПИСЬ ВНЕ ВЕТКИ ОТКАЗА. Одна неверная строка держала
+            # присваивание ПОСЛЕ `raise`: буфер оставался единичным, а флаг
+            # готовности ставился, то есть предел молча равнялся sqrt(rank).
+            with torch.no_grad():
+                self.rho.copy_(r.to(self.rho.device))
             self.rho_set.data = torch.ones_like(self.rho_set)
             self._rho_ready = True
 
@@ -448,7 +452,13 @@ def selftest(numpy_only=False):
         raise AssertionError("check_ready без rho прошёл")
     except RuntimeError:
         pass
-    head.set_rho(torch.full((rank,), 0.5))
+    want_rho = torch.full((rank,), 0.5)
+    head.set_rho(want_rho)
+    # БУФЕР СРАВНИВАЕТСЯ С ЗАПРОШЕННЫМ, а не сам с собой: прежний тест брал
+    # `head.rho.clone()` как эталон и потому не заметил, что set_rho ничего
+    # не записывает.
+    assert torch.equal(head.rho.cpu(), want_rho), (head.rho, want_rho)
+    assert abs(head.bound() - float(want_rho.norm())) < 1e-6
     for bad in (torch.randn(d_z, rank), B[:, :rank - 1], B * 2.0):
         try:
             head.set_basis(bad)
@@ -500,7 +510,8 @@ def selftest(numpy_only=False):
     # не зависит от того, чему обучились коэффициенты.
     torch.nn.init.normal_(head.net[-1].weight, std=50.0)
     torch.nn.init.normal_(head.net[-1].bias, std=50.0)
-    rho = head.rho.clone()
+    rho = want_rho.clone()
+    assert torch.equal(head.rho.cpu(), rho), "rho изменилась между проверками"
     with torch.no_grad():
         dz2, c2 = head(h, z0)
         nrm = torch.linalg.norm(dz2, dim=-1).max()
@@ -593,7 +604,7 @@ def selftest(numpy_only=False):
     finally:
         assert stray_ok, "сторож не заметил постороннего обучаемого веса"
 
-    print("самопроверка hicora_vla пройдена (версия «forward требует базис и rho»): доля насыщения, процентиль устойчив к выбросу, "
+    print("самопроверка hicora_vla пройдена (версия «set_rho действительно пишет»): доля насыщения, процентиль устойчив к выбросу, "
           "нулевая инициализация даёт строго нулевую поправку, голова живая "
           "при линейной потере, градиент по h есть а по черновику нет и тест "
           "это различает, базис ортонормирован и заморожен, ||dz|| <= ||rho|| "
