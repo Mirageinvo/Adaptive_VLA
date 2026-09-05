@@ -10,11 +10,13 @@
     dz     = Basis(rho * tanh(Hres(norm(h24), P(sg(z0)))))
     A      = D(z0 + dz)
 
-ПОЧЕМУ sg(z0). Поправка обязана исправлять черновик, а не переучивать голову
-q0 через себя: без stop-gradient градиент поправки потёк бы в кодовую книгу и
-в голову двенадцатого слоя, и «черновик» перестал бы быть тем, что модель
-предсказывает самостоятельно. Кодовые книги при этом заморожены и так, но
-sg делает независимость свойством архитектуры, а не режима обучения.
+ПОЧЕМУ sg(z0). Формулировка «иначе градиент переучил бы голову q0» была бы
+неверной: при жёстком argmax дискретный индекс обрывает градиент сам, и
+переучить голову поправка не может в любом случае. Настоящее назначение
+stop-gradient — ЗАФИКСИРОВАТЬ ИНТЕРФЕЙС «поправка к реально предсказанному
+черновику»: при последующей замене жёсткого поиска по книге на
+дифференцируемый (soft или straight-through) градиент не побежит в q0
+незаметно, а упрётся в уже стоящий барьер.
 
 ПОЧЕМУ tanh, rho И ЗАМОРОЖЕННЫЙ БАЗИС. Ограничение коэффициентов само по
 себе НИЧЕГО НЕ ОГРАНИЧИВАЕТ, если базис обучаемый: |c| <= 1 и |rho*c| <= rho,
@@ -84,6 +86,10 @@ def make_residual_head():
             # предел на коэффициенты обходится масштабированием столбцов.
             self.register_buffer("basis", torch.zeros(d_latent, self.rank))
             self.register_buffer("basis_set", torch.zeros(1))
+            # ФЛАГ НА CPU. Проверка готовности через `float(buffer)` в forward
+            # заставляла бы синхронизировать GPU на каждом вызове, а латентность
+            # здесь и есть предмет измерения.
+            self._basis_ready = False
             # НУЛЕВАЯ ИНИЦИАЛИЗАЦИЯ ПОСЛЕДНЕГО СЛОЯ: до обучения поправка
             # строго нулевая, и нулевое тождество проверяемо.
             nn.init.zeros_(self.net[-1].weight)
@@ -112,6 +118,7 @@ def make_residual_head():
                                  f"{off:.2e}")
             self.basis.data = b.to(self.basis.device)
             self.basis_set.data = torch.ones_like(self.basis_set)
+            self._basis_ready = True
 
         def bound(self):
             """Гарантированный предел ||dz||_2. Настоящий, а не тавтология."""
@@ -132,13 +139,25 @@ def make_residual_head():
             x = torch.cat([h, self.proj(z0.detach())], dim=-1)
             return torch.tanh(self.net(x))
 
-        def forward(self, h, z0):
-            """Поправка и коэффициенты — вторые нужны для учёта насыщения."""
-            if float(self.basis_set) == 0.0:
+        def check_ready(self):
+            """Проверка готовности ОДИН РАЗ, при сборке, а не в forward."""
+            ready = self._basis_ready or bool(
+                self.basis_set.detach().cpu().item())
+            if not ready:
                 raise RuntimeError(
                     "базис не задан: сначала set_basis по обучающей части. "
-                    "Нулевой базис дал бы тождественно нулевую поправку и "
+                    "Нулевой базис дал бы тождественно нулевую поправку, и "
                     "обучение «сошлось» бы, ничего не выучив")
+            self._basis_ready = True
+            return self
+
+        def forward(self, h, z0):
+            """Поправка и коэффициенты.
+
+            НИ ОДНОГО ПЕРЕХОДА НА CPU: ни проверок через `float(тензор)`, ни
+            подсчёта насыщения. Насыщение считается снаружи по возвращённым
+            коэффициентам и только в диагностическом режиме.
+            """
             c = self.coeffs(h, z0)
             return (self.rho * c) @ self.basis.T, c
 
@@ -264,13 +283,60 @@ def make_hicora_class(base_cls):
                     "ИСХОДНОЙ финальной нормой, снятой до наложения весов")
             h24 = self.res_norm(taps[max(self.taps)]).float()
             dz, c = self.hicora_head(h24, z0)
+            # `saturated` здесь БОЛЬШЕ НЕ СЧИТАЕТСЯ: `float(...)` на CUDA-
+            # тензоре синхронизирует устройство на каждом вызове, а
+            # латентность — основной измеряемый результат архитектуры.
+            # Коэффициенты возвращаются, доля насыщения считается снаружи.
             return dict(q0=q0, q0_logits=logits, z0=z0, dz=dz, z=z0 + dz,
-                        coeffs=c, layers_run=taps["layers_run"],
-                        saturated=float((c.abs() > 0.99).float().mean()))
+                        coeffs=c, layers_run=taps["layers_run"])
 
         def hicora_trainable_prefixes(self):
-            """Что обучается на этапе D1. Всё прочее заморожено."""
-            return ("hicora_head.",)
+            """Что обучается на этапе D1. БАЗИС И rho СЮДА НЕ ВХОДЯТ."""
+            return ("hicora_head.proj.", "hicora_head.net.")
+
+        def configure_hicora_d1(self, verbose=True):
+            """Заморозить всё, кроме коэффициентной части головы.
+
+            ВОЗВРАЩАТЬ СПИСОК ПРЕФИКСОВ НЕДОСТАТОЧНО: `init_joint_fast`
+            оставляет первые двенадцать слоёв, норму q0, `bos_embedding` и
+            голову q0 обучаемыми, а `res_norm` копируется уже после него и
+            наследует requires_grad=True. Без явной заморозки этап D1 обучал
+            бы ствол, и «обучена только голова» было бы заявлением, а не
+            фактом.
+            """
+            pref = self.hicora_trainable_prefixes()
+            for p_ in self.parameters():
+                p_.requires_grad_(False)
+            n_tr, n_par = 0, 0
+            for name, p_ in self.named_parameters():
+                if any(name.startswith(x) for x in pref):
+                    p_.requires_grad_(True)
+                    n_tr += 1
+                    n_par += p_.numel()
+            stray = [n for n, p_ in self.named_parameters()
+                     if p_.requires_grad
+                     and not any(n.startswith(x) for x in pref)]
+            if stray:
+                raise RuntimeError(f"обучаемое вне белого списка: {stray[:5]}")
+            if n_tr == 0:
+                raise RuntimeError("обучаемых параметров ноль: голова не "
+                                   "собрана или префиксы не совпали")
+            # БАЗИС И rho — БУФЕРЫ, они и так не обучаются; проверяем, что их
+            # никто не превратил в параметры.
+            for nm in ("basis", "rho"):
+                b_ = getattr(self.hicora_head, nm)
+                if isinstance(b_, torch.nn.Parameter):
+                    raise RuntimeError(f"{nm} стал параметром: предел "
+                                       f"амплитуды перестал быть пределом")
+            self.hicora_head.check_ready()
+            if hasattr(self, "res_norm"):
+                self.res_norm.eval()
+                for p_ in self.res_norm.parameters():
+                    p_.requires_grad_(False)
+            if verbose:
+                print(f"  D1: обучаемых тензоров {n_tr}, параметров {n_par}; "
+                      f"всё остальное заморожено, базис и rho — буферы")
+            return n_par
 
     return _HiCoRAVLA
 
@@ -300,7 +366,7 @@ def rho_from_residual(coef, q=95.0):
     return r
 
 
-def selftest():
+def selftest(numpy_only=False):
     # --- насыщение ---------------------------------------------------------
     c = np.concatenate([np.full(90, 0.5), np.full(10, 0.999)])
     assert abs(saturation_report(c)["frac"] - 0.10) < 1e-12
@@ -318,12 +384,16 @@ def selftest():
     except ValueError:
         pass
 
-    try:
-        import torch
-    except ImportError:
-        print("самопроверка hicora_vla пройдена ЧАСТИЧНО (torch нет): "
-              "насыщение и предел амплитуды проверены, СЕТЬ НЕ ПРОВЕРЕНА")
+    if numpy_only:
+        print("самопроверка hicora_vla: numpy-часть пройдена, СЕТЬ НЕ "
+              "ПРОВЕРЕНА (запрошен --numpy-only)")
         return
+    # FAIL-CLOSED. Прежде отсутствие torch печаталось как «частично» и давало
+    # код возврата 0: автоматический раннер считал такой прогон успешным, и
+    # ровно так две вырожденные сетевые проверки прожили до рецензии. Теперь
+    # обычный запуск без torch ПАДАЕТ, а облегчённый режим требует явного
+    # флага.
+    import torch
 
     RH = make_residual_head()
     d_h, d_z, rank = 24, 32, 8
@@ -331,14 +401,8 @@ def selftest():
     h = torch.randn(3, N_POS, d_h)
     z0 = torch.randn(3, N_POS, d_z, requires_grad=True)
 
-    # --- БЕЗ БАЗИСА ГОЛОВА ОТКАЗЫВАЕТ ---------------------------------------
-    # Нулевой базис дал бы тождественно нулевую поправку, и обучение
-    # «сошлось» бы, не выучив ничего.
-    try:
-        head(h, z0)
-        raise AssertionError("голова без базиса не отказала")
-    except RuntimeError:
-        pass
+    # Готовность базиса проверяется НЕ в forward (см. ниже): горячий путь
+    # обязан быть свободен от переходов на CPU.
     B = torch.linalg.qr(torch.randn(d_z, rank))[0]
     head.set_basis(B)
     for bad in (torch.randn(d_z, rank), B[:, :rank - 1], B * 2.0):
@@ -412,12 +476,89 @@ def selftest():
         except ValueError:
             pass
 
+    # --- ГОТОВНОСТЬ БАЗИСА ПРОВЕРЯЕТСЯ ВНЕ ГОРЯЧЕГО ПУТИ --------------------
+    fresh = RH(d_h, d_z, rank=rank, hidden=64, proj=16)
+    try:
+        fresh.check_ready()
+        raise AssertionError("голова без базиса объявила себя готовой")
+    except RuntimeError:
+        pass
+    # forward БЕЗ проверки: он обязан быть чист от переходов на CPU, поэтому
+    # с незаданным базисом просто даёт нули, а ловит это check_ready.
+    assert float(fresh(h, z0)[0].detach().abs().max()) == 0.0
+    fresh.set_basis(B)
+    fresh.check_ready()
+    # СРЕЗ ИМЕННО ТЕЛА forward: прежняя граница захватывала и check_ready,
+    # где переход на CPU законен и делается ровно один раз.
+    # СРЕЗ ИМЕННО ТЕЛА forward И ТОЛЬКО ИСПОЛНЯЕМЫХ СТРОК: докстрока сама
+    # упоминает `float(тензор)`, и сторож ловил бы собственное объяснение.
+    src = open(__file__).read()
+    beg = src.index("        def forward(self, h, z0):")
+    body = src[beg:src.index("    return ResidualHead", beg)]
+    code = body.split('"""')[-1]
+    for banned in ("float(", ".item(", ".cpu(", ".numpy(", ".tolist("):
+        assert banned not in code, f"в forward переход на CPU: {banned}"
+    assert "self.coeffs" in code, "срез не захватил тело forward"
+
+    # --- ЗАМОРОЗКА D1 ПРОВЕРЯЕТСЯ В ОБЕ СТОРОНЫ -----------------------------
+    import torch.nn as nn
+
+    class FakeExpert(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Linear(d_h, d_h)])
+            self.norm = nn.LayerNorm(d_h)
+
+    class Fake(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.action_expert = FakeExpert()
+            self.bos_embedding = nn.Parameter(torch.zeros(1, N_POS, d_h))
+            self.fast_head = nn.Linear(d_h, 5)
+            self.hicora_head = RH(d_h, d_z, rank=rank, hidden=16, proj=8)
+            self.res_norm = nn.LayerNorm(d_h)
+
+    H = make_hicora_class(Fake)
+    m = H()
+    m.hicora_head.set_basis(B)
+    n_par = m.configure_hicora_d1(verbose=False)
+    tr = {n for n, p_ in m.named_parameters() if p_.requires_grad}
+    assert tr == {"hicora_head.proj.weight", "hicora_head.proj.bias"} | {
+        f"hicora_head.net.{i}.{w}" for i in (0, 2, 4) for w in
+        ("weight", "bias")}, sorted(tr)
+    assert n_par > 0
+    # СТВОЛ, ГОЛОВА q0, bos И res_norm ОБЯЗАНЫ БЫТЬ ЗАМОРОЖЕНЫ.
+    for nm in ("action_expert.layers.0.weight", "action_expert.norm.weight",
+               "bos_embedding", "fast_head.weight", "res_norm.weight"):
+        assert not dict(m.named_parameters())[nm].requires_grad, nm
+    # Обратная сторона: посторонний обучаемый параметр обязан ЛОВИТЬСЯ.
+    m.fast_head.weight.requires_grad_(True)
+    m.hicora_head._basis_ready = True
+    try:
+        for p_ in m.parameters():
+            pass
+        stray_ok = False
+        # повторный вызов заново замораживает, поэтому проверяем сам сторож
+        pref = m.hicora_trainable_prefixes()
+        bad = [n for n, p_ in m.named_parameters() if p_.requires_grad
+               and not any(n.startswith(x) for x in pref)]
+        assert bad == ["fast_head.weight"], bad
+        stray_ok = True
+    finally:
+        assert stray_ok, "сторож не заметил постороннего обучаемого веса"
+
     print("самопроверка hicora_vla пройдена (версия «замороженный базис»): доля насыщения, процентиль устойчив к выбросу, "
           "нулевая инициализация даёт строго нулевую поправку, голова живая "
           "при линейной потере, градиент по h есть а по черновику нет и тест "
           "это различает, базис ортонормирован и заморожен, ||dz|| <= ||rho|| "
-          "при любых весах")
+          "при любых весах, forward без переходов на CPU, D1 замораживает "
+          "всё кроме коэффициентной части и ловит посторонние веса")
 
 
 if __name__ == "__main__":
-    selftest()
+    import argparse
+    _ap = argparse.ArgumentParser()
+    _ap.add_argument("--numpy-only", action="store_true",
+                     help="пропустить сетевую часть ЯВНО. Без этого флага "
+                          "отсутствие torch — ошибка, а не «частично»")
+    selftest(numpy_only=_ap.parse_args().numpy_only)

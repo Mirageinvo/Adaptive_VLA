@@ -81,6 +81,10 @@ PCA_RANKS = (4, 8, 16, 32, 64)
 # столько доступного улучшения ПОСЛЕ ДЕКОДЕРА одновременно по положению и по
 # вращению на исполняемых шагах.
 GAIN_TARGET = 0.90
+# ДОПУСК ПО СХВАТУ, ЗАФИКСИРОВАННЫЙ ДО ЧИСЕЛ. «Не смешивать схват с позой»
+# означает отдельный ЖЁСТКИЙ критерий, а не отсутствие критерия: без него ранг,
+# возвращающий 95% позы и переворачивающий 20% схватов, был бы выбран.
+GRIP_DELTA = 0.005
 
 
 def plan_batches(n, batch):
@@ -117,19 +121,43 @@ def explained(eigvals, ranks, d_latent=None):
             if d_latent is None or int(r) <= int(d_latent)}
 
 
-def action_err(a, ref):
-    """Ошибки на ИСПОЛНЯЕМЫХ ШАГАХ 0-7, раздельно по трём каналам.
+def err_sums(a, ref):
+    """Суммы квадратов и счётчики на ИСПОЛНЯЕМЫХ ШАГАХ 0-7.
 
-    Ось времени здесь — шаги чанка (их двадцать), а не латентные позиции
-    Perceiver (их шестнадцать). Смешение позы со схватом в одно число уже
-    стоило нам гейта, неспособного подтверждать (K-10g).
+    СУММЫ, А НЕ ГОТОВЫЕ RMS. Среднее корней по батчам не равно корню общего
+    среднего и зависит от размера последнего батча — величина слегка менялась
+    бы от `--batch`. Корень берётся один раз, в `finish`.
+
+    Ось времени — шаги чанка (их двадцать), а не латентные позиции Perceiver
+    (их шестнадцать). Смешение позы со схватом в одно число уже стоило нам
+    гейта, неспособного подтверждать (K-10g).
     """
     A = np.asarray(a, np.float64)[:, :H_EXEC]
     R = np.asarray(ref, np.float64)[:, :H_EXEC]
     d = A - R
-    return dict(pos=float(np.sqrt((d[..., :3] ** 2).mean())),
-                rot=float(np.sqrt((d[..., 3:6] ** 2).mean())),
-                grip=float((np.sign(A[..., 6]) != np.sign(R[..., 6])).mean()))
+    return dict(pos_sq=float((d[..., :3] ** 2).sum()), pos_n=int(d[..., :3].size),
+                rot_sq=float((d[..., 3:6] ** 2).sum()),
+                rot_n=int(d[..., 3:6].size),
+                grip_bad=int((np.sign(A[..., 6])
+                              != np.sign(R[..., 6])).sum()),
+                grip_n=int(A[..., 6].size))
+
+
+def err_add(acc, part):
+    for k, v in part.items():
+        acc[k] = acc.get(k, 0) + v
+    return acc
+
+
+def err_finish(acc):
+    return dict(pos=float(np.sqrt(acc["pos_sq"] / max(acc["pos_n"], 1))),
+                rot=float(np.sqrt(acc["rot_sq"] / max(acc["rot_n"], 1))),
+                grip=float(acc["grip_bad"] / max(acc["grip_n"], 1)))
+
+
+def action_err(a, ref):
+    """Удобная обёртка для одного батча — тот же код, что и в накоплении."""
+    return err_finish(err_sums(a, ref))
 
 
 def gain(err_z0, err_r, err_star, eps=1e-12):
@@ -145,33 +173,59 @@ def gain(err_z0, err_r, err_star, eps=1e-12):
     return float((err_z0 - err_r) / denom)
 
 
-def pick_rank(gains, ranks=PCA_RANKS, target=GAIN_TARGET, d_latent=None):
-    """Наименьший ранг, возвращающий target И по положению, И по вращению.
+def pick_rank(gains, grip=None, grip_draft=None, ranks=PCA_RANKS,
+              target=GAIN_TARGET, delta=GRIP_DELTA, d_latent=None):
+    """Наименьший ранг, проходящий ТРИ условия одновременно.
 
-    ОБА КАНАЛА ОБЯЗАТЕЛЬНЫ: среднее по ним спрятало бы ранг, вытягивающий
-    положение и проваливающий вращение. РАНГ, РАВНЫЙ РАЗМЕРНОСТИ ЛАТЕНТА, —
-    не сжатие: d компонент описывают d измерений полностью.
+    Доля возвращённого улучшения не ниже target И по положению, И по
+    вращению — среднее по ним спрятало бы ранг, вытягивающий положение и
+    проваливающий вращение. И ошибка знака схвата не хуже черновика больше
+    чем на delta: без этого условия схват просто не участвовал бы в решении.
+
+    РАНГ, РАВНЫЙ РАЗМЕРНОСТИ ЛАТЕНТА, — не сжатие: d компонент описывают d
+    измерений полностью.
     """
     for r in sorted(int(x) for x in ranks):
         if d_latent is not None and r >= int(d_latent):
             break
         g = gains.get(r)
-        if not g:
+        if not g or g.get("pos") is None or g.get("rot") is None:
             continue
-        if (g.get("pos") is not None and g.get("rot") is not None
-                and g["pos"] >= target and g["rot"] >= target):
-            return r
+        if g["pos"] < target or g["rot"] < target:
+            continue
+        if grip is not None and grip_draft is not None:
+            if grip.get(r) is None or grip[r] > grip_draft + delta:
+                continue
+        return r
     return None
 
 
-def read_rank(rank, gains, ranks=PCA_RANKS, target=GAIN_TARGET):
+def read_rank(rank, gains, grip=None, grip_draft=None, ranks=PCA_RANKS,
+              target=GAIN_TARGET, delta=GRIP_DELTA):
     top = max(int(x) for x in ranks)
     if rank is not None:
         g = gains[rank]
+        gr = ""
+        if grip is not None and grip_draft is not None:
+            gr = (f", знак схвата {grip[rank]:.1%} против {grip_draft:.1%} у "
+                  f"черновика при допуске {delta:.1%}")
         return (f"ранг {rank} возвращает {g['pos']:.1%} доступного улучшения "
                 f"по положению и {g['rot']:.1%} по вращению на шагах 0-7 "
-                f"(порог {target:.0%}, зафиксирован до прогона) — брать "
+                f"(порог {target:.0%}, зафиксирован до прогона){gr} — брать "
                 f"r={rank}")
+    if grip is not None and grip_draft is not None:
+        blocked = [r for r in sorted(gains)
+                   if gains[r].get("pos") is not None
+                   and gains[r]["pos"] >= target
+                   and gains[r].get("rot") is not None
+                   and gains[r]["rot"] >= target
+                   and grip.get(r) is not None
+                   and grip[r] > grip_draft + delta]
+        if blocked:
+            return (f"ранги {blocked} проходят по позе, но ПОРТЯТ ЗНАК СХВАТА "
+                    f"сверх допуска {delta:.1%}: латентная поправка ломает "
+                    f"дискретный канал. Это отдельное стоп-условие, а не "
+                    f"повод усреднить его с позой")
     best = gains.get(top) or {}
     gp = best.get("pos") or 0.0
     gr = best.get("rot") or 0.0
@@ -230,6 +284,39 @@ def selftest():
     assert "r=16" in read_rank(16, gs)
     assert pick_rank(gs, d_latent=16) is None, "ранг = размерность принят"
 
+    # --- СХВАТ ОТВЕРГАЕТ РАНГ САМОСТОЯТЕЛЬНО --------------------------------
+    # Ранг 16 идеален по позе, но переворачивает пятую часть схватов: он
+    # обязан быть отвергнут, а не усреднён с позой.
+    gr_bad = {4: 0.02, 8: 0.02, 16: 0.20, 32: 0.021, 64: 0.02}
+    assert pick_rank(gs, grip=gr_bad, grip_draft=0.02) == 32, \
+        pick_rank(gs, grip=gr_bad, grip_draft=0.02)
+    # Если схват портят ВСЕ проходящие ранги, вердикт обязан назвать причину.
+    gr_all = {r: 0.30 for r in PCA_RANKS}
+    assert pick_rank(gs, grip=gr_all, grip_draft=0.02) is None
+    txt = read_rank(None, gs, grip=gr_all, grip_draft=0.02)
+    assert "ПОРТЯТ ЗНАК СХВАТА" in txt, txt
+    # Допуск действует: чуть хуже черновика — ещё проходит.
+    gr_ok = {r: 0.02 + GRIP_DELTA for r in PCA_RANKS}
+    assert pick_rank(gs, grip=gr_ok, grip_draft=0.02) == 16
+
+    # --- АГРЕГИРОВАНИЕ НЕ ЗАВИСИТ ОТ РАЗБИЕНИЯ НА БАТЧИ ---------------------
+    rng2 = np.random.default_rng(7)
+    A = rng2.normal(size=(37, T_CHUNK, 7))
+    R = rng2.normal(size=(37, T_CHUNK, 7))
+    whole = action_err(A, R)
+    for bs in (1, 5, 16, 37):
+        acc = {}
+        for i, j in plan_batches(len(A), bs):
+            err_add(acc, err_sums(A[i:j], R[i:j]))
+        got = err_finish(acc)
+        for k in ("pos", "rot", "grip"):
+            assert abs(got[k] - whole[k]) < 1e-12, (bs, k, got[k], whole[k])
+    # Контроль самого теста: СРЕДНЕЕ RMS ПО БАТЧАМ от разбиения ЗАВИСИТ, и
+    # именно поэтому оно заменено на суммы.
+    naive = float(np.mean([action_err(A[i:j], R[i:j])["pos"]
+                           for i, j in plan_batches(len(A), 5)]))
+    assert abs(naive - whole["pos"]) > 1e-9, "тест инвариантности вырожден"
+
     # --- ошибки по каналам --------------------------------------------------
     a = np.zeros((4, T_CHUNK, 7)); ref = np.zeros((4, T_CHUNK, 7))
     a[:, :, 0] = 0.3
@@ -245,11 +332,13 @@ def selftest():
     assert action_err(a2, ref)["pos"] == 0.0, "срез взял хвост"
     assert a2.shape[1] != N_POS, "ось времени спутана с латентными позициями"
 
-    print("самопроверка k11a пройдена (версия «выбор ранга после декодера»): "
+    print("самопроверка k11a пройдена (версия «rho до ранга, схват отдельным гейтом»): "
           "базис из нецентрированного грамиана восстанавливает подпространство, "
           "центрирование теряет смещение, доля улучшения не определена при "
           "идеальном черновике и отрицательна при ухудшении, ранг требует "
-          "порога по обоим каналам, префикс режется по шагам чанка")
+          "порога по обоим каналам, схват отвергает ранг отдельным условием, "
+          "агрегирование не зависит от размера батча, префикс режется по "
+          "шагам чанка")
 
 
 def load_codec(args):
@@ -283,6 +372,24 @@ def diagnose(args):
     if meta.get("ckpt") != args.ckpt:
         raise SystemExit(f"кэш собран чекпойнтом {meta.get('ckpt')}, а "
                          f"декодер берётся из {args.ckpt}")
+    # КНИГИ СВЕРЯЮТСЯ С СОХРАНЁННЫМИ, А НЕ ПРОСТО ЗАГРУЖАЮТСЯ ЗАНОВО.
+    # Совпадения пути чекпойнта мало: локальный кэш HuggingFace или сам
+    # процессор могли смениться под тем же именем, и остаток считался бы в
+    # одних координатах, а декодировался в других.
+    Esav = np.load(prefix + ".codebooks.npy")
+    Ecur = E.cpu().numpy()
+    if Esav.shape != Ecur.shape:
+        raise SystemExit(f"книги формы {Ecur.shape} против {Esav.shape} в "
+                         f"кэше: другой кодек")
+    dmax = float(np.abs(Esav - Ecur).max())
+    if dmax > args.codebook_tol:
+        raise SystemExit(
+            f"кодовые книги разошлись на {dmax:.3e} при допуске "
+            f"{args.codebook_tol:.0e}: декодер не тот, которым собран кэш")
+    cb_sha = hashlib.sha1(np.ascontiguousarray(
+        Esav.astype(np.float32)).tobytes()).hexdigest()[:12]
+    print(f"  книги сверены с сохранёнными: max|Δ| = {dmax:.3e}, sha "
+          f"{cb_sha}")
 
     q0 = np.load(prefix + ".q0hat.npy")
     Kt = np.load(prefix + ".ktrue.npy")
@@ -324,86 +431,127 @@ def diagnose(args):
             mark = "  (= размерность, не сжатие)" if rk >= D else ""
             print(f"    ранг {rk:>3}: {exp[rk]:.1%}{mark}")
 
-    # --- ДОЛЯ УЛУЧШЕНИЯ НА VAL, ПОСЛЕ ДЕКОДЕРА -----------------------------
+    # --- rho СЧИТАЕТСЯ ДО ВЫБОРА РАНГА, НА TRAIN ---------------------------
+    # ПОРЯДОК ПРИНЦИПИАЛЕН. Прежде ранг выбирался по НЕОГРАНИЧЕННОЙ проекции,
+    # а rho считалась после. Но обученная голова способна выдать только
+    # |c_i| <= rho_i, поэтому выбранный так ранг мог быть недостижим
+    # архитектурой. Теперь rho определяется для координат полного базиса на
+    # train, а на val оценивается уже ОГРАНИЧЕННАЯ поправка.
+    Bt = torch.as_tensor(Bfull, dtype=torch.float32, device=dev)
+    take = tr if not args.diag_n else tr[:args.diag_n * 4]
+    coef = []
+    for i, j in plan_batches(len(take), args.batch * 16):
+        s_ = take[i:j]
+        with torch.no_grad():
+            r = (z_of(Kt[s_, 0, :], Kt[s_]) - z_of(q0[s_])).reshape(-1, D)
+            coef.append((r @ Bt).abs().cpu().numpy())
+    coef = np.concatenate(coef)
+    rho_full = np.percentile(coef, args.rho_pct, axis=0)
+    if not np.isfinite(rho_full).all() or (rho_full <= 0).any():
+        raise SystemExit("процентиль дал ноль или бесконечность: остаток "
+                         "вырожден хотя бы по одной координате базиса")
+    print(f"\n  rho: процентиль {args.rho_pct} по {len(coef)} строкам TRAIN, "
+          f"по каждой из {Bfull.shape[1]} координат полного базиса")
+
+    ranks = [r for r in PCA_RANKS if r <= Bfull.shape[1]]
+    print(f"\n  насыщение на train (процентиль по КАЖДОЙ координате не значит "
+          f"{100 - args.rho_pct:.0f}%\n  векторов вне предела: при r "
+          f"координатах хотя бы одна выходит гораздо чаще):")
+    print(f"    {'ранг':>8}{'коэфф.вне':>12}{'токенов вне':>14}"
+          f"{'координат':>12}{'||rho||':>10}")
+    sat_stats = {}
+    for rk in ranks:
+        c_ = coef[:, :rk]
+        rr = rho_full[:rk]
+        over = c_ > rr[None]
+        per_tok = over.any(1)
+        # Наблюдение = 16 латентных позиций подряд.
+        per_obs = per_tok.reshape(-1, N_POS).any(1)
+        sat_stats[rk] = dict(coef_frac=float(over.mean()),
+                             token_frac=float(per_tok.mean()),
+                             obs_frac=float(per_obs.mean()),
+                             mean_clamped=float(over.sum(1).mean()),
+                             rho_norm=float(np.linalg.norm(rr)))
+        st_ = sat_stats[rk]
+        print(f"    {rk:>8}{st_['coef_frac']:>11.1%}{st_['token_frac']:>13.1%}"
+              f"{st_['mean_clamped']:>12.2f}{st_['rho_norm']:>10.4f}")
+    print(f"    (столбец «координат» — сколько в среднем координат из r "
+          f"обрезается)")
+
+    # --- ДОЛЯ УЛУЧШЕНИЯ НА VAL, ПОСЛЕ ДЕКОДЕРА, С ОГРАНИЧЕНИЕМ -------------
     va_s = va if not args.diag_n else va[:args.diag_n]
     print(f"\n  доля возвращённого улучшения на val ({len(va_s)} "
-          f"наблюдений), ПОСЛЕ единственного декодирования:")
-    ranks = [r for r in PCA_RANKS if r <= Bfull.shape[1]]
-    acc = {r: {k: [] for k in ("pos", "rot", "grip")} for r in ranks}
-    e0 = []
+          f"наблюдений), ПОСЛЕ единственного декодирования.")
+    print(f"  «огр.» — поправка в пределах rho, то есть достижимая головой; "
+          f"«неогр.» — верхняя\n  граница проекции, которую архитектура "
+          f"воспроизвести не обязана.")
+    acc_c = {r: {} for r in ranks}
+    acc_u = {r: {} for r in ranks}
+    acc0 = {}
     for i, j in plan_batches(len(va_s), args.batch):
-        s = va_s[i:j]
+        s_ = va_s[i:j]
         with torch.no_grad():
-            z0b = z_of(q0[s])
-            zsb = z_of(Kt[s, 0, :], Kt[s])
+            z0b = z_of(q0[s_])
+            zsb = z_of(Kt[s_, 0, :], Kt[s_])
             A0 = codec._decode(z0b, embodiment_ids=0)[0][..., :7].float()
             As = codec._decode(zsb, embodiment_ids=0)[0][..., :7].float()
             As_n = As.cpu().numpy()
-            e0.append(action_err(A0.cpu().numpy(), As_n))
+            err_add(acc0, err_sums(A0.cpu().numpy(), As_n))
             rb = zsb - z0b
             for rk in ranks:
-                Br = torch.as_tensor(Bfull[:, :rk], dtype=rb.dtype,
-                                     device=rb.device)
-                zr = z0b + (rb @ Br) @ Br.T
-                Ar = codec._decode(zr, embodiment_ids=0)[0][..., :7].float()
-                er = action_err(Ar.cpu().numpy(), As_n)
-                for k_ in ("pos", "rot", "grip"):
-                    acc[rk][k_].append(er[k_])
+                Br = Bt[:, :rk].to(rb.dtype)
+                cf = rb @ Br
+                lim = torch.as_tensor(rho_full[:rk], dtype=cf.dtype,
+                                      device=cf.device)
+                for tag, cc, acc_ in (("u", cf, acc_u),
+                                      ("c", torch.clamp(cf, -lim, lim),
+                                       acc_c)):
+                    Ar = codec._decode(z0b + cc @ Br.T,
+                                       embodiment_ids=0)[0][..., :7].float()
+                    err_add(acc_[rk], err_sums(Ar.cpu().numpy(), As_n))
 
-    e_z0 = {k: float(np.mean([x[k] for x in e0]))
-            for k in ("pos", "rot", "grip")}
-    # ЭТАЛОН — САМО D(z*), поэтому его ошибка относительно себя ровно ноль.
+    e_z0 = err_finish(acc0)
     e_st = dict(pos=0.0, rot=0.0, grip=0.0)
-    gains = {}
-    print(f"    {'ранг':>8}{'поз.ошибка':>13}{'доля':>9}"
-          f"{'вр.ошибка':>12}{'доля':>9}{'знак':>9}")
+    gains, gains_u, grips = {}, {}, {}
+    print(f"    {'ранг':>8}{'поз.огр':>10}{'доля':>8}{'доля неогр':>12}"
+          f"{'вр.огр':>10}{'доля':>8}{'знак':>8}")
     for rk in ranks:
-        er = {k: float(np.mean(acc[rk][k])) for k in ("pos", "rot", "grip")}
-        g = {k: gain(e_z0[k], er[k], e_st[k]) for k in ("pos", "rot")}
-        gains[rk] = g
-        gp = "—" if g["pos"] is None else f"{g['pos']:.1%}"
-        gr = "—" if g["rot"] is None else f"{g['rot']:.1%}"
-        print(f"    {rk:>8}{er['pos']:>13.5f}{gp:>9}"
-              f"{er['rot']:>12.5f}{gr:>9}{er['grip']:>8.1%}")
-    print(f"    {'черновик':>8}{e_z0['pos']:>13.5f}{'0.0%':>9}"
-          f"{e_z0['rot']:>12.5f}{'0.0%':>9}{e_z0['grip']:>8.1%}")
+        ec = err_finish(acc_c[rk])
+        eu = err_finish(acc_u[rk])
+        gains[rk] = {k: gain(e_z0[k], ec[k], e_st[k]) for k in ("pos", "rot")}
+        gains_u[rk] = {k: gain(e_z0[k], eu[k], e_st[k])
+                       for k in ("pos", "rot")}
+        grips[rk] = ec["grip"]
+        f = lambda x: "—" if x is None else f"{x:.1%}"
+        print(f"    {rk:>8}{ec['pos']:>10.5f}{f(gains[rk]['pos']):>8}"
+              f"{f(gains_u[rk]['pos']):>12}{ec['rot']:>10.5f}"
+              f"{f(gains[rk]['rot']):>8}{ec['grip']:>7.1%}")
+    print(f"    {'черновик':>8}{e_z0['pos']:>10.5f}{'0.0%':>8}{'0.0%':>12}"
+          f"{e_z0['rot']:>10.5f}{'0.0%':>8}{e_z0['grip']:>7.1%}")
 
-    rank = pick_rank(gains, d_latent=D)
-    print(f"\n  {read_rank(rank, gains)}")
-    print("  СТОЛБЕЦ «знак» — доля шагов, где схват после поправки разошёлся "
-          "с полным\n  восстановлением. Он НЕ входит в выбор ранга и в одно "
-          "число с позой не сводится:\n  латентная поправка схват меняет, и "
-          "это отдельный предмет наблюдения.")
+    rank = pick_rank(gains, grip=grips, grip_draft=e_z0["grip"], d_latent=D)
+    rank_u = pick_rank(gains_u, grip=grips, grip_draft=e_z0["grip"],
+                       d_latent=D)
+    print(f"\n  {read_rank(rank, gains, grip=grips, grip_draft=e_z0['grip'])}")
+    if rank_u != rank:
+        print(f"  БЕЗ ограничения был бы выбран ранг {rank_u} — разница и "
+              f"есть цена предела амплитуды.")
+    print("  СТОЛБЕЦ «знак» участвует в решении ОТДЕЛЬНЫМ жёстким условием "
+          f"(допуск {GRIP_DELTA:.1%}),\n  а не усредняется с позой: латентная "
+          "поправка меняет схват, и ранг,\n  переворачивающий его, "
+          "отвергается независимо от качества позы.")
 
-    # --- rho В КООРДИНАТАХ ВЫБРАННОГО БАЗИСА, ТОЛЬКО TRAIN -----------------
-    rho = None
-    if rank is not None:
-        Br = torch.as_tensor(Bfull[:, :rank], dtype=torch.float32, device=dev)
-        take = tr if not args.diag_n else tr[:args.diag_n * 4]
-        coef = []
-        for i, j in plan_batches(len(take), args.batch * 16):
-            s = take[i:j]
-            with torch.no_grad():
-                r = (z_of(Kt[s, 0, :], Kt[s]) - z_of(q0[s])).reshape(-1, D)
-                coef.append((r @ Br).abs().cpu().numpy())
-        coef = np.concatenate(coef)
-        rho = np.percentile(coef, args.rho_pct, axis=0)
-        if not np.isfinite(rho).all() or (rho <= 0).any():
-            raise SystemExit("процентиль дал ноль или бесконечность: остаток "
-                             "вырожден хотя бы по одной координате базиса")
-        out_frac = float((coef > rho[None]).mean())
-        print(f"\n  rho: процентиль {args.rho_pct} по {len(coef)} строкам "
-              f"TRAIN в координатах выбранного базиса")
-        print(f"    ||rho|| = {float(np.linalg.norm(rho)):.4f} — это и есть "
-              f"ГАРАНТИРОВАННЫЙ предел ||dz|| при ортонормированном "
-              f"замороженном базисе")
-        print(f"    доля коэффициентов вне предела на train: {out_frac:.1%}")
+    rho = rho_full[:rank] if rank is not None else None
 
     out = dict(n_obs=int(N), q0_source=meta["q0_source"], d_latent=D,
                n_train=int(len(tr)), n_val=int(len(va_s)),
                explained={str(k): v for k, v in exp.items()},
                gains={str(k): v for k, v in gains.items()},
-               err_draft=e_z0, rank=rank, gain_target=GAIN_TARGET,
+               gains_unclamped={str(k): v for k, v in gains_u.items()},
+               grip={str(k): v for k, v in grips.items()},
+               saturation={str(k): v for k, v in sat_stats.items()},
+               err_draft=e_z0, rank=rank, rank_unclamped=rank_u,
+               gain_target=GAIN_TARGET, grip_delta=GRIP_DELTA,
                rho=None if rho is None else rho.tolist(),
                rho_pct=args.rho_pct, prefix=prefix,
                cache_meta_sha1=meta.get("script_sha1"),
@@ -439,6 +587,8 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--diag-n", type=int, default=20000)
     ap.add_argument("--rho-pct", type=float, default=95.0)
+    ap.add_argument("--codebook-tol", type=float, default=1e-5,
+                    help="допуск сверки книг кэша с текущим кодеком")
     ap.add_argument("--drift-n", type=int, default=2000)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
@@ -520,9 +670,23 @@ def main() -> None:
     if tuple(Ktrue.shape[1:]) != (N_LEVEL, N_POS):
         raise SystemExit(f"K_true формы {Ktrue.shape}, ожидалось "
                          f"(N, {N_LEVEL}, {N_POS})")
+
+    # ПРОВЕРКИ, А НЕ ПЕЧАТЬ. Прежняя версия просто выводила манифест, сид и
+    # словарь: отчёт утверждал, что они проверены, а код их только показывал.
+    # Производитель кэша обязан отказаться ДО часового прогона.
+    def need_eq(got, want, what):
+        if got != want:
+            raise SystemExit(f"{what}: {got!r} против {want!r} в meta кэша")
+
+    need_eq(int(cache_meta["n_obs"]), len(d["episode"]), "число наблюдений")
+    vals = set(np.unique(split).tolist())
+    if not vals <= {"train", "val", "test"} or not vals:
+        raise SystemExit(f"недопустимые значения split: {sorted(vals)}")
+    if int(Ktrue.min()) < 0:
+        raise SystemExit(f"в K_true отрицательный код {int(Ktrue.min())}")
     print(f"  происхождение кэша: манифест {cache_meta.get('manifest')}, "
           f"сид разбиения {cache_meta.get('split_seed')}, словарь "
-          f"{cache_meta.get('vocab')}")
+          f"{cache_meta.get('vocab')}, части {sorted(vals)}")
 
     # --- кадры: ИМЯ ФАЙЛА ТОЧНО КАК В K-9a ---------------------------------
     # K-9a пишет `<cache>.images.npy`, где <cache> уже содержит `.npz`.
@@ -535,7 +699,19 @@ def main() -> None:
     if IMG.shape[0] != len(d["episode"]):
         raise SystemExit(f"кадров {IMG.shape[0]}, наблюдений "
                          f"{len(d['episode'])}")
-    print(f"  кадры: {IMG.shape}, {IMG.nbytes / 2 ** 30:.1f} ГиБ")
+    if cache_meta.get("images_file") != os.path.basename(img_path):
+        raise SystemExit(f"meta называет кадры "
+                         f"{cache_meta.get('images_file')!r}, а открыт "
+                         f"{os.path.basename(img_path)!r}")
+    if IMG.dtype != np.uint8:
+        raise SystemExit(f"кадры типа {IMG.dtype}, ожидался uint8: "
+                         f"нормировка была бы применена дважды")
+    want_shape = tuple(cache_meta.get("image_shape") or ())
+    if want_shape and tuple(IMG.shape[1:]) != want_shape:
+        raise SystemExit(f"кадры формы {tuple(IMG.shape[1:])} против "
+                         f"{want_shape} в meta")
+    print(f"  кадры: {IMG.shape}, {IMG.dtype}, {IMG.nbytes / 2 ** 30:.1f} "
+          f"ГиБ, имя совпало с meta")
 
     # --- состояния: ИЗ PARQUET, в NPZ их нет -------------------------------
     st = None
@@ -579,6 +755,53 @@ def main() -> None:
         idx = torch.arange(int(codec.vocab_size), device=dev).unsqueeze(0)
         E = torch.stack([q.out_project(q.decode_code(idx))[0]
                          for q in codec.vq.quantizers]).float()
+    V = int(codec.vocab_size)
+    if int(cache_meta.get("vocab", V)) != V:
+        raise SystemExit(f"словарь кэша {cache_meta.get('vocab')} против "
+                         f"{V} у кодека")
+    if int(Ktrue.max()) >= V:
+        raise SystemExit(f"в K_true код {int(Ktrue.max())} при словаре {V}")
+    if int(E.shape[0]) != N_LEVEL:
+        raise SystemExit(f"уровней в кодеке {int(E.shape[0])}, ожидалось "
+                         f"{N_LEVEL}")
+
+    # --- МАНИФЕСТ ОТКРЫВАЕТСЯ И СВЕРЯЕТСЯ ----------------------------------
+    man_path = cache_meta.get("manifest")
+    man_info = None
+    if man_path and os.path.exists(man_path):
+        man = json.load(open(man_path))
+        eps_man = man.get("episodes") if isinstance(man, dict) else man
+        if isinstance(eps_man, dict):
+            eps_ids = sorted(int(k) for k in eps_man)
+            sp_man = {int(k): v for k, v in eps_man.items()}
+        else:
+            eps_ids = sorted(int(x) for x in eps_man)
+            sp_man = None
+        if len(eps_ids) != len(set(eps_ids)):
+            raise SystemExit(f"{man_path}: эпизоды дублируются")
+        miss = sorted(set(int(x) for x in np.unique(epi)) - set(eps_ids))
+        if miss:
+            raise SystemExit(f"эпизоды {miss[:5]} есть в кэше, но не в "
+                             f"манифесте {man_path}")
+        if sp_man is not None:
+            bad = [int(e) for e in np.unique(epi)
+                   if sp_man.get(int(e)) is not None
+                   and sp_man[int(e)] != split[np.where(epi == e)[0][0]]]
+            if bad:
+                raise SystemExit(f"часть не совпала с манифестом у эпизодов "
+                                 f"{bad[:5]}")
+        rev_man = man.get("revision") if isinstance(man, dict) else None
+        man_info = dict(path=man_path, sha1=file_sha1(man_path),
+                        n_episodes=len(eps_ids), revision=rev_man)
+        print(f"  манифест сверен: {len(eps_ids)} эпизодов, sha "
+              f"{man_info['sha1']}, revision {rev_man}")
+    else:
+        # ОТКАЗ, А НЕ ПРЕДУПРЕЖДЕНИЕ: без манифеста нечем подтвердить, что
+        # части не пересекаются и что кэш собран по тому же списку эпизодов.
+        raise SystemExit(
+            f"манифест {man_path!r} из meta кэша не найден. Сборка без "
+            f"сверки списка эпизодов и разбиения запрещена: часовой прогон "
+            f"дал бы кэш, происхождение которого нечем подтвердить")
 
     # ИСХОДНАЯ ФИНАЛЬНАЯ НОРМА СНИМАЕТСЯ ДО НАЛОЖЕНИЯ ВЕСОВ: чекпойнт Joint12
     # перезапишет `action_expert.norm`, обученную читать h12, а поздняя ветвь
@@ -822,6 +1045,10 @@ def main() -> None:
                 depth=args.depth, d_hidden=D_H, d_latent=D_Z, ckpt=args.ckpt,
                 cache=args.cache, source=src_meta, fp16_q0_mismatch=mism,
                 drift=drift, script_sha1=sha, cache_meta=cache_meta,
+                manifest=man_info, vocab=V,
+                codebooks_sha1=hashlib.sha1(np.ascontiguousarray(
+                    E.cpu().numpy().astype(np.float32)).tobytes()
+                ).hexdigest()[:12],
                 hicora_vla_sha1=file_sha1(hv.__file__),
                 joint12_vla_sha1=file_sha1(jv.__file__),
                 keys_sha1=hashlib.sha1(np.ascontiguousarray(
