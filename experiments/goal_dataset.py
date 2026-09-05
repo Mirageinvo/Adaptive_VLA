@@ -13,6 +13,14 @@ import math
 
 import numpy as np
 
+# Части полного входа. Разделены, чтобы измерить вклад каждой отдельно:
+# «rich помог» само по себе ничего не говорит, потому что меняет четыре
+# фактора разом. И один из них, `remaining`, ПРИВИЛЕГИРОВАННЫЙ — он
+# известен только потому, что мы знаем, когда произойдёт событие;
+# развёрнутая система его не знает без монитора, которого нет.
+RICH_PARTS = ("dstate", "prevact", "remaining", "task")
+ORACLE_PARTS = ("remaining",)
+
 
 def aa_to_R(v):
     """Axis-angle -> матрица поворота (Родриг), пакетно."""
@@ -66,7 +74,7 @@ def rel_goal(pos_t, aa_t, pos_g, aa_g):
 
 
 def build(a, st, tau, ttyp, rem, steps, state_norm=None, task_id=None,
-          rich=False, n_task=64):
+          rich=False, parts=None, n_task=64):
     """Тройки для выбранных шагов эпизода.
 
     rich=False воспроизводит вход отрицательного результата K-10d: только
@@ -83,7 +91,14 @@ def build(a, st, tau, ttyp, rem, steps, state_norm=None, task_id=None,
     oh[np.arange(len(t)), np.clip(ttyp[t], 0, 2)] = 1.0
     g = np.concatenate([g, np.sign(a[tau[t], 6:7]), oh], 1)
     sn = state_norm(st[t]) if state_norm is not None else st[t]
-    if not rich:
+    if parts is None:
+        parts = RICH_PARTS if rich else ()
+    parts = tuple(parts)
+    bad = [p for p in parts if p not in RICH_PARTS]
+    if bad:
+        raise ValueError(f"неизвестные части входа: {bad}; доступны "
+                         f"{list(RICH_PARTS)}")
+    if not parts:
         return sn.astype(np.float32), g.astype(np.float32), a[t].astype(np.float32)
     # НУЛЕВАЯ СТРОКА НЕ ИМЕЕТ ПРЕДЫДУЩЕГО ДЕЙСТВИЯ. При `prev = max(t-1, 0)`
     # на t=0 получалось `предыдущее действие = a[0] = таргет`, то есть прямая
@@ -102,11 +117,19 @@ def build(a, st, tau, ttyp, rem, steps, state_norm=None, task_id=None,
     # и не может распределить движение — величина команды в демонстрации от
     # этого зависит напрямую.
     rr = rem[t][:, None].astype(np.float64)
-    extra = [dst, pact, has_prev, np.log1p(rr)]
-    if task_id is not None:
+    extra = []
+    if "dstate" in parts:
+        extra.append(dst)
+    if "prevact" in parts:
+        extra += [pact, has_prev]
+    if "remaining" in parts:
+        extra.append(np.log1p(rr))
+    if "task" in parts and task_id is not None:
         oh_t = np.zeros((len(t), n_task))
         oh_t[np.arange(len(t)), int(task_id) % n_task] = 1.0
         extra.append(oh_t)
+    if not extra:
+        return sn.astype(np.float32), g.astype(np.float32), a[t].astype(np.float32)
     sn = np.concatenate([sn] + extra, 1)
     return sn.astype(np.float32), g.astype(np.float32), a[t].astype(np.float32)
 
@@ -152,6 +175,26 @@ def selftest():
     assert has_prev[0] == 0.0 and has_prev[1:].all()
     # ПРИРАЩЕНИЕ СОСТОЯНИЯ в нулевой строке тоже обнулено.
     assert np.abs(s1[0, d0:d0 + 8]).max() == 0.0
+    # ЧАСТИ ВКЛЮЧАЮТСЯ ПО ОТДЕЛЬНОСТИ и дают предсказуемую ширину входа.
+    w0 = s0.shape[1]
+    for pp, add in ((("dstate",), 8), (("prevact",), 8), (("remaining",), 1),
+                    (("task",), 64), (("dstate", "remaining"), 9)):
+        sp, gp, yp = build(a, st, tau, ttyp, rem, np.arange(n - 1), parts=pp,
+                           task_id=3, n_task=64)
+        assert sp.shape[1] == w0 + add, (pp, sp.shape[1], w0 + add)
+        assert np.allclose(gp, g0) and np.allclose(yp, y0)
+    # Пустой набор частей эквивалентен plain.
+    assert build(a, st, tau, ttyp, rem, np.arange(n - 1),
+                 parts=())[0].shape[1] == w0
+    # Неизвестная часть — отказ, а не молчаливое игнорирование.
+    try:
+        build(a, st, tau, ttyp, rem, np.arange(n - 1), parts=("нет",))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("неизвестная часть входа должна отвергаться")
+    assert "remaining" in ORACLE_PARTS, "привилегированная часть помечена"
+
     print("самопроверка goal_dataset пройдена: перегон axis-angle с pi, "
           "инвариантность цели к сдвигу, rich расширяет вход не меняя цель "
           "и таргет")

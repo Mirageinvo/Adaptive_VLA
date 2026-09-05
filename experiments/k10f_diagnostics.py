@@ -218,6 +218,11 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--lr", type=float, default=3e-3)
     ap.add_argument("--batch", type=int, default=1024)
+    ap.add_argument("--rich-parts", default=None,
+                    help="через запятую из dstate,prevact,remaining,task. "
+                         "ВНИМАНИЕ: remaining ПРИВИЛЕГИРОВАН — он известен "
+                         "только потому, что мы знаем время события, и "
+                         "развёрнутая система его без монитора не имеет.")
     ap.add_argument("--rich", action="store_true",
                     help="полный вход: приращение, прошлое действие, остаток, "
                          "идентификатор задачи")
@@ -232,6 +237,17 @@ def main() -> None:
     if not args.ckpt:
         raise SystemExit("нужен --ckpt или --selftest")
 
+    parts = (tuple(x.strip() for x in args.rich_parts.split(","))
+             if args.rich_parts else None)
+    if parts:
+        import sys as _s
+        _s.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import goal_dataset as _gd
+        oracle = [x for x in parts if x in _gd.ORACLE_PARTS]
+        if oracle:
+            print(f"  ВНИМАНИЕ: во входе привилегированные части {oracle} — "
+                  f"развёрнутая система их не имеет,\n  и результат с ними "
+                  f"является ВЕРХНЕЙ оценкой, а не достижимой.")
     sha = hashlib.sha1(open(__file__, "rb").read()).hexdigest()[:12]
     print(f"k10f sha1 {sha}")
 
@@ -306,7 +322,7 @@ def main() -> None:
         sn = lambda x: (x - STATE_Q01) / (STATE_Q99 - STATE_Q01) * 2 - 1 \
             if x.shape[1] == len(STATE_Q01) else x
         s_, g_, y_ = gd.build(a, st, tau, ttyp, rem, t, state_norm=sn,
-                              task_id=tmap[ep_task[e]], rich=args.rich,
+                              task_id=tmap[ep_task[e]], rich=args.rich, parts=parts,
                               n_task=len(tasks))
         S.append(s_); G.append(g_); Y.append(y_)
         EP.append(np.full(len(s_), e))
