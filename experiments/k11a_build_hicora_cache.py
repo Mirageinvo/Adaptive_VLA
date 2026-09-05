@@ -198,6 +198,22 @@ def check_manifest(man, cache_meta, epi, split, rev=DATASET_REV,
                 n_checked=len(uniq))
 
 
+def save_atomic(path, arr):
+    """Запись через временный файл и os.replace.
+
+    ПОРЯДОК ЗАПИСИ ЗНАЧИМ. Прежде `.diag.json` писался ПЕРВЫМ и не содержал
+    отпечатков базиса: при сбое между операциями рядом со свежей
+    диагностикой оставался СТАРЫЙ basis.npy, и никакая проверка этого не
+    видела. Теперь массивы пишутся атомарно и первыми, их SHA попадают в
+    диагностику, а она записывается последней — её наличие означает, что всё
+    предыдущее уже на диске и согласовано.
+    """
+    tmp = path + ".tmp"
+    np.save(tmp, arr)
+    os.replace(tmp + ".npy" if not tmp.endswith(".npy") else tmp, path)
+    return file_sha1(path)
+
+
 def gram_basis(G, rank):
     """Ортонормированный базис из НЕЦЕНТРИРОВАННОГО грамиана."""
     w, V = np.linalg.eigh(np.asarray(G, np.float64))
@@ -503,7 +519,7 @@ def selftest():
     assert action_err(a2, ref)["pos"] == 0.0, "срез взял хвост"
     assert a2.shape[1] != N_POS, "ось времени спутана с латентными позициями"
 
-    print("самопроверка k11a пройдена (версия «fail-closed отпечатки, rho по случайной выборке»): "
+    print("самопроверка k11a пройдена (версия «артефакты первыми, диагностика последней»): "
           "базис из нецентрированного грамиана восстанавливает подпространство, "
           "центрирование теряет смещение, доля улучшения не определена при "
           "идеальном черновике и отрицательна при ухудшении, ранг требует "
@@ -770,6 +786,15 @@ def diagnose(args):
 
     rho = rho_full[:rank] if rank is not None else None
 
+    # СНАЧАЛА МАССИВЫ, ПОТОМ ДИАГНОСТИКА С ИХ ОТПЕЧАТКАМИ.
+    basis_sha = rho_sha = None
+    if rank is not None:
+        basis_sha = save_atomic(prefix + ".basis.npy",
+                                Bfull[:, :rank].astype(np.float32))
+        rho_sha = save_atomic(prefix + ".rho.npy", rho.astype(np.float32))
+        print(f"\n  базис и rho сохранены: {prefix}.{{basis,rho}}.npy, sha "
+              f"{basis_sha} и {rho_sha}")
+
     out = dict(n_obs=int(N), q0_source=meta["q0_source"], d_latent=D,
                n_train=int(len(tr)), n_val=int(len(va_s)),
                explained={str(k): v for k, v in exp.items()},
@@ -782,16 +807,22 @@ def diagnose(args):
                gain_target=GAIN_TARGET, grip_delta=GRIP_DELTA,
                rho=None if rho is None else rho.tolist(),
                rho_pct=args.rho_pct, prefix=prefix,
+               # ОТПЕЧАТКИ АРТЕФАКТОВ — ЧАСТЬ ДИАГНОСТИКИ, а не отчёта о ней:
+               # без них любой ортонормированный базис той же формы выдавал
+               # бы себя за выбранный, и K-11b это принимал.
+               basis_sha1=basis_sha, rho_sha1=rho_sha,
+               basis_shape=None if rank is None else [int(D), int(rank)],
                cache_script_sha1=meta.get("script_sha1"),
                cache_meta_sha1=file_sha1(prefix + ".meta.json"),
+               depth=meta.get("depth"), taps=meta.get("taps"),
+               hicora_vla_sha1=meta.get("hicora_vla_sha1"),
                script_sha1=file_sha1(__file__))
-    json.dump(out, open(prefix + ".diag.json", "w"), ensure_ascii=False,
-              indent=1)
-    if rank is not None:
-        np.save(prefix + ".basis.npy", Bfull[:, :rank].astype(np.float32))
-        np.save(prefix + ".rho.npy", rho.astype(np.float32))
-        print(f"\n  базис и rho сохранены: {prefix}.{{basis,rho}}.npy")
-    print(f"  сохранено: {prefix}.diag.json")
+    # ДИАГНОСТИКА ЗАПИСЫВАЕТСЯ ПОСЛЕДНЕЙ И АТОМАРНО: её наличие есть признак
+    # того, что базис и rho уже лежат на диске и ей соответствуют.
+    tmp = prefix + ".diag.json.tmp"
+    json.dump(out, open(tmp, "w"), ensure_ascii=False, indent=1)
+    os.replace(tmp, prefix + ".diag.json")
+    print(f"  сохранено: {prefix}.diag.json (последним, с sha артефактов)")
     print("\n  ЧИТАТЬ ТАК: это ВЫБОР РАЗМЕРНОСТИ на val, а не свидетельство, "
           "что обученная\n  голова улучшит успех. Доля улучшения посчитана по "
           "ИСТИННОМУ остатку,\n  спроецированному на базис, то есть это "

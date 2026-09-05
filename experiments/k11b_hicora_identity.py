@@ -148,6 +148,75 @@ def act_diff(a, b):
                                      != np.sign(B[..., 6])).mean()))
 
 
+# Поля кэша, которые обязаны совпасть с диагностикой и с ожиданиями K-11b.
+CACHE_FIELDS = ("q0_source", "depth", "taps")
+
+
+def check_artifacts(diag, cache_prefix, basis_sha, rho_sha, rank,
+                    cache_meta_sha):
+    """Строгая привязка basis.npy и rho.npy к породившей их диагностике.
+
+    ХЕШ, ПОСЧИТАННЫЙ ПОСЛЕ ПРИНЯТИЯ ФАЙЛА, — ЭТО ОТЧЁТ, А НЕ ПРОВЕРКА.
+    Прежняя версия сверяла только ранг, поэтому любой ортонормированный
+    базис той же формы — например с переставленными столбцами — проходил
+    все проверки и обучение шло бы в чужих координатах с чужой rho.
+    """
+    need = ("basis_sha1", "rho_sha1", "rank", "prefix", "cache_meta_sha1")
+    miss = [k for k in need if not diag.get(k) and diag.get(k) != 0]
+    if miss:
+        raise SystemExit(
+            f"в диагностике нет полей {miss}: она собрана версией, которая не "
+            f"записывала отпечатки артефактов. Перезапустите шаг --diagnose "
+            f"текущей версией K-11a — он читает готовый кэш и стоит минуты")
+    if diag["prefix"] != cache_prefix:
+        raise SystemExit(f"диагностика собрана для {diag['prefix']}, а кэш "
+                         f"{cache_prefix}")
+    if int(diag["rank"]) != int(rank):
+        raise SystemExit(f"ранг в диагностике {diag['rank']}, а в basis.npy "
+                         f"{rank}")
+    if diag["basis_sha1"] != basis_sha:
+        raise SystemExit(
+            f"basis.npy sha {basis_sha}, а диагностика породила "
+            f"{diag['basis_sha1']}: это ДРУГОЙ базис той же формы")
+    if diag["rho_sha1"] != rho_sha:
+        raise SystemExit(f"rho.npy sha {rho_sha}, а в диагностике "
+                         f"{diag['rho_sha1']}")
+    if diag["cache_meta_sha1"] != cache_meta_sha:
+        raise SystemExit("meta кэша изменилась после диагностики: базис и "
+                         "rho относятся к другому кэшу")
+    return True
+
+
+def check_cache_fields(meta, diag, expect, modules, allow_drift=False):
+    """Поля кэша сверяются ДО загрузки модели, а не после.
+
+    `hicora_vla_sha1` и `joint12_vla_sha1` определяют исполняемую сеть не
+    меньше, чем веса. Расхождение по умолчанию — отказ; разрешить его можно
+    только явным флагом, и тогда оно печатается и попадает в отчёт.
+    """
+    for k, want in expect.items():
+        got = meta.get(k)
+        if want is not None and got != want:
+            raise SystemExit(f"кэш собран с {k}={got!r}, а здесь {want!r}")
+    if diag is not None:
+        for k in CACHE_FIELDS:
+            if diag.get(k) is not None and diag.get(k) != meta.get(k):
+                raise SystemExit(
+                    f"диагностика и кэш расходятся по {k}: "
+                    f"{diag.get(k)!r} против {meta.get(k)!r}")
+    drift = {k: (meta.get(k), v) for k, v in modules.items()
+             if meta.get(k) and meta[k] != v}
+    if drift and not allow_drift:
+        lines = "; ".join(f"{k}: кэш {a}, сейчас {b}"
+                          for k, (a, b) in drift.items())
+        raise SystemExit(
+            f"версии модулей разошлись с кэшем — {lines}. Если правка "
+            f"заведомо не затрагивает путь сбора, повторите с "
+            f"--allow-module-drift: расхождение будет напечатано и записано "
+            f"в отчёт")
+    return drift
+
+
 def read_identity(res):
     """Пре-регистрированное чтение: тождество либо есть, либо его нет."""
     bad = [k for k, v in res.items() if v is False]
@@ -246,16 +315,72 @@ def selftest():
     assert act_diff(a, b3)["max_abs"] == 0.0
     assert act_diff(a, b3)["grip_mismatch"] == 1.0
 
+    # --- ПРИВЯЗКА АРТЕФАКТОВ К ДИАГНОСТИКЕ ---------------------------------
+    # Прежде сверялся только ранг, и переставленный базис той же формы
+    # проходил. Здесь мутации: отсутствие поля, изменённый sha, чужой prefix,
+    # другой ранг, изменившаяся meta.
+    diag_ok = dict(basis_sha1="B1", rho_sha1="R1", rank=16, prefix="/c",
+                   cache_meta_sha1="M1")
+    assert check_artifacts(diag_ok, "/c", "B1", "R1", 16, "M1") is True
+
+    def art_fail(diag, *a, frag=""):
+        try:
+            check_artifacts(diag, *a)
+        except SystemExit as e:
+            assert frag in str(e), (frag, str(e))
+            return
+        raise AssertionError(f"пропущено: {frag}")
+
+    # ПЕРЕСТАВЛЕННЫЙ БАЗИС той же формы: ранг совпадает, sha другой.
+    art_fail(diag_ok, "/c", "B2", "R1", 16, "M1", frag="ДРУГОЙ базис")
+    art_fail(diag_ok, "/c", "B1", "R2", 16, "M1", frag="rho.npy sha")
+    art_fail(diag_ok, "/c", "B1", "R1", 8, "M1", frag="ранг")
+    art_fail(diag_ok, "/other", "B1", "R1", 16, "M1", frag="собрана для")
+    art_fail(diag_ok, "/c", "B1", "R1", 16, "M2", frag="meta кэша изменилась")
+    for k in ("basis_sha1", "rho_sha1", "rank", "prefix", "cache_meta_sha1"):
+        art_fail({x: v for x, v in diag_ok.items() if x != k},
+                 "/c", "B1", "R1", 16, "M1", frag="нет полей")
+
+    # --- ПОЛЯ КЭША И ВЕРСИИ МОДУЛЕЙ ----------------------------------------
+    meta_ok = dict(depth=12, taps=[12, 18, 24], q0_source="joint12",
+                   hicora_vla_sha1="H1", joint12_vla_sha1="J1")
+    mods = dict(hicora_vla_sha1="H1", joint12_vla_sha1="J1")
+    assert check_cache_fields(meta_ok, None, dict(depth=12,
+                                                  taps=[12, 18, 24]),
+                              mods) == {}
+    try:
+        check_cache_fields(meta_ok, None, dict(depth=18), mods)
+        raise AssertionError("другая глубина прошла")
+    except SystemExit as e:
+        assert "depth" in str(e)
+    # ДРЕЙФ ВЕРСИИ МОДУЛЯ по умолчанию отказ, с флагом — возвращается наружу.
+    try:
+        check_cache_fields(meta_ok, None, dict(depth=12),
+                           dict(hicora_vla_sha1="H2", joint12_vla_sha1="J1"))
+        raise AssertionError("дрейф модуля прошёл молча")
+    except SystemExit as e:
+        assert "разошлись с кэшем" in str(e)
+    d = check_cache_fields(meta_ok, None, dict(depth=12),
+                           dict(hicora_vla_sha1="H2", joint12_vla_sha1="J1"),
+                           allow_drift=True)
+    assert d == {"hicora_vla_sha1": ("H1", "H2")}, d
+    # Расхождение диагностики с кэшем по полю тоже отказ.
+    try:
+        check_cache_fields(meta_ok, dict(depth=18), dict(depth=12), mods)
+        raise AssertionError("расхождение диагностики и кэша прошло")
+    except SystemExit as e:
+        assert "расходятся по depth" in str(e)
+
     # --- чтение вердикта ----------------------------------------------------
     assert "можно переходить" in read_identity({"a": True, "b": True})
     txt = read_identity({"a": True, "q0_bitwise": False})
     assert "НЕ ВЫПОЛНЕНО" in txt and "q0_bitwise" in txt
 
-    print("самопроверка k11b пройдена (версия «счётчик на "
-          "_shared_attention_forward»): обёртка не меняет выход и снимается, "
+    print("самопроверка k11b пройдена (версия «привязка артефактов»): обёртка не меняет выход и снимается, "
           "счётчик слоёв считает по layer_idx и отвергает двенадцать по два "
           "при тех же 24 вызовах, знак схвата считается отдельно от позы, "
-          "вердикт называет провалившийся пункт")
+          "вердикт называет провалившийся пункт, переставленный базис той "
+          "же формы отвергается, дрейф версии модуля требует явного флага")
 
 
 def main() -> None:
@@ -273,6 +398,9 @@ def main() -> None:
     ap.add_argument("--dtype", default="float16")
     ap.add_argument("--depth", type=int, default=12)
     ap.add_argument("--batches", default="1,10")
+    ap.add_argument("--allow-module-drift", action="store_true",
+                    help="разрешить расхождение версий hicora_vla/joint12_vla "
+                         "с кэшем. Расхождение печатается и попадает в отчёт")
     ap.add_argument("--out", default="data/k11b_identity.json")
     args = ap.parse_args()
 
@@ -327,8 +455,30 @@ def main() -> None:
         raise SystemExit(
             f"кэш собран весами sha {src.get('weights_sha1')}, а здесь "
             f"{k11a.file_sha1(args.joint_ckpt)}: черновик был бы другой")
+
+    # --- ПОЛЯ КЭША И ВЕРСИИ МОДУЛЕЙ СВЕРЯЮТСЯ ДО ЗАГРУЗКИ МОДЕЛИ -----------
+    diag_p = args.cache + ".diag.json"
+    if not os.path.exists(diag_p):
+        raise SystemExit(f"нет {diag_p}: сначала шаг --diagnose K-11a")
+    diag = json.load(open(diag_p))
+    hv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "hicora_vla.py")
+    jv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "joint12_vla.py")
+    drift = check_cache_fields(
+        meta, diag,
+        expect=dict(depth=args.depth, taps=list(TAPS)),
+        modules=dict(hicora_vla_sha1=k11a.file_sha1(hv_path),
+                     joint12_vla_sha1=k11a.file_sha1(jv_path)),
+        allow_drift=args.allow_module_drift)
+    if drift:
+        print("  ВНИМАНИЕ, версии модулей разошлись с кэшем (разрешено "
+              "явно):")
+        for k, (a, b) in drift.items():
+            print(f"    {k}: кэш {a}, сейчас {b}")
     print(f"  кэш: {meta['n_obs']} наблюдений, источник q0 "
-          f"«{meta['q0_source']}», отводы {meta['taps']}")
+          f"«{meta['q0_source']}», отводы {meta['taps']}, глубина "
+          f"{meta['depth']}")
 
     # --- модель ровно как в K-11a -------------------------------------------
     Cls = make_joint12_class(SmolVLABlockwiseAR)
@@ -389,29 +539,17 @@ def main() -> None:
     if not (np.allclose(got_B, B, atol=1e-6)
             and np.allclose(got_r, rho, atol=1e-6)):
         raise SystemExit("базис или rho в модели не совпали с файлами")
-    # СОВПАДЕНИЕ С ФАЙЛАМИ ПОДТВЕРЖДАЕТ ТОЛЬКО КОПИРОВАНИЕ. Чужие basis.npy и
-    # rho.npy подходящего размера прошли бы ту же проверку, поэтому файлы
-    # сверяются с ДИАГНОСТИКОЙ, которая их и породила.
-    diag_p = args.cache + ".diag.json"
-    if not os.path.exists(diag_p):
-        raise SystemExit(f"нет {diag_p}: происхождение базиса и rho нечем "
-                         f"подтвердить")
-    diag = json.load(open(diag_p))
-    if diag.get("prefix") != args.cache:
-        raise SystemExit(f"диагностика собрана для {diag.get('prefix')}, а "
-                         f"кэш {args.cache}")
-    if int(diag.get("rank") or -1) != int(B.shape[1]):
-        raise SystemExit(f"ранг в диагностике {diag.get('rank')}, а в "
-                         f"basis.npy {B.shape[1]}")
-    if diag.get("cache_meta_sha1") != k11a.file_sha1(args.cache +
-                                                     ".meta.json"):
-        raise SystemExit("meta кэша изменилась после диагностики: базис и "
-                         "rho относятся к другому кэшу")
+    # ОТПЕЧАТКИ ФАЙЛОВ СЧИТАЮТСЯ ДО ИХ ПРИНЯТИЯ и сверяются с диагностикой,
+    # которая их породила. Совпадение содержимого с загруженным массивом
+    # подтверждало бы только копирование.
+    basis_sha, rho_sha = k11a.file_sha1(basis_p), k11a.file_sha1(rho_p)
+    check_artifacts(diag, args.cache, basis_sha, rho_sha, int(B.shape[1]),
+                    k11a.file_sha1(args.cache + ".meta.json"))
     if not np.allclose(np.asarray(diag["rho"], np.float64), rho, atol=1e-6):
         raise SystemExit("rho.npy не совпадает с rho из диагностики")
     detail_prov = dict(diag_sha1=k11a.file_sha1(diag_p),
-                       basis_sha1=k11a.file_sha1(basis_p),
-                       rho_sha1=k11a.file_sha1(rho_p),
+                       basis_sha1=basis_sha, rho_sha1=rho_sha,
+                       module_drift={k: list(v) for k, v in drift.items()},
                        gain_target=diag.get("gain_target"),
                        grip_delta=diag.get("grip_delta"))
     print(f"  происхождение базиса подтверждено диагностикой: ранг "
@@ -562,7 +700,19 @@ def main() -> None:
     # ЦЕЛЬ СТРОИТСЯ ТЕМ ЖЕ ВЫРАЖЕНИЕМ, ЧТО ПОЙДЁТ В ОБУЧЕНИЕ: r = z* - z0.
     # Прежняя версия сравнивала только z_real и z_fake — вывод верен
     # математически, но код построения actual-draft target не проверялся.
-    Kt = np.load(args.cache + ".ktrue.npy")[sel]
+    Kt_all = np.load(args.cache + ".ktrue.npy")
+    # ДОЛЯ СЧИТАЕТСЯ ПО ВСЕМУ КЭШУ, А НЕ ПО ОДНОМУ НАБЛЮДЕНИЮ. При batch=1
+    # прежняя величина опиралась на 16 токенов и о вырождении задачи не
+    # говорила ничего.
+    frac_diff = float((q0hat != Kt_all[:, 0, :]).mean())
+    detail["draft_vs_true_q0_frac"] = frac_diff
+    res["draft_differs_from_true_q0"] = bool(frac_diff > 0)
+    print(f"  черновик расходится с истинным q0* на {frac_diff:.1%} токенов "
+          f"по всему кэшу ({len(q0hat)} наблюдений)")
+    if frac_diff == 0:
+        print("    ноль означает, что задача HiCoRA вырождается в задачу "
+              "кодека:\n    исправлять ошибку предсказания нечего.")
+    Kt = Kt_all[sel]
     kt = torch.as_tensor(Kt).long().to(dev)
     z_star = sum(model.codebooks[l][kt[:, l, :]] for l in range(N_LEVEL))
     r_real = z_star - z_real
