@@ -74,25 +74,48 @@ def check_matched(base, copy):
 
 
 def audit(base, copy, margin_pose, margin_grip):
+    """Побакетное сравнение и размах копировщика В ВЫЗОВАХ VLA.
+
+    ЕДИНИЦЫ. `prefix_ok` возвращает ШАГИ среды (0/8/16/32/48). Размах, с
+    которым сравниваются пороги, измеряется в ВЫЗОВАХ и получается делением
+    на H_CALL — ровно как в вердикте K-10d. Без деления один пройденный
+    ближний бакет давал бы «8x» вместо «1x», и диапазон «1-2x» был бы
+    недостижим, а любой успех читался бы как разгром гейта.
+
+    ПРОПУСК БАКЕТА ОСТАНАВЛИВАЕТ. Пропускать отсутствующий бакет нельзя:
+    тогда следующий занимает его место в списке флагов, `prefix_ok` считает
+    его ближним, и отсутствие «<= 8» при остальных пройденных даёт ложный
+    полный размах. Префикс имеет смысл только на СПЛОШНОЙ шкале удалённости.
+    """
     edges = base["edges"]
     names = ge.bucket_names(edges)
     rows, flags = [], []
     for nm in names:
         b, c = base["buckets"].get(nm), copy["buckets"].get(nm)
         if b is None or c is None:
-            continue
+            miss = "опоре" if b is None else "контроле"
+            raise SystemExit(
+                f"бакет «{nm}» отсутствует в {miss}: шкала удалённости не "
+                f"сплошная, размах префиксом не определён")
+        if int(b["n"]) != int(c["n"]):
+            raise SystemExit(
+                f"бакет «{nm}»: строк в опоре {b['n']}, в контроле {c['n']} — "
+                f"при совпавших ключах это разная бакетизация")
+        if int(b["n"]) == 0:
+            raise SystemExit(f"бакет «{nm}» пуст: размах не определён")
         ok = k10d.gate(c, b, margin_pose, margin_grip)
         flags.append(ok)
         rows.append((nm, b, c, ok))
-    return rows, flags, k10d.prefix_ok(flags, edges)
+    return rows, flags, k10d.prefix_ok(flags, edges) / k10d.H_CALL
 
 
 def read_span(span):
+    """Чтение в ВЫЗОВАХ VLA. Пороги те же, что у вердикта K-10d."""
     if span <= 0:
         return ("копировщик отвергнут сразу: гейт отличает управление от "
                 "повтора, побакетные выводы K-10d остаются осмысленными")
     if span < 4:
-        return (f"размах копировщика {span}x: ближняя часть критерия "
+        return (f"размах копировщика {span:g}x: ближняя часть критерия "
                 f"вырождена — повтор проходит там же, где требовалось "
                 f"управление, но положительного вердикта не получает")
     return ("размах копировщика >= 4x: тривиальный повтор получает ТОТ ЖЕ "
@@ -115,26 +138,62 @@ def selftest():
                              for n, (p, r, g) in zip(nm, vals)})
 
     base = mk("coarse24", [(0.06, 0.06, 0.02)] * 5)
+
+    # ЕДИНИЦЫ. Размах — в ВЫЗОВАХ VLA, не в шагах среды. Пройденный ближний
+    # бакет (8 шагов) есть ОДИН вызов, а не восемь: без деления на H_CALL
+    # диапазон «1-2x» недостижим, и любой единичный успех читался бы как
+    # полный разгром гейта.
+    def span_for(flags_vals):
+        return audit(base, mk("copy-prev", flags_vals), 0.0, 0.005)[2]
+
+    good, bad = (0.05, 0.05, 0.01), (0.9, 0.9, 0.9)
+    assert span_for([good] + [bad] * 4) == 1, "один ближний бакет = 1 вызов"
+    assert span_for([good] * 2 + [bad] * 3) == 2
+    assert span_for([good] * 3 + [bad] * 2) == 4
+    assert span_for([good] * 5) == 6, "полная шкала 48 шагов = 6 вызовов"
+    assert "вырождена" in read_span(1) and "вырождена" in read_span(2)
+    assert "недискриминативен" in read_span(4)
+    assert "отвергнут" in read_span(0)
+
     # Копия точна по позе везде, но врёт знаком схвата в ближнем бакете —
     # ровно то, чего ждём от повтора в момент переключения.
-    grip_bad = mk("copy-prev", [(0.05, 0.05, 0.30)] + [(0.05, 0.05, 0.01)] * 4)
+    grip_bad = mk("copy-prev", [(0.05, 0.05, 0.30)] + [good] * 4)
     _, _, sp = audit(base, grip_bad, 0.0, 0.005)
     assert sp == 0, f"провал знака в ближнем бакете обязан давать 0, дал {sp}"
 
     # Поза хуже опоры — тоже отказ, даже при идеальном знаке.
-    pose_bad = mk("copy-prev", [(0.09, 0.05, 0.0)] * 5)
-    assert audit(base, pose_bad, 0.0, 0.005)[2] == 0
-
-    # Повтор лучше опоры везде — полный размах и разгромный вердикт.
-    allgood = mk("copy-prev", [(0.05, 0.05, 0.01)] * 5)
-    assert audit(base, allgood, 0.0, 0.005)[2] == 48
-    assert "недискриминативен" in read_span(48)
+    assert span_for([(0.09, 0.05, 0.0)] * 5) == 0
 
     # Размах ЯВЛЯЕТСЯ ПРЕФИКСОМ: дальний хороший бакет не спасает провал.
-    holed = mk("copy-prev", [(0.05, 0.05, 0.01), (0.05, 0.05, 0.01),
-                             (0.9, 0.9, 0.9), (0.05, 0.05, 0.01),
-                             (0.05, 0.05, 0.01)])
-    assert audit(base, holed, 0.0, 0.005)[2] == 16
+    assert span_for([good, good, bad, good, good]) == 2
+
+    # ПРОПУЩЕННЫЙ БАКЕТ ОСТАНАВЛИВАЕТ. Раньше он молча пропускался, и
+    # отсутствие «<= 8» при остальных пройденных давало ложный полный размах:
+    # следующий бакет занимал место ближнего в списке флагов.
+    gap = mk("copy-prev", [good] * 5)
+    del gap["buckets"][nm[0]]
+    try:
+        audit(base, gap, 0.0, 0.005)
+        raise AssertionError("отсутствие ближнего бакета дало размах")
+    except SystemExit:
+        pass
+    empty = mk("copy-prev", [good] * 5)
+    empty["buckets"][nm[1]]["n"] = 0
+    base_empty = mk("coarse24", [(0.06, 0.06, 0.02)] * 5)
+    base_empty["buckets"][nm[1]]["n"] = 0
+    try:
+        audit(base_empty, empty, 0.0, 0.005)
+        raise AssertionError("пустой бакет дал размах")
+    except SystemExit:
+        pass
+    # Разное число строк в одноимённом бакете — признак разной бакетизации.
+    nmis = mk("copy-prev", [good] * 5)
+    nmis["buckets"][nm[2]]["n"] = 7
+    try:
+        audit(base, nmis, 0.0, 0.005)
+        raise AssertionError("разное n прошло проверку")
+    except SystemExit:
+        pass
 
     # Несовпадение строк обязано ОСТАНАВЛИВАТЬ, а не предупреждать.
     other = mk("copy-prev", [(0.05, 0.05, 0.01)] * 5)
@@ -159,9 +218,10 @@ def selftest():
         raise AssertionError
     except SystemExit:
         pass
-    print("самопроверка k10g пройдена: провал знака в ближнем бакете даёт "
-          "нулевой размах, размах — префикс, несовпадение строк и события "
-          "останавливает, вердикт читается по трём диапазонам")
+    print("самопроверка k10g пройдена (версия «размах в вызовах»): "
+          "1/2/4/6x по префиксу, ближний бакет = 1 вызов, провал знака даёт "
+          "ноль, пропуск и пустота бакета останавливают, несовпадение строк "
+          "и события останавливает")
 
 
 def main():
@@ -204,7 +264,8 @@ def main():
               f"{b['grip']:>7.1%}{c['grip']:>8.1%}"
               f"{'  да' if ok else '  нет':>4}")
 
-    print(f"\nразмах копировщика: {span}x")
+    print(f"\nразмах копировщика: {span:g}x "
+          f"(вызовов VLA; префикс {span * k10d.H_CALL:g} шагов)")
     print(read_span(span))
     print("\nЭто утверждение о ПРИГОДНОСТИ КРИТЕРИЯ, а не о работоспособности "
           "в замкнутом цикле: пошаговая ошибка считается на состояниях "
@@ -212,7 +273,8 @@ def main():
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".",
                 exist_ok=True)
-    json.dump(dict(copy_span=int(span), split=args.split,
+    json.dump(dict(copy_span=float(span),
+                   copy_span_steps=float(span * k10d.H_CALL), split=args.split,
                    event=base["event"], edges=base["edges"],
                    n_rows=base["n_rows"], n_episodes=base["n_episodes"],
                    margin_pose=args.margin_pose, margin_grip=args.margin_grip,
