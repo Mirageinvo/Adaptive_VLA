@@ -519,7 +519,7 @@ def selftest():
     assert action_err(a2, ref)["pos"] == 0.0, "срез взял хвост"
     assert a2.shape[1] != N_POS, "ось времени спутана с латентными позициями"
 
-    print("самопроверка k11a пройдена (версия «артефакты первыми, диагностика последней»): "
+    print("самопроверка k11a пройдена (версия «GPU и состояния до долгого»): "
           "базис из нецентрированного грамиана восстанавливает подпространство, "
           "центрирование теряет смещение, доля улучшения не определена при "
           "идеальном черновике и отрицательна при ухудшении, ранг требует "
@@ -854,6 +854,9 @@ def main() -> None:
     ap.add_argument("--codebook-tol", type=float, default=1e-5,
                     help="допуск сверки книг кэша с текущим кодеком")
     ap.add_argument("--drift-n", type=int, default=2000)
+    ap.add_argument("--min-free-gib", type=float, default=8.0,
+                    help="минимум свободной памяти GPU; проверяется ДО "
+                         "сбора состояний")
     ap.add_argument("--drift-only", action="store_true",
                     help="повторить ТОЛЬКО аудит дрейфа на уже собранном "
                          "кэше: проход по батчам пропускается, отводы и коды "
@@ -932,6 +935,29 @@ def main() -> None:
     from joint12_vla import make_joint12_class
     import joint12_vla as jv
     import hicora_vla as hv
+
+    # ДОСТУПНОСТЬ GPU ПРОВЕРЯЕТСЯ ПЕРВОЙ. Контейнер на кластере периодически
+    # теряет карты при живом драйвере, и падение наступало ПОСЛЕ двадцати
+    # минут сбора состояний — дважды подряд. Проверка стоит миллисекунды.
+    if args.device.startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise SystemExit(
+                "torch.cuda.is_available() == False: контейнер потерял "
+                "видеокарты. Проверьте nvidia-smi; лечится перезапуском "
+                "докера с хоста, постоянно — no-cgroups=true в "
+                "/etc/nvidia-container-runtime/config.toml")
+        idx = int(args.device.split(":")[1]) if ":" in args.device else 0
+        if idx >= torch.cuda.device_count():
+            raise SystemExit(f"запрошено {args.device}, а видно "
+                             f"{torch.cuda.device_count()} устройств")
+        free_b, total_b = torch.cuda.mem_get_info(idx)
+        print(f"  {args.device}: свободно {free_b / 2**30:.1f} ГиБ из "
+              f"{total_b / 2**30:.1f}")
+        if free_b / 2 ** 30 < args.min_free_gib:
+            raise SystemExit(
+                f"свободно {free_b / 2**30:.1f} ГиБ, нужно хотя бы "
+                f"{args.min_free_gib}. Прогон упал бы по памяти уже после "
+                f"сбора состояний — проверьте занятость карт")
 
     seed_everything(0)
     dev, dt = torch.device(args.device), getattr(torch, args.dtype)
@@ -1036,30 +1062,67 @@ def main() -> None:
           f"ГиБ, имя совпало с meta")
 
     # --- состояния: ИЗ PARQUET, в NPZ их нет -------------------------------
+    # И КЕШИРУЮТСЯ РЯДОМ С КЭШЕМ. Сбор занимает около двадцати минут, а
+    # результат весит меньше десяти мегабайт; мы дважды теряли эти минуты на
+    # падениях следующего шага. Кеш привязан к ключам и ревизии, иначе он
+    # молча подсунул бы состояния от другого набора наблюдений.
+    st_path = args.cache + ".state.npy"
+    st_meta_path = args.cache + ".state.json"
+    keys_sha = hashlib.sha1(np.ascontiguousarray(
+        np.stack([epi, stp])).tobytes()).hexdigest()[:12]
     st = None
-    rid, rev = args.dataset_repo, args.dataset_revision
-    uniq = np.unique(epi)
-    for j, e in enumerate(uniq):
-        f = hf_hub_download(rid, f"data/chunk-{int(e) // 1000:03d}/"
-                            f"episode_{int(e):06d}.parquet",
-                            repo_type="dataset", revision=rev)
-        t = pq.read_table(f)
-        S_ = np.asarray(t.column("state").to_pylist(), np.float32)
-        if st is None:
-            st = np.zeros((N, S_.shape[1]), np.float64)
-        elif st.shape[1] != S_.shape[1]:
-            raise SystemExit(f"эпизод {e}: состояние {S_.shape[1]}-мерное, "
-                             f"раньше было {st.shape[1]}-мерное")
-        for r_ in np.where(epi == e)[0]:
-            st[r_] = S_[int(stp[r_])]
-        if j % 400 == 0:
-            print(f"  эпизодов {j}/{len(uniq)}", flush=True)
-    if st.shape[1] == len(STATE_Q01) + 1:
-        st = process_state(st)
-    if not np.isfinite(st).all():
-        raise SystemExit("в состояниях есть nan или inf")
+    if os.path.exists(st_path) and os.path.exists(st_meta_path):
+        sm = json.load(open(st_meta_path))
+        if (sm.get("keys_sha1") == keys_sha
+                and sm.get("dataset_revision") == args.dataset_revision
+                and sm.get("dataset_repo") == args.dataset_repo
+                and int(sm.get("n_obs", -1)) == N):
+            st = np.load(st_path)
+            if st.shape[0] != N:
+                st = None
+            else:
+                print(f"  состояния взяты из кеша {st_path} (ключи "
+                      f"{keys_sha}, ревизия {args.dataset_revision})")
+        else:
+            print(f"  кеш состояний {st_path} не подходит по ключам или "
+                  f"ревизии — пересобираю")
+    if st is None:
+        rid, rev = args.dataset_repo, args.dataset_revision
+        uniq = np.unique(epi)
+        for j, e in enumerate(uniq):
+            f = hf_hub_download(rid, f"data/chunk-{int(e) // 1000:03d}/"
+                                f"episode_{int(e):06d}.parquet",
+                                repo_type="dataset", revision=rev)
+            t = pq.read_table(f)
+            S_ = np.asarray(t.column("state").to_pylist(), np.float32)
+            if st is None:
+                st = np.zeros((N, S_.shape[1]), np.float64)
+            elif st.shape[1] != S_.shape[1]:
+                raise SystemExit(f"эпизод {e}: состояние {S_.shape[1]}-мерное, "
+                                 f"раньше было {st.shape[1]}-мерное")
+            for r_ in np.where(epi == e)[0]:
+                st[r_] = S_[int(stp[r_])]
+            if j % 400 == 0:
+                print(f"  эпизодов {j}/{len(uniq)}", flush=True)
+        if st.shape[1] == len(STATE_Q01) + 1:
+            st = process_state(st)
+        if not np.isfinite(st).all():
+            raise SystemExit("в состояниях есть nan или inf")
+        tmp = st_path + ".tmp.npy"
+        np.save(tmp, st)
+        os.replace(tmp, st_path)
+        json.dump(dict(keys_sha1=keys_sha, n_obs=int(N),
+                       dataset_repo=args.dataset_repo,
+                       dataset_revision=args.dataset_revision,
+                       dim=int(st.shape[1])),
+                  open(st_meta_path, "w"), ensure_ascii=False, indent=1)
+        print(f"  состояния собраны и сохранены в {st_path} "
+              f"({st.nbytes / 2**20:.1f} МБ) — повторный сбор не потребуется")
+    if st.shape[1] != len(STATE_Q01):
+        raise SystemExit(f"состояния {st.shape[1]}-мерные, ожидалось "
+                         f"{len(STATE_Q01)}")
     st_n = (st - STATE_Q01) / (STATE_Q99 - STATE_Q01) * 2.0 - 1.0
-    print("  состояния собраны")
+    print("  состояния готовы")
 
     # --- модель -------------------------------------------------------------
     Cls = make_joint12_class(SmolVLABlockwiseAR)
