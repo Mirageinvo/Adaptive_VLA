@@ -854,6 +854,10 @@ def main() -> None:
     ap.add_argument("--codebook-tol", type=float, default=1e-5,
                     help="допуск сверки книг кэша с текущим кодеком")
     ap.add_argument("--drift-n", type=int, default=2000)
+    ap.add_argument("--drift-only", action="store_true",
+                    help="повторить ТОЛЬКО аудит дрейфа на уже собранном "
+                         "кэше: проход по батчам пропускается, отводы и коды "
+                         "читаются с диска. Час работы не повторяется")
     # ОТВОДЫ СНИМАЮТСЯ ВСЕ, СОХРАНЯЮТСЯ НЕ ВСЕ. Голове HiCoRA-D нужен только
     # h24: черновик берётся из уже сохранённых кодов q0hat, а h18 понадобится
     # лишь будущей HiCoRA-V. Каждый лишний отвод — это N*16*D*2 байт на диске,
@@ -1185,6 +1189,16 @@ def main() -> None:
     need = len(save_taps) * N * N_POS * D_H * 2 / 2 ** 30
     stfs = os.statvfs(outdir)
     free = stfs.f_bavail * stfs.f_frsize / 2 ** 30
+    # МЕСТО, ЗАНЯТОЕ ТЕМИ ЖЕ ФАЙЛАМИ, СЧИТАЕТСЯ СВОБОДНЫМ. Перезапись идёт в
+    # те же пути и диск не удваивает: без этой поправки повторный сбор после
+    # падения отказывался по месту, которое сам же и занимал.
+    reuse = sum(os.path.getsize(f"{args.out}.h{t}.npy") / 2 ** 30
+                for t in save_taps
+                if os.path.exists(f"{args.out}.h{t}.npy"))
+    if reuse:
+        print(f"  на диске уже есть отводы прошлого прогона на {reuse:.2f} "
+              f"ГиБ — они будут перезаписаны, место засчитывается свободным")
+    free += reuse
     print(f"  сохраняются отводы {save_taps} (проход полный, снимаются все "
           f"{TAPS}): {len(save_taps)} x ({N}, {N_POS}, {D_H}) fp16 = "
           f"{need:.2f} ГиБ, свободно {free:.1f} ГиБ")
@@ -1195,10 +1209,26 @@ def main() -> None:
             f"освободите диск — падение на последнем батче стоило бы всего "
             f"прогона")
 
-    taps_mm = {t: np.lib.format.open_memmap(
-        f"{args.out}.h{t}.npy", mode="w+", dtype=np.float16,
-        shape=(N, N_POS, D_H)) for t in save_taps}
-    q0hat = np.zeros((N, N_POS), np.int16)
+    if args.drift_only:
+        # ОТВОДЫ ОТКРЫВАЮТСЯ ТОЛЬКО НА ЧТЕНИЕ: повтор аудита не имеет права
+        # переписать собранные данные.
+        prev = json.load(open(f"{args.out}.meta.json"))
+        if int(prev["n_obs"]) != N or int(prev["d_hidden"]) != D_H:
+            raise SystemExit(
+                f"кэш собран на {prev['n_obs']} наблюдениях с h="
+                f"{prev['d_hidden']}, а сейчас {N} и {D_H}")
+        taps_mm = {t: np.load(f"{args.out}.h{t}.npy", mmap_mode="r")
+                   for t in prev["saved_taps"]}
+        q0hat = np.load(f"{args.out}.q0hat.npy")
+        mism = prev.get("fp16_q0_mismatch")
+        src_meta = prev.get("source")
+        print(f"  режим --drift-only: отводы {list(taps_mm)} и коды прочитаны "
+              f"с диска, проход по батчам пропущен")
+    else:
+        taps_mm = {t: np.lib.format.open_memmap(
+            f"{args.out}.h{t}.npy", mode="w+", dtype=np.float16,
+            shape=(N, N_POS, D_H)) for t in save_taps}
+        q0hat = np.zeros((N, N_POS), np.int16)
 
     groups = []
     for po in sorted({int(v) for v in offs}):
@@ -1227,7 +1257,7 @@ def main() -> None:
         return dict_apply(lambda x: x.to(dev, dt), b)
 
     seen = set()
-    for gi, (po, sel) in enumerate(groups):
+    for gi, (po, sel) in enumerate([] if args.drift_only else groups):
         b = build(sel)
         with torch.no_grad(), torch.autocast(device_type=dev.type, dtype=dt):
             v, pp = model.build_inputs(position_offset=po, **b)
@@ -1241,32 +1271,85 @@ def main() -> None:
         q0hat[sel] = q0.cpu().numpy().astype(np.int16)
         if gi % 50 == 0:
             print(f"    батч {gi}/{len(groups)}", flush=True)
-    for t in save_taps:
-        taps_mm[t].flush()
-    if seen != {model.n_layers_total}:
+    if not args.drift_only:
+        for t in save_taps:
+            taps_mm[t].flush()
+    if not args.drift_only and seen != {model.n_layers_total}:
         raise SystemExit(f"глубина прохода {sorted(seen)} вместо "
                          f"{model.n_layers_total}")
     print(f"  проход: ровно {model.n_layers_total} слоёв во всех батчах")
 
     # --- ШУМ ХРАНЕНИЯ FP16 ИЗМЕРЯЕТСЯ, А НЕ ПРЕДПОЛАГАЕТСЯ -----------------
-    if args.depth not in save_taps:
+    if not args.drift_only and args.depth not in save_taps:
         raise SystemExit(
             f"отвод {args.depth} не сохраняется, а без него нечем измерить "
             f"шум fp16 на черновике: добавьте его в --save-taps")
-    chk = np.random.default_rng(0).choice(N, min(2048, N), replace=False)
-    with torch.no_grad(), torch.autocast(device_type=dev.type, dtype=dt):
-        hb = torch.from_numpy(np.asarray(taps_mm[args.depth][chk])).to(dev, dt)
-        _, qb = model.q0_from(hb)
-    mism = float((qb.cpu().numpy().astype(np.int16) != q0hat[chk]).mean())
-    print(f"  шум fp16: {mism:.3%} токенов q0 расходятся при перегоне из кэша")
-    if mism > 0.005:
-        raise SystemExit(f"расхождение {mism:.3%} выше 0.5%: кэш непригоден "
-                         f"как источник черновика")
+    if not args.drift_only:
+        chk = np.random.default_rng(0).choice(N, min(2048, N), replace=False)
+        with torch.no_grad(), torch.autocast(device_type=dev.type, dtype=dt):
+            hb = torch.from_numpy(
+                np.asarray(taps_mm[args.depth][chk])).to(dev, dt)
+            _, qb = model.q0_from(hb)
+        mism = float((qb.cpu().numpy().astype(np.int16) != q0hat[chk]).mean())
+        print(f"  шум fp16: {mism:.3%} токенов q0 расходятся при перегоне из "
+              f"кэша")
+        if mism > 0.005:
+            raise SystemExit(f"расхождение {mism:.3%} выше 0.5%: кэш "
+                             f"непригоден как источник черновика")
+
+    # --- КЭШ СОХРАНЯЕТСЯ ДО НЕОБЯЗАТЕЛЬНОЙ ДИАГНОСТИКИ ---------------------
+    # ПОРЯДОК СТОИЛ ЧАСА РАБОТЫ. Раньше мелкие артефакты и meta писались
+    # ПОСЛЕ аудита дрейфа, и падение аудита по памяти уничтожало весь сбор:
+    # отводы лежали на диске, но без кодов и без meta пользоваться ими
+    # нельзя. Дрейф — диагностика, он не имеет права губить данные.
+    if not args.drift_only:
+        np.save(f"{args.out}.q0hat.npy", q0hat)
+        np.save(f"{args.out}.ktrue.npy", Ktrue)
+        np.save(f"{args.out}.split.npy", split)
+        np.save(f"{args.out}.codebooks.npy",
+                E.cpu().numpy().astype(np.float32))
+
+    def write_meta(drift_val):
+        meta = dict(n_obs=int(N), q0_source=args.q0_source, taps=list(TAPS),
+                    saved_taps=list(save_taps),
+                    depth=args.depth, d_hidden=D_H, d_latent=D_Z,
+                    ckpt=args.ckpt, cache=args.cache, source=src_meta,
+                    fp16_q0_mismatch=mism, drift=drift_val, script_sha1=sha,
+                    cache_meta=cache_meta, manifest=man_info, vocab=V,
+                    dataset_revision=args.dataset_revision,
+                    codebooks_sha1=hashlib.sha1(np.ascontiguousarray(
+                        E.cpu().numpy().astype(np.float32)).tobytes()
+                    ).hexdigest()[:12],
+                    decoder_probe=decoder_probe(codec, E, dev),
+                    codec_state_sha1=state_sha1(codec),
+                    hicora_vla_sha1=file_sha1(hv.__file__),
+                    joint12_vla_sha1=file_sha1(jv.__file__),
+                    keys_sha1=hashlib.sha1(np.ascontiguousarray(
+                        np.stack([epi, stp])).tobytes()).hexdigest()[:12])
+        tmp = f"{args.out}.meta.json.tmp"
+        json.dump(meta, open(tmp, "w"), ensure_ascii=False, indent=1)
+        os.replace(tmp, f"{args.out}.meta.json")
+        return meta
+
+    meta = write_meta(None) if not args.drift_only else json.load(
+        open(f"{args.out}.meta.json"))
+    hs = ",".join(f"h{t}" for t in save_taps)
+    print(f"\n  КЭШ СОХРАНЁН: {args.out}.{{{hs},q0hat,ktrue,split,"
+          f"codebooks}}.npy и .meta.json")
+    print(f"  ключи sha {meta['keys_sha1']} — дальше только диагностика, "
+          f"данные уже на диске")
 
     # --- ЧЕТЫРЕ РАЗНЫЕ ВЕЛИЧИНЫ ДРЕЙФА -------------------------------------
     drift = None
+    drift_error = None
     if args.q0_source == "joint12" and args.drift_n > 0:
+      try:
         print(f"\n  дрейф на {args.drift_n} наблюдениях ЧИСТЫМ проходом")
+        # ОСНОВНАЯ МОДЕЛЬ БОЛЬШЕ НЕ НУЖНА и освобождается ДО загрузки чистой:
+        # две полные модели одновременно удваивали пик памяти, и именно на
+        # этом прогон падал по OOM, уже собрав все отводы.
+        del model
+        torch.cuda.empty_cache()
         clean = Cls.from_pretrained(**cfg.MODEL.vlm.kwargs).to(dev, dt).eval()
         clean.init_joint_fast(depth=args.depth, head_dtype=dt)
         clean_norm = copy.deepcopy(clean.action_expert.norm).to(dev)
@@ -1344,33 +1427,30 @@ def main() -> None:
               "окажется бесполезной, и повод сравнить с источником readout.")
         del clean
         torch.cuda.empty_cache()
+      except Exception as ex:
+        # ДИАГНОСТИКА НЕ ИМЕЕТ ПРАВА ГУБИТЬ СБОР. Кэш уже на диске; отказ
+        # аудита записывается в meta и повторяется отдельным прогоном
+        # `--drift-only`, без часового прохода.
+        drift, drift_error = None, f"{type(ex).__name__}: {ex}"
+        print(f"\n  АУДИТ ДРЕЙФА НЕ ВЫПОЛНЕН: {drift_error}")
+        print("  Кэш сохранён и пригоден. Повторить аудит отдельно: "
+              "--drift-only")
+        try:
+            del clean
+        except NameError:
+            pass
+        torch.cuda.empty_cache()
 
-    np.save(f"{args.out}.q0hat.npy", q0hat)
-    np.save(f"{args.out}.ktrue.npy", Ktrue)
-    np.save(f"{args.out}.split.npy", split)
-    np.save(f"{args.out}.codebooks.npy", E.cpu().numpy().astype(np.float32))
-    meta = dict(n_obs=int(N), q0_source=args.q0_source, taps=list(TAPS),
-                saved_taps=list(save_taps),
-                depth=args.depth, d_hidden=D_H, d_latent=D_Z, ckpt=args.ckpt,
-                cache=args.cache, source=src_meta, fp16_q0_mismatch=mism,
-                drift=drift, script_sha1=sha, cache_meta=cache_meta,
-                manifest=man_info, vocab=V,
-                dataset_revision=args.dataset_revision,
-                codebooks_sha1=hashlib.sha1(np.ascontiguousarray(
-                    E.cpu().numpy().astype(np.float32)).tobytes()
-                ).hexdigest()[:12],
-                decoder_probe=decoder_probe(codec, E, dev),
-                codec_state_sha1=state_sha1(codec),
-                hicora_vla_sha1=file_sha1(hv.__file__),
-                joint12_vla_sha1=file_sha1(jv.__file__),
-                keys_sha1=hashlib.sha1(np.ascontiguousarray(
-                    np.stack([epi, stp])).tobytes()).hexdigest()[:12])
-    json.dump(meta, open(f"{args.out}.meta.json", "w"), ensure_ascii=False,
-              indent=1)
-    hs = ",".join(f"h{t}" for t in save_taps)
-    print(f"\n  сохранено: {args.out}.{{{hs},q0hat,ktrue,split,codebooks}}"
-          f".npy и .meta.json")
-    print(f"  ключи sha {meta['keys_sha1']}")
+    # META ПЕРЕПИСЫВАЕТСЯ РЕЗУЛЬТАТОМ АУДИТА — атомарно, поверх уже
+    # сохранённой. Если аудит не выполнен, в meta остаётся drift=None и
+    # причина отказа.
+    meta = write_meta(drift)
+    if drift_error:
+        meta["drift_error"] = drift_error
+        tmp = f"{args.out}.meta.json.tmp"
+        json.dump(meta, open(tmp, "w"), ensure_ascii=False, indent=1)
+        os.replace(tmp, f"{args.out}.meta.json")
+    print(f"\n  meta обновлена; ключи sha {meta['keys_sha1']}")
     print("\n  ДАЛЬШЕ: --diagnose для выбора ранга и rho, затем K-11b с "
           "проверками\n  тождества. Обучение головы не начинать до "
           "тождества.")
