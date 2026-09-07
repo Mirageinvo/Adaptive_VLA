@@ -114,9 +114,10 @@ def select_arm(arms, tol=GRIP_TOL, min_seeds=SEL_SEEDS_MIN):
     корреляцию: голова и черновик мерены на одних эпизодах, их разброс общий,
     и такой гейт мог и отвергнуть годную конфигурацию, и принять негодную.
     """
-    rows = []
+    rows, skipped = [], []
     for key, runs in sorted(arms.items()):
         if len(runs) < min_seeds:
+            skipped.append((key, len(runs)))
             continue
         if any(r.get("grip_delta_hi") is None for r in runs):
             raise SystemExit(
@@ -132,11 +133,26 @@ def select_arm(arms, tol=GRIP_TOL, min_seeds=SEL_SEEDS_MIN):
                          ok=ok, score=0.5 * (pos + rot), n_seeds=len(runs)))
     good = [r for r in rows if r["ok"]]
     best = max(good, key=lambda r: r["score"]) if good else None
-    return best, sorted(rows, key=lambda r: -r["score"])
+    return best, sorted(rows, key=lambda r: -r["score"]), skipped
 
 
-def read_train(best, rows, probe_pos, oracle_pos):
-    """Чтение результата обучения относительно двух ориентиров."""
+def read_train(best, rows, probe_pos, oracle_pos, skipped=()):
+    """Чтение результата обучения относительно двух ориентиров.
+
+    ПРИЧИНА ОТСУТСТВИЯ ПОБЕДИТЕЛЯ НАЗЫВАЕТСЯ ТОЧНО. Прежняя версия при пустой
+    таблице печатала «ни одна конфигурация не прошла гейт по схвату», хотя на
+    деле ни одна конфигурация до гейта и не дошла: при одном сиде правило
+    отбора их отбрасывает. Сообщение выдавало нехватку сидов за провал
+    схвата — тот же класс ошибки, что мы ловим в измерениях.
+    """
+    if best is None and not rows:
+        why = (f" (пропущены из-за нехватки сидов: "
+               + ", ".join(f"{k} — {n}" for k, n in skipped) + ")"
+               ) if skipped else ""
+        return ("ОТБОР НЕ ПРОВОДИЛСЯ: ни одна конфигурация не набрала "
+                f"минимума в {SEL_SEEDS_MIN} сида{why}. Это НЕ провал гейта "
+                "по схвату и вообще не результат — прогон с одним сидом "
+                "годится только для проверки механики")
     if best is None:
         return ("НИ ОДНА КОНФИГУРАЦИЯ НЕ ПРОШЛА ГЕЙТ ПО СХВАТУ. Поза и "
                 "вращение здесь не важны: поправка, переворачивающая знак "
@@ -181,7 +197,7 @@ def selftest():
         "act/1e-4": [dict(pos=0.60, rot=0.60, grip_delta_hi=0.061),
                      dict(pos=0.60, rot=0.60, grip_delta_hi=0.001)],
     }
-    best, rows = select_arm(arms)
+    best, rows, _sk = select_arm(arms)
     # среднее по сидам: star/1e-4 даёт 0.31, star/1e-3 — 0.30
     assert best["key"] == "star/1e-4", best
     # КОНТРОЛЬ: по ЛУЧШЕМУ сиду победил бы star/1e-3 (0.50) — правило обязано
@@ -190,23 +206,23 @@ def selftest():
     # схват провален на одном сиде -> вся конфигурация не годится
     assert not [r for r in rows if r["key"] == "act/1e-4"][0]["ok"]
     # РОВНО НА ДОПУСКЕ проходит, чуть выше — нет
-    b_e, _ = select_arm({"e": [dict(pos=0.9, rot=0.9,
+    b_e, *_ = select_arm({"e": [dict(pos=0.9, rot=0.9,
                                     grip_delta_hi=GRIP_TOL)] * 2})
     assert b_e is not None
-    b_e2, _ = select_arm({"e": [dict(pos=0.9, rot=0.9,
+    b_e2, *_ = select_arm({"e": [dict(pos=0.9, rot=0.9,
                                      grip_delta_hi=GRIP_TOL * 1.01)] * 2})
     assert b_e2 is None
     # КОНТРОЛЬ ЕДИНИЦ: абсолютная доля ошибок схвата (около 2.5%) НЕ является
     # разницей и обязана проваливать гейт, если подставить её по ошибке
-    b_abs, _ = select_arm({"x": [dict(pos=0.9, rot=0.9,
+    b_abs, *_ = select_arm({"x": [dict(pos=0.9, rot=0.9,
                                       grip_delta_hi=0.025)] * 2})
     assert b_abs is None, "абсолютная величина принята вместо разницы"
     # конфигурация с одним сидом не участвует вовсе
-    b2, r2 = select_arm(dict(arms, solo=[dict(pos=0.99, rot=0.99,
+    b2, r2, _ = select_arm(dict(arms, solo=[dict(pos=0.99, rot=0.99,
                                               grip_delta_hi=0.0)]))
     assert b2["key"] == "star/1e-4" and "solo" not in [r["key"] for r in r2]
     # ни одной прошедшей -> None, а не молчаливый выбор
-    b3, _ = select_arm({"x": [dict(pos=0.9, rot=0.9, grip_delta_hi=0.9)] * 2})
+    b3, *_ = select_arm({"x": [dict(pos=0.9, rot=0.9, grip_delta_hi=0.9)] * 2})
     assert b3 is None
     # отсутствие интервала — ОТКАЗ, а не переход на точечную оценку
     try:
@@ -215,7 +231,19 @@ def selftest():
         pass
     else:
         raise AssertionError("конфигурация без интервала принята")
-    assert "НИ ОДНА" in read_train(None, [], 0.105, 0.904)
+    # ПРИЧИНА НАЗЫВАЕТСЯ ТОЧНО. Пустая таблица — это нехватка сидов, а не
+    # провал гейта; на смоук-прогоне с одним сидом прежняя версия печатала
+    # именно «не прошла гейт по схвату», то есть выдавала одну причину за
+    # другую.
+    t_none = read_train(None, [], 0.105, 0.904, skipped=[("star/1e-4", 1)])
+    assert "ОТБОР НЕ ПРОВОДИЛСЯ" in t_none and "нехватки сидов" in t_none
+    assert "НЕ провал гейта" in t_none, t_none
+    # а при непустой таблице без прошедших — действительно провал гейта
+    t_gate = read_train(None, [dict(key="x", pos=0.1, rot=0.1,
+                                    grip_delta_hi=0.9, ok=False, score=0.1,
+                                    n_seeds=2)], 0.105, 0.904)
+    assert "НИ ОДНА КОНФИГУРАЦИЯ НЕ ПРОШЛА ГЕЙТ" in t_gate, t_gate
+    assert "ОТБОР НЕ ПРОВОДИЛСЯ" not in t_gate
 
     # --- чтение ------------------------------------------------------------
     t = read_train(dict(key="k", pos=0.09, rot=0.09, n_seeds=2), [], 0.105,
@@ -286,7 +314,9 @@ def selftest():
           "среднему по сидам и НЕ выбрал бы лучший сид, гейт схвата считает "
           "ПАРНУЮ разницу и отвергает подставленную вместо неё абсолютную "
           "величину, отсутствие интервала — отказ, а не точечная оценка, "
-          "конфигурация с одним сидом не участвует, посторонний обучаемый "
+          "конфигурация с одним сидом не участвует и её отсутствие "
+          "называется нехваткой сидов, а не провалом гейта, посторонний "
+          "обучаемый "
           "параметр и полностью замороженная голова — отказ, потеря режет "
           "хвост чанка и видит исполняемые шаги")
 
@@ -713,7 +743,7 @@ def main() -> None:
                 torch.cuda.empty_cache()
 
     draft_grip = runs[0]["hist"][0]["val"]["star"]["draft"]["grip"]
-    best, rows = select_arm(arms_acc)
+    best, rows, skipped = select_arm(arms_acc)
     print(f"\n  сводка по конфигурациям (опора D(z*), среднее по сидам, "
           f"схват черновика {draft_grip:.1%}):")
     print(f"    {'конфигурация':>16}{'сидов':>7}{'поз':>8}{'вр':>8}"
@@ -725,7 +755,7 @@ def main() -> None:
     print(f"    (Δсхват — ВЕРХНЯЯ граница интервала ПАРНОЙ разницы "
           f"«голова минус черновик»,\n     допуск {GRIP_TOL:.1%}; худший сид "
           f"конфигурации)")
-    print(f"\n  {read_train(best, rows, probe_pos or 0.0, oracle_pos or 1.0)}")
+    print(f"\n  {read_train(best, rows, probe_pos or 0.0, oracle_pos or 1.0, skipped)}")
     print("  ЧИТАТЬ ТАК: доли относительно D(z*) сопоставимы с зондом и "
           "оракулом.\n  Доли относительно A* сопоставимы между собой, но "
           "оракул там НЕ потолок:\n  непрерывная поправка в решётку кодов "
@@ -741,7 +771,8 @@ def main() -> None:
                seeds=seeds, lrs=lrs, targets=targets,
                probe_pos=probe_pos, oracle_pos=oracle_pos,
                draft_grip=draft_grip, runs=runs,
-               selection=rows, best=best, grip_tol=GRIP_TOL,
+               selection=rows, best=best, skipped=skipped,
+               grip_tol=GRIP_TOL,
                array_sha1=arr_sha,
                basis_sha1=k11a.file_sha1(basis_p),
                rho_sha1=k11a.file_sha1(rho_p),
