@@ -1,0 +1,381 @@
+"""K-11q. Откуда 1.9% невязки между кэшированным h24 и живым проходом.
+
+ПОВОД. K-11b (8a5897441056) измерил относительную невязку 1.88e-02 при
+контролях 0.96 и 1.38. Контроль пройден с запасом в полсотни раз, то есть
+кэш заведомо не подменён. Но 1.9% — это на два порядка больше шума хранения
+fp16 (относительная точность около 5e-4), и списывать такую величину на
+округление нельзя.
+
+ДВЕ ГИПОТЕЗЫ, КОТОРЫЕ НАДО РАЗДЕЛИТЬ.
+
+  A. Состав батча и набивка. Кэш собран батчами по 16 из СОСЕДНИХ наблюдений
+     одного эпизода — длины подсказок близки, набивки мало. Проверка K-11b
+     берёт по одному наблюдению из РАЗНЫХ эпизодов и задач, длины подсказок
+     разные, набивки много. Тогда 1.9% — цена формы, одинаковая для любых
+     двух разных разбиений, и кэш пригоден.
+
+  B. Наблюдение зависит от соседей по батчу. Если `position_ids` при левой
+     набивке считаются не так или внимание протекает между примерами, то
+     h24 одного и того же наблюдения МЕНЯЕТСЯ от того, с кем оно поехало.
+     Тогда кэшированный вход не соответствует никакому одному режиму
+     исполнения, и зонд с обучением читают величину, которой у HiCoRA в
+     работе не будет.
+
+РЕШАЮЩИЙ ОПЫТ. Одно и то же наблюдение прогоняется трижды: в одиночку, с
+набором соседей A и с набором соседей B. Сравниваются ЕГО СОБСТВЕННЫЕ
+строки h24.
+
+  - если одиночный, A и B дают между собой ~1e-4, а с кэшем ~1.9% —
+    гипотеза A неполна: дело не в составе батча, а в чём-то, отличающем
+    сбор от проверки;
+  - если A и B расходятся между собой на те же ~1.9% — верна гипотеза B, и
+    кэш описывает вход лишь с точностью до состава батча;
+  - если одиночный проход совпадает с кэшем гораздо лучше батчевого, значит
+    невязку создаёт набивка, и мерить вход надо без неё.
+
+Скрипт НИЧЕГО не записывает в кэш и не трогает отпечатки: он только меряет.
+
+Запуск:
+    python3 experiments/k11q_tap_noise.py --selftest
+
+    PYTHONPATH=$HOME/LIBERO MUJOCO_GL=egl \\
+    python3 experiments/k11q_tap_noise.py --ckpt <base> \\
+        --cache data/k11a_joint12 --joint-ckpt data/k9d_ep3.pt \\
+        --device cuda:1
+"""
+
+import argparse
+import copy
+import json
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import k11a_build_hicora_cache as k11a  # noqa: E402
+import k11b_hicora_identity as k11b  # noqa: E402
+
+TAPS = (12, 18, 24)
+
+
+def rel_rms(a, b):
+    """Относительная невязка в тех же единицах, что в K-11b."""
+    x = np.asarray(a, np.float64)
+    y = np.asarray(b, np.float64)
+    if x.shape != y.shape:
+        raise SystemExit(f"формы {x.shape} и {y.shape}")
+    den = float(np.sqrt((y ** 2).mean()))
+    if den <= 0:
+        raise SystemExit("опора нулевая")
+    return float(np.sqrt(((x - y) ** 2).mean()) / den)
+
+
+def read_noise(solo_vs_cache, batch_vs_cache, a_vs_b, solo_vs_a,
+               storage=5e-4, near=3.0):
+    """Пре-регистрированное чтение: какая гипотеза подтвердилась.
+
+    Пороги названы ДО прогона. `near` — во сколько раз величины должны
+    отличаться, чтобы считать их разными: сравнивать точные числа тут
+    бессмысленно, они сами шумные.
+    """
+    if a_vs_b > batch_vs_cache / near:
+        return "B", (
+            f"ГИПОТЕЗА B: одно и то же наблюдение с разными соседями даёт "
+            f"расхождение {a_vs_b:.2e}, сопоставимое с расхождением против "
+            f"кэша {batch_vs_cache:.2e}. Значит h24 зависит от состава "
+            f"батча, и кэшированный вход определён лишь с точностью до "
+            f"этого состава. Ни зонд, ни обучение не читают ту величину, "
+            f"которую HiCoRA увидит в работе поодиночке")
+    if solo_vs_cache < batch_vs_cache / near:
+        return "padding", (
+            f"НАБИВКА: одиночный проход совпадает с кэшем на "
+            f"{solo_vs_cache:.2e}, а батчевый лишь на {batch_vs_cache:.2e}. "
+            f"Невязку создаёт набивка разнородных подсказок, а не кэш. "
+            f"Вход надо мерить и обучать без неё либо с однородными батчами")
+    if solo_vs_cache <= storage * near:
+        return "storage", (
+            f"ХРАНЕНИЕ: одиночный проход совпадает с кэшем на "
+            f"{solo_vs_cache:.2e}, что на уровне округления fp16. Кэш верен, "
+            f"вся невязка K-11b — цена формы батча")
+    return "unexplained", (
+        f"НЕ ОБЪЯСНЕНО: одиночный проход расходится с кэшем на "
+        f"{solo_vs_cache:.2e} при шуме хранения {storage:.0e}, а соседи "
+        f"влияют лишь на {a_vs_b:.2e}. Различие между сбором и проверкой "
+        f"есть, но оно не в составе батча и не в округлении — искать в "
+        f"подготовке входа: состояние, картинка, подсказка, офсет")
+
+
+def selftest():
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(4, 16, 32))
+    assert rel_rms(x, x) == 0.0
+    # величина относительная: общий масштаб не влияет
+    y = x + 0.01 * rng.normal(size=x.shape)
+    assert abs(rel_rms(x, y) - rel_rms(10 * x, 10 * y)) < 1e-12
+    # и растёт с расхождением
+    assert rel_rms(x + 0.1, x) > rel_rms(x + 0.01, x)
+    try:
+        rel_rms(x[:2], x)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("разные формы приняты")
+
+    # --- чтение вердикта ----------------------------------------------------
+    # соседи влияют так же сильно, как кэш расходится -> B
+    tag, _ = read_noise(solo_vs_cache=1.8e-2, batch_vs_cache=1.9e-2,
+                        a_vs_b=1.8e-2, solo_vs_a=1.8e-2)
+    assert tag == "B", tag
+    # одиночный проход много ближе к кэшу -> набивка
+    tag, _ = read_noise(1e-4, 1.9e-2, 1e-4, 1.9e-2)
+    assert tag in ("padding", "storage"), tag
+    # одиночный совпал с кэшем на уровне fp16, соседи не влияют -> хранение
+    tag, _ = read_noise(3e-4, 3.5e-4, 1e-5, 1e-5)
+    assert tag == "storage", tag
+    # ничего не объясняет
+    tag, txt = read_noise(1.8e-2, 1.9e-2, 1e-5, 1e-5)
+    assert tag == "unexplained" and "подготовке входа" in txt, tag
+    # КОНТРОЛЬ: вердикт «хранение» не должен выдаваться при большой невязке
+    for s_ in (1e-2, 5e-3):
+        assert read_noise(s_, s_ * 1.05, 1e-6, 1e-6)[0] != "storage"
+
+    print("самопроверка k11q пройдена (версия «соседи по батчу»): "
+          "относительная невязка не зависит от масштаба и растёт с "
+          "расхождением, чтение различает влияние соседей, набивку, "
+          "округление хранения и необъяснённый остаток, и не называет "
+          "округлением невязку в проценты")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--ckpt")
+    ap.add_argument("--cache")
+    ap.add_argument("--joint-ckpt")
+    ap.add_argument("--root", default="third_party/actioncodec")
+    ap.add_argument("--cfg-path", default="config/eval/bar.yaml")
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--dtype", default="float16")
+    ap.add_argument("--depth", type=int, default=12)
+    ap.add_argument("--n-comp", type=int, default=7,
+                    help="соседей в каждом из двух наборов")
+    ap.add_argument("--n-target", type=int, default=3,
+                    help="сколько разных наблюдений проверить")
+    ap.add_argument("--out", default="data/k11q_tap_noise.json")
+    args = ap.parse_args()
+
+    if args.selftest:
+        selftest()
+        return
+    selftest()
+
+    for f in ("cache", "joint_ckpt", "out"):
+        if getattr(args, f):
+            setattr(args, f, os.path.abspath(getattr(args, f)))
+    args.root = os.path.abspath(args.root)
+    sys.path.insert(0, args.root)
+    print(f"k11q sha1 {k11a.file_sha1(__file__)}")
+    for need, why in ((args.ckpt, "--ckpt"), (args.cache, "--cache"),
+                      (args.joint_ckpt, "--joint-ckpt")):
+        if not need:
+            raise SystemExit(f"нужен {why}")
+
+    import torch
+    import pyarrow.parquet as pq
+    from huggingface_hub import hf_hub_download
+    import actioncodec  # noqa: F401
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+    if "action_codec" not in CONFIG_MAPPING:
+        raise SystemExit("тип «action_codec» не зарегистрирован")
+    from smolvla.bar import SmolVLABlockwiseAR
+    from utils import (STATE_Q01, STATE_Q99, VisionLanguageActionProcessor,
+                       dict_apply, get_cfg, process_state, prompt_template,
+                       seed_everything)
+    from joint12_vla import make_joint12_class
+    import hicora_vla as hv
+
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        raise SystemExit("контейнер потерял видеокарты")
+    seed_everything(0)
+    dev, dt = torch.device(args.device), getattr(torch, args.dtype)
+    cfg = get_cfg(os.path.join(args.root, args.cfg_path))
+    cfg.TRAINING.ckpt_dir = args.ckpt
+    cfg.MODEL.vlm.kwargs.pretrained_model_name_or_path = args.ckpt
+
+    meta = json.load(open(args.cache + ".meta.json"))
+    ds_repo, ds_rev = k11b.dataset_source(meta)
+    tap = max(meta["saved_taps"])
+
+    Cls = make_joint12_class(SmolVLABlockwiseAR)
+    model = Cls.from_pretrained(**cfg.MODEL.vlm.kwargs).to(dev, dt).eval()
+    proc = VisionLanguageActionProcessor.from_pretrained(
+        args.ckpt, trust_remote_code=True, mode="discrete")
+    model.init_joint_fast(depth=args.depth, head_dtype=dt)
+    res_norm = copy.deepcopy(model.action_expert.norm)
+    # ЗАГРУЗКА ДОСЛОВНО КАК В K-11a. Веса Joint12 перезаписывают
+    # `bos_embedding`, участвующий во всех 24 шагах внимания, поэтому h24 от
+    # них зависит напрямую: частично или иначе применённый чекпойнт дал бы
+    # правдоподобные, но НЕ СОПОСТАВИМЫЕ с кэшем числа, а весь смысл этого
+    # скрипта — в сопоставимости.
+    wsha = k11a.file_sha1(args.joint_ckpt)
+    src_sha = (meta.get("source") or {}).get("weights_sha1")
+    if src_sha != wsha:
+        raise SystemExit(f"кэш собран весами sha {src_sha}, а здесь {wsha}")
+    obj = torch.load(args.joint_ckpt, map_location="cpu", weights_only=False)
+    if int(obj.get("depth", -1)) != args.depth:
+        raise SystemExit(f"чекпойнт глубины {obj.get('depth')}, задано "
+                         f"{args.depth}")
+    state = obj["state"]
+    own = dict(model.named_parameters())
+    stray = [k for k in state
+             if not any(k.startswith(pp) or k == pp.rstrip(".")
+                        for pp in model.trainable_prefixes)]
+    missing = [k for k in own if own[k].requires_grad and k not in state]
+    if stray or missing:
+        raise SystemExit(f"ключей вне белого списка {len(stray)}, "
+                         f"недостающих обучаемых {len(missing)}")
+    with torch.no_grad():
+        for k, v in state.items():
+            if tuple(own[k].shape) != tuple(v.shape):
+                raise SystemExit(f"форма {k}")
+            own[k].data = v.to(dev, torch.float32)
+    model.to_fp32_trainable()
+    not32 = [k for k in state if own[k].dtype != torch.float32]
+    if not32:
+        raise SystemExit(f"{len(not32)} загруженных весов не в fp32")
+    print(f"  веса Joint12 sha {wsha} совпали с кэшем, {len(state)} тензоров "
+          f"в fp32")
+    model.eval()
+    model.__class__ = hv.make_hicora_class(type(model))
+    ac = proc.action_processor
+    codec = ac if hasattr(ac, "vq") else getattr(ac, "codec", None)
+    with torch.no_grad():
+        idx = torch.arange(int(codec.vocab_size), device=dev).unsqueeze(0)
+        E = torch.stack([q.out_project(q.decode_code(idx))[0]
+                         for q in codec.vq.quantizers]).float()
+    model.set_codebooks(E)
+    model.set_res_norm(res_norm.to(dev))
+    model.taps, model.q0_depth = TAPS, args.depth
+    model.n_layers_total = len(model.action_expert.layers)
+
+    d = np.load(meta["cache"], allow_pickle=True)
+    IMG = np.load(meta["cache"] + ".images.npy", mmap_mode="r")
+    offs = d["pos_offset"].astype(np.int64)
+    epi, stp, tsk = d["episode"], d["step"], d["task"]
+    H = np.load(f"{args.cache}.h{tap}.npy", mmap_mode="r")
+
+    def states_for(idxs):
+        st = np.zeros((len(idxs), len(STATE_Q01)), np.float64)
+        for j, gi in enumerate(idxs):
+            e = int(epi[gi])
+            f = hf_hub_download(
+                ds_repo, f"data/chunk-{e // 1000:03d}/episode_{e:06d}.parquet",
+                repo_type="dataset", revision=ds_rev)
+            S_ = np.asarray(pq.read_table(f).column("state").to_pylist(),
+                            np.float32)
+            st[j] = S_[int(stp[gi])] if S_.shape[1] == len(STATE_Q01) \
+                else process_state(S_[int(stp[gi])][None])[0]
+        return (st - STATE_Q01) / (STATE_Q99 - STATE_Q01) * 2.0 - 1.0
+
+    def run(sel, po):
+        """h24 для набора наблюдений и длины подсказок до набивки."""
+        st_n = states_for(sel)
+        image = torch.from_numpy(np.asarray(IMG[sel]))
+        msgs = []
+        for j, gi in enumerate(sel):
+            m = prompt_template(
+                st_n[j], None, str(tsk[gi]),
+                mode=cfg.MODEL.vla_processor.kwargs.mode,
+                action_vocab_size=cfg.MODEL.action_processor.vocab_size,
+                action_token_len=cfg.MODEL.action_processor.token_len)
+            m[1]["content"] = m[1]["content"][1:]
+            msgs.append(m)
+        texts = proc.apply_chat_template(msgs, add_generation_prompt=True)
+        b = proc(text=texts, images=[[image[i].numpy()]
+                                     for i in range(len(sel))],
+                 return_tensors="pt", padding=True, padding_side="left",
+                 action_processor_kwargs={"embodiment_ids": 0})
+        b = dict_apply(lambda x: x.to(dev, dt), b)
+        am = b.get("attention_mask")
+        lens = (am.sum(-1).detach().cpu().numpy().tolist()
+                if am is not None else None)
+        with torch.no_grad(), torch.autocast(device_type=dev.type, dtype=dt):
+            v, pp = model.build_inputs(position_offset=int(po), **b)
+            tp = model.forward_taps(vlm_inputs_embeds=v, attention_mask=am,
+                                    position_ids=pp)
+        return tp[tap].float().cpu().numpy().astype(np.float16), lens
+
+    # --- выбор: одна цель, два непересекающихся набора соседей -------------
+    rng = np.random.default_rng(3)
+    po = int(rng.choice(sorted({int(v) for v in offs})))
+    cand = np.where(offs == po)[0]
+    eps = np.unique(epi[cand])
+    if len(eps) < 2 * args.n_comp + args.n_target:
+        raise SystemExit("мало эпизодов на этом офсете")
+    order = rng.permutation(eps)
+    tgt_eps = order[:args.n_target]
+    comp_a = order[args.n_target:args.n_target + args.n_comp]
+    comp_b = order[args.n_target + args.n_comp:
+                   args.n_target + 2 * args.n_comp]
+
+    def one_per_ep(ep_list):
+        out = []
+        for e in ep_list:
+            same = cand[epi[cand] == e]
+            out.append(int(same[rng.integers(0, len(same))]))
+        return np.asarray(out)
+
+    A = one_per_ep(comp_a)
+    B = one_per_ep(comp_b)
+    print(f"  офсет {po}, целей {args.n_target}, соседей по {args.n_comp} "
+          f"в двух непересекающихся наборах, все из разных эпизодов")
+
+    rows = []
+    for t in one_per_ep(tgt_eps):
+        cache_t = np.asarray(H[[t]])[0]
+        solo, len_solo = run(np.asarray([t]), po)
+        ha, len_a = run(np.concatenate([[t], A]), po)
+        hb, len_b = run(np.concatenate([[t], B]), po)
+        r = dict(
+            idx=int(t), episode=int(epi[t]), task=str(tsk[t]),
+            solo_vs_cache=rel_rms(solo[0], cache_t),
+            batchA_vs_cache=rel_rms(ha[0], cache_t),
+            batchB_vs_cache=rel_rms(hb[0], cache_t),
+            A_vs_B=rel_rms(ha[0], hb[0]),
+            solo_vs_A=rel_rms(solo[0], ha[0]),
+            len_solo=len_solo, len_A=len_a, len_B=len_b)
+        rows.append(r)
+        print(f"    набл. {t} (эпизод {r['episode']}): одиночно/кэш "
+              f"{r['solo_vs_cache']:.2e}, батчА/кэш {r['batchA_vs_cache']:.2e}, "
+              f"батчБ/кэш {r['batchB_vs_cache']:.2e}, А/Б {r['A_vs_B']:.2e}, "
+              f"одиночно/А {r['solo_vs_A']:.2e}")
+        print(f"      длины после набивки: одиночно {len_solo}, "
+              f"в А {sorted(set(len_a))[:4]}..., в Б {sorted(set(len_b))[:4]}...")
+
+    med = lambda k: float(np.median([r[k] for r in rows]))
+    tag, verdict = read_noise(med("solo_vs_cache"), med("batchA_vs_cache"),
+                              med("A_vs_B"), med("solo_vs_A"))
+    print(f"\n  медианы: одиночно/кэш {med('solo_vs_cache'):.2e}, "
+          f"батч/кэш {med('batchA_vs_cache'):.2e}, "
+          f"А/Б {med('A_vs_B'):.2e}, одиночно/А {med('solo_vs_A'):.2e}")
+    print(f"\n  {verdict}")
+    print("  ЧИТАТЬ ТАК: это диагностика ВХОДА, а не тождества и не "
+          "качества.\n  Ни один исход не отменяет K-11b: контроль подмены "
+          "там пройден с запасом\n  в полсотни раз, речь только о том, "
+          "насколько точно кэш описывает вход.")
+
+    out = dict(script_sha1=k11a.file_sha1(__file__), cache=args.cache,
+               tap=int(tap), offset=po, rows=rows,
+               medians={k: med(k) for k in
+                        ("solo_vs_cache", "batchA_vs_cache",
+                         "batchB_vs_cache", "A_vs_B", "solo_vs_A")},
+               tag=tag, verdict=verdict)
+    tmp = args.out + ".tmp"
+    json.dump(out, open(tmp, "w"), ensure_ascii=False, indent=1)
+    os.replace(tmp, args.out)
+    print(f"\n  сохранено: {args.out}")
+
+
+if __name__ == "__main__":
+    main()
