@@ -310,7 +310,16 @@ def pick_rank(gains, grip=None, grip_draft=None, ranks=PCA_RANKS,
 
 
 def read_rank(rank, gains, grip=None, grip_draft=None, ranks=PCA_RANKS,
-              target=GAIN_TARGET, delta=GRIP_DELTA):
+              target=GAIN_TARGET, delta=GRIP_DELTA, gains_unclamped=None):
+    """Вердикт по рангу. РАЗЛИЧАЕТ ДВЕ ПРИЧИНЫ ОТКАЗА.
+
+    Прежняя версия при недостижении порога печатала «остаток не описывается
+    низкоранговым базисом» независимо от того, чем именно он не описывается.
+    Но если НЕОГРАНИЧЕННАЯ проекция порог берёт, а ограниченная нет, то
+    подпространство найдено, и связывает нас предел амплитуды — это другой
+    вывод и другое решение. Смешивать их значит закрывать ветку не по той
+    причине.
+    """
     top = max(int(x) for x in ranks)
     if rank is not None:
         g = gains[rank]
@@ -322,6 +331,22 @@ def read_rank(rank, gains, grip=None, grip_draft=None, ranks=PCA_RANKS,
                 f"по положению и {g['rot']:.1%} по вращению на шагах 0-7 "
                 f"(порог {target:.0%}, зафиксирован до прогона){gr} — брать "
                 f"r={rank}")
+    # ПРИЧИНА ОТКАЗА: ранг или амплитуда.
+    if gains_unclamped:
+        unc = [r for r in sorted(gains_unclamped)
+               if (gains_unclamped[r].get("pos") or 0) >= target
+               and (gains_unclamped[r].get("rot") or 0) >= target]
+        if unc:
+            r0 = min(unc)
+            gu, gc = gains_unclamped[r0], gains.get(r0, {})
+            return (f"РАНГА ХВАТАЕТ, НЕ ХВАТАЕТ АМПЛИТУДЫ. Неограниченная "
+                    f"проекция ранга {r0} возвращает {gu['pos']:.1%} по "
+                    f"положению и {gu['rot']:.1%} по вращению, то есть "
+                    f"подпространство найдено. Ограничение rho срезает до "
+                    f"{(gc.get('pos') or 0):.1%} и {(gc.get('rot') or 0):.1%}. "
+                    f"Это НЕ стоп-условие «остаток не низкоранговый»: решать "
+                    f"надо про предел амплитуды, измерив зависимость от "
+                    f"процентиля (--rho-pct-sweep), а не закрывать ветку")
     if grip is not None and grip_draft is not None:
         blocked = [r for r in sorted(gains)
                    if gains[r].get("pos") is not None
@@ -772,10 +797,56 @@ def diagnose(args):
     print(f"    {'черновик':>8}{e_z0['pos']:>10.5f}{'0.0%':>8}{'0.0%':>12}"
           f"{e_z0['rot']:>10.5f}{'0.0%':>8}{e_z0['grip']:>7.1%}")
 
+    # --- РАЗВЁРТКА ПО ПРЕДЕЛУ АМПЛИТУДЫ ------------------------------------
+    # Отвечает на вопрос, которого не различало прежнее правило чтения:
+    # упираемся ли мы в РАНГ или в АМПЛИТУДУ. Выбранный --rho-pct при этом
+    # не меняется: развёртка описывает, а не решает.
+    sweep = {}
+    if args.rho_pct_sweep:
+        pcts = [float(x) for x in str(args.rho_pct_sweep).split(",") if x]
+        print(f"\n  развёртка по пределу амплитуды: процентили {pcts}")
+        rho_by_pct = {q: np.percentile(coef, q, axis=0) for q in pcts}
+        acc_s = {(q, r): {} for q in pcts for r in ranks}
+        for i, j in plan_batches(len(va_s), args.batch):
+            s_ = va_s[i:j]
+            with torch.no_grad():
+                z0b = z_of(q0[s_])
+                zsb = z_of(Kt[s_, 0, :], Kt[s_])
+                As_n = codec._decode(zsb, embodiment_ids=0)[0][
+                    ..., :7].float().cpu().numpy()
+                rb = zsb - z0b
+                for rk in ranks:
+                    Br = Bt[:, :rk].to(rb.dtype)
+                    cf = rb @ Br
+                    for q in pcts:
+                        lim = torch.as_tensor(rho_by_pct[q][:rk],
+                                              dtype=cf.dtype, device=cf.device)
+                        Ar = codec._decode(
+                            z0b + torch.clamp(cf, -lim, lim) @ Br.T,
+                            embodiment_ids=0)[0][..., :7].float()
+                        err_add(acc_s[(q, rk)],
+                                err_sums(Ar.cpu().numpy(), As_n))
+        print(f"    {'ранг':>6}" + "".join(f"{('p' + str(q)):>16}"
+                                           for q in pcts))
+        for rk in ranks:
+            row = f"    {rk:>6}"
+            for q in pcts:
+                er = err_finish(acc_s[(q, rk)])
+                gp = gain(e_z0["pos"], er["pos"], 0.0)
+                gr_ = gain(e_z0["rot"], er["rot"], 0.0)
+                sweep[f"{q}_{rk}"] = dict(pos=gp, rot=gr_, grip=er["grip"])
+                row += f"{gp:>8.1%}{gr_:>8.1%}"
+            print(row)
+        print("    (в каждой паре: доля по положению и по вращению)")
+        print(f"    Читать так: если доля растёт с процентилем, связывает "
+              f"АМПЛИТУДА,\n    а не ранг. Выбранный --rho-pct "
+              f"({args.rho_pct}) от этой таблицы НЕ меняется:\n    менять "
+              f"его по результату значило бы подгонять правило под данные.")
+
     rank = pick_rank(gains, grip=grips, grip_draft=e_z0["grip"], d_latent=D)
     rank_u = pick_rank(gains_u, grip=grips_u, grip_draft=e_z0["grip"],
                        d_latent=D)
-    print(f"\n  {read_rank(rank, gains, grip=grips, grip_draft=e_z0['grip'])}")
+    print(f"\n  {read_rank(rank, gains, grip=grips, grip_draft=e_z0['grip'], gains_unclamped=gains_u)}")
     if rank_u != rank:
         print(f"  БЕЗ ограничения был бы выбран ранг {rank_u} — разница и "
               f"есть цена предела амплитуды.")
@@ -803,6 +874,7 @@ def diagnose(args):
                grip={str(k): v for k, v in grips.items()},
                grip_unclamped={str(k): v for k, v in grips_u.items()},
                saturation={str(k): v for k, v in sat_stats.items()},
+               rho_sweep=sweep,
                err_draft=e_z0, rank=rank, rank_unclamped=rank_u,
                gain_target=GAIN_TARGET, grip_delta=GRIP_DELTA,
                rho=None if rho is None else rho.tolist(),
@@ -847,6 +919,11 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--diag-n", type=int, default=20000)
     ap.add_argument("--rho-pct", type=float, default=95.0)
+    ap.add_argument("--rho-pct-sweep", default=None,
+                    help="процентили через запятую: посчитать долю "
+                         "возвращённого улучшения при каждом пределе. "
+                         "Отвечает на вопрос «ранг или амплитуда», не меняя "
+                         "выбранного --rho-pct")
     ap.add_argument("--dataset-repo", default=DATASET_REPO)
     ap.add_argument("--dataset-revision", default=DATASET_REV,
                     help="ревизия датасета; обязана совпасть с той, на "
