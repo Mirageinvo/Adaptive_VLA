@@ -658,14 +658,18 @@ def selftest():
     # --- строгая сверка происхождения повторного аудита ---------------------
     prod = dict(n_obs=150, d_hidden=768, d_latent=512, depth=12,
                 q0_source="joint12", taps=[12, 18, 24], ckpt="A/B",
-                cache="c.npz", vocab=1024, dataset_revision="v2.0")
+                cache="c.npz", vocab=1024, dataset_revision="v2.0",
+                keys_sha1="kkkk")
     assert check_drift_only(prod, dict(prod))
     # каждое поле по отдельности обязано ловиться: раньше сверялись только
     # n_obs и d_hidden, и аудит другой глубиной проходил молча
     for k, other in (("depth", 24), ("q0_source", "readout"),
                      ("taps", [12, 24]), ("ckpt", "X/Y"), ("cache", "d.npz"),
                      ("vocab", 2048), ("dataset_revision", "v1.0"),
-                     ("d_latent", 256), ("n_obs", 149), ("d_hidden", 512)):
+                     ("d_latent", 256), ("n_obs", 149), ("d_hidden", 512),
+                     # подмена самого кэша K-9a на месте: путь и размеры те
+                     # же, содержимое другое
+                     ("keys_sha1", "ДРУГОЙ")):
         try:
             check_drift_only(prod, dict(prod, **{k: other}))
         except SystemExit:
@@ -1582,11 +1586,20 @@ def main() -> None:
                 "--drift-only с --drift-n 0 не выполнил бы аудит вовсе, но "
                 "переписал бы meta и завершился успешно. Задайте --drift-n "
                 "больше нуля")
+        # `keys_sha1` ОБЯЗАТЕЛЕН: без него кэш K-9a можно подменить на месте,
+        # сохранив путь, число наблюдений и размеры, и повторный аудит этого
+        # не заметил бы. То же про sha манифеста разбиения.
         check_drift_only(prev, dict(
             n_obs=int(N), d_hidden=int(D_H), d_latent=int(D_Z),
             depth=int(args.depth), q0_source=str(args.q0_source),
             taps=list(TAPS), ckpt=str(args.ckpt), cache=str(args.cache),
-            vocab=int(V), dataset_revision=str(args.dataset_revision)))
+            vocab=int(V), dataset_revision=str(args.dataset_revision),
+            keys_sha1=str(keys_sha)))
+        prev_man = (prev.get("manifest") or {}).get("sha1")
+        if prev_man != man_info.get("sha1"):
+            raise SystemExit(
+                f"манифест разбиения sha {man_info.get('sha1')}, а кэш "
+                f"собран с {prev_man}: train и val могли разъехаться")
         # ЧЕКПОЙНТ ЧЕРНОВИКА СВЕРЯЕТСЯ ПО SHA ФАЙЛА, а не по пути: одно имя
         # может указывать на другую эпоху обучения.
         prev_src = prev.get("source") or {}
@@ -1837,14 +1850,22 @@ def main() -> None:
         # K-11b увидел бы свежие sha и принял кэш, собранный другим кодом.
         # Аудит меняет только собственные поля и свои отпечатки.
         meta = json.load(open(f"{args.out}.meta.json"))
-        meta["drift"] = drift
-        meta["drift_error"] = drift_error
-        # БЛОК АУДИТА ПИШЕТСЯ ТОЛЬКО ПРИ ВЫПОЛНЕННОМ АУДИТЕ. Прежде он
-        # записывался всегда: при пропуске (например `--drift-n 0`) в meta
-        # оставался `drift: null`, но рядом стоял `drift_audit` со свежими
-        # sha, и следующий шаг видел признак проведённой проверки там, где
-        # её не было.
-        if drift is not None:
+        # БЛОК АУДИТА ПИШЕТСЯ ТОЛЬКО ПРИ ВЫПОЛНЕННОМ АУДИТЕ, А ПРИ НЕУДАЧЕ
+        # УДАЛЯЕТСЯ. Прежде он записывался всегда: при пропуске (например
+        # `--drift-n 0`) в meta оставался `drift: null`, но рядом стоял
+        # `drift_audit` со свежими sha. Хуже того, после НЕудачного повтора
+        # рядом с пустым дрейфом оставался СТАРЫЙ успешный блок, и следующий
+        # шаг видел признак проведённой проверки там, где её не было.
+        #
+        # ПОРЯДОК ЗНАЧИМ: причина отказа выставляется ДО записи в meta.
+        # Прежде `meta["drift_error"]` присваивалось раньше, чем возникала
+        # строка «аудит не дал результата», и она в файл не попадала.
+        if drift is None:
+            meta.pop("drift_audit", None)
+            if not drift_error:
+                drift_error = ("аудит не дал результата и не сообщил об "
+                               "ошибке — код прошёл мимо измерения")
+        else:
             meta["drift_audit"] = dict(
                 script_sha1=sha, n=args.drift_n, batch=args.batch,
                 device=args.device, seed=1,
@@ -1852,9 +1873,8 @@ def main() -> None:
                 joint12_vla_sha1=file_sha1(jv.__file__),
                 joint_ckpt_sha1=(src_meta.get("weights_sha1")
                                  if src_meta else None))
-        elif not drift_error:
-            drift_error = ("аудит не дал результата и не сообщил об ошибке — "
-                           "код прошёл мимо измерения")
+        meta["drift"] = drift
+        meta["drift_error"] = drift_error
     else:
         meta = write_meta(drift)
         meta["drift_error"] = drift_error

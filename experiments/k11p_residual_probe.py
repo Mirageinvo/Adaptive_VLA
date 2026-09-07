@@ -59,6 +59,12 @@ INNER_FRAC = 0.2
 # Пре-регистрированный допуск маршрутизации: схват варианта «both» не
 # должен быть хуже варианта «z0» больше чем на полпроцентного пункта.
 GRIP_TOL = 0.005
+# Потолок допуска и минимум отношения контроля, с которыми зонд соглашается
+# принять заверение входа. Заверение, сделанное более снисходительными
+# порогами, отвергается: иначе строгость проверки задавал бы тот, кто её
+# запускал, а не протокол.
+TAP_TOL_MAX = 0.05
+TAP_RATIO_MIN = 10.0
 
 
 # --------------------------------------------------------------------------
@@ -279,42 +285,83 @@ def read_source(gain_both, gain_oracle):
 
 
 # --------------------------------------------------------------------------
-def check_stamp(stamp, arrays, res_norm_sha, tap, cache_meta_sha):
+def check_stamp(stamp, arrays, res_norm_sha, tap, cache_meta_sha,
+                basis_sha, rho_sha, k11b_sha, batches=(1, 10),
+                tol_max=None, ratio_min=None):
     """Зонд обязан читать РОВНО те файлы, на которых K-11b сверил вход.
 
     Тождество проверяет ВЫХОД и при dz == 0 от h24 не зависит вовсе. Единая
     точка, где подтверждается правильность позднего ВХОДА, — сверка живого
     прохода с кэшем в K-11b. Она действительна только для файлов, лежавших
-    на диске в тот момент, поэтому здесь требуется совпадение их отпечатков
-    и sha `res_norm`. Без этого зонд мог бы исследовать другой отвод или
-    другую норму, а вывод об источнике относился бы к другому входу.
+    на диске в тот момент, и только если её саму провела текущая версия
+    K-11b утверждёнными порогами.
+
+    ПРЕЖНЯЯ ВЕРСИЯ ЭТОЙ ФУНКЦИИ БЫЛА FAIL-OPEN. Она не смотрела ни на версию
+    заверителя, ни на пороги, ни на отпечатки базиса и rho, ни на исход
+    тождества. Отпечаток со старым `script_sha1`, чужими basis/rho,
+    `tap_tol=999` и `live_vs_cache_raw.ok=False` принимался. Практическое
+    следствие: после `--diagnose --force` можно было подменить пару
+    basis/rho вместе с диагностикой, а зонд принял бы её по старому
+    заверению.
     """
-    need = ("res_norm_sha1", "arrays", "tap", "cache_meta_sha1")
+    tol_max = TAP_TOL_MAX if tol_max is None else tol_max
+    ratio_min = TAP_RATIO_MIN if ratio_min is None else ratio_min
+    need = ("verified_by", "script_sha1", "identity_ok", "batches",
+            "res_norm_sha1", "arrays", "tap", "cache_meta_sha1",
+            "basis_sha1", "rho_sha1", "tap_tol", "tap_ratio",
+            "live_vs_cache_raw", "live_vs_cache_normed")
     miss = [k for k in need if stamp.get(k) is None]
     if miss:
         raise SystemExit(
             f"в отпечатках нет полей {miss}: файл собран версией K-11b, "
-            f"которая не сверяла живой проход с кэшем. Перезапустите K-11b")
+            f"которая не заверяла вход полностью. Перезапустите K-11b")
+    if stamp["verified_by"] != "k11b":
+        raise SystemExit(f"отпечатки заверены «{stamp['verified_by']}», а не "
+                         f"K-11b")
+    if stamp["script_sha1"] != k11b_sha:
+        raise SystemExit(
+            f"вход заверён K-11b версии {stamp['script_sha1']}, а сейчас на "
+            f"диске {k11b_sha}: заверение относится к другой проверке")
+    if not stamp["identity_ok"]:
+        raise SystemExit("в отпечатках тождество отмечено как НЕ выполненное")
+    got_b = sorted(int(x) for x in stamp["batches"])
+    if not set(int(x) for x in batches) <= set(got_b):
+        raise SystemExit(f"тождество проверено на батчах {got_b}, требуются "
+                         f"{sorted(batches)}")
+    if float(stamp["tap_tol"]) > tol_max:
+        raise SystemExit(
+            f"вход заверён с допуском {stamp['tap_tol']} при потолке "
+            f"{tol_max}: сверка была слишком снисходительной")
+    if float(stamp["tap_ratio"]) < ratio_min:
+        raise SystemExit(
+            f"контроль сверки требовал отношения {stamp['tap_ratio']} при "
+            f"минимуме {ratio_min}")
+    for k in ("live_vs_cache_raw", "live_vs_cache_normed"):
+        if not (stamp[k] or {}).get("ok"):
+            raise SystemExit(
+                f"в отпечатках {k} НЕ подтверждён сверкой с живым проходом: "
+                f"запускать зонд не на чем")
     if int(stamp["tap"]) != int(tap):
         raise SystemExit(f"отпечатки для отвода {stamp['tap']}, а зонд "
                          f"читает {tap}")
-    if stamp["res_norm_sha1"] != res_norm_sha:
+    for name, got, want in (("res_norm", res_norm_sha, stamp["res_norm_sha1"]),
+                            ("basis.npy", basis_sha, stamp["basis_sha1"]),
+                            ("rho.npy", rho_sha, stamp["rho_sha1"]),
+                            ("meta кэша", cache_meta_sha,
+                             stamp["cache_meta_sha1"])):
+        if got != want:
+            raise SystemExit(
+                f"{name}: сейчас sha {got}, а вход заверён на {want}. "
+                f"Файл сменился после подтверждения")
+    if set(arrays) != set(stamp["arrays"]):
         raise SystemExit(
-            f"res_norm sha {res_norm_sha}, а тождество подтверждено на "
-            f"{stamp['res_norm_sha1']}: голова видела бы другую норму")
-    if stamp["cache_meta_sha1"] != cache_meta_sha:
-        raise SystemExit("meta кэша изменилась после подтверждения входа")
-    bad = [k for k, v in sorted(arrays.items())
-           if stamp["arrays"].get(k) != v]
+            f"набор массивов отличается: сейчас {sorted(arrays)}, заверено "
+            f"{sorted(stamp['arrays'])}")
+    bad = [k for k, v in sorted(arrays.items()) if stamp["arrays"][k] != v]
     if bad:
         raise SystemExit(
             f"массивы {bad} изменились после подтверждения входа в K-11b: "
             f"зонд читал бы не то, что было сверено с живым проходом")
-    lv = stamp.get("live_vs_cache_normed") or {}
-    if not lv.get("ok"):
-        raise SystemExit(
-            "в отпечатках вход головы НЕ подтверждён сверкой с живым "
-            "проходом: запускать зонд не на чем")
     return True
 
 
@@ -517,42 +564,73 @@ def selftest():
         assert "бесполезен" in bad  # правило обязано называть запрещённый вывод
 
     # --- отпечатки входа ----------------------------------------------------
-    good_stamp = dict(res_norm_sha1="aa11", tap=24, cache_meta_sha1="mm",
-                      arrays=dict(h24="h1", q0hat="q1", ktrue="k1",
-                                  split="s1"),
-                      live_vs_cache_normed=dict(ok=True))
-    assert check_stamp(good_stamp, dict(h24="h1", q0hat="q1"), "aa11", 24, "mm")
-    for kw, msg in ((dict(res_norm_sha="bb22"), "норма"),
-                    (dict(tap=18), "отвод"),
-                    (dict(cache_meta_sha="zz"), "meta"),
-                    (dict(arrays=dict(h24="ДРУГОЙ")), "массив")):
-        a = dict(arrays=dict(h24="h1", q0hat="q1"), res_norm_sha="aa11",
-                 tap=24, cache_meta_sha="mm")
-        a.update(kw)
+    def mk(**kw):
+        st = dict(verified_by="k11b", script_sha1="BSHA", identity_ok=True,
+                  batches=[1, 10], res_norm_sha1="aa11", tap=24,
+                  cache_meta_sha1="mm", basis_sha1="bb", rho_sha1="rr",
+                  tap_tol=0.05, tap_ratio=10.0,
+                  arrays=dict(h24="h1", q0hat="q1"),
+                  live_vs_cache_raw=dict(ok=True),
+                  live_vs_cache_normed=dict(ok=True))
+        st.update(kw)
+        return st
+
+    def call(st, **kw):
+        a_ = dict(arrays=dict(h24="h1", q0hat="q1"), res_norm_sha="aa11",
+                  tap=24, cache_meta_sha="mm", basis_sha="bb", rho_sha="rr",
+                  k11b_sha="BSHA")
+        a_.update(kw)
+        return check_stamp(st, a_["arrays"], a_["res_norm_sha"], a_["tap"],
+                           a_["cache_meta_sha"], a_["basis_sha"],
+                           a_["rho_sha"], a_["k11b_sha"])
+
+    assert call(mk())
+    # ВОСПРОИЗВЕДЁННЫЙ ПРОВЕРЯЮЩИМ СЛУЧАЙ: старая версия заверителя, чужие
+    # basis/rho, огромный допуск, отрицательное отношение и непрошедшая
+    # сырая сверка. Прежняя функция это принимала.
+    bad_all = mk(script_sha1="OLD_K11B", basis_sha1="ЧУЖОЙ",
+                 rho_sha1="ЧУЖАЯ", tap_tol=999.0, tap_ratio=-1.0,
+                 live_vs_cache_raw=dict(ok=False))
+    try:
+        call(bad_all)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("принят заведомо негодный отпечаток")
+    # и каждая часть по отдельности
+    cases = (("script_sha1", dict(script_sha1="OLD")),
+             ("verified_by", dict(verified_by="кто-то")),
+             ("identity_ok", dict(identity_ok=False)),
+             ("batches", dict(batches=[1])),
+             ("tap_tol", dict(tap_tol=0.5)),
+             ("tap_ratio", dict(tap_ratio=2.0)),
+             ("live_vs_cache_raw", dict(live_vs_cache_raw=dict(ok=False))),
+             ("live_vs_cache_normed", dict(live_vs_cache_normed=dict(ok=False))),
+             ("basis_sha1", dict(basis_sha1="ЧУЖОЙ")),
+             ("rho_sha1", dict(rho_sha1="ЧУЖАЯ")),
+             ("res_norm_sha1", dict(res_norm_sha1="ЧУЖАЯ")),
+             ("tap", dict(tap=18)),
+             ("cache_meta_sha1", dict(cache_meta_sha1="zz")),
+             ("arrays", dict(arrays=dict(h24="ДРУГОЙ", q0hat="q1"))),
+             ("набор массивов", dict(arrays=dict(h24="h1"))))
+    for name, kw in cases:
         try:
-            check_stamp(good_stamp, a["arrays"], a["res_norm_sha"], a["tap"],
-                        a["cache_meta_sha"])
+            call(mk(**kw))
         except SystemExit:
             pass
         else:
-            raise AssertionError(f"подмена принята: {msg}")
-    # неподтверждённый вход — отказ, даже если все хеши сошлись
-    bad_stamp = dict(good_stamp, live_vs_cache_normed=dict(ok=False))
-    try:
-        check_stamp(bad_stamp, dict(h24="h1"), "aa11", 24, "mm")
-    except SystemExit:
-        pass
-    else:
-        raise AssertionError("неподтверждённый вход принят")
-    # отпечатки старой версии K-11b — отказ, а не пропуск
-    try:
-        check_stamp({k: v for k, v in good_stamp.items()
-                     if k != "res_norm_sha1"}, dict(h24="h1"), "aa11", 24,
-                    "mm")
-    except SystemExit:
-        pass
-    else:
-        raise AssertionError("отпечатки без sha нормы приняты")
+            raise AssertionError(f"подмена принята: {name}")
+    # отсутствие любого обязательного поля — отказ, а не пропуск
+    for k in ("script_sha1", "identity_ok", "basis_sha1", "tap_tol",
+              "live_vs_cache_raw", "verified_by", "batches"):
+        try:
+            call({x: v for x, v in mk().items() if x != k})
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"отпечаток без {k} принят")
+    # более строгое заверение (меньший допуск, большее отношение) проходит
+    assert call(mk(tap_tol=0.001, tap_ratio=50.0))
 
     # --- корзины по доле совпадений q0 -------------------------------------
     tr_frac = np.linspace(0.0, 1.0, 900)
@@ -747,7 +825,10 @@ def main() -> None:
         if os.path.exists(p_):
             arr_sha[nm] = k11a.file_sha1(p_)
     check_stamp(stamp, arr_sha, rn_sha, tap_st,
-                k11a.file_sha1(prefix + ".meta.json"))
+                k11a.file_sha1(prefix + ".meta.json"),
+                basis_sha=k11a.file_sha1(basis_p),
+                rho_sha=k11a.file_sha1(rho_p),
+                k11b_sha=k11a.file_sha1(k11b.__file__))
     lv = stamp["live_vs_cache_normed"]
     print(f"  вход подтверждён K-11b ({stamp.get('script_sha1')}): невязка "
           f"живого прохода против кэша после нормы {lv['rel']:.2e}, "
@@ -895,7 +976,7 @@ def main() -> None:
     # --- ВЫБОР lam НА ВНУТРЕННЕМ ДЕРЖАННОМ НАБОРЕ --------------------------
     print(f"\n  выбор lam на внутреннем держанном наборе (мишень головы, "
           f"{len(LAMBDAS)} значений):")
-    best = {}
+    best, edge_vars = {}, []
     for v in ("z0", "h24", "both"):
         sc = []
         for lam in LAMBDAS:
@@ -906,8 +987,9 @@ def main() -> None:
             sc.append(float(ssr.sum() / n_iv_rows / rank))
         k_ = int(np.argmin(sc))
         best[v] = LAMBDAS[k_]
-        edge = " (на КРАЮ сетки — расширить)" if k_ in (0, len(LAMBDAS) - 1) \
-            else ""
+        at_edge = k_ in (0, len(LAMBDAS) - 1)
+        edge_vars += [v] if at_edge else []
+        edge = " (на КРАЮ сетки — вердикт недействителен)" if at_edge else ""
         print(f"    {v:>5}: lam = {best[v]:.3g}, MSE = {sc[k_]:.6f}{edge}")
 
     # --- ПОДГОНКА НА ВСЁМ TRAIN --------------------------------------------
@@ -1039,15 +1121,17 @@ def main() -> None:
     # и жёсткое условие было бы жёстким только на словах.
     d_grip = [g["both"]["grip"] - g["z0"]["grip"] for g in gb]
     d_pos_ci, d_rot_ci, d_grip_ci = ci(d_pos), ci(d_rot), ci(d_grip)
+    obs_d = {k: float(g_all["both"][k] - g_all["z0"][k])
+             for k in ("pos", "rot", "grip")}
     print(f"\n  95% интервалы по {args.n_boot} бутстрап-выборкам ЭПИЗОДОВ:")
     for v in ("z0", "h24", "both", "oracle"):
         print(f"    {v:>9}: поз [{boot[v]['pos'][0]:.1%}, "
               f"{boot[v]['pos'][1]:.1%}], вр [{boot[v]['rot'][0]:.1%}, "
               f"{boot[v]['rot'][1]:.1%}]")
-    print(f"    ПАРНАЯ разница both - z0: поз {np.mean(d_pos):+.3f} "
-          f"[{d_pos_ci[0]:+.3f}, {d_pos_ci[1]:+.3f}], вр "
-          f"{np.mean(d_rot):+.3f} [{d_rot_ci[0]:+.3f}, {d_rot_ci[1]:+.3f}]")
-    print(f"    ПАРНАЯ разница по знаку схвата: {np.mean(d_grip):+.4f} "
+    print(f"    ПАРНАЯ разница both - z0 (наблюдаемая): поз "
+          f"{obs_d['pos']:+.3f} [{d_pos_ci[0]:+.3f}, {d_pos_ci[1]:+.3f}], вр "
+          f"{obs_d['rot']:+.3f} [{d_rot_ci[0]:+.3f}, {d_rot_ci[1]:+.3f}]")
+    print(f"    ПАРНАЯ разница по знаку схвата: {obs_d['grip']:+.4f} "
           f"[{d_grip_ci[0]:+.4f}, {d_grip_ci[1]:+.4f}]; решение принимается "
           f"по ВЕРХНЕЙ границе при допуске {GRIP_TOL:.1%}")
 
@@ -1070,6 +1154,16 @@ def main() -> None:
                   f"{g['grip']:>7.1%}")
 
     ok, verdict = read_routing(d_pos_ci, d_rot_ci, d_grip_ci)
+    if edge_vars:
+        # ОПТИМУМ НА КРАЮ СЕТКИ ЗНАЧИТ, ЧТО ОПТИМУМА НЕ НАШЛИ. Сравнение
+        # вариантов тогда сравнивает не входы, а упёршийся в границу штраф,
+        # и «преимущества нет» могло бы означать «сетка мала».
+        ok = False
+        verdict = (
+            f"ВЕРДИКТ НЕДЕЙСТВИТЕЛЕН: у вариантов {edge_vars} оптимальная lam "
+            f"пришлась на край сетки [{LAMBDAS[0]:.1g}, {LAMBDAS[-1]:.1g}], "
+            f"то есть оптимум не найден. Расширьте сетку и повторите; "
+            f"числа ниже — разведочные.\n  " + verdict)
     print(f"\n  {verdict}")
     print("  ЧИТАТЬ ТАК: зонд отвечает на вопрос об ИСТОЧНИКЕ, а не о том, "
           "улучшит ли\n  обученная голова успех в симуляторе. Оракул здесь — "
@@ -1089,12 +1183,16 @@ def main() -> None:
                source_fraction=src,
                boot={v: {k: list(boot[v][k]) for k in boot[v]}
                      for v in boot},
-               paired_diff=dict(pos=dict(mean=float(np.mean(d_pos)),
-                                         ci=list(d_pos_ci)),
-                                rot=dict(mean=float(np.mean(d_rot)),
-                                         ci=list(d_rot_ci)),
-                                grip=dict(mean=float(np.mean(d_grip)),
-                                          ci=list(d_grip_ci))),
+               # НАБЛЮДАЕМАЯ разница — из полной выборки; среднее по
+               # бутстрапу хранится рядом и отчётным числом не является.
+               paired_diff=dict(
+                   pos=dict(observed=obs_d["pos"], boot_mean=float(
+                       np.mean(d_pos)), ci=list(d_pos_ci)),
+                   rot=dict(observed=obs_d["rot"], boot_mean=float(
+                       np.mean(d_rot)), ci=list(d_rot_ci)),
+                   grip=dict(observed=obs_d["grip"], boot_mean=float(
+                       np.mean(d_grip)), ci=list(d_grip_ci))),
+               lam_at_grid_edge=edge_vars,
                bucket_edges=[float(x) for x in edges],
                per_bucket=per_bucket, n_boot=int(args.n_boot),
                grip_tol=GRIP_TOL, routing_ok=bool(ok), routing=verdict,

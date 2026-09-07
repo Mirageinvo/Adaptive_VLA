@@ -570,6 +570,11 @@ def main() -> None:
                          "строго: кэш с q0 от другого источника описывает "
                          "другую модель")
     ap.add_argument("--batches", default="1,10")
+    ap.add_argument("--tap-offsets", type=int, default=3,
+                    help="сколько РАЗНЫХ position_offset взять для сверки "
+                         "живого отвода с кэшем")
+    ap.add_argument("--tap-n", type=int, default=8,
+                    help="наблюдений на офсет, по одному из разных эпизодов")
     ap.add_argument("--tap-tol", type=float, default=TAP_TOL,
                     help="допуск на относительную невязку живого отвода "
                          "против кэшированного (в долях RMS отвода)")
@@ -761,25 +766,28 @@ def main() -> None:
     # выглядело бы как расхождение модели.
     ds_repo, ds_rev = dataset_source(meta)
     print(f"  данные: {ds_repo}@{ds_rev} (из meta, не из литерала)")
-    st = np.zeros((len(pool), len(STATE_Q01)), np.float64)
-    for j, gi in enumerate(pool):
-        e = int(epi[gi])
-        f = hf_hub_download(ds_repo,
-                            f"data/chunk-{e // 1000:03d}/episode_{e:06d}.parquet",
-                            repo_type="dataset", revision=ds_rev)
-        S_ = np.asarray(pq.read_table(f).column("state").to_pylist(),
-                        np.float32)
-        st[j] = S_[int(stp[gi])] if S_.shape[1] == len(STATE_Q01) \
-            else process_state(S_[int(stp[gi])][None])[0]
-    st_n = (st - STATE_Q01) / (STATE_Q99 - STATE_Q01) * 2.0 - 1.0
+    def states_for(idxs):
+        st = np.zeros((len(idxs), len(STATE_Q01)), np.float64)
+        for j, gi in enumerate(idxs):
+            e = int(epi[gi])
+            f = hf_hub_download(
+                ds_repo,
+                f"data/chunk-{e // 1000:03d}/episode_{e:06d}.parquet",
+                repo_type="dataset", revision=ds_rev)
+            S_ = np.asarray(pq.read_table(f).column("state").to_pylist(),
+                            np.float32)
+            st[j] = S_[int(stp[gi])] if S_.shape[1] == len(STATE_Q01) \
+                else process_state(S_[int(stp[gi])][None])[0]
+        return (st - STATE_Q01) / (STATE_Q99 - STATE_Q01) * 2.0 - 1.0
 
-    def build(k):
-        sel = pool[:k]
+    st_n = states_for(pool)
+
+    def build_sel(sel, st_rows):
         image = torch.from_numpy(np.asarray(IMG[sel]))
         msgs = []
         for j, gi in enumerate(sel):
             m = prompt_template(
-                st_n[j], None, str(tsk[gi]),
+                st_rows[j], None, str(tsk[gi]),
                 mode=cfg.MODEL.vla_processor.kwargs.mode,
                 action_vocab_size=cfg.MODEL.action_processor.vocab_size,
                 action_token_len=cfg.MODEL.action_processor.token_len)
@@ -790,6 +798,9 @@ def main() -> None:
                  return_tensors="pt", padding=True, padding_side="left",
                  action_processor_kwargs={"embodiment_ids": 0})
         return dict_apply(lambda x: x.to(dev, dt), b), sel
+
+    def build(k):
+        return build_sel(pool[:k], st_n[:k])
 
     res, detail = {}, {}
     gen_cnt = CallCounter(model, "generate")
@@ -879,24 +890,81 @@ def main() -> None:
         raise SystemExit(f"в кэше сохранён отвод {tap_used}, а поздняя ветвь "
                          f"читает {max(TAPS)}")
     Hmm_ = np.load(f"{args.cache}.h{tap_used}.npy", mmap_mode="r")
-    cached_raw = np.asarray(Hmm_[sel])
-    # ПРИВЕДЕНИЕ ТОЧНО ТАКОЕ ЖЕ, каким кэш писался: float -> cpu -> fp16.
-    fresh_raw = tp[tap_used].float().cpu().numpy().astype(np.float16)
-    lvc_raw = live_vs_cache(fresh_raw, cached_raw, args.tap_tol, TAP_RATIO)
-    # И ОТДЕЛЬНО — ВХОД ГОЛОВЫ ПОСЛЕ НОРМЫ. Норма может сжать расхождение
-    # сырого отвода или, наоборот, его усилить; голова видит именно это.
-    with torch.no_grad():
-        h24_from_cache = model.res_norm(
-            torch.from_numpy(cached_raw).to(dev, dt)).float().cpu().numpy()
-    lvc_norm = live_vs_cache(h24.cpu().numpy(), h24_from_cache, args.tap_tol,
-                             TAP_RATIO)
+
+    # ВЫБОРКА СТРАТИФИЦИРОВАНА ПО ОФСЕТАМ, ЗАДАЧАМ И ЭПИЗОДАМ. Десять
+    # наблюдений подряд при одном `position_offset` — проверка грубой подмены
+    # файла целиком, но не кэша целиком: сдвиг, затронувший часть офсетов или
+    # часть задач, туда бы не попал. Один офсет на вызов обязателен (его
+    # задаёт `position_offset`), поэтому берётся несколько групп по офсетам, а
+    # внутри группы — разные эпизоды.
+    rng_t = np.random.default_rng(7)
+    offs_all = sorted({int(v) for v in offs})
+    pick_offs = [int(x) for x in rng_t.permutation(offs_all)[
+        :max(1, args.tap_offsets)]]
+    groups_t = []
+    for po_t in pick_offs:
+        cand = np.where(offs == po_t)[0]
+        if len(cand) == 0:
+            continue
+        eps_here = np.unique(epi[cand])
+        take = []
+        for e in rng_t.permutation(eps_here)[:args.tap_n]:
+            same = cand[epi[cand] == e]
+            take.append(int(same[rng_t.integers(0, len(same))]))
+        if take:
+            groups_t.append((po_t, np.sort(np.asarray(take))))
+    if not groups_t:
+        raise SystemExit("не набралось наблюдений для сверки входа")
+
+    agg_raw, agg_norm = [], []
+    n_seen, eps_seen, tsk_seen = 0, set(), set()
+    for po_t, sel_t in groups_t:
+        b_t, _ = build_sel(sel_t, states_for(sel_t))
+        with torch.no_grad(), torch.autocast(device_type=dev.type, dtype=dt):
+            v_t, pp_t = model.build_inputs(position_offset=po_t, **b_t)
+            tp_t = model.forward_taps(
+                vlm_inputs_embeds=v_t,
+                attention_mask=b_t.get("attention_mask"), position_ids=pp_t)
+        cached_raw = np.asarray(Hmm_[sel_t])
+        # ПРИВЕДЕНИЕ ТОЧНО ТАКОЕ ЖЕ, каким кэш писался: float -> cpu -> fp16.
+        fresh_raw = tp_t[tap_used].float().cpu().numpy().astype(np.float16)
+        agg_raw.append(live_vs_cache(fresh_raw, cached_raw, args.tap_tol,
+                                     TAP_RATIO))
+        # И ОТДЕЛЬНО — ВХОД ГОЛОВЫ ПОСЛЕ НОРМЫ. Норма может сжать расхождение
+        # сырого отвода или, наоборот, усилить; голова видит именно это.
+        with torch.no_grad():
+            hn_live = model.res_norm(tp_t[tap_used]).float().cpu().numpy()
+            hn_cache = model.res_norm(
+                torch.from_numpy(cached_raw).to(dev, dt)).float().cpu().numpy()
+        agg_norm.append(live_vs_cache(hn_live, hn_cache, args.tap_tol,
+                                      TAP_RATIO))
+        n_seen += len(sel_t)
+        eps_seen.update(int(x) for x in epi[sel_t])
+        tsk_seen.update(str(x) for x in tsk[sel_t])
+
+    def worst(parts):
+        """Худшая группа, а не средняя: сверка обязана держаться ВЕЗДЕ."""
+        out = dict(max(parts, key=lambda d: d["rel"]))
+        out["ok"] = all(d["ok"] for d in parts)
+        out["n_groups"] = len(parts)
+        out["rel_max"] = float(max(d["rel"] for d in parts))
+        out["rel_min"] = float(min(d["rel"] for d in parts))
+        return out
+
+    lvc_raw, lvc_norm = worst(agg_raw), worst(agg_norm)
     res["tap_matches_cache"] = bool(lvc_raw["ok"])
     res["head_input_matches_cache"] = bool(lvc_norm["ok"])
     detail["live_vs_cache_raw"] = lvc_raw
     detail["live_vs_cache_normed"] = lvc_norm
-    print(f"  живой h{tap_used} против кэша: невязка {lvc_raw['rel']:.2e} "
-          f"(допуск {args.tap_tol:.0e}), контроль по позициям "
-          f"{lvc_raw['rel_pos_shift']:.2e}"
+    detail["tap_check_scope"] = dict(
+        offsets=pick_offs, n_obs=int(n_seen), n_episodes=len(eps_seen),
+        n_tasks=len(tsk_seen), groups=len(groups_t))
+    print(f"  сверка входа: {n_seen} наблюдений, {len(pick_offs)} офсетов "
+          f"{pick_offs}, {len(eps_seen)} эпизодов, {len(tsk_seen)} задач")
+    print(f"  живой h{tap_used} против кэша: невязка худшей группы "
+          f"{lvc_raw['rel']:.2e} (разброс {lvc_raw['rel_min']:.2e}.."
+          f"{lvc_raw['rel_max']:.2e}, допуск {args.tap_tol:.0e}), контроль по "
+          f"позициям {lvc_raw['rel_pos_shift']:.2e}"
           + (f", по наблюдениям {lvc_raw['rel_obs_shift']:.2e}"
              if "rel_obs_shift" in lvc_raw else ""))
     print(f"  вход головы после res_norm: невязка {lvc_norm['rel']:.2e}, "
@@ -1018,23 +1086,37 @@ def main() -> None:
             stamp_arrays[nm] = k11a.file_sha1(p_)
     stamp = dict(verified_by="k11b", script_sha1=sha,
                  cache=args.cache, tap=int(tap_used),
+                 identity_ok=bool(ok), batches=sorted(int(x) for x in sizes),
                  res_norm_sha1=k11a.state_sha1(model.res_norm),
                  res_norm_class=type(model.res_norm).__name__,
                  arrays=stamp_arrays,
                  live_vs_cache_raw=lvc_raw, live_vs_cache_normed=lvc_norm,
-                 tap_tol=float(args.tap_tol), tap_ratio=TAP_RATIO,
+                 tap_check_scope=detail["tap_check_scope"],
+                 tap_tol=float(args.tap_tol), tap_ratio=float(TAP_RATIO),
                  cache_meta_sha1=k11a.file_sha1(args.cache + ".meta.json"),
-                 basis_sha1=diag.get("basis_sha1"),
-                 rho_sha1=diag.get("rho_sha1"))
+                 # ОТПЕЧАТКИ БАЗИСА И rho — ЧАСТЬ ЗАВЕРЕНИЯ. Без них после
+                 # `--diagnose --force` можно подменить пару basis/rho вместе
+                 # с диагностикой, и зонд принял бы новую пару на основании
+                 # старого отпечатка.
+                 basis_sha1=k11a.file_sha1(basis_p),
+                 rho_sha1=k11a.file_sha1(rho_p))
     stamp_p = args.cache + ".artifacts.json"
     if not ok:
         # ОТПЕЧАТКИ СТАВЯТСЯ ТОЛЬКО ПРИ ВЫПОЛНЕННОМ ТОЖДЕСТВЕ: иначе файл
-        # заверял бы артефакты, на которых проверка провалилась.
-        print(f"  отпечатки НЕ записаны: тождество не выполнено")
+        # заверял бы артефакты, на которых проверка провалилась. И СТАРЫЙ
+        # отпечаток при этом обязан быть отозван: иначе после провала рядом
+        # остаётся заверение прошлого прогона, и зонд стартовал бы по нему.
+        if os.path.exists(stamp_p):
+            bad_p = stamp_p + ".invalidated"
+            os.replace(stamp_p, bad_p)
+            print(f"  прежние отпечатки ОТОЗВАНЫ и перемещены в {bad_p}")
+        print("  отпечатки НЕ записаны: тождество не выполнено")
     elif os.path.exists(stamp_p) and not args.restamp:
         old = json.load(open(stamp_p))
         diffs = [k for k in ("res_norm_sha1", "arrays", "cache_meta_sha1",
-                             "basis_sha1", "rho_sha1", "tap")
+                             "basis_sha1", "rho_sha1", "tap", "script_sha1",
+                             "tap_tol", "tap_ratio", "batches",
+                             "identity_ok", "verified_by")
                  if old.get(k) != stamp[k]]
         if diffs:
             raise SystemExit(
