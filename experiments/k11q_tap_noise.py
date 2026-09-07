@@ -248,13 +248,11 @@ def main() -> None:
           f"в fp32")
     model.eval()
     model.__class__ = hv.make_hicora_class(type(model))
-    ac = proc.action_processor
-    codec = ac if hasattr(ac, "vq") else getattr(ac, "codec", None)
-    with torch.no_grad():
-        idx = torch.arange(int(codec.vocab_size), device=dev).unsqueeze(0)
-        E = torch.stack([q.out_project(q.decode_code(idx))[0]
-                         for q in codec.vq.quantizers]).float()
-    model.set_codebooks(E)
+    # КОДЕК ЗДЕСЬ НЕ НУЖЕН И НЕ ПОДНИМАЕТСЯ. Скрипт делает только
+    # `forward_taps` и сравнивает отводы; ничего не декодируется, кодовые
+    # книги ни во что не входят. Прежняя версия доставала их и падала на
+    # том, что квантователи остались на CPU, — лишняя зависимость, которая
+    # могла только сломаться.
     model.set_res_norm(res_norm.to(dev))
     model.taps, model.q0_depth = TAPS, args.depth
     model.n_layers_total = len(model.action_expert.layers)
