@@ -225,6 +225,30 @@ def check_cache_fields(meta, diag, expect, modules, allow_drift=False):
     return drift
 
 
+def dataset_source(meta):
+    """Репозиторий и ревизия данных — из meta, а не из литерала в коде.
+
+    Прежде оба были зашиты строками. Тогда состояния для входов читались бы
+    из набора, никак не связанного с тем, на котором собран кэш: тождество
+    подтверждалось бы на чужих данных, а расхождение выглядело бы как
+    расхождение моделей. Отсутствие поля — отказ, а не подстановка
+    умолчания: угаданное происхождение хуже отсутствующего.
+    """
+    man = meta.get("manifest") or {}
+    repo, rev = man.get("dataset_repo"), man.get("dataset_revision")
+    if not repo or not rev:
+        raise SystemExit(
+            "в meta нет manifest.dataset_repo/dataset_revision — кэш собран "
+            "версией K-11a без записи происхождения данных; восстановить "
+            "поля угадыванием нельзя, нужен пересбор")
+    top = meta.get("dataset_revision")
+    if top is not None and top != rev:
+        raise SystemExit(
+            f"ревизия в meta противоречива: dataset_revision={top}, "
+            f"manifest.dataset_revision={rev}")
+    return str(repo), str(rev)
+
+
 def read_identity(res):
     """Пре-регистрированное чтение: тождество либо есть, либо его нет."""
     bad = [k for k, v in res.items() if v is False]
@@ -394,16 +418,51 @@ def selftest():
     except SystemExit as e:
         assert "расходятся по depth" in str(e)
 
+    # --- происхождение данных берётся из meta -------------------------------
+    good_meta = dict(manifest=dict(dataset_repo="physical-intelligence/libero",
+                                   dataset_revision="v2.0"),
+                     dataset_revision="v2.0")
+    assert dataset_source(good_meta) == ("physical-intelligence/libero", "v2.0")
+    # поле отсутствует — отказ, а не подстановка умолчания
+    for bad in (dict(manifest={}, dataset_revision="v2.0"),
+                dict(manifest=dict(dataset_repo="physical-intelligence/libero"),
+                     dataset_revision="v2.0"),
+                dict(manifest=dict(dataset_revision="v2.0")),
+                dict(dataset_revision="v2.0")):
+        try:
+            dataset_source(bad)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"неполное происхождение принято: {bad}")
+    # верхнее поле противоречит манифесту — отказ
+    try:
+        dataset_source(dict(manifest=dict(
+            dataset_repo="physical-intelligence/libero",
+            dataset_revision="v2.0"), dataset_revision="v1.0"))
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("противоречивая ревизия принята")
+    # контроль: другой (но согласованный) источник проходит и возвращает себя,
+    # то есть проверка сверяет поля, а не сравнивает с зашитым литералом
+    assert dataset_source(dict(manifest=dict(dataset_repo="someone/else",
+                                             dataset_revision="v9.9"))) \
+        == ("someone/else", "v9.9")
+
     # --- чтение вердикта ----------------------------------------------------
     assert "можно переходить" in read_identity({"a": True, "b": True})
     txt = read_identity({"a": True, "q0_bitwise": False})
     assert "НЕ ВЫПОЛНЕНО" in txt and "q0_bitwise" in txt
 
-    print("самопроверка k11b пройдена (версия «версии модулей обязательны»): обёртка не меняет выход и снимается, "
+    print("самопроверка k11b пройдена (версия «происхождение данных из meta»): "
+          "обёртка не меняет выход и снимается, "
           "счётчик слоёв считает по layer_idx и отвергает двенадцать по два "
           "при тех же 24 вызовах, знак схвата считается отдельно от позы, "
           "вердикт называет провалившийся пункт, переставленный базис той "
-          "же формы отвергается, дрейф версии модуля требует явного флага")
+          "же формы отвергается, дрейф версии модуля требует явного флага, "
+          "репозиторий и ревизия читаются из манифеста и отвергают неполное "
+          "и противоречивое происхождение")
 
 
 def main() -> None:
@@ -603,12 +662,19 @@ def main() -> None:
     # в одном нельзя.
     po = int(offs[0])
     pool = np.where(offs == po)[0][:max(sizes)]
+
+    # ПРОИСХОЖДЕНИЕ ДАННЫХ БЕРЁТСЯ ИЗ meta, А НЕ ИЗ ЛИТЕРАЛА. Прежде
+    # репозиторий и ревизия были зашиты строками: тождество подтверждалось
+    # бы на любом наборе, даже если кэш собран на другом, и расхождение
+    # выглядело бы как расхождение модели.
+    ds_repo, ds_rev = dataset_source(meta)
+    print(f"  данные: {ds_repo}@{ds_rev} (из meta, не из литерала)")
     st = np.zeros((len(pool), len(STATE_Q01)), np.float64)
     for j, gi in enumerate(pool):
         e = int(epi[gi])
-        f = hf_hub_download("physical-intelligence/libero",
+        f = hf_hub_download(ds_repo,
                             f"data/chunk-{e // 1000:03d}/episode_{e:06d}.parquet",
-                            repo_type="dataset", revision="v2.0")
+                            repo_type="dataset", revision=ds_rev)
         S_ = np.asarray(pq.read_table(f).column("state").to_pylist(),
                         np.float32)
         st[j] = S_[int(stp[gi])] if S_.shape[1] == len(STATE_Q01) \
