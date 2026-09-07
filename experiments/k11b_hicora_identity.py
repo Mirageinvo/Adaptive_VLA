@@ -63,6 +63,17 @@ TAPS = (12, 18, 24)
 # другой порядок операций. Порог на три порядка ниже характерной величины
 # действия (около 1e-2), то есть заведомо ниже любой содержательной разницы.
 ACT_TOL = 1e-5
+# Допуск на невязку живого отвода против кэшированного, в долях RMS самого
+# отвода. Побитового равенства здесь быть не может: кэш собран батчами по 16,
+# проверка идёт другим батчем, и порядок редукции в GEMM меняется с формой.
+# Значение выбрано заведомо ЛОЯЛЬНЫМ, чтобы не отвергать по неизвестной пока
+# величине шума формы; настоящая защита — контроль отношения к сдвинутому
+# кэшу, который обязан быть в десять раз больше. Измеренная невязка
+# печатается и попадает в отчёт: если она окажется на порядки меньше
+# допуска, допуск нужно ужесточить.
+TAP_TOL = 0.05
+TAP_RATIO = 10.0
+ARRAYS = ("q0hat", "ktrue", "split", "codebooks")
 
 
 class CallCounter:
@@ -223,6 +234,45 @@ def check_cache_fields(meta, diag, expect, modules, allow_drift=False):
             f"--allow-module-drift: расхождение будет напечатано и записано "
             f"в отчёт")
     return drift
+
+
+def live_vs_cache(fresh, cached, tol, ratio=10.0):
+    """Совпадает ли кэшированный отвод с живым проходом.
+
+    ЗАЧЕМ ЭТО ОТДЕЛЬНАЯ ПРОВЕРКА. При нулевой инициализации последнего слоя
+    `dz == 0`, поэтому выход HiCoRA НЕ ЗАВИСИТ от h24 вовсе. Все проверки
+    тождества — совпадение действий, знака, числа слоёв и декодирований —
+    прошли бы и с чужой поздней сетью, с неверной `res_norm`, и с
+    подменённым `.h24.npy`. Тождество говорит о ВЫХОДЕ; правильность ВХОДА
+    им не проверяется никак, а зонд и обучение будут читать именно вход.
+
+    ПОБИТОВОГО РАВЕНСТВА НЕ ТРЕБУЕТСЯ И НЕ ОЖИДАЕТСЯ: кэш собран батчами по
+    16, а здесь батч другой, и порядок редукции в GEMM меняется вместе с
+    формой. Требуется малая относительная невязка И КОНТРОЛЬ: та же величина
+    против сдвинутого кэша обязана быть во много раз больше. Без контроля
+    проверка проходила бы на любом достаточно гладком массиве.
+    """
+    f = np.asarray(fresh, np.float64)
+    c = np.asarray(cached, np.float64)
+    if f.shape != c.shape:
+        raise SystemExit(f"формы не совпали: живой {f.shape}, кэш {c.shape}")
+    denom = float(np.sqrt((c ** 2).mean()))
+    if denom <= 0:
+        raise SystemExit("кэшированный отвод нулевой целиком")
+    rel = float(np.sqrt(((f - c) ** 2).mean()) / denom)
+    # Контроль по ПОЗИЦИЯМ работает и при одном наблюдении в батче.
+    roll_p = np.roll(c, 1, axis=1)
+    rel_pos = float(np.sqrt(((f - roll_p) ** 2).mean()) / denom)
+    out = dict(rel=rel, rel_pos_shift=rel_pos, denom=denom,
+               shape=list(f.shape))
+    if f.shape[0] > 1:
+        roll_o = np.roll(c, 1, axis=0)
+        out["rel_obs_shift"] = float(
+            np.sqrt(((f - roll_o) ** 2).mean()) / denom)
+    ctrl = [v for k, v in out.items() if k.endswith("_shift")]
+    out["ok"] = bool(rel <= tol and all(v > ratio * max(rel, 1e-12)
+                                        for v in ctrl))
+    return out
 
 
 def dataset_source(meta):
@@ -418,6 +468,40 @@ def selftest():
     except SystemExit as e:
         assert "расходятся по depth" in str(e)
 
+    # --- живой отвод против кэшированного -----------------------------------
+    rg = np.random.default_rng(5)
+    base = rg.normal(size=(10, N_POS, 64))
+    # кэш = тот же отвод, округлённый до fp16, как его и пишет K-11a
+    cached = base.astype(np.float16).astype(np.float64)
+    good = live_vs_cache(base, cached, TAP_TOL, TAP_RATIO)
+    assert good["ok"], good
+    assert good["rel"] < 1e-2, good["rel"]
+    # КОНТРОЛЬ 1: чужой отвод обязан провалиться по величине невязки
+    other = rg.normal(size=base.shape)
+    assert not live_vs_cache(other, cached, TAP_TOL, TAP_RATIO)["ok"]
+    # КОНТРОЛЬ 2: перестановка наблюдений внутри того же массива —
+    # подмена, которую сравнение «по величине» само по себе не ловит
+    assert not live_vs_cache(np.roll(base, 1, axis=0), cached, TAP_TOL,
+                             TAP_RATIO)["ok"]
+    assert not live_vs_cache(np.roll(base, 1, axis=1), cached, TAP_TOL,
+                             TAP_RATIO)["ok"]
+    # КОНТРОЛЬ 3: почти постоянный массив проходит по невязке, но обязан
+    # отвергаться контролем — иначе проверка была бы пустой на гладких данных
+    flat = np.ones((10, N_POS, 64)) + 1e-6 * rg.normal(size=(10, N_POS, 64))
+    r_flat = live_vs_cache(flat, flat.astype(np.float16).astype(np.float64),
+                           TAP_TOL, TAP_RATIO)
+    assert r_flat["rel"] < TAP_TOL and not r_flat["ok"], r_flat
+    # масштаб не должен влиять: величина относительная
+    assert abs(live_vs_cache(base * 1000, cached * 1000, TAP_TOL,
+                             TAP_RATIO)["rel"] - good["rel"]) < 1e-9
+    # несовпадение формы — отказ, а не молчаливое усечение
+    try:
+        live_vs_cache(base[:5], cached, TAP_TOL, TAP_RATIO)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("разные формы приняты")
+
     # --- происхождение данных берётся из meta -------------------------------
     good_meta = dict(manifest=dict(dataset_repo="physical-intelligence/libero",
                                    dataset_revision="v2.0"),
@@ -455,14 +539,16 @@ def selftest():
     txt = read_identity({"a": True, "q0_bitwise": False})
     assert "НЕ ВЫПОЛНЕНО" in txt and "q0_bitwise" in txt
 
-    print("самопроверка k11b пройдена (версия «происхождение данных из meta»): "
-          "обёртка не меняет выход и снимается, "
+    print("самопроверка k11b пройдена (версия «поздний вход сверяется с "
+          "живым проходом»): обёртка не меняет выход и снимается, "
           "счётчик слоёв считает по layer_idx и отвергает двенадцать по два "
           "при тех же 24 вызовах, знак схвата считается отдельно от позы, "
           "вердикт называет провалившийся пункт, переставленный базис той "
           "же формы отвергается, дрейф версии модуля требует явного флага, "
           "репозиторий и ревизия читаются из манифеста и отвергают неполное "
-          "и противоречивое происхождение")
+          "и противоречивое происхождение, сверка живого отвода с кэшем "
+          "отвергает чужой отвод, перестановку наблюдений и позиций, и не "
+          "проходит на почти постоянном массиве")
 
 
 def main() -> None:
@@ -484,6 +570,12 @@ def main() -> None:
                          "строго: кэш с q0 от другого источника описывает "
                          "другую модель")
     ap.add_argument("--batches", default="1,10")
+    ap.add_argument("--tap-tol", type=float, default=TAP_TOL,
+                    help="допуск на относительную невязку живого отвода "
+                         "против кэшированного (в долях RMS отвода)")
+    ap.add_argument("--restamp", action="store_true",
+                    help="перезаписать <cache>.artifacts.json. Нужен только "
+                         "при осознанной пересборке кэша")
     ap.add_argument("--allow-module-drift", action="store_true",
                     help="разрешить расхождение версий hicora_vla/joint12_vla "
                          "с кэшем. Расхождение печатается и попадает в отчёт")
@@ -768,7 +860,7 @@ def main() -> None:
     # --- КОНТРФАКТИЧЕСКАЯ ПРОВЕРКА ------------------------------------------
     # Подменяем черновик и требуем, чтобы изменились И вход головы, И цель.
     # Голова, игнорирующая z0, прошла бы все проверки выше.
-    b, sel = build(min(sizes))
+    b, sel = build(max(sizes))
     with torch.no_grad(), torch.autocast(device_type=dev.type, dtype=dt):
         v, pp = model.build_inputs(position_offset=po, **b)
         tp = model.forward_taps(vlm_inputs_embeds=v,
@@ -776,6 +868,43 @@ def main() -> None:
                                 position_ids=pp)
         _, q_real = model.q0_from(tp[args.depth])
     h24 = model.res_norm(tp[max(TAPS)]).float()
+
+    # --- ПРАВИЛЬНОСТЬ ПОЗДНЕГО ВХОДА ----------------------------------------
+    # Всё, что проверено выше, относится к ВЫХОДУ. При dz == 0 выход не
+    # зависит от h24, поэтому чужой отвод, чужая res_norm или подменённый
+    # `.h24.npy` прошли бы все десять пунктов. Здесь сверяется сам ВХОД —
+    # тот, который увидят и зонд, и обучение.
+    tap_used = max(meta["saved_taps"])
+    if tap_used != max(TAPS):
+        raise SystemExit(f"в кэше сохранён отвод {tap_used}, а поздняя ветвь "
+                         f"читает {max(TAPS)}")
+    Hmm_ = np.load(f"{args.cache}.h{tap_used}.npy", mmap_mode="r")
+    cached_raw = np.asarray(Hmm_[sel])
+    # ПРИВЕДЕНИЕ ТОЧНО ТАКОЕ ЖЕ, каким кэш писался: float -> cpu -> fp16.
+    fresh_raw = tp[tap_used].float().cpu().numpy().astype(np.float16)
+    lvc_raw = live_vs_cache(fresh_raw, cached_raw, args.tap_tol, TAP_RATIO)
+    # И ОТДЕЛЬНО — ВХОД ГОЛОВЫ ПОСЛЕ НОРМЫ. Норма может сжать расхождение
+    # сырого отвода или, наоборот, его усилить; голова видит именно это.
+    with torch.no_grad():
+        h24_from_cache = model.res_norm(
+            torch.from_numpy(cached_raw).to(dev, dt)).float().cpu().numpy()
+    lvc_norm = live_vs_cache(h24.cpu().numpy(), h24_from_cache, args.tap_tol,
+                             TAP_RATIO)
+    res["tap_matches_cache"] = bool(lvc_raw["ok"])
+    res["head_input_matches_cache"] = bool(lvc_norm["ok"])
+    detail["live_vs_cache_raw"] = lvc_raw
+    detail["live_vs_cache_normed"] = lvc_norm
+    print(f"  живой h{tap_used} против кэша: невязка {lvc_raw['rel']:.2e} "
+          f"(допуск {args.tap_tol:.0e}), контроль по позициям "
+          f"{lvc_raw['rel_pos_shift']:.2e}"
+          + (f", по наблюдениям {lvc_raw['rel_obs_shift']:.2e}"
+             if "rel_obs_shift" in lvc_raw else ""))
+    print(f"  вход головы после res_norm: невязка {lvc_norm['rel']:.2e}, "
+          f"контроль по позициям {lvc_norm['rel_pos_shift']:.2e}")
+    if not (lvc_raw["ok"] and lvc_norm["ok"]):
+        print("    НЕВЯЗКА ИЛИ КОНТРОЛЬ НЕ ПРОШЛИ: кэшированный отвод не "
+              "воспроизводится живым проходом.\n    Зонд и обучение читали бы "
+              "не тот вход, который увидит HiCoRA.")
     z_real = model.codebooks[0][q_real]
     q_fake = (q_real + 1) % int(model.codebooks.shape[1])
     z_fake = model.codebooks[0][q_fake]
@@ -873,10 +1002,57 @@ def main() -> None:
           f"незамороженных весов кодека: {len(unfrozen)}")
 
     gen_cnt.close(); dec_cnt.close(); lay_cnt.close()
+    ok = all(v is not False for v in res.values())
+
+    # --- ОТПЕЧАТКИ ПРОВЕРЕННЫХ АРТЕФАКТОВ -----------------------------------
+    # Сверка живого прохода с кэшем действительна ТОЛЬКО для тех файлов, что
+    # лежали на диске в этот момент. Поэтому их хеши и sha `res_norm`
+    # записываются рядом, и всё последующее (зонд, обучение) обязано читать
+    # ровно их. Хеш, посчитанный позже и ни с чем не сверенный, — это отчёт,
+    # а не проверка.
+    stamp_arrays = {f"h{tap_used}": k11a.file_sha1(
+        f"{args.cache}.h{tap_used}.npy")}
+    for nm in ARRAYS:
+        p_ = f"{args.cache}.{nm}.npy"
+        if os.path.exists(p_):
+            stamp_arrays[nm] = k11a.file_sha1(p_)
+    stamp = dict(verified_by="k11b", script_sha1=sha,
+                 cache=args.cache, tap=int(tap_used),
+                 res_norm_sha1=k11a.state_sha1(model.res_norm),
+                 res_norm_class=type(model.res_norm).__name__,
+                 arrays=stamp_arrays,
+                 live_vs_cache_raw=lvc_raw, live_vs_cache_normed=lvc_norm,
+                 tap_tol=float(args.tap_tol), tap_ratio=TAP_RATIO,
+                 cache_meta_sha1=k11a.file_sha1(args.cache + ".meta.json"),
+                 basis_sha1=diag.get("basis_sha1"),
+                 rho_sha1=diag.get("rho_sha1"))
+    stamp_p = args.cache + ".artifacts.json"
+    if not ok:
+        # ОТПЕЧАТКИ СТАВЯТСЯ ТОЛЬКО ПРИ ВЫПОЛНЕННОМ ТОЖДЕСТВЕ: иначе файл
+        # заверял бы артефакты, на которых проверка провалилась.
+        print(f"  отпечатки НЕ записаны: тождество не выполнено")
+    elif os.path.exists(stamp_p) and not args.restamp:
+        old = json.load(open(stamp_p))
+        diffs = [k for k in ("res_norm_sha1", "arrays", "cache_meta_sha1",
+                             "basis_sha1", "rho_sha1", "tap")
+                 if old.get(k) != stamp[k]]
+        if diffs:
+            raise SystemExit(
+                f"отпечатки артефактов разошлись с {stamp_p} по {diffs}. "
+                f"Файлы, на которых подтверждено тождество, изменились. "
+                f"Если это осознанная пересборка — флаг --restamp")
+        print(f"  отпечатки совпали с {os.path.basename(stamp_p)}")
+    else:
+        json.dump(stamp, open(stamp_p + ".tmp", "w"), ensure_ascii=False,
+                  indent=1)
+        os.replace(stamp_p + ".tmp", stamp_p)
+        print(f"  отпечатки записаны: {stamp_p} (res_norm sha "
+              f"{stamp['res_norm_sha1']}, h{tap_used} sha "
+              f"{stamp_arrays[f'h{tap_used}']})")
 
     print(f"\n  {read_identity(res)}")
-    ok = all(v is not False for v in res.values())
     out_j = dict(ok=ok, checks=res, detail=detail, batches=sizes,
+                 artifacts=stamp, artifacts_path=stamp_p,
                  provenance=detail_prov,
                  rank=int(B.shape[1]), rho_norm=float(np.linalg.norm(rho)),
                  act_tol=ACT_TOL, cache=args.cache,

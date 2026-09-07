@@ -217,12 +217,19 @@ def ci(vals, lo=2.5, hi=97.5):
 # --------------------------------------------------------------------------
 # пре-регистрированное правило маршрутизации
 # --------------------------------------------------------------------------
-def read_routing(d_pos_ci, d_rot_ci, grip_both, grip_z0, tol=GRIP_TOL):
+def read_routing(d_pos_ci, d_rot_ci, d_grip_ci, tol=GRIP_TOL):
     """АСИММЕТРИЧНОЕ правило: подтверждает источник или отправляет дальше.
 
     Условие продолжения: нижняя граница 95% интервала парной разницы
-    (both - z0) строго выше нуля И по положению, И по вращению, и знак
-    схвата у «both» не хуже, чем у «z0», больше чем на `tol`.
+    (both - z0) строго выше нуля И по положению, И по вращению, а ВЕРХНЯЯ
+    граница парной разницы по знаку схвата не выше `tol`.
+
+    СХВАТ ПРОВЕРЯЕТСЯ ПО ИНТЕРВАЛУ, А НЕ ПО ТОЧЕЧНОЙ РАЗНИЦЕ. Прежняя версия
+    сравнивала с допуском только точечную оценку: разница 0.4 п.п. проходила
+    бы и при верхней границе интервала 1.2 п.п., то есть жёсткое условие
+    было бы жёстким только на словах. Позиция и вращение требуют, чтобы
+    преимущество БЫЛО; схват требует, чтобы ухудшения НЕ БЫЛО, — поэтому у
+    первых берётся нижняя граница, у второго верхняя.
 
     Отрицательный исход НЕ является стоп-гейтом. Линейная модель не обязана
     видеть то, что видит трёхслойная голова с tanh, поэтому отсутствие
@@ -230,26 +237,29 @@ def read_routing(d_pos_ci, d_rot_ci, grip_both, grip_z0, tol=GRIP_TOL):
     считываний. Закрывать ветвь по одному линейному зонду ЗАПРЕЩЕНО.
     """
     lo_p, lo_r = d_pos_ci[0], d_rot_ci[0]
+    hi_g = d_grip_ci[1]
     # Допуск сравнивается с запасом в 1e-12: разность двух долей, равная
     # допуску точно, в двоичной записи оказывается больше него, и решение
     # переворачивалось бы на шуме представления, а не на данных.
-    grip_ok = (grip_both - grip_z0) <= tol + 1e-12
+    grip_ok = hi_g is not None and hi_g <= tol + 1e-12
     if lo_p is not None and lo_r is not None and lo_p > 0 and lo_r > 0 \
             and grip_ok:
         return True, (
             "ПРОДОЛЖАЕМ С ТЕКУЩИМ ИСТОЧНИКОМ: h24 добавляет к z0 и по "
             "положению, и по вращению (нижние границы интервалов парной "
-            f"разницы {lo_p:+.3f} и {lo_r:+.3f} выше нуля), знак схвата не "
-            f"хуже допуска {tol:.1%}. Поздняя ветвь несёт сведения, которых "
-            "нет в черновике")
+            f"разницы {lo_p:+.3f} и {lo_r:+.3f} выше нуля), ВЕРХНЯЯ граница "
+            f"разницы по знаку схвата {hi_g:+.4f} не выше допуска "
+            f"{tol:.1%}. Поздняя ветвь несёт сведения, которых нет в "
+            "черновике")
     why = []
     if lo_p is None or lo_p <= 0:
         why.append("по положению нижняя граница не выше нуля")
     if lo_r is None or lo_r <= 0:
         why.append("по вращению нижняя граница не выше нуля")
     if not grip_ok:
-        why.append(f"знак схвата хуже на {(grip_both - grip_z0):.1%} при "
-                   f"допуске {tol:.1%}")
+        why.append("верхняя граница разницы по знаку схвата "
+                   + ("не определена" if hi_g is None else f"{hi_g:+.4f}")
+                   + f" выше допуска {tol:.1%}")
     return False, (
         f"ЛИНЕЙНОГО ПРЕИМУЩЕСТВА НЕТ ({'; '.join(why)}). Это НЕ повод "
         "закрывать ветвь: линейная модель не обязана видеть то, что видит "
@@ -269,6 +279,45 @@ def read_source(gain_both, gain_oracle):
 
 
 # --------------------------------------------------------------------------
+def check_stamp(stamp, arrays, res_norm_sha, tap, cache_meta_sha):
+    """Зонд обязан читать РОВНО те файлы, на которых K-11b сверил вход.
+
+    Тождество проверяет ВЫХОД и при dz == 0 от h24 не зависит вовсе. Единая
+    точка, где подтверждается правильность позднего ВХОДА, — сверка живого
+    прохода с кэшем в K-11b. Она действительна только для файлов, лежавших
+    на диске в тот момент, поэтому здесь требуется совпадение их отпечатков
+    и sha `res_norm`. Без этого зонд мог бы исследовать другой отвод или
+    другую норму, а вывод об источнике относился бы к другому входу.
+    """
+    need = ("res_norm_sha1", "arrays", "tap", "cache_meta_sha1")
+    miss = [k for k in need if stamp.get(k) is None]
+    if miss:
+        raise SystemExit(
+            f"в отпечатках нет полей {miss}: файл собран версией K-11b, "
+            f"которая не сверяла живой проход с кэшем. Перезапустите K-11b")
+    if int(stamp["tap"]) != int(tap):
+        raise SystemExit(f"отпечатки для отвода {stamp['tap']}, а зонд "
+                         f"читает {tap}")
+    if stamp["res_norm_sha1"] != res_norm_sha:
+        raise SystemExit(
+            f"res_norm sha {res_norm_sha}, а тождество подтверждено на "
+            f"{stamp['res_norm_sha1']}: голова видела бы другую норму")
+    if stamp["cache_meta_sha1"] != cache_meta_sha:
+        raise SystemExit("meta кэша изменилась после подтверждения входа")
+    bad = [k for k, v in sorted(arrays.items())
+           if stamp["arrays"].get(k) != v]
+    if bad:
+        raise SystemExit(
+            f"массивы {bad} изменились после подтверждения входа в K-11b: "
+            f"зонд читал бы не то, что было сверено с живым проходом")
+    lv = stamp.get("live_vs_cache_normed") or {}
+    if not lv.get("ok"):
+        raise SystemExit(
+            "в отпечатках вход головы НЕ подтверждён сверкой с живым "
+            "проходом: запускать зонд не на чем")
+    return True
+
+
 def bucket_edges(frac, n_bucket=3):
     """Границы по ДОЛЕ совпавших позиций черновика, считаются на TRAIN.
 
@@ -341,8 +390,9 @@ def _integration(h_matters, seed=0, n_ep=40, per_ep=30, d_h=8, d_z=6, rank=4):
     gb = [gains_from(x) for x in draws]
     dp = ci([g["both"]["pos"] - g["z0"]["pos"] for g in gb])
     dr = ci([g["both"]["rot"] - g["z0"]["rot"] for g in gb])
+    dg = ci([g["both"]["grip"] - g["z0"]["grip"] for g in gb])
     g_all = gains_from(S_ep.sum(0))
-    ok, _ = read_routing(dp, dr, g_all["both"]["grip"], g_all["z0"]["grip"])
+    ok, _ = read_routing(dp, dr, dg)
     return ok, g_all, dp, dr
 
 
@@ -445,19 +495,64 @@ def selftest():
     assert lo < hi
 
     # --- правило маршрутизации ---------------------------------------------
-    ok, txt = read_routing((0.02, 0.09), (0.03, 0.11), 0.030, 0.028)
+    ok, txt = read_routing((0.02, 0.09), (0.03, 0.11), (-0.004, 0.002))
     assert ok and "ПРОДОЛЖАЕМ" in txt
-    ok, txt = read_routing((-0.01, 0.09), (0.03, 0.11), 0.030, 0.028)
+    ok, txt = read_routing((-0.01, 0.09), (0.03, 0.11), (-0.004, 0.002))
     assert not ok and "НЕ повод" in txt and "закрывать" in txt
     # схват хуже допуска перевешивает выигрыш в позе — отдельное жёсткое условие
-    ok, txt = read_routing((0.02, 0.09), (0.03, 0.11), 0.050, 0.028)
+    ok, txt = read_routing((0.02, 0.09), (0.03, 0.11), (0.001, 0.022))
     assert not ok and "схват" in txt
+    # ГЛАВНОЕ: точечная разница внутри допуска, а ВЕРХНЯЯ граница вне его.
+    # Прежняя версия правила это пропускала, потому что смотрела на точку.
+    ok, txt = read_routing((0.02, 0.09), (0.03, 0.11), (-0.001, 0.012))
+    assert not ok and "верхняя граница" in txt.lower(), txt
     # ровно на допуске — ещё проходит
-    ok, _ = read_routing((0.02, 0.09), (0.03, 0.11), 0.033, 0.028)
+    ok, _ = read_routing((0.02, 0.09), (0.03, 0.11), (-0.002, 0.005))
     assert ok
-    for bad in (read_routing((-0.01, 0.0), (-0.02, 0.0), 0.03, 0.03)[1],):
+    # интервал не определён — отказ, а не пропуск
+    ok, txt = read_routing((0.02, 0.09), (0.03, 0.11), (None, None))
+    assert not ok and "не определена" in txt
+    for bad in (read_routing((-0.01, 0.0), (-0.02, 0.0), (0.0, 0.1))[1],):
         assert "закрывать ветвь" in bad or "закрывать" in bad
         assert "бесполезен" in bad  # правило обязано называть запрещённый вывод
+
+    # --- отпечатки входа ----------------------------------------------------
+    good_stamp = dict(res_norm_sha1="aa11", tap=24, cache_meta_sha1="mm",
+                      arrays=dict(h24="h1", q0hat="q1", ktrue="k1",
+                                  split="s1"),
+                      live_vs_cache_normed=dict(ok=True))
+    assert check_stamp(good_stamp, dict(h24="h1", q0hat="q1"), "aa11", 24, "mm")
+    for kw, msg in ((dict(res_norm_sha="bb22"), "норма"),
+                    (dict(tap=18), "отвод"),
+                    (dict(cache_meta_sha="zz"), "meta"),
+                    (dict(arrays=dict(h24="ДРУГОЙ")), "массив")):
+        a = dict(arrays=dict(h24="h1", q0hat="q1"), res_norm_sha="aa11",
+                 tap=24, cache_meta_sha="mm")
+        a.update(kw)
+        try:
+            check_stamp(good_stamp, a["arrays"], a["res_norm_sha"], a["tap"],
+                        a["cache_meta_sha"])
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"подмена принята: {msg}")
+    # неподтверждённый вход — отказ, даже если все хеши сошлись
+    bad_stamp = dict(good_stamp, live_vs_cache_normed=dict(ok=False))
+    try:
+        check_stamp(bad_stamp, dict(h24="h1"), "aa11", 24, "mm")
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("неподтверждённый вход принят")
+    # отпечатки старой версии K-11b — отказ, а не пропуск
+    try:
+        check_stamp({k: v for k, v in good_stamp.items()
+                     if k != "res_norm_sha1"}, dict(h24="h1"), "aa11", 24,
+                    "mm")
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("отпечатки без sha нормы приняты")
 
     # --- корзины по доле совпадений q0 -------------------------------------
     tr_frac = np.linspace(0.0, 1.0, 900)
@@ -484,16 +579,19 @@ def selftest():
     for g_ in (g_yes, g_no):
         assert g_["oracle"]["pos"] >= g_["both"]["pos"] - 1e-9, g_
 
-    print("самопроверка k11p пройдена (версия «асимметричная маршрутизация»): "
+    print("самопроверка k11p пройдена (версия «вход сверяется с отпечатками "
+          "K-11b, схват по интервалу»): "
           "суммы по наблюдениям сходятся с диагностикой и не зависят от "
           "разбиения, гребень восстанавливает известную связь и не "
           "восстанавливает её по части признаков, остаток и R^2 считаются из "
           "грамиана и совпадают с прямым счётом на неоптимальных весах, "
           "накопление не зависит от размера батча, доля улучшения равна нулю "
           "у черновика и единице у оракула, бутстрап по эпизодам замечает "
-          "выбросовый эпизод, правило маршрутизации отвергает по схвату "
-          "отдельно и запрещает закрывать ветвь, а собранный конвейер "
-          "находит заложенную связь и НЕ находит её там, где её нет")
+          "выбросовый эпизод, правило маршрутизации требует ВЕРХНЮЮ границу "
+          "разницы по схвату и запрещает закрывать ветвь, отпечатки входа "
+          "отвергают подмену нормы, отвода, meta и массивов, а собранный "
+          "конвейер находит заложенную связь и НЕ находит её там, где её "
+          "нет")
 
 
 # --------------------------------------------------------------------------
@@ -577,11 +675,17 @@ def main() -> None:
     k11b.check_artifacts(diag, prefix, k11a.file_sha1(basis_p),
                          k11a.file_sha1(rho_p), B.shape[1],
                          k11a.file_sha1(prefix + ".meta.json"))
-    k11b.check_cache_fields(
+    # РАСХОЖДЕНИЕ ВЕРСИЙ МОДУЛЕЙ НЕ ПРОГЛАТЫВАЕТСЯ МОЛЧА. Прежде возвращённый
+    # словарь расхождений никуда не шёл: флаг `--allow-module-drift` разрешал
+    # дрейф И СКРЫВАЛ его, то есть отчёт не отличался от прогона без дрейфа.
+    mod_drift = k11b.check_cache_fields(
         meta, diag, dict(ckpt=args.ckpt),
         dict(hicora_vla_sha1=k11a.file_sha1(hv.__file__),
              joint12_vla_sha1=k11a.file_sha1(jv.__file__)),
         allow_drift=args.allow_module_drift)
+    if mod_drift:
+        print(f"  ВНИМАНИЕ: версии модулей разошлись с кэшем: {mod_drift}. "
+              f"Разрешено флагом; расхождение записано в отчёт")
     if len(rho) != B.shape[1]:
         raise SystemExit(f"rho длины {len(rho)} против ранга {B.shape[1]}")
     # ОРТОНОРМАЛЬНОСТЬ ПРОВЕРЯЕТСЯ ЗДЕСЬ, А НЕ ПРИНИМАЕТСЯ НА ВЕРУ: только с
@@ -595,15 +699,25 @@ def main() -> None:
           f"max|B^T B - I| = {dev_i:.1e}; артефакты привязаны к диагностике")
     ds_repo, ds_rev = k11b.dataset_source(meta)
     print(f"  данные: {ds_repo}@{ds_rev} (из meta)")
+    stamp_p = prefix + ".artifacts.json"
+    if not os.path.exists(stamp_p):
+        raise SystemExit(
+            f"нет {stamp_p}: правильность ПОЗДНЕГО ВХОДА не подтверждена. "
+            f"Тождество проверяет выход, а при dz == 0 выход от h24 не "
+            f"зависит вовсе — запустите K-11b текущей версии, он сверит "
+            f"живой проход с кэшем и запишет отпечатки")
+    stamp = json.load(open(stamp_p))
 
     dev = torch.device(args.device)
     dt = getattr(torch, args.dtype)
 
     # --- ИСХОДНАЯ ФИНАЛЬНАЯ НОРМА ------------------------------------------
     # Голова читает h24 ПОСЛЕ неё, поэтому зонд обязан видеть тот же вход.
-    # Дрейф 0.883 из аудита K-11a посчитан ДО нормы и к этому входу
-    # отношения не имеет. Модель снимается сразу после извлечения нормы:
-    # две модели в памяти одновременно уже стоили нам падения по памяти.
+    # Дрейф 0.883 из аудита K-11a измерен ДО нормы и величиной дрейфа ПОСЛЕ
+    # неё не является; связи между ними никто не мерил, и предполагать её
+    # отсутствие оснований ровно столько же, сколько предполагать наличие.
+    # Модель снимается сразу после извлечения нормы: две модели в памяти
+    # одновременно уже стоили нам падения по памяти.
     cfg = get_cfg(os.path.join(args.root, args.cfg_path))
     # ЧЕКПОЙНТ ПОДСТАВЛЯЕТСЯ В cfg, А НЕ ЧИТАЕТСЯ ИЗ yaml. Без этих двух
     # строк `from_pretrained(**cfg.MODEL.vlm.kwargs)` поднимает модель,
@@ -623,6 +737,23 @@ def main() -> None:
     print(f"  res_norm снята с исходного чекпойнта, sha {rn_sha}; модель "
           f"выгружена до тяжёлой части")
 
+    # ОТПЕЧАТКИ СВЕРЯЮТСЯ, А НЕ ПРОСТО ПЕЧАТАЮТСЯ. Прежде sha нормы только
+    # записывалась в отчёт: другая норма прошла бы весь зонд, и вывод об
+    # источнике относился бы к входу, которого HiCoRA не увидит.
+    tap_st = max(meta["saved_taps"])
+    arr_sha = {f"h{tap_st}": k11a.file_sha1(f"{prefix}.h{tap_st}.npy")}
+    for nm in ("q0hat", "ktrue", "split", "codebooks"):
+        p_ = f"{prefix}.{nm}.npy"
+        if os.path.exists(p_):
+            arr_sha[nm] = k11a.file_sha1(p_)
+    check_stamp(stamp, arr_sha, rn_sha, tap_st,
+                k11a.file_sha1(prefix + ".meta.json"))
+    lv = stamp["live_vs_cache_normed"]
+    print(f"  вход подтверждён K-11b ({stamp.get('script_sha1')}): невязка "
+          f"живого прохода против кэша после нормы {lv['rel']:.2e}, "
+          f"контроль {lv['rel_pos_shift']:.2e}; отпечатки {len(arr_sha)} "
+          f"массивов совпали")
+
     _, codec, E, _ = k11a.load_codec(args)
     Esav = np.load(prefix + ".codebooks.npy")
     Ecur = E.cpu().numpy()
@@ -639,7 +770,7 @@ def main() -> None:
     q0 = np.load(prefix + ".q0hat.npy")
     Kt = np.load(prefix + ".ktrue.npy")
     split = np.load(prefix + ".split.npy", allow_pickle=True).astype(str)
-    tap = max(meta["saved_taps"])
+    tap = tap_st
     H = np.load(f"{prefix}.h{tap}.npy", mmap_mode="r")
     d_cache = np.load(meta["cache"], allow_pickle=True)
     epi = np.asarray(d_cache["episode"]).astype(np.int64)
@@ -903,7 +1034,11 @@ def main() -> None:
         boot[v]["grip"] = ci([g[v]["grip"] for g in gb])
     d_pos = [g["both"]["pos"] - g["z0"]["pos"] for g in gb]
     d_rot = [g["both"]["rot"] - g["z0"]["rot"] for g in gb]
-    d_pos_ci, d_rot_ci = ci(d_pos), ci(d_rot)
+    # СХВАТ — ТОЖЕ ПАРНАЯ РАЗНИЦА С ИНТЕРВАЛОМ, а не точечная величина:
+    # разница 0.4 п.п. при верхней границе 1.2 п.п. допуск не выдерживает,
+    # и жёсткое условие было бы жёстким только на словах.
+    d_grip = [g["both"]["grip"] - g["z0"]["grip"] for g in gb]
+    d_pos_ci, d_rot_ci, d_grip_ci = ci(d_pos), ci(d_rot), ci(d_grip)
     print(f"\n  95% интервалы по {args.n_boot} бутстрап-выборкам ЭПИЗОДОВ:")
     for v in ("z0", "h24", "both", "oracle"):
         print(f"    {v:>9}: поз [{boot[v]['pos'][0]:.1%}, "
@@ -912,6 +1047,9 @@ def main() -> None:
     print(f"    ПАРНАЯ разница both - z0: поз {np.mean(d_pos):+.3f} "
           f"[{d_pos_ci[0]:+.3f}, {d_pos_ci[1]:+.3f}], вр "
           f"{np.mean(d_rot):+.3f} [{d_rot_ci[0]:+.3f}, {d_rot_ci[1]:+.3f}]")
+    print(f"    ПАРНАЯ разница по знаку схвата: {np.mean(d_grip):+.4f} "
+          f"[{d_grip_ci[0]:+.4f}, {d_grip_ci[1]:+.4f}]; решение принимается "
+          f"по ВЕРХНЕЙ границе при допуске {GRIP_TOL:.1%}")
 
     # --- РАЗБИВКА ПО КАЧЕСТВУ ЧЕРНОВИКА ------------------------------------
     print(f"\n  разбивка по доле совпавших позиций q0 (корзина 0 — худший "
@@ -931,8 +1069,7 @@ def main() -> None:
             print(f"    {b_:>8}{v:>9}{f(g['pos']):>10}{f(g['rot']):>10}"
                   f"{g['grip']:>7.1%}")
 
-    ok, verdict = read_routing(d_pos_ci, d_rot_ci, g_all["both"]["grip"],
-                               g_all["z0"]["grip"])
+    ok, verdict = read_routing(d_pos_ci, d_rot_ci, d_grip_ci)
     print(f"\n  {verdict}")
     print("  ЧИТАТЬ ТАК: зонд отвечает на вопрос об ИСТОЧНИКЕ, а не о том, "
           "улучшит ли\n  обученная голова успех в симуляторе. Оракул здесь — "
@@ -941,7 +1078,10 @@ def main() -> None:
 
     out = dict(script_sha1=sha, cache=prefix, rank=rank,
                tap=int(tap), d_h=D_H, d_latent=D_Z,
-               res_norm_sha1=rn_sha,
+               res_norm_sha1=rn_sha, module_drift=mod_drift,
+               input_verified_by=stamp.get("script_sha1"),
+               live_vs_cache_normed=stamp.get("live_vs_cache_normed"),
+               array_sha1=arr_sha,
                n_train=int(len(tr)), n_val=int(len(va)),
                n_val_episodes=int(len(ep_ids)),
                lam=best, lam_grid=list(LAMBDAS), r2=r2,
@@ -952,7 +1092,9 @@ def main() -> None:
                paired_diff=dict(pos=dict(mean=float(np.mean(d_pos)),
                                          ci=list(d_pos_ci)),
                                 rot=dict(mean=float(np.mean(d_rot)),
-                                         ci=list(d_rot_ci))),
+                                         ci=list(d_rot_ci)),
+                                grip=dict(mean=float(np.mean(d_grip)),
+                                          ci=list(d_grip_ci))),
                bucket_edges=[float(x) for x in edges],
                per_bucket=per_bucket, n_boot=int(args.n_boot),
                grip_tol=GRIP_TOL, routing_ok=bool(ok), routing=verdict,

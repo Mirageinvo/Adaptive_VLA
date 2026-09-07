@@ -203,6 +203,39 @@ def check_manifest(man, cache_meta, epi, split, rev=DATASET_REV,
                 n_checked=len(uniq))
 
 
+def check_drift_only(prev, cur):
+    """Сверка ТЕКУЩИХ параметров с полями производителя кэша.
+
+    ПРЕЖНЯЯ ВЕРСИЯ БЫЛА FAIL-OPEN. Сверялись только `n_obs` и `d_hidden`, то
+    есть повторный аудит можно было запустить другой глубиной, другим
+    источником черновика или другим чекпойнтом Joint12 — и записать
+    получившийся дрейф в meta кэша, собранного совсем иначе. Число выглядело
+    бы измеренным на этих данных, а относилось бы к другой модели.
+
+    Сверяются все поля, которые определяют, ЧТО именно измеряется. Поле,
+    отсутствующее в meta, — отказ, а не пропуск: кэш, собранный версией без
+    этого поля, не описывает себя полностью.
+    """
+    bad, miss = [], []
+    for k, want in sorted(cur.items()):
+        if want is None:
+            continue
+        if k not in prev or prev[k] is None:
+            miss.append(k)
+        elif prev[k] != want:
+            bad.append(f"{k}: в кэше {prev[k]!r}, сейчас {want!r}")
+    if miss:
+        raise SystemExit(
+            f"в meta нет полей {miss}: кэш собран версией, которая их не "
+            f"записывала, и совпадение параметров аудита не доказуемо")
+    if bad:
+        raise SystemExit(
+            "аудит запущен НЕ ТЕМИ параметрами, которыми собран кэш:\n    "
+            + "\n    ".join(bad)
+            + "\n  Записанный дрейф относился бы к другой модели")
+    return True
+
+
 def save_atomic(path, arr):
     """Запись через временный файл и os.replace.
 
@@ -622,14 +655,45 @@ def selftest():
     assert action_err(a2, ref)["pos"] == 0.0, "срез взял хвост"
     assert a2.shape[1] != N_POS, "ось времени спутана с латентными позициями"
 
-    print("самопроверка k11a пройдена (версия «совместное покрытие, происхождение аудита»): "
+    # --- строгая сверка происхождения повторного аудита ---------------------
+    prod = dict(n_obs=150, d_hidden=768, d_latent=512, depth=12,
+                q0_source="joint12", taps=[12, 18, 24], ckpt="A/B",
+                cache="c.npz", vocab=1024, dataset_revision="v2.0")
+    assert check_drift_only(prod, dict(prod))
+    # каждое поле по отдельности обязано ловиться: раньше сверялись только
+    # n_obs и d_hidden, и аудит другой глубиной проходил молча
+    for k, other in (("depth", 24), ("q0_source", "readout"),
+                     ("taps", [12, 24]), ("ckpt", "X/Y"), ("cache", "d.npz"),
+                     ("vocab", 2048), ("dataset_revision", "v1.0"),
+                     ("d_latent", 256), ("n_obs", 149), ("d_hidden", 512)):
+        try:
+            check_drift_only(prod, dict(prod, **{k: other}))
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"расхождение по {k} принято")
+    # отсутствующее поле — отказ, а не пропуск
+    for k in ("depth", "q0_source"):
+        try:
+            check_drift_only({x: v for x, v in prod.items() if x != k},
+                             dict(prod))
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"отсутствие {k} принято")
+    # None в текущих значениях не сверяется: поле неизвестно этому запуску
+    assert check_drift_only(prod, dict(prod, joint_ckpt=None))
+
+    print("самопроверка k11a пройдена (версия «строгая сверка повторного "
+          "аудита»): "
           "базис из нецентрированного грамиана восстанавливает подпространство, "
           "центрирование теряет смещение, доля улучшения не определена при "
           "идеальном черновике и отрицательна при ухудшении, ранг требует "
           "порога по обоим каналам, схват отвергает ранг отдельным условием, "
           "агрегирование не зависит от размера батча, префикс режется по "
           "шагам чанка, манифест и отпечатки декодера отвергают и подмену, "
-          "и отсутствие поля")
+          "и отсутствие поля, повторный аудит отвергает расхождение по "
+          "каждому полю происхождения по отдельности")
 
 
 def decoder_probe(codec, E, dev):
@@ -685,6 +749,25 @@ def diagnose(args):
     import torch
     prefix = args.diagnose
     meta = json.load(open(prefix + ".meta.json"))
+
+    # ПЕРЕЗАПИСЬ ГОТОВОЙ ДИАГНОСТИКИ ТРЕБУЕТ ЯВНОГО РАЗРЕШЕНИЯ, И ПРОВЕРЯЕТСЯ
+    # ДО РАБОТЫ. Прежде `--diagnose` молча затирал `basis.npy`, `rho.npy` и
+    # `diag.json`. Обещание «старая диагностика не перезаписывается»
+    # держалось только на дисциплине запускающего, а после заморозки правила
+    # случайный повторный прогон с другими ключами подменил бы замороженные
+    # артефакты — и K-11b принял бы подмену, потому что сверяет их с
+    # диагностикой, а она сменилась бы вместе с ними.
+    exist = [p for p in (prefix + ".diag.json", prefix + ".basis.npy",
+                         prefix + ".rho.npy") if os.path.exists(p)]
+    if exist and not args.force:
+        old = json.load(open(prefix + ".diag.json")) \
+            if os.path.exists(prefix + ".diag.json") else {}
+        raise SystemExit(
+            f"диагностика уже существует ({len(exist)} файлов, ранг "
+            f"{old.get('rank')}, базис sha {old.get('basis_sha1')}). "
+            f"Перезапись затрёт ЗАМОРОЖЕННЫЕ артефакты. Повторить осознанно "
+            f"— флагом --force, предварительно скопировав старые файлы")
+
     _, codec, E, dev = load_codec(args)
     D = int(E.shape[-1])
     if D != int(meta["d_latent"]):
@@ -979,7 +1062,8 @@ def diagnose(args):
 
     rho = rho_of[rank] if rank is not None else None
 
-    # СНАЧАЛА МАССИВЫ, ПОТОМ ДИАГНОСТИКА С ИХ ОТПЕЧАТКАМИ.
+    # СНАЧАЛА МАССИВЫ, ПОТОМ ДИАГНОСТИКА С ИХ ОТПЕЧАТКАМИ. Право на
+    # перезапись уже проверено в начале diagnose, до всей работы.
     basis_sha = rho_sha = None
     if rank is not None:
         basis_sha = save_atomic(prefix + ".basis.npy",
@@ -1069,6 +1153,11 @@ def main() -> None:
     ap.add_argument("--min-free-gib", type=float, default=8.0,
                     help="минимум свободной памяти GPU; проверяется ДО "
                          "сбора состояний")
+    ap.add_argument("--force", action="store_true",
+                    help="разрешить --diagnose перезаписать уже существующие "
+                         "basis.npy, rho.npy и diag.json. Без флага "
+                         "диагностика отказывается затирать замороженные "
+                         "артефакты")
     ap.add_argument("--drift-only", action="store_true",
                     help="повторить ТОЛЬКО аудит дрейфа на уже собранном "
                          "кэше: проход по батчам пропускается, отводы и коды "
@@ -1488,10 +1577,26 @@ def main() -> None:
         # ОТВОДЫ ОТКРЫВАЮТСЯ ТОЛЬКО НА ЧТЕНИЕ: повтор аудита не имеет права
         # переписать собранные данные.
         prev = json.load(open(f"{args.out}.meta.json"))
-        if int(prev["n_obs"]) != N or int(prev["d_hidden"]) != D_H:
+        if args.drift_n <= 0:
             raise SystemExit(
-                f"кэш собран на {prev['n_obs']} наблюдениях с h="
-                f"{prev['d_hidden']}, а сейчас {N} и {D_H}")
+                "--drift-only с --drift-n 0 не выполнил бы аудит вовсе, но "
+                "переписал бы meta и завершился успешно. Задайте --drift-n "
+                "больше нуля")
+        check_drift_only(prev, dict(
+            n_obs=int(N), d_hidden=int(D_H), d_latent=int(D_Z),
+            depth=int(args.depth), q0_source=str(args.q0_source),
+            taps=list(TAPS), ckpt=str(args.ckpt), cache=str(args.cache),
+            vocab=int(V), dataset_revision=str(args.dataset_revision)))
+        # ЧЕКПОЙНТ ЧЕРНОВИКА СВЕРЯЕТСЯ ПО SHA ФАЙЛА, а не по пути: одно имя
+        # может указывать на другую эпоху обучения.
+        prev_src = prev.get("source") or {}
+        if prev_src.get("weights_sha1") != wsha:
+            raise SystemExit(
+                f"кэш собран весами sha {prev_src.get('weights_sha1')}, а "
+                f"сейчас {wsha}: аудит мерил бы дрейф другой модели")
+        print(f"  происхождение сверено: глубина {args.depth}, источник "
+              f"{args.q0_source}, веса sha {wsha}, ключи sha "
+              f"{prev.get('keys_sha1')}")
         taps_mm = {t: np.load(f"{args.out}.h{t}.npy", mmap_mode="r")
                    for t in prev["saved_taps"]}
         q0hat = np.load(f"{args.out}.q0hat.npy")
@@ -1734,12 +1839,22 @@ def main() -> None:
         meta = json.load(open(f"{args.out}.meta.json"))
         meta["drift"] = drift
         meta["drift_error"] = drift_error
-        meta["drift_audit"] = dict(
-            script_sha1=sha, n=args.drift_n, batch=args.batch,
-            device=args.device, seed=1,
-            hicora_vla_sha1=file_sha1(hv.__file__),
-            joint12_vla_sha1=file_sha1(jv.__file__),
-            joint_ckpt_sha1=src_meta.get("weights_sha1") if src_meta else None)
+        # БЛОК АУДИТА ПИШЕТСЯ ТОЛЬКО ПРИ ВЫПОЛНЕННОМ АУДИТЕ. Прежде он
+        # записывался всегда: при пропуске (например `--drift-n 0`) в meta
+        # оставался `drift: null`, но рядом стоял `drift_audit` со свежими
+        # sha, и следующий шаг видел признак проведённой проверки там, где
+        # её не было.
+        if drift is not None:
+            meta["drift_audit"] = dict(
+                script_sha1=sha, n=args.drift_n, batch=args.batch,
+                device=args.device, seed=1,
+                hicora_vla_sha1=file_sha1(hv.__file__),
+                joint12_vla_sha1=file_sha1(jv.__file__),
+                joint_ckpt_sha1=(src_meta.get("weights_sha1")
+                                 if src_meta else None))
+        elif not drift_error:
+            drift_error = ("аудит не дал результата и не сообщил об ошибке — "
+                           "код прошёл мимо измерения")
     else:
         meta = write_meta(drift)
         meta["drift_error"] = drift_error
