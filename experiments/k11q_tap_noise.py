@@ -339,7 +339,16 @@ def main() -> None:
             v, pp = model.build_inputs(position_offset=int(po), **b)
             tp = model.forward_taps(vlm_inputs_embeds=v, attention_mask=am,
                                     position_ids=pp)
-        return tp[tap].float().cpu().numpy().astype(np.float16), lens
+        # ПОЗИЦИИ И ВЛОЖЕНИЯ ЦЕЛЕВОЙ СТРОКИ БЕЗ НАБИВКИ. Если они у одного и
+        # того же наблюдения зависят от батча, механизм найден: RoPE считает
+        # позицию от начала НАБИТОЙ строки, а не от начала подсказки.
+        keep = (am[0] == 1) if am is not None else None
+        pos0 = (pp[0][keep] if pp.dim() == 2 else pp[keep]).detach().cpu(
+            ).numpy() if keep is not None else None
+        emb0 = v[0][keep].float().detach().cpu().numpy() \
+            if keep is not None else None
+        return (tp[tap].float().cpu().numpy().astype(np.float16), lens,
+                pos0, emb0)
 
     # --- выбор: одна цель, два непересекающихся набора соседей -------------
     rng = np.random.default_rng(3)
@@ -372,13 +381,13 @@ def main() -> None:
     # Берём уже выбранные наблюдения, не трогая генератор: лишний розыгрыш
     # сдвинул бы состав целей и прогон перестал бы сравниваться с прошлым.
     probe_sel = np.concatenate([[int(B[0])], A])
-    r1, _ = run(probe_sel, po)
-    r2, _ = run(probe_sel, po)
+    r1, *_ = run(probe_sel, po)
+    r2, *_ = run(probe_sel, po)
     rep = rel_rms(r1, r2)
     seed_everything(0)
-    r3, _ = run(probe_sel, po)
+    r3, *_ = run(probe_sel, po)
     seed_everything(0)
-    r4, _ = run(probe_sel, po)
+    r4, *_ = run(probe_sel, po)
     rep_seed = rel_rms(r3, r4)
     print(f"  ПОВТОР того же вызова: {rep:.2e}; он же со сбросом сида перед "
           f"каждым: {rep_seed:.2e}")
@@ -386,9 +395,18 @@ def main() -> None:
     rows = []
     for t in one_per_ep(tgt_eps):
         cache_t = np.asarray(H[[t]])[0]
-        solo, len_solo = run(np.asarray([t]), po)
-        ha, len_a = run(np.concatenate([[t], A]), po)
-        hb, len_b = run(np.concatenate([[t], B]), po)
+        solo, len_solo, pos_s, emb_s = run(np.asarray([t]), po)
+        ha, len_a, pos_a, emb_a = run(np.concatenate([[t], A]), po)
+        hb, len_b, pos_b, emb_b = run(np.concatenate([[t], B]), po)
+        # МЕХАНИЗМ: совпадают ли позиции и вложения целевой строки
+        same_pos = (pos_s is not None and pos_a is not None
+                    and pos_s.shape == pos_a.shape
+                    and bool(np.array_equal(pos_s, pos_a))
+                    and pos_a.shape == pos_b.shape
+                    and bool(np.array_equal(pos_a, pos_b)))
+        emb_d = (float(np.abs(emb_s - emb_a).max())
+                 if emb_s is not None and emb_a is not None
+                 and emb_s.shape == emb_a.shape else None)
         r = dict(
             idx=int(t), episode=int(epi[t]), task=str(tsk[t]),
             solo_vs_cache=rel_rms(solo[0], cache_t),
@@ -396,14 +414,22 @@ def main() -> None:
             batchB_vs_cache=rel_rms(hb[0], cache_t),
             A_vs_B=rel_rms(ha[0], hb[0]),
             solo_vs_A=rel_rms(solo[0], ha[0]),
-            len_solo=len_solo, len_A=len_a, len_B=len_b)
+            len_solo=len_solo, len_A=len_a, len_B=len_b,
+            same_position_ids=same_pos,
+            pos_solo_head=(pos_s[:4].tolist() if pos_s is not None else None),
+            pos_A_head=(pos_a[:4].tolist() if pos_a is not None else None),
+            emb_max_abs_diff=emb_d)
         rows.append(r)
         print(f"    набл. {t} (эпизод {r['episode']}): одиночно/кэш "
               f"{r['solo_vs_cache']:.2e}, батчА/кэш {r['batchA_vs_cache']:.2e}, "
               f"батчБ/кэш {r['batchB_vs_cache']:.2e}, А/Б {r['A_vs_B']:.2e}, "
               f"одиночно/А {r['solo_vs_A']:.2e}")
-        print(f"      длины после набивки: одиночно {len_solo}, "
+        print(f"      длины без набивки: одиночно {len_solo}, "
               f"в А {sorted(set(len_a))[:4]}..., в Б {sorted(set(len_b))[:4]}...")
+        print(f"      позиции целевой строки совпадают: {same_pos}; "
+              f"начало одиночно {r['pos_solo_head']}, в А {r['pos_A_head']}; "
+              f"вложения расходятся на "
+              + ("—" if emb_d is None else f"{emb_d:.2e}"))
 
     med = lambda k: float(np.median([r[k] for r in rows]))
     tag, verdict = read_noise(rep, rep_seed, med("solo_vs_cache"),
@@ -412,6 +438,21 @@ def main() -> None:
           f"одиночно/кэш {med('solo_vs_cache'):.2e}, "
           f"батч/кэш {med('batchA_vs_cache'):.2e}, "
           f"А/Б {med('A_vs_B'):.2e}, одиночно/А {med('solo_vs_A'):.2e}")
+    n_same = sum(1 for r in rows if r["same_position_ids"])
+    print(f"\n  позиции целевой строки совпали у {n_same} из {len(rows)} "
+          f"наблюдений")
+    if tag == "B":
+        if n_same == len(rows):
+            verdict += (
+                ".\n  МЕХАНИЗМ НЕ В ПОЗИЦИЯХ: они совпали у всех целей, а "
+                "вложения\n  расходятся — искать в обработке картинки или в "
+                "самой подсказке")
+        else:
+            verdict += (
+                ".\n  МЕХАНИЗМ: `position_ids` целевой строки ЗАВИСЯТ от "
+                "батча — RoPE считает\n  позицию от начала набитой строки. "
+                "Чинится однородными по длине\n  батчами при сборе и при "
+                "исполнении либо правкой построения позиций")
     print(f"\n  {verdict}")
     print("  ЧИТАТЬ ТАК: это диагностика ВХОДА, а не тождества и не "
           "качества.\n  Ни один исход не отменяет K-11b: контроль подмены "
