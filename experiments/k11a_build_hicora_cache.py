@@ -91,6 +91,11 @@ GAIN_TARGET = 0.90
 # означает отдельный ЖЁСТКИЙ критерий, а не отсутствие критерия: без него ранг,
 # возвращающий 95% позы и переворачивающий 20% схватов, был бы выбран.
 GRIP_DELTA = 0.005
+# ЕДИНИЦА ПОКРЫТИЯ — ЛАТЕНТНЫЙ ТОКЕН. Голова применяет один и тот же
+# покоординатный предел независимо к каждому из шестнадцати токенов, поэтому
+# и покрытие естественно считать по токенам.
+RHO_SCHEMES = ("coord", "joint")
+RHO_COVER = 0.95
 
 
 def plan_batches(n, batch):
@@ -262,6 +267,29 @@ def err_finish(acc):
     return dict(pos=float(np.sqrt(acc["pos_sq"] / max(acc["pos_n"], 1))),
                 rot=float(np.sqrt(acc["rot_sq"] / max(acc["rot_n"], 1))),
                 grip=float(acc["grip_bad"] / max(acc["grip_n"], 1)))
+
+
+def rho_joint(coef, rank, base_q=95.0, cover=RHO_COVER):
+    """Предел по СОВМЕСТНОМУ покрытию токенов, а не по каждой координате.
+
+    ЗАЧЕМ. Покоординатный процентиль q оставляет вне предела долю (1-q) по
+    КАЖДОЙ координате, и при r координатах вне оказывается гораздо больше
+    токенов: измерено 44.9% токенов и 99.2% наблюдений при p95 и r=64. То
+    есть строгость правила незаметно росла с размерностью, и «p95» означало
+    совершенно разное при r=4 и r=64.
+
+    Схема: покоординатный масштаб s_i как базовый процентиль, затем общий
+    множитель alpha как процентиль величины m = max_i |a_i| / s_i. Тогда
+    внутрь бокса целиком попадает ровно `cover` токенов при ЛЮБОМ ранге.
+    """
+    a = np.abs(np.asarray(coef, np.float64)[:, :int(rank)])
+    s_ = np.percentile(a, base_q, axis=0)
+    if not np.isfinite(s_).all() or (s_ <= 0).any():
+        raise ValueError("базовый масштаб вырожден хотя бы по одной "
+                         "координате")
+    m = (a / s_[None]).max(axis=1)
+    alpha = float(np.percentile(m, 100.0 * cover))
+    return alpha * s_, alpha
 
 
 def action_err(a, ref):
@@ -529,6 +557,31 @@ def selftest():
     except SystemExit:
         pass
 
+    # --- ПОКРЫТИЕ НЕ ЗАВИСИТ ОТ РАНГА В СХЕМЕ joint -------------------------
+    # ГЛАВНОЕ СВОЙСТВО ПОПРАВКИ: покоординатный процентиль оставлял вне
+    # предела тем больше токенов, чем выше ранг (12.8% при r=4 против 44.9%
+    # при r=64), то есть строгость правила незаметно росла с размерностью.
+    rng3 = np.random.default_rng(3)
+    A_ = rng3.normal(size=(20000, 64))
+    for rk in (4, 16, 64):
+        rr, al = rho_joint(A_, rk, base_q=95.0, cover=0.95)
+        cov = float((np.abs(A_[:, :rk]) <= rr[None]).all(1).mean())
+        assert abs(cov - 0.95) < 0.01, (rk, cov)
+        assert al > 0
+    # Для сравнения: покоординатный p95 покрывает целиком тем меньше, чем
+    # больше ранг — именно это и было дефектом правила.
+    s95 = np.percentile(np.abs(A_), 95.0, axis=0)
+    cov4 = float((np.abs(A_[:, :4]) <= s95[:4][None]).all(1).mean())
+    cov64 = float((np.abs(A_[:, :64]) <= s95[None]).all(1).mean())
+    assert cov4 > 0.8 > cov64, (cov4, cov64)
+    # Вырожденная координата — отказ, а не молчаливый ноль.
+    bad = A_.copy(); bad[:, 0] = 0.0
+    try:
+        rho_joint(bad, 4)
+        raise AssertionError("вырожденный масштаб принят")
+    except ValueError:
+        pass
+
     # --- ПРИЧИНА ОТКАЗА: РАНГ ИЛИ АМПЛИТУДА --------------------------------
     # Прежняя ветка смотрела только pos/rot неограниченной проекции и потому
     # печатала «не хватает амплитуды» даже там, где clamp ни при чём.
@@ -569,7 +622,7 @@ def selftest():
     assert action_err(a2, ref)["pos"] == 0.0, "срез взял хвост"
     assert a2.shape[1] != N_POS, "ось времени спутана с латентными позициями"
 
-    print("самопроверка k11a пройдена (версия «причина отказа различается»): "
+    print("самопроверка k11a пройдена (версия «совместное покрытие, происхождение аудита»): "
           "базис из нецентрированного грамиана восстанавливает подпространство, "
           "центрирование теряет смещение, доля улучшения не определена при "
           "идеальном черновике и отрицательна при ухудшении, ранг требует "
@@ -730,14 +783,33 @@ def diagnose(args):
             r = (z_of(Kt[s_, 0, :], Kt[s_]) - z_of(q0[s_])).reshape(-1, D)
             coef.append((r @ Bt).abs().cpu().numpy())
     coef = np.concatenate(coef)
-    rho_full = np.percentile(coef, args.rho_pct, axis=0)
-    if not np.isfinite(rho_full).all() or (rho_full <= 0).any():
-        raise SystemExit("процентиль дал ноль или бесконечность: остаток "
-                         "вырожден хотя бы по одной координате базиса")
-    print(f"\n  rho: процентиль {args.rho_pct} по {len(coef)} строкам TRAIN, "
-          f"по каждой из {Bfull.shape[1]} координат полного базиса")
+    # ПРЕДЕЛ ЗАВИСИТ ОТ РАНГА В СХЕМЕ joint, поэтому считается для каждого.
+    ranks_all = [r for r in PCA_RANKS if r <= Bfull.shape[1]]
+    if args.rho_scheme == "coord":
+        rho_full = np.percentile(coef, args.rho_pct, axis=0)
+        if not np.isfinite(rho_full).all() or (rho_full <= 0).any():
+            raise SystemExit("процентиль дал ноль или бесконечность: остаток "
+                             "вырожден хотя бы по одной координате базиса")
+        rho_of = {r: rho_full[:r] for r in ranks_all}
+        alpha_of = {r: None for r in ranks_all}
+        print(f"\n  rho, схема «coord»: процентиль {args.rho_pct} по "
+              f"{len(coef)} строкам TRAIN, по каждой из {Bfull.shape[1]} "
+              f"координат")
+    else:
+        rho_of, alpha_of = {}, {}
+        for r in ranks_all:
+            rho_of[r], alpha_of[r] = rho_joint(coef, r, args.rho_pct,
+                                               args.rho_cover)
+        rho_full = rho_of[max(ranks_all)]
+        print(f"\n  rho, схема «joint»: базовый масштаб — процентиль "
+              f"{args.rho_pct} по координате, общий множитель — процентиль "
+              f"{100 * args.rho_cover:.0f} величины max_i |a_i|/s_i")
+        print(f"    покрытие ТОКЕНОВ целиком фиксировано на "
+              f"{100 * args.rho_cover:.0f}% при ЛЮБОМ ранге; множители "
+              f"alpha: "
+              + ", ".join(f"r{r}={alpha_of[r]:.2f}" for r in ranks_all))
 
-    ranks = [r for r in PCA_RANKS if r <= Bfull.shape[1]]
+    ranks = ranks_all
     print(f"\n  насыщение на train (процентиль по КАЖДОЙ координате не значит "
           f"{100 - args.rho_pct:.0f}%\n  векторов вне предела: при r "
           f"координатах хотя бы одна выходит гораздо чаще):")
@@ -746,7 +818,7 @@ def diagnose(args):
     sat_stats = {}
     for rk in ranks:
         c_ = coef[:, :rk]
-        rr = rho_full[:rk]
+        rr = rho_of[rk]
         over = c_ > rr[None]
         per_tok = over.any(1)
         # Наблюдение = 16 латентных позиций подряд.
@@ -790,7 +862,7 @@ def diagnose(args):
             for rk in ranks:
                 Br = Bt[:, :rk].to(rb.dtype)
                 cf = rb @ Br
-                lim = torch.as_tensor(rho_full[:rk], dtype=cf.dtype,
+                lim = torch.as_tensor(rho_of[rk], dtype=cf.dtype,
                                       device=cf.device)
                 for tag, cc, acc_ in (("u", cf, acc_u),
                                       ("c", torch.clamp(cf, -lim, lim),
@@ -905,7 +977,7 @@ def diagnose(args):
           "поправка меняет схват, и ранг,\n  переворачивающий его, "
           "отвергается независимо от качества позы.")
 
-    rho = rho_full[:rank] if rank is not None else None
+    rho = rho_of[rank] if rank is not None else None
 
     # СНАЧАЛА МАССИВЫ, ПОТОМ ДИАГНОСТИКА С ИХ ОТПЕЧАТКАМИ.
     basis_sha = rho_sha = None
@@ -928,7 +1000,10 @@ def diagnose(args):
                err_draft=e_z0, rank=rank, rank_unclamped=rank_u,
                gain_target=GAIN_TARGET, grip_delta=GRIP_DELTA,
                rho=None if rho is None else rho.tolist(),
-               rho_pct=args.rho_pct, prefix=prefix,
+               rho_pct=args.rho_pct, rho_scheme=args.rho_scheme,
+               rho_cover=args.rho_cover,
+               rho_alpha=None if rank is None else alpha_of.get(rank),
+               prefix=prefix,
                # ОТПЕЧАТКИ АРТЕФАКТОВ — ЧАСТЬ ДИАГНОСТИКИ, а не отчёта о ней:
                # без них любой ортонормированный базис той же формы выдавал
                # бы себя за выбранный, и K-11b это принимал.
@@ -968,6 +1043,13 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--diag-n", type=int, default=20000)
+    ap.add_argument("--rho-scheme", choices=RHO_SCHEMES, default="coord",
+                    help="coord — покоординатный процентиль (исходное "
+                         "пре-регистрированное правило, провалено); joint — "
+                         "совместное покрытие токенов, поправка протокола")
+    ap.add_argument("--rho-cover", type=float, default=RHO_COVER,
+                    help="доля ТОКЕНОВ, целиком попадающих внутрь предела "
+                         "(схема joint)")
     ap.add_argument("--rho-pct", type=float, default=95.0)
     ap.add_argument("--rho-pct-sweep", default=None,
                     help="процентили через запятую: посчитать долю "
@@ -1470,7 +1552,8 @@ def main() -> None:
     if not args.drift_only and seen != {model.n_layers_total}:
         raise SystemExit(f"глубина прохода {sorted(seen)} вместо "
                          f"{model.n_layers_total}")
-    print(f"  проход: ровно {model.n_layers_total} слоёв во всех батчах")
+    if not args.drift_only:
+        print(f"  проход: ровно {model.n_layers_total} слоёв во всех батчах")
 
     # --- ШУМ ХРАНЕНИЯ FP16 ИЗМЕРЯЕТСЯ, А НЕ ПРЕДПОЛАГАЕТСЯ -----------------
     if not args.drift_only and args.depth not in save_taps:
@@ -1642,12 +1725,27 @@ def main() -> None:
     # META ПЕРЕПИСЫВАЕТСЯ РЕЗУЛЬТАТОМ АУДИТА — атомарно, поверх уже
     # сохранённой. Если аудит не выполнен, в meta остаётся drift=None и
     # причина отказа.
-    meta = write_meta(drift)
-    if drift_error:
+    if args.drift_only:
+        # ПОЛЯ ПРОИЗВОДИТЕЛЯ СОХРАНЯЮТСЯ БЕЗ ИЗМЕНЕНИЙ. `write_meta` собирает
+        # meta заново и вписал бы туда sha ТЕКУЩИХ скрипта и модулей, хотя
+        # отводы созданы предыдущей версией. Это отмывание происхождения:
+        # K-11b увидел бы свежие sha и принял кэш, собранный другим кодом.
+        # Аудит меняет только собственные поля и свои отпечатки.
+        meta = json.load(open(f"{args.out}.meta.json"))
+        meta["drift"] = drift
         meta["drift_error"] = drift_error
-        tmp = f"{args.out}.meta.json.tmp"
-        json.dump(meta, open(tmp, "w"), ensure_ascii=False, indent=1)
-        os.replace(tmp, f"{args.out}.meta.json")
+        meta["drift_audit"] = dict(
+            script_sha1=sha, n=args.drift_n, batch=args.batch,
+            device=args.device, seed=1,
+            hicora_vla_sha1=file_sha1(hv.__file__),
+            joint12_vla_sha1=file_sha1(jv.__file__),
+            joint_ckpt_sha1=src_meta.get("weights_sha1") if src_meta else None)
+    else:
+        meta = write_meta(drift)
+        meta["drift_error"] = drift_error
+    tmp = f"{args.out}.meta.json.tmp"
+    json.dump(meta, open(tmp, "w"), ensure_ascii=False, indent=1)
+    os.replace(tmp, f"{args.out}.meta.json")
     print(f"\n  meta обновлена; ключи sha {meta['keys_sha1']}")
     print("\n  ДАЛЬШЕ: --diagnose для выбора ранга и rho, затем K-11b с "
           "проверками\n  тождества. Обучение головы не начинать до "
