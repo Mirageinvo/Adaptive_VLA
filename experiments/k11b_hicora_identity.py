@@ -794,7 +794,15 @@ def main() -> None:
             m[1]["content"] = m[1]["content"][1:]
             msgs.append(m)
         texts = proc.apply_chat_template(msgs, add_generation_prompt=True)
-        b = proc(text=texts, images=[[image[i].numpy()] for i in range(k)],
+        # ДЛИНА БЕРЁТСЯ ИЗ САМОЙ ВЫБОРКИ. После вынесения `build_sel` здесь
+        # оставалось `range(k)` из замыкания, то есть размер ПРЕДЫДУЩЕГО
+        # вызова: любая выборка другой длины падала по индексу, а выборка
+        # МЕНЬШЕЙ длины прошла бы молча, взяв лишние картинки.
+        n_sel = len(sel)
+        if len(msgs) != n_sel or image.shape[0] != n_sel:
+            raise SystemExit(f"рассогласование: {n_sel} наблюдений, "
+                             f"{len(msgs)} подсказок, {image.shape[0]} картинок")
+        b = proc(text=texts, images=[[image[i].numpy()] for i in range(n_sel)],
                  return_tensors="pt", padding=True, padding_side="left",
                  action_processor_kwargs={"embodiment_ids": 0})
         return dict_apply(lambda x: x.to(dev, dt), b), sel
