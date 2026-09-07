@@ -387,6 +387,10 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--seeds", default="0,1")
     ap.add_argument("--lrs", default="1e-4,1e-3")
+    ap.add_argument("--wds", default="0",
+                    help="затухание весов; перебирается наравне со скоростью. "
+                         "Потеря на обучении падает, а доля на val стоит — "
+                         "это переобучение, и штраф на веса первый кандидат")
     ap.add_argument("--targets", default="star,action",
                     help="star — D(z*), action — истинные действия A*")
     ap.add_argument("--val-n", type=int, default=0,
@@ -676,9 +680,11 @@ def main() -> None:
     runs, arms_acc = [], {}
     oracle_pos = None
 
+    wds = [float(x) for x in str(args.wds).split(",") if x]
     for tgt in targets:
+      for wd in wds:
         for lr in lrs:
-            key = f"{tgt}/{lr:g}"
+            key = f"{tgt}/{lr:g}/wd{wd:g}"
             for seed in seeds:
                 seed_everything(seed)
                 # ГОЛОВА СТРОИТСЯ ТОЙ ЖЕ ФАБРИКОЙ И ТЕМИ ЖЕ РАЗМЕРАМИ,
@@ -694,7 +700,7 @@ def main() -> None:
                 names, n_par = trainable_report(head)
                 opt = torch.optim.AdamW(
                     [p for p in head.parameters() if p.requires_grad], lr=lr,
-                    weight_decay=0.0)
+                    weight_decay=wd)
                 scaler = torch.amp.GradScaler(dev.type)
 
                 # ЭПОХА 0 — ЧАСТЬ ЗАМЕРА, А НЕ ФОРМАЛЬНОСТЬ.
@@ -761,17 +767,17 @@ def main() -> None:
                           f"{ev['saturated_tokens']:.1%}", flush=True)
                 last = hist[-1]["val"]
                 cp = os.path.join(args.ckpt_dir,
-                                  f"d1_{tgt}_{lr:g}_s{seed}.pt")
+                                  f"d1_{tgt}_{lr:g}_wd{wd:g}_s{seed}.pt")
                 torch.save(dict(
                     state={f"hicora_head.{k}": v.detach().cpu()
                            for k, v in head.state_dict().items()
                            if k.startswith(TRAIN_PREFIXES)},
-                    target=tgt, lr=lr, seed=seed, epochs=args.epochs,
+                    target=tgt, lr=lr, wd=wd, seed=seed, epochs=args.epochs,
                     rank=rank, script_sha1=sha,
                     basis_sha1=k11a.file_sha1(basis_p),
                     rho_sha1=k11a.file_sha1(rho_p),
                     res_norm_sha1=rn_sha, cache=prefix), cp)
-                rec = dict(key=key, target=tgt, lr=lr, seed=seed,
+                rec = dict(key=key, target=tgt, lr=lr, wd=wd, seed=seed,
                            ckpt=cp, minutes=(time.time() - t0) / 60.0,
                            hist=hist)
                 runs.append(rec)
@@ -784,8 +790,20 @@ def main() -> None:
                 # ПРИРОСТ ЗА ПОСЛЕДНЮЮ ЭПОХУ — признак того, вышла ли
                 # кривая на полку. Без него вывод об архитектуре делался бы
                 # на недообученной голове.
-                prev = hist[-2]["val"]["star"]["head"]["pos"] \
-                    if len(hist) >= 2 else 0.0
+                # СХОДИМОСТЬ ПО ОКНУ, А НЕ ПО ОДНОЙ ЭПОХЕ. Доля на val
+                # колеблется в пределах процентного пункта от эпохи к эпохе
+                # (у одного из сидов наблюдалось 7.7 -> 6.6 -> 7.4 -> 6.8),
+                # поэтому разность двух соседних эпох — шумная статистика:
+                # она может и объявить сходимость на растущей кривой, и
+                # наоборот. Сравниваются средние по двум окнам.
+                gains_h = [h["val"]["star"]["head"]["pos"] for h in hist[1:]]
+                w_ = min(3, len(gains_h) // 2)
+                if w_ >= 1:
+                    delta_ = float(np.mean(gains_h[-w_:])
+                                   - np.mean(gains_h[-2 * w_:-w_]))
+                else:
+                    delta_ = float(gains_h[-1]) if gains_h else 0.0
+                prev = last["star"]["head"]["pos"] - delta_
                 arms_acc.setdefault(key, []).append(dict(
                     pos=last["star"]["head"]["pos"],
                     rot=last["star"]["head"]["rot"],
@@ -799,10 +817,10 @@ def main() -> None:
     best, rows, skipped = select_arm(arms_acc)
     print(f"\n  сводка по конфигурациям (опора D(z*), среднее по сидам, "
           f"схват черновика {draft_grip:.1%}):")
-    print(f"    {'конфигурация':>16}{'сидов':>7}{'поз':>8}{'вр':>8}"
+    print(f"    {'конфигурация':>22}{'сидов':>7}{'поз':>8}{'вр':>8}"
           f"{'Δсхват сверху':>15}{'гейт':>7}{'прирост':>10}")
     for r in rows:
-        print(f"    {r['key']:>16}{r['n_seeds']:>7}{r['pos']:>8.1%}"
+        print(f"    {r['key']:>22}{r['n_seeds']:>7}{r['pos']:>8.1%}"
               f"{r['rot']:>8.1%}{r['grip_delta_hi']:>14.2%}"
               f"{('да' if r['ok'] else 'НЕТ'):>7}{r['last_delta']:>+10.1%}")
     print(f"    (прирост — за ПОСЛЕДНЮЮ эпоху; выше {CONV_TOL:.1%} означает, "
@@ -824,7 +842,7 @@ def main() -> None:
                n_train=int(len(tr)), n_val=int(len(va)),
                n_val_episodes=int(len(ep_ids)),
                epochs=args.epochs, batch=args.batch,
-               seeds=seeds, lrs=lrs, targets=targets,
+               seeds=seeds, lrs=lrs, wds=wds, targets=targets,
                probe_pos=probe_pos, oracle_pos=oracle_pos,
                draft_grip=draft_grip, runs=runs,
                selection=rows, best=best, skipped=skipped,
