@@ -133,6 +133,37 @@ def read_noise(repeat, repeat_reseed, solo_vs_cache, batch_vs_cache,
         f"подсказка, офсет")
 
 
+def read_mechanism(interv_vs_solo, interv_vs_batch, batch_effect, near=3.0):
+    """Причина устанавливается ИНТЕРВЕНЦИЕЙ, а не совпадением изменений.
+
+    Прежняя версия объявляла механизм по тому, что позиции у одного и того
+    же наблюдения различаются между батчами. Это корреляция: позиции меняются
+    ОДНОВРЕМЕННО с составом батча, длиной набивки и всем прочим. Тем более
+    что при точной арифметике одинаковый сдвиг ВСЕХ валидных позиций
+    относительные углы RoPE сохраняет, и эффект вовсе не обязан быть.
+
+    Здесь подменены только позиции, при тех же вложениях, маске и форме.
+    `interv_vs_solo` — насколько это сдвинуло результат от одиночного;
+    `interv_vs_batch` — сколько осталось до батчевого.
+    """
+    if interv_vs_solo >= batch_effect / near and \
+            interv_vs_batch <= batch_effect / near:
+        return ("МЕХАНИЗМ — ПОЗИЦИИ: подмена ТОЛЬКО position_ids сдвигает "
+                f"результат на {interv_vs_solo:.2e} и приводит его к "
+                f"батчевому с точностью {interv_vs_batch:.2e}. Чинится "
+                "однородными по длине батчами либо правкой построения позиций")
+    if interv_vs_solo <= batch_effect / near:
+        return ("МЕХАНИЗМ НЕ В ПОЗИЦИЯХ: их подмена почти ничего не меняет "
+                f"({interv_vs_solo:.2e} против батчевого эффекта "
+                f"{batch_effect:.2e}). Совпадение изменения позиций с "
+                "изменением h24 оказалось корреляцией. Искать в набивке, "
+                "маске и форме батча")
+    return ("ПОЗИЦИИ ОБЪЯСНЯЮТ ЧАСТЬ: их подмена сдвигает результат на "
+            f"{interv_vs_solo:.2e}, но до батчевого остаётся "
+            f"{interv_vs_batch:.2e} при эффекте {batch_effect:.2e}. "
+            "Причина составная, и одними позициями она не исчерпывается")
+
+
 def selftest():
     rng = np.random.default_rng(0)
     x = rng.normal(size=(4, 16, 32))
@@ -175,13 +206,28 @@ def selftest():
     for s_ in (1e-2, 5e-3):
         assert read_noise(1e-5, 1e-5, s_, s_ * 1.05, 1e-6)[0] != "storage"
 
-    print("самопроверка k11q пройдена (версия «нулевой контроль повтором»): "
+    # --- механизм устанавливается интервенцией ------------------------------
+    # позиции сдвигают к батчевому и почти доводят до него -> они и есть
+    t_ = read_mechanism(1.9e-2, 1e-3, 1.9e-2)
+    assert t_.startswith("МЕХАНИЗМ — ПОЗИЦИИ"), t_
+    # подмена позиций почти ничего не меняет -> корреляция, а не причина
+    t_ = read_mechanism(1e-4, 1.9e-2, 1.9e-2)
+    assert "НЕ В ПОЗИЦИЯХ" in t_ and "корреляцией" in t_, t_
+    # частичное объяснение не выдаётся за полное
+    t_ = read_mechanism(1.0e-2, 1.0e-2, 1.9e-2)
+    assert "ЧАСТЬ" in t_, t_
+    # КОНТРОЛЬ: вердикт «позиции» не выдаётся, когда до батчевого далеко
+    assert not read_mechanism(1.9e-2, 1.8e-2, 1.9e-2).startswith(
+        "МЕХАНИЗМ — ПОЗИЦИИ")
+
+    print("самопроверка k11q пройдена (версия «интервенция по позициям»): "
           "относительная невязка не зависит от масштаба и растёт с "
           "расхождением, чтение СНАЧАЛА требует воспроизводимости повтора и "
           "на картине из первого прогона больше НЕ выдаёт вердикт о соседях, "
-          "отделяет случайность подготовки входа от недетерминизма ядер, а "
+          "отделяет случайность подготовки входа от недетерминизма ядер, "
           "при воспроизводимом повторе различает соседей, набивку, "
-          "округление и необъяснённый остаток")
+          "округление и необъяснённый остаток, а механизм устанавливает "
+          "ИНТЕРВЕНЦИЕЙ по позициям и не выдаёт корреляцию за причину")
 
 
 def main() -> None:
@@ -313,8 +359,12 @@ def main() -> None:
                 else process_state(S_[int(stp[gi])][None])[0]
         return (st - STATE_Q01) / (STATE_Q99 - STATE_Q01) * 2.0 - 1.0
 
-    def run(sel, po):
-        """h24 для набора наблюдений и длины подсказок до набивки."""
+    def run(sel, po, pos_override=None):
+        """h24 для набора наблюдений и длины подсказок до набивки.
+
+        `pos_override` подменяет `position_ids` целиком, не трогая ничего
+        другого: это и есть интервенция, отделяющая позиции от прочего.
+        """
         st_n = states_for(sel)
         image = torch.from_numpy(np.asarray(IMG[sel]))
         msgs = []
@@ -337,6 +387,13 @@ def main() -> None:
                 if am is not None else None)
         with torch.no_grad(), torch.autocast(device_type=dev.type, dtype=dt):
             v, pp = model.build_inputs(position_offset=int(po), **b)
+            # ИНТЕРВЕНЦИЯ: позиции можно подменить, оставив вложения, маску и
+            # форму батча теми же. Только так отделяется вклад позиций от
+            # вклада всего остального; совпадение изменений причиной не
+            # является, тем более что при точной арифметике одинаковый сдвиг
+            # всех валидных позиций относительные углы RoPE сохраняет.
+            if pos_override is not None:
+                pp = pos_override.to(pp.device, pp.dtype)
             tp = model.forward_taps(vlm_inputs_embeds=v, attention_mask=am,
                                     position_ids=pp)
         # ПОЗИЦИИ И ВЛОЖЕНИЯ ЦЕЛЕВОЙ СТРОКИ БЕЗ НАБИВКИ. Если они у одного и
@@ -364,7 +421,7 @@ def main() -> None:
         pos_all = unpad(pp if pp.dim() > 1 else pp.unsqueeze(0))
         pos_act = pos_all[-n_act:] if n_act > 0 else pos_all[-16:]
         return (tp[tap].float().cpu().numpy().astype(np.float16), lens,
-                pos_all, unpad(v), pos_act)
+                pos_all, unpad(v), pos_act, pp.detach().clone())
 
     # --- выбор: одна цель, два непересекающихся набора соседей -------------
     rng = np.random.default_rng(3)
@@ -411,9 +468,20 @@ def main() -> None:
     rows = []
     for t in one_per_ep(tgt_eps):
         cache_t = np.asarray(H[[t]])[0]
-        solo, len_solo, pos_s, emb_s, act_s = run(np.asarray([t]), po)
-        ha, len_a, pos_a, emb_a, act_a = run(np.concatenate([[t], A]), po)
-        hb, len_b, pos_b, emb_b, act_b = run(np.concatenate([[t], B]), po)
+        solo, len_solo, pos_s, emb_s, act_s, raw_s = run(np.asarray([t]), po)
+        ha, len_a, pos_a, emb_a, act_a, raw_a = run(
+            np.concatenate([[t], A]), po)
+        hb, len_b, pos_b, emb_b, act_b, _ = run(np.concatenate([[t], B]), po)
+        # ИНТЕРВЕНЦИЯ ПО ПОЗИЦИЯМ. Тот же одиночный вход, та же маска, та же
+        # форма — подменены ТОЛЬКО позиции на те, что наблюдение получило бы
+        # в батче А. Если h24 после этого совпадёт с батчевым, позиции и есть
+        # причина; если останется на месте — причина в другом.
+        n_solo = raw_s.shape[-1]
+        pos_from_batch = raw_a[:1, -n_solo:] if raw_a.dim() > 1 \
+            else raw_a[-n_solo:].unsqueeze(0)
+        solo_pi, *_ = run(np.asarray([t]), po, pos_override=pos_from_batch)
+        iv_vs_solo = rel_rms(solo_pi[0], solo[0])
+        iv_vs_batch = rel_rms(solo_pi[0], ha[0])
         # МЕХАНИЗМ: совпадают ли позиции и вложения целевой строки
         same_pos = (pos_s is not None and pos_a is not None
                     and pos_s.shape == pos_a.shape
@@ -439,7 +507,8 @@ def main() -> None:
             act_pos_solo=act_s.tolist()[:6], act_pos_A=act_a.tolist()[:6],
             pos_solo_head=(pos_s[:4].tolist() if pos_s is not None else None),
             pos_A_head=(pos_a[:4].tolist() if pos_a is not None else None),
-            emb_max_abs_diff=emb_d)
+            emb_max_abs_diff=emb_d,
+            interv_pos_vs_solo=iv_vs_solo, interv_pos_vs_batch=iv_vs_batch)
         rows.append(r)
         print(f"    набл. {t} (эпизод {r['episode']}): одиночно/кэш "
               f"{r['solo_vs_cache']:.2e}, батчА/кэш {r['batchA_vs_cache']:.2e}, "
@@ -449,6 +518,9 @@ def main() -> None:
               f"в А {sorted(set(len_a))[:4]}..., в Б {sorted(set(len_b))[:4]}...")
         print(f"      позиции подсказки совпадают: {same_pos}; позиции "
               f"ПОТОКА ДЕЙСТВИЙ совпадают: {r['same_action_positions']}")
+        print(f"      ИНТЕРВЕНЦИЯ (подменены только позиции): сдвиг от "
+              f"одиночного {iv_vs_solo:.2e}, остаток до батчевого "
+              f"{iv_vs_batch:.2e}")
         print(f"      действия одиночно {r['act_pos_solo']}, в А "
               f"{r['act_pos_A']}; вложения расходятся на "
               + ("—" if emb_d is None else f"{emb_d:.2e}"))
@@ -464,18 +536,13 @@ def main() -> None:
     n_act = sum(1 for r in rows if r["same_action_positions"])
     print(f"\n  позиции подсказки совпали у {n_same} из {len(rows)}, позиции "
           f"потока действий — у {n_act} из {len(rows)}")
+    iv_s = float(np.median([r["interv_pos_vs_solo"] for r in rows]))
+    iv_b = float(np.median([r["interv_pos_vs_batch"] for r in rows]))
+    print(f"  интервенция по позициям: сдвиг от одиночного {iv_s:.2e}, "
+          f"остаток до батчевого {iv_b:.2e}")
     if tag == "B":
-        if n_same == len(rows) and n_act == len(rows):
-            verdict += (
-                ".\n  МЕХАНИЗМ НЕ В ПОЗИЦИЯХ: они совпали у всех целей, а "
-                "вложения\n  расходятся — искать в обработке картинки или в "
-                "самой подсказке")
-        else:
-            verdict += (
-                ".\n  МЕХАНИЗМ: `position_ids` целевой строки ЗАВИСЯТ от "
-                "батча — RoPE считает\n  позицию от начала набитой строки. "
-                "Чинится однородными по длине\n  батчами при сборе и при "
-                "исполнении либо правкой построения позиций")
+        verdict += ".\n  " + read_mechanism(iv_s, iv_b,
+                                            med("batchA_vs_cache"))
     print(f"\n  {verdict}")
     print("  ЧИТАТЬ ТАК: это диагностика ВХОДА, а не тождества и не "
           "качества.\n  Ни один исход не отменяет K-11b: контроль подмены "
@@ -488,6 +555,9 @@ def main() -> None:
                medians={k: med(k) for k in
                         ("solo_vs_cache", "batchA_vs_cache",
                          "batchB_vs_cache", "A_vs_B", "solo_vs_A")},
+               intervention=dict(
+                   pos_only_vs_solo=iv_s, pos_only_vs_batch=iv_b,
+                   batch_effect=med("batchA_vs_cache")),
                tag=tag, verdict=verdict)
     tmp = args.out + ".tmp"
     json.dump(out, open(tmp, "w"), ensure_ascii=False, indent=1)

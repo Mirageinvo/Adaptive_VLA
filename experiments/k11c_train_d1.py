@@ -97,30 +97,39 @@ def trainable_report(head):
     return tr, n_par
 
 
-def select_arm(arms, grip_draft, tol=GRIP_TOL, min_seeds=SEL_SEEDS_MIN):
+def select_arm(arms, tol=GRIP_TOL, min_seeds=SEL_SEEDS_MIN):
     """Пре-регистрированный отбор: по СРЕДНЕМУ ПО СИДАМ, с гейтом по схвату.
 
     `arms` — словарь ключ -> список записей по сидам, каждая с полями
-    `pos`, `rot`, `grip_hi` (верхняя граница интервала доли ошибок знака).
+    `pos`, `rot`, `grip_delta_hi` — ВЕРХНЯЯ ГРАНИЦА ИНТЕРВАЛА ПАРНОЙ
+    РАЗНИЦЫ «голова минус черновик», а не интервал абсолютной ошибки.
 
-    ДВА ПРАВИЛА, КОТОРЫЕ ЛЕГКО НАРУШИТЬ СЛУЧАЙНО.
+    ТРИ ПРАВИЛА, КОТОРЫЕ ЛЕГКО НАРУШИТЬ СЛУЧАЙНО.
     Первое: берётся среднее по сидам, а не лучший сид — выбор лучшего сида
     есть выбор шума, и на двух сидах это даёт заметное смещение вверх.
     Второе: схват — ЖЁСТКИЙ гейт по ВЕРХНЕЙ границе, а не слагаемое: рука,
     роняющая предмет, не компенсируется точностью позы.
+    Третье: разница ПАРНАЯ. Прежняя версия сравнивала верхнюю границу
+    АБСОЛЮТНОЙ ошибки головы с ТОЧЕЧНЫМ схватом черновика и тем выбрасывала
+    корреляцию: голова и черновик мерены на одних эпизодах, их разброс общий,
+    и такой гейт мог и отвергнуть годную конфигурацию, и принять негодную.
     """
     rows = []
     for key, runs in sorted(arms.items()):
         if len(runs) < min_seeds:
             continue
+        if any(r.get("grip_delta_hi") is None for r in runs):
+            raise SystemExit(
+                f"у {key} нет верхней границы ПАРНОЙ разницы по схвату: гейт "
+                f"нечем считать. Отчётный прогон обязан идти с бутстрапом")
         pos = float(np.mean([r["pos"] for r in runs]))
         rot = float(np.mean([r["rot"] for r in runs]))
         # Гейт по ХУДШЕМУ сиду: конфигурация, проваливающая схват хотя бы на
         # одном сиде, не годится — при новом сиде провалит и она.
-        grip_hi = float(max(r["grip_hi"] for r in runs))
-        ok = grip_hi <= grip_draft + tol + 1e-12
-        rows.append(dict(key=key, pos=pos, rot=rot, grip_hi=grip_hi, ok=ok,
-                         score=0.5 * (pos + rot), n_seeds=len(runs)))
+        grip_hi = float(max(r["grip_delta_hi"] for r in runs))
+        ok = grip_hi <= tol + 1e-12
+        rows.append(dict(key=key, pos=pos, rot=rot, grip_delta_hi=grip_hi,
+                         ok=ok, score=0.5 * (pos + rot), n_seeds=len(runs)))
     good = [r for r in rows if r["ok"]]
     best = max(good, key=lambda r: r["score"]) if good else None
     return best, sorted(rows, key=lambda r: -r["score"])
@@ -161,15 +170,18 @@ def selftest():
     assert not epoch0_ok(0.0, 0.0, ACT_TOL * 10)
 
     # --- отбор -------------------------------------------------------------
+    # Записи содержат ВЕРХНЮЮ ГРАНИЦУ ПАРНОЙ РАЗНИЦЫ по схвату, а не
+    # абсолютную ошибку: гейт задан как «голова не хуже черновика больше чем
+    # на допуск», и считаться обязан так же.
     arms = {
-        "star/1e-4": [dict(pos=0.30, rot=0.28, grip_hi=0.020),
-                      dict(pos=0.34, rot=0.32, grip_hi=0.021)],
-        "star/1e-3": [dict(pos=0.50, rot=0.10, grip_hi=0.019),
-                      dict(pos=0.10, rot=0.10, grip_hi=0.019)],
-        "act/1e-4": [dict(pos=0.60, rot=0.60, grip_hi=0.090),   # схват провален
-                     dict(pos=0.60, rot=0.60, grip_hi=0.021)],
+        "star/1e-4": [dict(pos=0.30, rot=0.28, grip_delta_hi=-0.004),
+                      dict(pos=0.34, rot=0.32, grip_delta_hi=0.001)],
+        "star/1e-3": [dict(pos=0.50, rot=0.10, grip_delta_hi=0.000),
+                      dict(pos=0.10, rot=0.10, grip_delta_hi=0.000)],
+        "act/1e-4": [dict(pos=0.60, rot=0.60, grip_delta_hi=0.061),
+                     dict(pos=0.60, rot=0.60, grip_delta_hi=0.001)],
     }
-    best, rows = select_arm(arms, grip_draft=0.026)
+    best, rows = select_arm(arms)
     # среднее по сидам: star/1e-4 даёт 0.31, star/1e-3 — 0.30
     assert best["key"] == "star/1e-4", best
     # КОНТРОЛЬ: по ЛУЧШЕМУ сиду победил бы star/1e-3 (0.50) — правило обязано
@@ -177,15 +189,32 @@ def selftest():
     assert max(arms["star/1e-3"], key=lambda r: r["pos"])["pos"] > best["pos"]
     # схват провален на одном сиде -> вся конфигурация не годится
     assert not [r for r in rows if r["key"] == "act/1e-4"][0]["ok"]
+    # РОВНО НА ДОПУСКЕ проходит, чуть выше — нет
+    b_e, _ = select_arm({"e": [dict(pos=0.9, rot=0.9,
+                                    grip_delta_hi=GRIP_TOL)] * 2})
+    assert b_e is not None
+    b_e2, _ = select_arm({"e": [dict(pos=0.9, rot=0.9,
+                                     grip_delta_hi=GRIP_TOL * 1.01)] * 2})
+    assert b_e2 is None
+    # КОНТРОЛЬ ЕДИНИЦ: абсолютная доля ошибок схвата (около 2.5%) НЕ является
+    # разницей и обязана проваливать гейт, если подставить её по ошибке
+    b_abs, _ = select_arm({"x": [dict(pos=0.9, rot=0.9,
+                                      grip_delta_hi=0.025)] * 2})
+    assert b_abs is None, "абсолютная величина принята вместо разницы"
     # конфигурация с одним сидом не участвует вовсе
     b2, r2 = select_arm(dict(arms, solo=[dict(pos=0.99, rot=0.99,
-                                              grip_hi=0.0)]),
-                        grip_draft=0.026)
+                                              grip_delta_hi=0.0)]))
     assert b2["key"] == "star/1e-4" and "solo" not in [r["key"] for r in r2]
     # ни одной прошедшей -> None, а не молчаливый выбор
-    b3, _ = select_arm({"x": [dict(pos=0.9, rot=0.9, grip_hi=0.9)] * 2},
-                       grip_draft=0.026)
+    b3, _ = select_arm({"x": [dict(pos=0.9, rot=0.9, grip_delta_hi=0.9)] * 2})
     assert b3 is None
+    # отсутствие интервала — ОТКАЗ, а не переход на точечную оценку
+    try:
+        select_arm({"x": [dict(pos=0.9, rot=0.9, grip_delta_hi=None)] * 2})
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("конфигурация без интервала принята")
     assert "НИ ОДНА" in read_train(None, [], 0.105, 0.904)
 
     # --- чтение ------------------------------------------------------------
@@ -252,13 +281,14 @@ def selftest():
     b2_[:, 0] = 1.0
     assert float(loss_terms(a, b2_)) > 0.0, "потеря не видит исполняемых шагов"
 
-    print("самопроверка k11c пройдена (версия «две опоры, отбор по среднему "
-          "по сидам»): нулевая эпоха ловит любое отклонение от черновика, "
-          "отбор идёт по среднему по сидам и НЕ выбрал бы лучший сид, схват "
-          "отвергает конфигурацию по худшему сиду, конфигурация с одним "
-          "сидом не участвует, посторонний обучаемый параметр и полностью "
-          "замороженная голова — отказ, потеря режет хвост чанка и видит "
-          "исполняемые шаги")
+    print("самопроверка k11c пройдена (версия «схват по ПАРНОЙ разнице»): "
+          "нулевая эпоха ловит любое отклонение от черновика, отбор идёт по "
+          "среднему по сидам и НЕ выбрал бы лучший сид, гейт схвата считает "
+          "ПАРНУЮ разницу и отвергает подставленную вместо неё абсолютную "
+          "величину, отсутствие интервала — отказ, а не точечная оценка, "
+          "конфигурация с одним сидом не участвует, посторонний обучаемый "
+          "параметр и полностью замороженная голова — отказ, потеря режет "
+          "хвост чанка и видит исполняемые шаги")
 
 
 def main() -> None:
@@ -490,7 +520,12 @@ def main() -> None:
                 A_orc = decode(z0b + torch.clamp(
                     a_coef, -rho_t, rho_t) @ Bt.T).cpu().numpy()
                 A_head = decode(z0b + dz.float()).cpu().numpy()
-            over = (c.abs().float() > rho_t * 0.99)
+            # НАСЫЩЕНИЕ СЧИТАЕТСЯ В ЕДИНИЦАХ tanh. Голова возвращает `c` —
+            # безразмерный выход tanh в [-1, 1]; предел применяется к нему
+            # умножением. Сравнение `|c| > rho*0.99` смешивало две шкалы:
+            # печаталась величина, зависящая от масштаба rho и насыщения не
+            # означающая. Порог тот же, что в `hv.saturation_report`.
+            over = (c.abs().float() > 0.99)
             sat_tok += int(over.any(-1).sum())
             sat_n += int(over.shape[0] * over.shape[1])
             act_gap = max(act_gap, float(np.abs(A_head - A_draft).max()))
@@ -520,11 +555,22 @@ def main() -> None:
                 for x in dr:
                     b2 = k11p.finish(x[ARMS.index("draft")])
                     e2 = k11p.finish(x[ARMS.index("head")])
+                    # СХВАТ — ПАРНАЯ РАЗНИЦА ВНУТРИ РОЗЫГРЫША, а не интервал
+                    # абсолютной величины. Сравнивать верхнюю границу
+                    # абсолютной ошибки головы с ТОЧЕЧНЫМ схватом черновика
+                    # значит выбросить корреляцию: голова и черновик мерены
+                    # на одних эпизодах, и их разброс общий. Правило,
+                    # заявленное как «верхняя граница разницы», обязано и
+                    # считаться как разница — так это сделано в K-11p.
                     gg.append((1 - e2["pos"] / b2["pos"],
-                               1 - e2["rot"] / b2["rot"], e2["grip"]))
+                               1 - e2["rot"] / b2["rot"],
+                               e2["grip"], e2["grip"] - b2["grip"]))
                 g["head"]["ci_pos"] = list(k11p.ci([x[0] for x in gg]))
                 g["head"]["ci_rot"] = list(k11p.ci([x[1] for x in gg]))
                 g["head"]["ci_grip"] = list(k11p.ci([x[2] for x in gg]))
+                g["head"]["ci_grip_delta"] = list(k11p.ci([x[3] for x in gg]))
+                g["head"]["grip_delta"] = float(
+                    g["head"]["grip"] - g["draft"]["grip"])
             out[ref_name] = g
         out["saturated_tokens"] = float(sat_tok / max(sat_n, 1))
         out["act_gap_vs_draft"] = act_gap
@@ -539,6 +585,11 @@ def main() -> None:
               else "  зонд без поля gains.both.pos")
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
+    if args.n_boot < 1:
+        raise SystemExit(
+            "--n-boot 0 обесценил бы гейт по схвату: он задан как ВЕРХНЯЯ "
+            "граница интервала парной разницы, и без бутстрапа считался бы "
+            "по точечной оценке. Это ослабление правила, а не ускорение")
     seeds = [int(x) for x in str(args.seeds).split(",") if x]
     lrs = [float(x) for x in str(args.lrs).split(",") if x]
     targets = [t for t in str(args.targets).split(",") if t]
@@ -647,24 +698,33 @@ def main() -> None:
                            ckpt=cp, minutes=(time.time() - t0) / 60.0,
                            hist=hist)
                 runs.append(rec)
+                gd = last["star"]["head"].get("ci_grip_delta")
+                if not gd or gd[1] is None:
+                    raise SystemExit(
+                        "нет интервала ПАРНОЙ разницы по схвату: гейт "
+                        "выродился бы в точечную оценку. Запускайте с "
+                        "--n-boot больше нуля")
                 arms_acc.setdefault(key, []).append(dict(
                     pos=last["star"]["head"]["pos"],
                     rot=last["star"]["head"]["rot"],
-                    grip_hi=last["star"]["head"].get(
-                        "ci_grip", [None, last["star"]["head"]["grip"]])[1]))
+                    grip_delta=last["star"]["head"]["grip_delta"],
+                    grip_delta_hi=gd[1]))
                 del head, opt
                 torch.cuda.empty_cache()
 
     draft_grip = runs[0]["hist"][0]["val"]["star"]["draft"]["grip"]
-    best, rows = select_arm(arms_acc, grip_draft=draft_grip)
+    best, rows = select_arm(arms_acc)
     print(f"\n  сводка по конфигурациям (опора D(z*), среднее по сидам, "
           f"схват черновика {draft_grip:.1%}):")
     print(f"    {'конфигурация':>16}{'сидов':>7}{'поз':>8}{'вр':>8}"
-          f"{'схват сверху':>14}{'гейт':>7}")
+          f"{'Δсхват сверху':>15}{'гейт':>7}")
     for r in rows:
         print(f"    {r['key']:>16}{r['n_seeds']:>7}{r['pos']:>8.1%}"
-              f"{r['rot']:>8.1%}{r['grip_hi']:>13.1%}"
+              f"{r['rot']:>8.1%}{r['grip_delta_hi']:>14.2%}"
               f"{('да' if r['ok'] else 'НЕТ'):>7}")
+    print(f"    (Δсхват — ВЕРХНЯЯ граница интервала ПАРНОЙ разницы "
+          f"«голова минус черновик»,\n     допуск {GRIP_TOL:.1%}; худший сид "
+          f"конфигурации)")
     print(f"\n  {read_train(best, rows, probe_pos or 0.0, oracle_pos or 1.0)}")
     print("  ЧИТАТЬ ТАК: доли относительно D(z*) сопоставимы с зондом и "
           "оракулом.\n  Доли относительно A* сопоставимы между собой, но "

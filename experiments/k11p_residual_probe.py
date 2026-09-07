@@ -131,7 +131,7 @@ def gains_from(stat):
 # --------------------------------------------------------------------------
 # гребневая регрессия из грамиана
 # --------------------------------------------------------------------------
-def ridge_from_gram(G, C, idx, lam, bias_i):
+def ridge_from_gram(G, C, idx, lam, bias_i, return_info=False):
     """Решение через нормальные уравнения на СТАНДАРТИЗОВАННЫХ признаках.
 
     Штраф `lam` без стандартизации означал бы разное для `h24` и `z0`: у них
@@ -161,18 +161,30 @@ def ridge_from_gram(G, C, idx, lam, bias_i):
     Cs = Cc / std[:, None]
     Cs[dead, :] = 0.0
     A = Ms + float(lam) * np.eye(len(idx))
-    # ПРИ lam = 0 СИСТЕМА МОЖЕТ ОКАЗАТЬСЯ ВЫРОЖДЕННОЙ: вход z0 — это векторы
-    # кодовой книги, и их ковариация вполне может быть неполного ранга.
-    # Тогда берётся решение наименьших квадратов, а не падение: нуль в сетке
-    # обязан быть вычислимым, иначе он в ней бесполезен.
-    try:
+    # ПРИ lam = 0 РЕШАЕМ ЧЕРЕЗ SVD ВСЕГДА, а не по исключению.
+    #
+    # `np.linalg.solve` на ПОЧТИ вырожденной матрице исключения НЕ бросает:
+    # она возвращает крайне неустойчивые коэффициенты, и ловить это через
+    # try/except бесполезно — ветка просто никогда не срабатывает. Здесь
+    # 1281 коррелированный признак и нормальные уравнения, то есть число
+    # обусловленности возводится в квадрат; а оптимум по внутреннему
+    # держанному набору пришёлся именно на нуль. Поэтому при lam = 0 берётся
+    # решение наименьших квадратов с отсечением малых сингулярных чисел, а
+    # эффективный ранг и число обусловленности возвращаются в отчёт.
+    info = {}
+    if float(lam) <= 0.0:
+        w_s, _res, eff_rank, sv = np.linalg.lstsq(A, Cs, rcond=None)
+        sv = np.asarray(sv, np.float64)
+        info = dict(eff_rank=int(eff_rank), n_features=len(idx),
+                    cond=float(sv.max() / sv.min()) if sv.min() > 0
+                    else float("inf"),
+                    sv_max=float(sv.max()), sv_min=float(sv.min()))
+    else:
         w_s = np.linalg.solve(A, Cs)
-    except np.linalg.LinAlgError:
-        w_s = np.linalg.lstsq(A, Cs, rcond=None)[0]
     w = w_s / std[:, None]
     w[dead, :] = 0.0
     b = ybar - mean @ w
-    return w, b
+    return (w, b, info) if return_info else (w, b)
 
 
 def ss_res_from_gram(G, C, S, idx, bias_i, w, b):
@@ -486,8 +498,32 @@ def selftest():
     G0, C0_, S0 = Xa0.T @ Xa0, Xa0.T @ Y0, (Y0 ** 2).sum(0)
     # ВЫРОЖДЕННАЯ СИСТЕМА ПРИ lam=0 НЕ ДОЛЖНА РОНЯТЬ ПРОГОН: иначе нуль в
     # сетке бесполезен, а именно он оказался оптимумом на реальных данных.
-    w0, b0_ = ridge_from_gram(G0, C0_, list(range(d0)), 0.0, d0)
+    # ПОЧТИ вырожденная матрица исключения НЕ бросает — ветка через
+    # try/except никогда бы не сработала. Проверяем это прямо: solve
+    # отрабатывает и возвращает огромные коэффициенты, а наш путь — нет.
+    X0n = X0.copy()
+    X0n[:, 3] = X0n[:, 0] + 1e-9 * rng0.normal(size=n0)
+    Xan = np.hstack([X0n, np.ones((n0, 1))])
+    Gn, Cn = Xan.T @ Xan, Xan.T @ Y0
+    An = Gn[:d0, :d0] / n0
+    An = An - np.outer(Gn[:d0, d0] / n0, Gn[:d0, d0] / n0)
+    try:
+        naive = np.linalg.solve(An, np.ones((d0, 1)))
+        assert np.abs(naive).max() > 1e3, (
+            "почти вырожденная система не дала неустойчивого решения — "
+            "проверка не воспроизводит опасный случай")
+    except np.linalg.LinAlgError:
+        pass  # редкий случай точного вырождения — тоже приемлемо
+    w0, b0_, i0 = ridge_from_gram(Gn, Cn, list(range(d0)), 0.0, d0,
+                                  return_info=True)
     assert np.isfinite(w0).all() and np.isfinite(b0_).all()
+    assert i0["eff_rank"] < d0, ("SVD не отсёк вырожденное направление: "
+                                 f"ранг {i0['eff_rank']} из {d0}")
+    assert i0["cond"] > 1.0 and np.isfinite(i0["n_features"])
+    # и при ненулевом штрафе отчёта об обусловленности нет — он относится
+    # только к пути через SVD
+    assert ridge_from_gram(Gn, Cn, list(range(d0)), 1.0, d0,
+                           return_info=True)[2] == {}
     ss0 = ss_res_from_gram(G0, C0_, S0, list(range(d0)), d0, w0, b0_)
     assert np.isfinite(ss0).all() and (ss0 >= 0).all()
 
@@ -1028,13 +1064,25 @@ def main() -> None:
         print(f"    {v:>5}: lam = {best[v]:.3g}, MSE = {sc[k_]:.6f}{edge}")
 
     # --- ПОДГОНКА НА ВСЁМ TRAIN --------------------------------------------
-    W = {}
+    W, cond_info = {}, {}
     for v in ("z0", "h24", "both"):
-        W[v] = dict(
-            clip=ridge_from_gram(full["G"], full["Cclip"], IDX[v], best[v],
-                                 bias_i),
-            raw=ridge_from_gram(full["G"], full["Craw"], IDX[v], best[v],
-                                bias_i))
+        wc, bc, ic = ridge_from_gram(full["G"], full["Cclip"], IDX[v],
+                                     best[v], bias_i, return_info=True)
+        wr, br = ridge_from_gram(full["G"], full["Craw"], IDX[v], best[v],
+                                 bias_i)
+        W[v] = dict(clip=(wc, bc), raw=(wr, br))
+        cond_info[v] = ic
+    # ОБУСЛОВЛЕННОСТЬ ПЕЧАТАЕТСЯ, А НЕ ПОДРАЗУМЕВАЕТСЯ. При нулевом штрафе
+    # решение идёт через SVD, и без эффективного ранга нельзя сказать,
+    # осмысленны ли коэффициенты вообще.
+    if any(cond_info.values()):
+        print(f"\n  обусловленность при нулевом штрафе (решение через SVD):")
+        for v in ("z0", "h24", "both"):
+            ic = cond_info.get(v) or {}
+            if ic:
+                print(f"    {v:>5}: эффективный ранг {ic['eff_rank']} из "
+                      f"{ic['n_features']}, число обусловленности "
+                      f"{ic['cond']:.2e}")
 
     # --- R^2 НА VAL, ОПИСАТЕЛЬНО -------------------------------------------
     accv = dict(G=torch.zeros(d_all, d_all, dtype=torch.float64, device=dev),
@@ -1155,7 +1203,14 @@ def main() -> None:
     # разница 0.4 п.п. при верхней границе 1.2 п.п. допуск не выдерживает,
     # и жёсткое условие было бы жёстким только на словах.
     d_grip = [g["both"]["grip"] - g["z0"]["grip"] for g in gb]
+    # ВТОРАЯ ПАРНАЯ РАЗНИЦА, БЕЗ КОТОРОЙ ВЫВОД НЕПОЛОН. Интервал `both - z0`
+    # доказывает, что h24 добавляет СВЕРХ z0. Утверждение «z0 полезен только
+    # совместно» требует обратной разницы `both - h24`: без неё точечных
+    # 10.5% против 5.7% недостаточно, это две оценки с общим разбросом.
+    d2_pos = [g["both"]["pos"] - g["h24"]["pos"] for g in gb]
+    d2_rot = [g["both"]["rot"] - g["h24"]["rot"] for g in gb]
     d_pos_ci, d_rot_ci, d_grip_ci = ci(d_pos), ci(d_rot), ci(d_grip)
+    d2_pos_ci, d2_rot_ci = ci(d2_pos), ci(d2_rot)
     obs_d = {k: float(g_all["both"][k] - g_all["z0"][k])
              for k in ("pos", "rot", "grip")}
     print(f"\n  95% интервалы по {args.n_boot} бутстрап-выборкам ЭПИЗОДОВ:")
@@ -1166,6 +1221,11 @@ def main() -> None:
     print(f"    ПАРНАЯ разница both - z0 (наблюдаемая): поз "
           f"{obs_d['pos']:+.3f} [{d_pos_ci[0]:+.3f}, {d_pos_ci[1]:+.3f}], вр "
           f"{obs_d['rot']:+.3f} [{d_rot_ci[0]:+.3f}, {d_rot_ci[1]:+.3f}]")
+    print(f"    ПАРНАЯ разница both - h24: поз "
+          f"{float(g_all['both']['pos'] - g_all['h24']['pos']):+.3f} "
+          f"[{d2_pos_ci[0]:+.3f}, {d2_pos_ci[1]:+.3f}], вр "
+          f"{float(g_all['both']['rot'] - g_all['h24']['rot']):+.3f} "
+          f"[{d2_rot_ci[0]:+.3f}, {d2_rot_ci[1]:+.3f}] — вклад z0 СВЕРХ h24")
     print(f"    ПАРНАЯ разница по знаку схвата: {obs_d['grip']:+.4f} "
           f"[{d_grip_ci[0]:+.4f}, {d_grip_ci[1]:+.4f}]; решение принимается "
           f"по ВЕРХНЕЙ границе при допуске {GRIP_TOL:.1%}")
@@ -1214,6 +1274,7 @@ def main() -> None:
                n_train=int(len(tr)), n_val=int(len(va)),
                n_val_episodes=int(len(ep_ids)),
                lam=best, lam_grid=list(LAMBDAS), r2=r2,
+               conditioning=cond_info,
                gains={v: g_all[v] for v in VARIANTS},
                source_fraction=src,
                boot={v: {k: list(boot[v][k]) for k in boot[v]}
@@ -1227,6 +1288,13 @@ def main() -> None:
                        np.mean(d_rot)), ci=list(d_rot_ci)),
                    grip=dict(observed=obs_d["grip"], boot_mean=float(
                        np.mean(d_grip)), ci=list(d_grip_ci))),
+               paired_diff_vs_h24=dict(
+                   pos=dict(observed=float(g_all["both"]["pos"]
+                                           - g_all["h24"]["pos"]),
+                            ci=list(d2_pos_ci)),
+                   rot=dict(observed=float(g_all["both"]["rot"]
+                                           - g_all["h24"]["rot"]),
+                            ci=list(d2_rot_ci))),
                lam_at_grid_edge=edge_vars,
                bucket_edges=[float(x) for x in edges],
                per_bucket=per_bucket, n_boot=int(args.n_boot),
