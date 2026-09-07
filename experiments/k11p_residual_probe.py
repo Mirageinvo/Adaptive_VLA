@@ -230,7 +230,10 @@ def read_routing(d_pos_ci, d_rot_ci, grip_both, grip_z0, tol=GRIP_TOL):
     считываний. Закрывать ветвь по одному линейному зонду ЗАПРЕЩЕНО.
     """
     lo_p, lo_r = d_pos_ci[0], d_rot_ci[0]
-    grip_ok = (grip_both - grip_z0) <= tol
+    # Допуск сравнивается с запасом в 1e-12: разность двух долей, равная
+    # допуску точно, в двоичной записи оказывается больше него, и решение
+    # переворачивалось бы на шуме представления, а не на данных.
+    grip_ok = (grip_both - grip_z0) <= tol + 1e-12
     if lo_p is not None and lo_r is not None and lo_p > 0 and lo_r > 0 \
             and grip_ok:
         return True, (
@@ -284,6 +287,65 @@ def assign_bucket(frac, edges):
 
 
 # --------------------------------------------------------------------------
+def _integration(h_matters, seed=0, n_ep=40, per_ep=30, d_h=8, d_z=6, rank=4):
+    """Весь конвейер на синтетике с ИЗВЕСТНЫМ ответом.
+
+    Отдельные части проверены поштучно, но собранными они могут давать
+    неверный вывод: например правило маршрутизации получало бы разницу,
+    посчитанную по разным розыгрышам, и «преимущество» возникало бы из
+    разброса выборки. Здесь связь задана явно — при `h_matters=True` остаток
+    зависит от h, иначе не зависит вовсе, — и конвейер обязан ответить
+    соответственно. Возвращает исход правила и парные разницы.
+    """
+    rng = np.random.default_rng(seed)
+    n = n_ep * per_ep
+    ep = np.repeat(np.arange(n_ep), per_ep)
+    hh = rng.normal(size=(n, N_POS, d_h))
+    zz = rng.normal(size=(n, N_POS, d_z))
+    Az = rng.normal(size=(d_z, rank))
+    Ah = rng.normal(size=(d_h, rank)) * (1.0 if h_matters else 0.0)
+    a = zz @ Az + hh @ Ah + 0.1 * rng.normal(size=(n, N_POS, rank))
+    rho_ = np.percentile(np.abs(a).reshape(-1, rank), 95.0, axis=0)
+    a_cl = np.clip(a, -rho_, rho_)
+    # «Декодер»: фиксированное линейное отображение коэффициентов в действия.
+    M = rng.normal(size=(rank, H_EXEC * 7)) / np.sqrt(rank)
+
+    def dec(c):
+        return (c.sum(1) @ M).reshape(-1, H_EXEC, 7)
+
+    X = np.concatenate([hh, zz, np.ones_like(zz[..., :1])], -1)
+    d_all = d_h + d_z + 1
+    bias_i = d_all - 1
+    idx = dict(z0=list(range(d_h, d_h + d_z)), both=list(range(d_h + d_z)))
+    tr = ep < n_ep // 2
+    va = ~tr
+    out = {}
+    for part, mask in (("tr", tr), ("va", va)):
+        Xf = X[mask].reshape(-1, d_all)
+        Y = (a_cl[mask] / rho_).reshape(-1, rank)
+        out[part] = dict(G=Xf.T @ Xf, C=Xf.T @ Y, S=(Y ** 2).sum(0))
+    S_ep = np.zeros((n_ep // 2, len(VARIANTS), N_STAT))
+    ref = dec(a[va])
+    pred_dec = dict(draft=dec(np.zeros_like(a[va])), oracle=dec(a_cl[va]))
+    for v in ("z0", "both"):
+        w, b = ridge_from_gram(out["tr"]["G"], out["tr"]["C"], idx[v], 1e-4,
+                               bias_i)
+        p = np.clip(X[va].reshape(-1, d_all)[:, idx[v]] @ w + b, -1.0, 1.0)
+        pred_dec[v] = dec(p.reshape(-1, N_POS, rank) * rho_)
+    pred_dec["h24"] = pred_dec["z0"]
+    ev = ep[va] - ep[va].min()
+    for vi, v in enumerate(VARIANTS):
+        per = err_per_obs(pred_dec[v], ref)
+        np.add.at(S_ep, (ev, vi), per)
+    draws = boot_draws(S_ep, n_boot=300, seed=7)
+    gb = [gains_from(x) for x in draws]
+    dp = ci([g["both"]["pos"] - g["z0"]["pos"] for g in gb])
+    dr = ci([g["both"]["rot"] - g["z0"]["rot"] for g in gb])
+    g_all = gains_from(S_ep.sum(0))
+    ok, _ = read_routing(dp, dr, g_all["both"]["grip"], g_all["z0"]["grip"])
+    return ok, g_all, dp, dr
+
+
 def selftest():
     # --- суммы по наблюдениям сходятся с диагностикой ----------------------
     rng = np.random.default_rng(0)
@@ -407,6 +469,21 @@ def selftest():
     ed2 = bucket_edges(tr_frac, 3)
     assert np.allclose(ed, ed2)
 
+    # --- сквозная проверка конвейера на известном ответе --------------------
+    ok_yes, g_yes, dp_yes, _ = _integration(True, seed=3)
+    assert ok_yes, ("конвейер не увидел связи, которая заложена явно: "
+                    f"разница {dp_yes}")
+    assert g_yes["both"]["pos"] > g_yes["z0"]["pos"] + 0.05, g_yes
+    # КОНТРОЛЬ: остаток не зависит от h — преимущества быть НЕ должно.
+    # Без этой половины проверка ловила бы только «что-то нашлось».
+    ok_no, g_no, dp_no, _ = _integration(False, seed=3)
+    assert not ok_no, ("конвейер нашёл преимущество там, где связи нет: "
+                       f"разница {dp_no}, доли {g_no['both']}, {g_no['z0']}")
+    assert abs(g_no["both"]["pos"] - g_no["z0"]["pos"]) < 0.05, g_no
+    # и оракул обязан быть верхней границей в обоих случаях
+    for g_ in (g_yes, g_no):
+        assert g_["oracle"]["pos"] >= g_["both"]["pos"] - 1e-9, g_
+
     print("самопроверка k11p пройдена (версия «асимметричная маршрутизация»): "
           "суммы по наблюдениям сходятся с диагностикой и не зависят от "
           "разбиения, гребень восстанавливает известную связь и не "
@@ -415,7 +492,8 @@ def selftest():
           "накопление не зависит от размера батча, доля улучшения равна нулю "
           "у черновика и единице у оракула, бутстрап по эпизодам замечает "
           "выбросовый эпизод, правило маршрутизации отвергает по схвату "
-          "отдельно и запрещает закрывать ветвь")
+          "отдельно и запрещает закрывать ветвь, а собранный конвейер "
+          "находит заложенную связь и НЕ находит её там, где её нет")
 
 
 # --------------------------------------------------------------------------
@@ -463,10 +541,27 @@ def main() -> None:
     if "action_codec" not in CONFIG_MAPPING:
         raise SystemExit("тип «action_codec» не зарегистрирован")
     from smolvla.bar import SmolVLABlockwiseAR
-    from utils import get_cfg
+    from utils import get_cfg, seed_everything
     from joint12_vla import make_joint12_class
     import joint12_vla as jv
     import hicora_vla as hv
+
+    # ДОСТУПНОСТЬ GPU ПРОВЕРЯЕТСЯ ПЕРВОЙ: контейнер периодически теряет карты
+    # при живом драйвере, и падение наступало бы уже после сбора моментов.
+    if args.device.startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise SystemExit(
+                "torch.cuda.is_available() == False: контейнер потерял "
+                "видеокарты. Проверьте nvidia-smi; лечится перезапуском "
+                "докера с хоста")
+        gi = int(args.device.split(":")[1]) if ":" in args.device else 0
+        if gi >= torch.cuda.device_count():
+            raise SystemExit(f"запрошено {args.device}, а видно "
+                             f"{torch.cuda.device_count()} устройств")
+        free_b, total_b = torch.cuda.mem_get_info(gi)
+        print(f"  {args.device}: свободно {free_b / 2 ** 30:.1f} ГиБ из "
+              f"{total_b / 2 ** 30:.1f}")
+    seed_everything(0)
 
     prefix = args.cache
     meta = json.load(open(prefix + ".meta.json"))
@@ -510,6 +605,12 @@ def main() -> None:
     # отношения не имеет. Модель снимается сразу после извлечения нормы:
     # две модели в памяти одновременно уже стоили нам падения по памяти.
     cfg = get_cfg(os.path.join(args.root, args.cfg_path))
+    # ЧЕКПОЙНТ ПОДСТАВЛЯЕТСЯ В cfg, А НЕ ЧИТАЕТСЯ ИЗ yaml. Без этих двух
+    # строк `from_pretrained(**cfg.MODEL.vlm.kwargs)` поднимает модель,
+    # прописанную в конфиге, и норма была бы снята с ДРУГОГО чекпойнта —
+    # молча, потому что форма и имена совпали бы.
+    cfg.TRAINING.ckpt_dir = args.ckpt
+    cfg.MODEL.vlm.kwargs.pretrained_model_name_or_path = args.ckpt
     Cls = make_joint12_class(SmolVLABlockwiseAR)
     m0 = Cls.from_pretrained(**cfg.MODEL.vlm.kwargs).to(dev, dt).eval()
     m0.init_joint_fast(depth=int(meta["depth"]), head_dtype=dt)
