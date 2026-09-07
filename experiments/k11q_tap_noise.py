@@ -565,6 +565,18 @@ def main() -> None:
         solo_pi, *_ = run(np.asarray([t]), po, pos_override=pos_from_batch)
         iv_vs_solo = rel_rms(solo_pi[0], solo[0])
         iv_vs_batch = rel_rms(solo_pi[0], ha[0])
+        # ТО ЖЕ ПОСЛЕ НОРМЫ. Голова читает `res_norm(h24)`, а не сырой отвод;
+        # норма может расхождение сжать или усилить, и мерить надо тот вход,
+        # который HiCoRA действительно получает.
+        def nrm(x):
+            with torch.no_grad():
+                return model.res_norm(
+                    torch.from_numpy(x).to(dev, dt)).float().cpu().numpy()
+        n_solo_, n_pi_, n_ha_ = nrm(solo), nrm(solo_pi), nrm(ha)
+        ivn_vs_solo = rel_rms(n_pi_[0], n_solo_[0])
+        ivn_vs_batch = rel_rms(n_pi_[0], n_ha_[0])
+        eff_solo_a = rel_rms(solo[0], ha[0])
+        eff_norm_a = rel_rms(n_solo_[0], n_ha_[0])
         # МЕХАНИЗМ: совпадают ли позиции и вложения целевой строки
         same_pos = (pos_s is not None and pos_a is not None
                     and pos_s.shape == pos_a.shape
@@ -591,7 +603,10 @@ def main() -> None:
             pos_solo_head=(pos_s[:4].tolist() if pos_s is not None else None),
             pos_A_head=(pos_a[:4].tolist() if pos_a is not None else None),
             emb_max_abs_diff=emb_d,
-            interv_pos_vs_solo=iv_vs_solo, interv_pos_vs_batch=iv_vs_batch)
+            interv_pos_vs_solo=iv_vs_solo, interv_pos_vs_batch=iv_vs_batch,
+            interv_norm_vs_solo=ivn_vs_solo,
+            interv_norm_vs_batch=ivn_vs_batch,
+            effect_solo_vs_A=eff_solo_a, effect_norm_solo_vs_A=eff_norm_a)
         rows.append(r)
         print(f"    набл. {t} (эпизод {r['episode']}): одиночно/кэш "
               f"{r['solo_vs_cache']:.2e}, батчА/кэш {r['batchA_vs_cache']:.2e}, "
@@ -603,7 +618,9 @@ def main() -> None:
               f"ПОТОКА ДЕЙСТВИЙ совпадают: {r['same_action_positions']}")
         print(f"      ИНТЕРВЕНЦИЯ (подменены только позиции): сдвиг от "
               f"одиночного {iv_vs_solo:.2e}, остаток до батчевого "
-              f"{iv_vs_batch:.2e}")
+              f"{iv_vs_batch:.2e}, сам эффект {eff_solo_a:.2e}")
+        print(f"      она же ПОСЛЕ res_norm: сдвиг {ivn_vs_solo:.2e}, "
+              f"остаток {ivn_vs_batch:.2e}, эффект {eff_norm_a:.2e}")
         print(f"      действия одиночно {r['act_pos_solo']}, в А "
               f"{r['act_pos_A']}; вложения расходятся на "
               + ("—" if emb_d is None else f"{emb_d:.2e}"))
@@ -659,11 +676,23 @@ def main() -> None:
           f"потока действий — у {n_act} из {len(rows)}")
     iv_s = float(np.median([r["interv_pos_vs_solo"] for r in rows]))
     iv_b = float(np.median([r["interv_pos_vs_batch"] for r in rows]))
-    print(f"  интервенция по позициям: сдвиг от одиночного {iv_s:.2e}, "
-          f"остаток до батчевого {iv_b:.2e}")
+    ivn_s = float(np.median([r["interv_norm_vs_solo"] for r in rows]))
+    ivn_b = float(np.median([r["interv_norm_vs_batch"] for r in rows]))
+    # ОПОРА — ТОТ ЖЕ ЭФФЕКТ, КОТОРЫЙ ОБЪЯСНЯЕМ. Прежде порог нормировался на
+    # `batchA_vs_cache` — расхождение батча с КЭШЕМ, тогда как интервенция
+    # сравнивает одиночный проход с батчем. Величины близки, но это разные
+    # опоры, и правило должно нормироваться на ту, что объясняет.
+    eff_raw = float(np.median([r["effect_solo_vs_A"] for r in rows]))
+    eff_norm = float(np.median([r["effect_norm_solo_vs_A"] for r in rows]))
+    print(f"  интервенция по позициям (сырой отвод): сдвиг {iv_s:.2e}, "
+          f"остаток {iv_b:.2e}, объясняемый эффект {eff_raw:.2e}")
+    print(f"  она же после res_norm: сдвиг {ivn_s:.2e}, остаток "
+          f"{ivn_b:.2e}, эффект {eff_norm:.2e}")
     if tag == "B":
-        verdict += ".\n  " + read_mechanism(iv_s, iv_b,
-                                            med("batchA_vs_cache"))
+        verdict += (".\n  СЫРОЙ ОТВОД: "
+                    + read_mechanism(iv_s, iv_b, eff_raw)
+                    + ".\n  ВХОД ГОЛОВЫ (после res_norm): "
+                    + read_mechanism(ivn_s, ivn_b, eff_norm))
         if leak_diff is not None:
             leak_tag, leak_txt = read_leak(leak_diff, med("batchA_vs_cache"),
                                            ctrl=leak_ctrl)
@@ -689,7 +718,10 @@ def main() -> None:
                          tag=leak_tag),
                intervention=dict(
                    pos_only_vs_solo=iv_s, pos_only_vs_batch=iv_b,
-                   batch_effect=med("batchA_vs_cache")),
+                   effect_solo_vs_batch=eff_raw,
+                   norm_pos_only_vs_solo=ivn_s,
+                   norm_pos_only_vs_batch=ivn_b,
+                   norm_effect_solo_vs_batch=eff_norm),
                tag=tag, verdict=verdict)
     tmp = args.out + ".tmp"
     json.dump(out, open(tmp, "w"), ensure_ascii=False, indent=1)
