@@ -204,8 +204,16 @@ def check_cache_fields(meta, diag, expect, modules, allow_drift=False):
                 raise SystemExit(
                     f"диагностика и кэш расходятся по {k}: "
                     f"{diag.get(k)!r} против {meta.get(k)!r}")
+    # ОТСУТСТВИЕ ОТПЕЧАТКА МОДУЛЯ — ОТКАЗ, а не «нечего сравнивать»: условие
+    # `if meta.get(k)` было fail-open, и кэш без этих полей проходил молча.
+    miss_mod = [k for k in modules if not meta.get(k)]
+    if miss_mod:
+        raise SystemExit(
+            f"в meta кэша нет версий модулей {miss_mod}: подтвердить, что "
+            f"кэш собран той же сетью, нечем. Пересоберите кэш текущей "
+            f"версией K-11a")
     drift = {k: (meta.get(k), v) for k, v in modules.items()
-             if meta.get(k) and meta[k] != v}
+             if meta[k] != v}
     if drift and not allow_drift:
         lines = "; ".join(f"{k}: кэш {a}, сейчас {b}"
                           for k, (a, b) in drift.items())
@@ -346,8 +354,23 @@ def selftest():
                    hicora_vla_sha1="H1", joint12_vla_sha1="J1")
     mods = dict(hicora_vla_sha1="H1", joint12_vla_sha1="J1")
     assert check_cache_fields(meta_ok, None, dict(depth=12,
-                                                  taps=[12, 18, 24]),
+                                                  taps=[12, 18, 24],
+                                                  q0_source="joint12"),
                               mods) == {}
+    # ИСТОЧНИК ЧЕРНОВИКА СВЕРЯЕТСЯ СТРОГО.
+    try:
+        check_cache_fields(meta_ok, None, dict(q0_source="readout"), mods)
+        raise AssertionError("чужой источник q0 прошёл")
+    except SystemExit as e:
+        assert "q0_source" in str(e)
+    # ОТСУТСТВИЕ ОТПЕЧАТКА МОДУЛЯ — отказ, а не молчаливый пропуск.
+    for k in ("hicora_vla_sha1", "joint12_vla_sha1"):
+        gone = {x: v for x, v in meta_ok.items() if x != k}
+        try:
+            check_cache_fields(gone, None, dict(depth=12), mods)
+            raise AssertionError(f"отсутствие {k} прошло")
+        except SystemExit as e:
+            assert "нет версий модулей" in str(e), str(e)
     try:
         check_cache_fields(meta_ok, None, dict(depth=18), mods)
         raise AssertionError("другая глубина прошла")
@@ -376,7 +399,7 @@ def selftest():
     txt = read_identity({"a": True, "q0_bitwise": False})
     assert "НЕ ВЫПОЛНЕНО" in txt and "q0_bitwise" in txt
 
-    print("самопроверка k11b пройдена (версия «привязка артефактов»): обёртка не меняет выход и снимается, "
+    print("самопроверка k11b пройдена (версия «версии модулей обязательны»): обёртка не меняет выход и снимается, "
           "счётчик слоёв считает по layer_idx и отвергает двенадцать по два "
           "при тех же 24 вызовах, знак схвата считается отдельно от позы, "
           "вердикт называет провалившийся пункт, переставленный базис той "
@@ -397,6 +420,10 @@ def main() -> None:
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="float16")
     ap.add_argument("--depth", type=int, default=12)
+    ap.add_argument("--q0-source", default="joint12",
+                    help="источник черновика, ожидаемый от кэша. Сверяется "
+                         "строго: кэш с q0 от другого источника описывает "
+                         "другую модель")
     ap.add_argument("--batches", default="1,10")
     ap.add_argument("--allow-module-drift", action="store_true",
                     help="разрешить расхождение версий hicora_vla/joint12_vla "
@@ -467,7 +494,8 @@ def main() -> None:
                            "joint12_vla.py")
     drift = check_cache_fields(
         meta, diag,
-        expect=dict(depth=args.depth, taps=list(TAPS)),
+        expect=dict(depth=args.depth, taps=list(TAPS),
+                    q0_source=args.q0_source),
         modules=dict(hicora_vla_sha1=k11a.file_sha1(hv_path),
                      joint12_vla_sha1=k11a.file_sha1(jv_path)),
         allow_drift=args.allow_module_drift)

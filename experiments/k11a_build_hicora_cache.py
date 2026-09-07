@@ -310,7 +310,8 @@ def pick_rank(gains, grip=None, grip_draft=None, ranks=PCA_RANKS,
 
 
 def read_rank(rank, gains, grip=None, grip_draft=None, ranks=PCA_RANKS,
-              target=GAIN_TARGET, delta=GRIP_DELTA, gains_unclamped=None):
+              target=GAIN_TARGET, delta=GRIP_DELTA, gains_unclamped=None,
+              rank_unclamped=None):
     """Вердикт по рангу. РАЗЛИЧАЕТ ДВЕ ПРИЧИНЫ ОТКАЗА.
 
     Прежняя версия при недостижении порога печатала «остаток не описывается
@@ -331,13 +332,12 @@ def read_rank(rank, gains, grip=None, grip_draft=None, ranks=PCA_RANKS,
                 f"по положению и {g['rot']:.1%} по вращению на шагах 0-7 "
                 f"(порог {target:.0%}, зафиксирован до прогона){gr} — брать "
                 f"r={rank}")
-    # ПРИЧИНА ОТКАЗА: ранг или амплитуда.
-    if gains_unclamped:
-        unc = [r for r in sorted(gains_unclamped)
-               if (gains_unclamped[r].get("pos") or 0) >= target
-               and (gains_unclamped[r].get("rot") or 0) >= target]
-        if unc:
-            r0 = min(unc)
+    # ПРИЧИНА ОТКАЗА: ранг или амплитуда. РЕШАЕТ НАСТОЯЩИЙ pick_rank НА
+    # НЕОГРАНИЧЕННОЙ ВЕТКЕ, а не собственная упрощённая проверка по pos/rot:
+    # она игнорировала бы гейт по схвату и запрет «ранг = размерность», и
+    # печатала бы «не хватает амплитуды» там, где clamp вообще ни при чём.
+    if rank_unclamped is not None and gains_unclamped:
+            r0 = int(rank_unclamped)
             gu, gc = gains_unclamped[r0], gains.get(r0, {})
             return (f"РАНГА ХВАТАЕТ, НЕ ХВАТАЕТ АМПЛИТУДЫ. Неограниченная "
                     f"проекция ранга {r0} возвращает {gu['pos']:.1%} по "
@@ -529,6 +529,31 @@ def selftest():
     except SystemExit:
         pass
 
+    # --- ПРИЧИНА ОТКАЗА: РАНГ ИЛИ АМПЛИТУДА --------------------------------
+    # Прежняя ветка смотрела только pos/rot неограниченной проекции и потому
+    # печатала «не хватает амплитуды» даже там, где clamp ни при чём.
+    g_lo = {r: dict(pos=0.2, rot=0.2) for r in PCA_RANKS}
+    g_hi = {r: dict(pos=0.95, rot=0.95) for r in PCA_RANKS}
+    gr_ok = {r: 0.02 for r in PCA_RANKS}
+    gr_bad = {r: 0.30 for r in PCA_RANKS}
+    # Ограничение мешает: неограниченная ветка ранг выбирает, ограниченная нет.
+    ru = pick_rank(g_hi, grip=gr_ok, grip_draft=0.02, d_latent=512)
+    t = read_rank(None, g_lo, grip=gr_ok, grip_draft=0.02,
+                  gains_unclamped=g_hi, rank_unclamped=ru)
+    assert "НЕ ХВАТАЕТ АМПЛИТУДЫ" in t, t
+    # СХВАТ ЛОМАЮТ ВСЕ РАНГИ: clamp ни при чём, и вердикт обязан назвать схват.
+    ru2 = pick_rank(g_hi, grip=gr_bad, grip_draft=0.02, d_latent=512)
+    assert ru2 is None, ru2
+    t2 = read_rank(None, g_hi, grip=gr_bad, grip_draft=0.02,
+                   gains_unclamped=g_hi, rank_unclamped=ru2)
+    assert "ПОРТЯТ ЗНАК СХВАТА" in t2, t2
+    # НЕ ХВАТАЕТ РАНГА: и ограниченная, и неограниченная ветки низки.
+    t3 = read_rank(None, g_lo, grip=gr_ok, grip_draft=0.02,
+                   gains_unclamped=g_lo,
+                   rank_unclamped=pick_rank(g_lo, grip=gr_ok,
+                                            grip_draft=0.02, d_latent=512))
+    assert "стоп-условие" in t3, t3
+
     # --- ошибки по каналам --------------------------------------------------
     a = np.zeros((4, T_CHUNK, 7)); ref = np.zeros((4, T_CHUNK, 7))
     a[:, :, 0] = 0.3
@@ -544,7 +569,7 @@ def selftest():
     assert action_err(a2, ref)["pos"] == 0.0, "срез взял хвост"
     assert a2.shape[1] != N_POS, "ось времени спутана с латентными позициями"
 
-    print("самопроверка k11a пройдена (версия «GPU и состояния до долгого»): "
+    print("самопроверка k11a пройдена (версия «причина отказа различается»): "
           "базис из нецентрированного грамиана восстанавливает подпространство, "
           "центрирование теряет смещение, доля улучшения не определена при "
           "идеальном черновике и отрицательна при ухудшении, ранг требует "
@@ -826,18 +851,43 @@ def diagnose(args):
                             embodiment_ids=0)[0][..., :7].float()
                         err_add(acc_s[(q, rk)],
                                 err_sums(Ar.cpu().numpy(), As_n))
-        print(f"    {'ранг':>6}" + "".join(f"{('p' + str(q)):>16}"
-                                           for q in pcts))
-        for rk in ranks:
-            row = f"    {rk:>6}"
-            for q in pcts:
+        # ТАБЛИЦА ПО ПРОЦЕНТИЛЯМ, А НЕ ПО РАНГАМ: решение принимается о
+        # пределе, и рядом обязаны стоять ВСЕ величины, входящие в гейт, —
+        # включая схват, который является жёстким условием.
+        print(f"    {'процентиль':>11}{'ранг':>7}{'поз':>8}{'вр':>8}"
+              f"{'знак':>8}{'||rho||':>10}{'коэф.вне':>10}{'токен.вне':>11}"
+              f"{'набл.вне':>10}")
+        for q in pcts:
+            g_q, gr_q = {}, {}
+            for rk in ranks:
                 er = err_finish(acc_s[(q, rk)])
-                gp = gain(e_z0["pos"], er["pos"], 0.0)
-                gr_ = gain(e_z0["rot"], er["rot"], 0.0)
-                sweep[f"{q}_{rk}"] = dict(pos=gp, rot=gr_, grip=er["grip"])
-                row += f"{gp:>8.1%}{gr_:>8.1%}"
-            print(row)
-        print("    (в каждой паре: доля по положению и по вращению)")
+                g_q[rk] = dict(pos=gain(e_z0["pos"], er["pos"], 0.0),
+                               rot=gain(e_z0["rot"], er["rot"], 0.0))
+                gr_q[rk] = er["grip"]
+                sweep[f"{q}_{rk}"] = dict(pos=g_q[rk]["pos"],
+                                          rot=g_q[rk]["rot"], grip=er["grip"])
+            rq = pick_rank(g_q, grip=gr_q, grip_draft=e_z0["grip"],
+                           d_latent=D)
+            show = rq if rq is not None else max(ranks)
+            rr = rho_by_pct[q][:show]
+            c_ = coef[:, :show]
+            over = c_ > rr[None]
+            per_tok = over.any(1)
+            per_obs = per_tok.reshape(-1, N_POS).any(1)
+            sweep[f"{q}_rank"] = rq
+            sweep[f"{q}_rho_norm"] = float(np.linalg.norm(rr))
+            sweep[f"{q}_saturation"] = dict(
+                coef=float(over.mean()), token=float(per_tok.mean()),
+                obs=float(per_obs.mean()))
+            print(f"    {('p' + str(q)):>11}"
+                  f"{(str(rq) if rq else '—'):>7}"
+                  f"{g_q[show]['pos']:>8.1%}{g_q[show]['rot']:>8.1%}"
+                  f"{gr_q[show]:>7.1%}{float(np.linalg.norm(rr)):>10.4f}"
+                  f"{float(over.mean()):>10.1%}{float(per_tok.mean()):>11.1%}"
+                  f"{float(per_obs.mean()):>10.1%}")
+        print(f"    (доли и знак — при выбранном для этого процентиля ранге, "
+              f"иначе при r={max(ranks)};\n     насыщение — на TRAIN, "
+              f"черновик даёт знак {e_z0['grip']:.1%})")
         print(f"    Читать так: если доля растёт с процентилем, связывает "
               f"АМПЛИТУДА,\n    а не ранг. Выбранный --rho-pct "
               f"({args.rho_pct}) от этой таблицы НЕ меняется:\n    менять "
@@ -846,7 +896,7 @@ def diagnose(args):
     rank = pick_rank(gains, grip=grips, grip_draft=e_z0["grip"], d_latent=D)
     rank_u = pick_rank(gains_u, grip=grips_u, grip_draft=e_z0["grip"],
                        d_latent=D)
-    print(f"\n  {read_rank(rank, gains, grip=grips, grip_draft=e_z0['grip'], gains_unclamped=gains_u)}")
+    print(f"\n  {read_rank(rank, gains, grip=grips, grip_draft=e_z0['grip'], gains_unclamped=gains_u, rank_unclamped=rank_u)}")
     if rank_u != rank:
         print(f"  БЕЗ ограничения был бы выбран ранг {rank_u} — разница и "
               f"есть цена предела амплитуды.")
@@ -931,6 +981,9 @@ def main() -> None:
     ap.add_argument("--codebook-tol", type=float, default=1e-5,
                     help="допуск сверки книг кэша с текущим кодеком")
     ap.add_argument("--drift-n", type=int, default=2000)
+    ap.add_argument("--allow-missing-drift", action="store_true",
+                    help="разрешить завершение с кодом 0, если аудит дрейфа "
+                         "не выполнился")
     ap.add_argument("--min-free-gib", type=float, default=8.0,
                     help="минимум свободной памяти GPU; проверяется ДО "
                          "сбора состояний")
@@ -1553,7 +1606,7 @@ def main() -> None:
         print(f"    1. q0 Joint12 против исходной головы на h12: "
               f"{drift['q0_vs_clean_h12']:.1%} совпадений")
         print(f"    2. q0 Joint12 против НАСТОЯЩЕГО coarse24 (generate, "
-              f"{model.n_layers_total} слоёв): {drift['q0_vs_coarse24']:.1%}")
+              f"{clean.n_layers_total} слоёв): {drift['q0_vs_coarse24']:.1%}")
         print(f"    3. декодированные действия, шаги 0-7: положение "
               f"{drift['act_pos']:.5f}, вращение {drift['act_rot']:.5f}, "
               f"знак схвата {drift['act_grip']:.1%}")
@@ -1568,11 +1621,16 @@ def main() -> None:
         del clean
         torch.cuda.empty_cache()
       except Exception as ex:
-        # ДИАГНОСТИКА НЕ ИМЕЕТ ПРАВА ГУБИТЬ СБОР. Кэш уже на диске; отказ
-        # аудита записывается в meta и повторяется отдельным прогоном
-        # `--drift-only`, без часового прохода.
+        # ДИАГНОСТИКА НЕ ИМЕЕТ ПРАВА ГУБИТЬ СБОР — но и ПРЯТАТЬ ОШИБКИ не
+        # имеет права. Широкий `except` уже проглотил UnboundLocalError от
+        # обращения к удалённой модели: прогон завершился нулём, а аудит
+        # молча не выполнился. Поэтому здесь печатается полная трассировка, а
+        # в конце прогон завершается НЕНУЛЕВЫМ кодом, если отказ не разрешён
+        # явно. Кэш при этом уже на диске и не страдает.
+        import traceback
         drift, drift_error = None, f"{type(ex).__name__}: {ex}"
         print(f"\n  АУДИТ ДРЕЙФА НЕ ВЫПОЛНЕН: {drift_error}")
+        traceback.print_exc()
         print("  Кэш сохранён и пригоден. Повторить аудит отдельно: "
               "--drift-only")
         try:
@@ -1594,6 +1652,12 @@ def main() -> None:
     print("\n  ДАЛЬШЕ: --diagnose для выбора ранга и rho, затем K-11b с "
           "проверками\n  тождества. Обучение головы не начинать до "
           "тождества.")
+    if drift_error and not args.allow_missing_drift:
+        raise SystemExit(
+            f"\nАУДИТ ДРЕЙФА НЕ ВЫПОЛНЕН ({drift_error}). Кэш сохранён и "
+            f"годен, но прогон завершается ненулевым кодом, чтобы конвейер не "
+            f"пошёл дальше молча. Повторите --drift-only или разрешите "
+            f"пропуск флагом --allow-missing-drift")
 
 
 if __name__ == "__main__":
