@@ -342,13 +342,29 @@ def main() -> None:
         # ПОЗИЦИИ И ВЛОЖЕНИЯ ЦЕЛЕВОЙ СТРОКИ БЕЗ НАБИВКИ. Если они у одного и
         # того же наблюдения зависят от батча, механизм найден: RoPE считает
         # позицию от начала НАБИТОЙ строки, а не от начала подсказки.
-        keep = (am[0] == 1) if am is not None else None
-        pos0 = (pp[0][keep] if pp.dim() == 2 else pp[keep]).detach().cpu(
-            ).numpy() if keep is not None else None
-        emb0 = v[0][keep].float().detach().cpu().numpy() \
-            if keep is not None else None
+        #
+        # ДЛИНЫ РАЗНЫЕ. `position_ids` покрывают подсказку И поток действий
+        # (179 + 16 = 195), а маска внимания — только подсказку. Поток
+        # действий и есть то, откуда снимается h24, поэтому его позиции
+        # выделяются отдельно и сравниваются тоже.
+        def unpad(x):
+            if am is None:
+                return x[0].detach().float().cpu().numpy()
+            L = int(am.shape[-1])
+            row, m = x[0], (am[0] == 1)
+            if row.shape[0] == L:
+                return row[m].detach().float().cpu().numpy()
+            if row.shape[0] > L:
+                head = row[:L][m]
+                return torch.cat([head, row[L:]], 0).detach().float(
+                    ).cpu().numpy()
+            raise SystemExit(f"длина {row.shape[0]} меньше маски {L}")
+
+        n_act = int(pp.shape[-1]) - int(am.shape[-1]) if am is not None else 0
+        pos_all = unpad(pp if pp.dim() > 1 else pp.unsqueeze(0))
+        pos_act = pos_all[-n_act:] if n_act > 0 else pos_all[-16:]
         return (tp[tap].float().cpu().numpy().astype(np.float16), lens,
-                pos0, emb0)
+                pos_all, unpad(v), pos_act)
 
     # --- выбор: одна цель, два непересекающихся набора соседей -------------
     rng = np.random.default_rng(3)
@@ -395,9 +411,9 @@ def main() -> None:
     rows = []
     for t in one_per_ep(tgt_eps):
         cache_t = np.asarray(H[[t]])[0]
-        solo, len_solo, pos_s, emb_s = run(np.asarray([t]), po)
-        ha, len_a, pos_a, emb_a = run(np.concatenate([[t], A]), po)
-        hb, len_b, pos_b, emb_b = run(np.concatenate([[t], B]), po)
+        solo, len_solo, pos_s, emb_s, act_s = run(np.asarray([t]), po)
+        ha, len_a, pos_a, emb_a, act_a = run(np.concatenate([[t], A]), po)
+        hb, len_b, pos_b, emb_b, act_b = run(np.concatenate([[t], B]), po)
         # МЕХАНИЗМ: совпадают ли позиции и вложения целевой строки
         same_pos = (pos_s is not None and pos_a is not None
                     and pos_s.shape == pos_a.shape
@@ -416,6 +432,11 @@ def main() -> None:
             solo_vs_A=rel_rms(solo[0], ha[0]),
             len_solo=len_solo, len_A=len_a, len_B=len_b,
             same_position_ids=same_pos,
+            same_action_positions=bool(
+                act_s.shape == act_a.shape and np.array_equal(act_s, act_a)
+                and act_a.shape == act_b.shape
+                and np.array_equal(act_a, act_b)),
+            act_pos_solo=act_s.tolist()[:6], act_pos_A=act_a.tolist()[:6],
             pos_solo_head=(pos_s[:4].tolist() if pos_s is not None else None),
             pos_A_head=(pos_a[:4].tolist() if pos_a is not None else None),
             emb_max_abs_diff=emb_d)
@@ -426,9 +447,10 @@ def main() -> None:
               f"одиночно/А {r['solo_vs_A']:.2e}")
         print(f"      длины без набивки: одиночно {len_solo}, "
               f"в А {sorted(set(len_a))[:4]}..., в Б {sorted(set(len_b))[:4]}...")
-        print(f"      позиции целевой строки совпадают: {same_pos}; "
-              f"начало одиночно {r['pos_solo_head']}, в А {r['pos_A_head']}; "
-              f"вложения расходятся на "
+        print(f"      позиции подсказки совпадают: {same_pos}; позиции "
+              f"ПОТОКА ДЕЙСТВИЙ совпадают: {r['same_action_positions']}")
+        print(f"      действия одиночно {r['act_pos_solo']}, в А "
+              f"{r['act_pos_A']}; вложения расходятся на "
               + ("—" if emb_d is None else f"{emb_d:.2e}"))
 
     med = lambda k: float(np.median([r[k] for r in rows]))
@@ -439,10 +461,11 @@ def main() -> None:
           f"батч/кэш {med('batchA_vs_cache'):.2e}, "
           f"А/Б {med('A_vs_B'):.2e}, одиночно/А {med('solo_vs_A'):.2e}")
     n_same = sum(1 for r in rows if r["same_position_ids"])
-    print(f"\n  позиции целевой строки совпали у {n_same} из {len(rows)} "
-          f"наблюдений")
+    n_act = sum(1 for r in rows if r["same_action_positions"])
+    print(f"\n  позиции подсказки совпали у {n_same} из {len(rows)}, позиции "
+          f"потока действий — у {n_act} из {len(rows)}")
     if tag == "B":
-        if n_same == len(rows):
+        if n_same == len(rows) and n_act == len(rows):
             verdict += (
                 ".\n  МЕХАНИЗМ НЕ В ПОЗИЦИЯХ: они совпали у всех целей, а "
                 "вложения\n  расходятся — искать в обработке картинки или в "
