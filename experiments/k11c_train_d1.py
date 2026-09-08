@@ -1249,6 +1249,16 @@ def main() -> None:
                                   if ep == args.epochs else 0, tgt=tgt)
                     hist.append(dict(epoch=ep, loss=run_loss / max(nb, 1),
                                      val=ev))
+                    # ЧЕКПОЙНТ КАЖДОЙ ЭПОХИ. Без них выбирать эпоху нечем, а
+                    # без выбора эпохи сравнение несправедливо: ветвь,
+                    # которая переобучается, штрафуется за то, что её не
+                    # остановили, а не за качество.
+                    torch.save({k_: v.detach().cpu()
+                                for k_, v in head.state_dict().items()
+                                if k_.startswith(TRAIN_PREFIXES)},
+                               os.path.join(args.ckpt_dir,
+                                            f"ep_{arch}_{tgt}_{lr:g}_"
+                                            f"wd{wd:g}_s{seed}_e{ep}.pt"))
                     gs = ev["star"]["head"]
                     ga = ev["action"]["head"]
                     vl, tlf = ev.get("val_loss"), ev.get("train_loss_fixed")
@@ -1261,6 +1271,32 @@ def main() -> None:
                           f"знак {gs['grip']:.1%}; A* поз {ga['pos']:.1%} вр "
                           f"{ga['rot']:.1%}; насыщено токенов "
                           f"{ev['saturated_tokens']:.1%}", flush=True)
+                # ВЫБОР ЭПОХИ — ПРЕ-РЕГИСТРИРОВАННЫМ ПРАВИЛОМ ПО ПОТЕРЕ НА
+                # VAL, А НЕ ПО ОТЧЁТНОЙ МЕТРИКЕ. Выбирать по доле значило бы
+                # подбирать под собственный критерий приёмки; выбирать всегда
+                # последнюю — штрафовать переобучающуюся ветвь за отсутствие
+                # ранней остановки. При равенстве берётся РАННЯЯ эпоха.
+                vls = [(h["val"].get("val_loss"), h["epoch"])
+                       for h in hist[1:] if h["val"].get("val_loss") is not None]
+                sel_ep = args.epochs
+                if vls:
+                    sel_ep = min(vls, key=lambda t: (t[0], t[1]))[1]
+                if sel_ep != args.epochs:
+                    sp = os.path.join(args.ckpt_dir,
+                                      f"ep_{arch}_{tgt}_{lr:g}_wd{wd:g}_"
+                                      f"s{seed}_e{sel_ep}.pt")
+                    head.load_state_dict(torch.load(sp, map_location=dev,
+                                                    weights_only=False),
+                                         strict=False)
+                    ev_sel = evaluate(head, n_boot=args.n_boot, tgt=tgt)
+                    hist.append(dict(epoch=sel_ep, selected=True, val=ev_sel))
+                    print(f"    ВЫБРАНА эпоха {sel_ep} по минимуму потери на "
+                          f"val ({min(v for v, _ in vls):.5f}), не последняя "
+                          f"({args.epochs}); её доля поз "
+                          f"{ev_sel['star']['head']['pos']:.1%}")
+                else:
+                    print(f"    выбрана последняя эпоха {sel_ep}: минимум "
+                          f"потери на val там же")
                 last = hist[-1]["val"]
                 cp = os.path.join(args.ckpt_dir,
                                   f"d1_{arch}_{tgt}_{lr:g}_wd{wd:g}_s{seed}.pt")
@@ -1274,7 +1310,7 @@ def main() -> None:
                            for k, v in head.state_dict().items()
                            if k.startswith(TRAIN_PREFIXES)},
                     target=tgt, arch=arch, lr=lr, wd=wd, seed=seed,
-                    chan_weights=chan_w,
+                    chan_weights=chan_w, selected_epoch=int(sel_ep),
                     epochs=args.epochs,
                     rank=rank, script_sha1=sha,
                     basis_sha1=k11a.file_sha1(basis_p),
@@ -1300,8 +1336,12 @@ def main() -> None:
                 # поэтому разность двух соседних эпох — шумная статистика:
                 # она может и объявить сходимость на растущей кривой, и
                 # наоборот. Сравниваются средние по двум окнам.
-                gains_h = [h["val"]["star"]["head"]["pos"] for h in hist[1:]]
-                rot_h = [h["val"]["star"]["head"]["rot"] for h in hist[1:]]
+                # Окно стабильности считается по обучающей траектории, БЕЗ
+                # добавленной записи о выбранной эпохе: иначе она вошла бы в
+                # окно дважды.
+                traj = [h for h in hist[1:] if not h.get("selected")]
+                gains_h = [h["val"]["star"]["head"]["pos"] for h in traj]
+                rot_h = [h["val"]["star"]["head"]["rot"] for h in traj]
                 w_ = min(3, len(gains_h) // 2)
                 if w_ >= 1:
                     delta_ = float(np.mean(gains_h[-w_:])
