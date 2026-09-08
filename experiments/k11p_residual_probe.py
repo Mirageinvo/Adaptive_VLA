@@ -1339,6 +1339,24 @@ def main() -> None:
                cache_meta_sha1=k11a.file_sha1(prefix + ".meta.json"),
                hicora_vla_sha1=k11a.file_sha1(hv.__file__),
                k11a_sha1=k11a.file_sha1(k11a.__file__))
+    # ВЕСА ЗОНДА СОХРАНЯЮТСЯ. Без них «воспроизводит ли обучение зонд»
+    # проверить нечем: линейная голова с tanh — ДРУГАЯ модель, и её неудача
+    # конвейер обучения не проверяет. Веса даны в исходном пространстве
+    # признаков (стандартизация уже свёрнута в них), порядок столбцов —
+    # [res_norm(h24), z0], тот же, что у головы.
+    wp = args.out.replace(".json", "") + ".weights.npz"
+    np.savez(wp, w_clip=W["both"]["clip"][0], b_clip=W["both"]["clip"][1],
+             w_raw=W["both"]["raw"][0], b_raw=W["both"]["raw"][1],
+             idx_both=np.asarray(IDX["both"], np.int64),
+             d_h=np.int64(D_H), d_latent=np.int64(D_Z),
+             rank=np.int64(rank), lam=np.float64(best["both"]),
+             note=np.asarray(
+                 "pred = X[:, idx] @ w + b; c_hat = clip(pred, -1, 1); "
+                 "dz = (rho * c_hat) @ B.T", dtype=object))
+    out["weights_npz"] = wp
+    out["weights_sha1"] = k11a.file_sha1(wp)
+    print(f"  веса зонда сохранены: {wp}, sha {out['weights_sha1']}")
+
     tmp = args.out + ".tmp"
     json.dump(out, open(tmp, "w"), ensure_ascii=False, indent=1)
     os.replace(tmp, args.out)

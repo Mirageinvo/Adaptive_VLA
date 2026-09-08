@@ -70,8 +70,15 @@ def make_linear_head():
     import torch.nn as nn
 
     class LinearHead(nn.Module):
-        def __init__(self, d_hidden, d_latent, rank=32):
+        def __init__(self, d_hidden, d_latent, rank=32, squash="tanh"):
             super().__init__()
+            # СПОСОБ ОГРАНИЧЕНИЯ — ПАРАМЕТР. Зонд ограничивает коэффициенты
+            # ОБРЕЗАНИЕМ, голова — `tanh`. Это РАЗНЫЕ модели, и чтобы
+            # проверить конвейер обучения на известном ответе, контрольная
+            # голова обязана уметь ровно то же, что зонд.
+            if squash not in ("tanh", "clip"):
+                raise ValueError(f"неизвестное ограничение {squash}")
+            self.squash = squash
             self.rank, self.d_latent = int(rank), int(d_latent)
             self.lin = nn.Linear(d_hidden + d_latent, self.rank)
             # НУЛЕВАЯ ИНИЦИАЛИЗАЦИЯ, как у настоящей головы: без неё эпоха 0
@@ -99,7 +106,9 @@ def make_linear_head():
         def coeffs(self, h, z0):
             # `z0` под stop-gradient, как в настоящей голове: поправка
             # строится К черновику, а не меняет его.
-            return torch.tanh(self.lin(torch.cat([h, z0.detach()], -1)))
+            x = self.lin(torch.cat([h, z0.detach()], -1))
+            return torch.tanh(x) if self.squash == "tanh" \
+                else torch.clamp(x, -1.0, 1.0)
 
         def forward(self, h, z0):
             c = self.coeffs(h, z0)
@@ -185,8 +194,8 @@ def select_arm(arms, tol=GRIP_TOL, min_seeds=SEL_SEEDS_MIN):
         grip_hi = float(max(r["grip_delta_hi"] for r in runs))
         ok = grip_hi <= tol + 1e-12
         rows.append(dict(key=key, pos=pos, rot=rot, grip_delta_hi=grip_hi,
-                         pos_last=float(np.mean([r.get("pos_last", r["pos"])
-                                                 for r in runs])),
+                         pos_window=float(np.mean(
+                             [r.get("pos_window", r["pos"]) for r in runs])),
                          window=int(max(r.get("window", 1) for r in runs)),
                          ok=ok, score=0.5 * (pos + rot), n_seeds=len(runs),
                          # ПО ХУДШЕМУ СИДУ, А НЕ ПО СРЕДНЕМУ: рост одного
@@ -507,6 +516,13 @@ def main() -> None:
                          "линейная той же формы выхода. Матрица "
                          "«архитектура на мишень» разделяет причины отставания "
                          "от зонда")
+    ap.add_argument("--eval-ckpts", default=None,
+                    help="каталог или список .pt через запятую: только "
+                         "перекрёстная оценка сохранённых весов, без обучения")
+    ap.add_argument("--eval-probe", default=None,
+                    help="npz с весами зонда: контроль воспроизведения. "
+                         "Оценивается дважды — с обрезанием (как у зонда) и с "
+                         "tanh (как у головы)")
     ap.add_argument("--allow-probe-mismatch", action="store_true",
                     help="разрешить ориентир зонда, собранный на других "
                          "артефактах")
@@ -695,6 +711,14 @@ def main() -> None:
     def decode(z):
         return codec._decode(z, embodiment_ids=0)[0][..., :7].float()
 
+    # ФИКСИРОВАННЫЕ СЛУЧАЙНЫЕ ПОДВЫБОРКИ ДЛЯ РАЗРЫВА, одни на весь прогон.
+    _rg_gap = np.random.default_rng(51)
+    n_gap = min(4096, len(tr), len(va))
+    gap_tr = np.sort(_rg_gap.choice(tr, n_gap, replace=False))
+    gap_va = np.sort(_rg_gap.choice(va, n_gap, replace=False))
+    print(f"  разрыв считается на фиксированных случайных подвыборках по "
+          f"{n_gap} наблюдений (сид 51), одними и теми же финальными весами")
+
     ep_va = epi[va]
     ep_ids = np.unique(ep_va)
     ep_pos = {int(e): i for i, e in enumerate(ep_ids)}
@@ -796,13 +820,20 @@ def main() -> None:
         out["saturated_tokens"] = float(sat_tok / max(sat_n, 1))
         out["act_gap_vs_draft"] = act_gap
         if tgt is not None:
-            # ПОТЕРЯ НА VAL — ТА ЖЕ ФУНКЦИЯ, ЧТО НА TRAIN. Считается по
-            # подвыборке: полный val для этого не нужен, а стоит он времени.
-            sub = va[:min(len(va), 4096)]
-            ls = []
-            for i2, j2 in k11a.plan_batches(len(sub), args.batch):
-                ls.append(train_loss_on(head, sub[i2:j2], tgt))
-            out["val_loss"] = float(np.mean(ls)) if ls else None
+            # РАЗРЫВ СЧИТАЕТСЯ ОДНИМИ И ТЕМИ ЖЕ ФИНАЛЬНЫМИ ВЕСАМИ по обе
+            # стороны. Прежде «train» была бегущим средним потерь ВО ВРЕМЯ
+            # обновления весов внутри эпохи, а «val» — оценкой уже готовой
+            # модели: это не две оценки одной модели, и разрыв между ними
+            # ничего не диагностировал.
+            #
+            # Подвыборки СЛУЧАЙНЫЕ и фиксированные, а не префикс: кэш
+            # упорядочен по эпизодам, и `va[:4096]` — это первые задачи.
+            for nm_, sub in (("train_loss_fixed", gap_tr),
+                             ("val_loss", gap_va)):
+                ls = []
+                for i2, j2 in k11a.plan_batches(len(sub), args.batch):
+                    ls.append(train_loss_on(head, sub[i2:j2], tgt))
+                out[nm_] = float(np.mean(ls)) if ls else None
         return out
 
     # --- ПРОИСХОЖДЕНИЕ ЗОНДА СВЕРЯЕТСЯ: это ЦЕНТРАЛЬНОЕ сравнение --------
@@ -843,6 +874,140 @@ def main() -> None:
     else:
         print(f"  ориентира зонда нет ({args.probe} отсутствует): вывод о "
               f"сравнении с ним делаться не будет")
+
+    def cross_eval():
+        """ОДНИ И ТЕ ЖЕ ТРИ МЕТРИКИ ДЛЯ ВСЕХ СОХРАНЁННЫХ ВЕСОВ.
+
+        ЗАЧЕМ. При обучении каждая ветвь считала потерю ПО СВОЕЙ мишени, и
+        числа вроде 0.01380 и 0.00885 лежат в разных пространствах: они не
+        говорят, какая голова лучше оптимизировала действия. Пока обе не
+        измерены ОДНИМИ метриками, вывод «виновата функция потерь» не
+        доказан — он одинаково совместим с трудностью оптимизации и с
+        несовпадением обучающей и отчётной метрик.
+
+        ЧИТАТЬ ТАК: если голова с мишенью-коэффициентами лучше и по потере
+        ДЕЙСТВИЙ — виновата оптимизация action-loss. Если она хуже по
+        действиям, но лучше по доле RMS — расходятся обучающая и отчётная
+        метрики, и это другой вывод.
+        """
+        paths = []
+        for tok in str(args.eval_ckpts).split(","):
+            tok = os.path.abspath(tok.strip())
+            if os.path.isdir(tok):
+                paths += sorted(os.path.join(tok, f) for f in os.listdir(tok)
+                                if f.endswith(".pt"))
+            elif os.path.exists(tok):
+                paths.append(tok)
+            else:
+                raise SystemExit(f"нет {tok}")
+        if not paths:
+            raise SystemExit("не нашлось ни одного .pt")
+        rows_e = []
+
+        def measure(head, name, extra=None):
+            ev = evaluate(head, n_boot=args.n_boot)
+            g = ev["star"]["head"]
+            lc = float(np.mean([train_loss_on(head, gap_va[i2:j2], "coef")
+                                for i2, j2 in k11a.plan_batches(
+                                    len(gap_va), args.batch)]))
+            la = float(np.mean([train_loss_on(head, gap_va[i2:j2], "star")
+                                for i2, j2 in k11a.plan_batches(
+                                    len(gap_va), args.batch)]))
+            r = dict(name=name, pos=g["pos"], rot=g["rot"],
+                     grip_delta=g.get("grip_delta"),
+                     grip_delta_hi=(g.get("ci_grip_delta") or [None, None])[1],
+                     loss_coef=lc, loss_action=la,
+                     saturated=ev["saturated_tokens"])
+            if extra:
+                r.update(extra)
+            rows_e.append(r)
+            print(f"    {name}: поз {g['pos']:.1%}, вр {g['rot']:.1%}, "
+                  f"коэф {lc:.5f}, действия {la:.5f}, насыщено "
+                  f"{ev['saturated_tokens']:.1%}", flush=True)
+
+        print(f"\n  перекрёстная оценка {len(paths)} чекпойнтов, все метрики "
+              f"на одном val ({len(va)} наблюдений):")
+        for cp_ in paths:
+            obj_ = torch.load(cp_, map_location="cpu", weights_only=False)
+            for k_, want_ in (("basis_sha1", k11a.file_sha1(basis_p)),
+                              ("rho_sha1", k11a.file_sha1(rho_p))):
+                if obj_.get(k_) != want_:
+                    raise SystemExit(
+                        f"{os.path.basename(cp_)}: {k_} = {obj_.get(k_)}, а "
+                        f"сейчас {want_} — веса от других артефактов")
+            a_ = obj_.get("arch", "mlp")
+            h_ = (hv.make_residual_head()(D_H, int(E.shape[-1]), rank=rank,
+                                          hidden=args.hidden, proj=args.proj)
+                  if a_ == "mlp"
+                  else make_linear_head()(D_H, int(E.shape[-1]), rank=rank))
+            h_ = h_.to(dev)
+            h_.set_basis(torch.as_tensor(B))
+            h_.set_rho(torch.as_tensor(rho))
+            h_.float()
+            st_ = {k_[len("hicora_head."):]: v
+                   for k_, v in obj_["state"].items()
+                   if k_.startswith("hicora_head.")}
+            rep = h_.load_state_dict(st_, strict=False)
+            if rep.unexpected_keys:
+                raise SystemExit(f"лишние ключи в {cp_}: "
+                                 f"{rep.unexpected_keys[:3]}")
+            measure(h_, os.path.basename(cp_).replace(".pt", ""),
+                    dict(arch=a_, target=obj_.get("target"),
+                         lr=obj_.get("lr"), wd=obj_.get("wd"),
+                         seed=obj_.get("seed"), ckpt=cp_))
+            del h_
+            torch.cuda.empty_cache()
+
+        # КОНТРОЛЬ НА ИЗВЕСТНОМ ОТВЕТЕ. Веса зонда в голове С ОБРЕЗАНИЕМ
+        # обязаны воспроизвести его долю: иначе расходятся пути оценки и всё
+        # сравнение недействительно. Та же подстановка с `tanh` отделяет цену
+        # способа ограничения от цены обучения.
+        if args.eval_probe:
+            zp = np.load(args.eval_probe, allow_pickle=True)
+            wq = np.asarray(zp["w_clip"], np.float32)
+            bq = np.asarray(zp["b_clip"], np.float32)
+            need_sh = (D_H + int(E.shape[-1]), rank)
+            if tuple(wq.shape) != need_sh:
+                raise SystemExit(f"веса зонда формы {wq.shape}, ждали "
+                                 f"{need_sh}")
+            for sq in ("clip", "tanh"):
+                hp = make_linear_head()(D_H, int(E.shape[-1]), rank=rank,
+                                        squash=sq).to(dev)
+                hp.set_basis(torch.as_tensor(B))
+                hp.set_rho(torch.as_tensor(rho))
+                hp.float()
+                with torch.no_grad():
+                    hp.lin.weight.copy_(torch.as_tensor(wq.T))
+                    hp.lin.bias.copy_(torch.as_tensor(bq))
+                measure(hp, f"зонд/{sq}",
+                        dict(arch=f"probe-{sq}", target="coef-exact"))
+                del hp
+                torch.cuda.empty_cache()
+
+        print(f"\n  {'веса':>34}{'поз':>8}{'вр':>8}{'коэф':>10}"
+              f"{'действия':>11}{'насыщ':>8}")
+        for r in sorted(rows_e, key=lambda x: -x["pos"]):
+            print(f"    {r['name']:>32}{r['pos']:>8.1%}{r['rot']:>8.1%}"
+                  f"{r['loss_coef']:>10.5f}{r['loss_action']:>11.5f}"
+                  f"{r['saturated']:>8.1%}")
+        if probe_pos is not None:
+            print(f"    ориентир зонда по доле: {probe_pos:.1%}")
+        print("    ЧИТАТЬ ТАК: обе потери посчитаны ОДНИМИ весами на ОДНОМ "
+              "наборе.\n    Голова с мишенью-коэффициентами лучше и по потере "
+              "ДЕЙСТВИЙ — виновата\n    оптимизация action-loss. Хуже по "
+              "действиям, но лучше по доле —\n    расходятся обучающая и "
+              "отчётная метрики.")
+        out_e = dict(script_sha1=sha, cache=prefix, rank=rank, rows=rows_e,
+                     probe_pos=probe_pos, probe_weights=args.eval_probe,
+                     n_val=int(len(va)), n_gap=int(len(gap_va)))
+        tmp_e = args.out + ".tmp"
+        json.dump(out_e, open(tmp_e, "w"), ensure_ascii=False, indent=1)
+        os.replace(tmp_e, args.out)
+        print(f"\n  сохранено: {args.out}")
+
+    if args.eval_ckpts:
+        cross_eval()
+        return
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
     if args.n_boot < 1:
@@ -959,10 +1124,12 @@ def main() -> None:
                                      val=ev))
                     gs = ev["star"]["head"]
                     ga = ev["action"]["head"]
-                    vl = ev.get("val_loss")
-                    print(f"    эпоха {ep}: потеря train "
-                          f"{run_loss / max(nb, 1):.5f} / val "
-                          + ("—" if vl is None else f"{vl:.5f}")
+                    vl, tlf = ev.get("val_loss"), ev.get("train_loss_fixed")
+                    print(f"    эпоха {ep}: потеря бегущая "
+                          f"{run_loss / max(nb, 1):.5f}; финальными весами "
+                          "train "
+                          + ("—" if tlf is None else f"{tlf:.5f}")
+                          + " / val " + ("—" if vl is None else f"{vl:.5f}")
                           + f"; D(z*) поз {gs['pos']:.1%} вр {gs['rot']:.1%} "
                           f"знак {gs['grip']:.1%}; A* поз {ga['pos']:.1%} вр "
                           f"{ga['rot']:.1%}; насыщено токенов "
@@ -970,6 +1137,11 @@ def main() -> None:
                 last = hist[-1]["val"]
                 cp = os.path.join(args.ckpt_dir,
                                   f"d1_{arch}_{tgt}_{lr:g}_wd{wd:g}_s{seed}.pt")
+                # ЧЕКПОЙНТ СООТВЕТСТВУЕТ ОТЧЁТНОМУ ЧИСЛУ. Прежде доля была
+                # средним по трём эпохам, а сохранялись веса ТОЛЬКО последней:
+                # ни одной конкретной головы, про которую доказано 13.0%, не
+                # существовало. Теперь окно остаётся диагностикой стабильности,
+                # а отчётное число и гейт берутся у ОДНОЙ сохранённой эпохи.
                 torch.save(dict(
                     state={f"hicora_head.{k}": v.detach().cpu()
                            for k, v in head.state_dict().items()
@@ -1017,10 +1189,12 @@ def main() -> None:
                 # дисперсии; значение последней эпохи сохраняется рядом.
                 w_s_ = min(3, len(gains_h))
                 arms_acc.setdefault(key, []).append(dict(
-                    pos=float(np.mean(gains_h[-w_s_:])),
-                    rot=float(np.mean(rot_h[-w_s_:])),
-                    pos_last=last["star"]["head"]["pos"],
-                    rot_last=last["star"]["head"]["rot"],
+                    # ОТЧЁТНОЕ ЧИСЛО — У СОХРАНЁННОЙ ЭПОХИ, а окно рядом как
+                    # диагностика стабильности.
+                    pos=last["star"]["head"]["pos"],
+                    rot=last["star"]["head"]["rot"],
+                    pos_window=float(np.mean(gains_h[-w_s_:])),
+                    rot_window=float(np.mean(rot_h[-w_s_:])),
                     window=int(w_s_),
                     grip_delta=last["star"]["head"]["grip_delta"],
                     grip_delta_hi=gd[1],
@@ -1032,15 +1206,16 @@ def main() -> None:
     best, rows, skipped = select_arm(arms_acc)
     print(f"\n  сводка по конфигурациям (опора D(z*), среднее по сидам, "
           f"схват черновика {draft_grip:.1%}):")
-    print(f"    {'конфигурация':>22}{'сидов':>7}{'поз окно':>10}{'поз посл':>10}{'вр окно':>9}"
+    print(f"    {'конфигурация':>22}{'сидов':>7}{'поз ckpt':>10}{'поз окно':>10}{'вр ckpt':>9}"
           f"{'Δсхват сверху':>15}{'гейт':>7}{'Δокон':>10}")
     for r in rows:
         print(f"    {r['key']:>22}{r['n_seeds']:>7}{r['pos']:>10.1%}"
-              f"{r['pos_last']:>10.1%}{r['rot']:>9.1%}{r['grip_delta_hi']:>14.2%}"
+              f"{r['pos_window']:>10.1%}{r['rot']:>9.1%}{r['grip_delta_hi']:>14.2%}"
               f"{('да' if r['ok'] else 'НЕТ'):>7}{r['last_delta']:>+10.1%}")
-    print(f"    («поз окно» — среднее по последним "
-          f"{rows[0]['window'] if rows else 3} эпохам, оно и идёт в отбор; "
-          f"«поз посл» — только\n     последняя эпоха, для сравнения)")
+    print(f"    («поз ckpt» — у СОХРАНЁННОЙ эпохи, оно и идёт в отбор и в "
+          f"K-11e;\n     «поз окно» — среднее по последним "
+          f"{rows[0]['window'] if rows else 3} эпохам, только диагностика "
+          f"стабильности)")
     print(f"    (Δокон — разница средних по двум последним окнам эпох, "
           f"худший сид;\n     модуль выше {CONV_TOL:.1%} означает, что кривая "
           f"не вышла на полку и вывод\n     об архитектуре недействителен)")
