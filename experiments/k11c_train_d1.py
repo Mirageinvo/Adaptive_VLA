@@ -118,6 +118,66 @@ def make_linear_head():
     return LinearHead
 
 
+def mean_over_batches(values, sizes):
+    """Среднее, ВЗВЕШЕННОЕ размером батча.
+
+    ЗАЧЕМ. Обычное среднее средних по батчам даёт последнему, неполному,
+    тот же вес, что полному. При 14493 наблюдениях и батче 256 последний
+    состоит из 157 строк и переоценивается примерно в 1.6 раза. Данные
+    упорядочены по эпизодам, поэтому переоценивается КОНКРЕТНАЯ задача, и
+    близкие модели могут поменяться местами.
+    """
+    v = np.asarray(values, np.float64)
+    n = np.asarray(sizes, np.float64)
+    if v.shape != n.shape:
+        raise ValueError(f"длины не совпали: {v.shape} и {n.shape}")
+    tot = float(n.sum())
+    if tot <= 0:
+        raise ValueError("суммарный размер нулевой")
+    return float((v * n).sum() / tot)
+
+
+def parse_snapshot(fname):
+    """Разбор имени поэпохного снимка. Отказ вместо догадки."""
+    import re
+    m = re.match(r"^ep_(mlp|linear)_(coef|star|action)_"
+                 r"([0-9.e+-]+)_wd([0-9.e+-]+)_s(\d+)_e(\d+)\.pt$", fname)
+    if not m:
+        return None
+    a, t, lr, wd, sd, ep = m.groups()
+    return dict(arch=a, target=t, lr=lr, wd=wd, seed=int(sd), epoch=int(ep))
+
+
+def check_probe_control(got, want, tol, tol_max=0.005):
+    """Контроль на известном ответе: обязан совпасть, а не просто посчитаться.
+
+    `got` и `want` — словари с полями `pos` и `rot`. Проверяются ОБА: совпав
+    по положению, можно разойтись по вращению, и это означало бы ровно ту же
+    беду — разные пути оценки.
+
+    Допуск ограничен сверху жёстко: иначе `--probe-tol 999` или `nan`
+    обесценили бы контроль одной опцией командной строки.
+    """
+    if not np.isfinite(tol) or tol < 0 or tol > tol_max:
+        raise SystemExit(
+            f"допуск контроля {tol} вне [0, {tol_max}]: контроль, который "
+            f"можно ослабить опцией, контролем не является")
+    bad = []
+    for k in ("pos", "rot"):
+        g, w = got.get(k), want.get(k)
+        if g is None or w is None:
+            raise SystemExit(f"нет величины {k} для сверки контроля")
+        if abs(g - w) > tol:
+            bad.append(f"{k}: {g:.1%} против {w:.1%}, расхождение "
+                       f"{abs(g - w):.1%}")
+    if bad:
+        raise SystemExit(
+            "КОНТРОЛЬ ПРОВАЛЕН (" + "; ".join(bad) + f") при допуске "
+            f"{tol:.1%}. Значит K-11p и K-11c меряют РАЗНОЕ, и всё сравнение "
+            f"головы с зондом недействительно")
+    return True
+
+
 def loss_by_channel(pred, target, h_exec=H_EXEC):
     """Вклад каждой группы каналов в ту же потерю действий.
 
@@ -463,6 +523,58 @@ def selftest():
     else:
         raise AssertionError("замороженная голова принята")
 
+    # --- взвешенное усреднение по батчам ------------------------------------
+    # КОНТРОЛЬ НА НЕДЕЛЯЩЕМСЯ РАЗМЕРЕ: именно он отличает правильное
+    # усреднение от наивного, и именно он встречается на реальном val.
+    rgm = np.random.default_rng(17)
+    xs = rgm.normal(size=1000)
+    bs = [(i, min(i + 256, 1000)) for i in range(0, 1000, 256)]
+    vals = [float(xs[i:j].mean()) for i, j in bs]
+    szs = [j - i for i, j in bs]
+    assert abs(mean_over_batches(vals, szs) - float(xs.mean())) < 1e-12
+    naive = float(np.mean(vals))
+    assert abs(naive - float(xs.mean())) > 1e-6, (
+        "контроль не воспроизводит опасный случай: наивное среднее совпало")
+    # на делящемся размере оба совпадают — значит разница именно в хвосте
+    bs2 = [(i, i + 250) for i in range(0, 1000, 250)]
+    v2 = [float(xs[i:j].mean()) for i, j in bs2]
+    assert abs(np.mean(v2) - mean_over_batches(v2, [250] * 4)) < 1e-12
+    try:
+        mean_over_batches([1.0, 2.0], [1])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("разные длины приняты")
+
+    # --- разбор имени снимка ------------------------------------------------
+    ok_n = parse_snapshot("ep_mlp_star_0.001_wd0_s1_e7.pt")
+    assert ok_n == dict(arch="mlp", target="star", lr="0.001", wd="0",
+                        seed=1, epoch=7), ok_n
+    for bad_n in ("d1_mlp_star_0.001_wd0_s1.pt", "ep_conv_star_1_wd0_s0_e1.pt",
+                  "ep_mlp_bogus_1_wd0_s0_e1.pt", "ep_mlp_star_1_wd0_s0.pt"):
+        assert parse_snapshot(bad_n) is None, bad_n
+
+    # --- контроль на известном ответе ---------------------------------------
+    assert check_probe_control(dict(pos=0.105, rot=0.111),
+                               dict(pos=0.105, rot=0.111), 0.005)
+    # расхождение по ВРАЩЕНИЮ обязано ловиться, даже если поза совпала
+    for bad_g in (dict(pos=0.105, rot=0.02), dict(pos=0.02, rot=0.111)):
+        try:
+            check_probe_control(bad_g, dict(pos=0.105, rot=0.111), 0.005)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"расхождение принято: {bad_g}")
+    # допуск нельзя ослабить опцией
+    for bad_t in (999.0, float("nan"), -0.1, 0.05):
+        try:
+            check_probe_control(dict(pos=0.0, rot=0.0),
+                                dict(pos=0.105, rot=0.111), bad_t)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"допуск {bad_t} принят")
+
     # --- линейная диагностическая голова -----------------------------------
     try:
         import torch as _t
@@ -555,6 +667,10 @@ def selftest():
           "ПАРНУЮ разницу и отвергает подставленную вместо неё абсолютную "
           "величину, отсутствие интервала — отказ, а не точечная оценка, "
           "вывод об архитектуре блокируется, пока кривая не вышла на полку, "
+          "усреднение по батчам взвешено размером и на неделящемся "
+          "размере расходится с наивным, разбор имени снимка отвергает чужие "
+          "имена, контроль на известном ответе сверяет и позу, и вращение и "
+          "не даёт ослабить допуск опцией, "
           "веса каналов при (1,1,1) воспроизводят равномерную потерю и "
           "нулевой вес убирает канал целиком, разложение потери по каналам "
           "складывается в общую и показывает "
@@ -603,6 +719,9 @@ def main() -> None:
                          "линейная той же формы выхода. Матрица "
                          "«архитектура на мишень» разделяет причины отставания "
                          "от зонда")
+    ap.add_argument("--legacy-chan-weights", default=None,
+                    help="веса каналов для снимков БЕЗ метаданных: «none» "
+                         "или три числа. Обязателен, если такие снимки есть")
     ap.add_argument("--reselect", default=None,
                     help="каталог со снимками ep_*.pt: пересчитать выбор "
                          "эпохи ПРАВИЛЬНОЙ потерей и переоценить, без "
@@ -823,6 +942,17 @@ def main() -> None:
     print(f"  разрыв считается на фиксированных случайных подвыборках по "
           f"{n_gap} наблюдений (сид 51), одними и теми же финальными весами")
 
+    # ВЕСА КАНАЛОВ РАЗБИРАЮТСЯ ДО ВСЕГО, ЧТО ИХ ЧИТАЕТ. Прежде разбор стоял
+    # ниже определения и вызова `reselect`, поэтому режим падал на обращении
+    # к свободной переменной ещё до первого измерения.
+    chan_w = None
+    if args.chan_weights:
+        chan_w = [float(x) for x in str(args.chan_weights).split(",") if x]
+        if len(chan_w) != 3 or any(w < 0 for w in chan_w):
+            raise SystemExit("--chan-weights: три неотрицательных числа")
+        print(f"  веса каналов потери действий: положение {chan_w[0]:g}, "
+              f"вращение {chan_w[1]:g}, схват {chan_w[2]:g}")
+
     ep_va = epi[va]
     ep_ids = np.unique(ep_va)
     ep_pos = {int(e): i for i, e in enumerate(ep_ids)}
@@ -939,11 +1069,11 @@ def main() -> None:
             # упорядочен по эпизодам, и `va[:4096]` — это первые задачи.
             for nm_, sub in (("train_loss_fixed", gap_tr),
                              ("val_loss", gap_va)):
-                ls = []
-                for i2, j2 in k11a.plan_batches(len(sub), args.batch):
-                    ls.append(train_loss_on(head, sub[i2:j2], tgt,
-                                            w_chan=chan_w))
-                out[nm_] = float(np.mean(ls)) if ls else None
+                bs_ = k11a.plan_batches(len(sub), args.batch)
+                out[nm_] = mean_over_batches(
+                    [train_loss_on(head, sub[i2:j2], tgt, w_chan=chan_w)
+                     for i2, j2 in bs_],
+                    [j2 - i2 for i2, j2 in bs_]) if bs_ else None
         return out
 
     # --- ПРОИСХОЖДЕНИЕ ЗОНДА СВЕРЯЕТСЯ: это ЦЕНТРАЛЬНОЕ сравнение --------
@@ -1016,7 +1146,7 @@ def main() -> None:
                 raise SystemExit(f"нет {tok}")
         if not paths:
             raise SystemExit("не нашлось ни одного .pt")
-        rows_e = []
+        rows_e, probe_check = [], None
 
         # ОДНА И ТА ЖЕ ВЫБОРКА ДЛЯ ВСЕГО. Прежде доля считалась на полном
         # val (14493), а потери и разложение — на подвыборке (4096). Тогда
@@ -1026,10 +1156,10 @@ def main() -> None:
         eval_idx = va
 
         def losses_on(head, idx, tgt, w_chan=None):
-            return float(np.mean([train_loss_on(head, idx[i2:j2], tgt,
-                                                w_chan=w_chan)
-                                  for i2, j2 in k11a.plan_batches(
-                                      len(idx), args.batch)]))
+            bs = k11a.plan_batches(len(idx), args.batch)
+            return mean_over_batches(
+                [train_loss_on(head, idx[i2:j2], tgt, w_chan=w_chan)
+                 for i2, j2 in bs], [j2 - i2 for i2, j2 in bs])
 
         def decompose(head, idx):
             """Чем занята потеря действий: разложение по группам каналов."""
@@ -1160,7 +1290,13 @@ def main() -> None:
                 else {}
             want_w = pr_.get("weights_sha1")
             got_w = k11a.file_sha1(args.eval_probe)
-            if want_w and want_w != got_w:
+            # ОТСУТСТВИЕ SHA — ОТКАЗ, а не молчаливое принятие: иначе файл
+            # весов от другого прогона проходил бы контроль.
+            if not want_w:
+                raise SystemExit(
+                    f"в отчёте зонда {args.probe} нет weights_sha1: он собран "
+                    f"версией, которая веса не сохраняла. Пересчитайте зонд")
+            if want_w != got_w:
                 raise SystemExit(
                     f"веса зонда sha {got_w}, а отчёт зонда породил "
                     f"{want_w}: это файл от другого прогона")
@@ -1203,24 +1339,24 @@ def main() -> None:
             # КОНТРОЛЬ ОБЯЗАН СОВПАСТЬ, А НЕ ПРОСТО ПОСЧИТАТЬСЯ. Прежде
             # программа завершалась успешно и при результате 0% вместо
             # 10.5%: «контроль на известном ответе» ничего не контролировал.
-            got_pos = [r["pos"] for r in rows_e if r["name"] == "зонд/clip"]
-            if probe_pos is not None and got_pos:
-                d_ = abs(got_pos[0] - probe_pos)
-                if d_ > args.probe_tol:
-                    raise SystemExit(
-                        f"КОНТРОЛЬ ПРОВАЛЕН: веса зонда дали {got_pos[0]:.1%} "
-                        f"против {probe_pos:.1%} у самого зонда, расхождение "
-                        f"{d_:.1%} при допуске {args.probe_tol:.1%}. Значит "
-                        f"K-11p и K-11c меряют РАЗНОЕ, и всё сравнение головы "
-                        f"с зондом недействительно")
-                print(f"    контроль пройден: веса зонда воспроизвели его "
-                      f"долю ({got_pos[0]:.1%} против {probe_pos:.1%}, "
-                      f"расхождение {d_:.1%} при допуске "
-                      f"{args.probe_tol:.1%})")
-            elif got_pos:
-                raise SystemExit(
-                    "нет доли зонда для сверки: контроль на известном ответе "
-                    "невозможен без отчёта K-11p")
+            got_r = [r for r in rows_e if r["name"] == "зонд/clip"]
+            want_g = (pr_.get("gains", {}) or {}).get("both") or {}
+            if not got_r:
+                raise SystemExit("подстановка весов зонда не дала строки")
+            check_probe_control(dict(pos=got_r[0]["pos"],
+                                     rot=got_r[0]["rot"]),
+                                dict(pos=want_g.get("pos"),
+                                     rot=want_g.get("rot")),
+                                float(args.probe_tol))
+            probe_check = dict(
+                passed=True, tol=float(args.probe_tol),
+                got=dict(pos=got_r[0]["pos"], rot=got_r[0]["rot"]),
+                want=dict(pos=want_g.get("pos"), rot=want_g.get("rot")),
+                weights_sha1=got_w)
+            print(f"    контроль пройден: веса зонда воспроизвели его доли "
+                  f"({got_r[0]['pos']:.1%}/{got_r[0]['rot']:.1%} против "
+                  f"{want_g['pos']:.1%}/{want_g['rot']:.1%}) при допуске "
+                  f"{args.probe_tol:.1%}")
 
         print(f"\n  {'веса':>34}{'поз':>8}{'вр':>8}{'коэф':>10}"
               f"{'действия':>11}{'дейст.tr':>10}{'схват в потере':>16}")
@@ -1238,7 +1374,9 @@ def main() -> None:
               "отчётная метрики.")
         out_e = dict(script_sha1=sha, cache=prefix, rank=rank, rows=rows_e,
                      probe_pos=probe_pos, probe_weights=args.eval_probe,
-                     n_val=int(len(va)), n_gap=int(len(gap_va)))
+                     probe_check=probe_check, probe_tol=float(args.probe_tol),
+                     eval_n=int(len(eval_idx)), n_train_side=int(len(gap_tr)),
+                     n_val=int(len(va)))
         tmp_e = args.out + ".tmp"
         json.dump(out_e, open(tmp_e, "w"), ensure_ascii=False, indent=1)
         os.replace(tmp_e, args.out)
@@ -1262,18 +1400,68 @@ def main() -> None:
         d_ = os.path.abspath(args.reselect)
         if not os.path.isdir(d_):
             raise SystemExit(f"нет каталога {d_}")
-        pat = re.compile(r"^ep_(mlp|linear)_(coef|star|action)_"
-                         r"([0-9.e+-]+)_wd([0-9.e+-]+)_s(\d+)_e(\d+)\.pt$")
-        groups = {}
+        if args.n_boot < 1:
+            raise SystemExit("--n-boot 0: гейт схвата выродился бы в точечную "
+                             "оценку и здесь")
+        groups, legacy = {}, []
         for f_ in sorted(os.listdir(d_)):
-            m_ = pat.match(f_)
-            if not m_:
+            info = parse_snapshot(f_)
+            if info is None:
                 continue
-            a_, t_, lr_, wd_, sd_, ep_ = m_.groups()
-            groups.setdefault((a_, t_, lr_, wd_, int(sd_)), []).append(
-                (int(ep_), os.path.join(d_, f_)))
+            groups.setdefault((info["arch"], info["target"], info["lr"],
+                               info["wd"], info["seed"]), []).append(
+                (info["epoch"], os.path.join(d_, f_), info))
         if not groups:
             raise SystemExit(f"в {d_} нет снимков вида ep_*.pt")
+        # МЕТАДАННЫЕ СВЕРЯЮТСЯ С ИМЕНЕМ И С ТЕКУЩИМИ АРТЕФАКТАМИ. У снимков
+        # прежних прогонов их нет — такие файлы объявляются устаревшими, и
+        # для них веса каналов приходится ЗАЯВЛЯТЬ явно, потому что проверить
+        # их нечем.
+        for key, items in groups.items():
+            for ep_, path_, info in items:
+                o_ = torch.load(path_, map_location="cpu", weights_only=False)
+                if not (isinstance(o_, dict) and "state" in o_):
+                    legacy.append(os.path.basename(path_))
+                    continue
+                for k2, want2 in (("arch", info["arch"]),
+                                  ("target", info["target"]),
+                                  ("seed", info["seed"]),
+                                  ("epoch", info["epoch"]),
+                                  ("cache", prefix), ("rank", rank),
+                                  ("res_norm_sha1", rn_sha),
+                                  ("basis_sha1", k11a.file_sha1(basis_p)),
+                                  ("rho_sha1", k11a.file_sha1(rho_p))):
+                    if str(o_.get(k2)) != str(want2):
+                        raise SystemExit(
+                            f"{os.path.basename(path_)}: {k2} = "
+                            f"{o_.get(k2)!r}, ожидалось {want2!r}")
+                inner = o_.get("chan_weights")
+                if (inner or None) != (chan_w or None):
+                    raise SystemExit(
+                        f"{os.path.basename(path_)}: веса каналов внутри "
+                        f"{inner}, а задано {chan_w}")
+        if legacy:
+            if not args.legacy_chan_weights:
+                raise SystemExit(
+                    f"{len(legacy)} снимков без метаданных (например "
+                    f"{legacy[0]}). Их веса каналов проверить нечем, поэтому "
+                    f"их надо ЗАЯВИТЬ флагом --legacy-chan-weights "
+                    f"(«none» или три числа) — молча предполагать нельзя")
+            decl = (None if str(args.legacy_chan_weights).strip() == "none"
+                    else [float(x) for x in
+                          str(args.legacy_chan_weights).split(",") if x])
+            if (decl or None) != (chan_w or None):
+                raise SystemExit(
+                    f"заявленные веса устаревших снимков {decl} не совпали с "
+                    f"--chan-weights {chan_w}")
+            print(f"    ВНИМАНИЕ: {len(legacy)} снимков без метаданных; их "
+                  f"веса каналов ЗАЯВЛЕНЫ как {decl}, а не проверены")
+        # ПОЛНОТА ТРАЕКТОРИИ. Пропущенная эпоха означала бы выбор из неполного
+        # набора, и «минимум» мог бы оказаться не минимумом.
+        for key, items in sorted(groups.items()):
+            eps_ = sorted(e for e, _, _ in items)
+            if eps_ != list(range(1, len(eps_) + 1)):
+                raise SystemExit(f"{key}: эпохи {eps_} не образуют 1..N")
         print(f"\n  пересчёт выбора эпохи по {sum(len(v) for v in groups.values())} "
               f"снимкам, {len(groups)} траекторий")
         if chan_w:
@@ -1295,7 +1483,7 @@ def main() -> None:
             want_keys = {k2 for k2 in h_.state_dict()
                          if k2.startswith(TRAIN_PREFIXES)}
             curve = []
-            for ep_, path_ in sorted(items):
+            for ep_, path_, _info in sorted(items):
                 o_ = torch.load(path_, map_location=dev, weights_only=False)
                 st_ = o_["state"] if isinstance(o_, dict) and "state" in o_ \
                     else o_
@@ -1303,9 +1491,14 @@ def main() -> None:
                     raise SystemExit(f"{os.path.basename(path_)}: набор весов "
                                      f"не совпал с {a_}")
                 h_.load_state_dict(st_, strict=False)
-                vl = float(np.mean([
-                    train_loss_on(h_, va[i2:j2], t_, w_chan=chan_w)
-                    for i2, j2 in k11a.plan_batches(len(va), args.batch)]))
+                # ВЫБОРКА ОТБОРА — ТА ЖЕ, ЧТО В ОБУЧЕНИИ (`gap_va`), а не
+                # полный val. Иначе пересчёт менял бы ОДНОВРЕМЕННО функцию
+                # потерь и набор, на котором она считается, и утверждение
+                # «изменилась только передача весов» было бы неверным.
+                bs_ = k11a.plan_batches(len(gap_va), args.batch)
+                vl = mean_over_batches(
+                    [train_loss_on(h_, gap_va[i2:j2], t_, w_chan=chan_w)
+                     for i2, j2 in bs_], [j2 - i2 for i2, j2 in bs_])
                 curve.append((vl, ep_, path_))
             vl_b, ep_b, path_b = min(curve, key=lambda x: (x[0], x[1]))
             o_ = torch.load(path_b, map_location=dev, weights_only=False)
@@ -1313,9 +1506,23 @@ def main() -> None:
                                strict=False)
             ev = evaluate(h_, n_boot=args.n_boot)
             g = ev["star"]["head"]
+            # ВЫБРАННАЯ МОДЕЛЬ СОХРАНЯЕТСЯ В СТАНДАРТНОМ ФОРМАТЕ, пригодном
+            # для K-11e: ссылаться на сырой снимок значило бы тащить дальше
+            # файл без происхождения.
+            std_ = os.path.join(d_, f"d1_{a_}_{t_}_{lr_}_wd{wd_}_s{sd_}.pt")
+            torch.save(dict(
+                state={f"hicora_head.{k2}": v.detach().cpu()
+                       for k2, v in h_.state_dict().items()
+                       if k2.startswith(TRAIN_PREFIXES)},
+                arch=a_, target=t_, lr=float(lr_), wd=float(wd_), seed=sd_,
+                selected_epoch=ep_b, chan_weights=chan_w, cache=prefix,
+                rank=rank, res_norm_sha1=rn_sha, script_sha1=sha,
+                basis_sha1=k11a.file_sha1(basis_p),
+                rho_sha1=k11a.file_sha1(rho_p),
+                reselected_from=os.path.basename(path_b)), std_)
             rec = dict(arch=a_, target=t_, lr=lr_, wd=wd_, seed=sd_,
-                       epoch=ep_b, val_loss=vl_b, ckpt=path_b,
-                       ckpt_sha1=k11a.file_sha1(path_b),
+                       epoch=ep_b, val_loss=vl_b, ckpt=std_,
+                       snapshot=path_b, ckpt_sha1=k11a.file_sha1(std_),
                        pos=g["pos"], rot=g["rot"],
                        grip_delta=g.get("grip_delta"),
                        grip_delta_hi=(g.get("ci_grip_delta")
@@ -1372,13 +1579,6 @@ def main() -> None:
     runs, arms_acc = [], {}
     oracle_pos = None
 
-    chan_w = None
-    if args.chan_weights:
-        chan_w = [float(x) for x in str(args.chan_weights).split(",") if x]
-        if len(chan_w) != 3 or any(w < 0 for w in chan_w):
-            raise SystemExit("--chan-weights: три неотрицательных числа")
-        print(f"  веса каналов потери действий: положение {chan_w[0]:g}, "
-              f"вращение {chan_w[1]:g}, схват {chan_w[2]:g}")
     wds = [float(x) for x in str(args.wds).split(",") if x]
     for tgt in targets:
       for arch in archs:
