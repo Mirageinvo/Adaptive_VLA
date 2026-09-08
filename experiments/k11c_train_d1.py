@@ -117,6 +117,38 @@ def make_linear_head():
     return LinearHead
 
 
+def loss_by_channel(pred, target, h_exec=H_EXEC):
+    """Вклад каждой группы каналов в ту же потерю действий.
+
+    ЗАЧЕМ. Потеря усредняется по СЕМИ каналам в АБСОЛЮТНОМ масштабе. Схват
+    принимает значения около +-1, а положение и вращение имеют RMS порядка
+    0.12: в квадратичном режиме это разница примерно в сто раз. Если потеря
+    почти целиком состоит из схвата, то на позу градиента почти не остаётся —
+    а отчётная метрика нормирует ошибку по каждому каналу отдельно и схват
+    выносит в отдельный гейт. Тогда «обучаем на действиях» означает на деле
+    «обучаем на схвате», и расхождение обучающей и отчётной метрик
+    объясняется без всякой мистики.
+
+    Возвращает сумму вкладов, равную общей потере: доли складываются в 1.
+    """
+    import torch
+    p_ = pred[:, :h_exec]
+    t_ = target[:, :h_exec]
+    out, tot = {}, 0.0
+    for nm, sl in (("pos", slice(0, 3)), ("rot", slice(3, 6)),
+                   ("grip", slice(6, 7))):
+        # ВКЛАД, А НЕ СРЕДНЕЕ ПО ГРУППЕ: домножаем на долю каналов, чтобы
+        # сумма трёх величин равнялась общей потере.
+        v = float(torch.nn.functional.smooth_l1_loss(
+            p_[..., sl], t_[..., sl])) * (sl.stop - sl.start) / 7.0
+        out[nm] = v
+        tot += v
+    out["total"] = tot
+    for nm in ("pos", "rot", "grip"):
+        out[nm + "_frac"] = out[nm] / tot if tot > 0 else None
+    return out
+
+
 def loss_terms(pred, target, h_exec=H_EXEC):
     """Потеря в пространстве действий на ИСПОЛНЯЕМЫХ шагах 0..h_exec-1.
 
@@ -466,6 +498,23 @@ def selftest():
     b = torch.zeros(3, 20, 7)
     b[:, H_EXEC:] = 100.0
     assert float(loss_terms(a, b)) == 0.0, "потеря захватила хвост чанка"
+    # --- разложение по каналам складывается в общую потерю ------------------
+    rg2 = torch.Generator().manual_seed(3)
+    pa = torch.randn(4, 20, 7, generator=rg2) * 0.1
+    pb = torch.randn(4, 20, 7, generator=rg2) * 0.1
+    dec = loss_by_channel(pa, pb)
+    assert abs(dec["total"] - float(loss_terms(pa, pb))) < 1e-6, dec
+    assert abs(sum(dec[k] for k in ("pos", "rot", "grip"))
+               - dec["total"]) < 1e-9
+    assert abs(sum(dec[k + "_frac"] for k in ("pos", "rot", "grip"))
+               - 1.0) < 1e-9
+    # КОНТРОЛЬ: большая ошибка ТОЛЬКО в схвате обязана дать долю схвата
+    # близкую к единице — иначе разложение не показывает, чем занята потеря.
+    pc = pb.clone()
+    pc[..., 6] += 2.0
+    d2 = loss_by_channel(pc, pb)
+    assert d2["grip_frac"] > 0.9, d2
+    assert d2["pos_frac"] < 0.05 and d2["rot_frac"] < 0.05, d2
     b2_ = torch.zeros(3, 20, 7)
     b2_[:, 0] = 1.0
     assert float(loss_terms(a, b2_)) > 0.0, "потеря не видит исполняемых шагов"
@@ -476,7 +525,9 @@ def selftest():
           "ПАРНУЮ разницу и отвергает подставленную вместо неё абсолютную "
           "величину, отсутствие интервала — отказ, а не точечная оценка, "
           "вывод об архитектуре блокируется, пока кривая не вышла на полку, "
-          "линейная диагностическая голова нулевая в старте, живая после "
+          "разложение потери по каналам складывается в общую и показывает "
+          "канал, которым она занята, линейная диагностическая голова нулевая "
+          "в старте, живая после "
           "шага и соблюдает предел, конфигурация с одним сидом не участвует "
           "и её отсутствие "
           "называется нехваткой сидов, а не провалом гейта, посторонний "
@@ -904,26 +955,59 @@ def main() -> None:
             raise SystemExit("не нашлось ни одного .pt")
         rows_e = []
 
+        def losses_on(head, idx, tgt):
+            return float(np.mean([train_loss_on(head, idx[i2:j2], tgt)
+                                  for i2, j2 in k11a.plan_batches(
+                                      len(idx), args.batch)]))
+
+        def decompose(head, idx):
+            """Чем занята потеря действий: разложение по группам каналов."""
+            acc = {}
+            for i2, j2 in k11a.plan_batches(len(idx), args.batch):
+                sel = idx[i2:j2]
+                hn, z0b, zsb = inputs(sel)
+                with torch.no_grad(), torch.autocast(device_type=dev.type,
+                                                     dtype=dt):
+                    dz, _ = head(hn, z0b)
+                with torch.no_grad():
+                    d_ = loss_by_channel(decode(z0b + dz.float()), decode(zsb))
+                for k_, v_ in d_.items():
+                    if not k_.endswith("_frac"):
+                        acc[k_] = acc.get(k_, 0.0) + v_ * len(sel)
+            n_ = max(len(idx), 1)
+            out_ = {k_: v_ / n_ for k_, v_ in acc.items()}
+            for k_ in ("pos", "rot", "grip"):
+                out_[k_ + "_frac"] = (out_[k_] / out_["total"]
+                                      if out_["total"] > 0 else None)
+            return out_
+
         def measure(head, name, extra=None):
             ev = evaluate(head, n_boot=args.n_boot)
             g = ev["star"]["head"]
-            lc = float(np.mean([train_loss_on(head, gap_va[i2:j2], "coef")
-                                for i2, j2 in k11a.plan_batches(
-                                    len(gap_va), args.batch)]))
-            la = float(np.mean([train_loss_on(head, gap_va[i2:j2], "star")
-                                for i2, j2 in k11a.plan_batches(
-                                    len(gap_va), args.batch)]))
+            lc = losses_on(head, gap_va, "coef")
+            la = losses_on(head, gap_va, "star")
+            # СТОРОНА TRAIN ТЕМИ ЖЕ ВЕСАМИ: отделяет «не смогла
+            # минимизировать» от «минимизировала, но не обобщила».
+            lc_tr = losses_on(head, gap_tr, "coef")
+            la_tr = losses_on(head, gap_tr, "star")
+            dec = decompose(head, gap_va)
             r = dict(name=name, pos=g["pos"], rot=g["rot"],
                      grip_delta=g.get("grip_delta"),
                      grip_delta_hi=(g.get("ci_grip_delta") or [None, None])[1],
                      loss_coef=lc, loss_action=la,
+                     loss_coef_train=lc_tr, loss_action_train=la_tr,
+                     action_by_channel=dec,
                      saturated=ev["saturated_tokens"])
             if extra:
                 r.update(extra)
             rows_e.append(r)
-            print(f"    {name}: поз {g['pos']:.1%}, вр {g['rot']:.1%}, "
-                  f"коэф {lc:.5f}, действия {la:.5f}, насыщено "
+            print(f"    {name}: поз {g['pos']:.1%}, вр {g['rot']:.1%}; "
+                  f"коэф {lc_tr:.5f}/{lc:.5f}, действия "
+                  f"{la_tr:.5f}/{la:.5f} (train/val); насыщено "
                   f"{ev['saturated_tokens']:.1%}", flush=True)
+            print(f"      потеря действий по каналам: поз "
+                  f"{dec['pos_frac']:.1%}, вр {dec['rot_frac']:.1%}, схват "
+                  f"{dec['grip_frac']:.1%}", flush=True)
 
         print(f"\n  перекрёстная оценка {len(paths)} чекпойнтов, все метрики "
               f"на одном val ({len(va)} наблюдений):")
@@ -985,11 +1069,12 @@ def main() -> None:
                 torch.cuda.empty_cache()
 
         print(f"\n  {'веса':>34}{'поз':>8}{'вр':>8}{'коэф':>10}"
-              f"{'действия':>11}{'насыщ':>8}")
+              f"{'действия':>11}{'дейст.tr':>10}{'схват в потере':>16}")
         for r in sorted(rows_e, key=lambda x: -x["pos"]):
             print(f"    {r['name']:>32}{r['pos']:>8.1%}{r['rot']:>8.1%}"
                   f"{r['loss_coef']:>10.5f}{r['loss_action']:>11.5f}"
-                  f"{r['saturated']:>8.1%}")
+                  f"{r['loss_action_train']:>10.5f}"
+                  f"{r['action_by_channel']['grip_frac']:>15.1%}")
         if probe_pos is not None:
             print(f"    ориентир зонда по доле: {probe_pos:.1%}")
         print("    ЧИТАТЬ ТАК: обе потери посчитаны ОДНИМИ весами на ОДНОМ "
