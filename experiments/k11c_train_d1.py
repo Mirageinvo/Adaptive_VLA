@@ -30,6 +30,7 @@
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -602,6 +603,10 @@ def main() -> None:
                          "линейная той же формы выхода. Матрица "
                          "«архитектура на мишень» разделяет причины отставания "
                          "от зонда")
+    ap.add_argument("--reselect", default=None,
+                    help="каталог со снимками ep_*.pt: пересчитать выбор "
+                         "эпохи ПРАВИЛЬНОЙ потерей и переоценить, без "
+                         "обучения")
     ap.add_argument("--eval-ckpts", default=None,
                     help="каталог или список .pt через запятую: только "
                          "перекрёстная оценка сохранённых весов, без обучения")
@@ -609,6 +614,9 @@ def main() -> None:
                     help="npz с весами зонда: контроль воспроизведения. "
                          "Оценивается дважды — с обрезанием (как у зонда) и с "
                          "tanh (как у головы)")
+    ap.add_argument("--probe-tol", type=float, default=0.005,
+                    help="допуск на расхождение подставленных весов зонда с "
+                         "его собственной долей; больше — отказ")
     ap.add_argument("--allow-probe-mismatch", action="store_true",
                     help="разрешить ориентир зонда, собранный на других "
                          "артефактах")
@@ -732,6 +740,16 @@ def main() -> None:
     Esav = np.load(prefix + ".codebooks.npy")
     if float(np.abs(Esav - E.cpu().numpy()).max()) > 1e-4:
         raise SystemExit("кодовые книги разошлись с кэшем")
+    # КНИГИ — НЕ ВЕСЬ ДЕКОДЕР. За теми же книгами может стоять другая сеть, и
+    # тогда поправка считалась бы в одних координатах, а декодировалась в
+    # других. K-11p и K-11b сверяют три отпечатка; здесь сверялся только
+    # первый.
+    k11a.check_fingerprints(meta, dict(
+        codebooks_sha1=hashlib.sha1(np.ascontiguousarray(
+            Esav.astype(np.float32)).tobytes()).hexdigest()[:12],
+        decoder_probe=k11a.decoder_probe(codec, E, dev),
+        codec_state_sha1=k11a.state_sha1(codec)))
+    print("  книги, проба декодера и веса кодека сверены с кэшем")
     unfrozen = [n for n, p_ in codec.named_parameters() if p_.requires_grad]
     if unfrozen:
         raise SystemExit(f"кодек не заморожен: {unfrozen[:3]}")
@@ -809,7 +827,7 @@ def main() -> None:
     ep_ids = np.unique(ep_va)
     ep_pos = {int(e): i for i, e in enumerate(ep_ids)}
 
-    def train_loss_on(head, idx, tgt):
+    def train_loss_on(head, idx, tgt, w_chan=None):
         """Потеря обучения на заданных индексах. ТА ЖЕ функция, что в цикле.
 
         БЕЗ ЭТОГО ПЕРЕОБУЧЕНИЕ НЕ ДИАГНОСТИРУЕТСЯ. Прежде на train падал
@@ -830,7 +848,12 @@ def main() -> None:
             A_ = decode(z0b + dz.float())
             T_ = decode(zsb) if tgt == "star" else torch.from_numpy(
                 np.asarray(ACT[idx], np.float32)).to(dev)
-            return float(loss_terms(A_, T_))
+            # ВЕСА КАНАЛОВ ОБЯЗАТЕЛЬНЫ И ЗДЕСЬ. Прежде обучение шло по
+            # ВЗВЕШЕННОЙ потере, а эпоха выбиралась по НЕВЗВЕШЕННОЙ — то есть
+            # по другой функции. Заявление «эпоха выбирается по той же
+            # потере» было неверным, и выбранные эпохи взвешенной ветви
+            # выбраны не тем правилом.
+            return float(loss_terms(A_, T_, weights=w_chan))
 
     def evaluate(head, n_boot=0, tgt=None):
         """Доли улучшения относительно ОБЕИХ опор плюс насыщение и val-потеря."""
@@ -918,7 +941,8 @@ def main() -> None:
                              ("val_loss", gap_va)):
                 ls = []
                 for i2, j2 in k11a.plan_batches(len(sub), args.batch):
-                    ls.append(train_loss_on(head, sub[i2:j2], tgt))
+                    ls.append(train_loss_on(head, sub[i2:j2], tgt,
+                                            w_chan=chan_w))
                 out[nm_] = float(np.mean(ls)) if ls else None
         return out
 
@@ -980,8 +1004,12 @@ def main() -> None:
         for tok in str(args.eval_ckpts).split(","):
             tok = os.path.abspath(tok.strip())
             if os.path.isdir(tok):
+                # ФАЙЛЫ ПОЭПОХНЫХ СНИМКОВ ПРОПУСКАЮТСЯ: у них другой формат
+                # (голый state_dict без метаданных), и прежняя версия на них
+                # падала бы посреди прогона.
                 paths += sorted(os.path.join(tok, f) for f in os.listdir(tok)
-                                if f.endswith(".pt"))
+                                if f.endswith(".pt")
+                                and not f.startswith("ep_"))
             elif os.path.exists(tok):
                 paths.append(tok)
             else:
@@ -990,8 +1018,16 @@ def main() -> None:
             raise SystemExit("не нашлось ни одного .pt")
         rows_e = []
 
-        def losses_on(head, idx, tgt):
-            return float(np.mean([train_loss_on(head, idx[i2:j2], tgt)
+        # ОДНА И ТА ЖЕ ВЫБОРКА ДЛЯ ВСЕГО. Прежде доля считалась на полном
+        # val (14493), а потери и разложение — на подвыборке (4096). Тогда
+        # утверждение «упорядочивание по потере против упорядочивания по
+        # доле» сравнивало величины с РАЗНЫХ наборов, и перестановки могли
+        # быть следствием этого, а не свойством потерь.
+        eval_idx = va
+
+        def losses_on(head, idx, tgt, w_chan=None):
+            return float(np.mean([train_loss_on(head, idx[i2:j2], tgt,
+                                                w_chan=w_chan)
                                   for i2, j2 in k11a.plan_batches(
                                       len(idx), args.batch)]))
 
@@ -1019,13 +1055,13 @@ def main() -> None:
         def measure(head, name, extra=None):
             ev = evaluate(head, n_boot=args.n_boot)
             g = ev["star"]["head"]
-            lc = losses_on(head, gap_va, "coef")
-            la = losses_on(head, gap_va, "star")
+            lc = losses_on(head, eval_idx, "coef")
+            la = losses_on(head, eval_idx, "star")
             # СТОРОНА TRAIN ТЕМИ ЖЕ ВЕСАМИ: отделяет «не смогла
             # минимизировать» от «минимизировала, но не обобщила».
             lc_tr = losses_on(head, gap_tr, "coef")
             la_tr = losses_on(head, gap_tr, "star")
-            dec = decompose(head, gap_va)
+            dec = decompose(head, eval_idx)
             r = dict(name=name, pos=g["pos"], rot=g["rot"],
                      grip_delta=g.get("grip_delta"),
                      grip_delta_hi=(g.get("ci_grip_delta") or [None, None])[1],
@@ -1044,8 +1080,9 @@ def main() -> None:
                   f"{dec['pos_frac']:.1%}, вр {dec['rot_frac']:.1%}, схват "
                   f"{dec['grip_frac']:.1%}", flush=True)
 
-        print(f"\n  перекрёстная оценка {len(paths)} чекпойнтов, все метрики "
-              f"на одном val ({len(va)} наблюдений):")
+        print(f"\n  перекрёстная оценка {len(paths)} чекпойнтов; доля, обе "
+              f"потери и разложение — на ОДНОМ наборе ({len(eval_idx)} "
+              f"наблюдений), сторона train — на {len(gap_tr)}:")
         for cp_ in paths:
             obj_ = torch.load(cp_, map_location="cpu", weights_only=False)
             for k_, want_ in (("basis_sha1", k11a.file_sha1(basis_p)),
@@ -1054,7 +1091,24 @@ def main() -> None:
                     raise SystemExit(
                         f"{os.path.basename(cp_)}: {k_} = {obj_.get(k_)}, а "
                         f"сейчас {want_} — веса от других артефактов")
-            a_ = obj_.get("arch", "mlp")
+            # ПРОИСХОЖДЕНИЕ ВЕСОВ СВЕРЯЕТСЯ ЦЕЛИКОМ, а не по двум полям.
+            for k_, want_ in (("cache", prefix), ("rank", rank),
+                              ("res_norm_sha1", rn_sha)):
+                got_ = obj_.get(k_)
+                if got_ is None:
+                    raise SystemExit(
+                        f"{os.path.basename(cp_)}: нет поля {k_} — веса "
+                        f"сохранены версией без записи происхождения")
+                if str(got_) != str(want_):
+                    raise SystemExit(
+                        f"{os.path.basename(cp_)}: {k_} = {got_!r}, а сейчас "
+                        f"{want_!r}")
+            a_ = obj_.get("arch")
+            # БЕЛЫЙ СПИСОК АРХИТЕКТУР. Прежде неизвестное значение молча
+            # становилось линейной головой, и веса грузились бы не в ту сеть.
+            if a_ not in ("mlp", "linear"):
+                raise SystemExit(f"{os.path.basename(cp_)}: неизвестная "
+                                 f"архитектура {a_!r}")
             h_ = (hv.make_residual_head()(D_H, int(E.shape[-1]), rank=rank,
                                           hidden=args.hidden, proj=args.proj)
                   if a_ == "mlp"
@@ -1066,14 +1120,30 @@ def main() -> None:
             st_ = {k_[len("hicora_head."):]: v
                    for k_, v in obj_["state"].items()
                    if k_.startswith("hicora_head.")}
+            # НАБОР ПАРАМЕТРОВ ДОЛЖЕН СОВПАСТЬ ТОЧНО. Прежде проверялись
+            # только лишние ключи, поэтому частичный или почти пустой state
+            # принимался молча: голова осталась бы нулевой, а доля — 0.0%,
+            # и это выглядело бы как результат.
+            want_keys = {k_ for k_ in h_.state_dict()
+                         if k_.startswith(TRAIN_PREFIXES)}
+            if set(st_) != want_keys:
+                raise SystemExit(
+                    f"{os.path.basename(cp_)}: набор весов не совпал. "
+                    f"Нет {sorted(want_keys - set(st_))[:3]}, лишние "
+                    f"{sorted(set(st_) - want_keys)[:3]}")
             rep = h_.load_state_dict(st_, strict=False)
             if rep.unexpected_keys:
                 raise SystemExit(f"лишние ключи в {cp_}: "
                                  f"{rep.unexpected_keys[:3]}")
+            if not all(bool(torch.isfinite(v).all()) for v in st_.values()):
+                raise SystemExit(f"{os.path.basename(cp_)}: в весах nan/inf")
             measure(h_, os.path.basename(cp_).replace(".pt", ""),
                     dict(arch=a_, target=obj_.get("target"),
                          lr=obj_.get("lr"), wd=obj_.get("wd"),
-                         seed=obj_.get("seed"), ckpt=cp_))
+                         seed=obj_.get("seed"), ckpt=cp_,
+                         chan_weights=obj_.get("chan_weights"),
+                         selected_epoch=obj_.get("selected_epoch"),
+                         ckpt_sha1=k11a.file_sha1(cp_)))
             del h_
             torch.cuda.empty_cache()
 
@@ -1083,8 +1153,34 @@ def main() -> None:
         # способа ограничения от цены обучения.
         if args.eval_probe:
             zp = np.load(args.eval_probe, allow_pickle=True)
+            # ПРОИСХОЖДЕНИЕ ФАЙЛА ВЕСОВ. Прежде принимался любой NPZ
+            # подходящей формы: контроль на «известном ответе» проходил бы с
+            # неизвестно чьим ответом.
+            pr_ = json.load(open(args.probe)) if os.path.exists(args.probe) \
+                else {}
+            want_w = pr_.get("weights_sha1")
+            got_w = k11a.file_sha1(args.eval_probe)
+            if want_w and want_w != got_w:
+                raise SystemExit(
+                    f"веса зонда sha {got_w}, а отчёт зонда породил "
+                    f"{want_w}: это файл от другого прогона")
+            for k_, want_ in (("rank", rank), ("d_h", D_H),
+                              ("d_latent", int(E.shape[-1]))):
+                if k_ not in zp:
+                    raise SystemExit(f"в весах зонда нет поля {k_}")
+                if int(zp[k_]) != int(want_):
+                    raise SystemExit(f"веса зонда: {k_} = {int(zp[k_])}, а "
+                                     f"здесь {want_}")
+            idxb = np.asarray(zp["idx_both"], np.int64)
+            if idxb.size != D_H + int(E.shape[-1]) or \
+                    not np.array_equal(idxb, np.arange(idxb.size)):
+                raise SystemExit(
+                    "порядок признаков зонда не совпадает с [h24, z0]: "
+                    "подстановка весов сложила бы их не с теми входами")
             wq = np.asarray(zp["w_clip"], np.float32)
             bq = np.asarray(zp["b_clip"], np.float32)
+            if not (np.isfinite(wq).all() and np.isfinite(bq).all()):
+                raise SystemExit("в весах зонда nan или inf")
             need_sh = (D_H + int(E.shape[-1]), rank)
             if tuple(wq.shape) != need_sh:
                 raise SystemExit(f"веса зонда формы {wq.shape}, ждали "
@@ -1099,9 +1195,32 @@ def main() -> None:
                     hp.lin.weight.copy_(torch.as_tensor(wq.T))
                     hp.lin.bias.copy_(torch.as_tensor(bq))
                 measure(hp, f"зонд/{sq}",
-                        dict(arch=f"probe-{sq}", target="coef-exact"))
+                        dict(arch=f"probe-{sq}", target="coef-exact",
+                             weights_sha1=got_w))
                 del hp
                 torch.cuda.empty_cache()
+
+            # КОНТРОЛЬ ОБЯЗАН СОВПАСТЬ, А НЕ ПРОСТО ПОСЧИТАТЬСЯ. Прежде
+            # программа завершалась успешно и при результате 0% вместо
+            # 10.5%: «контроль на известном ответе» ничего не контролировал.
+            got_pos = [r["pos"] for r in rows_e if r["name"] == "зонд/clip"]
+            if probe_pos is not None and got_pos:
+                d_ = abs(got_pos[0] - probe_pos)
+                if d_ > args.probe_tol:
+                    raise SystemExit(
+                        f"КОНТРОЛЬ ПРОВАЛЕН: веса зонда дали {got_pos[0]:.1%} "
+                        f"против {probe_pos:.1%} у самого зонда, расхождение "
+                        f"{d_:.1%} при допуске {args.probe_tol:.1%}. Значит "
+                        f"K-11p и K-11c меряют РАЗНОЕ, и всё сравнение головы "
+                        f"с зондом недействительно")
+                print(f"    контроль пройден: веса зонда воспроизвели его "
+                      f"долю ({got_pos[0]:.1%} против {probe_pos:.1%}, "
+                      f"расхождение {d_:.1%} при допуске "
+                      f"{args.probe_tol:.1%})")
+            elif got_pos:
+                raise SystemExit(
+                    "нет доли зонда для сверки: контроль на известном ответе "
+                    "невозможен без отчёта K-11p")
 
         print(f"\n  {'веса':>34}{'поз':>8}{'вр':>8}{'коэф':>10}"
               f"{'действия':>11}{'дейст.tr':>10}{'схват в потере':>16}")
@@ -1124,6 +1243,111 @@ def main() -> None:
         json.dump(out_e, open(tmp_e, "w"), ensure_ascii=False, indent=1)
         os.replace(tmp_e, args.out)
         print(f"\n  сохранено: {args.out}")
+
+    def reselect():
+        """Пересчёт ВЫБОРА ЭПОХИ по уже сохранённым снимкам, без обучения.
+
+        ЗАЧЕМ. Взвешенная ветвь обучалась по потере с весами каналов, а
+        эпоха выбиралась по НЕВЗВЕШЕННОЙ: это разные функции, и выбранные
+        эпохи выбраны не тем правилом. Переобучать не нужно — снимки всех
+        эпох сохранены, достаточно посчитать правильную потерю и выбрать
+        заново.
+
+        ОГОВОРКА ПРО СТАРЫЕ ФАЙЛЫ. Снимки прежних прогонов не содержат
+        метаданных, поэтому архитектура, мишень и сид читаются ИЗ ИМЕНИ, а
+        веса каналов берутся с командной строки и проверке не поддаются.
+        Это объявляется в выводе явно; у новых снимков метаданные внутри.
+        """
+        import re
+        d_ = os.path.abspath(args.reselect)
+        if not os.path.isdir(d_):
+            raise SystemExit(f"нет каталога {d_}")
+        pat = re.compile(r"^ep_(mlp|linear)_(coef|star|action)_"
+                         r"([0-9.e+-]+)_wd([0-9.e+-]+)_s(\d+)_e(\d+)\.pt$")
+        groups = {}
+        for f_ in sorted(os.listdir(d_)):
+            m_ = pat.match(f_)
+            if not m_:
+                continue
+            a_, t_, lr_, wd_, sd_, ep_ = m_.groups()
+            groups.setdefault((a_, t_, lr_, wd_, int(sd_)), []).append(
+                (int(ep_), os.path.join(d_, f_)))
+        if not groups:
+            raise SystemExit(f"в {d_} нет снимков вида ep_*.pt")
+        print(f"\n  пересчёт выбора эпохи по {sum(len(v) for v in groups.values())} "
+              f"снимкам, {len(groups)} траекторий")
+        if chan_w:
+            print(f"    веса каналов взяты С КОМАНДНОЙ СТРОКИ "
+                  f"({chan_w}) — у старых снимков они внутри не записаны и "
+                  f"проверке не поддаются")
+        out_r = []
+        for (a_, t_, lr_, wd_, sd_), items in sorted(groups.items()):
+            if a_ not in ("mlp", "linear"):
+                raise SystemExit(f"неизвестная архитектура {a_}")
+            h_ = (hv.make_residual_head()(D_H, int(E.shape[-1]), rank=rank,
+                                          hidden=args.hidden, proj=args.proj)
+                  if a_ == "mlp"
+                  else make_linear_head()(D_H, int(E.shape[-1]), rank=rank))
+            h_ = h_.to(dev)
+            h_.set_basis(torch.as_tensor(B))
+            h_.set_rho(torch.as_tensor(rho))
+            h_.float()
+            want_keys = {k2 for k2 in h_.state_dict()
+                         if k2.startswith(TRAIN_PREFIXES)}
+            curve = []
+            for ep_, path_ in sorted(items):
+                o_ = torch.load(path_, map_location=dev, weights_only=False)
+                st_ = o_["state"] if isinstance(o_, dict) and "state" in o_ \
+                    else o_
+                if set(st_) != want_keys:
+                    raise SystemExit(f"{os.path.basename(path_)}: набор весов "
+                                     f"не совпал с {a_}")
+                h_.load_state_dict(st_, strict=False)
+                vl = float(np.mean([
+                    train_loss_on(h_, va[i2:j2], t_, w_chan=chan_w)
+                    for i2, j2 in k11a.plan_batches(len(va), args.batch)]))
+                curve.append((vl, ep_, path_))
+            vl_b, ep_b, path_b = min(curve, key=lambda x: (x[0], x[1]))
+            o_ = torch.load(path_b, map_location=dev, weights_only=False)
+            h_.load_state_dict(o_["state"] if "state" in o_ else o_,
+                               strict=False)
+            ev = evaluate(h_, n_boot=args.n_boot)
+            g = ev["star"]["head"]
+            rec = dict(arch=a_, target=t_, lr=lr_, wd=wd_, seed=sd_,
+                       epoch=ep_b, val_loss=vl_b, ckpt=path_b,
+                       ckpt_sha1=k11a.file_sha1(path_b),
+                       pos=g["pos"], rot=g["rot"],
+                       grip_delta=g.get("grip_delta"),
+                       grip_delta_hi=(g.get("ci_grip_delta")
+                                      or [None, None])[1],
+                       curve=[(v, e) for v, e, _ in curve])
+            out_r.append(rec)
+            print(f"    {a_}/{t_}/lr{lr_}/wd{wd_}/сид {sd_}: эпоха {ep_b} "
+                  f"(потеря {vl_b:.5f}), доля поз {g['pos']:.1%}, вр "
+                  f"{g['rot']:.1%}", flush=True)
+            del h_
+            torch.cuda.empty_cache()
+        by_key = {}
+        for r in out_r:
+            by_key.setdefault((r["arch"], r["target"], r["lr"], r["wd"]),
+                              []).append(r)
+        print(f"\n  {'конфигурация':>26}{'сидов':>7}{'поз':>9}{'вр':>9}")
+        for k_, rs in sorted(by_key.items()):
+            print(f"    {'/'.join(map(str, k_)):>24}{len(rs):>7}"
+                  f"{float(np.mean([r['pos'] for r in rs])):>9.1%}"
+                  f"{float(np.mean([r['rot'] for r in rs])):>9.1%}")
+        print("    ВАЖНО: среднее по сидам НЕ принадлежит одной модели. Для "
+              "K-11e\n    берётся конкретный чекпойнт конкретного сида.")
+        res = dict(script_sha1=sha, cache=prefix, rank=rank, dir=d_,
+                   chan_weights=chan_w, rows=out_r, n_val=int(len(va)))
+        tmp_r = args.out + ".tmp"
+        json.dump(res, open(tmp_r, "w"), ensure_ascii=False, indent=1)
+        os.replace(tmp_r, args.out)
+        print(f"\n  сохранено: {args.out}")
+
+    if args.reselect:
+        reselect()
+        return
 
     if args.eval_ckpts:
         cross_eval()
@@ -1253,12 +1477,18 @@ def main() -> None:
                     # без выбора эпохи сравнение несправедливо: ветвь,
                     # которая переобучается, штрафуется за то, что её не
                     # остановили, а не за качество.
-                    torch.save({k_: v.detach().cpu()
-                                for k_, v in head.state_dict().items()
-                                if k_.startswith(TRAIN_PREFIXES)},
-                               os.path.join(args.ckpt_dir,
-                                            f"ep_{arch}_{tgt}_{lr:g}_"
-                                            f"wd{wd:g}_s{seed}_e{ep}.pt"))
+                    torch.save(dict(
+                        state={k_: v.detach().cpu()
+                               for k_, v in head.state_dict().items()
+                               if k_.startswith(TRAIN_PREFIXES)},
+                        arch=arch, target=tgt, lr=lr, wd=wd, seed=seed,
+                        epoch=ep, chan_weights=chan_w, cache=prefix,
+                        rank=rank, res_norm_sha1=rn_sha,
+                        basis_sha1=k11a.file_sha1(basis_p),
+                        rho_sha1=k11a.file_sha1(rho_p)),
+                        os.path.join(args.ckpt_dir,
+                                     f"ep_{arch}_{tgt}_{lr:g}_"
+                                     f"wd{wd:g}_s{seed}_e{ep}.pt"))
                     gs = ev["star"]["head"]
                     ga = ev["action"]["head"]
                     vl, tlf = ev.get("val_loss"), ev.get("train_loss_fixed")
@@ -1285,9 +1515,9 @@ def main() -> None:
                     sp = os.path.join(args.ckpt_dir,
                                       f"ep_{arch}_{tgt}_{lr:g}_wd{wd:g}_"
                                       f"s{seed}_e{sel_ep}.pt")
-                    head.load_state_dict(torch.load(sp, map_location=dev,
-                                                    weights_only=False),
-                                         strict=False)
+                    _o = torch.load(sp, map_location=dev, weights_only=False)
+                    head.load_state_dict(
+                        _o["state"] if "state" in _o else _o, strict=False)
                     ev_sel = evaluate(head, n_boot=args.n_boot, tgt=tgt)
                     hist.append(dict(epoch=sel_ep, selected=True, val=ev_sel))
                     print(f"    ВЫБРАНА эпоха {sel_ep} по минимуму потери на "
