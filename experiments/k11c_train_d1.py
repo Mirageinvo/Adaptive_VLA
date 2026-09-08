@@ -149,21 +149,35 @@ def loss_by_channel(pred, target, h_exec=H_EXEC):
     return out
 
 
-def loss_terms(pred, target, h_exec=H_EXEC):
+def loss_terms(pred, target, h_exec=H_EXEC, weights=None):
     """Потеря в пространстве действий на ИСПОЛНЯЕМЫХ шагах 0..h_exec-1.
 
     Ось времени — шаги чанка, а не латентные позиции Perceiver. Хвост чанка
-    не исполняется при частоте вызовов, измеренной в K-9, и включать его в
-    потерю значило бы тратить ёмкость ранга 32 на то, что будет отброшено.
+    не исполняется при частоте вызовов, измеренной в K-9.
 
-    Каналы взвешены РАВНОМЕРНО. Знак схвата НЕ оптимизируется отдельно: он
-    участвует в решении как жёсткий гейт, и подгонять его прямо означало бы
-    обучать модель под собственный критерий приёмки.
+    ВЕСА КАНАЛОВ. Равномерное усреднение по семи каналам ИЗМЕРЕНО как
+    источник расхождения: схват занимает 41-52% потери, тогда как в отчётном
+    числе он вынесен в отдельный гейт и в долю по позе не входит. Голова,
+    обученная на такой потере, разменивает точность позы на точность схвата —
+    в обеих парах её позиционная составляющая на val ВЫШЕ, чем у головы,
+    обученной на коэффициентах.
+
+    `weights` — три множителя (положение, вращение, схват). `None` означает
+    прежнее равномерное поведение и оставлено, чтобы старые прогоны
+    воспроизводились ровно.
     """
     import torch
     p = pred[:, :h_exec]
     t = target[:, :h_exec]
-    return torch.nn.functional.smooth_l1_loss(p, t)
+    if weights is None:
+        return torch.nn.functional.smooth_l1_loss(p, t)
+    wp, wr, wg = (float(x) for x in weights)
+    f = torch.nn.functional.smooth_l1_loss
+    # Доли каналов сохранены (3/7, 3/7, 1/7), чтобы при весах (1,1,1)
+    # величина совпадала с равномерной потерей до последнего знака.
+    return (wp * 3.0 / 7.0 * f(p[..., 0:3], t[..., 0:3])
+            + wr * 3.0 / 7.0 * f(p[..., 3:6], t[..., 3:6])
+            + wg * 1.0 / 7.0 * f(p[..., 6:7], t[..., 6:7]))
 
 
 def epoch0_ok(gain_pos, gain_rot, act_max_abs, tol=ACT_TOL, eps=1e-9):
@@ -498,6 +512,21 @@ def selftest():
     b = torch.zeros(3, 20, 7)
     b[:, H_EXEC:] = 100.0
     assert float(loss_terms(a, b)) == 0.0, "потеря захватила хвост чанка"
+    # ВЕСА (1,1,1) ОБЯЗАНЫ ВОСПРОИЗВОДИТЬ РАВНОМЕРНУЮ ПОТЕРЮ до последнего
+    # знака — иначе прежние прогоны перестают сравниваться с новыми.
+    rg3 = torch.Generator().manual_seed(7)
+    qa = torch.randn(3, 20, 7, generator=rg3) * 0.1
+    qb = torch.randn(3, 20, 7, generator=rg3) * 0.1
+    assert abs(float(loss_terms(qa, qb, weights=(1, 1, 1)))
+               - float(loss_terms(qa, qb))) < 1e-9
+    # нулевой вес схвата обязан убирать его вклад целиком
+    qc = qb.clone()
+    qc[..., 6] += 5.0
+    assert abs(float(loss_terms(qc, qb, weights=(1, 1, 0)))
+               - float(loss_terms(qb, qb, weights=(1, 1, 0)))) < 1e-9
+    # и вес схвата обязан менять величину, если ошибка схвата есть
+    assert float(loss_terms(qc, qb, weights=(1, 1, 1))) > \
+        float(loss_terms(qc, qb, weights=(1, 1, 0.1)))
     # --- разложение по каналам складывается в общую потерю ------------------
     rg2 = torch.Generator().manual_seed(3)
     pa = torch.randn(4, 20, 7, generator=rg2) * 0.1
@@ -525,7 +554,9 @@ def selftest():
           "ПАРНУЮ разницу и отвергает подставленную вместо неё абсолютную "
           "величину, отсутствие интервала — отказ, а не точечная оценка, "
           "вывод об архитектуре блокируется, пока кривая не вышла на полку, "
-          "разложение потери по каналам складывается в общую и показывает "
+          "веса каналов при (1,1,1) воспроизводят равномерную потерю и "
+          "нулевой вес убирает канал целиком, разложение потери по каналам "
+          "складывается в общую и показывает "
           "канал, которым она занята, линейная диагностическая голова нулевая "
           "в старте, живая после "
           "шага и соблюдает предел, конфигурация с одним сидом не участвует "
@@ -549,6 +580,10 @@ def main() -> None:
     ap.add_argument("--hidden", type=int, default=512,
                     help="ширина головы; обязана совпадать с init_hicora")
     ap.add_argument("--proj", type=int, default=64)
+    ap.add_argument("--chan-weights", default=None,
+                    help="три множителя каналов потери действий через запятую "
+                         "(положение, вращение, схват). Без флага — прежнее "
+                         "равномерное усреднение по семи каналам")
     ap.add_argument("--preload", action="store_true",
                     help="держать отвод train в ОЗУ (около 3 ГиБ): за эпоху "
                          "иначе идут 121 тыс. случайных чтений с диска")
@@ -1113,6 +1148,13 @@ def main() -> None:
     runs, arms_acc = [], {}
     oracle_pos = None
 
+    chan_w = None
+    if args.chan_weights:
+        chan_w = [float(x) for x in str(args.chan_weights).split(",") if x]
+        if len(chan_w) != 3 or any(w < 0 for w in chan_w):
+            raise SystemExit("--chan-weights: три неотрицательных числа")
+        print(f"  веса каналов потери действий: положение {chan_w[0]:g}, "
+              f"вращение {chan_w[1]:g}, схват {chan_w[2]:g}")
     wds = [float(x) for x in str(args.wds).split(",") if x]
     for tgt in targets:
       for arch in archs:
@@ -1193,7 +1235,7 @@ def main() -> None:
                             else:
                                 T = torch.from_numpy(
                                     np.asarray(ACT[idx], np.float32)).to(dev)
-                            loss = loss_terms(A, T)
+                            loss = loss_terms(A, T, weights=chan_w)
                         opt.zero_grad(set_to_none=True)
                         scaler.scale(loss).backward()
                         scaler.step(opt)
@@ -1232,6 +1274,7 @@ def main() -> None:
                            for k, v in head.state_dict().items()
                            if k.startswith(TRAIN_PREFIXES)},
                     target=tgt, arch=arch, lr=lr, wd=wd, seed=seed,
+                    chan_weights=chan_w,
                     epochs=args.epochs,
                     rank=rank, script_sha1=sha,
                     basis_sha1=k11a.file_sha1(basis_p),
