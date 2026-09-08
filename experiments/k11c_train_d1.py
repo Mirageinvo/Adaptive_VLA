@@ -118,6 +118,151 @@ def make_linear_head():
     return LinearHead
 
 
+def uncond_width(n_target, d_hidden, rank, tol=0.01):
+    """Ширина безусловной головы, дающая ТУ ЖЕ ёмкость.
+
+    ЗАЧЕМ РАВНАЯ ЁМКОСТЬ. Вопрос K-11d — нужна ли УСЛОВНОСТЬ, то есть даёт
+    ли что-нибудь знание предсказанного черновика. Если безусловную голову
+    просто лишить входа `z0`, она заодно потеряет параметры проекции, и
+    разница окажется смесью двух причин: отсутствия сведений и меньшей
+    ёмкости. Поэтому ширина подбирается так, чтобы число параметров совпало.
+
+    Форма та же: Linear(d_hidden -> h), GELU, Linear(h -> h), GELU,
+    Linear(h -> rank). Параметров: h^2 + h*(d_hidden + rank + 2) + rank.
+    """
+    best, best_d = None, None
+    for h in range(16, 4096):
+        n = h * h + h * (d_hidden + rank + 2) + rank
+        d = abs(n - n_target)
+        if best_d is None or d < best_d:
+            best, best_d = h, d
+    n_best = best * best + best * (d_hidden + rank + 2) + rank
+    if best_d > tol * n_target:
+        raise SystemExit(
+            f"не нашлось ширины с ёмкостью {n_target} в пределах {tol:.0%}: "
+            f"лучшая {best} даёт {n_best}")
+    return int(best), int(n_best)
+
+
+def make_uncond_head():
+    """Безусловная голова: видит ТОЛЬКО позднее состояние, без `z0`.
+
+    Контракт тот же, что у рабочей: возвращает поправку и коэффициенты,
+    ограничена тем же `rho` и тем же базисом, нулевая при инициализации.
+    Аргумент `z0` принимается и ИГНОРИРУЕТСЯ — сигнатура сохранена, чтобы
+    циклы обучения и оценки не разветвлялись.
+    """
+    import torch
+    import torch.nn as nn
+
+    class UncondHead(nn.Module):
+        def __init__(self, d_hidden, d_latent, rank=32, hidden=None):
+            super().__init__()
+            self.rank, self.d_latent = int(rank), int(d_latent)
+            h = int(hidden)
+            self.net = nn.Sequential(
+                nn.Linear(d_hidden, h), nn.GELU(),
+                nn.Linear(h, h), nn.GELU(),
+                nn.Linear(h, self.rank))
+            nn.init.zeros_(self.net[-1].weight)
+            nn.init.zeros_(self.net[-1].bias)
+            self.register_buffer("basis", torch.zeros(d_latent, self.rank))
+            self.register_buffer("rho", torch.ones(self.rank))
+
+        def set_basis(self, B):
+            b = torch.as_tensor(B).float()
+            dev_ = float((b.T @ b - torch.eye(b.shape[1])).abs().max())
+            if dev_ > 1e-4:
+                raise ValueError(f"базис не ортонормален: {dev_:.2e}")
+            self.basis.copy_(b.to(self.basis.device))
+            return self
+
+        def set_rho(self, r):
+            r = torch.as_tensor(r).float()
+            if not torch.isfinite(r).all() or bool((r <= 0).any()):
+                raise ValueError("rho обязана быть конечной и положительной")
+            self.rho.copy_(r.to(self.rho.device))
+            return self
+
+        def coeffs(self, h, z0=None):
+            return torch.tanh(self.net(h))
+
+        def forward(self, h, z0=None):
+            c = self.coeffs(h)
+            return (self.rho * c) @ self.basis.T, c
+
+    return UncondHead
+
+
+def paired_gain_diff(S_a, S_b, n_boot=1000, seed=None):
+    """Парная разница долей между ДВУМЯ моделями по одним эпизодам.
+
+    Сравнение двух голов без парности выбросило бы общий разброс эпизодов:
+    он одинаков для обеих, и в разности должен сокращаться. Розыгрыш
+    эпизодов один и тот же для обеих моделей.
+    """
+    A = np.asarray(S_a, np.float64)
+    Bm = np.asarray(S_b, np.float64)
+    if A.shape != Bm.shape:
+        raise ValueError(f"формы не совпали: {A.shape} и {Bm.shape}")
+    n_ep = A.shape[0]
+    rng = np.random.default_rng(k11p.BOOT_SEED if seed is None else seed)
+    idx = rng.integers(0, n_ep, size=(int(n_boot), n_ep))
+    def gain_of(tot, k):
+        """Та же доля, что в `evaluate`: 1 - RMS головы / RMS черновика."""
+        b_ = k11p.finish(tot[ARMS.index("draft")])
+        e_ = k11p.finish(tot[ARMS.index("head")])
+        return float(1.0 - e_[k] / b_[k]) if b_[k] > 0 else float("nan")
+
+    out = {}
+    for k in ("pos", "rot"):
+        d = [gain_of(A[row].sum(0), k) - gain_of(Bm[row].sum(0), k)
+             for row in idx]
+        out[k] = dict(observed=gain_of(A.sum(0), k) - gain_of(Bm.sum(0), k),
+                      ci=list(k11p.ci(d)))
+    return out
+
+
+def read_conditionality(diff, probe_z0_gain=0.048):
+    """Пре-регистрированное чтение K-11d.
+
+    Условность подтверждена, если нижняя граница парной разницы
+    «условная минус безусловная» строго выше нуля И по положению, И по
+    вращению. Иначе тезис «поправлять именно предсказанный черновик» НЕ
+    подтверждён, и архитектуру надо упрощать: безусловная голова дешевле и
+    не требует ни `z0`, ни проекции.
+
+    Ориентир величины: линейный зонд намерил вклад `z0` СВЕРХ `h24` равным
+    +0.048 по положению. Если условность подтвердится, но окажется много
+    меньше — это тоже содержательный ответ.
+    """
+    lo_p = diff["pos"]["ci"][0]
+    lo_r = diff["rot"]["ci"][0]
+    if lo_p is None or lo_r is None:
+        return False, "интервалы не посчитаны: сравнение недействительно"
+    if lo_p > 0 and lo_r > 0:
+        txt = (f"УСЛОВНОСТЬ ПОДТВЕРЖДЕНА: условная голова выше безусловной на "
+               f"{diff['pos']['observed']:+.1%} по положению "
+               f"[{lo_p:+.1%}, {diff['pos']['ci'][1]:+.1%}] и "
+               f"{diff['rot']['observed']:+.1%} по вращению "
+               f"[{lo_r:+.1%}, {diff['rot']['ci'][1]:+.1%}]")
+        if diff["pos"]["observed"] < probe_z0_gain / 2:
+            txt += (f".\n  Но величина много меньше вклада z0, намеренного "
+                    f"зондом ({probe_z0_gain:+.1%}): условность работает "
+                    f"слабее, чем позволяет линейная оценка")
+        return True, txt
+    return False, (
+        f"УСЛОВНОСТЬ НЕ ПОДТВЕРЖДЕНА: разница "
+        f"{diff['pos']['observed']:+.1%} по положению "
+        f"[{lo_p:+.1%}, {diff['pos']['ci'][1]:+.1%}] и "
+        f"{diff['rot']['observed']:+.1%} по вращению "
+        f"[{lo_r:+.1%}, {diff['rot']['ci'][1]:+.1%}] — нижняя граница не выше "
+        f"нуля хотя бы по одному каналу. Тезис «поправлять ИМЕННО "
+        f"предсказанный черновик» на этих данных не подтверждается, и "
+        f"архитектуру следует упростить: безусловная голова не требует ни "
+        f"z0, ни проекции")
+
+
 def mean_over_batches(values, sizes):
     """Среднее, ВЗВЕШЕННОЕ размером батча.
 
@@ -523,6 +668,58 @@ def selftest():
     else:
         raise AssertionError("замороженная голова принята")
 
+    # --- K-11d: ёмкость, парная разница, чтение -----------------------------
+    h_u, n_u = uncond_width(738400, 768, 32)
+    assert abs(n_u - 738400) / 738400 < 0.01, (h_u, n_u)
+    # КОНТРОЛЬ: недостижимая ёмкость обязана отвергаться, а не подгоняться
+    try:
+        uncond_width(10 ** 9, 768, 32)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("недостижимая ёмкость принята")
+
+    # парная разница: одинаковые суммы дают ноль, разные — сдвиг
+    rg4 = np.random.default_rng(23)
+    base_ep = np.zeros((40, len(ARMS), N_STAT))
+    base_ep[:, :, 1] = base_ep[:, :, 3] = base_ep[:, :, 5] = 100.0
+    base_ep[:, ARMS.index("draft"), 0] = 4.0 * 100.0
+    base_ep[:, ARMS.index("draft"), 2] = 4.0 * 100.0
+    A_ = base_ep.copy()
+    A_[:, ARMS.index("head"), 0] = 1.0 * 100.0
+    A_[:, ARMS.index("head"), 2] = 1.0 * 100.0
+    B_ = base_ep.copy()
+    B_[:, ARMS.index("head"), 0] = 4.0 * 100.0
+    B_[:, ARMS.index("head"), 2] = 4.0 * 100.0
+    d_same = paired_gain_diff(A_, A_, n_boot=100)
+    assert abs(d_same["pos"]["observed"]) < 1e-12
+    assert abs(d_same["pos"]["ci"][0]) < 1e-9, d_same
+    d_diff = paired_gain_diff(A_, B_, n_boot=100)
+    assert abs(d_diff["pos"]["observed"] - 0.5) < 1e-12, d_diff
+    assert d_diff["pos"]["ci"][0] > 0.4, d_diff
+    try:
+        paired_gain_diff(A_, B_[:10], n_boot=10)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("разные формы приняты")
+
+    # чтение: нижняя граница выше нуля по ОБОИМ каналам
+    ok_c, t_c = read_conditionality(
+        dict(pos=dict(observed=0.05, ci=[0.03, 0.07]),
+             rot=dict(observed=0.05, ci=[0.03, 0.07])))
+    assert ok_c and "ПОДТВЕРЖДЕНА" in t_c
+    # по одному каналу ноль накрыт -> не подтверждена
+    ok_c, t_c = read_conditionality(
+        dict(pos=dict(observed=0.05, ci=[0.03, 0.07]),
+             rot=dict(observed=0.00, ci=[-0.01, 0.01])))
+    assert not ok_c and "НЕ ПОДТВЕРЖДЕНА" in t_c and "упростить" in t_c
+    # подтверждена, но много слабее зонда -> оговорка обязана появиться
+    ok_c, t_c = read_conditionality(
+        dict(pos=dict(observed=0.005, ci=[0.002, 0.008]),
+             rot=dict(observed=0.005, ci=[0.002, 0.008])))
+    assert ok_c and "много меньше" in t_c, t_c
+
     # --- взвешенное усреднение по батчам ------------------------------------
     # КОНТРОЛЬ НА НЕДЕЛЯЩЕМСЯ РАЗМЕРЕ: именно он отличает правильное
     # усреднение от наивного, и именно он встречается на реальном val.
@@ -667,6 +864,10 @@ def selftest():
           "ПАРНУЮ разницу и отвергает подставленную вместо неё абсолютную "
           "величину, отсутствие интервала — отказ, а не точечная оценка, "
           "вывод об архитектуре блокируется, пока кривая не вышла на полку, "
+          "ёмкость безусловной головы подбирается под условную и "
+          "недостижимая отвергается, парная разница двух моделей нулевая на "
+          "одинаковых суммах и сдвинута на разных, чтение условности требует "
+          "обоих каналов, "
           "усреднение по батчам взвешено размером и на неделящемся "
           "размере расходится с наивным, разбор имени снимка отвергает чужие "
           "имена, контроль на известном ответе сверяет и позу, и вращение и "
@@ -945,6 +1146,19 @@ def main() -> None:
     # ВЕСА КАНАЛОВ РАЗБИРАЮТСЯ ДО ВСЕГО, ЧТО ИХ ЧИТАЕТ. Прежде разбор стоял
     # ниже определения и вызова `reselect`, поэтому режим падал на обращении
     # к свободной переменной ещё до первого измерения.
+    # ЁМКОСТЬ БЕЗУСЛОВНОЙ ГОЛОВЫ ПОДБИРАЕТСЯ ПОД УСЛОВНУЮ и сверяется
+    # отказом: иначе разница между ними была бы смесью «нет сведений» и
+    # «меньше параметров».
+    _ref = hv.make_residual_head()(D_H, int(E.shape[-1]), rank=rank,
+                                   hidden=args.hidden, proj=args.proj)
+    n_cond = sum(int(p_.numel()) for p_ in _ref.parameters()
+                 if p_.requires_grad)
+    del _ref
+    unc_h, n_unc = uncond_width(n_cond, D_H, rank)
+    print(f"  ёмкость: условная голова {n_cond} параметров, безусловная при "
+          f"ширине {unc_h} — {n_unc} ({abs(n_unc - n_cond) / n_cond:.2%} "
+          f"разницы)")
+
     chan_w = None
     if args.chan_weights:
         chan_w = [float(x) for x in str(args.chan_weights).split(",") if x]
@@ -985,7 +1199,7 @@ def main() -> None:
             # выбраны не тем правилом.
             return float(loss_terms(A_, T_, weights=w_chan))
 
-    def evaluate(head, n_boot=0, tgt=None):
+    def evaluate(head, n_boot=0, tgt=None, keep_ep=False):
         """Доли улучшения относительно ОБЕИХ опор плюс насыщение и val-потеря."""
         S = {"star": np.zeros((len(ep_ids), len(ARMS), N_STAT)),
              "action": np.zeros((len(ep_ids), len(ARMS), N_STAT))}
@@ -1058,6 +1272,10 @@ def main() -> None:
             out[ref_name] = g
         out["saturated_tokens"] = float(sat_tok / max(sat_n, 1))
         out["act_gap_vs_draft"] = act_gap
+        if keep_ep:
+            # Посуточные суммы нужны для ПАРНОГО сравнения двух моделей по
+            # одним эпизодам; в отчёт они не идут.
+            out["_S_ep"] = S["star"].copy()
         if tgt is not None:
             # РАЗРЫВ СЧИТАЕТСЯ ОДНИМИ И ТЕМИ ЖЕ ФИНАЛЬНЫМИ ВЕСАМИ по обе
             # стороны. Прежде «train» была бегущим средним потерь ВО ВРЕМЯ
@@ -1574,9 +1792,9 @@ def main() -> None:
             raise SystemExit(f"неизвестная мишень {t}")
     archs = [a for a in str(args.archs).split(",") if a]
     for a_ in archs:
-        if a_ not in ("mlp", "linear"):
+        if a_ not in ("mlp", "linear", "uncond"):
             raise SystemExit(f"неизвестная архитектура {a_}")
-    runs, arms_acc = [], {}
+    runs, arms_acc, ep_stats = [], {}, {}
     oracle_pos = None
 
     wds = [float(x) for x in str(args.wds).split(",") if x]
@@ -1595,6 +1813,10 @@ def main() -> None:
                     head = hv.make_residual_head()(
                         D_H, int(E.shape[-1]), rank=rank,
                         hidden=args.hidden, proj=args.proj).to(dev)
+                elif arch == "uncond":
+                    head = make_uncond_head()(
+                        D_H, int(E.shape[-1]), rank=rank,
+                        hidden=unc_h).to(dev)
                 else:
                     head = make_linear_head()(
                         D_H, int(E.shape[-1]), rank=rank).to(dev)
@@ -1609,6 +1831,7 @@ def main() -> None:
 
                 # ЭПОХА 0 — ЧАСТЬ ЗАМЕРА, А НЕ ФОРМАЛЬНОСТЬ.
                 e0 = evaluate(head, tgt=tgt)
+                e0.pop("_S_ep", None)
                 g0 = e0["star"]["head"]
                 if not epoch0_ok(g0["pos"], g0["rot"], e0["act_gap_vs_draft"]):
                     raise SystemExit(
@@ -1670,7 +1893,8 @@ def main() -> None:
                             print(f"      эпоха {ep}, батч {nb}, потеря "
                                   f"{run_loss / nb:.5f}", flush=True)
                     ev = evaluate(head, n_boot=args.n_boot
-                                  if ep == args.epochs else 0, tgt=tgt)
+                                  if ep == args.epochs else 0, tgt=tgt,
+                                  keep_ep=(ep == args.epochs))
                     hist.append(dict(epoch=ep, loss=run_loss / max(nb, 1),
                                      val=ev))
                     # ЧЕКПОЙНТ КАЖДОЙ ЭПОХИ. Без них выбирать эпоху нечем, а
@@ -1718,7 +1942,8 @@ def main() -> None:
                     _o = torch.load(sp, map_location=dev, weights_only=False)
                     head.load_state_dict(
                         _o["state"] if "state" in _o else _o, strict=False)
-                    ev_sel = evaluate(head, n_boot=args.n_boot, tgt=tgt)
+                    ev_sel = evaluate(head, n_boot=args.n_boot, tgt=tgt,
+                                      keep_ep=True)
                     hist.append(dict(epoch=sel_ep, selected=True, val=ev_sel))
                     print(f"    ВЫБРАНА эпоха {sel_ep} по минимуму потери на "
                           f"val ({min(v for v, _ in vls):.5f}), не последняя "
@@ -1728,6 +1953,9 @@ def main() -> None:
                     print(f"    выбрана последняя эпоха {sel_ep}: минимум "
                           f"потери на val там же")
                 last = hist[-1]["val"]
+                ep_stats[(arch, tgt, lr, wd, seed)] = last.pop("_S_ep", None)
+                for h_ in hist:
+                    h_.get("val", {}).pop("_S_ep", None)
                 cp = os.path.join(args.ckpt_dir,
                                   f"d1_{arch}_{tgt}_{lr:g}_wd{wd:g}_s{seed}.pt")
                 # ЧЕКПОЙНТ СООТВЕТСТВУЕТ ОТЧЁТНОМУ ЧИСЛУ. Прежде доля была
@@ -1820,6 +2048,23 @@ def main() -> None:
     print(f"    (Δсхват — ВЕРХНЯЯ граница интервала ПАРНОЙ разницы "
           f"«голова минус черновик»,\n     допуск {GRIP_TOL:.1%}; худший сид "
           f"конфигурации)")
+    # --- K-11d: УСЛОВНАЯ ПРОТИВ БЕЗУСЛОВНОЙ, ПАРНО ПО ЭПИЗОДАМ -----------
+    cond_rows = []
+    for (a_, t_, lr_, wd_, sd_), S_a in sorted(ep_stats.items()):
+        if a_ != "mlp" or S_a is None:
+            continue
+        S_b = ep_stats.get(("uncond", t_, lr_, wd_, sd_))
+        if S_b is None:
+            continue
+        d_ = paired_gain_diff(S_a, S_b, n_boot=args.n_boot)
+        ok_c, txt_c = read_conditionality(d_)
+        cond_rows.append(dict(target=t_, lr=lr_, wd=wd_, seed=sd_,
+                              diff=d_, ok=bool(ok_c), verdict=txt_c))
+        print(f"\n  K-11d, мишень {t_}, сид {sd_}: {txt_c}")
+    if ep_stats and not cond_rows:
+        print(f"\n  K-11d не проводился: нужны обе архитектуры mlp и uncond "
+              f"при одинаковых мишени, скорости, затухании и сиде")
+
     print(f"\n  {read_train(best, rows, probe_pos or 0.0, oracle_pos or 1.0, skipped, None if best is None else best.get('last_delta'))}")
     print("  ЧИТАТЬ ТАК: доли относительно D(z*) сопоставимы с зондом и "
           "оракулом.\n  Доли относительно A* сопоставимы между собой, но "
@@ -1837,6 +2082,8 @@ def main() -> None:
                probe_pos=probe_pos, probe=probe_meta, oracle_pos=oracle_pos,
                draft_grip=draft_grip, runs=runs,
                selection=rows, best=best, skipped=skipped,
+               conditionality=cond_rows, n_cond_params=int(n_cond),
+               n_uncond_params=int(n_unc), uncond_hidden=int(unc_h),
                grip_tol=GRIP_TOL,
                array_sha1=arr_sha,
                basis_sha1=k11a.file_sha1(basis_p),
