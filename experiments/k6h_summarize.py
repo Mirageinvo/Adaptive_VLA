@@ -141,6 +141,16 @@ def selftest():
         pass
     else:
         raise AssertionError("руки с разными весами Joint12 приняты")
+    # НЕЗАПИСАННАЯ sha больше не пропускает проверку
+    for bad_ in ({"joint12": {"wj"}, "hicora_s0": {"?"}, "hicora_s1": {"wj"}},
+                 {"joint12": {"wj"}, "hicora_s0": set(), "hicora_s1": {"wj"}},
+                 {"joint12": {"wj"}, "hicora_s0": {"a", "b"}}):
+        try:
+            check_shared_joint(bad_)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"неудостоверенные веса приняты: {bad_}")
     # метки вне карты K-11e не трогаются: агрегатор общий
     assert check_shared_joint({"fast12": {"a"}, "fast12_rstar": {"b"}})
 
@@ -172,6 +182,25 @@ def selftest():
         pass
     else:
         raise AssertionError("одинаковые сиды приняты за репликацию")
+    # СОВМЕСТНОЕ ОТСУТСТВИЕ ПОЛЕЙ прежде проходило: обе руки без полей
+    # считались репликацией.
+    try:
+        check_hicora_replication({"hicora_s0": {"hicora_seed": 0},
+                                  "hicora_s1": {"hicora_seed": 1}})
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("руки без полей приняты за репликацию")
+    # сиды обязаны быть именно 0 и 1
+    for a, b in ((1, 0), (2, 3)):
+        try:
+            check_hicora_replication(
+                {"hicora_s0": dict(base_h, hicora_seed=a),
+                 "hicora_s1": dict(base_h, hicora_seed=b, hicora_sha1="c1")})
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"сиды {a}/{b} приняты")
 
     print("самопроверка пройдена: руки делят один черновик и различаются "
           "только сидом, карта меток отвергает единообразную подмену "
@@ -201,12 +230,23 @@ def check_shared_joint(wsha_by_arm, known=None):
     эксперименты могли законно сравнивать руки с разными весами.
     """
     m = ARM_POLICY if known is None else known
-    got = {}
-    for arm, shas in sorted(wsha_by_arm.items()):
-        if arm in m and shas and shas != {"?"}:
-            got[arm] = sorted(shas)
-    vals = {v for lst in got.values() for v in lst}
-    if len(vals) > 1:
+    need = [a for a in m if m[a] in ("fast", "hicora")]
+    present = [a for a in need if a in wsha_by_arm]
+    if not present:
+        return True                      # ни одной руки K-11e — не наш случай
+    bad, got = [], {}
+    for arm in need:
+        shas = {x for x in wsha_by_arm.get(arm, set()) if x and x != "?"}
+        if arm in wsha_by_arm and not shas:
+            bad.append(f"{arm}: sha весов не записана")
+        elif len(shas) > 1:
+            bad.append(f"{arm}: sha весов несколько {sorted(shas)}")
+        elif shas:
+            got[arm] = next(iter(shas))
+    if bad:
+        raise SystemExit("ВЕСА Joint12 НЕ УДОСТОВЕРЕНЫ:\n    "
+                         + "\n    ".join(bad))
+    if len(set(got.values())) > 1:
         raise SystemExit(
             f"РУКИ ДЕЛЯТ РАЗНЫЕ ВЕСА Joint12: {got}. HiCoRA сравнивалась бы "
             f"не со своим черновиком — сравнение недействительно.")
@@ -227,11 +267,21 @@ def check_hicora_replication(hic_by_arm):
     bad = []
     for fld in same:
         vals = {a: hic_by_arm[a].get(fld) for a in arms}
-        if len({str(v) for v in vals.values()}) > 1:
+        # СОВМЕСТНОЕ ОТСУТСТВИЕ ПОЛЯ — ТОЖЕ ОТКАЗ. Прежде проверялось лишь
+        # несовпадение, и две руки без полей вовсе считались репликацией.
+        if any(v is None for v in vals.values()):
+            bad.append(f"{fld}: отсутствует у {[a for a in arms if hic_by_arm[a].get(fld) is None]}")
+        elif len({str(v) for v in vals.values()}) > 1:
             bad.append(f"{fld}: {vals}")
-    seeds = {a: hic_by_arm[a].get("hicora_seed") for a in arms}
-    if len({str(v) for v in seeds.values()}) < len(arms):
-        bad.append(f"сиды не различаются: {seeds}")
+    # СИДЫ ОБЯЗАНЫ БЫТЬ ИМЕННО 0 И 1, а не просто разными.
+    for a, want in (("hicora_s0", 0), ("hicora_s1", 1)):
+        if a not in hic_by_arm:
+            continue
+        got = hic_by_arm[a].get("hicora_seed")
+        if got is None:
+            bad.append(f"{a}: сид не записан")
+        elif int(got) != want:
+            bad.append(f"{a}: сид {got} вместо {want}")
     if bad:
         raise SystemExit(
             "РУКИ hicora_s0 И hicora_s1 РАЗЛИЧАЮТСЯ НЕ ТОЛЬКО СИДОМ:\n    "

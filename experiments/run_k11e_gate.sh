@@ -59,59 +59,64 @@ for f in "$JOINT" "$H_S0" "$H_S1"; do
   [ -s "$f" ] || { echo "нет файла $f"; exit 1; }
 done
 
+# --- ПАРАМЕТРЫ ИСПОЛНЕНИЯ ЗАДАЮТСЯ ЯВНО, а не наследуются из умолчаний
+# K-9h: иначе смена умолчания молча изменила бы условия посреди прогона.
+# Значения те же, что в K-6h/K-9d/K-9h, чтобы опорные числа оставались
+# сопоставимыми. Менять их без причины нельзя: 520 вместо 600 сделало бы
+# руки несравнимыми с прежними прогонами.
+HORIZON=8
+MAXSTEPS=600
+WAITSTEPS=10
+SEEDMODE="block"
+SUITE="10"        # то же значение, что в K-6h/K-9d/K-9h
+
+CFG=$(printf '{"run_tag":"%s","pairs":%d,"tasks":%d,"n_envs":%d,"ensemble":"%s","horizon":%d,"max_steps":%d,"waiting_steps":%d,"rollout_seed_mode":"%s","device":"%s","suite":"%s","task_ids":"%s","blocks":"%s"}' \
+  "$TAG" "$PAIRS" "$NTASKS" "$NENV" "$ENS" "$HORIZON" "$MAXSTEPS" \
+  "$WAITSTEPS" "$SEEDMODE" "$DEV" "$SUITE" "$TASKS" "$BLOCKS")
+
 # --- ПРОТОКОЛ: ЗАПИСЬ ЛИБО СВЕРКА ------------------------------------------
-python - "$PROTO" "$CKPT" "$JOINT" "$H_S0" "$H_S1" \
-        "$TAG" "$PAIRS" "$NTASKS" "$NENV" "$ENS" "$TASKS" "$BLOCKS" <<'PY' || exit 1
-import hashlib, json, os, sys
-(pp, ckpt, joint, h0, h1, tag, pairs, ntasks,
- nenv, ens, tasks, blocks) = sys.argv[1:13]
+python experiments/k11e_protocol.py init \
+  --proto "$PROTO" --ckpt "$CKPT" --joint "$JOINT" \
+  --h0 "$H_S0" --h1 "$H_S1" --cells "$CELLS" --cfg "$CFG" || exit 1
 
-
-def sha(p):
-    h = hashlib.sha1()
-    with open(p, "rb") as fh:
-        for c in iter(lambda: fh.read(1 << 22), b""):
-            h.update(c)
-    return h.hexdigest()[:12]
-
-
-cur = dict(ckpt=ckpt, joint_sha1=sha(joint), head_s0_sha1=sha(h0),
-           head_s1_sha1=sha(h1), run_tag=tag, pairs=int(pairs),
-           tasks=int(ntasks), n_envs=int(nenv), ensemble=ens,
-           task_ids=tasks.split(), blocks=blocks.split())
-if cur["head_s0_sha1"] == cur["head_s1_sha1"]:
-    raise SystemExit(
-        "головы s0 и s1 — один и тот же файл: это не репликация по сиду")
-if os.path.exists(pp):
-    old = json.load(open(pp))
-    diff = [k for k in cur if str(old.get(k)) != str(cur[k])]
-    if diff:
-        raise SystemExit(
-            "ПРОТОКОЛ РАСХОДИТСЯ С ЗАПИСАННЫМ по полям " + str(diff) +
-            "\n  Продолжать прогон другим чекпойнтом или другой "
-            "конфигурацией нельзя:\n  часть ячеек была бы посчитана иначе, а "
-            "пропуск готовых это скрыл бы.")
-    print(f"  протокол сверен с {pp}")
-else:
-    json.dump(cur, open(pp, "w"), ensure_ascii=False, indent=1)
-    print(f"  протокол записан: {pp}")
-print(f"    Joint12 {cur['joint_sha1']}, головы {cur['head_s0_sha1']} и "
-      f"{cur['head_s1_sha1']}, пар {cur['pairs']}, задач {cur['tasks']}")
-PY
+K9H_SHA=$(python -c "
+import hashlib,sys
+h=hashlib.sha1(open('experiments/k9h_multiarm_gate.py','rb').read())
+print(h.hexdigest()[:12])")
+echo "  версия стенда k9h $K9H_SHA"
 
 # --- ЯЧЕЙКИ -----------------------------------------------------------------
 # Готовые пропускаются: прогон длинный, и падение одной ячейки не должно
 # стоить всего остального. Так же устроен run_k9d_gate.sh.
+verify() {  # file arm
+  python experiments/k11e_protocol.py check --proto "$PROTO" \
+    --cell "$1" --arm "$2" --task "$T" --block "$I" --script-sha "$K9H_SHA"
+}
+
 cell() {  # policy arm_label [extra...]
   local pol="$1" arm="$2"; shift 2
   local f="$CELLS/t${T}_i${I}_${arm}.json"
-  if [ -s "$f" ]; then echo "  пропуск (готово): $f"; return 0; fi
+  # ПРОПУСК ТОЛЬКО ПОСЛЕ СВЕРКИ С ПРОТОКОЛОМ. Прежде условием было «файл
+  # непустой», и ячейки от ДРУГОЙ головы или другого Joint12 молча
+  # переиспользовались бы, а вердикт оказался бы не для зарегистрированной
+  # конфигурации.
+  if [ -s "$f" ]; then
+    verify "$f" "$arm" || { echo "  ГОТОВАЯ ЯЧЕЙКА НЕ ПРОШЛА СВЕРКУ: $f"; \
+                            return 1; }
+    echo "  пропуск (готово и сверено): $f"
+    return 0
+  fi
   echo "  ячейка: задача $T, блок $I, рука $arm"
   PYTHONPATH="$HOME/LIBERO" MUJOCO_GL=egl \
   python experiments/k9h_multiarm_gate.py \
     --ckpt "$CKPT" --policy "$pol" --arm-label "$arm" --run-tag "$TAG" \
     --task-id "$T" --init-start "$I" --n-envs "$NENV" --ensemble "$ENS" \
-    --device "$DEV" --out "$f" "$@" || return 1
+    --horizon "$HORIZON" --max-steps "$MAXSTEPS" \
+    --waiting-steps "$WAITSTEPS" --rollout-seed-mode "$SEEDMODE" \
+    --task-suite "$SUITE" --device "$DEV" --out "$f" "$@" || return 1
+  # И ТОЛЬКО ЧТО ПОСЧИТАННАЯ СВЕРЯЕТСЯ ТОЖЕ: флаги могли разойтись с
+  # протоколом, и заметить это лучше сразу, а не через сутки на анализе.
+  verify "$f" "$arm" || return 1
 }
 
 for T in $TASKS; do

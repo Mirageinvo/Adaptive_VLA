@@ -1040,6 +1040,14 @@ def main() -> None:
                        n_envs=args.n_envs, task_description=task_desc,
                        seed=args.seed, rollout_seed=roll_seed,
                        rollout_seed_mode=args.rollout_seed_mode,
+                       # УСЛОВИЯ ИСПОЛНЕНИЯ ЗАПИСЫВАЮТСЯ ЯВНО. Без них
+                       # ячейка неотличима от посчитанной другим горизонтом,
+                       # другим числом шагов или на другой карте — а
+                       # чувствительность позднего состояния к численным
+                       # условиям у нас уже измерена (K-11q).
+                       max_steps=args.max_steps,
+                       waiting_steps=args.waiting_steps,
+                       device=args.device,
                        ckpt=args.ckpt, joint=policy_meta,
                        script_sha1=sha, argv=vars(args)),
                   open(args.out, "w"), ensure_ascii=False, indent=1)
