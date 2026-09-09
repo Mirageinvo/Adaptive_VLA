@@ -130,6 +130,30 @@ def selftest():
     assert check_arm_policies(dict(ok_map, hicora_s0={"fast"}),
                               strict=False) is False
 
+    # --- обязательный набор рук --------------------------------------------
+    # ДЕФЕКТ ОБЩЕГО АГРЕГАТОРА: проверки сверяют найденные руки между собой и
+    # словарь из одной руки принимают. Для K-11e это недосчитанный прогон.
+    K11E = ("fullbar", "coarse24", "joint12", "hicora_s0", "hicora_s1")
+    full = {a: {ARM_POLICY[a]} for a in K11E}
+    assert check_required_arms(full, K11E)
+    assert check_required_arms({"joint12": {"fast"}}, ())      # без флага
+    assert check_required_arms({"joint12": {"fast"}}, None)
+    assert check_required_arms(dict(full, лишняя={"x"}), K11E)  # лишняя можно
+    for gone in K11E:
+        try:
+            check_required_arms({a: v for a, v in full.items() if a != gone},
+                                K11E)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"отсутствие руки {gone} принято")
+    try:
+        check_required_arms({"joint12": {"fast"}}, K11E)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("одна рука вместо пяти принята")
+
     # --- руки обязаны делить один черновик ---------------------------------
     assert check_shared_joint({"joint12": {"wj"}, "hicora_s0": {"wj"},
                               "hicora_s1": {"wj"}, "coarse24": set()})
@@ -202,7 +226,8 @@ def selftest():
         else:
             raise AssertionError(f"сиды {a}/{b} приняты")
 
-    print("самопроверка пройдена: руки делят один черновик и различаются "
+    print("самопроверка пройдена: обязательный набор рук требуется целиком, "
+          "руки делят один черновик и различаются "
           "только сидом, карта меток отвергает единообразную подмену "
           "руки, не записанную политику и смесь; Макнемар точный, кластерный бутстрап шире "
           f"наивного ({w_cl:.3f} против {w_nv:.3f}), разность парная")
@@ -291,6 +316,29 @@ def check_hicora_replication(hic_by_arm):
     return True
 
 
+def check_required_arms(pol_by_arm, required):
+    """Все перечисленные метки обязаны присутствовать в прочитанных ячейках.
+
+    ЗАЧЕМ ОТДЕЛЬНЫМ ФЛАГОМ. `check_shared_joint` и `check_hicora_replication`
+    сверяют между собой те руки, которые НАЙДЕНЫ: словарь с одной рукой они
+    принимают, и это правильно для общего агрегатора — он разбирает и старые
+    каталоги K-6h/K-9d, где рук две. Но для K-11e «нашлась одна рука» — не
+    успех, а признак недосчитанного прогона. Раннер до анализа не доходит,
+    пока не выполнены все пять ячеек, поэтому дефект был неисполнимым; здесь
+    он закрывается в самом агрегаторе, а не только в вызывающем скрипте.
+    """
+    if not required:
+        return True
+    miss = [a for a in required if a not in pol_by_arm]
+    if miss:
+        raise SystemExit(
+            f"В ЯЧЕЙКАХ НЕТ ОБЯЗАТЕЛЬНЫХ РУК: {miss}\n"
+            f"  Найдены: {sorted(pol_by_arm)}\n"
+            "  Сравнение по неполному набору рук означало бы, что часть\n"
+            "  зарегистрированных условий не исполнялась вовсе.")
+    return True
+
+
 def check_arm_policies(pol_by_arm, expect=None, strict=True):
     """Каждая известная метка обязана нести свою политику.
 
@@ -372,6 +420,12 @@ def main() -> None:
                     help="читать ячейки без rollout_seed и смешивать версии "
                          "скрипта. Гарантии при этом слабее заявленных; "
                          "нужен для файлов, снятых до введения поля (K-9d).")
+    ap.add_argument("--require-arms", default=None,
+                    help="метки через запятую, которые ОБЯЗАНЫ найтись в "
+                         "прочитанных ячейках. Без флага агрегатор сверяет "
+                         "лишь те руки, что нашлись, и неполный прогон "
+                         "прошёл бы. Для K-11e: fullbar,coarse24,joint12,"
+                         "hicora_s0,hicora_s1")
     ap.add_argument("--allow-arm-policy-mismatch", action="store_true",
                     help="разрешить метке нести не ту политику. Нужен только "
                          "для разбора старых каталогов")
@@ -484,6 +538,13 @@ def main() -> None:
         print(f"  ВНИМАНИЕ: файлы получены РАЗНЫМИ версиями скрипта: {shas}")
     if len(ckpts) > 1:
         raise SystemExit(f"разные чекпойнты в одном сравнении: {ckpts}")
+    req_arms = tuple(a.strip() for a in args.require_arms.split(",")
+                     if a.strip()) if args.require_arms else ()
+    if args.require_arms and not req_arms:
+        raise SystemExit("--require-arms задан, но пуст: это не проверка")
+    check_required_arms(pol_by_arm, req_arms)
+    if req_arms:
+        print(f"  обязательный набор рук найден целиком: {list(req_arms)}")
     check_arm_policies(pol_by_arm, strict=not args.allow_arm_policy_mismatch)
     if not args.allow_arm_policy_mismatch:
         check_shared_joint(wsha_by_arm)

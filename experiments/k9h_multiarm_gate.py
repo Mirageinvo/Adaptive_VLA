@@ -86,7 +86,11 @@ POLICIES = ("fullbar", "coarse24", "fast", "hicora")
 
 
 def file_sha12(path):
-    """SHA файла, 12 знаков. Один способ на весь модуль."""
+    """SHA файла, 12 знаков. ЕДИНСТВЕННЫЙ способ хешировать файл в модуле.
+
+    Остальные вызовы hashlib в модуле хешируют тензоры и строки, а не файлы,
+    и совпадать с этим по определению не могут.
+    """
     h = hashlib.sha1()
     with open(path, "rb") as fh:
         for c in iter(lambda: fh.read(1 << 22), b""):
@@ -662,8 +666,7 @@ def main() -> None:
                            rstar_sha1=obj.get("rstar_sha1"),
                            trunk_digest=dig,
                            trunk_digest_verified=ck_dig is not None,
-                           joint12_vla_sha1=hashlib.sha1(
-                               open(jv.__file__, "rb").read()).hexdigest()[:12])
+                           joint12_vla_sha1=file_sha12(jv.__file__))
         print(f"  политика {args.policy}: {len(state)} тензоров Joint12, "
               f"глубина {depth}, "
               f"веса sha {weights_sha}, source={obj.get('source')}, "

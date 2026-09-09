@@ -140,6 +140,7 @@ summ() {  # test ref out
     --hypothesis superiority --margin 0 \
     --expect-pairs "$PAIRS" --expect-tasks "$NTASKS" \
     --require-full-hash --allow-extra-arms \
+    --require-arms fullbar,coarse24,joint12,hicora_s0,hicora_s1 \
     --out "$3" || return 1
 }
 
