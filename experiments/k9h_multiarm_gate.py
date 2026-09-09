@@ -81,7 +81,22 @@ import time
 import numpy as np
 
 N_POS, N_LEVEL = 16, 3
-POLICIES = ("fullbar", "coarse24", "fast")
+POLICIES = ("fullbar", "coarse24", "fast", "hicora")
+
+
+class Latent:
+    """Непрерывный латент вместо кодов.
+
+    HiCoRA кодов не выдаёт вовсе: она собирает `z = z0 + dz`, где `dz`
+    непрерывна и в решётку кодов попадать не обязана. Обёртка нужна, чтобы
+    `decode` отличил её от кодов ЯВНО, а не по форме массива — молчаливое
+    угадывание здесь означало бы декодирование не того.
+    """
+
+    __slots__ = ("z",)
+
+    def __init__(self, z):
+        self.z = z
 # K-6h, опорные числа. ПО 200 ПАР НА ПРОТОКОЛ, а не 400: 400 — сумма двух.
 REFERENCE_K6H = {"on": dict(fullbar=88.0, coarse24=89.0),
                  "off": dict(fullbar=90.0, coarse24=89.5)}
@@ -98,7 +113,11 @@ def summarize(eps):
 
 
 def levels_of(policy):
-    """Сколько уровней RVQ собирается в действие для данной политики."""
+    """Сколько уровней RVQ собирается в действие для данной политики.
+
+    У `hicora` уровней нет: она декодирует непрерывный латент напрямую, и
+    величина сюда не входит. Возвращается 1 только чтобы не ветвить вызовы.
+    """
     return N_LEVEL if policy == "fullbar" else 1
 
 
@@ -190,15 +209,34 @@ def selftest():
         wrong.setdefault((tag, "10", 0, "on", 8, 0), {})[lab] = 1
     assert len(wrong) == 2, "разные run_tag разносят руки по экспериментам"
 
-    print("самопроверка k9h пройдена (версия «run_tag общий, arm_label "
-          "различающий»): нормировка вызовов, уровни по политике, покрытие "
-          "блоков при batch 10 и 5, ключ ячейки")
+    # --- обёртка латента различает случаи ЯВНО ------------------------------
+    lt = Latent(np.zeros((2, 16, 4)))
+    assert isinstance(lt, Latent) and lt.z.shape == (2, 16, 4)
+    # КОНТРОЛЬ: обычные коды обёрткой не являются и не должны ею притворяться
+    assert not isinstance(np.zeros((2, 16)), Latent)
+    try:
+        lt.other = 1
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("обёртка принимает посторонние поля")
+    assert levels_of("hicora") == 1 and levels_of("fullbar") == N_LEVEL
+    assert "hicora" in POLICIES
+
+    print("самопроверка k9h пройдена (версия «рука hicora»): "
+          "нормировка вызовов, уровни по политике, покрытие "
+          "блоков при batch 10 и 5, ключ ячейки, обёртка латента отличается "
+          "от кодов и не принимает посторонних полей")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--ckpt", help="базовый чекпойнт BAR (все руки)")
+    ap.add_argument("--hicora-ckpt", default=None,
+                    help="чекпойнт головы поправки D1 (k11c). Нужен и "
+                         "достаточен только для --policy hicora; вместе с ним "
+                         "--policy-ckpt задаёт веса Joint12 для черновика")
     ap.add_argument("--policy", choices=POLICIES, default=None,
                     help="fullbar: 24 слоя x 3 прохода, 3 уровня; "
                          "coarse24: 24 слоя x 1 проход, уровень 0; "
@@ -254,9 +292,18 @@ def main() -> None:
     for need in ("policy", "arm_label", "run_tag", "ensemble"):
         if getattr(args, need) is None:
             raise SystemExit(f"--{need.replace('_', '-')} обязателен")
+    if args.policy == "hicora":
+        if not args.hicora_ckpt:
+            raise SystemExit("для --policy hicora нужен --hicora-ckpt")
+        if not args.policy_ckpt:
+            raise SystemExit(
+                "для --policy hicora нужен и --policy-ckpt: черновик берётся "
+                "головой Joint12, и её веса — часть исполняемой модели")
+    elif args.hicora_ckpt:
+        raise SystemExit("--hicora-ckpt имеет смысл только с --policy hicora")
     if args.policy == "fast" and not args.policy_ckpt:
         raise SystemExit("--policy fast требует --policy-ckpt")
-    if args.policy != "fast" and args.policy_ckpt:
+    if args.policy not in ("fast", "hicora") and args.policy_ckpt:
         raise SystemExit(
             f"--policy {args.policy} исполняется на ИСХОДНЫХ весах; "
             f"--policy-ckpt здесь запрещён, иначе опора уедет вместе с рукой")
@@ -299,7 +346,69 @@ def main() -> None:
     # map_location="cpu" CUDA не инициализирует, поэтому порядок «среды до
     # модели» не нарушается.
     ck_obj, weights_sha = None, None
-    if args.policy == "fast":
+    hic_obj, hic_sha = None, None
+    if args.policy == "hicora":
+        # ВСЁ ПРОВЕРЯЕТСЯ ДО СОЗДАНИЯ СРЕД: отказ после их поднятия тонет в
+        # предупреждениях robosuite из десяти процессов.
+        for f_ in (args.policy_ckpt, args.hicora_ckpt):
+            if not os.path.exists(f_):
+                raise SystemExit(f"нет файла {f_}")
+        h = hashlib.sha1()
+        with open(args.hicora_ckpt, "rb") as fh:
+            for c in iter(lambda: fh.read(1 << 22), b""):
+                h.update(c)
+        hic_sha = h.hexdigest()[:12]
+        hic_obj = torch.load(args.hicora_ckpt, map_location="cpu",
+                             weights_only=False)
+        need = ("state", "arch", "target", "rank", "cache", "res_norm_sha1",
+                "basis_sha1", "rho_sha1")
+        miss = [k for k in need if hic_obj.get(k) is None]
+        if miss:
+            raise SystemExit(
+                f"в чекпойнте головы нет полей {miss}: он собран версией "
+                f"K-11c без записи происхождения, и что именно исполняется — "
+                f"не доказуемо")
+        if hic_obj["arch"] != "mlp":
+            raise SystemExit(
+                f"архитектура головы {hic_obj['arch']!r}: в симулятор идёт "
+                f"условная MLP, остальные — диагностические")
+        # БАЗИС И ПРЕДЕЛ БЕРУТСЯ ИЗ ТОГО ЖЕ КЭША, ЧТО У ОБУЧЕНИЯ, и сверяются
+        # по sha: чужой базис той же формы дал бы поправку в других
+        # координатах и не пожаловался бы.
+        pref = hic_obj["cache"]
+        bp, rp = pref + ".basis.npy", pref + ".rho.npy"
+        for f_ in (bp, rp):
+            if not os.path.exists(f_):
+                raise SystemExit(f"нет {f_}: базис и предел неоткуда взять")
+
+        def _sha(path):
+            hh = hashlib.sha1()
+            with open(path, "rb") as fh:
+                for c in iter(lambda: fh.read(1 << 22), b""):
+                    hh.update(c)
+            return hh.hexdigest()[:12]
+        for f_, want_, nm_ in ((bp, hic_obj["basis_sha1"], "базис"),
+                               (rp, hic_obj["rho_sha1"], "предел")):
+            got_ = _sha(f_)
+            if got_ != want_:
+                raise SystemExit(f"{nm_} sha {got_}, а голова обучена на "
+                                 f"{want_}")
+        hic_B = np.load(bp).astype(np.float32)
+        hic_rho = np.load(rp).astype(np.float32)
+        if hic_B.shape[1] != int(hic_obj["rank"]) or \
+                len(hic_rho) != int(hic_obj["rank"]):
+            raise SystemExit("ранг базиса или предела не совпал с чекпойнтом")
+        dev_i = float(np.abs(hic_B.T.astype(np.float64)
+                             @ hic_B.astype(np.float64)
+                             - np.eye(hic_B.shape[1])).max())
+        if dev_i > 1e-4:
+            raise SystemExit(f"базис не ортонормален: {dev_i:.2e}; тогда "
+                             f"предел ничего не ограничивает")
+        print(f"  голова поправки: {os.path.basename(args.hicora_ckpt)}, sha "
+              f"{hic_sha}, мишень {hic_obj['target']}, ранг "
+              f"{hic_obj['rank']}, эпоха {hic_obj.get('selected_epoch')}; "
+              f"базис и предел сверены", flush=True)
+    if args.policy in ("fast", "hicora"):
         if not os.path.exists(args.policy_ckpt):
             raise SystemExit(f"нет файла {args.policy_ckpt}")
         h = hashlib.sha1()
@@ -349,10 +458,18 @@ def main() -> None:
         args.ckpt, trust_remote_code=True, mode="discrete")
 
     policy_meta, depth = None, 24
-    if args.policy == "fast":
+    res_norm_orig = None
+    if args.policy in ("fast", "hicora"):
         # Метаданные уже проверены до создания сред; здесь только веса.
         obj = ck_obj
         depth = int(obj["depth"])
+        if args.policy == "hicora":
+            # ИСХОДНАЯ ФИНАЛЬНАЯ НОРМА СНИМАЕТСЯ ДО НАЛОЖЕНИЯ ВЕСОВ Joint12:
+            # чекпойнт перезапишет `action_expert.norm`, обученную читать h12,
+            # а поздняя ветвь обязана читать h24 своей нормой. Та же
+            # последовательность, что в K-11a при сборе кэша.
+            import copy as _copy
+            res_norm_orig = _copy.deepcopy(model.action_expert.norm)
         model.init_joint_fast(depth=depth)
         state = obj["state"]
         stray = [k for k in state
@@ -398,7 +515,8 @@ def main() -> None:
                            trunk_digest_verified=ck_dig is not None,
                            joint12_vla_sha1=hashlib.sha1(
                                open(jv.__file__, "rb").read()).hexdigest()[:12])
-        print(f"  политика fast: {len(state)} тензоров, глубина {depth}, "
+        print(f"  политика {args.policy}: {len(state)} тензоров Joint12, "
+              f"глубина {depth}, "
               f"веса sha {weights_sha}, source={obj.get('source')}, "
               f"ствол {dig}"
               + ("" if ck_dig is not None else " (в чекпойнте не записан)"))
@@ -412,7 +530,8 @@ def main() -> None:
 
     import contextlib
     autocast = (torch.autocast("cuda", dtype=torch.float16)
-                if args.policy == "fast" else contextlib.nullcontext())
+                if args.policy in ("fast", "hicora")
+                else contextlib.nullcontext())
 
     ac = proc.action_processor
     codec = ac if hasattr(ac, "vq") else getattr(ac, "codec", None)
@@ -425,6 +544,69 @@ def main() -> None:
         idx = torch.arange(int(codec.vocab_size), device=dev).unsqueeze(0)
         E = torch.stack([q.out_project(q.decode_code(idx))[0]
                          for q in codec.vq.quantizers]).float().to(dev)
+
+    if args.policy == "hicora":
+        import hicora_vla as hv
+        model.__class__ = hv.make_hicora_class(type(model))
+        model.set_codebooks(E)
+        model.set_res_norm(res_norm_orig.to(dev))
+        model.taps, model.q0_depth = (12, 18, 24), depth
+        model.n_layers_total = len(model.action_expert.layers)
+        if max(model.taps) != model.n_layers_total:
+            raise SystemExit(f"последний отвод {max(model.taps)} против "
+                             f"{model.n_layers_total} слоёв")
+        # НОРМА СВЕРЯЕТСЯ С ТОЙ, НА КОТОРОЙ ГОЛОВА ОБУЧАЛАСЬ. Другая норма
+        # той же формы прошла бы молча, а голова видела бы другой вход.
+        rn_sha = hashlib.sha1()
+        for k_ in sorted(model.res_norm.state_dict()):
+            v_ = model.res_norm.state_dict()[k_]
+            rn_sha.update(k_.encode())
+            rn_sha.update(np.ascontiguousarray(
+                v_.detach().float().cpu().numpy()).tobytes())
+        rn_sha = rn_sha.hexdigest()[:12]
+        if rn_sha != hic_obj["res_norm_sha1"]:
+            raise SystemExit(
+                f"res_norm sha {rn_sha}, а голова обучена на "
+                f"{hic_obj['res_norm_sha1']}: вход головы был бы другим")
+        d_h = int(model.fast_head.in_features)
+        head = hv.make_residual_head()(
+            d_h, int(E.shape[-1]), rank=int(hic_obj["rank"]),
+            hidden=int(hic_obj.get("hidden", 512)),
+            proj=int(hic_obj.get("proj", 64))).to(dev)
+        head.set_basis(torch.as_tensor(hic_B))
+        head.set_rho(torch.as_tensor(hic_rho))
+        st_h = {k_[len("hicora_head."):]: v_
+                for k_, v_ in hic_obj["state"].items()
+                if k_.startswith("hicora_head.")}
+        want_h = {k_ for k_ in head.state_dict()
+                  if k_.startswith(("proj.", "net."))}
+        if set(st_h) != want_h:
+            raise SystemExit(
+                f"набор весов головы не совпал: нет "
+                f"{sorted(want_h - set(st_h))[:3]}, лишние "
+                f"{sorted(set(st_h) - want_h)[:3]}")
+        with torch.no_grad():
+            for k_, v_ in st_h.items():
+                if not torch.isfinite(v_).all():
+                    raise SystemExit(f"в весах головы {k_} есть nan или inf")
+        head.load_state_dict(st_h, strict=False)
+        head.float().eval()
+        model.hicora_head = head
+        n_head = sum(int(p_.numel()) for p_ in head.parameters())
+        print(f"  голова поправки установлена: {len(st_h)} тензоров, "
+              f"{n_head} параметров, res_norm {rn_sha} сверена", flush=True)
+        policy_meta = dict(policy_meta or {},
+                           hicora_ckpt=os.path.abspath(args.hicora_ckpt),
+                           hicora_sha1=hic_sha,
+                           hicora_target=hic_obj["target"],
+                           hicora_rank=int(hic_obj["rank"]),
+                           hicora_epoch=hic_obj.get("selected_epoch"),
+                           hicora_seed=hic_obj.get("seed"),
+                           basis_sha1=hic_obj["basis_sha1"],
+                           rho_sha1=hic_obj["rho_sha1"],
+                           res_norm_sha1=rn_sha,
+                           hicora_vla_sha1=hashlib.sha1(
+                               open(hv.__file__, "rb").read()).hexdigest()[:12])
 
     n_lv = levels_of(args.policy)
     print(f"=== suite {args.task_suite}, задача {args.task_id}, офсет {pos_off}")
@@ -458,7 +640,15 @@ def main() -> None:
                              f"{d:.3e} — сравнение недействительно")
 
     def decode(codes):
-        """Действие из первых n_lv уровней — то, что исполняет симулятор."""
+        """Действие из первых n_lv уровней — то, что исполняет симулятор.
+
+        HiCoRA приходит сюда НЕПРЕРЫВНЫМ латентом: он собран как `z0 + dz` и
+        в решётку кодов не ложится. Обёртка `Latent` различает случаи явно.
+        """
+        if isinstance(codes, Latent):
+            with torch.no_grad():
+                x, _ = codec._decode(codes.z, embodiment_ids=0)
+                return x[..., :7].float().cpu().numpy()
         K = codes.reshape(-1, n_lv, N_POS) if n_lv > 1 else codes.reshape(-1, 1, N_POS)
         with torch.no_grad():
             zq = E[0][torch.as_tensor(K[:, 0, :]).long().to(dev)]
@@ -477,6 +667,38 @@ def main() -> None:
             check_assembly(t)
             K = t.reshape(-1, N_LEVEL, N_POS)
             return K.reshape(len(t), -1) if n_lv == N_LEVEL else K[:, 0, :]
+
+        if args.policy == "hicora":
+            # ОДИН ПРОХОД НА 24 СЛОЯ, ОДНО ДЕКОДИРОВАНИЕ. Черновик снимается
+            # на 12-м слое той же головой Joint12, поправка — с 24-го.
+            with torch.no_grad(), autocast:
+                v, p = model.build_inputs(position_offset=pos_off, **batch)
+                out = model.forward_hicora(
+                    vlm_inputs_embeds=v,
+                    attention_mask=batch.get("attention_mask"),
+                    position_ids=p)
+            if first:
+                if int(out["layers_run"]) != model.n_layers_total:
+                    raise SystemExit(
+                        f"проход {out['layers_run']} слоёв вместо "
+                        f"{model.n_layers_total}: это не один полный проход")
+                # ПОПРАВКА ОБЯЗАНА БЫТЬ НЕНУЛЕВОЙ И В ПРЕДЕЛАХ. Нулевая
+                # означала бы, что веса головы не встали и в симуляторе
+                # исполняется черновик под меткой hicora.
+                dz_max = float(out["dz"].abs().max())
+                if dz_max <= 0.0:
+                    raise SystemExit(
+                        "поправка тождественно нулевая: веса головы не "
+                        "загрузились, и рука исполняла бы черновик")
+                nrm = float(out["dz"].float().norm(dim=-1).max())
+                lim = float(np.linalg.norm(hic_rho))
+                if nrm > lim * 1.01:
+                    raise SystemExit(
+                        f"норма поправки {nrm:.4f} выше предела {lim:.4f}")
+                print(f"    проверка hicora: слоёв {out['layers_run']}, "
+                      f"|dz| макс {dz_max:.4f}, ||dz|| макс {nrm:.4f} при "
+                      f"пределе {lim:.4f}", flush=True)
+            return Latent(out["z"])
 
         with torch.no_grad(), autocast:
             v, p = model.build_inputs(position_offset=pos_off, **batch)

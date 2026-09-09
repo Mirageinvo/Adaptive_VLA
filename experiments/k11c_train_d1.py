@@ -1132,6 +1132,11 @@ def main() -> None:
     ap.add_argument("--legacy-chan-weights", default=None,
                     help="веса каналов для снимков БЕЗ метаданных: «none» "
                          "или три числа. Обязателен, если такие снимки есть")
+    ap.add_argument("--sensitivity", default=None,
+                    help="каталог со снимками: POST-HOC анализ "
+                         "чувствительности — эпоха выбирается по ДОЛЕ, но "
+                         "только на ОТБОРОЧНЫХ эпизодах, затем одна оценка на "
+                         "подтверждающих. НЕ замена основного K-11d")
     ap.add_argument("--reselect", default=None,
                     help="каталог со снимками ep_*.pt: пересчитать выбор "
                          "эпохи ПРАВИЛЬНОЙ потерей и переоценить, без "
@@ -1156,6 +1161,9 @@ def main() -> None:
                     help="доля ЭПИЗОДОВ val, отводимая на выбор эпохи; "
                          "остальные идут на подтверждающий интервал K-11d и "
                          "с отборочными не пересекаются")
+    ap.add_argument("--allow-nonstandard-margin", action="store_true",
+                    help="разрешить допуск K-11d, отличный от стандартного "
+                         "0.01. Отклонение записывается в отчёт")
     ap.add_argument("--cond-margin", type=float, default=COND_MARGIN_MAX,
                     help="практический допуск не-хуже для K-11d: верхняя "
                          "граница разницы «условная минус безусловная» ниже "
@@ -1359,10 +1367,19 @@ def main() -> None:
     # ЭПИЗОДОВ, потому что подвыборка бралась по наблюдениям. Тогда бутстрап
     # считает выбранную модель фиксированной и не учитывает, что те же
     # эпизоды участвовали в выборе. Нижняя граница переставала быть чистой.
-    if not (0.0 <= args.cond_margin <= COND_MARGIN_MAX):
+    # ДОПУСК ФИКСИРОВАН РОВНО. Верхний потолок закрывал только расширение,
+    # но `--cond-margin 0` СУЖАЛ его и тем облегчал вердикт `superior`:
+    # нижние границы выше нуля пройти легче, чем выше процентного пункта.
+    # Для отчётного протокола допуск обязан быть ровно стандартным.
+    if abs(float(args.cond_margin) - COND_MARGIN_MAX) > 1e-12 and \
+            not args.allow_nonstandard_margin:
         raise SystemExit(
-            f"--cond-margin {args.cond_margin} вне [0, {COND_MARGIN_MAX}]: "
-            f"допуск, который можно расширить опцией, гейтом не является")
+            f"--cond-margin {args.cond_margin} против стандартного "
+            f"{COND_MARGIN_MAX}: допуск, который можно двигать в ЛЮБУЮ "
+            f"сторону, гейтом не является. Отклонение — только явным флагом "
+            f"--allow-nonstandard-margin, и тогда оно попадает в отчёт")
+    if not (0.0 <= float(args.cond_margin) <= 0.05):
+        raise SystemExit(f"--cond-margin {args.cond_margin} вне [0, 0.05]")
     sel_eps, hold_eps = split_episodes(epi[va], args.sel_frac, seed=61)
     va_sel = va[np.isin(epi[va], list(sel_eps))]
     va_hold = va[np.isin(epi[va], list(hold_eps))]
@@ -2014,6 +2031,108 @@ def main() -> None:
         os.replace(tmp_r, args.out)
         print(f"\n  сохранено: {args.out}")
 
+    def sensitivity():
+        """ЧУВСТВИТЕЛЬНОСТЬ: эпоха выбирается по ДОЛЕ, но только на
+        ОТБОРОЧНЫХ эпизодах, и лишь потом один раз меряется на подтверждающих.
+
+        ЗАЧЕМ ИМЕННО ТАК. Соблазн был другой: посмотреть доли по всем эпохам
+        и взять «сопоставимые точки». Это был бы post-hoc переотбор НА
+        ПОДТВЕРЖДАЮЩИХ данных — ровно то, ради предотвращения чего выборка и
+        делилась. Здесь отбор идёт по доле, но исключительно на отборочных
+        эпизодах, а подтверждающие видят выбранную эпоху ОДИН раз.
+
+        Это ДОПОЛНИТЕЛЬНЫЙ анализ, а не замена основного K-11d: основной
+        результат относится к заранее заданной процедуре отбора по
+        коэффициентной потере и остаётся действительным независимо от этого.
+        """
+        d_ = os.path.abspath(args.sensitivity)
+        if not os.path.isdir(d_):
+            raise SystemExit(f"нет каталога {d_}")
+        groups = {}
+        for f_ in sorted(os.listdir(d_)):
+            info = parse_snapshot(f_)
+            if info is None:
+                continue
+            groups.setdefault((info["arch"], info["target"], info["lr"],
+                               info["wd"], info["seed"]), []).append(
+                (info["epoch"], os.path.join(d_, f_)))
+        if not groups:
+            raise SystemExit(f"в {d_} нет снимков ep_*.pt")
+        sel_mask = np.isin(ep_ids, list(sel_eps))
+        hold_mask = np.isin(ep_ids, list(hold_eps))
+
+        def gains_on(S, mask):
+            tot = S[mask].sum(0)
+            b_ = k11p.finish(tot[ARMS.index("draft")])
+            e_ = k11p.finish(tot[ARMS.index("head")])
+            return {k: float(1.0 - e_[k] / b_[k]) if b_[k] > 0 else float("nan")
+                    for k in ("pos", "rot")}
+
+        picked, rows_s = {}, []
+        for key, items in sorted(groups.items()):
+            a_, t_, lr_, wd_, sd_ = key
+            h_ = build_head(a_)
+            want_keys = {k2 for k2 in h_.state_dict()
+                         if k2.startswith(TRAIN_PREFIXES)}
+            best_ = None
+            for ep_, path_ in sorted(items):
+                o_ = torch.load(path_, map_location=dev, weights_only=False)
+                st_ = o_["state"] if isinstance(o_, dict) and "state" in o_ \
+                    else o_
+                if set(st_) != want_keys:
+                    raise SystemExit(f"{os.path.basename(path_)}: набор весов")
+                h_.load_state_dict(st_, strict=False)
+                S_ = evaluate(h_, keep_ep=True)["_S_ep"]
+                g_ = gains_on(S_, sel_mask)
+                score = 0.5 * (g_["pos"] + g_["rot"])
+                if best_ is None or score > best_[0]:
+                    best_ = (score, ep_, S_)
+            score, ep_b, S_b = best_
+            picked[key] = S_b
+            g_hold = gains_on(S_b, hold_mask)
+            rows_s.append(dict(arch=a_, target=t_, lr=lr_, wd=wd_, seed=sd_,
+                               epoch=ep_b, score_sel=float(score),
+                               pos_hold=g_hold["pos"], rot_hold=g_hold["rot"]))
+            print(f"    {a_}/{t_}/сид {sd_}: по ДОЛЕ на отборочных выбрана "
+                  f"эпоха {ep_b} (счёт {score:.1%}); на подтверждающих поз "
+                  f"{g_hold['pos']:.1%}, вр {g_hold['rot']:.1%}", flush=True)
+            del h_
+            torch.cuda.empty_cache()
+
+        diffs = []
+        for key, S_a in sorted(picked.items()):
+            a_, t_, lr_, wd_, sd_ = key
+            if a_ != "mlp":
+                continue
+            S_b = picked.get(("uncond", t_, lr_, wd_, sd_))
+            if S_b is None:
+                continue
+            d2 = paired_gain_diff(S_a[hold_mask], S_b[hold_mask],
+                                  n_boot=args.n_boot)
+            code2, fl2, txt2 = read_conditionality(
+                d2, GRIP_TOL, float(args.cond_margin))
+            diffs.append(dict(target=t_, lr=lr_, wd=wd_, seed=sd_, diff=d2,
+                              code=code2, flags=fl2, verdict=txt2))
+            print(f"\n  ЧУВСТВИТЕЛЬНОСТЬ, мишень {t_}, сид {sd_}: {txt2}")
+        print("\n  ЧИТАТЬ ТАК: это POST-HOC АНАЛИЗ ЧУВСТВИТЕЛЬНОСТИ, а не "
+              "замена K-11d.\n  Основной результат относится к заранее "
+              "заданному отбору по коэффициентной\n  потере и от этих чисел "
+              "не зависит. Здесь отбор шёл по доле, но ТОЛЬКО\n  на "
+              "отборочных эпизодах; подтверждающие видели выбранную эпоху "
+              "один раз.")
+        out_s = dict(script_sha1=sha, cache=prefix, rank=rank, dir=d_,
+                     kind="post-hoc sensitivity", rows=rows_s, diffs=diffs,
+                     n_sel_episodes=int(sel_mask.sum()),
+                     n_hold_episodes=int(hold_mask.sum()))
+        tmp_s = args.out + ".tmp"
+        json.dump(out_s, open(tmp_s, "w"), ensure_ascii=False, indent=1)
+        os.replace(tmp_s, args.out)
+        print(f"\n  сохранено: {args.out}")
+
+    if args.sensitivity:
+        sensitivity()
+        return
+
     if args.reselect:
         reselect()
         return
@@ -2355,6 +2474,8 @@ def main() -> None:
                n_sel_episodes=int(len(sel_eps)),
                n_hold_episodes=int(len(hold_eps)),
                cond_margin=float(args.cond_margin),
+               margin_nonstandard=bool(
+                   abs(float(args.cond_margin) - COND_MARGIN_MAX) > 1e-12),
                n_cond_params=int(n_cond),
                n_uncond_params=int(n_unc), uncond_hidden=int(unc_h),
                grip_tol=GRIP_TOL,
