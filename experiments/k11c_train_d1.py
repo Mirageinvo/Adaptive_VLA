@@ -55,6 +55,9 @@ TRAIN_PREFIXES = ("proj.", "net.", "lin.")
 # можно, строго переоценить нельзя.
 ARCHS = ("mlp", "linear", "uncond")
 GRIP_TOL = 0.005
+# ПРАКТИЧЕСКИЙ ДОПУСК K-11d ЗАФИКСИРОВАН СВЕРХУ. Иначе `--cond-margin 999`
+# превращал бы почти любой неопределённый результат в «безусловная не хуже».
+COND_MARGIN_MAX = 0.01
 SEL_SEEDS_MIN = 2
 
 
@@ -125,6 +128,29 @@ def make_linear_head():
             return (self.rho * c) @ self.basis.T, c
 
     return LinearHead
+
+
+def split_episodes(eps, frac, seed=61, min_each=8):
+    """Разбиение эпизодов на отборочные и подтверждающие. Отказ, а не догадка.
+
+    Прежде доля не проверялась: отрицательная молча превращалась в один
+    отборочный эпизод, а близкая к единице оставляла на подтверждение
+    считанные штуки — и «подтверждающий интервал» считался бы по горстке.
+    """
+    e = np.unique(np.asarray(eps))
+    if not (0.0 < float(frac) < 1.0):
+        raise SystemExit(f"доля отбора {frac} вне (0, 1)")
+    n_sel = int(round(len(e) * float(frac)))
+    if n_sel < min_each or len(e) - n_sel < min_each:
+        raise SystemExit(
+            f"при доле {frac} получается {n_sel} отборочных и "
+            f"{len(e) - n_sel} подтверждающих эпизодов при минимуме "
+            f"{min_each} в каждой части")
+    perm = np.random.default_rng(int(seed)).permutation(e)
+    sel = set(int(x) for x in perm[:n_sel])
+    hold = set(int(x) for x in perm[n_sel:])
+    assert not (sel & hold) and len(sel) + len(hold) == len(e)
+    return sel, hold
 
 
 def uncond_width(n_target, d_hidden, rank, tol=0.01):
@@ -233,93 +259,113 @@ def paired_gain_diff(S_a, S_b, n_boot=1000, seed=None):
         e_ = k11p.finish(tot[ARMS.index("head")])
         return float(1.0 - e_[k] / b_[k]) if b_[k] > 0 else float("nan")
 
+    def grip_delta(tot):
+        b_ = k11p.finish(tot[ARMS.index("draft")])
+        e_ = k11p.finish(tot[ARMS.index("head")])
+        return float(e_["grip"] - b_["grip"])
+
     out = {}
     for k in ("pos", "rot"):
         d = [gain_of(A[row].sum(0), k) - gain_of(Bm[row].sum(0), k)
              for row in idx]
         out[k] = dict(observed=gain_of(A.sum(0), k) - gain_of(Bm.sum(0), k),
                       ci=list(k11p.ci(d)))
+    # СХВАТ ТОЖЕ НА ПОДТВЕРЖДАЮЩИХ ЭПИЗОДАХ И ТЕМ ЖЕ РОЗЫГРЫШЕМ. Прежде его
+    # верхние границы брались из общей оценки на ПОЛНОМ val, куда входят
+    # отборочные эпизоды: поза и вращение были разделены, а схват нет, и
+    # утверждение о непересечении было неверным.
+    for nm, M in (("grip_a", A), ("grip_b", Bm)):
+        vals = [grip_delta(M[row].sum(0)) for row in idx]
+        out[nm] = dict(observed=grip_delta(M.sum(0)), ci=list(k11p.ci(vals)))
     return out
 
 
-def read_conditionality(diff, grip_cond_hi, grip_uncond_hi, grip_tol,
-                        margin, probe_ref=None):
-    """Пре-регистрированное чтение K-11d. ТРИ исхода, а не два.
+def read_conditionality(diff, grip_tol, margin, probe_ref=None):
+    """Пре-регистрированное чтение K-11d. Исходы ВЗАИМОИСКЛЮЧАЮЩИЕ.
 
-    ПОЧЕМУ НЕ ДВА. Прежняя версия объявляла «надо упростить» в любом случае,
-    когда преимущество не доказано. Но результат вида +3% [-1%, +7%] — это
-    НЕОПРЕДЕЛЁННОСТЬ, а не доказательство бесполезности `z0`. Упрощать
-    архитектуру на таком основании статистически нельзя.
+    ПОЧЕМУ ПРЕЖНИЕ ТРИ ИСХОДА ПЕРЕСЕКАЛИСЬ. При допуске 1 п.п. интервал вида
+    +0.4% [0.2%, 0.6%] одновременно означает «эффект статистически
+    положителен» и «безусловная не хуже в пределах допуска». Порядок проверок
+    решал исход, а не данные. Теперь граница одна и та же:
 
-      superior    — нижние границы разницы «условная минус безусловная» выше
-                    нуля по обоим каналам: условность подтверждена;
-      noninferior — верхние границы ниже практического допуска `margin` по
-                    обоим каналам: безусловная не хуже, упрощать МОЖНО;
-      inconclusive — ни то, ни другое: данных не хватает, и никакого решения
-                    об архитектуре принимать нельзя.
+      superior     — нижние границы ВЫШЕ допуска: преимущество не только
+                     значимо, но и практически заметно;
+      noninferior  — верхние границы НИЖЕ допуска: преимущества практической
+                     величины нет;
+      inconclusive — интервал накрывает допуск.
 
-    СХВАТ ПРОВЕРЯЕТСЯ ПЕРВЫМ. Сравнение по позе бессмысленно, если одна из
-    голов роняет предмет: код, рекомендующий безусловную голову, не прошедшую
-    гейт схвата, рекомендовал бы негодную модель.
+    Эти три случая не пересекаются, потому что нижняя граница не бывает выше
+    верхней. Отдельно возвращаются две НЕЗАВИСИМЫЕ величины: статистическая
+    положительность и не-хуже, — чтобы читатель видел обе.
+
+    СХВАТ ПРОВЕРЯЕТСЯ ПЕРВЫМ и по ТЕМ ЖЕ подтверждающим эпизодам: сравнение
+    по позе бессмысленно, если одна из голов роняет предмет.
     """
-    adm_c = grip_cond_hi is not None and grip_cond_hi <= grip_tol + 1e-12
-    adm_u = grip_uncond_hi is not None and grip_uncond_hi <= grip_tol + 1e-12
-    if not (adm_c and adm_u):
-        which = ("обе" if not adm_c and not adm_u
-                 else "безусловная" if adm_c else "условная")
-        return "grip", (
-            f"ГЕЙТ СХВАТА НЕ ПРОЙДЕН ({which}): условная "
-            f"{grip_cond_hi if grip_cond_hi is None else f'{grip_cond_hi:+.2%}'}, "
-            f"безусловная "
-            f"{grip_uncond_hi if grip_uncond_hi is None else f'{grip_uncond_hi:+.2%}'} "
-            f"при допуске {grip_tol:.1%}. Сравнение по позе не проводится: "
-            f"поправка, переворачивающая знак схвата, непригодна независимо "
-            f"от качества позы")
+    ga, gb = diff.get("grip_a") or {}, diff.get("grip_b") or {}
+    hi_a = (ga.get("ci") or [None, None])[1]
+    hi_b = (gb.get("ci") or [None, None])[1]
+    adm_a = hi_a is not None and hi_a <= grip_tol + 1e-12
+    adm_b = hi_b is not None and hi_b <= grip_tol + 1e-12
+    if not (adm_a and adm_b):
+        which = ("обе" if not adm_a and not adm_b
+                 else "безусловная" if adm_a else "условная")
+        f = lambda v: "—" if v is None else f"{v:+.2%}"
+        return "grip", dict(positive=None, noninferior=None), (
+            f"ГЕЙТ СХВАТА НЕ ПРОЙДЕН ({which}): верхние границы парной "
+            f"разницы с черновиком — условная {f(hi_a)}, безусловная "
+            f"{f(hi_b)} при допуске {grip_tol:.1%}. Сравнение по позе не "
+            f"проводится")
     los = [diff[k]["ci"][0] for k in ("pos", "rot")]
     his = [diff[k]["ci"][1] for k in ("pos", "rot")]
     if any(v is None for v in los + his):
-        return "inconclusive", "интервалы не посчитаны"
+        return "inconclusive", dict(positive=None, noninferior=None), \
+            "интервалы не посчитаны"
+    flags = dict(positive=bool(all(v > 0 for v in los)),
+                 noninferior=bool(all(v <= margin + 1e-12 for v in his)))
     obs = ", ".join(f"{k} {diff[k]['observed']:+.1%} "
                     f"[{diff[k]['ci'][0]:+.1%}, {diff[k]['ci'][1]:+.1%}]"
                     for k in ("pos", "rot"))
-    if all(v > 0 for v in los):
-        txt = f"УСЛОВНОСТЬ ПОДТВЕРЖДЕНА: {obs}"
+    tail = (f" Статистически положителен: {flags['positive']}; "
+            f"не хуже в пределах {margin:.1%}: {flags['noninferior']}.")
+    if all(v > margin for v in los):
+        txt = (f"УСЛОВНОСТЬ ПОДТВЕРЖДЕНА ПРАКТИЧЕСКИ: {obs} — нижние границы "
+               f"выше допуска {margin:.1%}." + tail)
         if probe_ref is not None and diff["pos"]["observed"] < probe_ref / 2:
-            txt += (f".\n  Но величина много меньше вклада z0, намеренного "
-                    f"зондом ({probe_ref:+.1%}): условность работает слабее, "
-                    f"чем позволяет линейная оценка")
-        return "superior", txt
+            txt += (f"\n  Но величина много меньше вклада z0, намеренного "
+                    f"зондом ({probe_ref:+.1%})")
+        return "superior", flags, txt
     if all(v <= margin + 1e-12 for v in his):
-        return "noninferior", (
-            f"БЕЗУСЛОВНАЯ НЕ ХУЖЕ: {obs}. Верхние границы ниже практического "
-            f"допуска {margin:.1%} по обоим каналам, значит преимущество "
-            f"условности, если и есть, меньше него. Архитектуру МОЖНО "
-            f"упростить: безусловная голова не требует ни z0, ни проекции")
-    return "inconclusive", (
-        f"НЕОПРЕДЕЛЁННО: {obs}. Ни нижние границы не выше нуля, ни верхние не "
-        f"ниже допуска {margin:.1%}. Данных не хватает, и решения об "
-        f"архитектуре принимать НЕЛЬЗЯ — ни подтверждать условность, ни "
-        f"упрощать")
+        return "noninferior", flags, (
+            f"БЕЗУСЛОВНАЯ НЕ ХУЖЕ: {obs} — верхние границы ниже допуска "
+            f"{margin:.1%}, значит преимущества практической величины нет. "
+            f"Архитектуру можно упростить." + tail)
+    return "inconclusive", flags, (
+        f"НЕОПРЕДЕЛЁННО: {obs} — интервал накрывает допуск {margin:.1%}. "
+        f"Решения об архитектуре принимать НЕЛЬЗЯ." + tail)
 
 
-def overall_conditionality(codes, min_seeds=2):
-    """Итог по сидам. Консервативно: нужен успех на ВСЕХ, и их не меньше двух.
+def overall_conditionality(codes, seeds=None, min_seeds=2):
+    """Итог по СИДАМ ОДНОЙ конфигурации. Успех нужен на всех, их не меньше двух.
+
+    Прежде список склеивал все мишени, скорости и затухания, и число строк
+    выдавалось за число сидов: сетка из двух скоростей и двух мишеней
+    превратила бы два сида в восемь якобы независимых. Группировка теперь
+    снаружи, а `seeds` позволяет пересчитать именно РАЗЛИЧНЫЕ сиды.
 
     Эпизодный бутстрап не видит разброса ОБУЧЕНИЯ между сидами, поэтому один
-    сид не может решать; и совпадение исходов на двух — минимальное, а не
-    достаточное основание.
+    сид решать не может; совпадение на двух — минимальное основание.
     """
-    if len(codes) < min_seeds:
+    n_ = len(set(seeds)) if seeds is not None else len(codes)
+    if n_ < min_seeds:
         return "insufficient", (
-            f"сидов {len(codes)} при минимуме {min_seeds}: итог K-11d не "
+            f"различных сидов {n_} при минимуме {min_seeds}: итог K-11d не "
             f"выносится. Эпизодный бутстрап разброса обучения не видит")
     uniq = set(codes)
     if uniq == {"superior"}:
-        return "superior", (f"условность подтверждена на всех {len(codes)} "
-                            f"сидах")
+        return "superior", (f"условность подтверждена на всех {n_} сидах")
     if uniq == {"noninferior"}:
-        return "noninferior", (f"безусловная не хуже на всех {len(codes)} "
-                               f"сидах: упрощение допустимо")
+        return "noninferior", (f"безусловная не хуже на всех {n_} сидах: "
+                               f"упрощение допустимо")
     if "grip" in uniq:
         return "grip", "хотя бы на одном сиде не пройден гейт схвата"
     return "inconclusive", (
@@ -769,46 +815,77 @@ def selftest():
     else:
         raise AssertionError("разные формы приняты")
 
-    # --- чтение K-11d: три исхода, гейт схвата первым --------------------
-    good = dict(pos=dict(observed=0.05, ci=[0.03, 0.07]),
-                rot=dict(observed=0.05, ci=[0.03, 0.07]))
-    c_, t_c = read_conditionality(good, -0.004, -0.003, GRIP_TOL, 0.01, 0.048)
-    assert c_ == "superior" and "ПОДТВЕРЖДЕНА" in t_c, t_c
-    # по одному каналу ноль накрыт и верхняя граница выше допуска -> неясно
-    mixed = dict(pos=dict(observed=0.03, ci=[-0.01, 0.07]),
-                 rot=dict(observed=0.03, ci=[-0.01, 0.07]))
-    c_, t_c = read_conditionality(mixed, -0.004, -0.003, GRIP_TOL, 0.01)
+    # --- чтение K-11d: исходы взаимоисключающие, гейт схвата первым ------
+    def mk_d(lo, hi, ga=(-0.006, -0.004), gb=(-0.006, -0.003)):
+        m = 0.5 * (lo + hi)
+        return dict(pos=dict(observed=m, ci=[lo, hi]),
+                    rot=dict(observed=m, ci=[lo, hi]),
+                    grip_a=dict(observed=ga[0], ci=list(ga)),
+                    grip_b=dict(observed=gb[0], ci=list(gb)))
+
+    c_, fl_, t_c = read_conditionality(mk_d(0.03, 0.07), GRIP_TOL, 0.01, 0.048)
+    assert c_ == "superior" and fl_["positive"] and "ПРАКТИЧЕСКИ" in t_c, t_c
+    # ГЛАВНЫЙ КОНТРОЛЬ ПЕРЕСЕЧЕНИЯ: +0.4% [0.2%, 0.6%] при допуске 1% раньше
+    # читалось И как «значимо», И как «не хуже», а исход решал порядок
+    # проверок. Теперь это ОДНОЗНАЧНО «не хуже», а флаги показывают оба факта.
+    c_, fl_, t_c = read_conditionality(mk_d(0.002, 0.006), GRIP_TOL, 0.01)
+    assert c_ == "noninferior", t_c
+    assert fl_["positive"] and fl_["noninferior"], fl_
+    # неопределённость не превращается в упрощение
+    c_, fl_, t_c = read_conditionality(mk_d(-0.01, 0.07), GRIP_TOL, 0.01)
     assert c_ == "inconclusive" and "НЕЛЬЗЯ" in t_c, t_c
-    # ГЛАВНЫЙ КОНТРОЛЬ: неопределённость НЕ должна превращаться в «упростить»
-    assert "упрост" not in t_c.lower(), t_c
-    # верхние границы ниже допуска -> безусловная не хуже
-    tiny = dict(pos=dict(observed=0.002, ci=[-0.003, 0.006]),
-                rot=dict(observed=0.001, ci=[-0.004, 0.005]))
-    c_, t_c = read_conditionality(tiny, -0.004, -0.003, GRIP_TOL, 0.01)
-    assert c_ == "noninferior" and "МОЖНО" in t_c, t_c
-    # СХВАТ ПРОВЕРЯЕТСЯ ПЕРВЫМ: негодная по схвату голова не рекомендуется
-    for gc, gu in ((0.02, -0.003), (-0.004, 0.02), (0.02, 0.02)):
-        c_, t_c = read_conditionality(tiny, gc, gu, GRIP_TOL, 0.01)
-        assert c_ == "grip" and "СХВАТА" in t_c, (gc, gu, t_c)
-    # подтверждена, но много слабее зонда -> оговорка обязана появиться
-    weak = dict(pos=dict(observed=0.005, ci=[0.002, 0.008]),
-                rot=dict(observed=0.005, ci=[0.002, 0.008]))
-    c_, t_c = read_conditionality(weak, -0.004, -0.003, GRIP_TOL, 0.01, 0.048)
+    assert not fl_["positive"] and not fl_["noninferior"], fl_
+    # исходы взаимоисключающие: нижняя граница не бывает выше верхней
+    for lo, hi in ((0.03, 0.07), (0.002, 0.006), (-0.01, 0.07),
+                   (0.011, 0.02), (-0.02, 0.009)):
+        code, _f, _t = read_conditionality(mk_d(lo, hi), GRIP_TOL, 0.01)
+        assert code in ("superior", "noninferior", "inconclusive")
+        assert not (lo > 0.01 and hi <= 0.01), "интервал вывернут"
+    # СХВАТ ПРОВЕРЯЕТСЯ ПЕРВЫМ и берётся ИЗ ТОГО ЖЕ diff
+    for ga, gb in (((0.01, 0.02), (-0.006, -0.003)),
+                   ((-0.006, -0.004), (0.01, 0.02)),
+                   ((0.01, 0.02), (0.01, 0.02))):
+        c_, _f, t_c = read_conditionality(mk_d(0.002, 0.006), GRIP_TOL, 0.01,
+                                          ga=None) if False else \
+            read_conditionality(mk_d(0.002, 0.006, ga, gb), GRIP_TOL, 0.01)
+        assert c_ == "grip" and "СХВАТА" in t_c, (ga, gb, t_c)
+    # подтверждена практически, но много слабее зонда -> оговорка
+    c_, _f, t_c = read_conditionality(mk_d(0.012, 0.016), GRIP_TOL, 0.01,
+                                      0.048)
     assert c_ == "superior" and "много меньше" in t_c, t_c
 
-    # --- итог по сидам ----------------------------------------------------
-    assert overall_conditionality(["superior", "superior"])[0] == "superior"
-    assert overall_conditionality(["noninferior"] * 2)[0] == "noninferior"
-    # ОДНОГО СИДА НЕ ХВАТАЕТ, даже если он успешен
-    c_, t_ = overall_conditionality(["superior"])
+    # --- итог по сидам ОДНОЙ конфигурации ----------------------------------
+    assert overall_conditionality(["superior"] * 2, seeds=[0, 1])[0] == \
+        "superior"
+    assert overall_conditionality(["noninferior"] * 2, seeds=[0, 1])[0] == \
+        "noninferior"
+    # ОДИН сид, повторённый дважды, за два не считается
+    c_, t_ = overall_conditionality(["superior"] * 2, seeds=[0, 0])
+    assert c_ == "insufficient" and "различных сидов 1" in t_, t_
+    c_, t_ = overall_conditionality(["superior"], seeds=[0])
     assert c_ == "insufficient" and "разброса обучения не видит" in t_
-    # расхождение исходов -> итог не выносится
-    assert overall_conditionality(["superior", "inconclusive"])[0] == \
-        "inconclusive"
-    # провал схвата хотя бы на одном сиде перевешивает
-    assert overall_conditionality(["superior", "grip"])[0] == "grip"
+    assert overall_conditionality(["superior", "inconclusive"],
+                                  seeds=[0, 1])[0] == "inconclusive"
+    assert overall_conditionality(["superior", "grip"], seeds=[0, 1])[0] == \
+        "grip"
 
-    # --- взвешенное усреднение по батчам ------------------------------------
+    # --- разбиение эпизодов -------------------------------------------------
+    eps_all = np.arange(100)
+    s1, h1 = split_episodes(eps_all, 0.4, seed=61)
+    s2, h2 = split_episodes(eps_all, 0.4, seed=61)
+    assert s1 == s2 and h1 == h2, "разбиение недетерминировано"
+    assert not (s1 & h1), "части пересекаются"
+    assert len(s1) + len(h1) == 100 and len(s1) == 40
+    # доли вне (0,1) и слишком крайние — отказ, а не молчаливая единица
+    for bad_f in (0.0, 1.0, -0.5, 1.5, 0.02, 0.99):
+        try:
+            split_episodes(eps_all, bad_f, seed=61)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"доля {bad_f} принята")
+
+    # --- взвешенное усреднение по батчам ------------------------------------    # --- взвешенное усреднение по батчам ------------------------------------
     # КОНТРОЛЬ НА НЕДЕЛЯЩЕМСЯ РАЗМЕРЕ: именно он отличает правильное
     # усреднение от наивного, и именно он встречается на реальном val.
     rgm = np.random.default_rng(17)
@@ -897,6 +974,47 @@ def selftest():
             pass
         else:
             raise AssertionError("линейная голова приняла негодные буферы")
+
+    # --- БЕЗУСЛОВНАЯ ГОЛОВА: тело теста, а не только строка в отчёте -------
+    # Прежняя правка утверждала эти проверки в тексте самопроверки, но само
+    # тело в файл не попало: патч упал на другой замене и ничего не записал.
+    # Это ровно тот класс дефекта, который мы ловим у измерений.
+    UH = make_uncond_head()
+    # Ширина здесь произвольная: подбор ёмкости проверяется отдельно выше.
+    uh = UH(8, 6, rank=3, hidden=16)
+    try:
+        uh(_t.randn(2, 4, 8), _t.randn(2, 4, 6))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("безусловная голова работает без базиса и rho")
+    uh.set_basis(_t.linalg.qr(_t.randn(6, 3))[0])
+    uh.set_rho(_t.full((3,), 0.5))
+    hh2, zA, zB = _t.randn(2, 4, 8), _t.randn(2, 4, 6), _t.randn(2, 4, 6)
+    dA, cA = uh(hh2, zA)
+    dB, cB = uh(hh2, zB)
+    # ГЛАВНОЕ СВОЙСТВО: чернового латента она не видит вовсе
+    assert _t.equal(dA, dB) and _t.equal(cA, cB), (
+        "безусловная голова зависит от z0 — тогда она не безусловная")
+    assert float(dA.abs().max()) == 0.0, "не нулевая в старте"
+    nm2, np2 = trainable_report(uh)
+    assert np2 > 0 and all(n_.startswith("net.") for n_ in nm2), nm2
+    op2 = _t.optim.AdamW([p for p in uh.parameters() if p.requires_grad],
+                         lr=1e-2)
+    (uh(hh2, zA)[1] - 1.0).pow(2).mean().backward()
+    op2.step()
+    assert float(uh(hh2, zA)[0].abs().max()) > 0, "мертва после шага"
+    assert bool((uh(hh2, zA)[0].norm(dim=-1) <= uh.rho.norm() + 1e-5).all())
+    # и после шага независимость от z0 обязана СОХРАНИТЬСЯ
+    assert _t.equal(uh(hh2, zA)[0], uh(hh2, zB)[0])
+    for bad_call in (lambda: uh.set_basis(_t.randn(6, 3)),
+                     lambda: uh.set_rho(_t.zeros(3))):
+        try:
+            bad_call()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("безусловная голова приняла негодные буферы")
 
     # --- потеря режет префикс ----------------------------------------------
     try:
@@ -1038,7 +1156,7 @@ def main() -> None:
                     help="доля ЭПИЗОДОВ val, отводимая на выбор эпохи; "
                          "остальные идут на подтверждающий интервал K-11d и "
                          "с отборочными не пересекаются")
-    ap.add_argument("--cond-margin", type=float, default=0.01,
+    ap.add_argument("--cond-margin", type=float, default=COND_MARGIN_MAX,
                     help="практический допуск не-хуже для K-11d: верхняя "
                          "граница разницы «условная минус безусловная» ниже "
                          "него означает, что безусловную можно принять")
@@ -1241,15 +1359,11 @@ def main() -> None:
     # ЭПИЗОДОВ, потому что подвыборка бралась по наблюдениям. Тогда бутстрап
     # считает выбранную модель фиксированной и не учитывает, что те же
     # эпизоды участвовали в выборе. Нижняя граница переставала быть чистой.
-    val_eps = np.unique(epi[va])
-    _rg_sp = np.random.default_rng(61)
-    _perm = _rg_sp.permutation(val_eps)
-    n_sel_eps = max(1, int(round(len(_perm) * args.sel_frac)))
-    sel_eps = set(int(x) for x in _perm[:n_sel_eps])
-    hold_eps = set(int(x) for x in _perm[n_sel_eps:])
-    if not hold_eps:
-        raise SystemExit("после разбиения не осталось эпизодов на "
-                         "подтверждение: уменьшите --sel-frac")
+    if not (0.0 <= args.cond_margin <= COND_MARGIN_MAX):
+        raise SystemExit(
+            f"--cond-margin {args.cond_margin} вне [0, {COND_MARGIN_MAX}]: "
+            f"допуск, который можно расширить опцией, гейтом не является")
+    sel_eps, hold_eps = split_episodes(epi[va], args.sel_frac, seed=61)
     va_sel = va[np.isin(epi[va], list(sel_eps))]
     va_hold = va[np.isin(epi[va], list(hold_eps))]
     print(f"  val разделён ПО ЭПИЗОДАМ (сид 61): {len(sel_eps)} эпизодов "
@@ -2184,16 +2298,11 @@ def main() -> None:
         # ТОЛЬКО ПОДТВЕРЖДАЮЩИЕ ЭПИЗОДЫ: на отборочных модель уже выбиралась.
         d_ = paired_gain_diff(S_a[hold_mask], S_b[hold_mask],
                               n_boot=args.n_boot)
-        g_c = [r for r in arms_acc.get(f"mlp/{t_}/{lr_:g}/wd{wd_:g}", [])
-               if r.get("seed_id") == sd_]
-        g_u = [r for r in arms_acc.get(f"uncond/{t_}/{lr_:g}/wd{wd_:g}", [])
-               if r.get("seed_id") == sd_]
-        code_c, txt_c = read_conditionality(
-            d_, g_c[0]["grip_delta_hi"] if g_c else None,
-            g_u[0]["grip_delta_hi"] if g_u else None,
-            GRIP_TOL, float(args.cond_margin), probe_ref)
+        code_c, flags_c, txt_c = read_conditionality(
+            d_, GRIP_TOL, float(args.cond_margin), probe_ref)
         cond_rows.append(dict(target=t_, lr=lr_, wd=wd_, seed=sd_,
-                              diff=d_, code=code_c, verdict=txt_c,
+                              diff=d_, code=code_c, flags=flags_c,
+                              verdict=txt_c,
                               n_hold_episodes=int(hold_mask.sum()),
                               margin=float(args.cond_margin),
                               probe_ref=probe_ref))
@@ -2201,10 +2310,25 @@ def main() -> None:
               f"({int(hold_mask.sum())} подтверждающих эпизодов): {txt_c}")
     cond_overall = None
     if cond_rows:
-        code_o, txt_o = overall_conditionality([r["code"] for r in cond_rows])
-        cond_overall = dict(code=code_o, text=txt_o,
-                            n_seeds=len(cond_rows))
-        print(f"\n  ИТОГ K-11d: {txt_o}")
+        # ИТОГ ПО КАЖДОЙ КОНФИГУРАЦИИ ОТДЕЛЬНО: склеивать мишени, скорости и
+        # затухания в один список нельзя — тогда сетка выдавала бы одни и те
+        # же два сида за восемь независимых.
+        cond_overall = []
+        by_cfg = {}
+        for r in cond_rows:
+            by_cfg.setdefault((r["target"], r["lr"], r["wd"]), []).append(r)
+        for cfg, rs in sorted(by_cfg.items()):
+            code_o, txt_o = overall_conditionality(
+                [r["code"] for r in rs], seeds=[r["seed"] for r in rs])
+            cond_overall.append(dict(config=list(map(str, cfg)), code=code_o,
+                                     text=txt_o,
+                                     seeds=sorted({r["seed"] for r in rs})))
+            print(f"\n  ИТОГ K-11d ({'/'.join(map(str, cfg))}): {txt_o}")
+        print("  ОГОВОРКА О СТАТУСЕ: разбиение непересекающееся ОТНОСИТЕЛЬНО "
+              "выбора эпохи\n  в этом прогоне, но post-hoc относительно "
+              "прежней разработки — полный val\n  уже использовался при "
+              "выборе мишени, скорости и устройства головы.\n  Строгое "
+              "подтверждение дают только новые раскатки K-11e.")
     elif ep_stats:
         print(f"\n  K-11d не проводился: нужны обе архитектуры mlp и uncond "
               f"при одинаковых мишени, скорости, затухании и сиде")
