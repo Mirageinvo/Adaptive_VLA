@@ -194,6 +194,7 @@ def main() -> None:
     # набора весов у ОДНОЙ метки: тогда часть её ячеек посчитана другой сетью.
     # Первая версия этой проверки была глобальной и падала на законных данных.
     wsha_by_arm = defaultdict(set)
+    fp_by_arm, pol_by_arm = defaultdict(set), defaultdict(set)
     vlasha = set()
     for f in files:
         d = json.load(open(f))
@@ -208,6 +209,15 @@ def main() -> None:
         if isinstance(j, dict):
             wsha_by_arm[str(d[args.field])].add(j.get("weights_sha1", "?"))
             vlasha.add(j.get("joint12_vla_sha1", "?"))
+            # ЕДИНЫЙ ОТПЕЧАТОК РУКИ. Для HiCoRA веса Joint12 одинаковы у
+            # `joint12` и у `hicora_*`, поэтому sha весов руки не различает:
+            # половина ячеек могла быть посчитана ДРУГОЙ головой, с другим
+            # базисом, пределом, нормой или сидом — и агрегатор молчал бы.
+            fp = j.get("arm_fingerprint")
+            if fp is not None:
+                fp_by_arm[str(d[args.field])].add(str(fp))
+            # Явная ловушка на подмену политики под меткой.
+            pol_by_arm[str(d[args.field])].add(str(d.get("policy", "?")))
         # run_tag В КЛЮЧЕ: ячейки K-6h и K-9d могут лежать рядом и совпадать по
         # (suite, task, ens, H, init_id). Без тега они молча склеились бы в
         # одну пару, и сравнивались бы эпизоды из разных экспериментов.
@@ -232,6 +242,20 @@ def main() -> None:
         print(f"  ВНИМАНИЕ: файлы получены РАЗНЫМИ версиями скрипта: {shas}")
     if len(ckpts) > 1:
         raise SystemExit(f"разные чекпойнты в одном сравнении: {ckpts}")
+    mixed_fp = {a: s for a, s in fp_by_arm.items() if len(s) > 1}
+    if mixed_fp:
+        raise SystemExit(
+            f"ВНУТРИ ОДНОЙ МЕТКИ РАЗНЫЕ ОТПЕЧАТКИ РУКИ: {mixed_fp}. Часть "
+            f"ячеек посчитана другой моделью — другой головой, базисом, "
+            f"пределом, нормой или сидом. Сравнение недействительно.")
+    mixed_pol = {a: s for a, s in pol_by_arm.items() if len(s) > 1}
+    if mixed_pol:
+        raise SystemExit(
+            f"ВНУТРИ ОДНОЙ МЕТКИ РАЗНЫЕ ПОЛИТИКИ: {mixed_pol}. Метка руки "
+            f"обязана соответствовать одной политике.")
+    for a in sorted(fp_by_arm):
+        if fp_by_arm[a]:
+            print(f"  рука {a}: отпечаток {sorted(fp_by_arm[a])[0]}")
     mixed = {a: s for a, s in wsha_by_arm.items() if len(s) > 1}
     if mixed:
         raise SystemExit(

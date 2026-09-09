@@ -75,6 +75,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 
@@ -233,6 +234,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--ckpt", help="базовый чекпойнт BAR (все руки)")
+    ap.add_argument("--expect-hicora-target", default="coef",
+                    help="обязательная мишень обучения головы. Основное плечо "
+                         "K-11e — только coef; остальные диагностические")
     ap.add_argument("--hicora-ckpt", default=None,
                     help="чекпойнт головы поправки D1 (k11c). Нужен и "
                          "достаточен только для --policy hicora; вместе с ним "
@@ -372,6 +376,27 @@ def main() -> None:
             raise SystemExit(
                 f"архитектура головы {hic_obj['arch']!r}: в симулятор идёт "
                 f"условная MLP, остальные — диагностические")
+        # МИШЕНЬ ТОЖЕ ОБЯЗАТЕЛЬНА, А НЕ СПРАВОЧНА. Прежде она только
+        # печаталась, и `mlp/star` прошла бы под меткой основного плеча.
+        if hic_obj["target"] != args.expect_hicora_target:
+            raise SystemExit(
+                f"мишень головы {hic_obj['target']!r}, ожидалась "
+                f"{args.expect_hicora_target!r}")
+        for k_ in ("selected_epoch", "seed", "script_sha1"):
+            if hic_obj.get(k_) is None:
+                raise SystemExit(
+                    f"в чекпойнте головы нет {k_}: происхождение неполно")
+        # МЕТКА РУКИ СВЕРЯЕТСЯ С СИДОМ. Иначе чекпойнт сида 1 поехал бы под
+        # меткой hicora_s0, и половина ячеек оказалась бы другой моделью.
+        m_ = re.search(r"_s(\d+)$", str(args.arm_label))
+        if m_ is None:
+            raise SystemExit(
+                f"метка руки {args.arm_label!r} не кончается на _s<сид>: "
+                f"сверить её с чекпойнтом нечем")
+        if int(m_.group(1)) != int(hic_obj["seed"]):
+            raise SystemExit(
+                f"метка {args.arm_label} против сида {hic_obj['seed']} в "
+                f"чекпойнте")
         # БАЗИС И ПРЕДЕЛ БЕРУТСЯ ИЗ ТОГО ЖЕ КЭША, ЧТО У ОБУЧЕНИЯ, и сверяются
         # по sha: чужой базис той же формы дал бы поправку в других
         # координатах и не пожаловался бы.
@@ -393,6 +418,41 @@ def main() -> None:
             if got_ != want_:
                 raise SystemExit(f"{nm_} sha {got_}, а голова обучена на "
                                  f"{want_}")
+        # --- ПРИВЯЗКА К КЭШУ, НА КОТОРОМ ГОЛОВА ОБУЧАЛАСЬ ------------------
+        # Прежде сверялись только базис и предел. Тогда сюда прошли бы:
+        # Joint-чекпойнт глубины 18 или 24, другой файл Joint12, кэш с иным
+        # источником черновика, другой базовый чекпойнт и другой декодер. А
+        # `model.taps, model.q0_depth = (12,18,24), depth` при depth 18 взял
+        # бы черновик с h18, хотя голова обучалась исправлять Joint12.
+        mp = pref + ".meta.json"
+        if not os.path.exists(mp):
+            raise SystemExit(f"нет {mp}: привязать голову к кэшу нечем")
+        hic_meta = json.load(open(mp))
+        if hic_meta.get("q0_source") != "joint12":
+            raise SystemExit(
+                f"кэш собран источником {hic_meta.get('q0_source')!r}, а "
+                f"голова обучалась исправлять черновик Joint12")
+        if int(hic_meta.get("depth", -1)) != 12:
+            raise SystemExit(
+                f"кэш собран на глубине {hic_meta.get('depth')}, ожидалась 12")
+        if hic_meta.get("ckpt") != args.ckpt:
+            raise SystemExit(
+                f"кэш собран чекпойнтом {hic_meta.get('ckpt')}, а здесь "
+                f"{args.ckpt}")
+        w_j = (hic_meta.get("source") or {}).get("weights_sha1")
+        if w_j != weights_sha:
+            raise SystemExit(
+                f"веса Joint12 sha {weights_sha}, а кэш собран на {w_j}: "
+                f"голова обучалась исправлять ДРУГОЙ черновик")
+        import hicora_vla as _hv
+        import joint12_vla as _jv
+        for mod, fld in ((_hv, "hicora_vla_sha1"), (_jv, "joint12_vla_sha1")):
+            cur_ = hashlib.sha1(open(mod.__file__, "rb").read()).hexdigest()[:12]
+            want_ = hic_meta.get(fld)
+            if want_ is not None and want_ != cur_:
+                raise SystemExit(
+                    f"{fld}: кэш собран на {want_}, сейчас {cur_}. Модуль "
+                    f"определяет исполняемую сеть не меньше, чем веса")
         hic_B = np.load(bp).astype(np.float32)
         hic_rho = np.load(rp).astype(np.float32)
         if hic_B.shape[1] != int(hic_obj["rank"]) or \
@@ -550,8 +610,23 @@ def main() -> None:
         model.__class__ = hv.make_hicora_class(type(model))
         model.set_codebooks(E)
         model.set_res_norm(res_norm_orig.to(dev))
+        if depth != 12:
+            raise SystemExit(
+                f"глубина черновика {depth}: голова обучалась исправлять "
+                f"черновик с 12-го слоя, и брать его с другого нельзя")
         model.taps, model.q0_depth = (12, 18, 24), depth
         model.n_layers_total = len(model.action_expert.layers)
+        # ДЕКОДЕР СВЕРЯЕТСЯ ЦЕЛИКОМ, А НЕ ТОЛЬКО КНИГИ: за теми же книгами
+        # может стоять другая сеть, и поправка считалась бы в одних
+        # координатах, а декодировалась в других.
+        import k11a_build_hicora_cache as _k11a
+        _k11a.check_fingerprints(hic_meta, dict(
+            codebooks_sha1=hashlib.sha1(np.ascontiguousarray(
+                E.cpu().numpy().astype(np.float32)).tobytes()).hexdigest()[:12],
+            decoder_probe=_k11a.decoder_probe(codec, E, dev),
+            codec_state_sha1=_k11a.state_sha1(codec)))
+        print("  книги, проба декодера и веса кодека сверены с кэшем головы",
+              flush=True)
         if max(model.taps) != model.n_layers_total:
             raise SystemExit(f"последний отвод {max(model.taps)} против "
                              f"{model.n_layers_total} слоёв")
@@ -575,9 +650,16 @@ def main() -> None:
             proj=int(hic_obj.get("proj", 64))).to(dev)
         head.set_basis(torch.as_tensor(hic_B))
         head.set_rho(torch.as_tensor(hic_rho))
+        # ЛИШНИЕ КЛЮЧИ НЕ ОТФИЛЬТРОВЫВАЮТСЯ МОЛЧА: чекпойнт с посторонними
+        # весами означал бы, что исполняется не то, что мы думаем.
+        stray_h = [k_ for k_ in hic_obj["state"]
+                   if not k_.startswith("hicora_head.")]
+        if stray_h:
+            raise SystemExit(
+                f"в чекпойнте головы {len(stray_h)} ключей вне "
+                f"hicora_head.: {stray_h[:5]}")
         st_h = {k_[len("hicora_head."):]: v_
-                for k_, v_ in hic_obj["state"].items()
-                if k_.startswith("hicora_head.")}
+                for k_, v_ in hic_obj["state"].items()}
         want_h = {k_ for k_ in head.state_dict()
                   if k_.startswith(("proj.", "net."))}
         if set(st_h) != want_h:
@@ -607,6 +689,18 @@ def main() -> None:
                            res_norm_sha1=rn_sha,
                            hicora_vla_sha1=hashlib.sha1(
                                open(hv.__file__, "rb").read()).hexdigest()[:12])
+        # ЕДИНЫЙ ОТПЕЧАТОК РУКИ. Агрегатор сверяет ОДНО поле и отказывается,
+        # если внутри одной метки встретились разные модели: прежде половина
+        # ячеек могла быть посчитана другой головой незаметно.
+        policy_meta["arm_fingerprint"] = hashlib.sha1("|".join([
+            str(args.policy), str(args.arm_label), str(hic_sha),
+            str(weights_sha), str(hic_obj["basis_sha1"]),
+            str(hic_obj["rho_sha1"]), str(rn_sha),
+            str(policy_meta["hicora_vla_sha1"]),
+            str(hic_obj["target"]), str(hic_obj["seed"]),
+            str(hic_obj.get("selected_epoch")),
+        ]).encode()).hexdigest()[:12]
+        print(f"  отпечаток руки {policy_meta['arm_fingerprint']}", flush=True)
 
     n_lv = levels_of(args.policy)
     print(f"=== suite {args.task_suite}, задача {args.task_id}, офсет {pos_off}")
@@ -648,7 +742,10 @@ def main() -> None:
         if isinstance(codes, Latent):
             with torch.no_grad():
                 x, _ = codec._decode(codes.z, embodiment_ids=0)
-                return x[..., :7].float().cpu().numpy()
+                a_ = x[..., :7].float().cpu().numpy()
+            if not np.isfinite(a_).all():
+                raise SystemExit("декодер вернул nan/inf в действиях")
+            return a_
         K = codes.reshape(-1, n_lv, N_POS) if n_lv > 1 else codes.reshape(-1, 1, N_POS)
         with torch.no_grad():
             zq = E[0][torch.as_tensor(K[:, 0, :]).long().to(dev)]
@@ -677,6 +774,15 @@ def main() -> None:
                     vlm_inputs_embeds=v,
                     attention_mask=batch.get("attention_mask"),
                     position_ids=p)
+            # КОНЕЧНОСТЬ ПРОВЕРЯЕТСЯ КАЖДЫЙ ВЫЗОВ И ПЕРВОЙ. При dz = NaN обе
+            # прежние проверки давали False (`nan <= 0` и `nan > lim`), и
+            # политика поехала бы с NaN-действиями до конца эпизода.
+            if not (bool(torch.isfinite(out["dz"]).all())
+                    and bool(torch.isfinite(out["z"]).all())):
+                raise SystemExit(
+                    "в поправке или латенте появились nan/inf: дальнейшие "
+                    "проверки на них не срабатывают, а действия были бы "
+                    "мусором")
             if first:
                 if int(out["layers_run"]) != model.n_layers_total:
                     raise SystemExit(
