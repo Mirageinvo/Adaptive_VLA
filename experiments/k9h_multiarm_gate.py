@@ -577,7 +577,7 @@ def main() -> None:
                 f"чекпойнт source={src!r}, ожидалось {args.expect_source!r}. "
                 f"Чекпойнты k9c старше поля source: для них --expect-source "
                 f"не задают вовсе (в раннере это EXPECT_SOURCE= пустой).")
-        cur_vla = hashlib.sha1(open(jv.__file__, "rb").read()).hexdigest()[:12]
+        cur_vla = file_sha12(jv.__file__)
         if args.expect_source is not None:
             for fld in ("joint12_vla_sha1", "trunk_digest"):
                 if ck_obj.get(fld) is None:
@@ -776,8 +776,7 @@ def main() -> None:
                            basis_sha1=hic_obj["basis_sha1"],
                            rho_sha1=hic_obj["rho_sha1"],
                            res_norm_sha1=rn_sha,
-                           hicora_vla_sha1=hashlib.sha1(
-                               open(hv.__file__, "rb").read()).hexdigest()[:12])
+                           hicora_vla_sha1=file_sha12(hv.__file__))
         # ЕДИНЫЙ ОТПЕЧАТОК РУКИ. Агрегатор сверяет ОДНО поле и отказывается,
         # если внутри одной метки встретились разные модели: прежде половина
         # ячеек могла быть посчитана другой головой незаметно.
@@ -1031,7 +1030,7 @@ def main() -> None:
     if args.out:
         os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".",
                     exist_ok=True)
-        sha = hashlib.sha1(open(__file__, "rb").read()).hexdigest()[:12]
+        sha = file_sha12(__file__)
         json.dump(dict(summary=s, episodes=eps,
                        arm_label=args.arm_label, run_tag=args.run_tag,
                        policy=args.policy, levels=n_lv, depth=depth,

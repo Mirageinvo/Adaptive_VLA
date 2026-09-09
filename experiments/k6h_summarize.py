@@ -109,8 +109,67 @@ def selftest():
     common = sorted(set(a2) & set(b2))
     assert common == [2], "непарные эпизоды должны выпадать, а не усредняться"
 
-    print("самопроверка пройдена: Макнемар точный, кластерный бутстрап шире "
+    # --- метка обязана нести свою политику ---------------------------------
+    ok_map = {"hicora_s0": {"hicora"}, "joint12": {"fast"},
+              "coarse24": {"coarse24"}, "чужая_метка": {"что_угодно"}}
+    assert check_arm_policies(ok_map)
+    # ИМЕННО ВОСПРОИЗВЕДЁННЫЙ ОБХОД: вся рука единообразно подменена, смеси
+    # нет, отпечатки одинаковы — прежде это проходило.
+    for bad, why in ((dict(ok_map, hicora_s0={"fast"}), "hicora_s0 -> fast"),
+                     (dict(ok_map, joint12={"hicora"}), "joint12 -> hicora"),
+                     (dict(ok_map, coarse24={"fullbar"}), "coarse24 -> fullbar"),
+                     (dict(ok_map, hicora_s0={"?"}), "политика не записана"),
+                     (dict(ok_map, hicora_s0={"hicora", "fast"}), "смесь")):
+        try:
+            check_arm_policies(bad)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"обход принят: {why}")
+    # мягкий режим только сообщает
+    assert check_arm_policies(dict(ok_map, hicora_s0={"fast"}),
+                              strict=False) is False
+
+    print("самопроверка пройдена: карта меток отвергает единообразную подмену "
+          "руки, не записанную политику и смесь; Макнемар точный, кластерный бутстрап шире "
           f"наивного ({w_cl:.3f} против {w_nv:.3f}), разность парная")
+
+
+# КАРТА МЕТКА -> ПОЛИТИКА для K-11e. Отпечаток руки ловит СМЕСЬ внутри
+# метки, но не ЕДИНООБРАЗНУЮ подмену: если ВСЕ ячейки `hicora_s0` посчитаны
+# политикой `fast`, отпечатки одинаковы и агрегатор молчит. Карта закрывает
+# именно этот случай.
+ARM_POLICY = {"fullbar": "fullbar", "coarse24": "coarse24",
+              "joint12": "fast", "hicora_s0": "hicora",
+              "hicora_s1": "hicora"}
+
+
+def check_arm_policies(pol_by_arm, expect=None, strict=True):
+    """Каждая известная метка обязана нести свою политику.
+
+    `strict` требует, чтобы у метки была ровно одна политика и чтобы она
+    совпала с ожидаемой. Метки вне карты пропускаются: агрегатор общий, и
+    старые эксперименты про K-11e ничего не знают.
+    """
+    m = ARM_POLICY if expect is None else expect
+    bad = []
+    for arm, pols in sorted(pol_by_arm.items()):
+        if arm not in m:
+            continue
+        if len(pols) != 1:
+            bad.append(f"{arm}: политик несколько {sorted(pols)}")
+            continue
+        got = next(iter(pols))
+        if got == "?":
+            bad.append(f"{arm}: политика не записана в ячейках")
+        elif got != m[arm]:
+            bad.append(f"{arm}: политика {got}, ожидалась {m[arm]}")
+    if bad and strict:
+        raise SystemExit(
+            "МЕТКА НЕ СООТВЕТСТВУЕТ ПОЛИТИКЕ:\n    " + "\n    ".join(bad)
+            + "\n  Единообразно подменённая рука дала бы одинаковые "
+              "отпечатки и прошла бы проверку на смесь.")
+    return not bad
 
 
 def main() -> None:
@@ -166,10 +225,22 @@ def main() -> None:
                     help="читать ячейки без rollout_seed и смешивать версии "
                          "скрипта. Гарантии при этом слабее заявленных; "
                          "нужен для файлов, снятых до введения поля (K-9d).")
+    ap.add_argument("--allow-arm-policy-mismatch", action="store_true",
+                    help="разрешить метке нести не ту политику. Нужен только "
+                         "для разбора старых каталогов")
+    ap.add_argument("--hypothesis", choices=["noninferiority", "superiority"],
+                    default="noninferiority",
+                    help="какая гипотеза проверяется. При superiority допуск "
+                         "обязан быть нулевым, а вердикт называется "
+                         "превосходством, а не не-худшестью")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
     selftest()
+    if args.hypothesis == "superiority" and abs(args.margin) > 1e-12:
+        raise SystemExit(
+            f"--hypothesis superiority требует --margin 0, задано "
+            f"{args.margin}: превосходство проверяется границей у нуля")
     if args.selftest:
         return
 
@@ -261,6 +332,11 @@ def main() -> None:
         print(f"  ВНИМАНИЕ: файлы получены РАЗНЫМИ версиями скрипта: {shas}")
     if len(ckpts) > 1:
         raise SystemExit(f"разные чекпойнты в одном сравнении: {ckpts}")
+    check_arm_policies(pol_by_arm, strict=not args.allow_arm_policy_mismatch)
+    for a_ in sorted(pol_by_arm):
+        if a_ in ARM_POLICY:
+            print(f"  метка {a_}: политика {sorted(pol_by_arm[a_])[0]} "
+                  f"(ожидалась {ARM_POLICY[a_]})")
     mixed_fp = {a: s for a, s in fp_by_arm.items() if len(s) > 1}
     if mixed_fp:
         raise SystemExit(
@@ -448,7 +524,16 @@ def main() -> None:
         if not non_inf and not inferior:
             print(f"    ни одна из двух односторонних гипотез не подтверждена; "
                   f"точечная оценка {micro:+.1f} пп сама по себе НЕ вывод")
-        res[tag] = dict(n_pairs=len(keys), n_tasks=len(by_task),
+        # ГИПОТЕЗА НАЗЫВАЕТСЯ СВОИМ ИМЕНЕМ. При нулевом допуске математика
+        # односторонней границы та же, но вердикт «НЕ ХУЖЕ» вводил бы в
+        # заблуждение: проверяется ПРЕВОСХОДСТВО, и в JSON должно стоять оно.
+        superior = bool(args.hypothesis == "superiority" and lo1 > 0)
+        if args.hypothesis == "superiority":
+            print(f"    ГИПОТЕЗА ПРЕВОСХОДСТВА: нижняя односторонняя граница "
+                  f"{lo1:+.1f} пп — " + ("ПРЕВОСХОДСТВО ДОКАЗАНО"
+                                         if superior else "НЕ ДОКАЗАНО"))
+        res[tag] = dict(hypothesis=args.hypothesis, superior=superior,
+                        n_pairs=len(keys), n_tasks=len(by_task),
                         n_unpaired=len(unpaired), n_full_hash=n_full,
                         field=args.field, arm_test=str(A), arm_ref=str(B),
                         rate_l1=r1, rate_l3=r3,
