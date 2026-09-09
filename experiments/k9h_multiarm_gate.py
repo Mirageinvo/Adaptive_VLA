@@ -85,6 +85,92 @@ N_POS, N_LEVEL = 16, 3
 POLICIES = ("fullbar", "coarse24", "fast", "hicora")
 
 
+def file_sha12(path):
+    """SHA файла, 12 знаков. Один способ на весь модуль."""
+    h = hashlib.sha1()
+    with open(path, "rb") as fh:
+        for c in iter(lambda: fh.read(1 << 22), b""):
+            h.update(c)
+    return h.hexdigest()[:12]
+
+
+def check_hicora_ckpt(obj, arm_label, expect_target):
+    """Происхождение чекпойнта головы. Отсутствие поля — отказ.
+
+    Вынесено из `main` НАРОЧНО: пока проверки жили внутри, самопроверка их не
+    видела, и стопроцентный отказ корректного запуска остался незамеченным.
+    """
+    need = ("state", "arch", "target", "rank", "cache", "res_norm_sha1",
+            "basis_sha1", "rho_sha1", "selected_epoch", "seed", "script_sha1")
+    miss = [k for k in need if obj.get(k) is None]
+    if miss:
+        raise SystemExit(
+            f"в чекпойнте головы нет полей {miss}: он собран версией K-11c "
+            f"без записи происхождения, и что исполняется — не доказуемо")
+    if obj["arch"] != "mlp":
+        raise SystemExit(
+            f"архитектура головы {obj['arch']!r}: в симулятор идёт условная "
+            f"MLP, остальные — диагностические")
+    if obj["target"] != expect_target:
+        raise SystemExit(
+            f"мишень головы {obj['target']!r}, ожидалась {expect_target!r}")
+    m = re.search(r"_s(\d+)$", str(arm_label))
+    if m is None:
+        raise SystemExit(
+            f"метка руки {arm_label!r} не кончается на _s<сид>: сверить её с "
+            f"чекпойнтом нечем")
+    if int(m.group(1)) != int(obj["seed"]):
+        raise SystemExit(
+            f"метка {arm_label} против сида {obj['seed']} в чекпойнте")
+    stray = [k for k in obj["state"] if not k.startswith("hicora_head.")]
+    if stray:
+        raise SystemExit(f"в чекпойнте головы {len(stray)} ключей вне "
+                         f"hicora_head.: {stray[:5]}")
+    return True
+
+
+def check_hicora_meta(meta, ckpt, weights_sha, cur_hv, cur_jv):
+    """Привязка головы к кэшу, на котором она обучалась.
+
+    ВСЕ ПОЛЯ ОБЯЗАТЕЛЬНЫ. Прежде sha модулей сверялись как
+    `if want is not None and want != cur`, то есть удаление поля снимало
+    проверку. И `weights_sha` мог прийти сюда None — тогда сравнение падало
+    на КАЖДОМ корректном запуске, а самопроверка этого не видела.
+    """
+    if not weights_sha:
+        raise SystemExit(
+            "sha весов Joint12 не посчитана до сверки с кэшем: порядок "
+            "проверок нарушен, и сравнение шло бы с None")
+    need = ("q0_source", "depth", "ckpt", "source", "hicora_vla_sha1",
+            "joint12_vla_sha1")
+    miss = [k for k in need if meta.get(k) is None]
+    if miss:
+        raise SystemExit(f"в meta кэша нет полей {miss}")
+    if meta["q0_source"] != "joint12":
+        raise SystemExit(
+            f"кэш собран источником {meta['q0_source']!r}, а голова обучалась "
+            f"исправлять черновик Joint12")
+    if int(meta["depth"]) != 12:
+        raise SystemExit(f"кэш собран на глубине {meta['depth']}, ожидалась 12")
+    if meta["ckpt"] != ckpt:
+        raise SystemExit(f"кэш собран чекпойнтом {meta['ckpt']}, а здесь "
+                         f"{ckpt}")
+    w_j = (meta.get("source") or {}).get("weights_sha1")
+    if not w_j:
+        raise SystemExit("в meta кэша нет source.weights_sha1")
+    if w_j != weights_sha:
+        raise SystemExit(
+            f"веса Joint12 sha {weights_sha}, а кэш собран на {w_j}: голова "
+            f"обучалась исправлять ДРУГОЙ черновик")
+    for fld, cur in (("hicora_vla_sha1", cur_hv),
+                     ("joint12_vla_sha1", cur_jv)):
+        if meta[fld] != cur:
+            raise SystemExit(
+                f"{fld}: кэш собран на {meta[fld]}, сейчас {cur}. Модуль "
+                f"определяет исполняемую сеть не меньше, чем веса")
+    return True
+
+
 class Latent:
     """Непрерывный латент вместо кодов.
 
@@ -224,10 +310,79 @@ def selftest():
     assert levels_of("hicora") == 1 and levels_of("fullbar") == N_LEVEL
     assert "hicora" in POLICIES
 
-    print("самопроверка k9h пройдена (версия «рука hicora»): "
+    # --- ПРОИСХОЖДЕНИЕ ГОЛОВЫ: мутации обязаны ловиться ---------------------
+    good_ck = dict(state={"hicora_head.proj.weight": 1},
+                   arch="mlp", target="coef", rank=32, cache="data/c",
+                   res_norm_sha1="rn", basis_sha1="bs", rho_sha1="rh",
+                   selected_epoch=4, seed=0, script_sha1="sc")
+    assert check_hicora_ckpt(good_ck, "hicora_s0", "coef")
+    for kw, why in ((dict(arch="uncond"), "архитектура"),
+                    (dict(target="star"), "мишень"),
+                    (dict(seed=1), "сид против метки"),
+                    (dict(state={"other.w": 1}), "посторонний ключ")):
+        try:
+            check_hicora_ckpt(dict(good_ck, **kw), "hicora_s0", "coef")
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"мутация принята: {why}")
+    for k_ in good_ck:
+        try:
+            check_hicora_ckpt({x: v for x, v in good_ck.items() if x != k_},
+                              "hicora_s0", "coef")
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"отсутствие поля {k_} принято")
+    # метка без сида — отказ
+    try:
+        check_hicora_ckpt(good_ck, "hicora", "coef")
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("метка без сида принята")
+
+    good_m = dict(q0_source="joint12", depth=12, ckpt="A/B",
+                  source=dict(weights_sha1="wj"), hicora_vla_sha1="hv",
+                  joint12_vla_sha1="jv")
+    assert check_hicora_meta(good_m, "A/B", "wj", "hv", "jv")
+    # ИМЕННО ЭТОТ СЛУЧАЙ ронял каждый корректный запуск: sha ещё не посчитана
+    for bad_w in (None, "", 0):
+        try:
+            check_hicora_meta(good_m, "A/B", bad_w, "hv", "jv")
+        except SystemExit as ex:
+            assert "порядок проверок" in str(ex), str(ex)
+        else:
+            raise AssertionError("несчитанная sha весов принята")
+    for kw, why in ((dict(q0_source="coarse24"), "источник"),
+                    (dict(depth=18), "глубина"),
+                    (dict(ckpt="X/Y"), "базовый чекпойнт"),
+                    (dict(source=dict(weights_sha1="другая")), "веса"),
+                    (dict(hicora_vla_sha1="иное"), "версия hicora_vla"),
+                    (dict(joint12_vla_sha1="иное"), "версия joint12_vla")):
+        try:
+            check_hicora_meta(dict(good_m, **kw), "A/B", "wj", "hv", "jv")
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"мутация принята: {why}")
+    # ОТСУТСТВИЕ поля больше не снимает проверку
+    for k_ in good_m:
+        try:
+            check_hicora_meta({x: v for x, v in good_m.items() if x != k_},
+                              "A/B", "wj", "hv", "jv")
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"отсутствие поля {k_} принято")
+
+    print("самопроверка k9h пройдена (версия «рука hicora, мутации "
+          "происхождения»): "
           "нормировка вызовов, уровни по политике, покрытие "
           "блоков при batch 10 и 5, ключ ячейки, обёртка латента отличается "
-          "от кодов и не принимает посторонних полей")
+          "от кодов и не принимает посторонних полей, происхождение головы "
+          "и её привязка к кэшу отвергают каждую мутацию и каждое "
+          "отсутствующее поле, включая несчитанную sha весов")
 
 
 def main() -> None:
@@ -354,105 +509,37 @@ def main() -> None:
     if args.policy == "hicora":
         # ВСЁ ПРОВЕРЯЕТСЯ ДО СОЗДАНИЯ СРЕД: отказ после их поднятия тонет в
         # предупреждениях robosuite из десяти процессов.
+        #
+        # ПОРЯДОК ЗНАЧИМ. Прежде sha весов Joint12 сравнивалась с meta ДО
+        # того, как её вычисляли: переменная была None, и КАЖДЫЙ корректный
+        # запуск падал с «веса Joint12 sha None». Теперь она считается первой.
         for f_ in (args.policy_ckpt, args.hicora_ckpt):
             if not os.path.exists(f_):
                 raise SystemExit(f"нет файла {f_}")
-        h = hashlib.sha1()
-        with open(args.hicora_ckpt, "rb") as fh:
-            for c in iter(lambda: fh.read(1 << 22), b""):
-                h.update(c)
-        hic_sha = h.hexdigest()[:12]
+        weights_sha = file_sha12(args.policy_ckpt)
+        hic_sha = file_sha12(args.hicora_ckpt)
         hic_obj = torch.load(args.hicora_ckpt, map_location="cpu",
                              weights_only=False)
-        need = ("state", "arch", "target", "rank", "cache", "res_norm_sha1",
-                "basis_sha1", "rho_sha1")
-        miss = [k for k in need if hic_obj.get(k) is None]
-        if miss:
-            raise SystemExit(
-                f"в чекпойнте головы нет полей {miss}: он собран версией "
-                f"K-11c без записи происхождения, и что именно исполняется — "
-                f"не доказуемо")
-        if hic_obj["arch"] != "mlp":
-            raise SystemExit(
-                f"архитектура головы {hic_obj['arch']!r}: в симулятор идёт "
-                f"условная MLP, остальные — диагностические")
-        # МИШЕНЬ ТОЖЕ ОБЯЗАТЕЛЬНА, А НЕ СПРАВОЧНА. Прежде она только
-        # печаталась, и `mlp/star` прошла бы под меткой основного плеча.
-        if hic_obj["target"] != args.expect_hicora_target:
-            raise SystemExit(
-                f"мишень головы {hic_obj['target']!r}, ожидалась "
-                f"{args.expect_hicora_target!r}")
-        for k_ in ("selected_epoch", "seed", "script_sha1"):
-            if hic_obj.get(k_) is None:
-                raise SystemExit(
-                    f"в чекпойнте головы нет {k_}: происхождение неполно")
-        # МЕТКА РУКИ СВЕРЯЕТСЯ С СИДОМ. Иначе чекпойнт сида 1 поехал бы под
-        # меткой hicora_s0, и половина ячеек оказалась бы другой моделью.
-        m_ = re.search(r"_s(\d+)$", str(args.arm_label))
-        if m_ is None:
-            raise SystemExit(
-                f"метка руки {args.arm_label!r} не кончается на _s<сид>: "
-                f"сверить её с чекпойнтом нечем")
-        if int(m_.group(1)) != int(hic_obj["seed"]):
-            raise SystemExit(
-                f"метка {args.arm_label} против сида {hic_obj['seed']} в "
-                f"чекпойнте")
-        # БАЗИС И ПРЕДЕЛ БЕРУТСЯ ИЗ ТОГО ЖЕ КЭША, ЧТО У ОБУЧЕНИЯ, и сверяются
-        # по sha: чужой базис той же формы дал бы поправку в других
-        # координатах и не пожаловался бы.
+        check_hicora_ckpt(hic_obj, args.arm_label,
+                          args.expect_hicora_target)
         pref = hic_obj["cache"]
         bp, rp = pref + ".basis.npy", pref + ".rho.npy"
-        for f_ in (bp, rp):
+        mp = pref + ".meta.json"
+        for f_ in (bp, rp, mp):
             if not os.path.exists(f_):
-                raise SystemExit(f"нет {f_}: базис и предел неоткуда взять")
-
-        def _sha(path):
-            hh = hashlib.sha1()
-            with open(path, "rb") as fh:
-                for c in iter(lambda: fh.read(1 << 22), b""):
-                    hh.update(c)
-            return hh.hexdigest()[:12]
+                raise SystemExit(f"нет {f_}: привязать голову к кэшу нечем")
         for f_, want_, nm_ in ((bp, hic_obj["basis_sha1"], "базис"),
                                (rp, hic_obj["rho_sha1"], "предел")):
-            got_ = _sha(f_)
+            got_ = file_sha12(f_)
             if got_ != want_:
                 raise SystemExit(f"{nm_} sha {got_}, а голова обучена на "
                                  f"{want_}")
-        # --- ПРИВЯЗКА К КЭШУ, НА КОТОРОМ ГОЛОВА ОБУЧАЛАСЬ ------------------
-        # Прежде сверялись только базис и предел. Тогда сюда прошли бы:
-        # Joint-чекпойнт глубины 18 или 24, другой файл Joint12, кэш с иным
-        # источником черновика, другой базовый чекпойнт и другой декодер. А
-        # `model.taps, model.q0_depth = (12,18,24), depth` при depth 18 взял
-        # бы черновик с h18, хотя голова обучалась исправлять Joint12.
-        mp = pref + ".meta.json"
-        if not os.path.exists(mp):
-            raise SystemExit(f"нет {mp}: привязать голову к кэшу нечем")
         hic_meta = json.load(open(mp))
-        if hic_meta.get("q0_source") != "joint12":
-            raise SystemExit(
-                f"кэш собран источником {hic_meta.get('q0_source')!r}, а "
-                f"голова обучалась исправлять черновик Joint12")
-        if int(hic_meta.get("depth", -1)) != 12:
-            raise SystemExit(
-                f"кэш собран на глубине {hic_meta.get('depth')}, ожидалась 12")
-        if hic_meta.get("ckpt") != args.ckpt:
-            raise SystemExit(
-                f"кэш собран чекпойнтом {hic_meta.get('ckpt')}, а здесь "
-                f"{args.ckpt}")
-        w_j = (hic_meta.get("source") or {}).get("weights_sha1")
-        if w_j != weights_sha:
-            raise SystemExit(
-                f"веса Joint12 sha {weights_sha}, а кэш собран на {w_j}: "
-                f"голова обучалась исправлять ДРУГОЙ черновик")
         import hicora_vla as _hv
         import joint12_vla as _jv
-        for mod, fld in ((_hv, "hicora_vla_sha1"), (_jv, "joint12_vla_sha1")):
-            cur_ = hashlib.sha1(open(mod.__file__, "rb").read()).hexdigest()[:12]
-            want_ = hic_meta.get(fld)
-            if want_ is not None and want_ != cur_:
-                raise SystemExit(
-                    f"{fld}: кэш собран на {want_}, сейчас {cur_}. Модуль "
-                    f"определяет исполняемую сеть не меньше, чем веса")
+        check_hicora_meta(
+            hic_meta, args.ckpt, weights_sha,
+            file_sha12(_hv.__file__), file_sha12(_jv.__file__))
         hic_B = np.load(bp).astype(np.float32)
         hic_rho = np.load(rp).astype(np.float32)
         if hic_B.shape[1] != int(hic_obj["rank"]) or \
@@ -466,16 +553,18 @@ def main() -> None:
                              f"предел ничего не ограничивает")
         print(f"  голова поправки: {os.path.basename(args.hicora_ckpt)}, sha "
               f"{hic_sha}, мишень {hic_obj['target']}, ранг "
-              f"{hic_obj['rank']}, эпоха {hic_obj.get('selected_epoch')}; "
-              f"базис и предел сверены", flush=True)
+              f"{hic_obj['rank']}, сид {hic_obj['seed']}, эпоха "
+              f"{hic_obj['selected_epoch']}; базис, предел и привязка к кэшу "
+              f"сверены", flush=True)
     if args.policy in ("fast", "hicora"):
         if not os.path.exists(args.policy_ckpt):
             raise SystemExit(f"нет файла {args.policy_ckpt}")
-        h = hashlib.sha1()
-        with open(args.policy_ckpt, "rb") as fh:
-            for c in iter(lambda: fh.read(1 << 22), b""):
-                h.update(c)
-        weights_sha = h.hexdigest()[:12]
+        # ОДИН СПОСОБ СЧИТАТЬ SHA НА ВЕСЬ МОДУЛЬ: у hicora она уже посчитана
+        # выше, и расхождение способов дало бы разные значения на одном файле.
+        w2 = file_sha12(args.policy_ckpt)
+        if weights_sha is not None and w2 != weights_sha:
+            raise SystemExit(f"sha весов разошлась: {weights_sha} против {w2}")
+        weights_sha = w2
         ck_obj = torch.load(args.policy_ckpt, map_location="cpu",
                             weights_only=False)
         d_ck = int(ck_obj["depth"])

@@ -205,19 +205,38 @@ def main() -> None:
                 f"скриптом. Проверьте --glob и --field.")
         # Путь к чекпойнту не удостоверяет ничего: best_imitation.pt
         # перезаписывается каждой лучшей эпохой. Удостоверяет sha весов.
+        # ПОЛИТИКА ЗАПИСЫВАЕТСЯ БЕЗУСЛОВНО. Прежде она собиралась только
+        # внутри `if isinstance(joint, dict)`, поэтому ячейки fullbar и
+        # coarse24 в проверку не попадали, и метка могла содержать смесь
+        # coarse24 с hicora незамеченно.
+        arm_ = str(d[args.field])
+        pol_ = str(d.get("policy", "?"))
+        pol_by_arm[arm_].add(pol_)
         j = d.get("joint")
         if isinstance(j, dict):
-            wsha_by_arm[str(d[args.field])].add(j.get("weights_sha1", "?"))
+            wsha_by_arm[arm_].add(j.get("weights_sha1", "?"))
             vlasha.add(j.get("joint12_vla_sha1", "?"))
-            # ЕДИНЫЙ ОТПЕЧАТОК РУКИ. Для HiCoRA веса Joint12 одинаковы у
-            # `joint12` и у `hicora_*`, поэтому sha весов руки не различает:
-            # половина ячеек могла быть посчитана ДРУГОЙ головой, с другим
-            # базисом, пределом, нормой или сидом — и агрегатор молчал бы.
+        # ЕДИНЫЙ ОТПЕЧАТОК РУКИ. Для HiCoRA веса Joint12 одинаковы у
+        # `joint12` и у `hicora_*`, поэтому sha весов руки не различает:
+        # половина ячеек могла быть посчитана ДРУГОЙ головой, с другим
+        # базисом, пределом, нормой или сидом — и агрегатор молчал бы.
+        #
+        # ОТСУТСТВИЕ ОТПЕЧАТКА У HICORA — ОТКАЗ, а не пропуск: иначе защиту
+        # снимало бы простое его отсутствие во всех ячейках.
+        if pol_ == "hicora":
+            if not isinstance(j, dict):
+                raise SystemExit(
+                    f"{os.path.basename(f)}: политика hicora без словаря "
+                    f"происхождения")
             fp = j.get("arm_fingerprint")
-            if fp is not None:
-                fp_by_arm[str(d[args.field])].add(str(fp))
-            # Явная ловушка на подмену политики под меткой.
-            pol_by_arm[str(d[args.field])].add(str(d.get("policy", "?")))
+            if not fp:
+                raise SystemExit(
+                    f"{os.path.basename(f)}: у руки hicora нет "
+                    f"arm_fingerprint — какая именно голова считала эту "
+                    f"ячейку, не доказуемо")
+            fp_by_arm[arm_].add(str(fp))
+        elif isinstance(j, dict) and j.get("arm_fingerprint"):
+            fp_by_arm[arm_].add(str(j["arm_fingerprint"]))
         # run_tag В КЛЮЧЕ: ячейки K-6h и K-9d могут лежать рядом и совпадать по
         # (suite, task, ens, H, init_id). Без тега они молча склеились бы в
         # одну пару, и сравнивались бы эпизоды из разных экспериментов.
