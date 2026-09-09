@@ -130,7 +130,51 @@ def selftest():
     assert check_arm_policies(dict(ok_map, hicora_s0={"fast"}),
                               strict=False) is False
 
-    print("самопроверка пройдена: карта меток отвергает единообразную подмену "
+    # --- руки обязаны делить один черновик ---------------------------------
+    assert check_shared_joint({"joint12": {"wj"}, "hicora_s0": {"wj"},
+                              "hicora_s1": {"wj"}, "coarse24": set()})
+    # ИМЕННО СЛУЧАЙ ВОЗОБНОВЛЕНИЯ: старые ячейки одним чекпойнтом, новые
+    # другим; внутри каждой метки единообразно, и прежде это проходило.
+    try:
+        check_shared_joint({"joint12": {"wj"}, "hicora_s0": {"другой"}})
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("руки с разными весами Joint12 приняты")
+    # метки вне карты K-11e не трогаются: агрегатор общий
+    assert check_shared_joint({"fast12": {"a"}, "fast12_rstar": {"b"}})
+
+    # --- s0 и s1 различаются ТОЛЬКО сидом ----------------------------------
+    base_h = dict(basis_sha1="bs", rho_sha1="rh", res_norm_sha1="rn",
+                  hicora_rank=32, hicora_target="coef",
+                  hicora_vla_sha1="hv", hicora_seed=0, hicora_sha1="c0")
+    assert check_hicora_replication(
+        {"hicora_s0": dict(base_h),
+         "hicora_s1": dict(base_h, hicora_seed=1, hicora_sha1="c1")})
+    for kw, why in ((dict(basis_sha1="иной"), "базис"),
+                    (dict(rho_sha1="иной"), "предел"),
+                    (dict(res_norm_sha1="иная"), "норма"),
+                    (dict(hicora_rank=16), "ранг"),
+                    (dict(hicora_target="star"), "мишень")):
+        try:
+            check_hicora_replication(
+                {"hicora_s0": dict(base_h),
+                 "hicora_s1": dict(base_h, hicora_seed=1, **kw)})
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"расхождение принято: {why}")
+    # одинаковый сид — это не репликация
+    try:
+        check_hicora_replication({"hicora_s0": dict(base_h),
+                                  "hicora_s1": dict(base_h)})
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("одинаковые сиды приняты за репликацию")
+
+    print("самопроверка пройдена: руки делят один черновик и различаются "
+          "только сидом, карта меток отвергает единообразную подмену "
           "руки, не записанную политику и смесь; Макнемар точный, кластерный бутстрап шире "
           f"наивного ({w_cl:.3f} против {w_nv:.3f}), разность парная")
 
@@ -142,6 +186,59 @@ def selftest():
 ARM_POLICY = {"fullbar": "fullbar", "coarse24": "coarse24",
               "joint12": "fast", "hicora_s0": "hicora",
               "hicora_s1": "hicora"}
+
+
+def check_shared_joint(wsha_by_arm, known=None):
+    """Сравниваемые руки K-11e обязаны делить ОДИН черновик.
+
+    Внутри метки единообразие уже проверено, но этого мало. Реальный случай
+    при возобновлении: старые 400 ячеек `joint12` посчитаны одним чекпойнтом
+    Joint12, новые `hicora_*` — другим. Внутри каждой метки sha единообразна,
+    карта политик верна, и агрегатор принимал бы сравнение. Тогда HiCoRA
+    сравнивалась бы НЕ СО СВОИМ черновиком.
+
+    Проверяются только метки из карты K-11e: агрегатор общий, и старые
+    эксперименты могли законно сравнивать руки с разными весами.
+    """
+    m = ARM_POLICY if known is None else known
+    got = {}
+    for arm, shas in sorted(wsha_by_arm.items()):
+        if arm in m and shas and shas != {"?"}:
+            got[arm] = sorted(shas)
+    vals = {v for lst in got.values() for v in lst}
+    if len(vals) > 1:
+        raise SystemExit(
+            f"РУКИ ДЕЛЯТ РАЗНЫЕ ВЕСА Joint12: {got}. HiCoRA сравнивалась бы "
+            f"не со своим черновиком — сравнение недействительно.")
+    return True
+
+
+def check_hicora_replication(hic_by_arm):
+    """`hicora_s0` и `hicora_s1` обязаны различаться ТОЛЬКО сидом.
+
+    Иначе это не репликация по сиду, а две разные конфигурации, и требование
+    «выполнить на обоих» ничего не удостоверяет.
+    """
+    arms = sorted(a for a in hic_by_arm if a.startswith("hicora_"))
+    if len(arms) < 2:
+        return True
+    same = ("basis_sha1", "rho_sha1", "res_norm_sha1", "hicora_rank",
+            "hicora_target", "hicora_vla_sha1")
+    bad = []
+    for fld in same:
+        vals = {a: hic_by_arm[a].get(fld) for a in arms}
+        if len({str(v) for v in vals.values()}) > 1:
+            bad.append(f"{fld}: {vals}")
+    seeds = {a: hic_by_arm[a].get("hicora_seed") for a in arms}
+    if len({str(v) for v in seeds.values()}) < len(arms):
+        bad.append(f"сиды не различаются: {seeds}")
+    if bad:
+        raise SystemExit(
+            "РУКИ hicora_s0 И hicora_s1 РАЗЛИЧАЮТСЯ НЕ ТОЛЬКО СИДОМ:\n    "
+            + "\n    ".join(bad)
+            + "\n  Тогда это не репликация, и «выполнить на обоих» ничего не "
+              "удостоверяет.")
+    return True
 
 
 def check_arm_policies(pol_by_arm, expect=None, strict=True):
@@ -266,6 +363,7 @@ def main() -> None:
     # Первая версия этой проверки была глобальной и падала на законных данных.
     wsha_by_arm = defaultdict(set)
     fp_by_arm, pol_by_arm = defaultdict(set), defaultdict(set)
+    hic_by_arm = {}
     vlasha = set()
     for f in files:
         d = json.load(open(f))
@@ -306,6 +404,10 @@ def main() -> None:
                     f"arm_fingerprint — какая именно голова считала эту "
                     f"ячейку, не доказуемо")
             fp_by_arm[arm_].add(str(fp))
+            hic_by_arm[arm_] = {k_: j.get(k_) for k_ in (
+                "basis_sha1", "rho_sha1", "res_norm_sha1", "hicora_rank",
+                "hicora_target", "hicora_vla_sha1", "hicora_seed",
+                "hicora_sha1")}
         elif isinstance(j, dict) and j.get("arm_fingerprint"):
             fp_by_arm[arm_].add(str(j["arm_fingerprint"]))
         # run_tag В КЛЮЧЕ: ячейки K-6h и K-9d могут лежать рядом и совпадать по
@@ -333,6 +435,9 @@ def main() -> None:
     if len(ckpts) > 1:
         raise SystemExit(f"разные чекпойнты в одном сравнении: {ckpts}")
     check_arm_policies(pol_by_arm, strict=not args.allow_arm_policy_mismatch)
+    if not args.allow_arm_policy_mismatch:
+        check_shared_joint(wsha_by_arm)
+        check_hicora_replication(hic_by_arm)
     for a_ in sorted(pol_by_arm):
         if a_ in ARM_POLICY:
             print(f"  метка {a_}: политика {sorted(pol_by_arm[a_])[0]} "
