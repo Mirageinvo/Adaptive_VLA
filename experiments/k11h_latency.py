@@ -97,6 +97,7 @@ PRIMARY_BATCH = 1
 # `--batches 1 --reps 1 --warmup 0` выдавал «K-11h-A ПРОЙДЕН» без оговорок.
 REGISTERED = dict(batches=[1, 10], reps=200, warmup=20, dtype="float16",
                   pos_offset=4, weight_mode="as-executed",
+                  cache="data/k9_teacher_150k.npz",
                   max_vs_coarse=MAX_VS_COARSE,
                   min_vs_fullbar=MIN_VS_FULLBAR)
 PASSES = {"fullbar": N_LEVEL, "coarse24": 1, "joint12": 1,
@@ -251,10 +252,20 @@ def registration(cfg, files=None, binding=None):
     Регистрация — это ТРИ условия сразу: режим и повторы как объявлено, все
     отпечатки входов вычислены, и веса те же, что проверял K-11e.
     """
-    dev = list(binding or [])
-    for f, v in sorted((files or {}).items()):
-        if not v:
-            dev.append(f"отпечаток {f} не вычислен")
+    # FAIL-CLOSED ПО АРГУМЕНТАМ. Вызов без files или без результата binding
+    # прежде возвращал registered=True: основной путь передаёт оба, но забыть
+    # их мог бы любой будущий вызывающий.
+    dev = []
+    if binding is None:
+        dev.append("привязка к протоколу K-11e не проверена")
+    else:
+        dev.extend(binding)
+    if files is None:
+        dev.append("отпечатки входов не переданы")
+    else:
+        for f, v in sorted(files.items()):
+            if not v:
+                dev.append(f"отпечаток {f} не вычислен")
     for k, want in REGISTERED.items():
         got = cfg.get(k)
         if isinstance(want, list):
@@ -290,9 +301,15 @@ def check_k11e_binding(k11e, files, ckpt):
             bad.append(f"{key} отсутствует в протоколе K-11e")
         elif got != want:
             bad.append(f"{f}: sha {got}, в K-11e {want}")
-    if k11e.get("ckpt") and ckpt != k11e["ckpt"]:
-        bad.append(f"ckpt {ckpt!r}, в K-11e {k11e['ckpt']!r}")
-    for f in ("cache", "images", "script"):
+    # ОТСУТСТВИЕ ckpt В K-11e — ОТКАЗ, А НЕ СНЯТИЕ ПРОВЕРКИ. Прежде условие
+    # было `if k11e.get("ckpt") and ...`, и протокол без этого поля вместе с
+    # произвольной моделью давал зарегистрированный прогон.
+    want_ckpt = k11e.get("ckpt")
+    if not want_ckpt:
+        bad.append("ckpt отсутствует в протоколе K-11e")
+    elif ckpt != want_ckpt:
+        bad.append(f"ckpt {ckpt!r}, в K-11e {want_ckpt!r}")
+    for f in ("cache", "images", "script", "cfg_yaml"):
         if not files.get(f):
             bad.append(f"{f}: отпечаток не вычислен")
     return bad
@@ -317,6 +334,13 @@ def verify_protocol(old, cur):
             f"  Сравнивать замеры разных условий нельзя. Для другой "
             f"конфигурации берите другой --proto и другой --out.")
     return True
+
+
+def good_f_ph():
+    """Полный набор непустых отпечатков — для самопроверки."""
+    return dict(joint12="wj", hicora_s0="h0", hicora_s1="h1", cache="c",
+                images="i", script="s", cfg_yaml="y", bar_py="b",
+                joint12_vla="j", hicora_vla="h")
 
 
 def selftest():
@@ -412,7 +436,11 @@ def selftest():
 
     # --- РЕГИСТРАЦИЯ --------------------------------------------------------
     good = dict(REGISTERED)
-    assert registration(good)["registered"]   # без файлов и привязки
+    # БЕЗ files И binding — НЕ зарегистрирован: fail-closed по аргументам.
+    r0 = registration(good)
+    assert not r0["registered"] and len(r0["deviations"]) == 2, r0
+    assert not registration(good, good_f_ph())["registered"]
+    assert not registration(good, None, [])["registered"]
     for k, v in (("reps", 1), ("warmup", 0), ("batches", [1]),
                  ("dtype", "bfloat16"), ("pos_offset", 0),
                  ("weight_mode", "uniform-trunk"), ("max_vs_coarse", 1.5)):
@@ -424,8 +452,7 @@ def selftest():
     # том, ЧТО именно мерилось.
     K11E = dict(ckpt="A/B", joint_sha1="wj", head_s0_sha1="h0",
                 head_s1_sha1="h1")
-    good_f = dict(joint12="wj", hicora_s0="h0", hicora_s1="h1",
-                  cache="c", images="i", script="s")
+    good_f = good_f_ph()
     assert check_k11e_binding(K11E, good_f, "A/B") == []
     assert registration(good, good_f,
                         check_k11e_binding(K11E, good_f, "A/B"))["registered"]
@@ -434,6 +461,7 @@ def selftest():
                      (dict(hicora_s1="ИНАЯ"), "чужая голова s1"),
                      (dict(joint12=None), "sha черновика не вычислен"),
                      (dict(images=None), "нет отпечатка картинок"),
+                     (dict(cfg_yaml=None), "нет отпечатка конфига"),
                      (dict(cache=None), "нет отпечатка кэша")):
         b = check_k11e_binding(K11E, dict(good_f, **mut), "A/B")
         assert b, f"принято: {why}"
@@ -442,7 +470,7 @@ def selftest():
     assert not registration(good, good_f, check_k11e_binding(
         K11E, good_f, "ДРУГАЯ/МОДЕЛЬ"))["registered"]
     assert check_k11e_binding({}, good_f, "A/B"), "пустой протокол K-11e"
-    for gone in ("joint_sha1", "head_s0_sha1", "head_s1_sha1"):
+    for gone in ("joint_sha1", "head_s0_sha1", "head_s1_sha1", "ckpt"):
         assert check_k11e_binding({k: v for k, v in K11E.items() if k != gone},
                                   good_f, "A/B"), f"нет {gone} в K-11e"
 
@@ -875,6 +903,11 @@ def main() -> None:
                          "помечается НЕ зарегистрированным")
     ap.add_argument("--mem-only", default=None,
                     help="внутренний режим: пик памяти одной руки")
+    ap.add_argument("--allow-unregistered", action="store_true",
+                    help="начать прогон, не совпадающий с зарегистрированным "
+                         "протоколом. Нужен для uniform-trunk и любых иных "
+                         "условий; без него такой прогон отказывается "
+                         "стартовать, а не тратит часы впустую")
     ap.add_argument("--no-mem", action="store_true",
                     help="не мерить память вовсе")
     ap.add_argument("--n-boot", type=int, default=2000)
@@ -930,6 +963,7 @@ def main() -> None:
                           ("bar_py", _bar.__file__),
                           ("joint12_vla", _jv.__file__),
                           ("hicora_vla", _hv.__file__),
+                          ("cfg_yaml", os.path.join(root, args.cfg_path)),
                           ("script", os.path.abspath(__file__)))}
     # ОКРУЖЕНИЕ ВХОДИТ В ПРОТОКОЛ: латентность от него зависит напрямую, и
     # возобновление на другой карте или другой версии torch — отказ.
@@ -963,12 +997,34 @@ def main() -> None:
         print("  прогон НЕ ЗАРЕГИСТРИРОВАННЫЙ, отклонения:")
         for d in reg["deviations"]:
             print(f"    {d}")
+        # ОТКАЗ ДО ПОСТРОЙКИ МОДЕЛИ. Прежде отклонения печатались, и расчёт
+        # продолжался несколько часов. Под nohup «увидеть первые строки и не
+        # запускать дальше» невозможно — он уже идёт.
+        if not args.allow_unregistered:
+            raise SystemExit(
+                "  ОТКАЗ: незарегистрированный прогон не начинается сам. "
+                "Для режима\n  uniform-trunk или иных условий передайте "
+                "--allow-unregistered осознанно.")
+        print("  продолжаю по --allow-unregistered")
 
     orders = rotations(CONFIGS, args.reps)
     per_pos = check_balance(orders, CONFIGS)
     print(f"  порядок рук: циклический сдвиг, каждая рука в каждой позиции "
           f"{per_pos} раз")
 
+
+def timing_stage(args, dev, dt, orders, batches):
+    """Все тайминги. ОТДЕЛЬНОЙ ФУНКЦИЕЙ РАДИ ОСВОБОЖДЕНИЯ КАРТЫ.
+
+    `del S` в main не освобождал модель: её держали замыкания `apply_weights`
+    (замыкает S целиком), `run` (model) и `do_decode` (codec, E), а также
+    локальные `batch` и последний результат прохода. Дочерние процессы замера
+    памяти поднимались рядом с живой родительской моделью. По возврату из
+    функции все эти ссылки исчезают сами.
+
+    Возвращает (rows_by_batch, batches_out, equivalence, meta).
+    """
+    import torch
     S = build_stack(args, CONFIGS, dev, dt)
     apply_weights, run, do_decode = make_runner(S, args)
 
@@ -980,16 +1036,9 @@ def main() -> None:
               "K-11e.\n  Пик памяти рук joint12/hicora включает fp32-копию и "
               "АРХИТЕКТУРНЫМ НЕ ЯВЛЯЕТСЯ.")
 
-    out = dict(ckpt=args.ckpt, joint_sha1=S["joint_sha"],
-               head_sha1=S["head_sha"], res_norm_sha1=S["rn_sha"],
-               script_sha1=k9h.file_sha12(os.path.abspath(__file__)),
-               device=str(dev), dtype=args.dtype,
-               weight_mode=args.weight_mode, reps=args.reps,
-               warmup=args.warmup, passes=PASSES, layers=LAYERS,
-               decodes=DECODES, primary_batch=PRIMARY_BATCH,
-               protocol=proto, registration=reg,
-               orders=[list(o) for o in orders], batches={})
-    out["equivalence"] = None
+    meta = dict(joint_sha1=S["joint_sha"],
+                head_sha1=S["head_sha"], res_norm_sha1=S["rn_sha"])
+    batches_out = {}
 
     if args.weight_mode == "uniform-trunk":
         # НА САМОМ БОЛЬШОМ БАТЧЕ: это все фиксированные входы сразу, а не
@@ -1094,10 +1143,37 @@ def main() -> None:
                   f"входит"
                   + ("" if gate["passed"]
                      else "; на нём порог НЕ выполняется"))
-        out["batches"][str(bs)] = dict(
+        batches_out[str(bs)] = dict(
             rows=row, median_ms=med, gate=gate, paired=pair,
             split_estimate=sp, is_primary=bool(bs == PRIMARY_BATCH))
 
+    return rows_by_batch, batches_out, out_eq, meta
+
+    rows_by_batch, out_batches, out_eq, meta = timing_stage(
+        args, dev, dt, orders, batches)
+    # ПОСЛЕ ВОЗВРАТА ссылок на модель, кодек и батчи не осталось: они были
+    # локальными в timing_stage. Проверяем это числом, а не на веру.
+    import gc as _gc
+    _gc.collect()
+    torch.cuda.empty_cache()
+    left = torch.cuda.memory_allocated(dev) / 2 ** 20
+    print(f"\n  на карте осталось {left:.0f} МиБ после освобождения "
+          f"родительской модели")
+    if left > 512:
+        raise SystemExit(
+            f"родительский процесс всё ещё держит {left:.0f} МиБ: дочерние "
+            f"замеры памяти\n  поднимались бы рядом с живой моделью, и "
+            f"peak_mib не был бы памятью развёртывания")
+
+    out = dict(ckpt=args.ckpt, script_sha1=k9h.file_sha12(
+                   os.path.abspath(__file__)),
+               device=str(dev), dtype=args.dtype,
+               weight_mode=args.weight_mode, reps=args.reps,
+               warmup=args.warmup, passes=PASSES, layers=LAYERS,
+               decodes=DECODES, primary_batch=PRIMARY_BATCH,
+               protocol=proto, registration=reg,
+               orders=[list(o) for o in orders], batches=out_batches)
+    out.update(meta)
     out["equivalence"] = out_eq
 
     # ПАМЯТЬ ПОСЛЕ ВСЕХ ТАЙМИНГОВ. Пока идёт основной процесс, он занимает
