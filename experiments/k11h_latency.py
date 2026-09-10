@@ -237,12 +237,17 @@ def main() -> None:
     sys.path.insert(0, root)
 
     import torch
-    from actioncodec.utils import get_cfg, seed_everything, dict_apply
-    from actioncodec.models.smolvla_bar import SmolVLABlockwiseAR
-    from actioncodec.processors.vla_processor import (
-        VisionLanguageActionProcessor, prompt_template)
-    from actioncodec.constants import STATE_Q01, STATE_Q99
+
+    # ИМЕННО ЭТИ ИМПОРТЫ, дословно как в K-9i и K-9h. Подпакетов
+    # actioncodec.utils / .models / .processors / .constants НЕ СУЩЕСТВУЕТ:
+    # `actioncodec` импортируется ради регистрации, а помощники лежат в
+    # ОТДЕЛЬНОМ пакете верхнего уровня `utils` внутри того же корня.
+    import actioncodec  # noqa: F401
+    import joint12_vla as jv
     from joint12_vla import make_joint12_class
+    from smolvla.bar import SmolVLABlockwiseAR
+    from utils import (STATE_Q01, STATE_Q99, VisionLanguageActionProcessor,
+                       dict_apply, get_cfg, prompt_template, seed_everything)
     import hicora_vla as hv
     import k9h_multiarm_gate as k9h
     import k11a_build_hicora_cache as k11a
@@ -367,8 +372,7 @@ def main() -> None:
         meta = json.load(open(mp))
         k9h.check_hicora_meta(meta, args.ckpt, joint_sha,
                               k9h.file_sha12(hv.__file__),
-                              k9h.file_sha12(
-                                  sys.modules["joint12_vla"].__file__))
+                              k9h.file_sha12(jv.__file__))
         k11a.check_fingerprints(meta, dict(
             codebooks_sha1=hashlib.sha1(np.ascontiguousarray(
                 E.cpu().numpy().astype(np.float32)).tobytes()).hexdigest()[:12],
