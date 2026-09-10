@@ -130,6 +130,20 @@ def selftest():
     assert check_arm_policies(dict(ok_map, hicora_s0={"fast"}),
                               strict=False) is False
 
+    # --- один прогон на один анализ ----------------------------------------
+    # ДЫРКА ДВУХ НЕДОСЧИТАННЫХ ПРОГОНОВ: ключи не столкнутся, и пул из двух
+    # машин прошёл бы. Тег — единственный признак: машина в ячейке не пишется.
+    assert check_single_run_tag(["k11e"] * 5)
+    assert check_single_run_tag([None, None])
+    assert check_single_run_tag([])
+    try:
+        check_single_run_tag(["k11e", "k11e", "k11e_b"])
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("смесь прогонов принята")
+    assert check_single_run_tag(["k11e", "k11e_b"], allow=True) is False
+
     # --- обязательный набор рук --------------------------------------------
     # ДЕФЕКТ ОБЩЕГО АГРЕГАТОРА: проверки сверяют найденные руки между собой и
     # словарь из одной руки принимают. Для K-11e это недосчитанный прогон.
@@ -226,7 +240,8 @@ def selftest():
         else:
             raise AssertionError(f"сиды {a}/{b} приняты")
 
-    print("самопроверка пройдена: обязательный набор рук требуется целиком, "
+    print("самопроверка пройдена: смесь прогонов отвергается, "
+          "обязательный набор рук требуется целиком, "
           "руки делят один черновик и различаются "
           "только сидом, карта меток отвергает единообразную подмену "
           "руки, не записанную политику и смесь; Макнемар точный, кластерный бутстрап шире "
@@ -313,6 +328,29 @@ def check_hicora_replication(hic_by_arm):
             + "\n    ".join(bad)
             + "\n  Тогда это не репликация, и «выполнить на обоих» ничего не "
               "удостоверяет.")
+    return True
+
+
+def check_single_run_tag(tags, allow=False):
+    """Все ячейки одного анализа обязаны нести ОДИН run_tag.
+
+    ЗАЧЕМ. `run_tag` входит в ключ пары, поэтому ПОЛНОЕ смешение двух прогонов
+    ловится как дубль ячейки. Но два НЕДОСЧИТАННЫХ прогона не столкнутся
+    ключами вовсе: 27 групп с одной машины и 27 с другой дадут 54 законные с
+    виду группы. Версия стенда, чекпойнт, черновик и головы у них совпадут, а
+    `device` у обеих машин будет `cuda:0` — машина в ячейке не записана.
+    Единственный надёжный признак — сам тег, и он обязан быть один.
+    """
+    t = sorted(x for x in tags if x is not None)
+    if len(set(t)) > 1:
+        if allow:
+            print(f"  ВНИМАНИЕ: ячейки от РАЗНЫХ прогонов: {sorted(set(t))}")
+            return False
+        raise SystemExit(
+            f"ЯЧЕЙКИ ОТ РАЗНЫХ ПРОГОНОВ: {sorted(set(t))}\n"
+            "  Объединять их нельзя: это разные машины или разные условия, и\n"
+            "  зарегистрированное правило относится к ОДНОМУ прогону.\n"
+            "  Если смешение намеренное — --allow-mixed-tags.")
     return True
 
 
@@ -420,6 +458,11 @@ def main() -> None:
                     help="читать ячейки без rollout_seed и смешивать версии "
                          "скрипта. Гарантии при этом слабее заявленных; "
                          "нужен для файлов, снятых до введения поля (K-9d).")
+    ap.add_argument("--allow-mixed-tags", action="store_true",
+                    help="разрешить ячейки от разных run_tag в одном анализе. "
+                         "Нужен только для намеренного разбора нескольких "
+                         "прогонов; для зарегистрированного правила смесь "
+                         "означает, что часть пар посчитана на другой машине")
     ap.add_argument("--require-arms", default=None,
                     help="метки через запятую, которые ОБЯЗАНЫ найтись в "
                          "прочитанных ячейках. Без флага агрегатор сверяет "
@@ -469,9 +512,11 @@ def main() -> None:
     fp_by_arm, pol_by_arm = defaultdict(set), defaultdict(set)
     hic_by_arm = {}
     vlasha = set()
+    tags = set()
     for f in files:
         d = json.load(open(f))
         shas.add(d.get("script_sha1", "?")); ckpts.add(d.get("ckpt", "?"))
+        tags.add(d.get("run_tag"))
         if args.field not in d:
             raise SystemExit(
                 f"в {f} нет поля «{args.field}» — файл получен другим "
@@ -538,6 +583,9 @@ def main() -> None:
         print(f"  ВНИМАНИЕ: файлы получены РАЗНЫМИ версиями скрипта: {shas}")
     if len(ckpts) > 1:
         raise SystemExit(f"разные чекпойнты в одном сравнении: {ckpts}")
+    check_single_run_tag(tags, allow=args.allow_mixed_tags)
+    if len(tags) == 1:
+        print(f"  прогон один: run_tag {sorted(x or '?' for x in tags)[0]}")
     req_arms = tuple(a.strip() for a in args.require_arms.split(",")
                      if a.strip()) if args.require_arms else ()
     if args.require_arms and not req_arms:
