@@ -228,6 +228,14 @@ def main() -> None:
             f"  Подобрать порог под измеренное — то же, что выбрать гипотезу "
             f"после данных.\n  Осознанно: --allow-nonstandard-threshold")
 
+    # КОРЕНЬ ActionCodec ДОБАВЛЯЕТСЯ ДО ИМПОРТОВ. Раньше он добавлялся ниже,
+    # и `import actioncodec` падал с ModuleNotFoundError: пакет лежит в
+    # third_party и в sys.path сам по себе не попадает. Так же устроен K-9i.
+    root = os.path.abspath(args.root)
+    if not os.path.isdir(root):
+        raise SystemExit(f"нет каталога ActionCodec: {root}")
+    sys.path.insert(0, root)
+
     import torch
     from actioncodec.utils import get_cfg, seed_everything, dict_apply
     from actioncodec.models.smolvla_bar import SmolVLABlockwiseAR
@@ -248,8 +256,6 @@ def main() -> None:
                 f"на {dev} свободно {free_b / 2 ** 30:.1f} ГБ: чужая нагрузка "
                 f"исказит замер. --allow-busy-gpu, если так и задумано")
 
-    root = os.path.abspath(args.root)
-    sys.path.insert(0, root)
     seed_everything(0)
     cfg = get_cfg(os.path.join(root, args.cfg_path))
     cfg.TRAINING.ckpt_dir = args.ckpt
