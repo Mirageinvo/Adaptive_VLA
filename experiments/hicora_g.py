@@ -95,6 +95,26 @@ def make_gaussian_residual_head():
         def std(self):
             return torch.exp(self.log_std_eff())
 
+        @torch.no_grad()
+        def project_log_std_(self, margin=1e-3):
+            """Вернуть сырой параметр СТРОГО ВНУТРЬ диапазона ПОСЛЕ шага.
+
+            ЗАЧЕМ. `clamp` в forward даёт нулевой градиент за пределом: если
+            оптимизатор однажды вынес сырой log_std наружу, параметр там и
+            останется навсегда, а sigma молча замрёт на границе.
+
+            ПОЧЕМУ С ОТСТУПОМ, А НЕ НА ГРАНИЦУ. Проверено: при значении РОВНО
+            на границе градиент clamp всё ещё нулевой, то есть проекция на
+            границу обучение не возобновляет. Поэтому отступ внутрь — не
+            косметика, а условие работоспособности. Вызывать в PPO сразу за
+            optimizer.step().
+            """
+            m = float(margin)
+            if not (0.0 < m < (self.LOG_STD_MAX - self.LOG_STD_MIN) / 2.0):
+                raise ValueError(f"отступ {m} вне допустимого")
+            self.log_std.clamp_(self.LOG_STD_MIN + m, self.LOG_STD_MAX - m)
+            return self
+
         def mean_coeffs(self, h, z0):
             """Средние ДО tanh. Именно это и есть `mu`.
 
@@ -377,6 +397,41 @@ def selftest():
         assert torch.allclose(torch.exp(ocl["log_std"]), ocl["std"],
                               atol=1e-9)
 
+    # --- ПРОЕКЦИЯ ПОСЛЕ ШАГА: clamp на границе даёт нулевой градиент --------
+    # Без проекции параметр, однажды вынесенный за предел, остался бы там
+    # навсегда, а sigma замерла бы на границе молча.
+    gp = _mk(Gh)
+    with torch.no_grad():
+        gp.log_std.fill_(50.0)
+    assert float(gp.log_std.max()) == 50.0, "сырой параметр должен быть снаружи"
+    op = gp(h_, z_)
+    (-op["log_prob_u"].mean()).backward()
+    assert float(gp.log_std.grad.abs().max()) == 0.0, \
+        "на границе градиент обязан быть нулевым — иначе проекция не нужна"
+    gp.project_log_std_()
+    assert gp.log_std.max() < Gh.LOG_STD_MAX, "проекция ровно на границу"
+    assert float(gp.log_std.max()) > Gh.LOG_STD_MAX - 1e-2
+    gp.zero_grad(set_to_none=True)
+    op2 = gp(h_, z_)
+    (-op2["log_prob_u"].mean()).backward()
+    assert float(gp.log_std.grad.abs().max()) > 0.0, \
+        "после проекции обучение должно возобновиться"
+    with torch.no_grad():
+        gp.log_std.fill_(-50.0)
+    gp.project_log_std_()
+    assert gp.log_std.min() > Gh.LOG_STD_MIN
+    gp.zero_grad(set_to_none=True)
+    op3 = gp(h_, z_)
+    (-op3["log_prob_u"].mean()).backward()
+    assert float(gp.log_std.grad.abs().max()) > 0.0, "нижняя граница"
+    for bad in (0.0, -1.0, 10.0):
+        try:
+            gp.project_log_std_(margin=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"отступ {bad} принят")
+
     print("самопроверка hicora_g пройдена: D1 грузится в среднюю ветвь и "
           "даёт\n  побитово то же в детерминированном режиме; нулевое "
           "тождество держится для\n  среднего, а сэмплы ненулевые; предел "
@@ -384,7 +439,9 @@ def selftest():
           "sigma; log pi(u) сходится с Normal и с\n  TanhTransform; "
           "переданный u не пересэмплируется; в z0 градиент не идёт;\n  "
           "log_std ограничен с обеих сторон и возвращается обрезанным;\n  "
-          "градиент обновления PPO идёт через mu и log_std при постоянном u")
+          "градиент обновления PPO идёт через mu и log_std при постоянном u;\n  "
+          "project_log_std_ возвращает параметр с границы, где градиент "
+          "нулевой")
 
 
 if __name__ == "__main__":
