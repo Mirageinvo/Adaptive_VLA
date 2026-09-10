@@ -82,9 +82,18 @@ def make_gaussian_residual_head():
                     f"границы, и обучение начиналось с обрезанного градиента")
             self.log_std = nn.Parameter(torch.full((self.rank,), v))
 
+        def log_std_eff(self):
+            """ФАКТИЧЕСКИ ИСПОЛЬЗУЕМЫЙ log_std, то есть обрезанный.
+
+            Возвращать сырой параметр было бы ловушкой: sigma считается из
+            обрезанного значения, и диагностика противоречила бы реально
+            исполнявшемуся распределению — например, показывала бы log_std=12
+            там, где политика шла с exp(1).
+            """
+            return self.log_std.clamp(self.LOG_STD_MIN, self.LOG_STD_MAX)
+
         def std(self):
-            return torch.exp(self.log_std.clamp(self.LOG_STD_MIN,
-                                                self.LOG_STD_MAX))
+            return torch.exp(self.log_std_eff())
 
         def mean_coeffs(self, h, z0):
             """Средние ДО tanh. Именно это и есть `mu`.
@@ -103,9 +112,13 @@ def make_gaussian_residual_head():
             [batch, n_pos, rank], и одна поправка на чанк — это ОДНО решение,
             а не n_pos*rank независимых.
             """
-            var = std * std
-            lp = (-0.5 * ((u - mu) ** 2) / var
-                  - torch.log(std)
+            # СЧИТАЕТСЯ В fp32 ВСЕГДА. Под autocast fp16 сумма по 512
+            # координатам теряет точность, а отношение правдоподобий PPO
+            # чувствительно к разнице двух больших почти равных чисел.
+            u32, mu32 = u.float(), mu.float()
+            std32 = std.float()
+            lp = (-0.5 * ((u32 - mu32) ** 2) / (std32 * std32)
+                  - torch.log(std32)
                   - 0.5 * float(np.log(2.0 * np.pi)))
             return lp.flatten(1).sum(-1)
 
@@ -146,15 +159,19 @@ def make_gaussian_residual_head():
                     eps = torch.empty_like(mu).normal_(generator=generator)
                     u = mu + std * eps
             else:
-                u = u.to(mu.dtype)
+                # И УСТРОЙСТВО, НЕ ТОЛЬКО dtype: сохранённый сэмпл
+                # приходит из буфера rollout, где он лежит на CPU, а `mu`
+                # считается на карте. Без переноса обновление PPO падало бы.
+                u = u.to(device=mu.device, dtype=mu.dtype)
                 if u.shape != mu.shape:
                     raise ValueError(
                         f"сохранённый u формы {tuple(u.shape)}, ожидалась "
                         f"{tuple(mu.shape)}: это действие от другого состояния")
             c = torch.tanh(u)
             dz = (self.rho * c) @ self.basis.T
-            return dict(mu=mu, log_std=self.log_std, std=std, u=u, coeffs=c,
-                        dz=dz, log_prob_u=self.log_prob_u(u, mu, std))
+            return dict(mu=mu, log_std=self.log_std_eff(), std=std, u=u,
+                        coeffs=c, dz=dz,
+                        log_prob_u=self.log_prob_u(u, mu, std))
 
     return GaussianResidualHead
 
@@ -284,6 +301,37 @@ def selftest():
         "градиент прошёл в z0"
     assert g.basis.grad is None and g.rho.grad is None, "базис или rho учатся"
 
+    # --- 7b. ГРАДИЕНТ PPO-ОБНОВЛЕНИЯ: ПУТЬ score-function -----------------
+    # Пункт 7 смешивал log_prob с dz.sum() и брал репараметризованный `u`,
+    # поэтому проходил бы и при сломанном score-function пути: градиент
+    # дотекал бы через сам сэмпл. На обновлении PPO `u` — КОНСТАНТА из
+    # буфера, и градиент обязан идти только через mu и log_std.
+    g7 = _mk(Gh)
+    for p_ in list(g7.net.parameters()) + list(g7.proj.parameters()):
+        torch.nn.init.normal_(p_, 0.0, 0.3)
+    with torch.no_grad():
+        u_buf = g7(h_, z_)["u"].detach().clone()
+    assert not u_buf.requires_grad
+    g7.zero_grad(set_to_none=True)
+    o7 = g7(h_, z_, u=u_buf)
+    assert o7["u"].grad_fn is None, "переданный u попал в граф"
+    (-o7["log_prob_u"].mean()).backward()
+    assert g7.log_std.grad is not None
+    assert torch.isfinite(g7.log_std.grad).all()
+    assert float(g7.log_std.grad.abs().max()) > 0.0, "log_std не учится"
+    for nm_, p_ in g7.named_parameters():
+        if nm_.startswith(("proj.", "net.")):
+            assert p_.grad is not None and torch.isfinite(p_.grad).all(), nm_
+    assert float(g7.net[-1].weight.grad.abs().max()) > 0.0, \
+        "средняя ветвь не учится от log_prob"
+    # КОНТРОЛЬ: без градиента по mu путь был бы мёртв. Отцепив mu, требуем
+    # нуля — иначе тест не различал бы рабочий и сломанный случай.
+    g7.zero_grad(set_to_none=True)
+    o7b = g7(h_, z_, u=u_buf)
+    (-g7.log_prob_u(u_buf, o7b["mu"].detach(), o7b["std"]).mean()).backward()
+    assert g7.net[-1].weight.grad is None or \
+        float(g7.net[-1].weight.grad.abs().max()) == 0.0
+
     # --- 8. log_prob_c ПРОТИВ TransformedDistribution ---------------------
     with torch.no_grad():
         o8 = g(h_, z_)
@@ -314,8 +362,20 @@ def selftest():
     with torch.no_grad():
         g.log_std.fill_(100.0)
         assert float(g.std().max()) <= float(np.exp(Gh.LOG_STD_MAX)) + 1e-6
+        # ВОЗВРАЩАЕТСЯ ОБРЕЗАННЫЙ log_std, А НЕ СЫРОЙ ПАРАМЕТР. Иначе
+        # диагностика показывала бы log_std=100 там, где политика шла с
+        # exp(1), и записанное в лог распределение не было бы исполнявшимся.
+        ocl = g(h_, z_, deterministic=True)
+        assert float(ocl["log_std"].max()) <= Gh.LOG_STD_MAX + 1e-6, \
+            "вернулся необрезанный log_std"
+        assert torch.allclose(torch.exp(ocl["log_std"]), ocl["std"],
+                              atol=1e-6), "log_std и std не согласованы"
         g.log_std.fill_(-100.0)
         assert float(g.std().min()) >= float(np.exp(Gh.LOG_STD_MIN)) - 1e-12
+        ocl = g(h_, z_, deterministic=True)
+        assert float(ocl["log_std"].min()) >= Gh.LOG_STD_MIN - 1e-6
+        assert torch.allclose(torch.exp(ocl["log_std"]), ocl["std"],
+                              atol=1e-9)
 
     print("самопроверка hicora_g пройдена: D1 грузится в среднюю ветвь и "
           "даёт\n  побитово то же в детерминированном режиме; нулевое "
@@ -323,7 +383,8 @@ def selftest():
           "||dz|| <= ||rho|| выполняется и на\n  сэмплах при насыщающей "
           "sigma; log pi(u) сходится с Normal и с\n  TanhTransform; "
           "переданный u не пересэмплируется; в z0 градиент не идёт;\n  "
-          "log_std ограничен с обеих сторон")
+          "log_std ограничен с обеих сторон и возвращается обрезанным;\n  "
+          "градиент обновления PPO идёт через mu и log_std при постоянном u")
 
 
 if __name__ == "__main__":
