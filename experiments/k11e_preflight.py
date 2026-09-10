@@ -28,9 +28,9 @@ import sys
 # расхождение означает другой код, и складывать такие прогоны нельзя.
 EXPECT_SHA = {
     "experiments/k9h_multiarm_gate.py": "c9235b6cc1f8",
-    "experiments/k6h_summarize.py": "a52cb228f16b",
+    "experiments/k6h_summarize.py": "5d4335cc4503",
     "experiments/k11e_protocol.py": "764e8d5775a5",
-    "experiments/run_k11e_gate.sh": "c90ab216fec7",
+    "experiments/run_k11e_gate.sh": "210fb35b25fe",
     "experiments/k11e_precheck.py": "b7199e6ff39c",
 }
 CKPT = "ZibinDong/SmolVLM2-2.2B-ActionCodec-BAR-LIBERO"

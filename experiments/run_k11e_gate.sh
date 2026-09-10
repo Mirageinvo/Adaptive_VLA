@@ -148,6 +148,12 @@ summ hicora_s0 joint12  "$ANA/an_s0_vs_joint12.json"  || exit 1
 summ hicora_s0 coarse24 "$ANA/an_s0_vs_coarse24.json" || exit 1
 summ hicora_s1 joint12  "$ANA/an_s1_vs_joint12.json"  || exit 1
 summ hicora_s1 coarse24 "$ANA/an_s1_vs_coarse24.json" || exit 1
+# ОПИСАТЕЛЬНАЯ ОПОРА, В КРИТЕРИЙ НЕ ВХОДИТ. Пара coarse24/fullbar на тех же
+# 400 парах воспроизводит K-9h и показывает, есть ли на наборе запас сверху.
+# Она НЕ участвует в вердикте: итоговый блок читает ровно четыре
+# зарегистрированных файла. Раньше эту строку давала одноразовая команда,
+# то есть в архиве её не было вовсе.
+summ coarse24 fullbar "$ANA/an_coarse24_vs_fullbar.json" || exit 1
 
 # --- ОБЩИЙ ВЕРДИКТ, ИСПОЛНЯЕМЫЙ --------------------------------------------
 python - "$ANA" <<'PY'
@@ -175,12 +181,16 @@ for name, f in files.items():
             bad.append(f"{name} [{tag}]: нижняя граница {lo}, превосходство "
                        f"НЕ доказано")
 print("\n  ИТОГ K-11e")
-print(f"    {'сравнение':>22}{'ячейка':>10}{'разница':>10}{'граница':>10}"
-      f"{'вердикт':>12}")
+# МЕТКА ЯЧЕЙКИ ПЕЧАТАЕТСЯ ОТДЕЛЬНОЙ СТРОКОЙ, а не колонкой: она вида
+# «k11e, ens=on, H=8» и в десять знаков не влезала — название сравнения и
+# метка слипались, а такую таблицу переносят в отчёт как есть.
+tags = sorted({t for _, t, _, _, _ in rows})
+print(f"    набор: {', '.join(tags)}")
+print(f"    {'сравнение':<22}{'разница':>9}{'граница':>9}{'вердикт':>12}")
 for name, tag, mic, lo, ok in rows:
-    print(f"    {name:>22}{tag:>10}"
-          f"{('—' if mic is None else f'{mic:+.1f}'):>10}"
-          f"{('—' if lo is None else f'{lo:+.1f}'):>10}"
+    print(f"    {name:<22}"
+          f"{('—' if mic is None else f'{mic:+.2f}'):>9}"
+          f"{('—' if lo is None else f'{lo:+.2f}'):>9}"
           f"{('превзошла' if ok else 'НЕТ'):>12}")
 if bad:
     print("\n  K-11e НЕ ПРОЙДЕН:")

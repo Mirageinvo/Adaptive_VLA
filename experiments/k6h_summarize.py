@@ -168,6 +168,25 @@ def selftest():
     else:
         raise AssertionError("одна рука вместо пяти принята")
 
+    # --- рука обязана стоять в КАЖДОЙ паре ---------------------------------
+    # check_required_arms пропускает случай «одна ячейка fullbar из сорока»:
+    # для гейтующих сравнений это ловит парность, для описательной руки — нет.
+    keys = [("k11e", "10", t, "on", 8, i) for t in (0, 1) for i in range(3)]
+    full_c = {k: {a: {} for a in K11E} for k in keys}
+    assert check_required_arms_per_key(full_c, K11E)
+    assert check_required_arms_per_key(full_c, ())
+    gap = {k: dict(v) for k, v in full_c.items()}
+    del gap[keys[2]]["fullbar"]
+    try:
+        check_required_arms_per_key(gap, K11E)
+    except SystemExit as e:
+        assert "1 ПАРАХ ИЗ 6" in str(e), str(e)
+    else:
+        raise AssertionError("пропуск руки в одной паре принят")
+    # глобальная проверка этот случай НЕ видит — потому и нужна вторая
+    assert check_required_arms(
+        {a: {"x"} for a in K11E}, K11E), "глобальная должна пройти"
+
     # --- руки обязаны делить один черновик ---------------------------------
     assert check_shared_joint({"joint12": {"wj"}, "hicora_s0": {"wj"},
                               "hicora_s1": {"wj"}, "coarse24": set()})
@@ -241,7 +260,7 @@ def selftest():
             raise AssertionError(f"сиды {a}/{b} приняты")
 
     print("самопроверка пройдена: смесь прогонов отвергается, "
-          "обязательный набор рук требуется целиком, "
+          "обязательный набор рук требуется целиком И в каждой паре, "
           "руки делят один черновик и различаются "
           "только сидом, карта меток отвергает единообразную подмену "
           "руки, не записанную политику и смесь; Макнемар точный, кластерный бутстрап шире "
@@ -328,6 +347,36 @@ def check_hicora_replication(hic_by_arm):
             + "\n    ".join(bad)
             + "\n  Тогда это не репликация, и «выполнить на обоих» ничего не "
               "удостоверяет.")
+    return True
+
+
+def check_required_arms_per_key(cells, required, max_show=6):
+    """Обязательная рука должна стоять в КАЖДОЙ паре, а не найтись вообще.
+
+    ЗАЧЕМ СВЕРХ `check_required_arms`. Та проверяет наличие метки в прочитанном
+    наборе: одной ячейки `fullbar` из сорока ей достаточно. Для четырёх
+    гейтующих сравнений это компенсировано парностью — пара без испытуемой или
+    опорной руки просто не образуется и до статистики не доходит. Но описательная
+    рука в гейт не входит, её пропуски ничем не ловятся, и доля успеха
+    посчиталась бы по другому подмножеству эпизодов, чем у остальных рук.
+    """
+    if not required:
+        return True
+    bad = []
+    for key in sorted(cells):
+        miss = [a for a in required if a not in cells[key]]
+        if miss:
+            bad.append((key, miss))
+    if bad:
+        shown = "\n    ".join(f"{k}: нет {m}" for k, m in bad[:max_show])
+        more = (f"\n    ... и ещё {len(bad) - max_show} пар"
+                if len(bad) > max_show else "")
+        raise SystemExit(
+            f"ОБЯЗАТЕЛЬНАЯ РУКА ОТСУТСТВУЕТ В {len(bad)} ПАРАХ ИЗ "
+            f"{len(cells)}:\n    " + shown + more
+            + "\n  Доля успеха такой руки посчиталась бы по другому "
+              "подмножеству эпизодов,\n  чем у остальных, и сравнение с ней "
+              "перестало бы быть парным.")
     return True
 
 
@@ -591,8 +640,10 @@ def main() -> None:
     if args.require_arms and not req_arms:
         raise SystemExit("--require-arms задан, но пуст: это не проверка")
     check_required_arms(pol_by_arm, req_arms)
+    check_required_arms_per_key(cells, req_arms)
     if req_arms:
-        print(f"  обязательный набор рук найден целиком: {list(req_arms)}")
+        print(f"  обязательный набор рук найден целиком и в каждой из "
+              f"{len(cells)} пар: {list(req_arms)}")
     check_arm_policies(pol_by_arm, strict=not args.allow_arm_policy_mismatch)
     if not args.allow_arm_policy_mismatch:
         check_shared_joint(wsha_by_arm)
