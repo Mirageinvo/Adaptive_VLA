@@ -1,5 +1,11 @@
 """K-11h: стоимость ИМЕННО ТОЙ политики, которая проверена в K-11e.
 
+ЧЕЙ ЭТО СЧЁТ. HiCoRA, joint12 и fullbar исполняются как в K-11e. coarse24
+меряется в ОПТИМИЗИРОВАННОЙ однопроходной реализации, выдающей то же грубое
+действие: в гейте она шла через все три блока generate() и выбрасывала уровни
+1-2, и её тамошнее время не было бы честным comparator. То есть порог 1.10
+сравнивает HiCoRA с ИДЕАЛИЗИРОВАННЫМ coarse24, что строже для нас.
+
 ЧТО МЕРЯЕТСЯ (K-11h-A, зарегистрированный критерий, батч 1):
   fullbar    — 24 слоя, ТРИ прохода, сборка из трёх уровней;
   coarse24   — 24 слоя, ОДИН проход, сборка из уровня 0;
@@ -30,9 +36,11 @@ joint12 и HiCoRA несли лишнюю двухбайтовую копию п
                 K-11e. Стоимость фактически исполнявшейся реализации.
                 Зарегистрированный режим: сравнивать надо то, что считало
                 успех. Память при этом НЕ является архитектурной.
-  uniform     — все веса в одном inference-dtype. Отвечает про АРХИТЕКТУРУ,
-                но это другая реализация, и K-11e её не исполнял. Прогон
-                маркируется как НЕ зарегистрированный.
+  uniform-trunk — единый inference-dtype У СТВОЛА. Название именно такое:
+                голова поправки, кодовые книги и декодер остаются fp32, так
+                что «все веса в одном dtype» было бы неправдой. Отвечает про
+                АРХИТЕКТУРУ, но это другая реализация, и K-11e её не исполнял;
+                прогон маркируется как НЕ зарегистрированный.
 
 ПАМЯТЬ МЕРИТСЯ ОТДЕЛЬНЫМ ПРОЦЕССОМ НА РУКУ. В одном процессе состояния всех
 рук предзагружены на карту, и `max_memory_allocated` не принадлежит ни одной
@@ -237,9 +245,16 @@ def split_estimate(med, decode_med):
     return out
 
 
-def registration(cfg):
-    """Чем прогон отличается от зарегистрированного протокола."""
-    dev = []
+def registration(cfg, files=None, binding=None):
+    """Чем прогон отличается от зарегистрированного протокола.
+
+    Регистрация — это ТРИ условия сразу: режим и повторы как объявлено, все
+    отпечатки входов вычислены, и веса те же, что проверял K-11e.
+    """
+    dev = list(binding or [])
+    for f, v in sorted((files or {}).items()):
+        if not v:
+            dev.append(f"отпечаток {f} не вычислен")
     for k, want in REGISTERED.items():
         got = cfg.get(k)
         if isinstance(want, list):
@@ -253,10 +268,40 @@ def registration(cfg):
     return dict(registered=not dev, deviations=dev)
 
 
-def build_protocol(cfg, files):
+def check_k11e_binding(k11e, files, ckpt):
+    """Зарегистрированный K-11h обязан мерить ВЕСА, проверенные в K-11e.
+
+    ЗАЧЕМ. `REGISTERED` фиксирует режим и число повторов, но не модель, не
+    черновик и не головы: `registration` с чужим `ckpt` и пустыми sha
+    возвращала registered=True. Протокол K-11h пишется прямо перед замером и
+    защищает возобновление, но сам по себе предварительной регистрацией
+    конфигурации не является. Ею является протокол K-11e — он записан ДО
+    гейта и содержит ckpt, sha черновика и обеих голов.
+    """
+    bad = []
+    if not isinstance(k11e, dict) or not k11e:
+        return ["протокол K-11e не прочитан"]
+    for f, key in (("joint12", "joint_sha1"), ("hicora_s0", "head_s0_sha1"),
+                   ("hicora_s1", "head_s1_sha1")):
+        got, want = files.get(f), k11e.get(key)
+        if not got:
+            bad.append(f"{f}: sha не вычислен (файла нет?)")
+        elif not want:
+            bad.append(f"{key} отсутствует в протоколе K-11e")
+        elif got != want:
+            bad.append(f"{f}: sha {got}, в K-11e {want}")
+    if k11e.get("ckpt") and ckpt != k11e["ckpt"]:
+        bad.append(f"ckpt {ckpt!r}, в K-11e {k11e['ckpt']!r}")
+    for f in ("cache", "images", "script"):
+        if not files.get(f):
+            bad.append(f"{f}: отпечаток не вычислен")
+    return bad
+
+
+def build_protocol(cfg, files, binding=None):
     p = dict(cfg)
     p["files"] = files
-    p.update(registration(cfg))
+    p.update(registration(cfg, files, binding))
     return p
 
 
@@ -367,21 +412,59 @@ def selftest():
 
     # --- РЕГИСТРАЦИЯ --------------------------------------------------------
     good = dict(REGISTERED)
-    assert registration(good)["registered"]
+    assert registration(good)["registered"]   # без файлов и привязки
     for k, v in (("reps", 1), ("warmup", 0), ("batches", [1]),
                  ("dtype", "bfloat16"), ("pos_offset", 0),
-                 ("weight_mode", "uniform"), ("max_vs_coarse", 1.5)):
+                 ("weight_mode", "uniform-trunk"), ("max_vs_coarse", 1.5)):
         r = registration(dict(good, **{k: v}))
         assert not r["registered"] and any(k in d for d in r["deviations"]), k
-    p = build_protocol(good, {"joint12": "sha"})
-    assert verify_protocol(p, build_protocol(good, {"joint12": "sha"}))
+    # --- ПРИВЯЗКА К ВЕСАМ K-11e ---------------------------------------------
+    # ДЫРА, КОТОРУЮ ЭТО ЗАКРЫВАЕТ: registration с ЧУЖИМ ckpt и пустыми sha
+    # возвращала registered=True. Режим и число повторов ничего не говорят о
+    # том, ЧТО именно мерилось.
+    K11E = dict(ckpt="A/B", joint_sha1="wj", head_s0_sha1="h0",
+                head_s1_sha1="h1")
+    good_f = dict(joint12="wj", hicora_s0="h0", hicora_s1="h1",
+                  cache="c", images="i", script="s")
+    assert check_k11e_binding(K11E, good_f, "A/B") == []
+    assert registration(good, good_f,
+                        check_k11e_binding(K11E, good_f, "A/B"))["registered"]
+    for mut, why in ((dict(joint12="ИНОЙ"), "чужой черновик"),
+                     (dict(hicora_s0="ИНАЯ"), "чужая голова s0"),
+                     (dict(hicora_s1="ИНАЯ"), "чужая голова s1"),
+                     (dict(joint12=None), "sha черновика не вычислен"),
+                     (dict(images=None), "нет отпечатка картинок"),
+                     (dict(cache=None), "нет отпечатка кэша")):
+        b = check_k11e_binding(K11E, dict(good_f, **mut), "A/B")
+        assert b, f"принято: {why}"
+        assert not registration(good, dict(good_f, **mut), b)["registered"]
+    assert check_k11e_binding(K11E, good_f, "ДРУГАЯ/МОДЕЛЬ"), "чужой ckpt"
+    assert not registration(good, good_f, check_k11e_binding(
+        K11E, good_f, "ДРУГАЯ/МОДЕЛЬ"))["registered"]
+    assert check_k11e_binding({}, good_f, "A/B"), "пустой протокол K-11e"
+    for gone in ("joint_sha1", "head_s0_sha1", "head_s1_sha1"):
+        assert check_k11e_binding({k: v for k, v in K11E.items() if k != gone},
+                                  good_f, "A/B"), f"нет {gone} в K-11e"
+
+    p = build_protocol(good, good_f, [])
+    assert verify_protocol(p, build_protocol(good, good_f, []))
     try:
-        verify_protocol(p, build_protocol(dict(good, reps=100),
-                                          {"joint12": "sha"}))
+        verify_protocol(p, build_protocol(dict(good, reps=100), good_f, []))
     except SystemExit:
         pass
     else:
         raise AssertionError("смена reps при возобновлении принята")
+    # ОКРУЖЕНИЕ ТОЖЕ ЗАПЕРТО: другая карта или другой torch — отказ.
+    e0 = dict(good, env=dict(gpu="V100", torch="2.4.1", cuda="12.4"))
+    for mut in (dict(gpu="A100"), dict(torch="2.5.0"), dict(cuda="12.1")):
+        try:
+            verify_protocol(build_protocol(e0, good_f, []),
+                            build_protocol(dict(e0, env=dict(e0["env"], **mut)),
+                                           good_f, []))
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"смена окружения принята: {mut}")
 
     # --- опора K-9i: порог 0.60 ей противоречил -----------------------------
     assert abs(65.1 / 84.7 - 0.7686) < 1e-3
@@ -391,7 +474,8 @@ def selftest():
           "обязателен\n  в зарегистрированном протоколе, порядок рук "
           "сбалансирован точно, веса\n  сверяются в обе стороны, K-11h-B "
           "учитывает второе декодирование,\n  парное отношение снимает общий "
-          "дрейф, смена условий при возобновлении — отказ")
+          "дрейф, регистрация привязана к весам K-11e\n  и отпечаткам входов, "
+          "смена условий или окружения при возобновлении — отказ")
 
 
 # ============================ ИЗМЕРЕНИЕ ====================================
@@ -653,11 +737,11 @@ def make_runner(S, args):
     return apply_weights, run, do_decode
 
 
-def equivalence_check(S, args, batch, arm="hicora_s0",
+def equivalence_check(S, args, batch, arms=HICORA,
                       code_frac=0.01, act_rel=1e-2):
     """Смена dtype не должна менять политику: q0, dz и действия те же.
 
-    ЗАЧЕМ. Режим `uniform` отвечает на архитектурный вопрос, но исполняет НЕ
+    ЗАЧЕМ. Режим `uniform-trunk` отвечает на архитектурный вопрос, но не
     то, что исполнял гейт K-11e. Прежде чем принимать его числа, надо
     показать, что он считает то же самое. Без этой проверки «архитектурная
     стоимость» могла бы относиться к другой политике.
@@ -670,7 +754,7 @@ def equivalence_check(S, args, batch, arm="hicora_s0",
     if S.get("j_state_ref") is None:
         return None
 
-    def once(state):
+    def once(state, arm):
         with torch.no_grad():
             for k, v in state.items():
                 own[k].data = v
@@ -686,24 +770,39 @@ def equivalence_check(S, args, batch, arm="hicora_s0",
                 o["dz"].detach().float().cpu().numpy(),
                 x[..., :7].detach().float().cpu().numpy())
 
-    q_r, dz_r, a_r = once(S["j_state_ref"])
-    q_u, dz_u, a_u = once(S["j_state"])
-    frac = float((q_r != q_u).mean())
-    den = float(np.linalg.norm(a_r)) or 1.0
-    rel_a = float(np.linalg.norm(a_u - a_r) / den)
-    den_d = float(np.linalg.norm(dz_r)) or 1.0
-    rel_dz = float(np.linalg.norm(dz_u - dz_r) / den_d)
-    ok = frac <= code_frac and rel_a <= act_rel
-    print(f"  равносильность uniform против as-executed на {arm}: "
-          f"коды q0 разошлись у {frac:.3%} (порог {code_frac:.1%}), "
-          f"dz отн. {rel_dz:.2e}, действия отн. {rel_a:.2e} "
-          f"(порог {act_rel:.0e}) -> {'да' if ok else 'НЕТ'}")
-    if not ok:
+    res, bad = {}, []
+    for arm in arms:
+        if arm not in S["heads"]:
+            continue
+        q_r, dz_r, a_r = once(S["j_state_ref"], arm)
+        q_u, dz_u, a_u = once(S["j_state"], arm)
+        frac = float((q_r != q_u).mean())
+        rel_a = float(np.linalg.norm(a_u - a_r)
+                      / (np.linalg.norm(a_r) or 1.0))
+        rel_dz = float(np.linalg.norm(dz_u - dz_r)
+                       / (np.linalg.norm(dz_r) or 1.0))
+        ok = frac <= code_frac and rel_a <= act_rel
+        res[arm] = dict(q0_diff_frac=frac, dz_rel=rel_dz, act_rel=rel_a,
+                        n_inputs=int(np.asarray(q_r).shape[0]), ok=bool(ok))
+        print(f"  совпадение на фиксированных входах "
+              f"({res[arm]['n_inputs']} шт), {arm}: коды q0 разошлись у "
+              f"{frac:.3%} (порог {code_frac:.1%}), dz отн. {rel_dz:.2e}, "
+              f"действия отн. {rel_a:.2e} (порог {act_rel:.0e}) -> "
+              f"{'да' if ok else 'НЕТ'}")
+        if not ok:
+            bad.append(arm)
+    if bad:
         raise SystemExit(
-            "СМЕНА DTYPE ИЗМЕНИЛА ПОЛИТИКУ. Числа режима uniform относились "
-            "бы\n  к другой политике, и архитектурным сравнением не были бы.")
-    return dict(q0_diff_frac=frac, dz_rel=rel_dz, act_rel=rel_a, arm=arm,
-                thresholds=dict(code_frac=code_frac, act_rel=act_rel))
+            f"СМЕНА DTYPE СТВОЛА ИЗМЕНИЛА ПОЛИТИКУ на {bad}. Числа режима "
+            f"uniform-trunk\n  относились бы к другой политике.")
+    # FP32-КОПИЯ УДАЛЯЕТСЯ ДО ЗАМЕРА: она нужна была только для сверки.
+    import gc
+    S["j_state_ref"] = None
+    gc.collect()
+    torch.cuda.empty_cache()
+    print("  ЭТО СОВПАДЕНИЕ НА ФИКСИРОВАННЫХ ВХОДАХ, а не эквивалентность "
+          "политики\n  на распределении LIBERO: проверены только эти входы.")
+    return dict(per_arm=res, code_frac=code_frac, act_rel=act_rel)
 
 
 def mem_only(args):
@@ -716,6 +815,17 @@ def mem_only(args):
     apply_weights, run, do_decode = make_runner(S, args)
     batch = S["build"](int(str(args.batches).split(",")[0]))
     apply_weights(arm)
+    # ВСПОМОГАТЕЛЬНЫЕ КОПИИ УДАЛЯЮТСЯ ДО ЗАМЕРА. Иначе процесс держит
+    # base_state (лишние ~1.7 ГиБ в fp16) и, в uniform-trunk, ещё и fp32
+    # j_state_ref (~3.5 ГиБ) — у реально развёрнутой политики их нет, и
+    # peak_mib не был бы памятью развёртывания. Веса уже переданы параметрам
+    # по ссылке, поэтому удаление словарей их не освобождает.
+    import gc
+    S["base_state"] = None
+    S["j_state_ref"] = None
+    S["j_state"] = None
+    gc.collect()
+    torch.cuda.empty_cache()
     for _ in range(3):
         k, pl, nl = run(arm, batch)
         do_decode(k, pl, nl)
@@ -748,15 +858,21 @@ def main() -> None:
     ap.add_argument("--reps", type=int, default=200)
     ap.add_argument("--warmup", type=int, default=20)
     ap.add_argument("--pos-offset", type=int, default=4)
-    ap.add_argument("--weight-mode", choices=["as-executed", "uniform"],
+    ap.add_argument("--weight-mode", choices=["as-executed", "uniform-trunk"],
                     default="as-executed",
                     help="as-executed: веса черновика в fp32 под autocast, "
                          "РОВНО как исполнял гейт K-11e (зарегистрировано). "
-                         "uniform: все веса в одном dtype — отвечает про "
-                         "АРХИТЕКТУРУ, но это другая реализация, и прогон "
-                         "помечается НЕ зарегистрированным")
+                         "uniform-trunk: единый dtype СТВОЛА (голова, книги "
+                         "и декодер остаются fp32) — отвечает про АРХИТЕКТУРУ, "
+                         "но это другая реализация, и прогон помечается НЕ "
+                         "зарегистрированным")
     ap.add_argument("--expect-hicora-target", default="coef")
     ap.add_argument("--proto", default="data/k11h/protocol.json")
+    ap.add_argument("--k11e-proto", default="data/k11e/protocol.json",
+                    help="протокол K-11e. Зарегистрированный K-11h обязан "
+                         "мерить ТЕ ЖЕ веса, что проверял гейт; без совпадения "
+                         "sha черновика, обеих голов и ckpt прогон "
+                         "помечается НЕ зарегистрированным")
     ap.add_argument("--mem-only", default=None,
                     help="внутренний режим: пик памяти одной руки")
     ap.add_argument("--no-mem", action="store_true",
@@ -799,14 +915,38 @@ def main() -> None:
                weight_mode=args.weight_mode,
                max_vs_coarse=MAX_VS_COARSE, min_vs_fullbar=MIN_VS_FULLBAR,
                ckpt=args.ckpt, cache=args.cache)
-    files = {k: (k9h.file_sha12(v) if os.path.exists(v) else None)
+    # ОТПЕЧАТОК КАРТИНОК ОТДЕЛЬНО: хешировался только .npz, а изображения
+    # берутся из .images.npy — незахешированного файла рядом. Подмена картинок
+    # меняла бы формы входа и время, оставаясь незамеченной.
+    import smolvla.bar as _bar
+    import joint12_vla as _jv
+    import hicora_vla as _hv
+    files = {k: (k9h.file_sha12(v) if v and os.path.exists(v) else None)
              for k, v in (("joint12", args.joint12),
                           ("hicora_s0", args.hicora_s0),
                           ("hicora_s1", args.hicora_s1),
                           ("cache", args.cache),
+                          ("images", args.cache + ".images.npy"),
+                          ("bar_py", _bar.__file__),
+                          ("joint12_vla", _jv.__file__),
+                          ("hicora_vla", _hv.__file__),
                           ("script", os.path.abspath(__file__)))}
-    proto = build_protocol(cfg, files)
-    reg = registration(cfg)
+    # ОКРУЖЕНИЕ ВХОДИТ В ПРОТОКОЛ: латентность от него зависит напрямую, и
+    # возобновление на другой карте или другой версии torch — отказ.
+    cfg["env"] = dict(gpu=torch.cuda.get_device_name(dev),
+                      torch=torch.__version__, cuda=str(torch.version.cuda),
+                      cfg_path=args.cfg_path)
+    k11e_path = args.k11e_proto
+    k11e = {}
+    if os.path.exists(k11e_path):
+        k11e = json.load(open(k11e_path))
+    binding = check_k11e_binding(k11e, files, args.ckpt)
+    if binding and args.weight_mode == "as-executed":
+        print(f"  ПРИВЯЗКА К K-11e НЕ СОШЛАСЬ ({k11e_path}):")
+        for b in binding:
+            print(f"    {b}")
+    proto = build_protocol(cfg, files, binding)
+    reg = registration(cfg, files, binding)
     if os.path.exists(args.proto):
         verify_protocol(json.load(open(args.proto)), proto)
         print(f"  протокол сверен: {args.proto}")
@@ -851,11 +991,14 @@ def main() -> None:
                orders=[list(o) for o in orders], batches={})
     out["equivalence"] = None
 
-    if args.weight_mode == "uniform":
-        out_eq = equivalence_check(S, args, S["build"](batches[0]))
+    if args.weight_mode == "uniform-trunk":
+        # НА САМОМ БОЛЬШОМ БАТЧЕ: это все фиксированные входы сразу, а не
+        # первый. Одного входа хватило бы лишь на грубую проверку связности.
+        out_eq = equivalence_check(S, args, S["build"](max(batches)))
     else:
         out_eq = None
 
+    rows_by_batch = {}
     for bs in batches:
         batch = S["build"](bs)
         print(f"\n=== батч {bs} ===")
@@ -941,28 +1084,7 @@ def main() -> None:
                          else "  — НЕ внутрь шага 50 мс"))
             print("  ЭТО ОЦЕНКА, НЕ ЗАМЕР: потоковой руки не существует.")
 
-        if not args.no_mem:
-            print("  память: отдельный процесс на руку", flush=True)
-            for name in CONFIGS:
-                cmd = [sys.executable, os.path.abspath(__file__),
-                       "--mem-only", name, "--ckpt", args.ckpt,
-                       "--cache", args.cache, "--joint12", args.joint12,
-                       "--hicora-s0", args.hicora_s0,
-                       "--hicora-s1", args.hicora_s1, "--root", args.root,
-                       "--cfg-path", args.cfg_path, "--device", args.device,
-                       "--dtype", args.dtype, "--batches", str(bs),
-                       "--pos-offset", str(args.pos_offset),
-                       "--weight-mode", args.weight_mode]
-                p = subprocess.run(cmd, capture_output=True, text=True)
-                line = [ln for ln in p.stdout.splitlines()
-                        if ln.startswith("MEMJSON ")]
-                if p.returncode == 0 and line:
-                    row[name]["peak_mib"] = json.loads(
-                        line[-1][len("MEMJSON "):])["peak_mib"]
-                    print(f"    {name:<12}{row[name]['peak_mib']:>8.0f}М")
-                else:
-                    tail = (p.stderr or p.stdout).strip().splitlines()[-2:]
-                    print(f"    {name:<12}  НЕ ИЗМЕРЕНА: {' | '.join(tail)}")
+        rows_by_batch[bs] = row
 
         if bs == PRIMARY_BATCH:
             verd = "ПРОЙДЕН" if gate["passed"] else "НЕ ПРОЙДЕН"
@@ -977,6 +1099,46 @@ def main() -> None:
             split_estimate=sp, is_primary=bool(bs == PRIMARY_BATCH))
 
     out["equivalence"] = out_eq
+
+    # ПАМЯТЬ ПОСЛЕ ВСЕХ ТАЙМИНГОВ. Пока идёт основной процесс, он занимает
+    # карту, и дочерний грузил бы модель рядом с ней: чужого allocator это не
+    # касается, но соседство влияет на чистоту стенда и может дать OOM.
+    n_want = 0 if args.no_mem else len(CONFIGS) * len(batches)
+    n_got = 0
+    if not args.no_mem:
+        print("\n  память: отдельный процесс на руку, после таймингов",
+              flush=True)
+        del S
+        import gc as _gc
+        _gc.collect()
+        torch.cuda.empty_cache()
+        for bs in batches:
+            print(f"    батч {bs}")
+            for name in CONFIGS:
+                cmd = [sys.executable, os.path.abspath(__file__),
+                       "--mem-only", name, "--ckpt", args.ckpt,
+                       "--cache", args.cache, "--joint12", args.joint12,
+                       "--hicora-s0", args.hicora_s0,
+                       "--hicora-s1", args.hicora_s1, "--root", args.root,
+                       "--cfg-path", args.cfg_path, "--device", args.device,
+                       "--dtype", args.dtype, "--batches", str(bs),
+                       "--pos-offset", str(args.pos_offset),
+                       "--weight-mode", args.weight_mode]
+                pr = subprocess.run(cmd, capture_output=True, text=True)
+                ln = [x for x in pr.stdout.splitlines()
+                      if x.startswith("MEMJSON ")]
+                if pr.returncode == 0 and ln:
+                    v = json.loads(ln[-1][len("MEMJSON "):])["peak_mib"]
+                    rows_by_batch[bs][name]["peak_mib"] = v
+                    n_got += 1
+                    print(f"      {name:<12}{v:>8.0f}М")
+                else:
+                    tail = (pr.stderr or pr.stdout).strip().splitlines()[-2:]
+                    print(f"      {name:<12}  НЕ ИЗМЕРЕНА: {' | '.join(tail)}")
+    out["memory_complete"] = bool(args.no_mem or n_got == n_want)
+    out["memory_measured"] = n_got
+    out["memory_expected"] = n_want
+
     prim = out["batches"].get(str(PRIMARY_BATCH))
     if prim is None:
         raise SystemExit(f"батч {PRIMARY_BATCH} не измерялся")
@@ -985,6 +1147,12 @@ def main() -> None:
                     exist_ok=True)
         json.dump(out, open(args.out, "w"), ensure_ascii=False, indent=1)
         print(f"\n  сохранено: {args.out} (сырые времена включены)")
+    if not out["memory_complete"]:
+        print(f"\n  ПАМЯТЬ ИЗМЕРЕНА НЕ ПОЛНОСТЬЮ: {n_got} из {n_want}. "
+              f"Прежде такой прогон\n  печатал «НЕ ИЗМЕРЕНА» и всё равно "
+              f"завершался успехом. Либо разберитесь\n  с падением "
+              f"дочернего процесса, либо запустите с --no-mem осознанно.")
+        raise SystemExit(1)
     tag = "" if reg["registered"] else " [НЕ ЗАРЕГИСТРИРОВАННЫЙ ПРОГОН]"
     if not prim["gate"]["passed"]:
         print(f"\n  K-11h-A НЕ ПРОЙДЕН{tag}. Порог зарегистрирован до "
