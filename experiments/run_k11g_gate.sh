@@ -48,6 +48,8 @@ MAXSTEPS=600
 WAITSTEPS=10
 SEED=0
 SEEDMODE="block"
+MAX_SAT=0.10        # порог насыщения
+MAX_DROP=10.0       # порог падения успеха, пп
 
 CELLS="$ROOT/cells"
 ANA="$ROOT/analysis"
@@ -71,7 +73,15 @@ CELL_SHA=$(sha12 experiments/k11g_cell.py)
 HG_SHA=$(sha12 experiments/hicora_g.py)
 HV_SHA=$(sha12 experiments/hicora_vla.py)
 JV_SHA=$(sha12 experiments/joint12_vla.py)
+K9H_SHA=$(sha12 experiments/k9h_multiarm_gate.py)
 OT_SHA=$(sha12 data/pos_offset_table.json)
+# СИД РАСКАТКИ ВЫЧИСЛЯЕТСЯ ТОЙ ЖЕ ФУНКЦИЕЙ, что в воркере, и входит в
+# протокол: иначе «общие начальные состояния» сверялись бы только по хешам.
+ROLL_SEED=$(python3 -c "
+import sys; sys.path.insert(0,'experiments')
+import k9h_multiarm_gate as k9h
+print(k9h.rollout_seed(int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]))" \
+  "$SEED" "$INIT" "$SEEDMODE")
 # res_norm, basis и rho берутся из чекпойнта головы: воркер их и так сверяет,
 # но в протоколе они нужны, чтобы подмена не прошла через пропуск ячейки.
 read -r RN_SHA BS_SHA RH_SHA <<<"$(python3 - "$H_S0" <<'PY'
@@ -87,11 +97,34 @@ SIG_JSON=$(python3 -c "
 import sys; print('[' + ','.join(str(float(x)) for x in sys.argv[1].split()) + ']')" "$SIGMAS")
 TASK_JSON=$(python3 -c "
 import sys; print('[' + ','.join(sys.argv[1].split()) + ']')" "$TASKS")
-CFG=$(printf '{"run_tag":"%s","ckpt":"%s","suite":"%s","tasks":%s,"sigmas":%s,"n_envs":%d,"init_start":%d,"eps_salt":%d,"horizon":%d,"max_steps":%d,"waiting_steps":%d,"ensemble":"off","seed":%d,"rollout_seed_mode":"%s","preprocess":"CenterCrop(196)->Resize(224)","image_size":224,"dtype":"float16","joint_sha1":"%s","head_s0_sha1":"%s","head_s1_sha1":"%s","res_norm_sha1":"%s","basis_sha1":"%s","rho_sha1":"%s","offset_table_sha1":"%s","cell_script_sha1":"%s","hicora_g_sha1":"%s","hicora_vla_sha1":"%s","joint12_vla_sha1":"%s","min_rms":0.01}' \
+CFG=$(printf '{"run_tag":"%s","ckpt":"%s","suite":"%s","tasks":%s,"sigmas":%s,"n_envs":%d,"init_start":%d,"eps_salt":%d,"horizon":%d,"max_steps":%d,"waiting_steps":%d,"ensemble":"off","seed":%d,"rollout_seed_mode":"%s","rollout_seed":%s,"device":"%s","preprocess":"CenterCrop(196)->Resize(224)","image_size":224,"dtype":"float16","joint_sha1":"%s","head_s0_sha1":"%s","head_s1_sha1":"%s","res_norm_sha1":"%s","basis_sha1":"%s","rho_sha1":"%s","offset_table_sha1":"%s","cell_script_sha1":"%s","hicora_g_sha1":"%s","hicora_vla_sha1":"%s","joint12_vla_sha1":"%s","k9h_sha1":"%s","min_rms":0.01,"max_sat":%s,"max_drop_pp":%s}' \
   "$TAG" "$CKPT" "$SUITE" "$TASK_JSON" "$SIG_JSON" "$NENV" "$INIT" \
   "$EPS_SALT" "$HORIZON" "$MAXSTEPS" "$WAITSTEPS" "$SEED" "$SEEDMODE" \
+  "$ROLL_SEED" "$DEV" \
   "$J_SHA" "$S0_SHA" "$S1_SHA" "$RN_SHA" "$BS_SHA" "$RH_SHA" "$OT_SHA" \
-  "$CELL_SHA" "$HG_SHA" "$HV_SHA" "$JV_SHA")
+  "$CELL_SHA" "$HG_SHA" "$HV_SHA" "$JV_SHA" "$K9H_SHA" \
+  "$MAX_SAT" "$MAX_DROP")
+
+# --- ПРЕФЛАЙТ: ХВАТАЕТ ЛИ НАЧАЛЬНЫХ СОСТОЯНИЙ -------------------------------
+# До записи протокола, а не после: иначе protocol.json зафиксировал бы
+# INIT=40, а первая же ячейка упала бы на отсутствующем состоянии.
+PYTHONPATH="$HOME/LIBERO" python3 - "$SUITE" "$INIT" "$NENV" "$TASKS" <<'PREFLIGHT' || exit 1
+import sys
+from libero.libero import benchmark
+suite_arg, init, nenv = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+tasks = [int(x) for x in sys.argv[4].split()]
+name = suite_arg if suite_arg.startswith("libero_") else f"libero_{suite_arg}"
+suite = benchmark.get_benchmark_dict()[name]()
+need = init + nenv
+have = {t: len(suite.get_task_init_states(t)) for t in tasks}
+print(f"  начальных состояний: нужно {need}, минимум по задачам "
+      f"{min(have.values())}")
+bad = {t: n for t, n in have.items() if n < need}
+if bad:
+    raise SystemExit(
+        f"НЕ ХВАТАЕТ НАЧАЛЬНЫХ СОСТОЯНИЙ для init_state_id {init}..{need-1}: "
+        f"{bad}\n  Смените INIT на существующий блок ДО записи протокола.")
+PREFLIGHT
 
 python3 experiments/k11g_protocol.py init --proto "$PROTO" --cells "$CELLS" \
   --cfg "$CFG" || exit 1

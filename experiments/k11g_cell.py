@@ -1,8 +1,8 @@
 """K-11g: одна ячейка окна исследования HiCoRA-G. Один процесс — одна ячейка.
 
 ЯЧЕЙКА = (голова, sigma, задача). Пять эпизодов с общими начальными
-состояниями. Полный пилот — 2 головы x 5 sigma x 10 задач = 100 ячеек,
-500 эпизодов.
+состояниями. Полный гейт — 2 головы x 7 sigma x 10 задач = 140 ячеек,
+700 эпизодов.
 
 ПОЧЕМУ ОТДЕЛЬНЫЙ ПРОЦЕСС НА ЯЧЕЙКУ, А НЕ ОДИН ПРОГОН. Сто загрузок модели
 дороже, но между руками не переносится ничего: ни состояние ГСЧ, ни log_std,
@@ -60,10 +60,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # даёт около 0.6% и порога исследования не достигает, а 0.10 уже уронила успех
 # одной головы. Точка между ними нужна, поэтому добавлены 0.05 и 0.07.
 SIGMAS = (0.0, 0.03, 0.05, 0.07, 0.10, 0.30, 0.50)
-# ЗАРЕГИСТРИРОВАННЫЙ ПОРОГ ИССЛЕДОВАНИЯ. Ниже 1% диапазона канала изменение
-# сопоставимо с дрожанием самого декодера, и «шум меняет поведение» было бы
-# утверждением о численном шуме. Выбран ДО регистрации и из этого основания, а
-# не из того, что дала какая-либо sigma.
+# ПОРОГ ИССЛЕДОВАНИЯ. Зафиксирован ПОСЛЕ пилотного smoke на задаче 0, но ДО
+# прогона на отложенных состояниях, и так и должен описываться. Величина 1%
+# диапазона канала выбрана как порядок, ниже которого изменение действия
+# считать поведенческим нет оснований; НЕЗАВИСИМО измеренного «дрожания
+# декодера» у нас нет, и ссылаться на него было бы выдумкой.
 MIN_RMS = 0.01
 CHANGE_LADDER = (0.01, 0.05, 0.10, 0.20)   # диагностика, НЕ критерий
 HEADS = ("s0", "s1")
@@ -265,8 +266,18 @@ def check_cell_self(cell):
             bad.append(f"pair_key {e.get('pair_key')!r} вместо {want_k!r}")
             break
     rec = summarize(cell["chunks"], cell["episodes"], cell["mode"])
+    # ГЕЙТУЮЩИЕ ПОЛЯ СВЕРЯЮТСЯ ТОЖЕ. Прежде rms_median, rms_per_episode и
+    # лестница не пересчитывались, и подмена rms_median на 0.999 проходила —
+    # то есть ячейка могла объявить исследование там, где его нет.
+    if rec["rms_per_episode"] != list(cell["summary"].get("rms_per_episode")
+                                      or []):
+        bad.append("rms_per_episode не пересчитывается из строк")
+    if sorted((cell["summary"].get("changed_frac_ladder") or {}).items()) != \
+            sorted(rec["changed_frac_ladder"].items()):
+        bad.append("лестница изменения не пересчитывается из строк")
     for k in ("chunks", "successes", "changed_frac", "grip_flip_frac",
-              "sat_frac_mean", "dz_frac_max", "invariants_ok"):
+              "sat_frac_mean", "dz_frac_max", "invariants_ok",
+              "rms_median", "rms_flat_median"):
         a, b = rec[k], cell["summary"].get(k)
         same = (a == b) if isinstance(a, (bool, int)) else \
             (b is not None and abs(float(a) - float(b)) < 1e-9)
@@ -444,6 +455,29 @@ def selftest():
         pass
     else:
         raise AssertionError("эпизод без init_hash_full принят")
+    # ПОДМЕНЁННЫЙ ГЕЙТУЮЩИЙ rms_median. Воспроизведённый обход: сырой RMS
+    # 0.002, в сводке 0.999 — прежде проходило, и ячейка объявляла бы
+    # исследование там, где его нет.
+    c = mk()
+    c["summary"] = dict(c["summary"], rms_median=0.999)
+    try:
+        check_cell_self(c)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("подменённый rms_median принят")
+    for fld, val in (("rms_per_episode", [0.9] * 5),
+                     ("changed_frac_ladder", {"0.01": 1.0}),
+                     ("rms_flat_median", 0.5)):
+        c = mk()
+        c["summary"] = dict(c["summary"], **{fld: val})
+        try:
+            check_cell_self(c)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"подменённое {fld} принято")
+
     # ЧУЖОЙ КЛЮЧ ПАРЫ: дискордантность считается по нему, и подмена сломала
     # бы сопоставление у агрегатора молча.
     c = mk()
@@ -483,6 +517,20 @@ def selftest():
     assert rms_median(rows2, eps3)[1] == [0.10, 0.02]
     assert rms_median([], eps2) == (0.0, [])
 
+    # --- НАСЫЩЕНИЕ ПРИПИСЫВАЕТСЯ СВОЕЙ СРЕДЕ ------------------------------
+    # Если насыщена только ЗАВЕРШИВШАЯСЯ среда, в активных чанках его быть не
+    # должно. Прежде одно число по батчу приписывалось всем активным, и порог
+    # <10% читал разбавленное чужими средами значение.
+    eps_s = [dict(env_index=i, init_state_id=i, pair_key=f"10|0|{i}",
+                  init_hash="a", init_hash_full="b", success=True,
+                  env_steps=10, policy_calls=1) for i in range(2)]
+    rows_s = [dict(env_index=0, rms=0.02, max=0.05, changed=True,
+                   grip_flip=False, sat_frac=0.0, dz_frac=0.2,
+                   layers_run=24, log_prob_u=-1.0)]
+    assert summarize(rows_s, eps_s, "gaussian")["sat_frac_mean"] == 0.0
+    rows_b = [dict(rows_s[0], sat_frac=0.8)]
+    assert summarize(rows_b, eps_s, "gaussian")["sat_frac_mean"] == 0.8
+
     # --- ЛЕСТНИЦА ПОРОГОВ — ДИАГНОСТИКА, И ОНА НАСЫЩАЕТСЯ ------------------
     # Smoke дал 100% при пороге 1% уже на sigma=0.10, поэтому доля в критерий
     # не входит. Здесь фиксируется, что лестница считается по всем порогам.
@@ -512,7 +560,8 @@ def selftest():
           "из строк; RMS агрегируется чанк->эпизод->эпизоды, и тест "
           "различает это\n  от плоской медианы; лестница порогов — "
           "диагностика; восемь синтетических\n  порч ячейки отвергаются, "
-          "включая отсутствующий eps_sha1 и чужой pair_key")
+          "включая отсутствующий eps_sha1, чужой pair_key\n  и подменённый "
+          "гейтующий rms_median")
 
 
 def main() -> None:
@@ -865,16 +914,28 @@ def main() -> None:
                 if dzn > rho_norm + 1e-4:
                     raise SystemExit(f"||dz|| = {dzn:.4f} превысила предел "
                                      f"{rho_norm:.4f}")
-                sat = float((o_exec["coeffs"].abs() > SAT_THR).float().mean())
-                lp = (None if mode == "deterministic"
-                      else float(o_exec["log_prob_u"].mean()))
+                # ПО КАЖДОЙ СРЕДЕ, А НЕ ПО БАТЧУ. Прежде бралось одно
+                # число по всем средам, включая завершившиеся, и затем
+                # приписывалось каждому активному чанку: порог насыщения
+                # <10% получал значение, разбавленное чужими средами.
+                sat_e = (o_exec["coeffs"].abs() > SAT_THR).float()
+                sat_e = sat_e.flatten(1).mean(-1).detach().cpu().numpy()
+                dz_e = torch.linalg.norm(o_exec["dz"], dim=-1)
+                dz_e = dz_e.flatten(1).max(-1).values.detach().cpu().numpy()
+                lp_e = (None if mode == "deterministic"
+                        else o_exec["log_prob_u"].detach()
+                        .float().cpu().numpy())
                 a_exec = decode_latent(z0 + o_exec["dz"])
                 a_mean = (a_exec if mode == "deterministic"
                           else decode_latent(z0 + o_mean["dz"]))
             for row in chunk_changes(a_exec, a_mean, active, max_act_q,
                                      act_range, h_exec=args.horizon):
-                row.update(call=calls, sat_frac=sat, dz_frac=dzn / rho_norm,
-                           layers_run=n_lay, log_prob_u=lp)
+                i_ = row["env_index"]
+                row.update(call=calls, sat_frac=float(sat_e[i_]),
+                           dz_frac=float(dz_e[i_]) / rho_norm,
+                           layers_run=n_lay,
+                           log_prob_u=(None if lp_e is None
+                                       else float(lp_e[i_])))
                 chunks.append(row)
             calls += 1
             action = np.copy(a_exec)

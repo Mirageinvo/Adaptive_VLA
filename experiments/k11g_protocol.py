@@ -8,8 +8,9 @@
 же МИНИМАЛЬНАЯ sigma, у которой НА ОБЕИХ головах:
     инварианты, паритет и происхождение пройдены;
     rms_median >= 0.01  — медианное изменение действия не ниже 1% диапазона
-        канала. Обоснование не из данных: ниже этого масштаба изменение
-        сопоставимо с дрожанием самого декодера;
+        канала. Порог зафиксирован ПОСЛЕ пилотного smoke на задаче 0, но ДО
+        прогона на отложенных состояниях, и так и описывается; независимо
+        измеренного «дрожания декодера» у нас нет;
     насыщение < 10%;
     падение успеха от СВОЕЙ детерминированной руки <= 10 пп.
 
@@ -21,7 +22,8 @@
 возможен: траектории заметно разные, но все успешны, и дискордантность нуль.
 
 ЭТО ИНЖЕНЕРНЫЙ ФИЛЬТР ДЛЯ ВЫБОРА НАЧАЛЬНОЙ sigma PPO, а не доказательство
-статистической не-худшести. Пятьдесят эпизодов на ячейку интервалов не дают.
+статистической не-худшести: правило не использует интервалов вовсе, а при
+пятидесяти эпизодах на ячейку они были бы широкими.
 
 Запуск:
     python3 experiments/k11g_protocol.py --selftest
@@ -65,6 +67,9 @@ CELL_VS_PROTO = (
     ("hicora_vla_sha1", "hicora_vla_sha1"),
     ("joint12_vla_sha1", "joint12_vla_sha1"),
     ("min_rms", "min_rms"),
+    ("device", "device"),
+    ("k9h_sha1", "k9h_sha1"),
+    ("rollout_seed", "rollout_seed"),
 )
 
 
@@ -98,9 +103,17 @@ def cell_name(task, head, sigma):
 
 def build_protocol(cfg):
     p = dict(cfg)
+    # ПОРОГИ И ВЕРСИИ АНАЛИЗА ТОЖЕ В ПРОТОКОЛЕ. Прежде max_sat и max_drop_pp
+    # жили только константами модуля: после записи протокола их можно было
+    # изменить и получить другой вердикт без единого отказа.
+    p.setdefault("max_sat", MAX_SAT)
+    p.setdefault("max_drop_pp", MAX_DROP)
+    p.setdefault("protocol_script_sha1", sha12(os.path.abspath(__file__)))
     miss = [k for k in ("run_tag", "ckpt", "suite", "tasks", "sigmas",
                         "n_envs", "init_start", "eps_salt", "joint_sha1",
-                        "head_s0_sha1", "head_s1_sha1", "min_rms")
+                        "head_s0_sha1", "head_s1_sha1", "min_rms",
+                        "max_sat", "max_drop_pp", "device", "k9h_sha1",
+                        "rollout_seed")
             if p.get(k) is None]
     if miss:
         raise SystemExit(f"в конфигурации протокола нет полей: {miss}")
@@ -109,9 +122,10 @@ def build_protocol(cfg):
                          "опоры, от которой считается падение успеха")
     if p["head_s0_sha1"] == p["head_s1_sha1"]:
         raise SystemExit("головы s0 и s1 — один файл: это не две руки")
-    if abs(float(p["min_rms"]) - MIN_RMS) > 1e-12:
-        raise SystemExit(f"min_rms={p['min_rms']} вместо "
-                         f"зарегистрированного {MIN_RMS}")
+    for k, want in (("min_rms", MIN_RMS), ("max_sat", MAX_SAT),
+                    ("max_drop_pp", MAX_DROP)):
+        if abs(float(p[k]) - want) > 1e-12:
+            raise SystemExit(f"{k}={p[k]} вместо зарегистрированного {want}")
     return p
 
 
@@ -185,6 +199,43 @@ def check_eps_shared(cells):
     return True
 
 
+def check_shared_initial_states(cells):
+    """Один pair_key — ОДНО фактическое начальное состояние у всех рук.
+
+    ЗАЧЕМ СВЕРХ НЕПУСТОГО init_hash_full. Ячейка требовала лишь наличие хеша,
+    а `discordance` соединяет эпизоды по строке `suite|task|init_state_id`.
+    Значит два РАЗНЫХ фактических состояния под одним номером образовали бы
+    пару, и парное сравнение перестало бы быть парным — молча.
+    """
+    by_key = {}
+    for (hd, sg, t), c in cells.items():
+        for e in c["episodes"]:
+            by_key.setdefault(e["pair_key"], {})[(hd, sg, t)] = (
+                e.get("init_hash_full"), e.get("rollout_seed"))
+    bad = []
+    for k, d in sorted(by_key.items()):
+        hs = {v[0] for v in d.values()}
+        rs = {v[1] for v in d.values()}
+        if None in rs:
+            bad.append(f"{k}: rollout_seed не записан в части эпизодов")
+            rs = {v for v in rs if v is not None}
+        if None in hs or "" in hs:
+            bad.append(f"{k}: init_hash_full отсутствует у "
+                       f"{[a for a, v in d.items() if not v[0]][:3]}")
+        elif len(hs) > 1:
+            bad.append(f"{k}: РАЗНЫЕ начальные состояния, хешей "
+                       f"{len(hs)} на {len(d)} рук")
+        if len(rs) > 1:
+            bad.append(f"{k}: разные сиды раскатки {sorted(rs, key=str)}")
+    if bad:
+        raise SystemExit(
+            "НАЧАЛЬНЫЕ СОСТОЯНИЯ НЕ ОБЩИЕ:\n    " + "\n    ".join(bad[:8])
+            + ("\n    ..." if len(bad) > 8 else "")
+            + "\n  Парное сравнение по номеру состояния тогда соединяло бы "
+              "разные эпизоды.")
+    return True
+
+
 def discordance(test_eps, ref_eps):
     """Парное сравнение исходов по pair_key. Считает АГРЕГАТОР, не воркер.
 
@@ -205,12 +256,18 @@ def discordance(test_eps, ref_eps):
                 paired_diff_pp=100.0 * (win - loss) / len(keys))
 
 
-def pool(cells_of_arm):
-    """Сводка руки по всем задачам. RMS — медиана ПО ЭПИЗОДАМ всех задач."""
+def pool(cells_of_arm, expect_episodes=None):
+    """Сводка руки по всем задачам. RMS — медиана ПО ЭПИЗОДАМ всех задач.
+
+    СВОДКА ЯЧЕЙКИ ПЕРЕСЧИТЫВАЕТСЯ ЗДЕСЬ ЗАНОВО, а не берётся на веру: гейтующий
+    `rms_median` — то самое число, подмена которого меняет вердикт. Воркер его
+    тоже сверяет, но агрегатор обязан не зависеть от честности воркера.
+    """
+    import k11g_cell as kc
     per_ep, sat, dzf, lad, eps_rows = [], [], [], {}, []
     chunks = succ = n_ep = grip = 0
     for c in cells_of_arm:
-        s = c["summary"]
+        s = kc.summarize(c["chunks"], c["episodes"], c["mode"])
         per_ep += list(s.get("rms_per_episode") or [])
         sat.append((s["sat_frac_mean"], s["chunks"]))
         dzf.append(s["dz_frac_max"])
@@ -232,7 +289,8 @@ def pool(cells_of_arm):
         sat_frac_mean=wmean(sat), dz_frac_max=max(dzf) if dzf else 0.0,
         grip_flip_frac=(grip / chunks) if chunks else 0.0,
         changed_frac_ladder={k: wmean(v) for k, v in sorted(lad.items())},
-        invariants_ok=all(c["summary"]["invariants_ok"]
+        invariants_ok=all(kc.summarize(c["chunks"], c["episodes"],
+                                       c["mode"])["invariants_ok"]
                           for c in cells_of_arm),
         episodes_rows=eps_rows)
 
@@ -280,6 +338,8 @@ def selftest():
                sigmas=[0.0, 0.03, 0.05, 0.07, 0.10, 0.30, 0.50], n_envs=5,
                init_start=40, eps_salt=1, joint_sha1="wj",
                head_s0_sha1="h0", head_s1_sha1="h1", min_rms=MIN_RMS,
+               max_sat=MAX_SAT, max_drop_pp=MAX_DROP, device="cuda:0",
+               k9h_sha1="k9", rollout_seed=0,
                horizon=8, max_steps=600, waiting_steps=10, ensemble="off",
                seed=0, rollout_seed_mode="block", preprocess="pp",
                image_size=224, dtype="float16", res_norm_sha1="rn",
@@ -291,6 +351,10 @@ def selftest():
     for mut, why in ((dict(sigmas=[0.03, 0.10]), "нет sigma=0"),
                      (dict(head_s1_sha1="h0"), "одна голова на два сида"),
                      (dict(min_rms=0.001), "иной порог исследования"),
+                     (dict(max_sat=0.5), "иной порог насыщения"),
+                     (dict(max_drop_pp=40.0), "иной порог падения"),
+                     (dict(device=None), "нет карты"),
+                     (dict(k9h_sha1=None), "нет версии k9h"),
                      (dict(joint_sha1=None), "нет поля")):
         try:
             build_protocol(dict(cfg, **mut))
@@ -311,7 +375,7 @@ def selftest():
         eps = [dict(env_index=i, init_state_id=40 + i,
                     pair_key=f"10|{task}|{40 + i}", success=(i < succ),
                     init_hash="a", init_hash_full="b", env_steps=80,
-                    policy_calls=10) for i in range(n)]
+                    policy_calls=10, rollout_seed=0) for i in range(n)]
         c = dict(run_tag="k11g", head=head, sigma=sigma, task_id=task,
                  mode=("deterministic" if sigma == 0.0 else "gaussian"),
                  ckpt="A/B", suite="10", n_envs=n, init_start=40, horizon=8,
@@ -322,16 +386,21 @@ def selftest():
                  res_norm_sha1="rn", basis_sha1="bs", rho_sha1="rh",
                  offset_table_sha1="ot", script_sha1="cs",
                  hicora_g_sha1="hg", hicora_vla_sha1="hv",
-                 joint12_vla_sha1="jv", min_rms=MIN_RMS,
+                 joint12_vla_sha1="jv", min_rms=MIN_RMS, device="cuda:0",
+                 k9h_sha1="k9", rollout_seed=0,
                  eps_sha1=(None if sigma == 0.0 else "E" + str(task)),
-                 parity=dict(ok=True), episodes=eps,
-                 summary=dict(chunks=10, episodes=n, successes=succ,
-                              success=succ / n, rms_median=rms,
-                              rms_per_episode=[rms] * n, sat_frac_mean=sat,
-                              dz_frac_max=0.5, grip_flip_frac=0.05,
-                              changed_frac_ladder={"0.01": 1.0, "0.05": 0.3,
-                                                   "0.1": 0.05, "0.2": 0.0},
-                              invariants_ok=True))
+                 parity=dict(ok=True), episodes=eps)
+        # ФИКСТУРА САМОСОГЛАСОВАНА: сводка считается из строк тем же кодом,
+        # что и в воркере. Иначе агрегатор, который теперь пересчитывает
+        # сводку сам, падал бы на собственной самопроверке.
+        import k11g_cell as kc
+        ch = [dict(call=j // n, env_index=j % n, rms=rms, max=2 * rms,
+                   changed=bool(2 * rms > 0.01), grip_flip=False,
+                   sat_frac=sat, dz_frac=0.5, layers_run=24,
+                   log_prob_u=(None if sigma == 0.0 else -10.0))
+              for j in range(2 * n)]
+        c["chunks"] = ch
+        c["summary"] = kc.summarize(ch, eps, c["mode"])
         if bad:
             c.update(bad)
         return c
@@ -350,6 +419,9 @@ def selftest():
                      (dict(parity=dict(ok=False)), "паритет не сошёлся"),
                      (dict(eps_sha1=None), "нет eps_sha1"),
                      (dict(min_rms=0.001), "иной порог"),
+                     (dict(device="cuda:1"), "иная карта"),
+                     (dict(k9h_sha1="иной"), "иная версия k9h"),
+                     (dict(rollout_seed=7), "иной сид раскатки"),
                      (dict(ensemble="on"), "включён ансамбль")):
         try:
             check_cell(mk_cell(bad=mut), p, "s0", 0.05, 3)
@@ -383,6 +455,74 @@ def selftest():
         pass
     else:
         raise AssertionError("отсутствующий eps_sha1 принят")
+
+    # --- ОБЩИЕ НАЧАЛЬНЫЕ СОСТОЯНИЯ МЕЖДУ РУКАМИ ---------------------------
+    # Непустого хеша мало: пары соединяются по номеру состояния, и разные
+    # фактические состояния под одним номером прошли бы молча.
+    assert check_shared_initial_states(good)
+    bh = dict(good)
+    c_ = mk_cell(head="s1", sigma=0.05, task=0)
+    c_["episodes"][2]["init_hash_full"] = "ДРУГОЕ_СОСТОЯНИЕ"
+    bh[("s1", 0.05, 0)] = c_
+    try:
+        check_shared_initial_states(bh)
+    except SystemExit as e:
+        assert "РАЗНЫЕ начальные состояния" in str(e), str(e)
+    else:
+        raise AssertionError("чужое начальное состояние принято")
+    bs_ = dict(good)
+    c_ = mk_cell(head="s1", sigma=0.05, task=1)
+    c_["episodes"][0]["rollout_seed"] = 999
+    bs_[("s1", 0.05, 1)] = c_
+    try:
+        check_shared_initial_states(bs_)
+    except SystemExit as e:
+        assert "сиды раскатки" in str(e), str(e)
+    else:
+        raise AssertionError("разные сиды раскатки приняты")
+    nh = dict(good)
+    c_ = mk_cell(task=0)
+    c_["episodes"][1]["init_hash_full"] = ""
+    nh[("s0", 0.05, 0)] = c_
+    try:
+        check_shared_initial_states(nh)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("отсутствующий хеш принят")
+
+    # --- ПОРОГИ БЕРУТСЯ ИЗ ПРОТОКОЛА --------------------------------------
+    # Подмена константы модуля после записи протокола не должна менять
+    # вердикт: read_window обязан принимать пороги аргументами.
+    arms_t = {(hd, s_): dict(success=0.9, rms_median=0.012,
+                             sat_frac_mean=0.01, invariants_ok=True)
+              for hd in HEADS for s_ in (0.0, 0.07)}
+    assert read_window(arms_t, min_rms=0.01)["chosen"] == 0.07
+    assert read_window(arms_t, min_rms=0.02)["chosen"] is None
+    assert read_window(arms_t, min_rms=0.01, max_sat=0.005)["chosen"] is None
+    drop_t = dict(arms_t)
+    drop_t[("s0", 0.07)] = dict(success=0.70, rms_median=0.012,
+                                sat_frac_mean=0.01, invariants_ok=True)
+    assert read_window(drop_t, min_rms=0.01, max_drop=10.0)["chosen"] is None
+    assert read_window(drop_t, min_rms=0.01, max_drop=40.0)["chosen"] == 0.07
+
+    # --- ПЕРЕСЧЁТ СВОДКИ АГРЕГАТОРОМ ------------------------------------
+    # Воспроизведённый обход: в сводке ячейки rms_median подменён на 0.999.
+    # pool обязан взять пересчитанное из строк значение, а не записанное.
+    import k11g_cell as kc
+    ep_f = [dict(env_index=i, init_state_id=40 + i, pair_key=f"10|0|{40+i}",
+                 init_hash="a", init_hash_full="b", success=True,
+                 env_steps=80, policy_calls=2, rollout_seed=0)
+            for i in range(2)]
+    ch_f = [dict(call=c, env_index=c % 2, rms=0.002, max=0.004, changed=False,
+                 grip_flip=False, sat_frac=0.0, dz_frac=0.1, layers_run=24,
+                 log_prob_u=-1.0) for c in range(4)]
+    forged = dict(mode="gaussian", episodes=ep_f, chunks=ch_f,
+                  summary=dict(kc.summarize(ch_f, ep_f, "gaussian"),
+                               rms_median=0.999,
+                               rms_per_episode=[0.999, 0.999]))
+    got = pool([forged])["rms_median"]
+    assert abs(got - 0.002) < 1e-12, f"агрегатор поверил подделке: {got}"
 
     # --- дискордантность ----------------------------------------------------
     ref = [dict(pair_key=f"10|0|{i}", success=True) for i in range(10)]
@@ -444,12 +584,14 @@ def selftest():
     assert abs(po["rms_median"] - 0.021) < 1e-9, po["rms_median"]
     assert po["invariants_ok"]
 
-    print("самопроверка k11g_protocol пройдена: протокол требует sigma=0, двух "
-          "разных голов\n  и зарегистрированного порога; ячейка сверяется по "
-          "четырнадцати подменам;\n  поток шума обязан быть общим внутри "
-          "задачи; дискордантность парная и в\n  критерий НЕ входит; окно "
-          "берёт минимальную годную sigma, сравнивает со СВОЕЙ\n  опорой и "
-          "падает от одной негодной головы")
+    print("самопроверка k11g_protocol пройдена: протокол требует sigma=0, "
+          "двух разных голов\n  и зарегистрированных порогов; ячейка "
+          "сверяется по семнадцати подменам; поток\n  шума обязан быть общим "
+          "внутри задачи, начальные состояния и сиды — у всех\n  рук; пороги "
+          "приходят ИЗ ПРОТОКОЛА; агрегатор пересчитывает сводку и не\n  "
+          "верит подделанному rms_median; дискордантность парная и в критерий "
+          "НЕ входит;\n  окно берёт минимальную годную sigma и падает от "
+          "одной негодной головы")
 
 
 def main():
@@ -491,6 +633,11 @@ def main():
         return
 
     proto = load_json(a.proto, "протокол")
+    # ПРОТОКОЛ ПЕРЕПРОВЕРЯЕТСЯ ПРИ ЧТЕНИИ. Пороги теперь берутся из него, и
+    # без этого их можно было бы отредактировать В ФАЙЛЕ после записи и
+    # получить другой вердикт. build_protocol отказывает на любом значении,
+    # кроме зарегистрированного.
+    build_protocol(dict(proto))
     if a.cmd == "check":
         check_cell(load_json(a.cell, "ячейка"), proto, a.head,
                    a.sigma, a.task)
@@ -517,13 +664,25 @@ def main():
             f"  Вердикт по неполному набору относился бы не к "
             f"зарегистрированному пилоту.")
     check_eps_shared(cells)
-    print(f"  ячеек {len(cells)}, поток шума общий внутри каждой задачи")
+    check_shared_initial_states(cells)
+    n_exp = int(proto["n_envs"]) * len(proto["tasks"])
+    print(f"  ячеек {len(cells)}, поток шума общий внутри каждой задачи, "
+          f"начальные состояния общие у всех рук")
 
     arms, disc = {}, {}
     for hd in HEADS:
         for sg in [float(x) for x in proto["sigmas"]]:
-            arms[(hd, sg)] = pool([cells[(hd, sg, t)]
-                                   for t in proto["tasks"]])
+            a_ = pool([cells[(hd, sg, t)] for t in proto["tasks"]])
+            # ОЖИДАЕМОЕ ЧИСЛО ЭПИЗОДОВ — ИЗ ПРОТОКОЛА. Рука, собранная из
+            # меньшего числа эпизодов, дала бы медиану RMS по другому набору.
+            if a_["rms_n_episodes"] != n_exp and float(sg) > 0:
+                raise SystemExit(
+                    f"{hd}, sigma={sg}: RMS посчитан по "
+                    f"{a_['rms_n_episodes']} эпизодам вместо {n_exp}")
+            if a_["episodes"] != n_exp:
+                raise SystemExit(f"{hd}, sigma={sg}: эпизодов "
+                                 f"{a_['episodes']} вместо {n_exp}")
+            arms[(hd, sg)] = a_
     for hd in HEADS:
         for sg in [float(x) for x in proto["sigmas"]]:
             if sg == 0.0:
@@ -531,9 +690,14 @@ def main():
             disc[f"{hd}|{sg}"] = discordance(
                 arms[(hd, sg)]["episodes_rows"],
                 arms[(hd, 0.0)]["episodes_rows"])
-    win = read_window(arms)
-
-    print(f"\n  ОКНО ИССЛЕДОВАНИЯ (правило записано до прогона)")
+    # ПОРОГИ БЕРУТСЯ ИЗ ПРОТОКОЛА, а не из константов модуля: иначе их можно
+    # было изменить после записи протокола и получить другой вердикт.
+    win = read_window(arms, min_rms=float(proto["min_rms"]),
+                      max_sat=float(proto["max_sat"]),
+                      max_drop=float(proto["max_drop_pp"]))
+    print(f"\n  ОКНО ИССЛЕДОВАНИЯ (правило записано до прогона): "
+          f"RMS >= {proto['min_rms']}, насыщение < {proto['max_sat']}, "
+          f"падение <= {proto['max_drop_pp']} пп")
     print(f"    {'sigma':>6}{'голова':>8}{'RMS':>9}{'нас':>7}{'усп':>7}"
           f"{'пад пп':>8}{'иссл':>6}{'без':>5}{'вердикт':>9}")
     for sg in sorted(win["per_sigma"]):
@@ -585,9 +749,10 @@ def main():
         raise SystemExit(1)
     print(f"\n  ОКНО ЕСТЬ. Годные sigma: {win['passing']}; для PPO берём "
           f"МИНИМАЛЬНУЮ: {win['chosen']}")
-    print("  ЭТО ИНЖЕНЕРНЫЙ ФИЛЬТР, НЕ ДОКАЗАТЕЛЬСТВО не-худшести: 50 "
-          "эпизодов на ячейку\n  интервалов не дают. Окончательная оценка RL "
-          "— на НОВЫХ начальных состояниях.")
+    print("  ЭТО ИНЖЕНЕРНЫЙ ФИЛЬТР, НЕ ДОКАЗАТЕЛЬСТВО не-худшести: правило "
+          "не использует\n  интервалов, а при 50 эпизодах на ячейку они были "
+          "бы широкими.\n  Окончательная оценка RL — на НОВЫХ начальных "
+          "состояниях.")
 
 
 if __name__ == "__main__":
