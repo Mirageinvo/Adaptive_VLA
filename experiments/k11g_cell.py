@@ -55,7 +55,17 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-SIGMAS = (0.0, 0.03, 0.10, 0.30, 0.50)
+# СЕТКА PILOT-INFORMED, и так и описывается. Smoke на задаче 0 дал при
+# sigma=0.10 медианный RMS около 2% диапазона; при линейной зависимости 0.03
+# даёт около 0.6% и порога исследования не достигает, а 0.10 уже уронила успех
+# одной головы. Точка между ними нужна, поэтому добавлены 0.05 и 0.07.
+SIGMAS = (0.0, 0.03, 0.05, 0.07, 0.10, 0.30, 0.50)
+# ЗАРЕГИСТРИРОВАННЫЙ ПОРОГ ИССЛЕДОВАНИЯ. Ниже 1% диапазона канала изменение
+# сопоставимо с дрожанием самого декодера, и «шум меняет поведение» было бы
+# утверждением о численном шуме. Выбран ДО регистрации и из этого основания, а
+# не из того, что дала какая-либо sigma.
+MIN_RMS = 0.01
+CHANGE_LADDER = (0.01, 0.05, 0.10, 0.20)   # диагностика, НЕ критерий
 HEADS = ("s0", "s1")
 CHANGE_THR = 0.01      # «существенно» — более 1% диапазона канала
 SAT_THR = 0.99         # |tanh(u)| выше этого — насыщение
@@ -135,6 +145,26 @@ def chunk_changes(sampled, mean, active, max_act_q, act_range,
     return out
 
 
+def rms_median(rows, episodes):
+    """RMS: по чанку -> медиана внутри эпизода -> медиана по эпизодам.
+
+    ПОЧЕМУ ДВУХУРОВНЕВО, А НЕ ПЛОСКО. Неудачный эпизод идёт до max_steps и
+    даёт втрое больше чанков, чем успешный. Плоская медиана по всем чанкам
+    взвесила бы долгие провалы сильнее, и «насколько шум меняет действие»
+    описывало бы в основном их.
+
+    Эпизод без активных чанков в расчёт не входит: мерить в нём нечего.
+    """
+    per_ep = []
+    for e in episodes:
+        v = [r["rms"] for r in rows
+             if r.get("env_index") == e.get("env_index")
+             and r.get("rms") is not None]
+        if v:
+            per_ep.append(float(np.median(v)))
+    return (float(np.median(per_ep)) if per_ep else 0.0), per_ep
+
+
 def summarize(rows, episodes, mode):
     """Сводка ячейки. Считается ТОЛЬКО из сохранённых строк.
 
@@ -158,8 +188,15 @@ def summarize(rows, episodes, mode):
         episodes=len(episodes),
         changed_frac=(len(changed) / n) if n else 0.0,
         grip_flip_frac=(len(grip) / n) if n else 0.0,
-        rms_median=float(np.median(rms)) if rms else 0.0,
+        rms_median=rms_median(rows, episodes)[0],
+        rms_per_episode=rms_median(rows, episodes)[1],
+        rms_flat_median=float(np.median(rms)) if rms else 0.0,
         max_p95=float(np.percentile(mx, 95)) if mx else 0.0,
+        # ЛЕСТНИЦА ПОРОГОВ — ДИАГНОСТИКА. Доля при 1% насыщается (smoke дал
+        # 100% уже при sigma=0.10), поэтому в критерий она не входит.
+        changed_frac_ladder={str(t): (float(np.mean(np.asarray(mx) > t))
+                                      if mx else 0.0)
+                             for t in CHANGE_LADDER},
         sat_frac_mean=float(np.mean(sat)) if sat else 0.0,
         dz_frac_max=float(np.max(dzf)) if dzf else 0.0,
         logp_median=float(np.median(lp)) if lp else None,
@@ -177,7 +214,7 @@ def check_cell_self(cell):
     bad = []
     for f in ("head", "sigma", "mode", "task_id", "init_start", "n_envs",
               "horizon", "episodes", "chunks", "summary", "parity",
-              "rollout_seed", "pos_offset", "preprocess"):
+              "rollout_seed", "pos_offset", "preprocess", "eps_salt"):
         if cell.get(f) is None:
             bad.append(f"нет поля {f}")
     if bad:
@@ -201,6 +238,15 @@ def check_cell_self(cell):
                        f"{cell['sigma']}")
         if not any(r.get("log_prob_u") is not None for r in cell["chunks"]):
             bad.append("в гауссовой ячейке нет ни одного правдоподобия")
+        # ХЕШ eps ПЕРВОГО ВЫЗОВА. Агрегатор потребует его совпадения у всех
+        # ненулевых sigma: это прямая проверка общего потока шума. Восстанав-
+        # ливать eps через (u-mu)/sigma значило бы сравнивать с ошибками
+        # округления.
+        if not cell.get("eps_sha1"):
+            bad.append("в гауссовой ячейке нет eps_sha1: общий поток шума "
+                       "нечем подтвердить")
+    if want_mode == "deterministic" and cell.get("eps_sha1"):
+        bad.append("в детерминированной ячейке записан eps_sha1")
     if len(cell["episodes"]) != int(cell["n_envs"]):
         bad.append(f"эпизодов {len(cell['episodes'])} при n_envs="
                    f"{cell['n_envs']}")
@@ -211,6 +257,13 @@ def check_cell_self(cell):
     if any(not e.get("init_hash_full") for e in cell["episodes"]):
         bad.append("нет init_hash_full: общие начальные состояния не "
                    "подтверждены")
+    # КЛЮЧ ПАРЫ ПИШЕТ ВОРКЕР, дискордантность считает агрегатор: воркер видит
+    # только свою руку и сравнивать ему не с чем.
+    for e in cell["episodes"]:
+        want_k = f"{cell.get('suite')}|{cell['task_id']}|{e['init_state_id']}"
+        if e.get("pair_key") != want_k:
+            bad.append(f"pair_key {e.get('pair_key')!r} вместо {want_k!r}")
+            break
     rec = summarize(cell["chunks"], cell["episodes"], cell["mode"])
     for k in ("chunks", "successes", "changed_frac", "grip_flip_frac",
               "sat_frac_mean", "dz_frac_max", "invariants_ok"):
@@ -299,8 +352,9 @@ def selftest():
             raise AssertionError(f"принято: {why}")
 
     # --- сводка и самопроверка ячейки --------------------------------------
-    def mk(mode="gaussian", sigma=0.10, n=5, nch=12, bad=None):
-        eps_rows = [dict(env_index=i, init_state_id=i, init_hash="a",
+    def mk(mode="gaussian", sigma=0.10, n=5, nch=12, bad=None, suite="10"):
+        eps_rows = [dict(env_index=i, init_state_id=i,
+                         pair_key=f"{suite}|0|{i}", init_hash="a",
                          init_hash_full="b", success=(i < 4), env_steps=80,
                          policy_calls=nch) for i in range(n)]
         ch = []
@@ -309,12 +363,13 @@ def selftest():
                            changed=(c % 3 == 0), grip_flip=False,
                            sat_frac=0.01, dz_frac=0.3, layers_run=24,
                            log_prob_u=(-12.0 if mode == "gaussian" else None)))
-        cell = dict(head="s0", sigma=sigma, mode=mode, task_id=0,
-                    init_start=0, n_envs=n, horizon=H_EXEC,
+        cell = dict(head="s0", sigma=sigma, mode=mode, task_id=0, suite=suite,
+                    init_start=0, n_envs=n, horizon=H_EXEC, eps_salt=0,
                     rollout_seed=7, pos_offset=4, preprocess=PREPROCESS,
                     log_std_set=(math.log(sigma) if mode == "gaussian"
                                  else None),
                     std_check=(sigma if mode == "gaussian" else None),
+                    eps_sha1=("abc123" if mode == "gaussian" else None),
                     episodes=eps_rows, chunks=ch,
                     parity=dict(ok=True, gauss_mean_vs_d1=0.0,
                                 d1_vs_forward_hicora=0.0, layers_run=24))
@@ -334,6 +389,10 @@ def selftest():
 
     # СИНТЕТИЧЕСКИЕ ПОРЧИ: каждая обязана быть отвергнута.
     cases = {
+        "нет eps_sha1 у гауссовой": dict(eps_sha1=None),
+        "eps_sha1 у детерминированной": dict(mode="deterministic", sigma=0.0,
+                                             eps_sha1="abc", log_std_set=None,
+                                             std_check=None),
         "режим не тот": dict(mode="deterministic"),
         "log_std не тот": dict(log_std_set=0.0),
         "std не равна sigma": dict(std_check=0.5),
@@ -385,6 +444,60 @@ def selftest():
         pass
     else:
         raise AssertionError("эпизод без init_hash_full принят")
+    # ЧУЖОЙ КЛЮЧ ПАРЫ: дискордантность считается по нему, и подмена сломала
+    # бы сопоставление у агрегатора молча.
+    c = mk()
+    c["episodes"][2]["pair_key"] = "10|0|99"
+    try:
+        check_cell_self(c)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("чужой pair_key принят")
+
+    # --- RMS: ДВУХУРОВНЕВАЯ АГРЕГАЦИЯ --------------------------------------
+    # Долгий неудачный эпизод даёт больше чанков. Плоская медиана взвесила бы
+    # его сильнее; двухуровневая — нет. Тест различает эти два способа.
+    eps2 = [dict(env_index=0, init_state_id=0, pair_key="10|0|0",
+                 init_hash="a", init_hash_full="b", success=True,
+                 env_steps=10, policy_calls=1),
+            dict(env_index=1, init_state_id=1, pair_key="10|0|1",
+                 init_hash="a", init_hash_full="b", success=False,
+                 env_steps=90, policy_calls=9)]
+    rows2 = ([dict(env_index=0, rms=0.10, max=0.2, changed=True,
+                   grip_flip=False, sat_frac=0.0, dz_frac=0.1, layers_run=24,
+                   log_prob_u=-1.0)]
+             + [dict(env_index=1, rms=0.02, max=0.05, changed=True,
+                     grip_flip=False, sat_frac=0.0, dz_frac=0.1,
+                     layers_run=24, log_prob_u=-1.0) for _ in range(9)])
+    med, per = rms_median(rows2, eps2)
+    assert per == [0.10, 0.02], per
+    assert abs(med - 0.06) < 1e-12, med         # медиана двух медиан
+    flat = float(np.median([r["rms"] for r in rows2]))
+    assert abs(flat - 0.02) < 1e-12, flat       # плоская утонула бы в провале
+    assert abs(med - flat) > 0.03, "тест не различает два способа"
+    # ЭПИЗОД БЕЗ ЧАНКОВ НЕ УЧИТЫВАЕТСЯ
+    eps3 = eps2 + [dict(env_index=2, init_state_id=2, pair_key="10|0|2",
+                        init_hash="a", init_hash_full="b", success=True,
+                        env_steps=0, policy_calls=0)]
+    assert rms_median(rows2, eps3)[1] == [0.10, 0.02]
+    assert rms_median([], eps2) == (0.0, [])
+
+    # --- ЛЕСТНИЦА ПОРОГОВ — ДИАГНОСТИКА, И ОНА НАСЫЩАЕТСЯ ------------------
+    # Smoke дал 100% при пороге 1% уже на sigma=0.10, поэтому доля в критерий
+    # не входит. Здесь фиксируется, что лестница считается по всем порогам.
+    sm = summarize(rows2, eps2, "gaussian")
+    # СВОДКА ОБЯЗАНА БРАТЬ ДВУХУРОВНЕВУЮ МЕДИАНУ, а не плоскую. Без этой
+    # проверки подмена внутри summarize проходила бы: сама rms_median
+    # тестировалась отдельно и оставалась исправной.
+    assert abs(sm["rms_median"] - 0.06) < 1e-12, sm["rms_median"]
+    assert abs(sm["rms_flat_median"] - 0.02) < 1e-12, sm["rms_flat_median"]
+    assert sm["rms_per_episode"] == [0.10, 0.02], sm["rms_per_episode"]
+    lad = sm["changed_frac_ladder"]
+    assert set(lad) == {str(t) for t in CHANGE_LADDER}, lad
+    assert lad["0.01"] == 1.0 and lad["0.1"] == 0.1, lad
+    assert MIN_RMS == 0.01
+
     # НЕ ТЕ СЛОИ
     c = mk()
     c["chunks"][3]["layers_run"] = 12
@@ -396,7 +509,10 @@ def selftest():
           "без log(0) и без\n  фиктивного правдоподобия; изменение считается "
           "по каждому активному чанку,\n  только по первым H шагам, в "
           "реальных единицах, со схватом отдельно;\n  сводка пересчитывается "
-          "из строк, и шесть синтетических порч ячейки\n  отвергаются")
+          "из строк; RMS агрегируется чанк->эпизод->эпизоды, и тест "
+          "различает это\n  от плоской медианы; лестница порогов — "
+          "диагностика; восемь синтетических\n  порч ячейки отвергаются, "
+          "включая отсутствующий eps_sha1 и чужой pair_key")
 
 
 def main() -> None:
@@ -428,6 +544,11 @@ def main() -> None:
     ap.add_argument("--pos-offset", type=int, default=None)
     ap.add_argument("--expect-depth", type=int, default=12)
     ap.add_argument("--expect-hicora-target", default="coef")
+    ap.add_argument("--eps-salt", type=int, default=0,
+                    help="пространство шумовых сидов. Зарегистрированный "
+                         "прогон обязан идти с другой солью, чем пилот: "
+                         "иначе он переиспользовал бы тот же шум на тех же "
+                         "номерах вызовов")
     ap.add_argument("--run-tag", default="k11g")
     ap.add_argument("--out", required=False)
     args = ap.parse_args()
@@ -633,6 +754,7 @@ def main() -> None:
         return x[..., :7].detach().float().cpu().numpy()
 
     chunks = []
+    eps_sha = [None]
     t0 = time.time()
     try:
         n = args.n_envs
@@ -701,8 +823,17 @@ def main() -> None:
                 else:
                     gen = torch.Generator(device=h24.device)
                     gen.manual_seed(eps_seed(args.task_id, args.init_start,
-                                             calls) % (2 ** 63))
+                                             calls, salt=args.eps_salt)
+                                    % (2 ** 63))
                     eps = torch.empty_like(o_mean["mu"]).normal_(generator=gen)
+                    if eps_sha[0] is None:
+                        # ХЕШ САМОГО eps, а не восстановленного (u-mu)/sigma:
+                        # восстановление внесло бы ошибки округления, и
+                        # сравнение потоков между sigma стало бы приблизи-
+                        # тельным там, где оно обязано быть точным.
+                        eps_sha[0] = hashlib.sha1(np.ascontiguousarray(
+                            eps.detach().float().cpu().numpy()
+                        ).tobytes()).hexdigest()[:16]
                     o_exec = gau_h(h24, z0, u=o_mean["mu"]
                                    + float(args.sigma) * eps)
                 # ПАРИТЕТ В КАЖДОЙ ЯЧЕЙКЕ, на НАСТОЯЩЕМ D1 и под autocast.
@@ -756,6 +887,8 @@ def main() -> None:
                 reward = np.clip(reward + r_, 0, 1)
                 steps += 1
         eps_rows = [dict(env_index=i, init_state_id=args.init_start + i,
+                         pair_key=f"{args.task_suite}|{args.task_id}|"
+                                  f"{args.init_start + i}",
                          init_hash=init_hash[i],
                          init_hash_full=init_hash_full[i],
                          success=bool(reward[i] >= 1.0), env_steps=steps,
@@ -774,7 +907,8 @@ def main() -> None:
         waiting_steps=args.waiting_steps, ensemble="off",
         pos_offset=pos_off, offset_table_sha1=off_sha,
         preprocess=PREPROCESS, image_size=224,
-        seed=args.seed, rollout_seed=roll_seed,
+        seed=args.seed, rollout_seed=roll_seed, eps_salt=args.eps_salt,
+        eps_sha1=eps_sha[0], min_rms=MIN_RMS,
         rollout_seed_mode=args.rollout_seed_mode,
         ckpt=args.ckpt, joint_sha1=joint_sha, head_sha1=head_sha,
         res_norm_sha1=rn_sha, basis_sha1=h_obj["basis_sha1"],
@@ -797,12 +931,19 @@ def main() -> None:
     json.dump(cell, open(tmp, "w"), ensure_ascii=False, indent=1)
     os.replace(tmp, args.out)          # АТОМАРНО: оборванная запись не
     s = cell["summary"]                # оставит полуячейку
+    lad = " ".join(f"{k}:{100 * v:.0f}%"
+                   for k, v in sorted(s["changed_frac_ladder"].items(),
+                                      key=lambda kv: float(kv[0])))
     print(f"\n  {args.head}, sigma={args.sigma}, задача {args.task_id}: "
-          f"успех {s['successes']}/{s['episodes']}, чанков {s['chunks']}, "
-          f"изменено {100 * s['changed_frac']:.1f}%, схват "
-          f"{100 * s['grip_flip_frac']:.1f}%, насыщение "
+          f"успех {s['successes']}/{s['episodes']}, чанков {s['chunks']}")
+    print(f"    RMS медиана по эпизодам {s['rms_median']:.4f} "
+          f"(порог исследования {MIN_RMS}), плоская {s['rms_flat_median']:.4f}")
+    print(f"    лестница изменения {lad}  — ДИАГНОСТИКА, не критерий")
+    print(f"    схват {100 * s['grip_flip_frac']:.1f}%, насыщение "
           f"{100 * s['sat_frac_mean']:.2f}%, ||dz||/||rho|| макс "
           f"{s['dz_frac_max']:.3f}, медиана log pi {s['logp_median']}")
+    print(f"    eps первого вызова sha {cell['eps_sha1']}, соль "
+          f"{args.eps_salt}")
     print(f"  сохранено: {args.out} ({cell['minutes']:.1f} мин)")
 
 
