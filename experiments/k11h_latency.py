@@ -343,7 +343,66 @@ def good_f_ph():
                 joint12_vla="j", hicora_vla="h")
 
 
+def check_orchestration(path=None):
+    """Основной путь обязан вызывать тайминги и писать JSON.
+
+    ЗАЧЕМ СТРУКТУРНАЯ ПРОВЕРКА. Вынос таймингов в отдельную функцию был
+    сделан текстовым рефакторингом, и весь хвост `main` — вызов
+    `timing_stage`, замер памяти, сбор и запись JSON — оказался ПОСЛЕ
+    `return` внутри `timing_stage`, то есть недостижим. Команда при этом
+    печатала протокол, порядок рук и завершалась с кодом 0, не измерив
+    ничего и не создав `latency.json`: снаружи выглядело успехом. Ни
+    компиляция, ни проверки чистых функций такого не видят, потому что
+    ломается ОРКЕСТРАЦИЯ, а не вычисление.
+    """
+    import ast
+    path = path or os.path.abspath(__file__)
+    src = open(path).read()
+    tree = ast.parse(src)
+    fns = {n.name: n for n in tree.body
+           if isinstance(n, ast.FunctionDef)}
+    bad = []
+    for need in ("main", "timing_stage", "mem_only", "equivalence_check"):
+        if need not in fns:
+            bad.append(f"нет функции {need}")
+    if bad:
+        raise SystemExit("СТРУКТУРА СЛОМАНА:\n    " + "\n    ".join(bad))
+    ts = fns["timing_stage"]
+    if not isinstance(ts.body[-1], ast.Return):
+        bad.append("в timing_stage есть код ПОСЛЕ return — он недостижим")
+    if sum(isinstance(x, ast.Return) for x in ts.body) != 1:
+        bad.append("в теле timing_stage не ровно один return")
+    m = ast.get_source_segment(src, fns["main"]) or ""
+    for frag, why in (("timing_stage(", "main не вызывает timing_stage"),
+                      ("json.dump(out", "main не пишет итоговый JSON"),
+                      ("--mem-only", "main не запускает замер памяти"),
+                      ("memory_complete",
+                       "main не фиксирует полноту памяти")):
+        if frag not in m:
+            bad.append(why)
+    # ВЕРДИКТ СЧИТАЕТСЯ В ТАЙМИНГАХ, А НЕ В main: требовать read_gate от main
+    # было моей ошибкой, и проверка сама же её показала.
+    t_src = ast.get_source_segment(src, ts) or ""
+    for frag, why in (("read_gate(", "вердикт не считается"),
+                      ("paired_ratio_ci(", "парное отношение не считается"),
+                      ("split_estimate(", "K-11h-B не считается"),
+                      ("rows_by_batch[bs] = row",
+                       "строки батча не возвращаются наружу")):
+        if frag not in t_src:
+            bad.append(why)
+    if "del S" in m:
+        bad.append("в main остался del S: после выноса модели такой "
+                   "переменной там нет, и это NameError")
+    if bad:
+        raise SystemExit("ОСНОВНОЙ ПУТЬ СЛОМАН:\n    " + "\n    ".join(bad)
+                         + "\n  Прогон завершился бы с кодом 0, ничего не "
+                           "измерив.")
+    return True
+
+
 def selftest():
+    # ПЕРВОЙ — ПРОВЕРКА ОРКЕСТРАЦИИ: прочие проверки её поломку не видят.
+    check_orchestration()
     base = dict(coarse24=83.6, fullbar=183.9, joint12=65.0,
                 hicora_s0=90.5, hicora_s1=90.7)
     g = read_gate(base)
@@ -498,7 +557,8 @@ def selftest():
     assert abs(65.1 / 84.7 - 0.7686) < 1e-3
     assert abs(261.0 / 296.8 - 0.8794) < 1e-3
 
-    print("самопроверка k11h пройдена: вердикт по ХУДШЕЙ голове, батч 10 "
+    print("самопроверка k11h пройдена: основной путь вызывает тайминги и "
+          "пишет JSON,\n  вердикт по ХУДШЕЙ голове, батч 10 "
           "обязателен\n  в зарегистрированном протоколе, порядок рук "
           "сбалансирован точно, веса\n  сверяются в обе стороны, K-11h-B "
           "учитывает второе декодирование,\n  парное отношение снимает общий "
@@ -868,6 +928,143 @@ def mem_only(args):
     print("MEMJSON " + json.dumps({"arm": arm, "peak_mib": peak}))
 
 
+def timing_stage(args, dev, dt, orders, batches):
+    """Все тайминги. ОТДЕЛЬНОЙ ФУНКЦИЕЙ РАДИ ОСВОБОЖДЕНИЯ КАРТЫ.
+
+    `del S` в main не освобождал модель: её держали замыкания `apply_weights`
+    (замыкает S целиком), `run` (model) и `do_decode` (codec, E), а также
+    локальные `batch` и последний результат прохода. Дочерние процессы замера
+    памяти поднимались рядом с живой родительской моделью. По возврату из
+    функции все эти ссылки исчезают сами.
+
+    Возвращает (rows_by_batch, batches_out, equivalence, meta).
+    """
+    import torch
+    S = build_stack(args, CONFIGS, dev, dt)
+    apply_weights, run, do_decode = make_runner(S, args)
+
+    print(f"\nруки: {', '.join(CONFIGS)}")
+    print("  ВНИМАНИЕ: потоковая политика здесь НЕ мерится — её нет в коде, "
+          "и успех\n  у неё был бы свой.")
+    if args.weight_mode == "as-executed":
+        print("  DTYPE as-executed: веса черновика в fp32 под autocast, как в "
+              "K-11e.\n  Пик памяти рук joint12/hicora включает fp32-копию и "
+              "АРХИТЕКТУРНЫМ НЕ ЯВЛЯЕТСЯ.")
+
+    meta = dict(joint_sha1=S["joint_sha"],
+                head_sha1=S["head_sha"], res_norm_sha1=S["rn_sha"])
+    batches_out = {}
+
+    if args.weight_mode == "uniform-trunk":
+        # НА САМОМ БОЛЬШОМ БАТЧЕ: это все фиксированные входы сразу, а не
+        # первый. Одного входа хватило бы лишь на грубую проверку связности.
+        out_eq = equivalence_check(S, args, S["build"](max(batches)))
+    else:
+        out_eq = None
+
+    rows_by_batch = {}
+    for bs in batches:
+        batch = S["build"](bs)
+        print(f"\n=== батч {bs} ===")
+        for name in CONFIGS:
+            apply_weights(name)
+            for _ in range(args.warmup):
+                k, pl, nl = run(name, batch)
+                do_decode(k, pl, nl)
+            torch.cuda.synchronize()
+        tm = {c: [] for c in CONFIGS}
+        td = {c: [] for c in CONFIGS}
+        for r, order in enumerate(orders):
+            for name in order:
+                apply_weights(name)          # ВНЕ замера
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                k, pl, nl = run(name, batch)
+                torch.cuda.synchronize()
+                t1 = time.perf_counter()
+                do_decode(k, pl, nl)
+                torch.cuda.synchronize()
+                t2 = time.perf_counter()
+                tm[name].append((t1 - t0) * 1000)
+                td[name].append((t2 - t1) * 1000)
+            if (r + 1) % 50 == 0:
+                print(f"    повтор {r + 1}/{args.reps}", flush=True)
+
+        row = {}
+        for name in CONFIGS:
+            tot = [m + d for m, d in zip(tm[name], td[name])]
+            row[name] = dict(model_ms=stats(tm[name]),
+                             decode_ms=stats(td[name]),
+                             total_ms=stats(tot), peak_mib=None,
+                             raw_model_ms=tm[name], raw_decode_ms=td[name])
+        med = {c: row[c]["total_ms"]["median"] for c in CONFIGS}
+        gate = read_gate(med, MAX_VS_COARSE, MIN_VS_FULLBAR)
+        tot_of = {c: [m + d for m, d in zip(tm[c], td[c])] for c in CONFIGS}
+        pair = {s: dict(
+            vs_coarse=paired_ratio_ci(tot_of[s], tot_of["coarse24"],
+                                      args.n_boot),
+            vs_fullbar=paired_ratio_ci(tot_of["fullbar"], tot_of[s],
+                                       args.n_boot)) for s in HICORA}
+        sp = split_estimate(med, float(np.median(
+            [row[s]["decode_ms"]["median"] for s in HICORA])))
+
+        print(f"\n  {'рука':<12}{'слоёв':>7}{'прох':>6}{'декод':>7}"
+              f"{'медиана':>10}{'сред':>9}{'p95':>9}")
+        for name in CONFIGS:
+            r_ = row[name]
+            print(f"  {name:<12}{LAYERS[name]:>7}{PASSES[name]:>6}"
+                  f"{DECODES[name]:>7}{r_['total_ms']['median']:>10.1f}"
+                  f"{r_['total_ms']['mean']:>9.1f}"
+                  f"{r_['total_ms']['p95']:>9.1f}")
+        print("\n  против coarse24 (отношение медиан): "
+              + ", ".join(f"{s} {v:.3f}x" for s, v
+                          in sorted(gate["ratio_vs_coarse"].items()))
+              + f"; худшая {gate['worst_vs_coarse']:.3f}, порог "
+                f"<= {MAX_VS_COARSE} -> "
+                f"{'да' if gate['ok_vs_coarse'] else 'НЕТ'}")
+        print("  против fullbar  (отношение медиан): "
+              + ", ".join(f"{s} {v:.2f}x" for s, v
+                          in sorted(gate["speedup_vs_fullbar"].items()))
+              + f"; худшая {gate['worst_vs_fullbar']:.2f}, порог "
+                f">= {MIN_VS_FULLBAR} -> "
+                f"{'да' if gate['ok_vs_fullbar'] else 'НЕТ'}")
+        print("  ПАРНОЕ отношение (проверка устойчивости, критерий НЕ "
+              "подменяет):")
+        for s in sorted(pair):
+            a_, b_ = pair[s]["vs_coarse"], pair[s]["vs_fullbar"]
+            print(f"    {s}: /coarse24 {a_['median_of_ratios']:.3f} "
+                  f"[{a_['lo']:.3f}, {a_['hi']:.3f}]   "
+                  f"fullbar/ {b_['median_of_ratios']:.2f} "
+                  f"[{b_['lo']:.2f}, {b_['hi']:.2f}]")
+        if sp:
+            for s in sorted(sp):
+                d = sp[s]
+                print(f"  K-11h-B, {s}: черновик готов через "
+                      f"{d['t_draft']:.1f} мс, исправленный — через "
+                      f"{d['t_refined_est']:.1f} мс,\n    то есть поправка "
+                      f"приходит спустя {d['delta_ms']:.1f} мс ПОСЛЕ "
+                      f"черновика"
+                      + ("  — внутрь шага 50 мс" if d["within_step"]
+                         else "  — НЕ внутрь шага 50 мс"))
+            print("  ЭТО ОЦЕНКА, НЕ ЗАМЕР: потоковой руки не существует.")
+
+        rows_by_batch[bs] = row
+
+        if bs == PRIMARY_BATCH:
+            verd = "ПРОЙДЕН" if gate["passed"] else "НЕ ПРОЙДЕН"
+            print(f"\n  K-11h-A ({verd}) — первичный критерий, батч {bs}")
+        else:
+            print(f"\n  батч {bs} — сопутствующий результат, в критерий НЕ "
+                  f"входит"
+                  + ("" if gate["passed"]
+                     else "; на нём порог НЕ выполняется"))
+        batches_out[str(bs)] = dict(
+            rows=row, median_ms=med, gate=gate, paired=pair,
+            split_estimate=sp, is_primary=bool(bs == PRIMARY_BATCH))
+
+    return rows_by_batch, batches_out, out_eq, meta
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
@@ -1012,143 +1209,6 @@ def main() -> None:
     print(f"  порядок рук: циклический сдвиг, каждая рука в каждой позиции "
           f"{per_pos} раз")
 
-
-def timing_stage(args, dev, dt, orders, batches):
-    """Все тайминги. ОТДЕЛЬНОЙ ФУНКЦИЕЙ РАДИ ОСВОБОЖДЕНИЯ КАРТЫ.
-
-    `del S` в main не освобождал модель: её держали замыкания `apply_weights`
-    (замыкает S целиком), `run` (model) и `do_decode` (codec, E), а также
-    локальные `batch` и последний результат прохода. Дочерние процессы замера
-    памяти поднимались рядом с живой родительской моделью. По возврату из
-    функции все эти ссылки исчезают сами.
-
-    Возвращает (rows_by_batch, batches_out, equivalence, meta).
-    """
-    import torch
-    S = build_stack(args, CONFIGS, dev, dt)
-    apply_weights, run, do_decode = make_runner(S, args)
-
-    print(f"\nруки: {', '.join(CONFIGS)}")
-    print("  ВНИМАНИЕ: потоковая политика здесь НЕ мерится — её нет в коде, "
-          "и успех\n  у неё был бы свой.")
-    if args.weight_mode == "as-executed":
-        print("  DTYPE as-executed: веса черновика в fp32 под autocast, как в "
-              "K-11e.\n  Пик памяти рук joint12/hicora включает fp32-копию и "
-              "АРХИТЕКТУРНЫМ НЕ ЯВЛЯЕТСЯ.")
-
-    meta = dict(joint_sha1=S["joint_sha"],
-                head_sha1=S["head_sha"], res_norm_sha1=S["rn_sha"])
-    batches_out = {}
-
-    if args.weight_mode == "uniform-trunk":
-        # НА САМОМ БОЛЬШОМ БАТЧЕ: это все фиксированные входы сразу, а не
-        # первый. Одного входа хватило бы лишь на грубую проверку связности.
-        out_eq = equivalence_check(S, args, S["build"](max(batches)))
-    else:
-        out_eq = None
-
-    rows_by_batch = {}
-    for bs in batches:
-        batch = S["build"](bs)
-        print(f"\n=== батч {bs} ===")
-        for name in CONFIGS:
-            apply_weights(name)
-            for _ in range(args.warmup):
-                k, pl, nl = run(name, batch)
-                do_decode(k, pl, nl)
-            torch.cuda.synchronize()
-        tm = {c: [] for c in CONFIGS}
-        td = {c: [] for c in CONFIGS}
-        for r, order in enumerate(orders):
-            for name in order:
-                apply_weights(name)          # ВНЕ замера
-                torch.cuda.synchronize()
-                t0 = time.perf_counter()
-                k, pl, nl = run(name, batch)
-                torch.cuda.synchronize()
-                t1 = time.perf_counter()
-                do_decode(k, pl, nl)
-                torch.cuda.synchronize()
-                t2 = time.perf_counter()
-                tm[name].append((t1 - t0) * 1000)
-                td[name].append((t2 - t1) * 1000)
-            if (r + 1) % 50 == 0:
-                print(f"    повтор {r + 1}/{args.reps}", flush=True)
-
-        row = {}
-        for name in CONFIGS:
-            tot = [m + d for m, d in zip(tm[name], td[name])]
-            row[name] = dict(model_ms=stats(tm[name]),
-                             decode_ms=stats(td[name]),
-                             total_ms=stats(tot), peak_mib=None,
-                             raw_model_ms=tm[name], raw_decode_ms=td[name])
-        med = {c: row[c]["total_ms"]["median"] for c in CONFIGS}
-        gate = read_gate(med, MAX_VS_COARSE, MIN_VS_FULLBAR)
-        tot_of = {c: [m + d for m, d in zip(tm[c], td[c])] for c in CONFIGS}
-        pair = {s: dict(
-            vs_coarse=paired_ratio_ci(tot_of[s], tot_of["coarse24"],
-                                      args.n_boot),
-            vs_fullbar=paired_ratio_ci(tot_of["fullbar"], tot_of[s],
-                                       args.n_boot)) for s in HICORA}
-        sp = split_estimate(med, float(np.median(
-            [row[s]["decode_ms"]["median"] for s in HICORA])))
-
-        print(f"\n  {'рука':<12}{'слоёв':>7}{'прох':>6}{'декод':>7}"
-              f"{'медиана':>10}{'сред':>9}{'p95':>9}")
-        for name in CONFIGS:
-            r_ = row[name]
-            print(f"  {name:<12}{LAYERS[name]:>7}{PASSES[name]:>6}"
-                  f"{DECODES[name]:>7}{r_['total_ms']['median']:>10.1f}"
-                  f"{r_['total_ms']['mean']:>9.1f}"
-                  f"{r_['total_ms']['p95']:>9.1f}")
-        print("\n  против coarse24 (отношение медиан): "
-              + ", ".join(f"{s} {v:.3f}x" for s, v
-                          in sorted(gate["ratio_vs_coarse"].items()))
-              + f"; худшая {gate['worst_vs_coarse']:.3f}, порог "
-                f"<= {MAX_VS_COARSE} -> "
-                f"{'да' if gate['ok_vs_coarse'] else 'НЕТ'}")
-        print("  против fullbar  (отношение медиан): "
-              + ", ".join(f"{s} {v:.2f}x" for s, v
-                          in sorted(gate["speedup_vs_fullbar"].items()))
-              + f"; худшая {gate['worst_vs_fullbar']:.2f}, порог "
-                f">= {MIN_VS_FULLBAR} -> "
-                f"{'да' if gate['ok_vs_fullbar'] else 'НЕТ'}")
-        print("  ПАРНОЕ отношение (проверка устойчивости, критерий НЕ "
-              "подменяет):")
-        for s in sorted(pair):
-            a_, b_ = pair[s]["vs_coarse"], pair[s]["vs_fullbar"]
-            print(f"    {s}: /coarse24 {a_['median_of_ratios']:.3f} "
-                  f"[{a_['lo']:.3f}, {a_['hi']:.3f}]   "
-                  f"fullbar/ {b_['median_of_ratios']:.2f} "
-                  f"[{b_['lo']:.2f}, {b_['hi']:.2f}]")
-        if sp:
-            for s in sorted(sp):
-                d = sp[s]
-                print(f"  K-11h-B, {s}: черновик готов через "
-                      f"{d['t_draft']:.1f} мс, исправленный — через "
-                      f"{d['t_refined_est']:.1f} мс,\n    то есть поправка "
-                      f"приходит спустя {d['delta_ms']:.1f} мс ПОСЛЕ "
-                      f"черновика"
-                      + ("  — внутрь шага 50 мс" if d["within_step"]
-                         else "  — НЕ внутрь шага 50 мс"))
-            print("  ЭТО ОЦЕНКА, НЕ ЗАМЕР: потоковой руки не существует.")
-
-        rows_by_batch[bs] = row
-
-        if bs == PRIMARY_BATCH:
-            verd = "ПРОЙДЕН" if gate["passed"] else "НЕ ПРОЙДЕН"
-            print(f"\n  K-11h-A ({verd}) — первичный критерий, батч {bs}")
-        else:
-            print(f"\n  батч {bs} — сопутствующий результат, в критерий НЕ "
-                  f"входит"
-                  + ("" if gate["passed"]
-                     else "; на нём порог НЕ выполняется"))
-        batches_out[str(bs)] = dict(
-            rows=row, median_ms=med, gate=gate, paired=pair,
-            split_estimate=sp, is_primary=bool(bs == PRIMARY_BATCH))
-
-    return rows_by_batch, batches_out, out_eq, meta
-
     rows_by_batch, out_batches, out_eq, meta = timing_stage(
         args, dev, dt, orders, batches)
     # ПОСЛЕ ВОЗВРАТА ссылок на модель, кодек и батчи не осталось: они были
@@ -1184,7 +1244,6 @@ def timing_stage(args, dev, dt, orders, batches):
     if not args.no_mem:
         print("\n  память: отдельный процесс на руку, после таймингов",
               flush=True)
-        del S
         import gc as _gc
         _gc.collect()
         torch.cuda.empty_cache()
