@@ -870,13 +870,33 @@ def equivalence_check(S, args, batch, arms=HICORA,
         rel_dz = float(np.linalg.norm(dz_u - dz_r)
                        / (np.linalg.norm(dz_r) or 1.0))
         ok = frac <= code_frac and rel_a <= act_rel
+        # РАЗДЕЛЕНИЕ ПРИЧИН. Перевернувшийся код q0 входит в голову через z0,
+        # поэтому один код из 160 может сам по себе сдвинуть dz сильно. Чтобы
+        # отличить это от влияния точности h24, те же величины считаются ещё
+        # раз ТОЛЬКО на примерах, где q0 совпал полностью.
+        q_a = np.asarray(q_r)
+        same = ~np.asarray(q_r != q_u).reshape(q_a.shape[0], -1).any(axis=1)
+        sub = {}
+        if same.any():
+            sub = dict(
+                n=int(same.sum()),
+                dz_rel=float(np.linalg.norm(dz_u[same] - dz_r[same])
+                             / (np.linalg.norm(dz_r[same]) or 1.0)),
+                act_rel=float(np.linalg.norm(a_u[same] - a_r[same])
+                              / (np.linalg.norm(a_r[same]) or 1.0)))
         res[arm] = dict(q0_diff_frac=frac, dz_rel=rel_dz, act_rel=rel_a,
-                        n_inputs=int(np.asarray(q_r).shape[0]), ok=bool(ok))
+                        same_q0=sub,
+                        n_inputs=int(q_a.shape[0]), ok=bool(ok))
         print(f"  совпадение на фиксированных входах "
               f"({res[arm]['n_inputs']} шт), {arm}: коды q0 разошлись у "
               f"{frac:.3%} (порог {code_frac:.1%}), dz отн. {rel_dz:.2e}, "
               f"действия отн. {rel_a:.2e} (порог {act_rel:.0e}) -> "
               f"{'да' if ok else 'НЕТ'}")
+        if sub:
+            print(f"    из них при СОВПАВШЕМ q0 ({sub['n']} шт): dz отн. "
+                  f"{sub['dz_rel']:.2e}, действия отн. {sub['act_rel']:.2e} — "
+                  f"это чистое влияние точности h24,\n    остальное даёт "
+                  f"перевернувшийся код через z0")
         if not ok:
             bad.append(arm)
     if bad:
@@ -925,7 +945,24 @@ def mem_only(args):
         do_decode(k, pl, nl)
     torch.cuda.synchronize()
     peak = torch.cuda.max_memory_allocated(dev) / 2 ** 20
-    print("MEMJSON " + json.dumps({"arm": arm, "peak_mib": peak}))
+    # ТОЧНЫЙ УЧЁТ БАЙТОВ ПО dtype. Он отвечает на архитектурный вопрос БЕЗ
+    # смены политики: сколько памяти приходится на fp32-копию ствола, видно
+    # арифметически, а подмена dtype меняет саму политику (проверка
+    # равносильности это и показала).
+    by_dt = {}
+    for _, pp in S["model"].named_parameters():
+        k = str(pp.dtype)
+        e = by_dt.setdefault(k, [0, 0])
+        e[0] += pp.numel()
+        e[1] += pp.numel() * pp.element_size()
+    bufs = 0
+    for _, bb in S["model"].named_buffers():
+        bufs += bb.numel() * bb.element_size()
+    print("MEMJSON " + json.dumps({
+        "arm": arm, "peak_mib": peak,
+        "params_by_dtype": {k: {"numel": v[0], "mib": v[1] / 2 ** 20}
+                            for k, v in sorted(by_dt.items())},
+        "buffers_mib": bufs / 2 ** 20}))
 
 
 def timing_stage(args, dev, dt, orders, batches):
@@ -1105,6 +1142,9 @@ def main() -> None:
                          "протоколом. Нужен для uniform-trunk и любых иных "
                          "условий; без него такой прогон отказывается "
                          "стартовать, а не тратит часы впустую")
+    ap.add_argument("--mem-table", action="store_true",
+                    help="только учёт памяти по рукам с разложением по dtype, "
+                         "без таймингов")
     ap.add_argument("--no-mem", action="store_true",
                     help="не мерить память вовсе")
     ap.add_argument("--n-boot", type=int, default=2000)
@@ -1125,6 +1165,50 @@ def main() -> None:
 
     if args.mem_only:
         mem_only(args)
+        return
+
+    if args.mem_table:
+        # ТОЛЬКО УЧЁТ ПАМЯТИ, БЕЗ ТАЙМИНГОВ. Нужен, чтобы разложить разрыв
+        # памяти между руками на fp32-копию и собственно конструкцию, не
+        # меняя политику.
+        import subprocess as _sp
+        print(f"учёт памяти, режим {args.weight_mode}, батч "
+              f"{args.batches.split(',')[0]}")
+        print(f"  {'рука':<12}{'пик МиБ':>10}{'fp16 МиБ':>10}"
+              f"{'fp32 МиБ':>10}{'буферы':>9}{'параметров':>12}")
+        rows = {}
+        for name in CONFIGS:
+            cmd = [sys.executable, os.path.abspath(__file__),
+                   "--mem-only", name, "--ckpt", args.ckpt,
+                   "--cache", args.cache, "--joint12", args.joint12,
+                   "--hicora-s0", args.hicora_s0,
+                   "--hicora-s1", args.hicora_s1, "--root", args.root,
+                   "--cfg-path", args.cfg_path, "--device", args.device,
+                   "--dtype", args.dtype,
+                   "--batches", args.batches.split(",")[0],
+                   "--pos-offset", str(args.pos_offset),
+                   "--weight-mode", args.weight_mode]
+            pr = _sp.run(cmd, capture_output=True, text=True)
+            ln = [x for x in pr.stdout.splitlines()
+                  if x.startswith("MEMJSON ")]
+            if pr.returncode != 0 or not ln:
+                tail = (pr.stderr or pr.stdout).strip().splitlines()[-3:]
+                raise SystemExit(f"{name}: учёт не удался: "
+                                 f"{' | '.join(tail)}")
+            d = json.loads(ln[-1][len("MEMJSON "):])
+            rows[name] = d
+            pbd = d["params_by_dtype"]
+            f16 = pbd.get("torch.float16", {}).get("mib", 0.0)
+            f32 = pbd.get("torch.float32", {}).get("mib", 0.0)
+            n = sum(v["numel"] for v in pbd.values())
+            print(f"  {name:<12}{d['peak_mib']:>10.0f}{f16:>10.0f}"
+                  f"{f32:>10.0f}{d['buffers_mib']:>9.1f}{n:>12,}")
+        if args.out:
+            os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".",
+                        exist_ok=True)
+            json.dump(dict(weight_mode=args.weight_mode, rows=rows),
+                      open(args.out, "w"), ensure_ascii=False, indent=1)
+            print(f"  сохранено: {args.out}")
         return
 
     import torch
