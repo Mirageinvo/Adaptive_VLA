@@ -58,9 +58,45 @@ from k12a_power import (ALPHA, TARGET_POWER, calibrate, cluster_lower,  # noqa
 RULES = ("mean", "mean_rep", "all")
 
 
-def draw(mean, sd, rng):
-    """Бета с точно заданным средним; при sd=0 возвращает само среднее."""
-    return draw_r_rec(mean, sd, rng)
+# Сколько раз разброс пришлось урезать и до чего. Разброс ДОЛИ ограничен
+# сверху самим средним: для доли в (0,1) дисперсия не может достигать
+# m(1-m). Задавать sd абсолютным числом независимо от среднего нельзя — при
+# r_loss=0.002 запрос sd=0.10 невозможен, и перебор падал посреди таблицы.
+CLAMPS = {}
+
+
+CV_MAX = 0.5      # предельный коэффициент вариации доли
+
+
+def feasible_sd(mean, sd, margin=0.95, cv_max=CV_MAX):
+    """Возможный разброс доли: ограничен И выполнимостью, И относительно.
+
+    Два ограничения, и второе не формальность. Выполнимость: дисперсия доли не
+    может достигать m(1-m). Относительное: при малом среднем абсолютный
+    разброс бессмыслен — бета со средним 0.002 и sd 0.042 ВЫРОЖДАЕТСЯ, почти
+    вся масса садится в нуль, и «разброс по задачам» превращается в «у
+    большинства задач ноль, у одной много». Поэтому sd дополнительно
+    ограничен долей самого среднего.
+    """
+    m = float(mean)
+    if m <= 0.0 or m >= 1.0:
+        return 0.0
+    top = min(margin * (m * (1.0 - m)) ** 0.5, cv_max * m)
+    return min(float(sd), top)
+
+
+def draw(mean, sd, rng, tag=""):
+    """Бета с точно заданным средним; разброс УРЕЗАЕТСЯ до возможного.
+
+    Урезание не молчаливое: оно считается и печатается, потому что «разброс
+    по задачам 0.10» при среднем 0.002 фактически означает 0.04, и читать
+    таблицу, не зная этого, нельзя.
+    """
+    eff = feasible_sd(mean, sd)
+    if sd > 0 and eff < float(sd) - 1e-12:
+        k = (tag, round(float(mean), 5))
+        CLAMPS[k] = (CLAMPS.get(k, (0, eff))[0] + 1, eff)
+    return draw_r_rec(mean, eff, rng)
 
 
 def sim_replica(rates, n_ep, r_rec, r_loss, task_sd, rng):
@@ -72,8 +108,8 @@ def sim_replica(rates, n_ep, r_rec, r_loss, task_sd, rng):
     """
     out, disc = [], []
     for p in rates:
-        rr = draw(r_rec, task_sd, rng)
-        rl = draw(r_loss, task_sd, rng)
+        rr = draw(r_rec, task_sd, rng, "задача/r_rec")
+        rl = draw(r_loss, task_sd, rng, "задача/r_loss")
         base = rng.random(n_ep) < p
         flip = np.where(base, rng.random(n_ep) < rl, rng.random(n_ep) < rr)
         new = np.where(flip, ~base, base)
@@ -89,8 +125,8 @@ def sim_study(rates_by_head, n_ep, r_rec, r_loss, rep_sd, task_sd, rng,
     reps, discs = [], []
     for _h, rates in sorted(rates_by_head.items()):
         for _s in range(n_rl):
-            rr = draw(r_rec, rep_sd, rng)
-            rl = draw(r_loss, rep_sd, rng)
+            rr = draw(r_rec, rep_sd, rng, "реплика/r_rec")
+            rl = draw(r_loss, rep_sd, rng, "реплика/r_loss")
             d, dc = sim_replica(rates, n_ep, rr, rl, task_sd, rng)
             reps.append(d)
             discs.append(dc)
@@ -142,9 +178,17 @@ def power_study(rates_by_head, n_ep, delta, discord, rule="mean",
     worst = min(p_fails, key=lambda h: p_fails[h])
     cal = calibrate(p_fails[worst], delta, discord)
     if cal is None:
-        return dict(power=None, reason=f"недостижимо для опоры {worst}: "
-                                      f"p_fail={100 * p_fails[worst]:.1f}%",
-                    calibrated_on=worst, p_fails=p_fails)
+        # ДВЕ РАЗНЫЕ ПРИЧИНЫ, и путать их нельзя: дискордантность по
+        # определению не меньше модуля эффекта (иначе перевернувшихся пар не
+        # хватит даже на сам сдвиг), а сверх того требуемая доля
+        # восстановлений может превысить единицу.
+        why = ("дискордантность меньше самого эффекта: "
+               f"{100 * discord:.1f}% < {100 * delta:.1f} пп"
+               if discord < abs(delta) else
+               f"требуется восстановить больше провалов, чем есть: опора "
+               f"{worst}, p_fail={100 * p_fails[worst]:.1f}%")
+        return dict(power=None, reason=why, calibrated_on=worst,
+                    p_fails=p_fails)
     rng = np.random.default_rng(seed)
     hit, lows, dcs = 0, [], []
     for _ in range(n_sim):
@@ -211,6 +255,38 @@ def selftest():
     # перепутав множитель; код был прав.)
     assert abs(m - 0.045) < 0.01, m
 
+    # --- РАЗБРОС УРЕЗАЕТСЯ, А НЕ ПАДАЕТ ------------------------------------
+    # Прежде при r_loss=0.002 и sd=0.10 перебор падал посреди таблицы.
+    # при малом среднем связывает ОТНОСИТЕЛЬНОЕ ограничение
+    assert abs(feasible_sd(0.002, 0.10) - 0.5 * 0.002) < 1e-12
+    # при среднем 0.5 запрошенные 0.10 проходят целиком
+    assert abs(feasible_sd(0.5, 0.10) - 0.10) < 1e-12
+    # при среднем 0.1 относительный предел 0.05
+    assert abs(feasible_sd(0.1, 0.10) - 0.05) < 1e-12
+    assert feasible_sd(0.0, 0.10) == 0.0
+    # распределение НЕ вырождено: среднее сохранено, масса не в нуле
+    g2 = np.random.default_rng(5)
+    dd = [draw(0.002, 0.10, g2, "t") for _ in range(5000)]
+    assert abs(float(np.mean(dd)) - 0.002) < 2e-4, float(np.mean(dd))
+    assert min(dd) > 0.0 and float(np.median(dd)) > 1e-4
+    CLAMPS.clear()
+    v = draw(0.002, 0.10, rng, "тест")
+    assert 0.0 < v < 1.0
+    assert CLAMPS and list(CLAMPS.values())[0][0] == 1
+    CLAMPS.clear()
+    draw(0.5, 0.01, rng, "тест")
+    assert not CLAMPS, "урезание там, где не нужно"
+    # И весь перебор с крошечным r_loss доходит до конца
+    out = power_study({"a": [0.9] * 6}, 20, 0.02, 0.025, "mean", 0.10, 0.10,
+                      n_sim=20, n_boot=20, seed=9)
+    assert out["power"] is not None, out
+
+    # --- ДВЕ ПРИЧИНЫ ОТКАЗА РАЗЛИЧАЮТСЯ ------------------------------------
+    r1 = power_study(rates, 40, 0.05, 0.03, "mean", n_sim=5, n_boot=5)
+    assert "меньше самого эффекта" in r1["reason"], r1["reason"]
+    r2 = power_study(rates, 40, 0.05, 0.16, "mean", n_sim=5, n_boot=5)
+    assert "больше провалов, чем есть" in r2["reason"], r2["reason"]
+
     # --- правило гейта: «каждая» строже «среднего» --------------------------
     mk = [[(0.05, 40)] * 10, [(0.05, 40)] * 10,
           [(0.05, 40)] * 10, [(-0.02, 40)] * 10]
@@ -243,7 +319,7 @@ def selftest():
     assert p_het["power"] <= p_hi["power"], (p_het["power"], p_hi["power"])
     # НЕДОСТИЖИМАЯ КОМБИНАЦИЯ ОБЪЯВЛЯЕТСЯ ДО ПРОГОНА, а не считается
     bad = power_study(rates, 40, 0.05, 0.16, "mean", n_sim=5, n_boot=5)
-    assert bad["power"] is None and "недостижимо" in bad["reason"]
+    assert bad["power"] is None and "провалов" in bad["reason"]
     assert bad["calibrated_on"] == "s0", bad["calibrated_on"]
     try:
         power_study(rates, 40, 0.05, 0.05, "чужое")
@@ -339,13 +415,22 @@ def main():
                 print(f"    {dl:>+4.0f}{100 * dsc:>8.1f}%{n_ep:>5}"
                       + "".join(f"{c:>12}" for c in cells))
 
+    if CLAMPS:
+        print("\n  РАЗБРОС УРЕЗАН ДО ВОЗМОЖНОГО (для доли он ограничен "
+              "сверху средним):")
+        for (tag, m), (n, eff) in sorted(CLAMPS.items()):
+            print(f"    {tag} при среднем {m:.4f}: запрошено — "
+                  f"фактически {eff:.4f}, раз {n}")
+
     if a.out:
         os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".",
                     exist_ok=True)
         json.dump(dict(rates=rates, sigma=a.sigma, rep_sd=a.rep_sd,
                        task_sd=a.task_sd, rules=a.rules.split(","),
                        results={k: v for k, v in res.items()},
-                       n_sim=a.n_sim, n_boot=a.n_boot, seed=a.seed),
+                       n_sim=a.n_sim, n_boot=a.n_boot, seed=a.seed,
+                       clamps={f"{k[0]}|{k[1]}": v
+                               for k, v in CLAMPS.items()}),
                   open(a.out, "w"), ensure_ascii=False, indent=1)
         print(f"\n  сохранено: {a.out}")
     print("\n  ЧТО ЭТО ДОПУСКАЕТ. Что разбросы по реплике и задаче бета и "
