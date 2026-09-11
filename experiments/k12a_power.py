@@ -64,6 +64,36 @@ def r_rec_for(delta, p_fail, r_loss):
     return None if need > 1.0 else max(need, 0.0)
 
 
+def calibrate(p_fail, delta, discord):
+    """Подобрать (r_rec, r_loss) по ЧИСТОМУ ЭФФЕКТУ И ДИСКОРДАНТНОСТИ.
+
+    ЗАЧЕМ. При r_loss = 0 модель порождает дискордантность p_fail*r_rec — в
+    наших условиях около 5%, тогда как в K-11e наблюдалось 15.5%, а в K-11g при
+    sigma=0.10 14-20%. Дискордантность и есть главный источник дисперсии парной
+    разности: она входит в неё ДВУМЯ направлениями, которые почти сокращаются в
+    среднем, но складываются в разбросе. Поэтому оценка мощности при r_loss = 0
+    оптимистична по построению и НЕ сопоставима с наблюдённой в K-11e
+    стандартной ошибкой.
+
+    Система:  p_fail*r_rec - p_succ*r_loss = delta
+              p_fail*r_rec + p_succ*r_loss = discord
+    откуда p_fail*r_rec = (discord + delta)/2 и p_succ*r_loss =
+    (discord - delta)/2. Возвращает None, если требуется доля вне [0, 1].
+    """
+    p_succ = 1.0 - p_fail
+    if discord < abs(delta):
+        return None
+    a = (discord + delta) / 2.0
+    b = (discord - delta) / 2.0
+    if p_fail <= 0 or p_succ <= 0:
+        return None
+    r_rec, r_loss = a / p_fail, b / p_succ
+    if not (0.0 <= r_rec <= 1.0 and 0.0 <= r_loss <= 1.0):
+        return None
+    return dict(r_rec=r_rec, r_loss=r_loss,
+                net=net_effect(p_fail, r_rec, r_loss), discord=discord)
+
+
 def cluster_lower(diff_by_task, n_boot, rng, alpha=ALPHA):
     """Нижняя односторонняя граница парной разности, бутстрап ПО ЗАДАЧАМ.
 
@@ -192,6 +222,22 @@ def selftest():
     assert r_rec_for(0.05, 0.11, 0.10) is None
     assert r_rec_for(0.0, 0.11, 0.0) == 0.0
 
+    # --- калибровка по эффекту И дискордантности ----------------------------
+    c = calibrate(0.105, 0.05, 0.155)
+    assert c is not None
+    assert abs(c["net"] - 0.05) < 1e-12
+    assert abs(0.105 * c["r_rec"] + 0.895 * c["r_loss"] - 0.155) < 1e-12
+    # ПРИ НАБЛЮДЁННОЙ ДИСКОРДАНТНОСТИ +5 пп ТРЕБУЕТ ПОЧТИ ВСЕХ ВОССТАНОВЛЕНИЙ
+    assert c["r_rec"] > 0.95, c["r_rec"]
+    assert 0.05 < c["r_loss"] < 0.07, c["r_loss"]
+    # дискордантность не может быть меньше модуля эффекта
+    assert calibrate(0.105, 0.05, 0.03) is None
+    # и не может требовать доли выше единицы
+    assert calibrate(0.105, 0.09, 0.30) is None
+    # при нулевых потерях дискордантность равна эффекту
+    c0 = calibrate(0.105, 0.05, 0.05)
+    assert abs(c0["r_loss"]) < 1e-12 and abs(c0["r_rec"] - 0.05 / 0.105) < 1e-9
+
     rng = np.random.default_rng(0)
     # --- бутстрап по кластерам ---------------------------------------------
     same = [(0.1, 10)] * 8
@@ -287,7 +333,8 @@ def selftest():
           "эффектом и числом задач, падает от потерь, а от разброса по "
           "репликам падает\n  при высокой мощности и РАСТЁТ при низкой — "
           "и это проверено в обе стороны;\n  добавка на реплику сохраняет "
-          "среднее (бета, не обрезанная нормаль)")
+          "среднее (бета, не обрезанная нормаль);\n  калибровка по эффекту И "
+          "дискордантности отвергает недостижимые комбинации")
 
 
 def main():
@@ -297,7 +344,13 @@ def main():
     ap.add_argument("--arm", default="joint12")
     ap.add_argument("--field", default="arm_label")
     ap.add_argument("--r-loss", type=float, default=0.0,
-                    help="доля потерянных успехов. 0 — оптимистичный предел")
+                    help="доля потерянных успехов. 0 — ОПТИМИСТИЧНЫЙ предел: "
+                         "он порождает дискордантность вдвое-втрое ниже "
+                         "наблюдённой и потому завышает мощность")
+    ap.add_argument("--discord", default="0.05,0.14,0.155",
+                    help="наблюдённые доли дискордантных пар для калибровки "
+                         "(K-11e: 0.135-0.155; K-11g при sigma=0.10: "
+                         "0.14-0.20)")
     ap.add_argument("--seed-sd", type=float, default=0.10,
                     help="стд добавки к r_rec на реплику (D1-сид x RL-сид). "
                          "Разыгрывается бета-распределением с ТОЧНО таким "
@@ -367,6 +420,44 @@ def main():
                   f"достигается при ~{nt['n_tasks']} задачах "
                   f"(по 40 эпизодов)")
         res[f"needed|{pp}"] = nt
+
+    print(f"\n  КАЛИБРОВКА ПО ДИСКОРДАНТНОСТИ. При r_loss=0 модель даёт "
+          f"дискордантность\n  p_fail*r_rec, то есть около "
+          f"{100 * p_fail * (r_rec_for(PRIMARY_PP / 100, p_fail, 0) or 0):.0f}"
+          f"% для +{PRIMARY_PP:.0f} пп — против наблюдённых 13.5-15.5% в "
+          f"K-11e.\n  Дискордантность входит в разброс парной разности ДВУМЯ "
+          f"направлениями, которые\n  почти сокращаются в среднем, но "
+          f"складываются в дисперсии.")
+    print(f"    {'эффект':>8}{'дискорд':>9}{'r_rec':>8}{'r_loss':>8}"
+          f"{'эпизодов':>10}{'мощность':>10}{'ниж.гр.':>10}")
+    for pp in (PRIMARY_PP, SECONDARY_PP):
+        for dsc in [float(x) for x in a.discord.split(",")]:
+            cal = calibrate(p_fail, pp / 100.0, dsc)
+            if cal is None:
+                print(f"    {pp:>+7.0f}{100 * dsc:>8.1f}%  НЕДОСТИЖИМО при "
+                      f"такой дискордантности")
+                res[f"cal|{pp}|{dsc}"] = None
+                continue
+            for n_ep in (40,):
+                pw = power(list(rates.values()), n_ep, cal["r_rec"],
+                           cal["r_loss"], a.n_sim, a.n_boot, a.seed,
+                           a.seed_sd)
+                print(f"    {pp:>+7.0f}{100 * dsc:>8.1f}%"
+                      f"{100 * cal['r_rec']:>7.0f}%{100 * cal['r_loss']:>7.1f}%"
+                      f"{n_ep:>10}{pw['power']:>10.2f}"
+                      f"{100 * pw['lower_median']:>+10.2f}")
+                res[f"cal|{pp}|{dsc}|{n_ep}"] = dict(cal=cal, power=pw)
+            nt = needed_tasks(list(rates.values()), 40, cal["r_rec"],
+                              cal["r_loss"], n_sim=max(a.n_sim // 2, 100),
+                              n_boot=max(a.n_boot // 2, 100), seed=a.seed,
+                              seed_sd=a.seed_sd)
+            res[f"calneed|{pp}|{dsc}"] = nt
+            if nt["n_tasks"] is None:
+                print(f"      мощности {TARGET_POWER} не достичь и на 200 "
+                      f"задачах")
+            elif nt["n_tasks"] > len(rates):
+                print(f"      мощность {TARGET_POWER} требует ~{nt['n_tasks']} "
+                      f"задач")
 
     if a.out:
         os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".",
