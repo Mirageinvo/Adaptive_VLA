@@ -74,13 +74,17 @@ def table(rows, out=print):
         q99 = agg([p["fin"]["log_ratio_q99"] for p in per.values()])
         kl = agg([p["fin"]["kl_exact"] for p in per.values()])
         al = agg([p["fin"]["align_mean"] for p in per.values()])
-        tp = agg([p["fin"].get("align_top1pct", float("nan"))
-                  for p in per.values()])
+        # ПОЛЕ МОЖЕТ ОТСУТСТВОВАТЬ у прогонов, сделанных до его введения.
+        # nan в таблице читался бы как измеренная величина; печатаем прочерк.
+        tps = [p["fin"]["align_top1pct"] for p in per.values()
+               if p["fin"].get("align_top1pct") is not None]
+        tp = agg(tps) if tps else None
+        tp_s = "—" if tp is None else f"{tp['median']:.2f}"
         out(f"  {ep:>5}{mb:>5}{lr:>8.0e}{hd:>4}{cf['n']:>4}"
             f"{100 * cf['median']:>18.1f}% "
             f"[{100 * cf['lo']:.0f}-{100 * cf['hi']:.0f}%]"
             f"{q99['median']:>11.3f}{kl['median']:>10.4g}"
-            f"{al['median']:>9.3f}{tp['median']:>8.2f}")
+            f"{al['median']:>9.3f}{tp_s:>8}")
         best.append((key, cf, q99))
     return best
 
