@@ -416,11 +416,22 @@ def main():
                       + "".join(f"{c:>12}" for c in cells))
 
     if CLAMPS:
-        print("\n  РАЗБРОС УРЕЗАН ДО ВОЗМОЖНОГО (для доли он ограничен "
-              "сверху средним):")
-        for (tag, m), (n, eff) in sorted(CLAMPS.items()):
-            print(f"    {tag} при среднем {m:.4f}: запрошено — "
-                  f"фактически {eff:.4f}, раз {n}")
+        # СЖАТО ПО ВИДУ, а не по каждому значению среднего: иначе отчёт даёт
+        # сотни строк и вытесняет саму таблицу мощности из вывода.
+        print("\n  РАЗБРОС УРЕЗАН ДО ВОЗМОЖНОГО (для доли он ограничен и "
+              "выполнимостью, и\n  коэффициентом вариации "
+              f"{CV_MAX}):")
+        agg_ = {}
+        for (tag, m), (n, eff) in CLAMPS.items():
+            a_ = agg_.setdefault(tag, [0, 1.0, 0.0, 1.0, 0.0])
+            a_[0] += n
+            a_[1] = min(a_[1], eff)
+            a_[2] = max(a_[2], eff)
+            a_[3] = min(a_[3], m)
+            a_[4] = max(a_[4], m)
+        for tag, (n, e1, e2, m1, m2) in sorted(agg_.items()):
+            print(f"    {tag}: {n} раз, средние {m1:.4f}-{m2:.4f}, "
+                  f"фактический разброс {e1:.4f}-{e2:.4f}")
 
     if a.out:
         os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".",
