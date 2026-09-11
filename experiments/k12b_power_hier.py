@@ -163,9 +163,12 @@ def lower_all(reps, n_boot, rng, alpha=ALPHA):
     return min(cluster_lower(r, n_boot, rng, alpha) for r in reps)
 
 
+R_REC_MAX = 0.90    # выше этого калибровка содержательно вырождена
+
+
 def power_study(rates_by_head, n_ep, delta, discord, rule="mean",
                 rep_sd=0.05, task_sd=0.10, n_sim=300, n_boot=300, seed=0,
-                n_rl=2, alpha=ALPHA):
+                n_rl=2, alpha=ALPHA, r_rec_max=R_REC_MAX):
     """Мощность при заданном правиле гейта. Калибровка — по ХУДШЕЙ опоре.
 
     Калибровка делается по голове с НАИМЕНЬШЕЙ долей провалов: если для неё
@@ -189,6 +192,18 @@ def power_study(rates_by_head, n_ep, delta, discord, rule="mean",
                f"{worst}, p_fail={100 * p_fails[worst]:.1f}%")
         return dict(power=None, reason=why, calibrated_on=worst,
                     p_fails=p_fails)
+    # ВЫРОЖДЕННАЯ КАЛИБРОВКА ОТСЕКАЕТСЯ, а не считается. Формально r_rec < 1
+    # достаточно, но при 0.997 модель требует «исправить практически все
+    # провалы», а случайный шум в §32 даёт 60-67%. Ожидать от обучения 99% нет
+    # оснований, и высокая мощность в такой строке — артефакт допущения, а не
+    # свидетельство выполнимости.
+    if cal["r_rec"] > r_rec_max:
+        return dict(power=None,
+                    reason=f"калибровка вырождена: требуется восстановить "
+                           f"{100 * cal['r_rec']:.1f}% провалов, порог "
+                           f"{100 * r_rec_max:.0f}%",
+                    calibrated_on=worst, p_fails=p_fails,
+                    r_rec=cal["r_rec"], r_loss=cal["r_loss"])
     rng = np.random.default_rng(seed)
     hit, lows, dcs = 0, [], []
     for _ in range(n_sim):
@@ -281,6 +296,20 @@ def selftest():
                       n_sim=20, n_boot=20, seed=9)
     assert out["power"] is not None, out
 
+    # --- ВЫРОЖДЕННАЯ КАЛИБРОВКА ОТСЕКАЕТСЯ ---------------------------------
+    # При дискордантности 13.5% и опоре ~10% провалов требуется r_rec ~ 0.95+,
+    # то есть «исправить почти все»; считать мощность там нельзя.
+    # Нужна опора, где r_rec попадает МЕЖДУ порогом и единицей: при p_fail=10%
+    # и эффекте 5 пп это дискордантность около 14% (r_rec = 0.95).
+    deg_rates = {"a": [0.90] * 10, "b": [0.90] * 10}
+    deg = power_study(deg_rates, 80, 0.05, 0.14, "mean", n_sim=5, n_boot=5)
+    assert deg["power"] is None and "вырождена" in deg["reason"], deg
+    assert deg["r_rec"] > 0.90, deg["r_rec"]
+    # с поднятым порогом та же строка считается — значит отсекает именно порог
+    ok_ = power_study(deg_rates, 40, 0.05, 0.14, "mean", n_sim=5, n_boot=5,
+                      r_rec_max=1.0)
+    assert ok_["power"] is not None, ok_
+
     # --- ДВЕ ПРИЧИНЫ ОТКАЗА РАЗЛИЧАЮТСЯ ------------------------------------
     r1 = power_study(rates, 40, 0.05, 0.03, "mean", n_sim=5, n_boot=5)
     assert "меньше самого эффекта" in r1["reason"], r1["reason"]
@@ -367,6 +396,11 @@ def main():
     ap.add_argument("--rules", default="mean,mean_rep,all")
     ap.add_argument("--n-sim", type=int, default=300)
     ap.add_argument("--n-boot", type=int, default=300)
+    ap.add_argument("--r-rec-max", type=float, default=R_REC_MAX,
+                    help="выше этой доли восстановлений калибровка считается "
+                         "вырожденной и строка не считается: случайный шум в "
+                         "K-11g давал 60-67%%, и 99%% от обучения ожидать не "
+                         "из чего")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
@@ -399,7 +433,7 @@ def main():
                 for rule in a.rules.split(","):
                     p = power_study(rates, n_ep, dl / 100.0, dsc, rule,
                                     a.rep_sd, a.task_sd, a.n_sim, a.n_boot,
-                                    a.seed)
+                                    a.seed, r_rec_max=a.r_rec_max)
                     res[f"{dl}|{dsc}|{n_ep}|{rule}"] = p
                     if p["power"] is None:
                         skip = p["reason"]
@@ -408,7 +442,7 @@ def main():
                         cells.append(f"{p['power']:.2f}")
                 row.append((n_ep, cells))
             if skip:
-                print(f"    {dl:>+4.0f}{100 * dsc:>8.1f}%   НЕДОСТИЖИМО: "
+                print(f"    {dl:>+4.0f}{100 * dsc:>8.1f}%   НЕ СЧИТАЕТСЯ: "
                       f"{skip}")
                 continue
             for n_ep, cells in row:
