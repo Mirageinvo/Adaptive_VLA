@@ -31,6 +31,7 @@ K-11a, веса обеих голов D1, sigma = 0.10 (выбрана гейт�
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -279,6 +280,11 @@ def main():
                          "СЫРОЙ отвод, а голова обучена на res_norm(h24): "
                          "без неё вход головы из другого распределения")
     ap.add_argument("--expect-target", default="coef")
+    ap.add_argument("--train-log-std", action="store_true",
+                    help="обучать sigma. ПО УМОЛЧАНИЮ ЗАМОРОЖЕНА на --sigma: "
+                         "гейт K-11g проверил именно фиксированную 0.10, и "
+                         "обучение самой sigma — отдельная абляция, а не "
+                         "часть проверенного режима")
     ap.add_argument("--sigma", type=float, default=0.10,
                     help="выбранная гейтом K-11g начальная sigma")
     ap.add_argument("--batch", type=int, default=256)
@@ -394,7 +400,8 @@ def main():
         B = np.load(a.cache + ".basis.npy").astype(np.float32)
         rho = np.load(a.cache + ".rho.npy").astype(np.float32)
         Gh = hg.make_gaussian_residual_head()
-        h_ = Gh(h24.shape[-1], int(Et.shape[-1]), rank=int(o["rank"]),
+        rank_ = int(o["rank"])
+        h_ = Gh(h24.shape[-1], int(Et.shape[-1]), rank=rank_,
                 hidden=int(o.get("hidden", 512)),
                 proj=int(o.get("proj", 64))).to(dev)
         h_.set_basis(torch.as_tensor(B))
@@ -426,238 +433,182 @@ def main():
                rho_sha1=r_sha, rank=int(objs["s0"]["rank"]),
                target=a.expect_target, heads={})
 
+    # --- ОБЩИЕ БУФЕРЫ, НЕ ЗАВИСЯЩИЕ НИ ОТ ГОЛОВЫ, НИ ОТ ЧИСЛА ЭПОХ ----------
+    # Прежде eps, преимущества и порядок минибатчей брались из общего потока,
+    # и число эпох у s0 меняло состояние ГСЧ перед s1: сравнения голов и
+    # режимов не были парными. Здесь всё выводится из ОТДЕЛЬНОГО генератора,
+    # засеянного только --seed, поэтому при любом (epochs, lr) и для любой
+    # головы буферы совпадают побитово.
+    gen = torch.Generator(device=dev)
+    gen.manual_seed(int(a.seed) * 1000003 + 17)
+    eps_shared = torch.empty(a.batch, h24.shape[1], rank_, device=dev,
+                             dtype=torch.float32).normal_(generator=gen)
+    adv = torch.empty(a.batch, device=dev,
+                      dtype=torch.float32).normal_(generator=gen)
+    # НОРМИРОВКА ОДИН РАЗ ПО ВСЕМУ БАТЧУ, а не по минибатчу: при редких
+    # бинарных наградах минибатч легко однороден и теряет весь сигнал.
+    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+    perms = [torch.randperm(a.batch, generator=gen, device=dev)
+             for _ in range(a.epochs)]
+    eps_sha = hashlib.sha1(np.ascontiguousarray(
+        eps_shared.cpu().numpy()).tobytes()).hexdigest()[:16]
+    adv_sha = hashlib.sha1(np.ascontiguousarray(
+        adv.cpu().numpy()).tobytes()).hexdigest()[:16]
+    perm_sha = hashlib.sha1(b"".join(
+        np.ascontiguousarray(p.cpu().numpy()).tobytes()
+        for p in perms)).hexdigest()[:16]
+    print(f"  общие буферы: eps sha {eps_sha}, преимущества {adv_sha}, "
+          f"перестановки {perm_sha}")
+    out.update(eps_sha1=eps_sha, adv_sha1=adv_sha, perm_sha1=perm_sha,
+               train_log_std=bool(a.train_log_std))
+
+    def measure(head, mu_old, std_old, u_buf, logp_old):
+        """Полный замер НА ВСЁМ буфере. Вызывается до первого шага и ПОСЛЕ
+        КАЖДОГО.
+
+        ЗАЧЕМ НА ВСЁМ БУФЕРЕ И ПОСЛЕ ШАГА. Прежде и ppo_terms, и analytic_kl
+        считались ПЕРЕД step_and_project и только на текущем минибатче:
+        последний шаг не измерялся вовсе, а «KL эпохи» был KL одного минибатча
+        ДО его обновления. Из-за этого скачок отношения приписывался второй
+        эпохе, хотя сдвиг мог быть сделан первой и просто обнаружен позже.
+        """
+        with torch.no_grad():
+            o = head(h24, z0, u=u_buf)
+            t = ppo_terms(o["log_prob_u"], logp_old, adv, a.clip_eps)
+            std_new = o["std"].expand_as(o["mu"]).contiguous()
+            akl = analytic_kl(mu_old, std_old, o["mu"], std_new)
+            # ВЫРАВНИВАНИЕ СЧИТАЕТСЯ В СКРИПТЕ, а не одноразовой командой:
+            # косинус между сдвигом среднего и отклонением сохранённого
+            # действия — то, что объясняет хвост отношения.
+            d = (o["mu"] - mu_old).flatten(1)
+            e = (u_buf - mu_old).flatten(1)
+            dn = d.norm(dim=-1)
+            en = e.norm(dim=-1)
+            cos = ((d * e).sum(-1) / (dn * en + 1e-30))
+            lr_abs = t["log_ratio"].abs()
+            q = torch.quantile(lr_abs.float(),
+                               torch.tensor([0.5, 0.9, 0.99], device=dev))
+        return dict(kl_exact=akl["joint_mean"], kl_exact_max=akl["joint_max"],
+                    kl_per_dim=akl["per_dim_mean"], n_dim=akl["n_dim"],
+                    kl_k1=t["kl_k1"], kl_k3=t["kl_k3"],
+                    clip_frac=t["clip_frac"],
+                    log_ratio_min=t["log_ratio_min"],
+                    log_ratio_max=t["log_ratio_max"],
+                    log_ratio_absmax=t["log_ratio_absmax"],
+                    log_ratio_q50=float(q[0]), log_ratio_q90=float(q[1]),
+                    log_ratio_q99=float(q[2]),
+                    ratio_zero_frac=t["ratio_zero_frac"],
+                    ratio_ok=t["ratio_ok"],
+                    align_mean=float(cos.mean()), align_max=float(cos.max()),
+                    d_norm_mean=float(dn.mean()),
+                    std_mean=float(head.std().mean()))
+
     for tag, head in heads.items():
         print(f"\n=== голова {tag} ===")
-        # --- «раскатка»: сэмпл и сохранение в буфер -------------------------
         with torch.no_grad():
-            o_roll = head(h24, z0)
-        u_buf = o_roll["u"].detach().clone()
-        logp_old = o_roll["log_prob_u"].detach().clone()
-        # mu И std ПОЛИТИКИ СБОРА нужны для АНАЛИТИЧЕСКОГО KL: оценки k1/k3
-        # при катастрофических отношениях расходятся на порядки и перестают
-        # что-либо измерять.
-        mu_old = o_roll["mu"].detach().clone()
-        std_old = o_roll["std"].detach().clone().expand_as(mu_old).contiguous()
+            head.log_std.fill_(math.log(a.sigma))
+        head.log_std.requires_grad_(bool(a.train_log_std))
+        # --- «раскатка» на ОБЩЕМ eps ---------------------------------------
+        with torch.no_grad():
+            o_roll = head(h24, z0, deterministic=True)
+            mu_old = o_roll["mu"].detach().clone()
+            std_old = head.std().detach().expand_as(mu_old).contiguous()
+            u_buf = (mu_old + float(a.sigma) * eps_shared).detach().clone()
+            logp_old = head.log_prob_u(u_buf, mu_old, std_old).detach().clone()
         assert not u_buf.requires_grad and not logp_old.requires_grad
-        # ПОДДЕЛЬНЫЕ ПРЕИМУЩЕСТВА: награды здесь нет. Нормированы, как принято.
-        adv = torch.as_tensor(rng.normal(0, 1, size=a.batch),
-                              dtype=torch.float32, device=dev)
-        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-        # --- ПРОВЕРКА ТОЖДЕСТВЕННОСТИ ДО ПЕРВОГО ШАГА ----------------------
+        # --- ТОЖДЕСТВЕННОСТЬ ДО ПЕРВОГО ШАГА ------------------------------
         o_re = head(h24, z0, u=u_buf)
         assert o_re["u"].grad_fn is None, "сохранённое u попало в граф"
         t0 = ppo_terms(o_re["log_prob_u"], logp_old, adv, a.clip_eps)
         t0["ratio_cpu"] = t0["ratio"].detach().cpu().numpy()
         check_identity(t0)
+        m0 = measure(head, mu_old, std_old, u_buf, logp_old)
+        if abs(m0["kl_exact"]) > 1e-9 or m0["clip_frac"] != 0.0:
+            raise SystemExit(f"замер до шага не тождественен: KL "
+                             f"{m0['kl_exact']:.3e}, обрезано "
+                             f"{m0['clip_frac']}")
         print(f"  до шага: отношение 1 +- "
-              f"{np.abs(t0['ratio_cpu'] - 1).max():.2e}, KL k1 "
-              f"{t0['kl_k1']:.2e} k3 {t0['kl_k3']:.2e}, обрезано "
-              f"{100 * t0['clip_frac']:.1f}%")
-        # РЕПЛЕЙ ДЕТЕРМИНИРОВАН
+              f"{np.abs(t0['ratio_cpu'] - 1).max():.2e}, точный KL "
+              f"{m0['kl_exact']:.2e}, обрезано {100 * m0['clip_frac']:.1f}%, "
+              f"выравнивание {m0['align_mean']:.3f}")
         with torch.no_grad():
             again = head(h24, z0, u=u_buf)["log_prob_u"]
         assert torch.allclose(again, o_re["log_prob_u"].detach(), atol=0), \
             "реплей не детерминирован"
-        # И ПУТЬ «БУФЕР НА CPU -> КАРТА» ПРОВЕРЯЕТСЯ ЯВНО: именно так действие
-        # приходит из буфера rollout, и заявлять этот путь, не исполнив его,
-        # было бы утверждением без проверки.
         with torch.no_grad():
             from_cpu = head(h24, z0, u=u_buf.detach().cpu())["log_prob_u"]
-        assert from_cpu.device == again.device, "результат ушёл не на ту карту"
-        assert torch.allclose(from_cpu, again, atol=0), \
+        assert from_cpu.device == again.device and \
+            torch.allclose(from_cpu, again, atol=0), \
             "реплей с CPU-буфера дал другое правдоподобие"
-        # ГРАДИЕНТ ТОЛЬКО ЧЕРЕЗ mu И log_std
         head.zero_grad(set_to_none=True)
         t0["loss"].backward()
-        assert head.log_std.grad is not None
-        assert torch.isfinite(head.log_std.grad).all()
-        g_net = head.net[-1].weight.grad
-        assert g_net is not None and torch.isfinite(g_net).all()
+        assert torch.isfinite(head.net[-1].weight.grad).all()
         assert head.basis.grad is None and head.rho.grad is None
+        if a.train_log_std:
+            assert head.log_std.grad is not None
 
-        # --- собственно обновление -----------------------------------------
-        log_std_before = head.log_std.detach().clone()
+        # --- обновление с ЗАМЕРОМ ПОСЛЕ КАЖДОГО ШАГА ----------------------
+        trainable = [p_ for n_, p_ in head.named_parameters()
+                     if n_.startswith(("proj.", "net."))
+                     or (n_ == "log_std" and a.train_log_std)]
+        opt = torch.optim.Adam(trainable, lr=a.lr)
         net_before = head.net[-1].weight.detach().clone()
-        opt = torch.optim.Adam(
-            [p for n_, p in head.named_parameters()
-             if n_.startswith(("proj.", "net.")) or n_ == "log_std"], lr=a.lr)
-        steps = []
+        post, step_i = [], 0
         for ep in range(a.epochs):
-            order = torch.randperm(a.batch, device=dev)
             for s_ in range(0, a.batch, a.minibatch):
-                sl = order[s_:s_ + a.minibatch]
+                sl = perms[ep][s_:s_ + a.minibatch]
                 o_mb = head(h24[sl], z0[sl], u=u_buf[sl])
                 t = ppo_terms(o_mb["log_prob_u"], logp_old[sl], adv[sl],
                               a.clip_eps)
                 if not t["ratio_ok"]:
                     why = ("переполнение" if not t["ratio_finite"]
                            else f"обнуление у "
-                                f"{100 * t['ratio_zero_frac']:.1f}% примеров")
+                                f"{100 * t['ratio_zero_frac']:.1f}%")
                     raise SystemExit(
-                        f"ОТНОШЕНИЕ ПРАВДОПОДОБИЙ НЕГОДНО на эпохе {ep} "
-                        f"({why}): log_ratio в\n  "
-                        f"[{t['log_ratio_min']:.1f}, {t['log_ratio_max']:.1f}]."
-                        f" При 512 координатах оно расходится быстро — нужен\n"
-                        f"  меньший lr, одна эпоха на батч и остановка по KL.")
+                        f"ОТНОШЕНИЕ НЕГОДНО на шаге {step_i} ({why}): "
+                        f"log_ratio в\n  [{t['log_ratio_min']:.1f}, "
+                        f"{t['log_ratio_max']:.1f}].")
                 opt.zero_grad(set_to_none=True)
                 t["loss"].backward()
-                gnorm = torch.nn.utils.clip_grad_norm_(
-                    [p for p in head.parameters() if p.requires_grad], 1e9)
+                gnorm = torch.nn.utils.clip_grad_norm_(trainable, 1e9)
                 if not torch.isfinite(gnorm):
-                    raise SystemExit(f"нечисловой градиент на эпохе {ep}")
-                with torch.no_grad():
-                    akl = analytic_kl(mu_old[sl], std_old[sl],
-                                      o_mb["mu"].detach(),
-                                      o_mb["std"].expand_as(
-                                          o_mb["mu"]).contiguous())
+                    raise SystemExit(f"нечисловой градиент на шаге {step_i}")
                 step_and_project(opt, head)
-                ls = head.log_std.detach()
-                assert float(ls.max()) <= head.LOG_STD_MAX, "log_std выше предела"
-                assert float(ls.min()) >= head.LOG_STD_MIN, "log_std ниже предела"
-                steps.append(dict(epoch=ep, kl_k1=t["kl_k1"], kl_k3=t["kl_k3"],
-                                  kl_exact=akl["joint_mean"],
-                                  kl_exact_max=akl["joint_max"],
-                                  kl_per_dim=akl["per_dim_mean"],
-                                  n_dim=akl["n_dim"],
-                                  clip_frac=t["clip_frac"],
-                                  log_ratio_absmax=t["log_ratio_absmax"],
-                                  log_ratio_min=t["log_ratio_min"],
-                                  log_ratio_max=t["log_ratio_max"],
-                                  ratio_zero_frac=t["ratio_zero_frac"],
-                                  log_ratio_std=t["log_ratio_std"],
-                                  grad_norm=float(gnorm),
-                                  loss=float(t["loss"].detach()),
-                                  std_mean=float(head.std().mean())))
-        last = steps[-1]
-        print(f"  шагов {len(steps)}; последний: ТОЧНЫЙ KL "
-              f"{last['kl_exact']:.4g} по {last['n_dim']} координатам "
-              f"({last['kl_per_dim']:.3g} на координату),\n    оценки k1 "
-              f"{last['kl_k1']:.4g} k3 {last['kl_k3']:.4g}, обрезано "
-              f"{100 * last['clip_frac']:.1f}%, log_ratio в "
-              f"[{last['log_ratio_min']:.2f}, {last['log_ratio_max']:.2f}], "
-              f"норма градиента {last['grad_norm']:.3e}")
-        ever = max(s["clip_frac"] for s in steps)
-        kl_max = max(s["kl_k3"] for s in steps)
-        # ДИАГНОСТИКА, НЕ ОТКАЗ: преимущества здесь поддельные, поэтому
-        # «слишком агрессивное обновление» о настоящем PPO не говорит. Но
-        # цифру надо видеть: при 512 координатах доля обрезанных легко
-        # уходит к единице, и тогда настоящему PPO понадобится меньший lr,
-        # меньше эпох на батч или ранняя остановка по KL.
-        if ever > 0.5 or kl_max > 0.05:
-            print(f"  ВНИМАНИЕ: обрезано до {100 * ever:.0f}%, KL k3 до "
-                  f"{kl_max:.4g}, |log_ratio| до "
-                  f"{max(s_['log_ratio_absmax'] for s_ in steps):.1f}.")
-            if kl_max > 1.0:
-                print("    ЭТО НЕ ПРОСТО МНОГО: при 512 случайных координатах "
-                      "изменение mu на\n    сотые доли множится по всем "
-                      "координатам, и отношение правдоподобий\n    либо "
-                      "обнуляется, либо взрывается. Обновление считается по "
-                      "данным,\n    которых политика уже не порождает.")
-                print("    Кандидатный режим для настоящего PPO: ОДНА эпоха "
-                      "на батч, lr на\n    порядок меньше, ранняя остановка "
-                      "по ТОЧНОМУ KL с порогом 0.01-0.02.")
-                print("    Преимущества нормировать ПО ВСЕМУ батчу раскатки "
-                      "(или по группе\n    эпизодов одного начального "
-                      "состояния), а затем делить на минибатчи БЕЗ\n    "
-                      "повторной нормировки: при редких бинарных наградах "
-                      "минибатч легко\n    оказывается однородным и теряет "
-                      "весь сигнал.")
-                print("    Это КАНДИДАТЫ, а не подтверждённые настройки: их "
-                      "надо прогнать отдельно\n    и потребовать точный KL в "
-                      "пределах порога при умеренной доле обрезанных.")
-            else:
-                print("    Для настоящего PPO это сигнал уменьшить lr или "
-                      "число эпох на батч\n    и добавить остановку по KL.")
-            print("    Здесь преимущества ПОДДЕЛЬНЫЕ, поэтому это не отказ, "
-                  "а величина к сведению.")
-        # ПАРАМЕТРЫ ОБЯЗАНЫ СДВИНУТЬСЯ. Иначе «обучение прошло без ошибок»
-        # неотличимо от обучения, которое ничего не меняло: при lr=1e-4 сдвиг
-        # log_std порядка 1e-3 не виден в четырёх знаках, и без явной проверки
-        # замерший параметр выглядел бы успехом.
-        d_ls = float((head.log_std.detach() - log_std_before).abs().max())
+                mp = measure(head, mu_old, std_old, u_buf, logp_old)
+                mp.update(step=step_i, epoch=ep, grad_norm=float(gnorm),
+                          mb_clip_frac_pre=t["clip_frac"])
+                post.append(mp)
+                step_i += 1
+                if not mp["ratio_ok"]:
+                    raise SystemExit(
+                        f"ПОСЛЕ шага {step_i - 1} отношение негодно: "
+                        f"обнулилось у {100 * mp['ratio_zero_frac']:.1f}%, "
+                        f"log_ratio\n  в [{mp['log_ratio_min']:.1f}, "
+                        f"{mp['log_ratio_max']:.1f}]. Параметры уже изменены: "
+                        f"для настоящего RL\n  здесь нужен откат состояния "
+                        f"головы и Adam, а не только остановка.")
+        fin = post[-1]
+        print(f"  ПОСЛЕ {len(post)} шагов, замер на ВСЁМ буфере: точный KL "
+              f"{fin['kl_exact']:.4g} (макс по состоянию "
+              f"{fin['kl_exact_max']:.4g}),\n    обрезано "
+              f"{100 * fin['clip_frac']:.1f}%, |log_ratio| медиана "
+              f"{fin['log_ratio_q50']:.3f} q90 {fin['log_ratio_q90']:.3f} "
+              f"q99 {fin['log_ratio_q99']:.3f} макс "
+              f"{fin['log_ratio_absmax']:.3f},\n    выравнивание "
+              f"{fin['align_mean']:.3f} (макс {fin['align_max']:.3f}), "
+              f"k1 {fin['kl_k1']:.4g} k3 {fin['kl_k3']:.4g}")
+        print(f"  по шагам обрезано: "
+              + " ".join(f"{100 * m['clip_frac']:.0f}%" for m in post))
         d_net = float((head.net[-1].weight.detach() - net_before).abs().max())
-        if d_ls == 0.0:
-            raise SystemExit(
-                "log_std НЕ СДВИНУЛСЯ за весь прогон: либо он не в "
-                "оптимизаторе, либо упёрся\n  в границу, где градиент clamp "
-                "нулевой — ровно то, против чего нужна project_log_std_.")
         if d_net == 0.0:
             raise SystemExit("средняя ветвь не сдвинулась: путь "
                              "score-function мёртв")
-        print(f"  sigma прошла {a.sigma:.6f} -> {last['std_mean']:.6f}; "
-              f"сдвиг log_std {d_ls:.3e}, последнего слоя {d_net:.3e}")
-        print(f"  log_std в пределах [{head.LOG_STD_MIN}, "
-              f"{head.LOG_STD_MAX}], фактически "
-              f"[{float(head.log_std.min()):.4f}, "
-              f"{float(head.log_std.max()):.4f}]")
-        # КОНТРОЛЬ НЕОБХОДИМОСТИ ПРОЕКЦИИ. В коротком прогоне log_std не
-        # покидает диапазон, поэтому project_log_std_ оказывается пустой
-        # операцией, и её удаление не проявилось бы ни в одном числе.
-        #
-        # ПОТЕРЯ ЗДЕСЬ ПРОСТАЯ, А ВЫНОС МАЛЫЙ, И ЭТО СУЩЕСТВЕННО. Первая
-        # версия брала потерю PPO и выносила log_std на +5, то есть sigma с
-        # 0.1 до ~2.7. Тогда logp_new - logp_old ~ -512*ln(27) ~ -1700,
-        # отношение обнуляется в fp32 ТОЧНО, обрезанный член становится
-        # константой, и градиент нулевой НЕ из-за clamp, а из-за исчезновения
-        # отношения. Контроль путал две причины и на малых размерностях
-        # проходил, а на настоящих 512 координатах ложно отказывал.
-        with torch.no_grad():
-            keep = head.log_std.detach().clone()
-            head.log_std.fill_(head.LOG_STD_MAX + 0.5)
-        head.zero_grad(set_to_none=True)
-        (-head(h24, z0, u=u_buf)["log_prob_u"].mean()).backward()
-        g_out = float(head.log_std.grad.abs().max())
-        head.project_log_std_()
-        inside = float(head.log_std.max())
-        head.zero_grad(set_to_none=True)
-        (-head(h24, z0, u=u_buf)["log_prob_u"].mean()).backward()
-        g_in = float(head.log_std.grad.abs().max())
-        with torch.no_grad():
-            head.log_std.copy_(keep)
-        if g_out != 0.0:
-            raise SystemExit(
-                f"за границей градиент log_std равен {g_out:.3e}, а не нулю: "
-                f"значит clamp\n  пропускает градиент, и проекция не нужна — "
-                f"либо контроль недействителен.")
-        if not (inside < head.LOG_STD_MAX and g_in > 0.0):
-            raise SystemExit(
-                "ПРОЕКЦИЯ НЕ ВОЗВРАЩАЕТ ОБУЧЕНИЕ: после выноса log_std за "
-                "границу\n  градиент не восстановился. Без этого sigma "
-                "замерла бы навсегда.")
-        print(f"  контроль проекции (потеря -log pi, вынос +0.5): за границей "
-              f"градиент {g_out:.1e},\n    после проекции {g_in:.3e} при "
-              f"log_std {inside:.4f}")
-
-        # КОНТРОЛЬ: ветвь обрезания должна быть ЖИВОЙ. Если за весь прогон
-        # ничего не обрезалось, «обрезано 0%» неотличимо от мёртвого кода.
-        probe = None
-        if ever == 0.0:
-            with torch.no_grad():
-                saved = head.log_std.detach().clone()
-                head.log_std.add_(0.7)          # заметно иная политика
-                o_p = head(h24, z0, u=u_buf)
-            tp = ppo_terms(o_p["log_prob_u"], logp_old, adv, a.clip_eps)
-            probe = dict(clip_frac=tp["clip_frac"],
-                         log_ratio_absmax=tp["log_ratio_absmax"])
-            with torch.no_grad():
-                head.log_std.copy_(saved)
-            if tp["clip_frac"] == 0.0:
-                raise SystemExit(
-                    "ВЕТВЬ ОБРЕЗАНИЯ МЁРТВА: даже при явно иной политике "
-                    "ничего не обрезалось.")
-            print(f"  контроль обрезания: при сдвиге log_std на +0.7 "
-                  f"обрезано {100 * tp['clip_frac']:.1f}%")
-        out["heads"][tag] = dict(
-            identity=dict(ratio_dev=float(np.abs(t0["ratio_cpu"] - 1).max()),
-                          kl_k1=t0["kl_k1"], kl_k3=t0["kl_k3"],
-                          clip_frac=t0["clip_frac"]),
-            steps=steps, clip_ever=ever, clip_probe=probe,
-            kl_max=kl_max, d_log_std=d_ls, d_net_last=d_net,
-            proj_grad_outside=g_out, proj_grad_inside=g_in,
-            log_std_range=[float(head.log_std.min()),
-                           float(head.log_std.max())],
-            sigma_end=last["std_mean"])
+        print(f"  сдвиг последнего слоя {d_net:.3e}; sigma "
+              f"{'обучалась' if a.train_log_std else 'ЗАМОРОЖЕНА'} на "
+              f"{fin['std_mean']:.6f}")
+        out["heads"][tag] = dict(identity=m0, post=post, d_net_last=d_net,
+                                 head_sha1=head_sha[tag])
 
     if a.out:
         os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".",
@@ -665,12 +616,13 @@ def main():
         json.dump(out, open(a.out, "w"), ensure_ascii=False, indent=1)
         print(f"\n  сохранено: {a.out}")
     print("\n  PPO SMOKE ПРОЙДЕН на обеих головах: отношение тождественно до "
-          "первого шага,\n  реплей детерминирован, градиент идёт через mu и "
-          "log_std, переполнений нет,\n  log_std остаётся в пределах после "
-          "проекции, ветвь обрезания жива.")
-    print("  ЭТО МЕХАНИКА, НЕ ОБУЧЕНИЕ: преимущества здесь поддельные, "
-          "наград нет.\n  Ни одного утверждения об улучшении политики отсюда "
-          "не следует.")
+          "первого шага,\n  реплей детерминирован (включая буфер с CPU), "
+          "градиент идёт через среднюю ветвь,\n  отношение годно ПОСЛЕ "
+          "каждого шага, замер делается на ВСЁМ буфере.")
+    print("  ЭТО МЕХАНИКА, НЕ ОБУЧЕНИЕ: преимущества поддельные, наград нет. "
+          "Ни одного\n  утверждения об улучшении политики отсюда не следует, "
+          "и выбирать предохранители\n  по одному сиду нельзя — нужен "
+          "перебор по нескольким --seed.")
 
 
 if __name__ == "__main__":
