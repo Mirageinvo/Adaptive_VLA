@@ -273,6 +273,8 @@ def main():
         assert head.basis.grad is None and head.rho.grad is None
 
         # --- собственно обновление -----------------------------------------
+        log_std_before = head.log_std.detach().clone()
+        net_before = head.net[-1].weight.detach().clone()
         opt = torch.optim.Adam(
             [p for n_, p in head.named_parameters()
              if n_.startswith(("proj.", "net.")) or n_ == "log_std"], lr=a.lr)
@@ -315,11 +317,74 @@ def main():
               f"обрезано {100 * last['clip_frac']:.1f}%, |log_ratio| макс "
               f"{last['log_ratio_absmax']:.3f}, норма градиента "
               f"{last['grad_norm']:.3e}")
-        print(f"  sigma прошла {a.sigma:.4f} -> {last['std_mean']:.4f}, "
-              f"log_std в пределах [{head.LOG_STD_MIN}, {head.LOG_STD_MAX}]")
+        # ПАРАМЕТРЫ ОБЯЗАНЫ СДВИНУТЬСЯ. Иначе «обучение прошло без ошибок»
+        # неотличимо от обучения, которое ничего не меняло: при lr=1e-4 сдвиг
+        # log_std порядка 1e-3 не виден в четырёх знаках, и без явной проверки
+        # замерший параметр выглядел бы успехом.
+        d_ls = float((head.log_std.detach() - log_std_before).abs().max())
+        d_net = float((head.net[-1].weight.detach() - net_before).abs().max())
+        if d_ls == 0.0:
+            raise SystemExit(
+                "log_std НЕ СДВИНУЛСЯ за весь прогон: либо он не в "
+                "оптимизаторе, либо упёрся\n  в границу, где градиент clamp "
+                "нулевой — ровно то, против чего нужна project_log_std_.")
+        if d_net == 0.0:
+            raise SystemExit("средняя ветвь не сдвинулась: путь "
+                             "score-function мёртв")
+        print(f"  sigma прошла {a.sigma:.6f} -> {last['std_mean']:.6f}; "
+              f"сдвиг log_std {d_ls:.3e}, последнего слоя {d_net:.3e}")
+        print(f"  log_std в пределах [{head.LOG_STD_MIN}, "
+              f"{head.LOG_STD_MAX}], фактически "
+              f"[{float(head.log_std.min()):.4f}, "
+              f"{float(head.log_std.max()):.4f}]")
+        # КОНТРОЛЬ НЕОБХОДИМОСТИ ПРОЕКЦИИ. В коротком прогоне log_std не
+        # покидает диапазон, поэтому project_log_std_ оказывается пустой
+        # операцией, и её удаление не проявилось бы ни в одном числе. Здесь
+        # параметр насильно выносится за границу: без проекции градиент clamp
+        # нулевой и обучение sigma встало бы навсегда.
+        with torch.no_grad():
+            keep = head.log_std.detach().clone()
+            head.log_std.fill_(head.LOG_STD_MAX + 5.0)
+        head.zero_grad(set_to_none=True)
+        o_out = head(h24, z0, u=u_buf)
+        ppo_terms(o_out["log_prob_u"], logp_old, adv,
+                  a.clip_eps)["loss"].backward()
+        g_out = float(head.log_std.grad.abs().max())
+        head.project_log_std_()
+        inside = float(head.log_std.max())
+        head.zero_grad(set_to_none=True)
+        o_in = head(h24, z0, u=u_buf)
+        ppo_terms(o_in["log_prob_u"], logp_old, adv,
+                  a.clip_eps)["loss"].backward()
+        g_in = float(head.log_std.grad.abs().max())
+        with torch.no_grad():
+            head.log_std.copy_(keep)
+        if g_out != 0.0:
+            raise SystemExit("за границей градиент log_std не нулевой: "
+                             "проверка контроля недействительна")
+        if not (inside < head.LOG_STD_MAX and g_in > 0.0):
+            raise SystemExit(
+                "ПРОЕКЦИЯ НЕ ВОЗВРАЩАЕТ ОБУЧЕНИЕ: после выноса log_std за "
+                "границу\n  градиент не восстановился. Без этого sigma "
+                "замерла бы навсегда.")
+        print(f"  контроль проекции: за границей градиент log_std {g_out:.1e}, "
+              f"после проекции {g_in:.1e} при log_std {inside:.4f}")
+
         # КОНТРОЛЬ: ветвь обрезания должна быть ЖИВОЙ. Если за весь прогон
         # ничего не обрезалось, «обрезано 0%» неотличимо от мёртвого кода.
         ever = max(s["clip_frac"] for s in steps)
+        kl_max = max(s["kl_k3"] for s in steps)
+        # ДИАГНОСТИКА, НЕ ОТКАЗ: преимущества здесь поддельные, поэтому
+        # «слишком агрессивное обновление» о настоящем PPO не говорит. Но
+        # цифру надо видеть: при 512 координатах доля обрезанных легко
+        # уходит к единице, и тогда настоящему PPO понадобится меньший lr,
+        # меньше эпох на батч или ранняя остановка по KL.
+        if ever > 0.5 or kl_max > 0.05:
+            print(f"  ВНИМАНИЕ: обрезано до {100 * ever:.0f}%, KL k3 до "
+                  f"{kl_max:.4f}. Для настоящего PPO это сигнал уменьшить "
+                  f"lr или число\n    эпох на батч и добавить остановку по "
+                  f"KL. Здесь преимущества поддельные, поэтому\n    это не "
+                  f"отказ, а величина к сведению.")
         probe = None
         if ever == 0.0:
             with torch.no_grad():
@@ -342,6 +407,10 @@ def main():
                           kl_k1=t0["kl_k1"], kl_k3=t0["kl_k3"],
                           clip_frac=t0["clip_frac"]),
             steps=steps, clip_ever=ever, clip_probe=probe,
+            kl_max=kl_max, d_log_std=d_ls, d_net_last=d_net,
+            proj_grad_outside=g_out, proj_grad_inside=g_in,
+            log_std_range=[float(head.log_std.min()),
+                           float(head.log_std.max())],
             sigma_end=last["std_mean"])
 
     if a.out:
