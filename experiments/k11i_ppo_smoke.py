@@ -488,6 +488,22 @@ def main():
             lr_abs = t["log_ratio"].abs()
             q = torch.quantile(lr_abs.float(),
                                torch.tensor([0.5, 0.9, 0.99], device=dev))
+            # ОТКУДА ХВОСТ: из выравнивания d с e или из НЕОДНОРОДНОСТИ ||d||
+            # по состояниям? Средний косинус этого не различает. Здесь
+            # считаются разброс ||d||, корреляция |log_ratio| с покоординатным
+            # KL состояния, и выравнивание ИМЕННО у худшего процента примеров.
+            dq = torch.quantile(dn.float(),
+                                torch.tensor([0.5, 0.9, 0.99], device=dev))
+            kl_s = (torch.log(std_new / std_old)
+                    + (std_old ** 2 + (mu_old - o["mu"]) ** 2)
+                    / (2 * std_new ** 2) - 0.5).flatten(1).sum(-1)
+            def _corr(x, y):
+                x = x.float() - x.float().mean()
+                y = y.float() - y.float().mean()
+                return float((x * y).sum()
+                             / (x.norm() * y.norm() + 1e-30))
+            k_top = max(1, int(0.01 * lr_abs.numel()))
+            top = torch.topk(lr_abs.float(), k_top).indices
         return dict(kl_exact=akl["joint_mean"], kl_exact_max=akl["joint_max"],
                     kl_per_dim=akl["per_dim_mean"], n_dim=akl["n_dim"],
                     kl_k1=t["kl_k1"], kl_k3=t["kl_k3"],
@@ -500,7 +516,15 @@ def main():
                     ratio_zero_frac=t["ratio_zero_frac"],
                     ratio_ok=t["ratio_ok"],
                     align_mean=float(cos.mean()), align_max=float(cos.max()),
+                    align_top1pct=float(cos[top].mean()),
                     d_norm_mean=float(dn.mean()),
+                    d_norm_q50=float(dq[0]), d_norm_q90=float(dq[1]),
+                    d_norm_q99=float(dq[2]),
+                    d_norm_ratio_q99_q50=float(dq[2] / (dq[0] + 1e-30)),
+                    kl_state_q99=float(torch.quantile(
+                        kl_s.float(), torch.tensor(0.99, device=dev))),
+                    corr_logratio_kl=_corr(lr_abs, kl_s),
+                    corr_logratio_dnorm=_corr(lr_abs, dn),
                     std_mean=float(head.std().mean()))
 
     for tag, head in heads.items():
@@ -598,6 +622,12 @@ def main():
               f"{fin['log_ratio_absmax']:.3f},\n    выравнивание "
               f"{fin['align_mean']:.3f} (макс {fin['align_max']:.3f}), "
               f"k1 {fin['kl_k1']:.4g} k3 {fin['kl_k3']:.4g}")
+        print(f"    ОТКУДА ХВОСТ: ||d|| q50 {fin['d_norm_q50']:.4f} q99 "
+              f"{fin['d_norm_q99']:.4f} (отношение "
+              f"{fin['d_norm_ratio_q99_q50']:.1f}x), выравнивание у худшего "
+              f"процента {fin['align_top1pct']:+.3f},\n    корреляция "
+              f"|log_ratio| с KL состояния {fin['corr_logratio_kl']:+.3f}, "
+              f"с ||d|| {fin['corr_logratio_dnorm']:+.3f}")
         print(f"  по шагам обрезано: "
               + " ".join(f"{100 * m['clip_frac']:.0f}%" for m in post))
         d_net = float((head.net[-1].weight.detach() - net_before).abs().max())

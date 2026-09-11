@@ -191,7 +191,15 @@ def main():
     if a.out:
         os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".",
                     exist_ok=True)
-        json.dump(dict(guard=g, n_files=len(files),
+        # КЛЮЧИ-КОРТЕЖИ JSON НЕ ПРИНИМАЕТ: приводим к строкам. Таблица до
+        # этого уже напечатана, поэтому падение теряло только файл.
+        g_out = dict(g)
+        g_out["per_arm"] = {f"{k[0]}|{k[1]}|{k[2]}": v
+                            for k, v in g["per_arm"].items()}
+        g_out["passing"] = [f"{r[0]}|{r[1]}" for r in g["passing"]]
+        g_out["chosen"] = (None if g["chosen"] is None
+                           else f"{g['chosen'][0]}|{g['chosen'][1]}")
+        json.dump(dict(guard=g_out, n_files=len(files),
                        cells={f"{k[0]}|{k[1]}|{k[2]}":
                               {str(s): v["fin"] for s, v in per.items()}
                               for k, per in rows.items()}),
