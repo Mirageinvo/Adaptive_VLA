@@ -42,9 +42,10 @@ def run_key(d, path):
 # ПОЛЯ, ОБЯЗАННЫЕ СОВПАСТЬ У ВСЕХ ПРОГОНОВ. Прежде не сверялось ничего:
 # набор из s0 с одним сидом и s1 с другим, при чужом script_sha1, принимался
 # как прошедший режим.
-SHARED = ("sigma", "clip_eps", "device", "dtype", "res_norm_sha1",
-          "basis_sha1", "rho_sha1", "rank", "target", "cache", "batch",
-          "script_sha1", "hicora_g_sha1", "hicora_vla_sha1")
+SHARED = ("sigma", "clip_eps", "device", "dtype", "torch_version",
+          "res_norm_sha1", "basis_sha1", "rho_sha1", "rank", "target",
+          "cache", "batch", "script_sha1", "hicora_g_sha1",
+          "hicora_vla_sha1")
 # eps и преимущества зависят ТОЛЬКО от seed: внутри одного сида обязаны
 # совпадать у всех режимов и обеих голов, между сидами — различаться.
 PER_SEED = ("eps_sha1", "adv_sha1")
@@ -87,8 +88,16 @@ def check_provenance(meta, expect_script=None):
     return True
 
 
-def check_complete(rows, expect_seeds=None, heads=("s0", "s1")):
-    """Одинаковый набор сидов у ВСЕХ режимов и ОБЕИХ голов; без дублей."""
+def check_complete(rows, expect_seeds=None, heads=("s0", "s1"),
+                  manifest=None):
+    """Одинаковый набор сидов у ВСЕХ режимов и ОБЕИХ голов; без дублей.
+
+    MANIFEST «режим -> обязательные сиды» нужен, когда режимы намеренно шли с
+    разным числом сидов. Без него один глобальный `--expect-seeds` либо
+    отвергает законный неравномерный набор, либо (если не задан) принимает
+    набор, где lr=1e-6 считан на сиде 0, а lr=3e-6 — на сиде 4. Второе я
+    воспроизвёл: оно проходило.
+    """
     bad = []
     regimes = sorted({k[:4] for k in rows})
     seeds_by = {}
@@ -103,12 +112,28 @@ def check_complete(rows, expect_seeds=None, heads=("s0", "s1")):
                if r + (hd,) in rows]
         if got and len(set(map(frozenset, got))) > 1:
             bad.append(f"{r}: головы измерены на РАЗНЫХ сидах {got}")
-        if expect_seeds is not None:
+        want = None
+        if manifest is not None:
+            key = f"e{r[0]}|mb{r[1]}|b{r[2]}|lr{r[3]:.0e}"
+            if key not in manifest:
+                bad.append(f"{key}: режима нет в манифесте")
+            else:
+                want = set(manifest[key])
+        elif expect_seeds is not None:
+            want = set(expect_seeds)
+        if want is not None:
             for hd in heads:
                 k = r + (hd,)
-                if k in rows and seeds_by[k] != set(expect_seeds):
+                if k in rows and seeds_by[k] != want:
                     bad.append(f"{r}, {hd}: сиды {sorted(seeds_by[k])} "
-                               f"вместо {sorted(expect_seeds)}")
+                               f"вместо {sorted(want)}")
+    if manifest is not None:
+        have = {f"e{r[0]}|mb{r[1]}|b{r[2]}|lr{r[3]:.0e}" for r in regimes}
+        missing = sorted(set(manifest) - have)
+        if missing:
+            bad.append(f"режимы из манифеста не посчитаны: {missing}")
+    if True:
+        pass
     for key, per in rows.items():
         exp = ((key[2] + key[1] - 1) // key[1]) * key[0]
         for sd, v in per.items():
@@ -230,6 +255,7 @@ def selftest():
 
     def m_(sd, **kw):
         base = dict(sigma=0.1, clip_eps=0.2, device="cuda:0", dtype="float16",
+                    torch_version="2.4.1+cu124",
                     res_norm_sha1="rn", basis_sha1="bs", rho_sha1="rh",
                     rank=32, target="coef", cache="data/c", batch=256,
                     script_sha1="SC", hicora_g_sha1="HG",
@@ -407,6 +433,33 @@ def selftest():
     else:
         raise AssertionError("дубль принят")
 
+    # --- ИНТЕГРАЦИОННЫЙ ТЕСТ: НАСТОЯЩИЙ ВЫХОД ВОРКЕРА -------------------
+    # Обе самопроверки проходили на РУЧНЫХ фикстурах, и несовпадение полей
+    # (воркер не писал device и dtype, агрегатор их требовал) не обнаружилось.
+    # Здесь набор полей берётся ИЗ КОДА ВОРКЕРА, а не переписывается руками.
+    import re as _re
+    wp = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      "k11i_ppo_smoke.py")
+    if os.path.exists(wp):
+        src = open(wp).read()
+        i = src.index("    out = dict(sigma=a.sigma")
+        j = src.index("heads={})", i)
+        blk = src[i:j]
+        written = set(_re.findall(r"(\w+)\s*=", blk))
+        need = set(SHARED) | set(PER_SEED) | {"epochs", "lr", "minibatch",
+                                              "batch", "seed", "head_sha1"}
+        # eps_sha1 и adv_sha1 воркер пишет отдельным out.update — учитываем.
+        for extra in _re.findall(r"out\.update\(([^)]*)\)", src):
+            written |= set(_re.findall(r"(\w+)\s*=", extra))
+        miss = sorted(need - written)
+        if miss:
+            raise SystemExit(
+                "ВОРКЕР И АГРЕГАТОР НЕСОВМЕСТИМЫ: k11i_ppo_smoke.py не "
+                f"записывает поля {miss},\n  а k11i_table.py их требует. "
+                "Файлы, созданные воркером, будут отвергнуты.")
+        print(f"  интеграция: воркер пишет все {len(need)} полей, которых "
+              f"требует агрегатор")
+
     print("самопроверка k11i_table пройдена: провенанс сверяется по "
           "четырнадцати полям,\n  eps зависит только от сида, набор сидов "
           "обязан совпадать у обеих голов,\n  число шагов сверяется, дубли "
@@ -425,6 +478,12 @@ def main():
                     help="обязательный набор сидов, например 0,1,2. Без него "
                          "проверяется только СОГЛАСОВАННОСТЬ сидов между "
                          "головами, но не их число")
+    ap.add_argument("--manifest", default=None,
+                    help="JSON «режим -> список сидов», например "
+                         "'{\"e1|mb256|b256|lr3e-06\": [0,1,2]}'. Нужен, "
+                         "когда режимы шли с РАЗНЫМ числом сидов: иначе "
+                         "неравномерный набор либо отвергается, либо "
+                         "принимается без проверки")
     ap.add_argument("--no-script-check", action="store_true",
                     help="не требовать, чтобы прогоны были сделаны текущей "
                          "версией k11i_ppo_smoke.py")
@@ -449,7 +508,8 @@ def main():
                     h.update(c)
             me = h.hexdigest()[:12]
     check_provenance(meta, me)
-    comp = check_complete(rows, a.expect_seeds)
+    man = json.loads(a.manifest) if a.manifest else None
+    comp = check_complete(rows, a.expect_seeds, manifest=man)
     print(f"  файлов {len(files)}, ячеек {len(rows)}, режимов "
           f"{comp['regimes']}, сиды {comp['seeds']}")
     print(f"  провенанс сверен: одна версия стенда"

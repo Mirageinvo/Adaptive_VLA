@@ -431,7 +431,13 @@ def main():
                hicora_vla_sha1=k9h.file_sha12(hv.__file__),
                head_sha1=head_sha, res_norm_sha1=rn_sha, basis_sha1=b_sha,
                rho_sha1=r_sha, rank=int(objs["s0"]["rank"]),
-               target=a.expect_target, heads={})
+               target=a.expect_target,
+               # ЭТИ ПОЛЯ ТРЕБУЕТ АГРЕГАТОР. Без них k11i_table отвергал
+               # файлы, созданные этим же воркером: самопроверки обеих сторон
+               # проходили, потому что фикстуры собирались вручную и поля
+               # содержали. Теперь есть интеграционный тест.
+               device=str(dev), dtype=str(h24.dtype),
+               torch_version=str(torch.__version__), heads={})
 
     # --- ОБЩИЕ БУФЕРЫ, НЕ ЗАВИСЯЩИЕ НИ ОТ ГОЛОВЫ, НИ ОТ ЧИСЛА ЭПОХ ----------
     # Прежде eps, преимущества и порядок минибатчей брались из общего потока,
