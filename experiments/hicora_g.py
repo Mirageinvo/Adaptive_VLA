@@ -179,10 +179,17 @@ def make_gaussian_residual_head():
                     eps = torch.empty_like(mu).normal_(generator=generator)
                     u = mu + std * eps
             else:
-                # И УСТРОЙСТВО, НЕ ТОЛЬКО dtype: сохранённый сэмпл
-                # приходит из буфера rollout, где он лежит на CPU, а `mu`
-                # считается на карте. Без переноса обновление PPO падало бы.
-                u = u.to(device=mu.device, dtype=mu.dtype)
+                # И УСТРОЙСТВО, НЕ ТОЛЬКО dtype: сохранённый сэмпл приходит
+                # из буфера rollout, где он лежит на CPU, а `mu` считается на
+                # карте. Без переноса обновление PPO падало бы.
+                #
+                # DETACH ОБЯЗАТЕЛЕН, А НЕ ПОЛАГАЕТСЯ НА ВЫЗЫВАЮЩЕГО. На
+                # обновлении PPO сохранённое действие — КОНСТАНТА, и градиент
+                # должен идти только через mu и log_std. Если буфер случайно
+                # сохранил тензор с историей, путь score-function подменился бы
+                # репараметризованным молча, и отношение правдоподобий
+                # перестало бы быть тем, чем его считают.
+                u = u.detach().to(device=mu.device, dtype=mu.dtype)
                 if u.shape != mu.shape:
                     raise ValueError(
                         f"сохранённый u формы {tuple(u.shape)}, ожидалась "
@@ -335,6 +342,14 @@ def selftest():
     g7.zero_grad(set_to_none=True)
     o7 = g7(h_, z_, u=u_buf)
     assert o7["u"].grad_fn is None, "переданный u попал в граф"
+    # И ЕСЛИ ВЫЗЫВАЮЩИЙ ПЕРЕДАЛ ТЕНЗОР С ИСТОРИЕЙ — голова обязана его
+    # отцепить сама: иначе score-function путь подменился бы репараметризован-
+    # ным, и это не проявилось бы ни в одном числе.
+    u_live = g7(h_, z_)["u"]
+    assert u_live.grad_fn is not None, "сэмпл должен быть в графе"
+    o7c = g7(h_, z_, u=u_live)
+    assert o7c["u"].grad_fn is None, "голова не отцепила переданный u"
+    assert not o7c["u"].requires_grad
     (-o7["log_prob_u"].mean()).backward()
     assert g7.log_std.grad is not None
     assert torch.isfinite(g7.log_std.grad).all()
