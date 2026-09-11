@@ -517,6 +517,23 @@ def main():
                     ratio_ok=t["ratio_ok"],
                     align_mean=float(cos.mean()), align_max=float(cos.max()),
                     align_top1pct=float(cos[top].mean()),
+                    # ЗНАК ПРЕИМУЩЕСТВ В ХВОСТЕ. Без него утверждение «у
+                    # хвостовых примеров отрицательное преимущество» из JSON
+                    # не воспроизводится — а именно им я объяснял хвост.
+                    tail_adv_mean=float(adv[top].mean()),
+                    tail_adv_neg_frac=float((adv[top] < 0).float().mean()),
+                    tail_logratio_mean=float(t["log_ratio"][top].mean()),
+                    tail_logratio_neg_frac=float(
+                        (t["log_ratio"][top] < 0).float().mean()),
+                    pos_tail_q99=float(torch.quantile(
+                        t["log_ratio"][adv > 0].float(),
+                        torch.tensor(0.99, device=dev)))
+                    if bool((adv > 0).any()) else None,
+                    neg_tail_q01=float(torch.quantile(
+                        t["log_ratio"][adv < 0].float(),
+                        torch.tensor(0.01, device=dev)))
+                    if bool((adv < 0).any()) else None,
+                    adv_mean=float(adv.mean()),
                     d_norm_mean=float(dn.mean()),
                     d_norm_q50=float(dq[0]), d_norm_q90=float(dq[1]),
                     d_norm_q99=float(dq[2]),
@@ -622,6 +639,13 @@ def main():
               f"{fin['log_ratio_absmax']:.3f},\n    выравнивание "
               f"{fin['align_mean']:.3f} (макс {fin['align_max']:.3f}), "
               f"k1 {fin['kl_k1']:.4g} k3 {fin['kl_k3']:.4g}")
+        print(f"    ХВОСТ: преимущество в хвосте "
+              f"{fin['tail_adv_mean']:+.3f}, отрицательных "
+              f"{100 * fin['tail_adv_neg_frac']:.0f}%; log_ratio в хвосте "
+              f"{fin['tail_logratio_mean']:+.2f}, отрицательных "
+              f"{100 * fin['tail_logratio_neg_frac']:.0f}%;\n    "
+              f"q99 при A>0 {fin['pos_tail_q99']}, q01 при A<0 "
+              f"{fin['neg_tail_q01']}")
         print(f"    ОТКУДА ХВОСТ: ||d|| q50 {fin['d_norm_q50']:.4f} q99 "
               f"{fin['d_norm_q99']:.4f} (отношение "
               f"{fin['d_norm_ratio_q99_q50']:.1f}x), выравнивание у худшего "
