@@ -224,7 +224,16 @@ def probe_block(get_envs, seed_everything, suite, task_id, ids, waiting,
             obs, _r, _d, _i = envs.step(dummy)
         short, full = obs_hashes(obs, len(ids))
     finally:
-        envs.close()
+        # ЗАКРЫТИЕ НЕ ДОЛЖНО ПОДМЕНЯТЬ ПРИЧИНУ ОТКАЗА. При недопустимом
+        # init_state_id рабочий процесс среды умирает, и envs.close() бросает
+        # «'NoneType' object has no attribute 'recv'» — это исключение
+        # ВЫТЕСНЯЛО бы исходное, и в артефакте вместо «такого состояния нет»
+        # оставалась бы сломанная труба. А различать их и есть смысл зонда.
+        try:
+            envs.close()
+        except Exception as e_close:                   # noqa: BLE001
+            print(f"    (закрытие среды после отказа: "
+                  f"{type(e_close).__name__})", flush=True)
     return desc, short, full
 
 
