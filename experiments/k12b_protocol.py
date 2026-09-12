@@ -1600,6 +1600,66 @@ def selftest(tmpdir=None):
     print("самопроверка k12b_protocol пройдена")
 
 
+def make_execution(args):
+    """Собрать раздел execution ИЗ ФАКТИЧЕСКИХ ФАЙЛОВ, а не из списка значений.
+
+    Всё, что можно вычислить, вычисляется здесь: отпечаток каталога базового
+    чекпойнта, sha Joint12, таблицы смещений и пяти скриптов. Единственное, что
+    нельзя вывести из файлов, — `hf_revision`: её надо назвать явно, и 'main'
+    не принимается, потому что это «какая окажется».
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    if not args.base_ckpt:
+        raise SystemExit("нужен --base-ckpt: каталог базового чекпойнта")
+    if not args.hf_revision or args.hf_revision == "main":
+        raise SystemExit(
+            "нужен --hf-revision, и не 'main': прогон станет невоспроизводимым "
+            "при первом же обновлении репозитория модели. Если revision для "
+            "этого чекпойнта неизвестна, так и запишите — например "
+            "'local-snapshot-<дата>' — но честным значением, а не 'main'")
+    need_files = [args.base_ckpt, args.policy_ckpt, args.offset_table]
+    miss = [f for f in need_files if not os.path.exists(f)]
+    if miss:
+        raise SystemExit(f"нет файлов: {miss}")
+    scripts = {}
+    for nm in ("k12d_rollout.py", "k12e_pg_step.py", "hicora_g.py",
+               "hicora_vla.py", "joint12_vla.py", "k9h_multiarm_gate.py"):
+        fp = os.path.join(here, nm)
+        if not os.path.exists(fp):
+            raise SystemExit(f"нет {fp}")
+        scripts[nm] = _sha12(fp)
+    ex = dict(
+        ckpt=args.base_ckpt, ckpt_fingerprint=ckpt_fingerprint(args.base_ckpt),
+        hf_revision=args.hf_revision, joint_sha1=_sha12(args.policy_ckpt),
+        suite=str(args.suite), horizon=int(args.horizon),
+        max_steps=int(args.rollout_max_steps),
+        waiting_steps=int(args.waiting_steps), n_envs=int(args.n_envs),
+        seed=int(args.rollout_seed), rollout_seed_mode=args.rollout_seed_mode,
+        preprocess="CenterCrop(196)->Resize(224)",
+        offset_table_sha1=_sha12(args.offset_table),
+        trunk_dtype=args.trunk_dtype, head_precision="fp32",
+        script_sha1=scripts["k12d_rollout.py"],
+        step_script_sha1=scripts["k12e_pg_step.py"],
+        hicora_g_sha1=scripts["hicora_g.py"],
+        hicora_vla_sha1=scripts["hicora_vla.py"],
+        joint12_vla_sha1=scripts["joint12_vla.py"],
+        k9h_sha1=scripts["k9h_multiarm_gate.py"])
+    miss_ex = [k for k in EXEC_REQUIRED if ex.get(k) in (None, "")]
+    if miss_ex:
+        raise SystemExit(f"не собрались поля {miss_ex}")
+    out = args.execution or "data/k12b/execution.json"
+    os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+    tmp = out + ".tmp"
+    json.dump(ex, open(tmp, "w"), ensure_ascii=False, indent=1, sort_keys=True)
+    os.replace(tmp, out)
+    print(f"записан {out}")
+    for k in EXEC_REQUIRED:
+        print(f"  {k:>20}: {ex[k]}")
+    print("\nПредобработка и горизонт взяты как в K-9h/K-11g. Если раскатка "
+          "будет\nзапущена с другими — она откажется: поля сверяются, а не "
+          "записываются.")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
@@ -1640,6 +1700,21 @@ def main():
     ap.add_argument("--k11e-protocol", default="data/k11e/protocol.json")
     ap.add_argument("--script", action="append", default=[],
                     help="путь к скрипту, чей sha войдёт в протокол")
+    ap.add_argument("--make-execution", action="store_true",
+                    help="собрать JSON раздела execution из фактических файлов")
+    ap.add_argument("--hf-revision", default=None,
+                    help="revision базового чекпойнта; 'main' не принимается")
+    ap.add_argument("--suite", default="10")
+    ap.add_argument("--horizon", type=int, default=8)
+    ap.add_argument("--rollout-max-steps", type=int, default=600)
+    ap.add_argument("--waiting-steps", type=int, default=10)
+    ap.add_argument("--n-envs", type=int, default=5)
+    ap.add_argument("--rollout-seed", type=int, default=0)
+    ap.add_argument("--rollout-seed-mode", default="block")
+    ap.add_argument("--trunk-dtype", default="float16")
+    ap.add_argument("--base-ckpt", default=None)
+    ap.add_argument("--policy-ckpt", default="data/k9d_ep3.pt")
+    ap.add_argument("--offset-table", default="data/pos_offset_table.json")
     ap.add_argument("--execution", default=None,
                     help="JSON с разделом execution: фактические условия "
                          "исполнения, с которыми сверяется каждая ячейка")
@@ -1648,8 +1723,11 @@ def main():
     if args.selftest:
         selftest()
         return
+    if args.make_execution:
+        make_execution(args)
+        return
     if not args.init:
-        ap.error("нужен --selftest или --init")
+        ap.error("нужен --selftest, --make-execution или --init")
     for f_ in (args.d1_s0, args.d1_s1):
         if not os.path.exists(f_):
             ap.error(f"нет чекпойнта D1 {f_}: карта сид -> чекпойнт "

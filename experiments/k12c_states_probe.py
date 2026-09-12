@@ -405,6 +405,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--suite", default="10")
+    ap.add_argument("--root", default="third_party/actioncodec")
     ap.add_argument("--task-ids", default="0,1,2,3,4,5,6,7,8,9")
     ap.add_argument("--n-envs", type=int, default=5)
     ap.add_argument("--waiting-steps", type=int, default=10)
@@ -455,7 +456,19 @@ def main():
                 f"сюите. Нужно --enum-max не меньше "
                 f"{args.need_per_task + len(set(used))}")
 
-    sys.path.insert(0, os.path.abspath("experiments"))
+    # ПУТИ КАК В K-11g, А НЕ «experiments». Пакет `utils` лежит НЕ в
+    # experiments, а в корне вендоренного actioncodec
+    # (third_party/actioncodec/utils), и без этого корня импорт падает. Порядок
+    # и набор путей взяты из k11g_cell, чтобы модули были те же самые.
+    root = os.path.abspath(args.root)
+    if not os.path.isdir(os.path.join(root, "utils")):
+        raise SystemExit(f"в {root} нет пакета utils: задайте --root на корень "
+                         f"actioncodec")
+    for pth in (root, os.path.join(root, "src"),
+                os.path.dirname(os.path.abspath(__file__)),
+                os.path.abspath("experiments")):
+        if pth not in sys.path:
+            sys.path.insert(0, pth)
     from utils import get_envs, seed_everything   # noqa: E402
 
     import inspect
