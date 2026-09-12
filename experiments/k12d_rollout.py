@@ -121,6 +121,11 @@ def build_meta(**kw):
     need = ("protocol_sha1", "replica", "stage", "sigma", "episodes",
             "d_hidden", "rank", "head_sha1", "policy_sha1", "codebooks_sha1",
             "joint_sha1")
+    if kw.get("stage") == "diag":
+        # У ДИАГНОСТИКИ ПРОТОКОЛА НЕТ ПО ОПРЕДЕЛЕНИЮ, и требовать его sha
+        # значило бы вынуждать подставить любой. Взамен stage="diag" несёт
+        # запрет: зарегистрированный шаг такие буферы не принимает.
+        need = tuple(k for k in need if k != "protocol_sha1")
     miss = [k for k in need if kw.get(k) in (None, "", [])]
     # step_index проверяется отдельно: ноль — законное значение, и проверка на
     # «пустоту» пропустила бы его отсутствие ровно на первом шаге
@@ -588,10 +593,10 @@ def main() -> None:
                      "иначе она перестаёт быть опорой")
         if args.arm == "baseline" and args.stage not in ("final", "diag"):
             ap.error("опорная рука нужна на этапе final и в диагностике")
-        if args.stage == "diag" and args.arm != "baseline":
-            ap.error("диагностика измеряет долю провалов исходной D1, поэтому "
-                     "только --arm baseline: политика с шумом здесь ничего не "
-                     "скажет о потолке эффекта")
+        if args.stage == "diag" and args.arm == "policy" and not args.sigma:
+            ap.error("для диагностической раскатки политикой нужна --sigma: "
+                     "без протокола её никто не подставит, а молчаливое "
+                     "значение по умолчанию означало бы неизвестный режим")
         run(args)
 
 
@@ -615,9 +620,13 @@ def run(args):
     diag = (args.stage == "diag")
     proto = None if diag else kb.load_protocol(args.protocol)
     det_mode = (args.arm == "baseline")
+    if diag and not det_mode:
+        print(f"  ДИАГНОСТИКА ПОЛИТИКОЙ: sigma={args.sigma}, протокол не "
+              f"используется, буфер помечается stage=diag и для "
+              f"зарегистрированного шага непригоден", flush=True)
     sigma = 0.0 if det_mode else round(float(args.sigma), 6)
-    if not det_mode and sigma not in [round(float(s), 6)
-                                      for s in proto["sigma_grid"]]:
+    if not diag and not det_mode and sigma not in [round(float(s), 6)
+                                                   for s in proto["sigma_grid"]]:
         raise SystemExit(f"sigma={sigma} вне зарегистрированной сетки "
                          f"{proto['sigma_grid']}")
     state_ids = [args.init_start + i for i in range(args.n_envs)]
@@ -704,6 +713,8 @@ def run(args):
                          f"зарегистрирован {reg_fp}: базовая модель не та, на "
                          f"которой регистрировался протокол")
 
+    if diag:
+        args.replica = args.replica or f"diag_d1{d1_seed}_rl{args.rl_seed}"
     rec0 = dict(stage=args.stage,
                 protocol_sha1=(None if diag else proto["sha1"]), arm=args.arm,
                 state_ids=state_ids, task_ids=[args.task_id], sigma=sigma,
@@ -1106,7 +1117,7 @@ def run(args):
 
     # ЭТАП final ПИШЕТ ЯЧЕЙКУ ОЦЕНКИ, А НЕ БУФЕР ОБУЧЕНИЯ: на final ничего не
     # обучается, пары строятся по успеху и init_hash_full
-    if args.stage in ("final", "diag"):
+    if args.stage == "final" or (diag and det_mode):
         if diag:
             common["note"] = ("диагностика до регистрации: для гейта "
                               "непригодна")

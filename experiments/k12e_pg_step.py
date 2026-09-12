@@ -160,7 +160,7 @@ def accept_step(meas, trust):
 # --------------------- цепочка шагов и состояние Adam ----------------------
 
 def check_resume_chain(prev, *, protocol_sha1, replica, step_index, d1_sha,
-                       d1_seed, sigma, require_optimizer):
+                       d1_seed, sigma, require_optimizer, stage=None):
     """Сверка головы предыдущего шага. ОДНА функция на раскатку и на шаг.
 
     Проверяется не только протокол: реплика, сид D1, исходный чекпойнт D1,
@@ -174,6 +174,10 @@ def check_resume_chain(prev, *, protocol_sha1, replica, step_index, d1_sha,
     """
     import k12b_protocol as kb
     bad = []
+    if stage is not None and prev.get("stage", "train") != stage:
+        bad.append(f"голова с этапа {prev.get('stage')}, а прогон на {stage}: "
+                   f"диагностическую голову нельзя продолжить как "
+                   f"зарегистрированную и наоборот")
     if prev.get("protocol_sha1") != protocol_sha1:
         bad.append(f"голова под протоколом {prev.get('protocol_sha1')}, а "
                    f"прогон под {protocol_sha1}")
@@ -239,7 +243,7 @@ def load_optimizer_state(opt, state, train_params):
 REC_KEYS = ("h", "q0", "u", "mu", "logp", "task", "state", "call")
 
 
-def check_rollouts(files, proto, *, replica, stage, sigma=None):
+def check_rollouts(files, proto, *, replica, stage, sigma=None, diag=False):
     """Сверка набора файлов раскатки с протоколом ДО любых вычислений.
 
     Отдельная функция, потому что именно здесь прежние протоколы были
@@ -251,12 +255,18 @@ def check_rollouts(files, proto, *, replica, stage, sigma=None):
         m = f["meta"]
         metas.append(m)
         tag = os.path.basename(str(m.get("path", "?")))
-        if m.get("protocol_sha1") != proto["sha1"]:
+        if diag:
+            # ДИАГНОСТИКА: протокола, наборов состояний и раздела условий нет,
+            # и подставлять их нечем. Всё остальное проверяется так же — один
+            # буфер не должен смешивать разные политики, шаги или sigma.
+            if m.get("stage") != "diag":
+                bad.append(f"{tag}: этап {m.get('stage')}, а ожидался diag")
+        elif m.get("protocol_sha1") != proto["sha1"]:
             bad.append(f"{tag}: протокол {m.get('protocol_sha1')} вместо "
                        f"{proto['sha1']}")
         if m.get("replica") != replica:
             bad.append(f"{tag}: реплика {m.get('replica')} вместо {replica}")
-        if m.get("stage") != stage:
+        if not diag and m.get("stage") != stage:
             bad.append(f"{tag}: этап {m.get('stage')} вместо {stage}")
         if not m.get("policy_sha1"):
             bad.append(f"{tag}: нет policy_sha1 — происхождение действующей "
@@ -286,10 +296,11 @@ def check_rollouts(files, proto, *, replica, stage, sigma=None):
     # Раньше эти поля писались в ячейку и не сверялись ни с чем: две ячейки с
     # разным горизонтом, числом холостых шагов или базовым чекпойнтом
     # складывались в один обучающий буфер.
-    for f in files:
-        m = f["meta"]
-        bad += kb.check_execution(
-            proto, m, os.path.basename(str(m.get("path", "?"))))
+    if not diag:
+        for f in files:
+            m = f["meta"]
+            bad += kb.check_execution(
+                proto, m, os.path.basename(str(m.get("path", "?"))))
     # rollout_seed зависит от init_start по правилу режима, поэтому равенства
     # между ячейками требовать нельзя — но ОДИН init_start обязан давать один
     # сид, иначе сид подменялся вручную
@@ -304,14 +315,15 @@ def check_rollouts(files, proto, *, replica, stage, sigma=None):
         by_start[k] = v
 
     # набор состояний и задач — против зарегистрированных
-    allowed = set(proto["splits"].get(stage, []))
-    leaked = sorted({s for (_t, s) in seen} - allowed)
-    if leaked:
-        bad.append(f"состояния {leaked[:8]} ({len(leaked)} шт.) не из набора "
-                   f"'{stage}'")
-    unknown = sorted({t for (t, _s) in seen} - set(proto["tasks"]))
-    if unknown:
-        bad.append(f"задачи {unknown} не зарегистрированы")
+    if not diag:
+        allowed = set(proto["splits"].get(stage, []))
+        leaked = sorted({s for (_t, s) in seen} - allowed)
+        if leaked:
+            bad.append(f"состояния {leaked[:8]} ({len(leaked)} шт.) не из "
+                       f"набора '{stage}'")
+        unknown = sorted({t for (t, _s) in seen} - set(proto["tasks"]))
+        if unknown:
+            bad.append(f"задачи {unknown} не зарегистрированы")
     # единая геометрия и единая голова
     for key, why in (("d_hidden", "разная размерность отвода"),
                      ("rank", "разный ранг"),
@@ -978,7 +990,13 @@ def main():
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--protocol", default="data/k12b/protocol.json")
     ap.add_argument("--replica", required=False)
-    ap.add_argument("--stage", default="train", choices=["train"])
+    ap.add_argument("--stage", default="train", choices=["train", "diag"])
+    ap.add_argument("--lr", type=float, default=3e-6,
+                    help="только для --stage diag; в зарегистрированном "
+                         "прогоне lr берётся из протокола")
+    ap.add_argument("--kl-max", type=float, default=0.02)
+    ap.add_argument("--ratio-max", type=float, default=1.5)
+    ap.add_argument("--halvings", type=int, default=4)
     ap.add_argument("--rollouts", default="",
                     help="файлы раскаток через запятую")
     ap.add_argument("--head-ckpt", required=False,
@@ -1005,7 +1023,24 @@ def main():
     import k12b_protocol as kb
     import k9h_multiarm_gate as k9h
 
-    proto = kb.load_protocol(args.protocol)
+    diag = (args.stage == "diag")
+    if diag:
+        # ПРОБНЫЙ ШАГ БЕЗ ПРОТОКОЛА. Нужен, чтобы узнать, меняет ли один
+        # полнобатчевый шаг успех ВООБЩЕ: K-11i показал только, что он численно
+        # выживает. Никакого зарегистрированного числа отсюда получить нельзя —
+        # голова помечается stage=diag, и цепочка продолжения этап сверяет.
+        proto = dict(sha1=None, step=dict(
+            full_batch=True, lr=float(args.lr), head_precision="fp32",
+            train_log_std=False,
+            trust=dict(kl_max=args.kl_max, ratio_max=args.ratio_max),
+            backtrack=dict(max_halvings=args.halvings,
+                           accept="net_effect_dev"),
+            rollback=["params", "optimizer_state"]))
+        print(f"  ДИАГНОСТИЧЕСКИЙ ШАГ: lr={args.lr:g}, KL<={args.kl_max}, "
+              f"отношение<={args.ratio_max}, дроблений до {args.halvings}. "
+              f"Протокол не используется.")
+    else:
+        proto = kb.load_protocol(args.protocol)
     sg = proto["step"]
     sigma = None          # sigma берётся из раскаток и сверяется с сеткой
     dev = torch.device(args.device)
@@ -1019,16 +1054,18 @@ def main():
     if len(sig) != 1:
         raise SystemExit(f"в раскатках разные sigma: {sorted(sig)}")
     sigma = sig.pop()
-    if sigma not in [round(float(s), 6) for s in proto["sigma_grid"]]:
+    if not diag and sigma not in [round(float(s), 6)
+                                  for s in proto["sigma_grid"]]:
         raise SystemExit(f"sigma={sigma} вне зарегистрированной сетки "
                          f"{proto['sigma_grid']}")
     info = check_rollouts(files, proto, replica=args.replica,
-                          stage=args.stage, sigma=sigma)
-    kb.check_run(proto, dict(
-        stage=args.stage, protocol_sha1=proto["sha1"],
-        state_ids=sorted({int(e["state_id"]) for f in files
-                          for e in f["meta"]["episodes"]}),
-        task_ids=info["tasks"], sigma=sigma, replica=args.replica))
+                          stage=args.stage, sigma=sigma, diag=diag)
+    if not diag:
+        kb.check_run(proto, dict(
+            stage=args.stage, protocol_sha1=proto["sha1"],
+            state_ids=sorted({int(e["state_id"]) for f in files
+                              for e in f["meta"]["episodes"]}),
+            task_ids=info["tasks"], sigma=sigma, replica=args.replica))
     print(f"раскатки приняты: файлов {info['n_files']}, эпизодов "
           f"{info['n_episodes']}, задач {len(info['tasks'])}, sigma {sigma}")
 
@@ -1053,7 +1090,7 @@ def main():
         check_resume_chain(prev, protocol_sha1=proto["sha1"],
                            replica=args.replica, step_index=args.step_index,
                            d1_sha=d1_sha, d1_seed=d1_seed, sigma=sigma,
-                           require_optimizer=True)
+                           require_optimizer=True, stage=args.stage)
         head.load_state_dict({k: v.to(dev, torch.float32)
                               for k, v in prev["state"].items()})
         policy_sha = k9h.file_sha12(args.resume_head)
@@ -1138,6 +1175,7 @@ def main():
                    max_halvings=int(sg["backtrack"]["max_halvings"]),
                    micro=args.micro)
     rec.update(protocol_sha1=proto["sha1"], replica=args.replica,
+               lr_registered=float(sg["lr"]), trust=dict(sg["trust"]),
                stage=args.stage, sigma=sigma, step_index=int(args.step_index),
                parity=par, advantage=dict(adv_info, scale=sc["scale"]),
                success_in_buffer=float(np.mean(rew)),
@@ -1154,6 +1192,9 @@ def main():
                script_sha1=k9h.file_sha12(os.path.abspath(__file__)),
                protocol_script_sha1=k9h.file_sha12(kb.__file__),
                minutes=(time.time() - t0) / 60.0)
+    if diag:
+        rec["note"] = ("пробный шаг до регистрации: для зарегистрированного "
+                       "вывода непригоден")
 
     if rec["status"] == "stepped":
         os.makedirs(os.path.dirname(os.path.abspath(args.out_head)) or ".",
@@ -1164,7 +1205,7 @@ def main():
         # было бы, и зарегистрированный алгоритм не выполнялся бы.
         torch.save(dict(state={k: v.detach().cpu()
                               for k, v in head.state_dict().items()},
-                        optimizer_state=opt.state_dict(),
+                        optimizer_state=opt.state_dict(), stage=args.stage,
                         protocol_sha1=proto["sha1"], replica=args.replica,
                         step_index=int(args.step_index), sigma=sigma,
                         d1_head_sha1=d1_sha, d1_seed=d1_seed,
