@@ -19,6 +19,9 @@ STARTS="${STARTS:-0 5}"           # состояния 0..9 двумя блок�
 NENV="${NENV:-5}"
 CKPT="${CKPT:-ZibinDong/SmolVLM2-2.2B-ActionCodec-BAR-LIBERO}"
 HEAD="${HEAD:-data/k11d/d1_mlp_coef_0.001_wd0_s0.pt}"
+# сид объявляется ЗДЕСЬ и сверяется с чекпойнтом: если HEAD
+# поменяли на _s1, а D1SEED оставили нулём — прогон откажет
+D1SEED="${D1SEED:-0}"
 OUTDIR="${OUTDIR:-data/k12g/diag}"
 LOGDIR="${LOGDIR:-logs/k12g}"
 PY="${PY:-python}"
@@ -39,7 +42,8 @@ for SU in ${SUITES//,/ }; do
         experiments/k12d_rollout.py \
         --stage diag --arm baseline --task-suite "$SU" --task-id "$T" \
         --init-start "$S" --n-envs "$NENV" --device "$DEV" \
-        --ckpt "$CKPT" --head-ckpt "$HEAD" --out "$OUT" >> "$LOG" 2>&1
+        --ckpt "$CKPT" --head-ckpt "$HEAD" \
+        --expect-d1-seed "$D1SEED" --out "$OUT" >> "$LOG" 2>&1
       rc=$?                      # код берём СРАЗУ: любая следующая команда
       if [ "$rc" -ne 0 ]; then   # (включая tee в конвейере) его затрёт
         fail_n=$((fail_n+1))

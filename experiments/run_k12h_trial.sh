@@ -19,6 +19,9 @@ STARTS="${STARTS:-0 5 10 15 20 25}"   # состояния 0..29 блоками 
 NENV="${NENV:-5}"
 CKPT="${CKPT:-ZibinDong/SmolVLM2-2.2B-ActionCodec-BAR-LIBERO}"
 HEAD="${HEAD:-data/k11d/d1_mlp_coef_0.001_wd0_s0.pt}"
+# сид объявляется ЗДЕСЬ и сверяется с чекпойнтом: если HEAD
+# поменяли на _s1, а D1SEED оставили нулём — прогон откажет
+D1SEED="${D1SEED:-0}"
 OUTDIR="${OUTDIR:-data/k12h/step$STEP}"
 LOG="${LOG:-logs/k12h/roll_step$STEP.log}"
 PY="${PY:-python}"
@@ -42,7 +45,7 @@ for T in $TASKS; do
     set -- --stage diag --arm policy --sigma "$SIGMA" --task-suite 10 \
       --task-id "$T" --init-start "$S" --n-envs "$NENV" --device "$DEV" \
       --rl-seed 0 --step-index "$STEP" --ckpt "$CKPT" --head-ckpt "$HEAD" \
-      --out "$OUT"
+      --expect-d1-seed "$D1SEED" --out "$OUT"
     [ -n "$RESUME" ] && set -- "$@" --resume-head "$RESUME"
     env PYTHONPATH="$HOME/LIBERO" MUJOCO_GL=egl "$PY" \
       experiments/k12d_rollout.py "$@" >> "$LOG" 2>&1

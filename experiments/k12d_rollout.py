@@ -570,6 +570,9 @@ def main() -> None:
     ap.add_argument("--pos-offset", type=int, default=None)
     ap.add_argument("--expect-depth", type=int, default=12)
     ap.add_argument("--expect-hicora-target", default="coef")
+    ap.add_argument("--expect-d1-seed", type=int, default=None,
+                    help="какой сид D1 прогон СОБИРАЕТСЯ исполнять; сверяется с "
+                         "чекпойнтом. В диагностике обязателен")
     ap.add_argument("--hf-revision", default=None,
                     help="revision базового чекпойнта; сверяется с протоколом")
     ap.add_argument("--cb0-out", default="data/k12d/cb0.pt")
@@ -649,7 +652,26 @@ def run(args):
     import k11g_cell as k11g        # eps_seed берётся из проверенного кода
 
     h_obj = torch.load(args.head_ckpt, map_location="cpu", weights_only=False)
-    k9h.check_hicora_ckpt(h_obj, "hicora", args.expect_hicora_target)
+    # ЗАЯВЛЕННЫЙ сид, а не взятый из чекпойнта: check_hicora_ckpt сверяет метку
+    # руки с сидом внутри файла, и если метку строить ИЗ этого же файла,
+    # проверка станет тождеством и перестанет ловить подмену головы. В
+    # зарегистрированном прогоне заявление — это метка реплики; в диагностике
+    # протокола нет, поэтому сид объявляется аргументом.
+    if diag:
+        if args.expect_d1_seed is None:
+            raise SystemExit(
+                "в диагностике нужен --expect-d1-seed: прогон обязан объявить, "
+                "какую голову он исполняет, иначе подмену чекпойнта нечем "
+                "поймать")
+        want_seed = int(args.expect_d1_seed)
+    else:
+        want_seed = kb.replica_seeds(proto, args.replica)[0]
+        if args.expect_d1_seed is not None \
+                and int(args.expect_d1_seed) != want_seed:
+            raise SystemExit(f"--expect-d1-seed {args.expect_d1_seed}, а метка "
+                             f"реплики {args.replica} означает сид {want_seed}")
+    k9h.check_hicora_ckpt(h_obj, f"hicora_s{want_seed}",
+                          args.expect_hicora_target)
     head_sha = k9h.file_sha12(args.head_ckpt)
     d1_seed = h_obj.get("seed")
 
