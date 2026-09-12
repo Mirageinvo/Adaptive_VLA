@@ -54,7 +54,7 @@ import time
 # Поля, которые ОБЯЗАНЫ быть зарегистрированы и сверяться с каждой ячейкой.
 # Список один на протокол и на проверку раскаток: разойдясь, они снова
 # позволили бы собрать буфер из ячеек разных условий.
-EXEC_REQUIRED = ("ckpt", "ckpt_fingerprint", "hf_revision",
+EXEC_REQUIRED = ("ckpt", "ckpt_path", "ckpt_fingerprint", "hf_revision",
                  "joint_sha1", "suite", "horizon",
                  "max_steps", "waiting_steps", "n_envs", "seed",
                  "rollout_seed_mode", "preprocess", "offset_table_sha1",
@@ -79,14 +79,60 @@ def _sha12(path):
     return hashlib.sha1(open(path, "rb").read()).hexdigest()[:12]
 
 
+def hf_snapshot(repo_id, hf_home=None):
+    """Путь к снапшоту репозитория HF в кэше и ЕГО РЕВИЗИЯ.
+
+    Имя каталога снапшота — это и есть коммит, то есть revision не надо
+    объявлять словами: её можно прочитать. Ровно этого не хватало прежним
+    прогонам, где базовая модель бралась как `main`.
+
+    Несколько снапшотов — отказ: какой из них использовался, из кэша не видно, а
+    угадать означало бы записать неверную ревизию.
+    """
+    base = (hf_home or os.environ.get("HF_HOME")
+            or os.path.expanduser("~/.cache/huggingface"))
+    hub = os.path.join(base, "hub")
+    if not os.path.isdir(hub):
+        hub = base
+    d = os.path.join(hub, "models--" + str(repo_id).replace("/", "--"),
+                     "snapshots")
+    if not os.path.isdir(d):
+        return None, None
+    snaps = sorted(x for x in os.listdir(d)
+                   if os.path.isdir(os.path.join(d, x)))
+    if not snaps:
+        return None, None
+    if len(snaps) > 1:
+        raise ProtocolError(
+            f"в кэше HF несколько снапшотов {repo_id}: {snaps}. Какой из них "
+            f"использовался, из кэша не видно — укажите --hf-revision явно")
+    return os.path.join(d, snaps[0]), snaps[0]
+
+
+def resolve_ckpt(ckpt, hf_home=None):
+    """(локальный путь, ревизия или None) для каталога ИЛИ id репозитория HF."""
+    if os.path.isdir(ckpt):
+        return ckpt, None
+    pth, rev = hf_snapshot(ckpt, hf_home)
+    if pth is None:
+        raise ProtocolError(
+            f"{ckpt} не каталог и не найден в кэше HF: отпечаток считать не от "
+            f"чего. Если модель лежит в другом месте, задайте путь к каталогу")
+    return pth, rev
+
+
 def ckpt_fingerprint(path):
-    """Отпечаток каталога базового чекпойнта: sha по (путь, размер) файлов.
+    """Отпечаток базового чекпойнта: sha по (путь, размер) файлов.
+
+    Принимает и каталог, и id репозитория HF — во втором случае считается по
+    снапшоту из кэша.
 
     `hf_revision` воркер может только ПЕРЕПИСАТЬ из аргумента — это заявление,
     а не проверка. Отпечаток вычисляется из того, что лежит на диске, поэтому
     подменённый или дообученный чекпойнт ловится, а стоит он одного stat на
     файл: считать sha по весам в несколько гигабайт на каждой ячейке нельзя.
     """
+    path, _rev = resolve_ckpt(path)
     rows = []
     for root, _d, files in os.walk(path):
         for f in sorted(files):
@@ -916,6 +962,13 @@ def diffs_from_final(proto, records):
     want_ids = list(proto["splits"]["final"])
     pol, base, bad = {}, {}, []
     for rec in records:
+        # ДИАГНОСТИЧЕСКАЯ ЯЧЕЙКА НЕ МОЖЕТ СТАТЬ ЧАСТЬЮ ГЕЙТА. Она снята до
+        # регистрации, у неё нет ни протокола, ни печати решений, и по arm её от
+        # опорной руки не отличить — значит проверять надо этап.
+        if rec.get("stage") != "final":
+            bad.append(f"ячейка {rec.get('_path', '?')} на этапе "
+                       f"{rec.get('stage')}, а не final")
+            continue
         arm = rec.get("arm", "policy")
         if arm == "baseline":
             who, tgt = int(rec["d1_seed"]), base
@@ -1073,7 +1126,7 @@ def _proto_ok(**over):
                        max_steps=600, waiting_steps=10, n_envs=5, seed=0,
                        rollout_seed_mode="block",
                        preprocess="CenterCrop(196)->Resize(224)",
-                       ckpt_fingerprint="f" * 12,
+                       ckpt_path="data/ckpt_base", ckpt_fingerprint="f" * 12,
                        offset_table_sha1="o" * 12, trunk_dtype="float16",
                        head_precision="fp32", script_sha1="d" * 12,
                        step_script_sha1="e" * 12, hicora_g_sha1="g" * 12,
@@ -1590,12 +1643,26 @@ def selftest(tmpdir=None):
     os.makedirs(os.path.join(cdir, "sub"), exist_ok=True)
     open(os.path.join(cdir, "config.json"), "w").write("{}")
     open(os.path.join(cdir, "sub", "w.bin"), "wb").write(b"0" * 16)
+    # каталог: отпечаток по содержимому, ревизии нет
+    assert resolve_ckpt(cdir) == (cdir, None)
     f1_ = ckpt_fingerprint(cdir)
     assert f1_ == ckpt_fingerprint(cdir), "отпечаток не воспроизводится"
     open(os.path.join(cdir, "sub", "w.bin"), "wb").write(b"0" * 17)
     assert ckpt_fingerprint(cdir) != f1_, "изменённый файл не замечен"
     os.makedirs(os.path.join(tmp, "пусто"), exist_ok=True)
     _expect(lambda: ckpt_fingerprint(os.path.join(tmp, "пусто")), "нет файлов")
+    # id репозитория HF: ревизия читается из имени снапшота
+    hh = os.path.join(tmp, "hf")
+    snap = os.path.join(hh, "hub", "models--Org--Model", "snapshots",
+                        "e" * 40)
+    os.makedirs(snap, exist_ok=True)
+    open(os.path.join(snap, "config.json"), "w").write("{}")
+    assert hf_snapshot("Org/Model", hh) == (snap, "e" * 40)
+    assert hf_snapshot("Org/Нет", hh) == (None, None)
+    os.makedirs(os.path.join(hh, "hub", "models--Org--Model", "snapshots",
+                             "f" * 40), exist_ok=True)
+    _expect(lambda: hf_snapshot("Org/Model", hh), "несколько снапшотов")
+    _expect(lambda: resolve_ckpt("Org/Нет", hh), "не найден в кэше HF")
 
     print("самопроверка k12b_protocol пройдена")
 
@@ -1610,14 +1677,22 @@ def make_execution(args):
     """
     here = os.path.dirname(os.path.abspath(__file__))
     if not args.base_ckpt:
-        raise SystemExit("нужен --base-ckpt: каталог базового чекпойнта")
-    if not args.hf_revision or args.hf_revision == "main":
+        raise SystemExit("нужен --base-ckpt: каталог или id репозитория HF")
+    ck_path, ck_rev = resolve_ckpt(args.base_ckpt)
+    rev = args.hf_revision or ck_rev
+    if not rev or rev == "main":
         raise SystemExit(
-            "нужен --hf-revision, и не 'main': прогон станет невоспроизводимым "
-            "при первом же обновлении репозитория модели. Если revision для "
-            "этого чекпойнта неизвестна, так и запишите — например "
-            "'local-snapshot-<дата>' — но честным значением, а не 'main'")
-    need_files = [args.base_ckpt, args.policy_ckpt, args.offset_table]
+            "ревизию базового чекпойнта не удалось ни прочитать из кэша HF, ни "
+            "получить из --hf-revision (и 'main' не принимается): прогон стал "
+            "бы невоспроизводимым при первом же обновлении репозитория модели")
+    if ck_rev and args.hf_revision and args.hf_revision != ck_rev:
+        raise SystemExit(f"--hf-revision {args.hf_revision}, а в кэше HF лежит "
+                         f"снапшот {ck_rev}: записывать заявленную ревизию "
+                         f"вместо фактической нельзя")
+    print(f"  базовый чекпойнт: {args.base_ckpt}\n    снапшот {ck_path}\n"
+          f"    ревизия {rev}"
+          + ("" if ck_rev else "  (из аргумента: в кэше не найдена)"))
+    need_files = [args.policy_ckpt, args.offset_table]
     miss = [f for f in need_files if not os.path.exists(f)]
     if miss:
         raise SystemExit(f"нет файлов: {miss}")
@@ -1629,8 +1704,9 @@ def make_execution(args):
             raise SystemExit(f"нет {fp}")
         scripts[nm] = _sha12(fp)
     ex = dict(
-        ckpt=args.base_ckpt, ckpt_fingerprint=ckpt_fingerprint(args.base_ckpt),
-        hf_revision=args.hf_revision, joint_sha1=_sha12(args.policy_ckpt),
+        ckpt=args.base_ckpt, ckpt_path=ck_path,
+        ckpt_fingerprint=ckpt_fingerprint(args.base_ckpt),
+        hf_revision=rev, joint_sha1=_sha12(args.policy_ckpt),
         suite=str(args.suite), horizon=int(args.horizon),
         max_steps=int(args.rollout_max_steps),
         waiting_steps=int(args.waiting_steps), n_envs=int(args.n_envs),

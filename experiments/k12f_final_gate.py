@@ -63,6 +63,9 @@ def pair_table(proto, cells):
     want = list(proto["splits"]["final"])
     pol, base = {}, {}
     for c in cells:
+        if c.get("stage") != "final":
+            raise SystemExit(f"{c.get('_path')}: этап {c.get('stage')}, а не "
+                             f"final — диагностика в гейт не входит")
         tgt = base if c.get("arm") == "baseline" else pol
         who = (int(c["d1_seed"]) if c.get("arm") == "baseline"
                else c["replica"])
@@ -101,6 +104,76 @@ def pair_table(proto, cells):
             effect=((rec - los) / n) if n else None,
             discord=((rec + los) / n) if n else None, by_task=per_task)
     return rows
+
+
+def diag_summary(cells):
+    """Сводка ДИАГНОСТИЧЕСКИХ ячеек: доля провалов исходной D1 по задачам.
+
+    Считает только то, ради чего диагностика и делается: потолок эффекта равен
+    доле провалов, и по нему видно, есть ли на сюите что восстанавливать. Гейта
+    здесь нет и быть не может — у этих ячеек нет ни протокола, ни печати
+    решений.
+    """
+    bad = [c["_path"] for c in cells if c.get("stage") != "diag"]
+    if bad:
+        raise SystemExit(f"не диагностические ячейки в сводке диагностики: "
+                         f"{bad[:5]}")
+    by = {}
+    for c in cells:
+        key = (str(c.get("suite")), int(c["task_ids"][0]))
+        r = by.setdefault(key, dict(n=0, ok=0, states=set(),
+                                    d1_seed=c.get("d1_seed")))
+        for e in c["episodes"]:
+            r["n"] += 1
+            r["ok"] += int(bool(e["success"]))
+            r["states"].add(int(e["state_id"]))
+    rows, by_suite = [], {}
+    for (su, t), r in sorted(by.items()):
+        p = r["ok"] / r["n"]
+        rows.append(dict(suite=su, task_id=t, n=r["n"], success=p,
+                         p_fail=1.0 - p, n_states=len(r["states"])))
+        s_ = by_suite.setdefault(su, dict(n=0, ok=0, tasks=0))
+        s_["n"] += r["n"]
+        s_["ok"] += r["ok"]
+        s_["tasks"] += 1
+    suites = {}
+    for su, s_ in sorted(by_suite.items()):
+        p = s_["ok"] / s_["n"]
+        # ПОТОЛОК ЭФФЕКТА РАВЕН ДОЛЕ ПРОВАЛОВ: восстановить больше, чем
+        # провалено, нельзя, поэтому доля провалов ниже целевого эффекта сразу
+        # закрывает сюиту, сколько бы эпизодов ни набирать
+        suites[su] = dict(tasks=s_["tasks"], episodes=s_["n"], success=p,
+                          p_fail=1.0 - p, delta_ceiling=1.0 - p,
+                          usable_for_5pp=bool(1.0 - p > 0.05))
+    return dict(by_task=rows, by_suite=suites)
+
+
+def report_diag(res):
+    print(f"\n  ДИАГНОСТИКА: исходная детерминированная D1 на нетронутых "
+          f"сюитах.\n  Потолок эффекта равен доле провалов — это и есть "
+          f"критерий пригодности сюиты.")
+    print(f"    {'сюита':<10}{'задач':>6}{'эпиз':>6}{'успех':>9}{'провалов':>10}"
+          f"{'потолок':>9}  пригодна для +5 пп")
+    for su, r in sorted(res["by_suite"].items()):
+        print(f"    {su:<10}{r['tasks']:>6}{r['episodes']:>6}"
+              f"{100 * r['success']:>8.2f}%{100 * r['p_fail']:>9.2f}%"
+              f"{100 * r['delta_ceiling']:>8.2f}%"
+              f"{'   да' if r['usable_for_5pp'] else '   НЕТ'}")
+    print(f"\n    {'сюита':<10}{'задача':>7}{'эпиз':>6}{'успех':>9}"
+          f"{'провалов':>10}")
+    for r in res["by_task"]:
+        print(f"    {r['suite']:<10}{r['task_id']:>7}{r['n']:>6}"
+              f"{100 * r['success']:>8.2f}%{100 * r['p_fail']:>9.2f}%")
+    hard = [r for r in res["by_task"] if r["p_fail"] <= 0.0]
+    easy = [r for r in res["by_task"] if r["success"] <= 0.2]
+    if hard:
+        print(f"\n    задач без провалов: {len(hard)} "
+              f"{[(r['suite'], r['task_id']) for r in hard][:8]} — на них "
+              f"восстанавливать нечего")
+    if easy:
+        print(f"    задач с успехом <=20%: {len(easy)} "
+              f"{[(r['suite'], r['task_id']) for r in easy][:8]} — там речь "
+              f"уже не о поправке к работающей политике")
 
 
 def run(proto, cells, *, decisions_path, final_open_path):
@@ -295,6 +368,31 @@ def selftest():
     _expect(lambda: collect([os.path.join(tmp, "нет_*.json")]),
             "не найдено ни одной ячейки")
 
+    # ДИАГНОСТИЧЕСКАЯ ЯЧЕЙКА В ГЕЙТ НЕ ВХОДИТ, хотя у неё arm=baseline
+    dg = dict(cells[-1])
+    dg.update(stage="diag", protocol_sha1=None, _path="diag.json")
+    # отказ приходит раньше — на проверке этапа в check_run, и это нормально:
+    # важно, что диагностика не доходит до сборки пар ни одним путём
+    _expect(lambda: run(p, cells + [dg], decisions_path=dpath,
+                        final_open_path=fpath), "этап 'diag' не из")
+    _expect(lambda: kb.diffs_from_final(p, [dg]), "на этапе diag, а не final")
+    # а сводка диагностики считает долю провалов и отвергает ячейки final
+    dgs = []
+    for t in (0, 1):
+        eps = [dict(state_id=int(i), init_hash_full=f"d{t}_{i}",
+                    success=bool((t + i) % 4)) for i in range(10)]
+        dgs.append(dict(stage="diag", arm="baseline", suite="object",
+                        task_ids=[t], state_ids=list(range(10)), sigma=0.0,
+                        d1_seed=0, episodes=eps, _path=f"d{t}.json"))
+    ds = diag_summary(dgs)
+    assert ds["by_suite"]["object"]["tasks"] == 2, ds
+    assert abs(ds["by_suite"]["object"]["p_fail"]
+               - sum(1 for c in dgs for e in c["episodes"]
+                     if not e["success"]) / 20) < 1e-12, ds
+    assert ds["by_suite"]["object"]["usable_for_5pp"] is True
+    report_diag(ds)
+    _expect(lambda: diag_summary(cells), "не диагностические ячейки")
+
     # НУЛЕВОЙ ЭФФЕКТ: та же политика, что опора -> гейт не проходит
     for f in glob.glob(os.path.join(tmp, "cell_policy_*.json")):
         os.remove(f)
@@ -330,10 +428,25 @@ def main():
     ap.add_argument("--final-open", default="data/k12b/final_open.json")
     ap.add_argument("--cells", action="append", default=[],
                     help="маска путей к ячейкам final; можно несколько раз")
+    ap.add_argument("--diag", action="store_true",
+                    help="сводка диагностических ячеек вместо гейта")
     ap.add_argument("--out", default="data/k12b/final_gate.json")
     args = ap.parse_args()
     if args.selftest:
         selftest()
+        return
+    if args.diag:
+        cells = collect(args.cells or ["data/k12g/diag/*.json"])
+        res = diag_summary(cells)
+        report_diag(res)
+        out = args.out if args.out != "data/k12b/final_gate.json" \
+            else "data/k12g/diag_summary.json"
+        os.makedirs(os.path.dirname(os.path.abspath(out)) or ".",
+                    exist_ok=True)
+        json.dump(res, open(out + ".tmp", "w"), ensure_ascii=False, indent=1,
+                  default=str)
+        os.replace(out + ".tmp", out)
+        print(f"\n  сохранено: {out}")
         return
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     sys.path.insert(0, os.path.abspath("experiments"))

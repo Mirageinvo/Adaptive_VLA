@@ -48,14 +48,16 @@ SAT_THR = 0.99
 PREPROCESS = "CenterCrop(196)->Resize(224)"
 
 
-def exec_fields(args, *, joint_sha, pos_off, off_sha, ckpt_fp):
+def exec_fields(args, *, joint_sha, pos_off, off_sha, ckpt_fp, ckpt_path,
+                hf_revision):
     """Поля условий исполнения — ОДИН набор на оба этапа.
 
     Собираются одной функцией, чтобы обучающая раскатка и ячейка финальной
     оценки предъявляли протоколу в точности одно и то же.
     """
-    return dict(ckpt=args.ckpt, ckpt_fingerprint=ckpt_fp,
-                hf_revision=args.hf_revision, joint_sha1=joint_sha,
+    return dict(ckpt=args.ckpt, ckpt_path=ckpt_path,
+                ckpt_fingerprint=ckpt_fp, hf_revision=hf_revision,
+                joint_sha1=joint_sha,
                 suite=args.task_suite, horizon=int(args.horizon),
                 max_steps=int(args.max_steps),
                 waiting_steps=int(args.waiting_steps),
@@ -531,7 +533,7 @@ def main() -> None:
     ap.add_argument("--protocol", default="data/k12b/protocol.json")
     ap.add_argument("--replica", required=False)
     ap.add_argument("--stage", default="train",
-                    choices=["train", "dev", "final"])
+                    choices=["train", "dev", "final", "diag"])
     ap.add_argument("--arm", default="policy", choices=["policy", "baseline"],
                     help="baseline — детерминированная D1 как опора пар")
     ap.add_argument("--decisions", default="data/k12b/decisions.json")
@@ -574,7 +576,7 @@ def main() -> None:
         check_names(args.root)
     else:
         check_orchestration()
-        need = ["ckpt", "head_ckpt", "out", "hf_revision"]
+        need = ["ckpt", "head_ckpt", "out"]
         # у опорной руки нет ни реплики, ни sigma: она детерминированная и
         # зависит только от сида D1 — см. k12b_protocol.check_run
         need += [] if args.arm == "baseline" else ["replica", "sigma"]
@@ -584,8 +586,12 @@ def main() -> None:
         if args.arm == "baseline" and args.resume_head:
             ap.error("--resume-head у опорной руки: опора — это исходная D1, "
                      "иначе она перестаёт быть опорой")
-        if args.arm == "baseline" and args.stage != "final":
-            ap.error("опорная рука нужна только на этапе final")
+        if args.arm == "baseline" and args.stage not in ("final", "diag"):
+            ap.error("опорная рука нужна на этапе final и в диагностике")
+        if args.stage == "diag" and args.arm != "baseline":
+            ap.error("диагностика измеряет долю провалов исходной D1, поэтому "
+                     "только --arm baseline: политика с шумом здесь ничего не "
+                     "скажет о потолке эффекта")
         run(args)
 
 
@@ -600,7 +606,14 @@ def run(args):
     import k12b_protocol as kb
     import k12e_pg_step as k12e
 
-    proto = kb.load_protocol(args.protocol)
+    # ЭТАП diag ИДЁТ БЕЗ ПРОТОКОЛА, И ЭТО НЕ ПОСЛАБЛЕНИЕ. Он отвечает на
+    # вопрос, который задают ДО регистрации: какова доля провалов исходной D1 на
+    # сюите, где ещё ничего не измерялось. Протокола в этот момент нет и быть не
+    # может — он регистрируется по результату этого измерения. Взамен ячейка
+    # помечается stage="diag", и гейт такие ячейки отвергает: из диагностики
+    # нельзя получить ни одного зарегистрированного числа.
+    diag = (args.stage == "diag")
+    proto = None if diag else kb.load_protocol(args.protocol)
     det_mode = (args.arm == "baseline")
     sigma = 0.0 if det_mode else round(float(args.sigma), 6)
     if not det_mode and sigma not in [round(float(s), 6)
@@ -608,7 +621,7 @@ def run(args):
         raise SystemExit(f"sigma={sigma} вне зарегистрированной сетки "
                          f"{proto['sigma_grid']}")
     state_ids = [args.init_start + i for i in range(args.n_envs)]
-    if proto["step"].get("head_precision") != "fp32":
+    if not diag and proto["step"].get("head_precision") != "fp32":
         raise SystemExit("протокол требует не fp32 для головы, а эта раскатка "
                          "считает её в fp32")
 
@@ -634,7 +647,12 @@ def run(args):
     # МЕТКА РЕПЛИКИ СВЕРЯЕТСЯ С ФАКТИЧЕСКИМИ СИДАМИ НА КАЖДОМ ПРОГОНЕ, а не
     # только при продолжении: иначе четыре реплики можно подписать неверно или
     # продублировать, и гейт по среднему считал бы одно и то же дважды
-    if not det_mode:
+    if diag:
+        print(f"  ДИАГНОСТИКА: сюита {args.task_suite}, задача "
+              f"{args.task_id}, состояния {state_ids[0]}..{state_ids[-1]}, "
+              f"исходная D1 {head_sha} (сид {d1_seed}). Протокол не "
+              f"используется, ячейка помечается stage=diag.", flush=True)
+    elif not det_mode:
         kb.check_replica_identity(proto, args.replica, d1_seed=d1_seed,
                                   rl_seed=args.rl_seed, d1_sha=head_sha)
     else:
@@ -666,23 +684,39 @@ def run(args):
 
     # ОТПЕЧАТОК КАТАЛОГА СЧИТАЕТСЯ ДО РАСКАТКИ: иначе неверный или
     # подменённый базовый чекпойнт обнаружился бы после часа работы
+    # РЕВИЗИЯ ЧИТАЕТСЯ ИЗ КЭША HF, а не объявляется: имя каталога снапшота —
+    # это коммит. Заявленная ревизия, отличная от фактической, отвергается.
+    ckpt_path, ckpt_rev = kb.resolve_ckpt(args.ckpt)
+    hf_rev = args.hf_revision or ckpt_rev
+    if not hf_rev or hf_rev == "main":
+        raise SystemExit(
+            "ревизию базового чекпойнта не удалось ни прочитать из кэша HF, ни "
+            "получить из --hf-revision ('main' не принимается): прогон стал бы "
+            "невоспроизводимым при обновлении репозитория модели")
+    if ckpt_rev and args.hf_revision and args.hf_revision != ckpt_rev:
+        raise SystemExit(f"--hf-revision {args.hf_revision}, а фактический "
+                         f"снапшот {ckpt_rev}")
     ckpt_fp = kb.ckpt_fingerprint(args.ckpt)
-    reg_fp = (proto.get("execution") or {}).get("ckpt_fingerprint")
-    if str(ckpt_fp) != str(reg_fp):
+    reg_fp = (None if diag else (proto.get("execution") or {}).get(
+        "ckpt_fingerprint"))
+    if not diag and str(ckpt_fp) != str(reg_fp):
         raise SystemExit(f"отпечаток каталога чекпойнта {ckpt_fp}, а "
                          f"зарегистрирован {reg_fp}: базовая модель не та, на "
                          f"которой регистрировался протокол")
 
-    rec0 = dict(stage=args.stage, protocol_sha1=proto["sha1"], arm=args.arm,
+    rec0 = dict(stage=args.stage,
+                protocol_sha1=(None if diag else proto["sha1"]), arm=args.arm,
                 state_ids=state_ids, task_ids=[args.task_id], sigma=sigma,
                 replica=(None if det_mode else args.replica),
                 d1_seed=(int(d1_seed) if d1_seed is not None else None),
                 ckpt_sha1=(head_sha if det_mode
                            else (None if args.resume_head is None
                                  else k9h.file_sha12(args.resume_head))))
-    kb.check_run(proto, rec0, decisions_path=(args.decisions if dec else None),
-                 final_open_path=(args.final_open if fo else None),
-                 partial=True)
+    if not diag:
+        kb.check_run(proto, rec0,
+                     decisions_path=(args.decisions if dec else None),
+                     final_open_path=(args.final_open if fo else None),
+                     partial=True)
     j_obj = torch.load(args.policy_ckpt, map_location="cpu",
                        weights_only=False)
     joint_sha = k9h.file_sha12(args.policy_ckpt)
@@ -1044,7 +1078,8 @@ def run(args):
         envs.close()
 
     ex = exec_fields(args, joint_sha=joint_sha, pos_off=pos_off,
-                     off_sha=off_sha, ckpt_fp=ckpt_fp)
+                     off_sha=off_sha, ckpt_fp=ckpt_fp, ckpt_path=ckpt_path,
+                     hf_revision=hf_rev)
     ex.update(script_sha1=k9h.file_sha12(os.path.abspath(__file__)),
               step_script_sha1=k9h.file_sha12(k12e.__file__),
               hicora_g_sha1=k9h.file_sha12(hg.__file__),
@@ -1053,8 +1088,8 @@ def run(args):
               k9h_sha1=k9h.file_sha12(k9h.__file__))
     common = dict(
         ex,
-        protocol_sha1=proto["sha1"], arm=args.arm, stage=args.stage,
-        replica=(None if det_mode else args.replica),
+        protocol_sha1=(None if diag else proto["sha1"]), arm=args.arm,
+        stage=args.stage, replica=(None if det_mode else args.replica),
         d1_seed=(int(d1_seed) if d1_seed is not None else None),
         step_index=int(args.step_index), sigma=sigma, episodes=eps_rows,
         task_ids=[int(args.task_id)], state_ids=state_ids,
@@ -1068,16 +1103,21 @@ def run(args):
         rho_sha1=h_obj["rho_sha1"], rho_norm=rho_norm,
         protocol_script_sha1=k9h.file_sha12(kb.__file__),
         minutes=(time.time() - t0) / 60.0)
-    probs = kb.check_execution(proto, common, os.path.basename(args.out))
-    if probs:
-        raise SystemExit("условия исполнения не совпали с протоколом:\n  - "
-                         + "\n  - ".join(probs))
 
     # ЭТАП final ПИШЕТ ЯЧЕЙКУ ОЦЕНКИ, А НЕ БУФЕР ОБУЧЕНИЯ: на final ничего не
     # обучается, пары строятся по успеху и init_hash_full
-    if args.stage == "final":
-        kb.check_run(proto, common, decisions_path=args.decisions,
-                     final_open_path=args.final_open, partial=True)
+    if args.stage in ("final", "diag"):
+        if diag:
+            common["note"] = ("диагностика до регистрации: для гейта "
+                              "непригодна")
+        else:
+            probs = kb.check_execution(proto, common,
+                                      os.path.basename(args.out))
+            if probs:
+                raise SystemExit("условия исполнения не совпали с протоколом:"
+                                 "\n  - " + "\n  - ".join(probs))
+            kb.check_run(proto, common, decisions_path=args.decisions,
+                         final_open_path=args.final_open, partial=True)
         save_final_cell(args.out, common)
         succ = sum(1 for e in eps_rows if e["success"])
         print(f"\n  {args.arm}, задача {args.task_id}, состояния "
