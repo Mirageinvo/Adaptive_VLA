@@ -62,7 +62,10 @@ EXEC_REQUIRED = ("ckpt", "ckpt_path", "ckpt_fingerprint", "hf_revision",
                  "step_script_sha1", "hicora_g_sha1", "hicora_vla_sha1",
                  "joint12_vla_sha1", "k9h_sha1")
 
-ARMS = ("policy", "baseline")
+# ТРИ РУКИ, А НЕ ДВЕ. g0 — гауссова голова ДО обучения: главное сравнение
+# g_rl - g0, потому что выигрыш над детерминированной D1 может объясняться одним
+# шумом, а не обучением. "policy" оставлен как прежнее имя обученной руки.
+ARMS = ("policy", "g0", "g_rl", "baseline")
 GATE_RULES = ("mean", "mean_rep", "all")
 REGISTERED_RULE = "mean"
 STAGES = ("train", "dev", "final")
@@ -970,6 +973,14 @@ def diffs_from_final(proto, records):
                        f"{rec.get('stage')}, а не final")
             continue
         arm = rec.get("arm", "policy")
+        if arm == "g0":
+            # ТРЁХРУЧНЫЙ ГЕЙТ ПОКА НЕ РЕАЛИЗОВАН, и молча считать g0 обученной
+            # рукой нельзя: это ровно та подмена, от которой g0 и защищает
+            bad.append(f"ячейка {rec.get('_path', '?')}: рука g0 в парной "
+                       f"сборке не поддержана — сравнение g_rl минус g0 ещё не "
+                       f"реализовано, а принять g0 за g_rl значит измерить не "
+                       f"то")
+            continue
         if arm == "baseline":
             who, tgt = int(rec["d1_seed"]), base
         else:

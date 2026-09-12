@@ -132,6 +132,7 @@ def ratio_stats(lp_new, lp_old, ratio_max):
         nonfinite=int((~fin).sum()),
         zero_frac_f32=float((r32 == 0).double().mean()),
         inf_frac_f32=float((~torch.isfinite(r32)).double().mean()))
+    out["logdiff_q99"] = float(d.abs().double().quantile(0.99))
     out["over_frac"] = float((r > ratio_max).double().mean())
     out["under_frac"] = float((r < 1.0 / ratio_max).double().mean())
     out["ok"] = bool(out["nonfinite"] == 0 and out["zero_frac_f32"] == 0.0
@@ -464,20 +465,48 @@ def grad_pass(head, buf, adv, std, n_episodes, micro):
 
 def measure(head, buf, std, micro):
     import torch
-    kls, lps = [], []
+    kls, lps, dmu = [], [], []
     with torch.no_grad():
         for a, b in iter_slices(buf["n"], micro):
             mu, lp = head_logp(head, buf, slice(a, b), std)
             kls.append(kl_mu(buf["mu"][a:b].float(), mu, std))
             lps.append(lp)
+            dmu.append((mu - buf["mu"][a:b].float()).abs().flatten())
         lp_new = torch.cat(lps)
         kl = torch.cat(kls)
+        dm = torch.cat(dmu)
         fin = all(torch.isfinite(p).all() for p in head.parameters())
+    # СДВИГ mu — это то, что реально дошло до действия. KL и отношение
+    # правдоподобий его нормируют на sigma, а здесь он в своих единицах:
+    # «параметры изменились, а действия нет» распознаётся именно по нему.
     return lp_new, dict(kl_mean=float(kl.mean()), kl_max=float(kl.max()),
+                        mu_absdiff_max=float(dm.max()),
+                        mu_absdiff_mean=float(dm.mean()),
                         finite_params=bool(fin))
 
 
 # --------------------------- снимок и откат --------------------------------
+
+def tensor_sha(items):
+    """sha по именованным тензорам — для записи, какая именно голова получилась."""
+    h = hashlib.sha1()
+    for k, v in sorted(items):
+        h.update(str(k).encode())
+        h.update(np.ascontiguousarray(
+            v.detach().float().cpu().numpy()).tobytes())
+    return h.hexdigest()[:12]
+
+
+def param_delta(head, snap):
+    """L2-норма изменения параметров относительно снимка."""
+    import torch
+    tot = 0.0
+    cur = head.state_dict()
+    for k, v in snap["params"].items():
+        d = (cur[k].detach().double().cpu() - v.detach().double().cpu())
+        tot += float((d * d).sum())
+    return float(np.sqrt(tot))
+
 
 def snapshot(head, opt):
     """Снимок параметров И состояния оптимизатора, с отвязкой от живых
@@ -541,6 +570,16 @@ def one_step(head, opt, buf, adv, std, *, n_episodes, lr, trust,
         if ok:
             return dict(status="stepped", loss=loss, grad_norm=gnorm,
                         lr_used=cur_lr, halvings=k, attempts=attempts,
+                        param_delta_norm=param_delta(head, snap),
+                        mu_absdiff_max=meas["mu_absdiff_max"],
+                        mu_absdiff_mean=meas["mu_absdiff_mean"],
+                        kl_mean=meas["kl_mean"], kl_max=meas["kl_max"],
+                        ratio=meas["ratio"],
+                        head_sha1_after=tensor_sha(head.state_dict().items()),
+                        adam_sha1_after=tensor_sha(
+                            (f"{i}/{k2}", v2)
+                            for i, st in opt.state_dict()["state"].items()
+                            for k2, v2 in st.items() if hasattr(v2, "shape")),
                         order_sha1=buf["order_sha1"], n_records=buf["n"],
                         n_episodes=int(n_episodes))
         restore(head, opt, snap, lr=cur_lr)
@@ -548,6 +587,8 @@ def one_step(head, opt, buf, adv, std, *, n_episodes, lr, trust,
     restore(head, opt, snap, lr=float(lr))
     return dict(status="no_step", loss=loss, grad_norm=gnorm, lr_used=None,
                 halvings=int(max_halvings), attempts=attempts,
+                param_delta_norm=param_delta(head, snap),
+                head_sha1_after=tensor_sha(head.state_dict().items()),
                 order_sha1=buf["order_sha1"], n_records=buf["n"],
                 n_episodes=int(n_episodes))
 
@@ -1169,12 +1210,17 @@ def main():
               f"{adam_info['n_params']}, счётчик шагов "
               f"{adam_info['step_min']:.0f}..{adam_info['step_max']:.0f}")
     t0 = time.time()
+    head_sha_before = tensor_sha(head.state_dict().items())
     rec = one_step(head, opt, buf, adv, std,
                    n_episodes=len(buf["episodes"]), lr=float(sg["lr"]),
                    trust=sg["trust"],
                    max_halvings=int(sg["backtrack"]["max_halvings"]),
                    micro=args.micro)
     rec.update(protocol_sha1=proto["sha1"], replica=args.replica,
+               head_sha1_before=head_sha_before,
+               eps_info={k: files[0]["meta"].get(k) for k in
+                         ("eps_mode", "eval_eps_seed", "eps_salt",
+                          "eps_sha1_first", "eps_sha1_all")},
                lr_registered=float(sg["lr"]), trust=dict(sg["trust"]),
                stage=args.stage, sigma=sigma, step_index=int(args.step_index),
                parity=par, advantage=dict(adv_info, scale=sc["scale"]),
@@ -1227,6 +1273,15 @@ def main():
     os.replace(tmp, args.out)
     print(f"запись шага: {args.out} ({rec['minutes']:.1f} мин), статус "
           f"{rec['status']}, lr {rec['lr_used']}, дроблений {rec['halvings']}")
+    print(f"  норма градиента {rec['grad_norm']:.4g}, норма изменения "
+          f"параметров {rec.get('param_delta_norm', 0):.4g}")
+    if rec["status"] == "stepped":
+        print(f"  сдвиг mu: макс {rec['mu_absdiff_max']:.4g}, среднее "
+              f"{rec['mu_absdiff_mean']:.4g}; KL {rec['kl_mean']:.6f}; "
+              f"|log r| q99 {rec['ratio']['logdiff_q99']:.4g}, макс "
+              f"{max(abs(rec['ratio']['logdiff_max']), abs(rec['ratio']['logdiff_min'])):.4g}")
+        print(f"  голова {rec['head_sha1_before']} -> "
+              f"{rec['head_sha1_after']}, Adam {rec['adam_sha1_after']}")
 
 
 if __name__ == "__main__":

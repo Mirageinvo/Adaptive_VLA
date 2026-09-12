@@ -68,10 +68,29 @@ def exec_fields(args, *, joint_sha, pos_off, off_sha, ckpt_fp, ckpt_path,
                 pos_offset=pos_off)
 
 
-def eps_salt(rl_seed, step_index):
-    """Соль потока шума. Разные шаги — разные реализации (см. п.3 шапки)."""
-    return int(hashlib.sha1(f"k12d|{int(rl_seed)}|{int(step_index)}".encode()
-                            ).hexdigest()[:8], 16)
+def eps_salt(rl_seed, step_index, mode="train", eval_seed=None):
+    """Соль потока шума. ДВА РЕЖИМА, и путать их нельзя.
+
+    `train` — соль зависит от номера шага: каждая итерация обучения обязана
+    видеть новые реализации шума, иначе градиент считается по одним и тем же
+    сэмплам.
+
+    `eval` — соль зависит ТОЛЬКО от eval_eps_seed и не зависит ни от номера
+    шага, ни от сида RL. Это и есть условие сравнимости g0 и g_rl: при смене
+    соли вместе с весами менялись бы и случайные числа, и разницу результатов
+    нельзя было бы отнести ни к обучению, ни к другому сэмплу.
+    """
+    if mode == "train":
+        key = f"k12d|train|{int(rl_seed)}|{int(step_index)}"
+    elif mode == "eval":
+        if eval_seed is None:
+            raise ValueError(
+                "режим eval без eval_eps_seed: поток шума оказался бы привязан "
+                "к номеру шага, и сравнение g0 с g_rl потеряло бы смысл")
+        key = f"k12d|eval|{int(eval_seed)}"
+    else:
+        raise ValueError(f"режим шума {mode!r} не из ('train', 'eval')")
+    return int(hashlib.sha1(key.encode()).hexdigest()[:8], 16)
 
 
 class Store:
@@ -181,7 +200,12 @@ def write_cb0(path, E0):
                              f"черновик восстановился бы из другой книги")
         return sha
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-    tmp = path + ".tmp"
+    # ВРЕМЕННОЕ ИМЯ УНИКАЛЬНО ПО ПРОЦЕССУ. Десяток параллельных раскаток писал
+    # в один и тот же `path + ".tmp"`: два процесса могли писать один файл
+    # одновременно, и os.replace переносил бы полузаписанное. Сама замена
+    # атомарна, поэтому при уникальном tmp гонка безвредна — кто успел первым,
+    # тот и записал, а остальные получат тот же sha и сверят его.
+    tmp = f"{path}.tmp.{os.getpid()}"
     torch.save(dict(codebook0=E0.float().cpu(), sha1=sha), tmp)
     os.replace(tmp, path)
     return sha
@@ -354,10 +378,30 @@ def selftest():
 
     check_orchestration()
 
-    # --- соль шума: разные шаги и сиды дают разные потоки ------------------
-    s = {eps_salt(a, b) for a in (0, 1) for b in (0, 1, 2)}
-    assert len(s) == 6, "соли совпали: шаги переиспользовали бы тот же шум"
-    assert eps_salt(1, 2) == eps_salt(1, 2)
+    # --- соль шума: ОБУЧЕНИЕ против ОЦЕНКИ --------------------------------
+    # в обучении соль обязана зависеть от шага и сида: иначе каждая итерация
+    # считала бы градиент по тем же реализациям шума
+    s = {eps_salt(a, b, mode="train") for a in (0, 1) for b in (0, 1, 2)}
+    assert len(s) == 6, "соли обучения совпали: шум переиспользован"
+    assert eps_salt(1, 2, mode="train") == eps_salt(1, 2, mode="train")
+    # в оценке соль НЕ зависит ни от шага, ни от сида RL — это и есть условие
+    # сравнимости g0 и g_rl
+    ev = {eps_salt(rl, st, mode="eval", eval_seed=5)
+          for rl in (0, 1, 7) for st in (0, 1, 4)}
+    assert len(ev) == 1, f"соль оценки поехала от шага или сида: {ev}"
+    assert eps_salt(0, 0, mode="eval", eval_seed=5) != \
+        eps_salt(0, 0, mode="eval", eval_seed=6)
+    # и она обязана отличаться от обучающей: иначе оценка пошла бы по тем же
+    # реализациям, на которых считался градиент
+    assert eps_salt(0, 0, mode="eval", eval_seed=0) != \
+        eps_salt(0, 0, mode="train")
+    for bad_kw in (dict(mode="eval"), dict(mode="прочее")):
+        try:
+            eps_salt(0, 0, **bad_kw)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"принято {bad_kw}")
 
     # --- накопитель: типы, формы, отказы ----------------------------------
     st = Store()
@@ -539,8 +583,19 @@ def main() -> None:
     ap.add_argument("--replica", required=False)
     ap.add_argument("--stage", default="train",
                     choices=["train", "dev", "final", "diag"])
-    ap.add_argument("--arm", default="policy", choices=["policy", "baseline"],
-                    help="baseline — детерминированная D1 как опора пар")
+    ap.add_argument("--arm", default="policy",
+                    choices=["policy", "g0", "g_rl", "baseline"],
+                    help="baseline — детерминированная D1; g0 — гауссова "
+                         "голова БЕЗ RL; g_rl — она же после RL. Главное "
+                         "сравнение g_rl минус g0, а не минус baseline: иначе "
+                         "выигрыш может объясняться одним шумом")
+    ap.add_argument("--eps-mode", default=None, choices=["train", "eval"],
+                    help="train — шум зависит от номера шага; eval — только от "
+                         "--eval-eps-seed")
+    ap.add_argument("--eval-eps-seed", type=int, default=None)
+    ap.add_argument("--cb0-only", action="store_true",
+                    help="построить книгу черновика и выйти: её надо создать "
+                         "ОДИН раз до параллельных прогонов")
     ap.add_argument("--decisions", default="data/k12b/decisions.json")
     ap.add_argument("--final-open", default="data/k12b/final_open.json")
     ap.add_argument("--step-index", type=int, default=0)
@@ -583,17 +638,30 @@ def main() -> None:
     elif args.check_names:
         check_names(args.root)
     else:
+        if args.cb0_only and not args.out:
+            args.out = "/dev/null"
         check_orchestration()
-        need = ["ckpt", "head_ckpt", "out"]
+        need = ["ckpt", "head_ckpt"]
+        if not args.cb0_only:
+            need.append("out")
         # у опорной руки нет ни реплики, ни sigma: она детерминированная и
         # зависит только от сида D1 — см. k12b_protocol.check_run
         need += [] if args.arm == "baseline" else ["replica", "sigma"]
         for nm in need:
             if getattr(args, nm) in (None, ""):
                 ap.error(f"нужен --{nm.replace('_', '-')}")
-        if args.arm == "baseline" and args.resume_head:
-            ap.error("--resume-head у опорной руки: опора — это исходная D1, "
-                     "иначе она перестаёт быть опорой")
+        if args.arm in ("baseline", "g0") and args.resume_head:
+            ap.error(f"--resume-head у руки {args.arm}: и опора, и g0 — это "
+                     f"ИСХОДНЫЕ политики, от которых отсчитывается эффект RL")
+        if args.arm == "g_rl" and not args.resume_head:
+            ap.error("--arm g_rl без --resume-head: это была бы g0, помеченная "
+                     "как обученная")
+        if args.arm in ("g0", "g_rl") and args.eps_mode != "eval":
+            ap.error(f"рука {args.arm} предназначена для сравнения, поэтому "
+                     f"нужен --eps-mode eval с --eval-eps-seed: иначе у g0 и "
+                     f"g_rl будут разные случайные числа")
+        if args.eps_mode == "eval" and args.eval_eps_seed is None:
+            ap.error("--eps-mode eval требует --eval-eps-seed")
         if args.arm == "baseline" and args.stage not in ("final", "diag"):
             ap.error("опорная рука нужна на этапе final и в диагностике")
         if args.stage == "diag" and args.arm == "policy" and not args.sigma:
@@ -623,6 +691,8 @@ def run(args):
     diag = (args.stage == "diag")
     proto = None if diag else kb.load_protocol(args.protocol)
     det_mode = (args.arm == "baseline")
+    eps_mode = args.eps_mode or ("eval" if args.arm in ("g0", "g_rl")
+                                 else "train")
     if diag and not det_mode:
         print(f"  ДИАГНОСТИКА ПОЛИТИКОЙ: sigma={args.sigma}, протокол не "
               f"используется, буфер помечается stage=diag и для "
@@ -852,6 +922,12 @@ def run(args):
         decoder_probe=k11a.decoder_probe(codec, E, dev),
         codec_state_sha1=k11a.state_sha1(codec)))
     cb0_sha = write_cb0(args.cb0_out, E[0])
+    if args.cb0_only:
+        print(f"  книга черновика готова: {args.cb0_out}, sha {cb0_sha}. "
+              f"Запускайте параллельные раскатки — они её только читают.",
+              flush=True)
+        envs.close()
+        return
 
     B = np.load(bp).astype(np.float32)
     rho = np.load(rp).astype(np.float32)
@@ -941,7 +1017,10 @@ def run(args):
     ac16 = torch.autocast("cuda", dtype=torch.float16)
     parity = {"ok": False}
     store = Store()
-    salt = eps_salt(args.rl_seed, args.step_index)
+    salt = eps_salt(args.rl_seed, args.step_index, mode=eps_mode,
+                    eval_seed=args.eval_eps_seed)
+    eps_hash_all = hashlib.sha1()
+    eps_hash_first = None
 
     def decode_latent(z):
         x, _ = codec._decode(z.float(), embodiment_ids=0)
@@ -1027,6 +1106,14 @@ def run(args):
                                                   args.init_start,
                                                   calls, salt) % (2 ** 63))
                     eps = torch.empty_like(o_mean["mu"]).normal_(generator=gen)
+                    # ПОТОК ШУМА ХЭШИРУЕТСЯ: равенство соли — это обещание, а
+                    # равенство хэша первого вызова — проверка, что g0 и g_rl
+                    # действительно получили те же случайные числа
+                    eb = np.ascontiguousarray(
+                        eps.detach().float().cpu().numpy()).tobytes()
+                    eps_hash_all.update(eb)
+                    if eps_hash_first is None:
+                        eps_hash_first = hashlib.sha1(eb).hexdigest()[:16]
                     o_exec = gau_h(h32, z32, u=o_mean["mu"] + sigma * eps)
                 if not parity["ok"]:
                     dz_d, _c = det_cur(h32, z32)
@@ -1125,6 +1212,9 @@ def run(args):
         stage=args.stage, replica=(None if det_mode else args.replica),
         d1_seed=(int(d1_seed) if d1_seed is not None else None),
         step_index=int(args.step_index), sigma=sigma, episodes=eps_rows,
+        eps_mode=eps_mode, eval_eps_seed=args.eval_eps_seed,
+        eps_salt=int(salt), eps_sha1_first=eps_hash_first,
+        eps_sha1_all=eps_hash_all.hexdigest()[:16],
         task_ids=[int(args.task_id)], state_ids=state_ids,
         ckpt_sha1=(head_sha if det_mode
                    else (None if args.resume_head is None
@@ -1173,6 +1263,9 @@ def run(args):
         rho_norm=rho_norm, hicora_seed=h_obj.get("seed"),
         selected_epoch=h_obj.get("selected_epoch"),
         resume_head=args.resume_head, eps_salt=int(salt),
+        eps_mode=eps_mode, eval_eps_seed=args.eval_eps_seed,
+        eps_sha1_first=eps_hash_first,
+        eps_sha1_all=eps_hash_all.hexdigest()[:16],
         rl_seed=int(args.rl_seed), rollout_seed=roll_seed,
         task_description=task_desc, init_start=int(args.init_start),
         image_size=224, parity=parity, sat_frac_last=sat, device=str(dev),
