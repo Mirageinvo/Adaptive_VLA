@@ -120,16 +120,22 @@ def collect_recorded(paths):
     return rows
 
 
-def crosscheck(recorded, observed, waiting, expected=None):
+def crosscheck(recorded, observed, waiting, expected_keys=None, suite=None):
     """Сверка записанных хэшей с измеренными сейчас.
 
     НЕСОВПАДЕНИЕ — это не «мелкое расхождение»: оно означает, что id больше не
     задаёт то же состояние, и значит прежние пары эпизодов между руками
     сравнивались не на общих состояниях.
     """
+    # ОЖИДАНИЕ ЗАДАЁТСЯ НАБОРОМ КЛЮЧЕЙ, А НЕ ЧИСЛОМ. По числу совпадений две
+    # записи ОДНОГО состояния (например с suite="10" и suite=None) закрывали
+    # ожидание двух состояний, хотя второго в артефактах не было вовсе.
+    want = (None if expected_keys is None
+            else {(int(t), int(i)) for t, i in expected_keys})
     res = dict(checked=0, matched=0, mismatched=[], skipped_waiting=0,
                skipped_no_obs=0, bad_files=[], recorded_conflicts=[],
-               expected=(None if expected is None else int(expected)))
+               skipped_suite=0,
+               expected=(None if want is None else len(want)))
     seen = {}
     for r in recorded:
         if r.get("error"):
@@ -139,7 +145,12 @@ def crosscheck(recorded, observed, waiting, expected=None):
                 int(r["waiting_steps"]) != int(waiting):
             res["skipped_waiting"] += 1
             continue
-        key = (r.get("suite"), r.get("task_id"), r["init_state_id"])
+        if suite is not None and r.get("suite") not in (None, str(suite)):
+            res["skipped_suite"] += 1
+            continue
+        # КЛЮЧ БЕЗ suite: одно и то же состояние не должно считаться дважды
+        # только потому, что в одном артефакте сюита записана, а в другом нет
+        key = (r.get("task_id"), r["init_state_id"])
         # ОДИН id В ОДНОЙ ЗАДАЧЕ НЕ МОЖЕТ ИМЕТЬ ДВУХ РАЗНЫХ ХЭШЕЙ в прежних
         # артефактах: это противоречие внутри уже опубликованных данных.
         if key in seen and seen[key] != r["init_hash_full"]:
@@ -148,23 +159,27 @@ def crosscheck(recorded, observed, waiting, expected=None):
                      b=r["init_hash_full"], src=r["src"]))
         seen[key] = r["init_hash_full"]
     res["n_recorded_keys"] = len(seen)
+    verified = set()
     for key, h in sorted(seen.items(), key=lambda kv: str(kv[0])):
-        okey = (key[1], key[2])
+        okey = (int(key[0]) if key[0] is not None else None, int(key[1]))
         if okey not in observed:
             res["skipped_no_obs"] += 1
             continue
         res["checked"] += 1
         if observed[okey] == h:
             res["matched"] += 1
+            verified.add(okey)
         else:
-            res["mismatched"].append(dict(task_id=key[1], init_state_id=key[2],
+            res["mismatched"].append(dict(task_id=okey[0], init_state_id=okey[1],
                                           recorded=h, observed=observed[okey]))
     # НУЛЕВОЕ ИЛИ НЕПОЛНОЕ ПОКРЫТИЕ — ОТКАЗ, А НЕ ЧИСТАЯ СВЕРКА. Пустая сверка
     # проходила как «расхождений нет», хотя не проверила ничего: именно так
     # отсутствие данных выглядело бы подтверждением.
-    res["enough_coverage"] = bool(
-        res["checked"] > 0
-        and (expected is None or res["checked"] >= int(expected)))
+    missing = sorted((want - verified) if want is not None else [])
+    res["n_verified_keys"] = len(verified)
+    res["missing_keys"] = [[int(a), int(b)] for a, b in missing[:20]]
+    res["n_missing_keys"] = len(missing)
+    res["enough_coverage"] = bool(len(verified) > 0 and not missing)
     res["ok"] = bool(res["enough_coverage"] and not res["mismatched"]
                      and not res["recorded_conflicts"]
                      and not res["bad_files"])
@@ -326,10 +341,27 @@ def selftest():
     empty = crosscheck([], {}, 10)
     assert not empty["enough_coverage"] and not empty["ok"], empty
     assert not empty["mismatched"], empty      # расхождений нет — и всё же отказ
-    # недобор покрытия тоже отказ
-    part = crosscheck(rec, obs, 10, expected=5)
-    assert part["checked"] == 2 and not part["enough_coverage"], part
-    assert crosscheck(rec, {(1, 0): "h0"}, 10, expected=1)["ok"] is True
+    # недобор покрытия тоже отказ, и видно ИМЕННО ЧЕГО не хватило
+    part = crosscheck(rec, obs, 10, expected_keys=[(1, 0), (1, 1), (1, 7)])
+    assert part["n_verified_keys"] == 1, part
+    assert not part["enough_coverage"], part
+    assert [1, 7] in part["missing_keys"] and [1, 1] in part["missing_keys"]
+    assert crosscheck(rec, {(1, 0): "h0"}, 10,
+                      expected_keys=[(1, 0)])["ok"] is True
+    # ДВЕ ЗАПИСИ ОДНОГО СОСТОЯНИЯ НЕ ЗАКРЫВАЮТ ОЖИДАНИЕ ДВУХ. Раньше ключ
+    # включал suite, и та же пара с suite=None считалась вторым состоянием.
+    twice = [dict(src="a", task_id=1, suite="10", waiting_steps=10,
+                  init_state_id=0, init_hash_full="h0"),
+             dict(src="b", task_id=1, suite=None, waiting_steps=10,
+                  init_state_id=0, init_hash_full="h0")]
+    dbl = crosscheck(twice, obs, 10, expected_keys=[(1, 0), (1, 1)], suite="10")
+    assert dbl["n_verified_keys"] == 1 and not dbl["enough_coverage"], dbl
+    assert dbl["missing_keys"] == [[1, 1]], dbl
+    # запись от ДРУГОЙ сюиты не идёт в зачёт
+    other = [dict(src="a", task_id=1, suite="90", waiting_steps=10,
+                  init_state_id=0, init_hash_full="h0")]
+    osr = crosscheck(other, obs, 10, expected_keys=[(1, 0)], suite="10")
+    assert osr["skipped_suite"] == 1 and not osr["enough_coverage"], osr
 
     # 4. граница: молчаливый кламп и честный отказ различаются
     b = find_bound({0: "a", 1: "b", 50: "a"}, {}, [0, 1, 50])
@@ -386,12 +418,9 @@ def main():
     ap.add_argument("--used-ids", default="0-44",
                     help="занятые прежними прогонами id, например 0-39,40-44")
     ap.add_argument("--need-per-task", type=int, default=80)
-    ap.add_argument("--crosscheck-frac", type=float, default=1.0,
-                    help="доля ожидаемого покрытия сверки; 1.0 — все занятые "
-                         "состояния всех задач обязаны быть сверены")
-    ap.add_argument("--require-crosscheck", action="store_true", default=True)
-    ap.add_argument("--no-require-crosscheck", dest="require_crosscheck",
-                    action="store_false")
+    ap.add_argument("--need-total", type=int, default=125,
+                    help="сколько ОБЩИХ свежих состояний нужно на все три "
+                         "набора: train + dev + final")
     ap.add_argument("--recorded", default="",
                     help="через запятую: артефакты K-11e/K-11g для сверки")
     ap.add_argument("--out", default="data/k12c_states.json")
@@ -507,23 +536,29 @@ def main():
         # задачах, и все те из них, что попали в перечисление, обязаны быть
         # сверены. Иначе «сверка прошла» означало бы лишь, что артефактов не
         # нашлось.
-        exp = sum(1 for t in task_ids for j in set(used)
-                  if (t, int(j)) in observed_all)
-        exp = int(exp * args.crosscheck_frac)
+        exp_keys = sorted((int(t), int(j)) for t in task_ids for j in set(used)
+                          if (t, int(j)) in observed_all)
         out["crosscheck"] = crosscheck(rows, observed_all, args.waiting_steps,
-                                       expected=exp)
+                                       expected_keys=exp_keys,
+                                       suite=args.suite)
         out["crosscheck"]["n_recorded_rows"] = len(rows)
         cc = out["crosscheck"]
         print(f"\nсверка с прежними артефактами: сверено {cc['checked']} при "
-              f"ожидаемых {exp}, совпало {cc['matched']}, расхождений "
+              f"ожидаемых {len(exp_keys)}, не покрыто "
+              f"{cc['n_missing_keys']} {cc['missing_keys'][:6]}, совпало "
+              f"{cc['matched']}, расхождений "
               f"{len(cc['mismatched'])}, конфликтов внутри артефактов "
               f"{len(cc['recorded_conflicts'])}", flush=True)
-    elif args.require_crosscheck:
-        out["crosscheck"] = dict(checked=0, matched=0, mismatched=[],
-                                 recorded_conflicts=[], bad_files=[],
-                                 expected=None, enough_coverage=False,
-                                 ok=False, n_recorded_rows=0,
-                                 note="артефакты для сверки не переданы")
+    else:
+        # СВЕРКА ОБЯЗАТЕЛЬНА. Раньше её можно было отключить флагом и получить
+        # чистый вердикт, ничего не проверив: прежние прогоны занимали
+        # состояния 0..44, и без сверки неизвестно, задаёт ли id то же
+        # состояние, что тогда.
+        out["crosscheck"] = dict(
+            checked=0, matched=0, mismatched=[], recorded_conflicts=[],
+            bad_files=[], expected=None, enough_coverage=False, ok=False,
+            n_recorded_rows=0, n_missing_keys=-1, missing_keys=[],
+            note="артефакты для сверки не переданы")
 
     if out["tasks"] and all("budget" in r for r in out["tasks"].values()):
         mn = min(r["budget"]["n_fresh"] for r in out["tasks"].values())
@@ -538,6 +573,9 @@ def main():
             n_common_fresh=len(out["common_fresh_ids"]),
             common_enough=bool(len(out["common_fresh_ids"])
                                >= args.need_per_task),
+            need_total=int(args.need_total),
+            total_enough=bool(len(out["common_fresh_ids"])
+                              >= args.need_total),
             enough_everywhere=all(r["budget"]["enough"]
                                   for r in out["tasks"].values()),
             # дубликаты ПОЛНОГО перечисления — тот же дефект, что кламп на
@@ -564,11 +602,17 @@ def main():
     # артефактами записывалось в JSON и молча завершалось нулём: в скрипте
     # запуска это выглядело бы как успешная проверка.
     red = []
-    if "summary" in out and not out["summary"].get("common_enough", True):
-        red.append(f"общее пересечение свежих id "
-                   f"{out['summary']['n_common_fresh']} < "
-                   f"{args.need_per_task}: одного набора состояний, годного "
-                   f"для всех задач, не существует")
+    if "summary" in out:
+        ncf = out["summary"]["n_common_fresh"]
+        if not out["summary"].get("common_enough", True):
+            red.append(f"общее пересечение свежих id {ncf} < "
+                       f"{args.need_per_task}: одного набора состояний, "
+                       f"годного для всех задач, не существует")
+        elif ncf < args.need_total:
+            red.append(f"общее пересечение свежих id {ncf} < {args.need_total}: "
+                       f"на final хватает, но train и dev тоже обязаны быть "
+                       f"свежими — иначе sigma и чекпойнт выбирались бы на "
+                       f"состояниях, уже использованных прежними прогонами")
     if "summary" in out:
         sm = out["summary"]
         print(f"ИТОГ: минимум различных состояний на задачу "
@@ -587,10 +631,11 @@ def main():
     cc = out.get("crosscheck")
     if cc:
         if not cc.get("enough_coverage"):
-            red.append(f"сверка ничего не покрыла: проверено "
-                       f"{cc.get('checked')} при ожидаемых "
-                       f"{cc.get('expected')} — отсутствие расхождений здесь "
-                       f"не значит, что id задаёт то же состояние")
+            red.append(f"сверка покрыла не весь ожидаемый набор: проверено "
+                       f"{cc.get('checked')} из {cc.get('expected')}, не "
+                       f"покрыто {cc.get('n_missing_keys')} "
+                       f"{cc.get('missing_keys', [])[:6]} — отсутствие "
+                       f"расхождений на остальных ничего не говорит о них")
         if cc["mismatched"]:
             red.append(f"хэши расходятся с прежними артефактами: "
                        f"{len(cc['mismatched'])} записей — id больше не задаёт "

@@ -43,6 +43,27 @@ import numpy as np
 
 H_EXEC = 8
 SAT_THR = 0.99
+# ТА ЖЕ строка предобработки, что в K-9h/K-11g: она входит в условия исполнения
+# и сверяется с протоколом, поэтому задана константой, а не собирается на месте
+PREPROCESS = "CenterCrop(196)->Resize(224)"
+
+
+def exec_fields(args, *, joint_sha, pos_off, off_sha, ckpt_fp):
+    """Поля условий исполнения — ОДИН набор на оба этапа.
+
+    Собираются одной функцией, чтобы обучающая раскатка и ячейка финальной
+    оценки предъявляли протоколу в точности одно и то же.
+    """
+    return dict(ckpt=args.ckpt, ckpt_fingerprint=ckpt_fp,
+                hf_revision=args.hf_revision, joint_sha1=joint_sha,
+                suite=args.task_suite, horizon=int(args.horizon),
+                max_steps=int(args.max_steps),
+                waiting_steps=int(args.waiting_steps),
+                n_envs=int(args.n_envs), seed=int(args.seed),
+                rollout_seed_mode=args.rollout_seed_mode,
+                preprocess=PREPROCESS, offset_table_sha1=off_sha,
+                trunk_dtype=args.dtype, head_precision="fp32",
+                pos_offset=pos_off)
 
 
 def eps_salt(rl_seed, step_index):
@@ -229,7 +250,11 @@ def final_cell_fields(path=None):
                 and isinstance(node.targets[0], ast.Name)
                 and node.targets[0].id == "common"
                 and isinstance(node.value, ast.Call)):
-            return {k.arg for k in node.value.keywords if k.arg}
+            kws = {k.arg for k in node.value.keywords if k.arg}
+            # условия исполнения подмешиваются позиционно (dict(ex, ...)):
+            # проверяем, что это действительно так, иначе их в ячейке нет
+            pos = [a.id for a in node.value.args if isinstance(a, ast.Name)]
+            return kws, ("ex" in pos)
     raise AssertionError("в run не нашёлся словарь ячейки final (common)")
 
 
@@ -391,11 +416,12 @@ def selftest():
                                  init_hash_full=f"h{task}{state}",
                                  env_steps=16, policy_calls=2, n_records=2,
                                  rollout_seed=123))
-    meta = build_meta(protocol_sha1=proto["sha1"], replica="d10_rl0",
+    meta = build_meta(**proto["execution"],
+                      protocol_sha1=proto["sha1"], replica="d10_rl0",
                       stage="train", sigma=sigma, episodes=eps_rows,
                       d_hidden=d_h, rank=rank, head_sha1="a" * 12,
-                      policy_sha1="a" * 12, step_index=0,
-                      codebooks_sha1="b" * 12, joint_sha1="c" * 12)
+                      policy_sha1="a" * 12, step_index=0, init_start=tr[0],
+                      rollout_seed=7, codebooks_sha1="b" * 12)
     meta["path"] = "cell.pt"
     cell = dict(meta=meta, data=st2.stack())
     info = k12e.check_rollouts([cell], proto, replica="d10_rl0",
@@ -422,10 +448,12 @@ def selftest():
         raise AssertionError("мета без step_index принята")
 
     # --- КОНТРАКТ ЯЧЕЙКИ final: поля берутся из исходника воркера ---------
-    got = final_cell_fields()
+    got, has_exec = final_cell_fields()
     need = {"protocol_sha1", "arm", "stage", "replica", "d1_seed", "sigma",
             "episodes", "task_ids", "state_ids", "ckpt_sha1"}
     assert need <= got, f"в ячейке final нет полей {sorted(need - got)}"
+    assert has_exec, "в ячейку final не подмешаны условия исполнения (ex)"
+    got |= set(kb.EXEC_REQUIRED)
 
     # и сама ячейка проходит проверки протокола — обе руки
     import tempfile as _tf
@@ -438,33 +466,35 @@ def selftest():
         cks[rk] = dict(path=fp, sha1=kb._sha12(fp))
     evp = os.path.join(td, "dev.json")
     json.dump(dict(sigma=0.03), open(evp, "w"))
-    dec = kb.seal_decisions(os.path.join(td, "dec.json"), proto, sigma=0.03,
-                            checkpoints=cks,
+    dpath = os.path.join(td, "dec.json")
+    dec = kb.seal_decisions(dpath, proto, sigma=0.03, checkpoints=cks,
                             dev_evidence=dict(source=evp,
                                               sha1=kb._sha12(evp)))
-    fop = os.path.join(td, "fo.json")
-    kb.open_final(fop, proto, dec)
-    fo = kb.load_final_open(fop, proto, dec)
+    fpath = os.path.join(td, "fo.json")
+    kb.open_final(fpath, proto, dec)
+    kb.load_final_open(fpath, proto, dec)
     fin_ids = list(proto["splits"]["final"])
     eps = [dict(task_id=0, state_id=int(i), init_hash_full=f"h{i}",
                 success=bool(i % 3), env_steps=80) for i in fin_ids[:5]]
     pol_cell = {k: None for k in got}
+    pol_cell.update(proto["execution"])
     pol_cell.update(protocol_sha1=proto["sha1"], arm="policy", stage="final",
                     replica="d10_rl0", d1_seed=0, sigma=0.03, episodes=eps,
                     task_ids=[0], state_ids=fin_ids[:5],
                     ckpt_sha1=cks["d10_rl0"]["sha1"])
-    assert kb.check_run(proto, pol_cell, decisions=dec, final_open=fo,
+    assert kb.check_run(proto, pol_cell, decisions_path=dpath, final_open_path=fpath,
                         partial=True)
     base_cell = dict(pol_cell, arm="baseline", replica=None, sigma=0.0,
                      ckpt_sha1=proto["d1_checkpoints"]["0"]["sha1"])
-    assert kb.check_run(proto, base_cell, decisions=dec, final_open=fo,
-                       partial=True)
+    assert kb.check_run(proto, base_cell, decisions_path=dpath,
+                        final_open_path=fpath, partial=True)
     # опора с шумом или чужим чекпойнтом не проходит
     for over, needle in ((dict(sigma=0.03), "детерминированная D1"),
                          (dict(ckpt_sha1="z" * 12), "зарегистрирован")):
         try:
-            kb.check_run(proto, dict(base_cell, **over), decisions=dec,
-                         final_open=fo, partial=True)
+            kb.check_run(proto, dict(base_cell, **over),
+                         decisions_path=dpath, final_open_path=fpath,
+                         partial=True)
         except kb.ProtocolError as e:
             assert needle in str(e), e
         else:
@@ -533,6 +563,8 @@ def main() -> None:
     ap.add_argument("--pos-offset", type=int, default=None)
     ap.add_argument("--expect-depth", type=int, default=12)
     ap.add_argument("--expect-hicora-target", default="coef")
+    ap.add_argument("--hf-revision", default=None,
+                    help="revision базового чекпойнта; сверяется с протоколом")
     ap.add_argument("--cb0-out", default="data/k12d/cb0.pt")
     ap.add_argument("--out", required=False)
     args = ap.parse_args()
@@ -542,7 +574,7 @@ def main() -> None:
         check_names(args.root)
     else:
         check_orchestration()
-        need = ["ckpt", "head_ckpt", "out"]
+        need = ["ckpt", "head_ckpt", "out", "hf_revision"]
         # у опорной руки нет ни реплики, ни sigma: она детерминированная и
         # зависит только от сида D1 — см. k12b_protocol.check_run
         need += [] if args.arm == "baseline" else ["replica", "sigma"]
@@ -632,6 +664,15 @@ def run(args):
                     f"{sealed['sha1']}: финальная оценка считалась бы не тем "
                     f"чекпойнтом, который выбран на dev")
 
+    # ОТПЕЧАТОК КАТАЛОГА СЧИТАЕТСЯ ДО РАСКАТКИ: иначе неверный или
+    # подменённый базовый чекпойнт обнаружился бы после часа работы
+    ckpt_fp = kb.ckpt_fingerprint(args.ckpt)
+    reg_fp = (proto.get("execution") or {}).get("ckpt_fingerprint")
+    if str(ckpt_fp) != str(reg_fp):
+        raise SystemExit(f"отпечаток каталога чекпойнта {ckpt_fp}, а "
+                         f"зарегистрирован {reg_fp}: базовая модель не та, на "
+                         f"которой регистрировался протокол")
+
     rec0 = dict(stage=args.stage, protocol_sha1=proto["sha1"], arm=args.arm,
                 state_ids=state_ids, task_ids=[args.task_id], sigma=sigma,
                 replica=(None if det_mode else args.replica),
@@ -639,7 +680,9 @@ def run(args):
                 ckpt_sha1=(head_sha if det_mode
                            else (None if args.resume_head is None
                                  else k9h.file_sha12(args.resume_head))))
-    kb.check_run(proto, rec0, decisions=dec, final_open=fo, partial=True)
+    kb.check_run(proto, rec0, decisions_path=(args.decisions if dec else None),
+                 final_open_path=(args.final_open if fo else None),
+                 partial=True)
     j_obj = torch.load(args.policy_ckpt, map_location="cpu",
                        weights_only=False)
     joint_sha = k9h.file_sha12(args.policy_ckpt)
@@ -1000,7 +1043,16 @@ def run(args):
     finally:
         envs.close()
 
+    ex = exec_fields(args, joint_sha=joint_sha, pos_off=pos_off,
+                     off_sha=off_sha, ckpt_fp=ckpt_fp)
+    ex.update(script_sha1=k9h.file_sha12(os.path.abspath(__file__)),
+              step_script_sha1=k9h.file_sha12(k12e.__file__),
+              hicora_g_sha1=k9h.file_sha12(hg.__file__),
+              hicora_vla_sha1=k9h.file_sha12(hv.__file__),
+              joint12_vla_sha1=k9h.file_sha12(jv.__file__),
+              k9h_sha1=k9h.file_sha12(k9h.__file__))
     common = dict(
+        ex,
         protocol_sha1=proto["sha1"], arm=args.arm, stage=args.stage,
         replica=(None if det_mode else args.replica),
         d1_seed=(int(d1_seed) if d1_seed is not None else None),
@@ -1009,27 +1061,23 @@ def run(args):
         ckpt_sha1=(head_sha if det_mode
                    else (None if args.resume_head is None
                          else k9h.file_sha12(args.resume_head))),
-        suite=args.task_suite, task_description=task_desc,
-        waiting_steps=int(args.waiting_steps), horizon=int(args.horizon),
-        max_steps=int(args.max_steps), pos_offset=pos_off,
-        offset_table_sha1=off_sha, image_size=224, ckpt=args.ckpt,
-        parity=parity, device=str(dev), trunk_dtype=args.dtype,
-        head_precision="fp32", seed=int(args.seed), rollout_seed=roll_seed,
-        rollout_seed_mode=args.rollout_seed_mode,
-        head_sha1=head_sha, policy_sha1=policy_sha,
+        task_description=task_desc, image_size=224, init_start=int(
+            args.init_start), rollout_seed=roll_seed, parity=parity,
+        device=str(dev), head_sha1=head_sha, policy_sha1=policy_sha,
         res_norm_sha1=rn_sha, basis_sha1=h_obj["basis_sha1"],
         rho_sha1=h_obj["rho_sha1"], rho_norm=rho_norm,
-        script_sha1=k9h.file_sha12(os.path.abspath(__file__)),
         protocol_script_sha1=k9h.file_sha12(kb.__file__),
-        hicora_g_sha1=k9h.file_sha12(hg.__file__),
-        hicora_vla_sha1=k9h.file_sha12(hv.__file__),
-        k9h_sha1=k9h.file_sha12(k9h.__file__),
         minutes=(time.time() - t0) / 60.0)
+    probs = kb.check_execution(proto, common, os.path.basename(args.out))
+    if probs:
+        raise SystemExit("условия исполнения не совпали с протоколом:\n  - "
+                         + "\n  - ".join(probs))
 
     # ЭТАП final ПИШЕТ ЯЧЕЙКУ ОЦЕНКИ, А НЕ БУФЕР ОБУЧЕНИЯ: на final ничего не
     # обучается, пары строятся по успеху и init_hash_full
     if args.stage == "final":
-        kb.check_run(proto, common, decisions=dec, final_open=fo, partial=True)
+        kb.check_run(proto, common, decisions_path=args.decisions,
+                     final_open_path=args.final_open, partial=True)
         save_final_cell(args.out, common)
         succ = sum(1 for e in eps_rows if e["success"])
         print(f"\n  {args.arm}, задача {args.task_id}, состояния "
@@ -1039,6 +1087,7 @@ def run(args):
 
     data = store.stack()
     meta = build_meta(
+        **ex,
         protocol_sha1=proto["sha1"], replica=args.replica, stage=args.stage,
         step_index=int(args.step_index), sigma=sigma, episodes=eps_rows,
         d_hidden=d_h, rank=int(h_obj["rank"]), head_sha1=head_sha,
@@ -1051,23 +1100,12 @@ def run(args):
         rho_norm=rho_norm, hicora_seed=h_obj.get("seed"),
         selected_epoch=h_obj.get("selected_epoch"),
         resume_head=args.resume_head, eps_salt=int(salt),
-        rl_seed=int(args.rl_seed), seed=int(args.seed),
-        rollout_seed=roll_seed, rollout_seed_mode=args.rollout_seed_mode,
-        suite=args.task_suite, task_description=task_desc,
-        init_start=int(args.init_start), n_envs=int(args.n_envs),
-        horizon=int(args.horizon), max_steps=int(args.max_steps),
-        waiting_steps=int(args.waiting_steps), pos_offset=pos_off,
-        offset_table_sha1=off_sha, image_size=224, ckpt=args.ckpt,
-        parity=parity, sat_frac_last=sat, device=str(dev),
-        trunk_dtype=args.dtype, n_records=int(store.n),
-        script_sha1=k9h.file_sha12(os.path.abspath(__file__)),
-        step_script_sha1=k9h.file_sha12(k12e.__file__),
+        rl_seed=int(args.rl_seed), rollout_seed=roll_seed,
+        task_description=task_desc, init_start=int(args.init_start),
+        image_size=224, parity=parity, sat_frac_last=sat, device=str(dev),
+        n_records=int(store.n),
         protocol_script_sha1=k9h.file_sha12(kb.__file__),
-        hicora_g_sha1=k9h.file_sha12(hg.__file__),
-        hicora_vla_sha1=k9h.file_sha12(hv.__file__),
-        joint12_vla_sha1=k9h.file_sha12(jv.__file__),
         k11g_cell_sha1=k9h.file_sha12(k11g.__file__),
-        k9h_sha1=k9h.file_sha12(k9h.__file__),
         minutes=(time.time() - t0) / 60.0)
     meta["path"] = args.out
     # ЯЧЕЙКА ПРОВЕРЯЕТСЯ ТЕМ ЖЕ КОДОМ, ЧТО БУДЕТ ЕЁ ЧИТАТЬ: рассогласование

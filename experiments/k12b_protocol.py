@@ -51,6 +51,17 @@ import os
 import sys
 import time
 
+# Поля, которые ОБЯЗАНЫ быть зарегистрированы и сверяться с каждой ячейкой.
+# Список один на протокол и на проверку раскаток: разойдясь, они снова
+# позволили бы собрать буфер из ячеек разных условий.
+EXEC_REQUIRED = ("ckpt", "ckpt_fingerprint", "hf_revision",
+                 "joint_sha1", "suite", "horizon",
+                 "max_steps", "waiting_steps", "n_envs", "seed",
+                 "rollout_seed_mode", "preprocess", "offset_table_sha1",
+                 "trunk_dtype", "head_precision", "script_sha1",
+                 "step_script_sha1", "hicora_g_sha1", "hicora_vla_sha1",
+                 "joint12_vla_sha1", "k9h_sha1")
+
 ARMS = ("policy", "baseline")
 GATE_RULES = ("mean", "mean_rep", "all")
 REGISTERED_RULE = "mean"
@@ -66,6 +77,24 @@ class ProtocolError(Exception):
 
 def _sha12(path):
     return hashlib.sha1(open(path, "rb").read()).hexdigest()[:12]
+
+
+def ckpt_fingerprint(path):
+    """Отпечаток каталога базового чекпойнта: sha по (путь, размер) файлов.
+
+    `hf_revision` воркер может только ПЕРЕПИСАТЬ из аргумента — это заявление,
+    а не проверка. Отпечаток вычисляется из того, что лежит на диске, поэтому
+    подменённый или дообученный чекпойнт ловится, а стоит он одного stat на
+    файл: считать sha по весам в несколько гигабайт на каждой ячейке нельзя.
+    """
+    rows = []
+    for root, _d, files in os.walk(path):
+        for f in sorted(files):
+            fp = os.path.join(root, f)
+            rows.append(f"{os.path.relpath(fp, path)}:{os.path.getsize(fp)}")
+    if not rows:
+        raise ProtocolError(f"в каталоге чекпойнта {path} нет файлов")
+    return hashlib.sha1("\n".join(sorted(rows)).encode()).hexdigest()[:12]
 
 
 def canon(obj):
@@ -130,7 +159,8 @@ def init_protocol(*, splits, sigma_grid, tasks, n_episodes_final,
                   gate_rule=REGISTERED_RULE, stop=None, step=None,
                   bootstrap=None, states_json=None, power_json=None,
                   scripts=None, k11g_protocol=None, k11e_protocol=None,
-                  d1_checkpoints=None, common_fresh_ids=None, notes=""):
+                  d1_checkpoints=None, common_fresh_ids=None, execution=None,
+                  notes=""):
     """Собрать протокол. НЕ пишет файл: запись — отдельное решение."""
     stop = dict(stop or {})
     step = dict(step or {})
@@ -153,6 +183,7 @@ def init_protocol(*, splits, sigma_grid, tasks, n_episodes_final,
         d1_checkpoints={str(k): dict(v)
                         for k, v in (d1_checkpoints or {}).items()},
         states_common_fresh=sorted({int(i) for i in (common_fresh_ids or [])}),
+        execution=dict(execution or {}),
         states_json=states_json, power_json=power_json,
         k11g_protocol=k11g_protocol, k11e_protocol=k11e_protocol,
         scripts=dict(scripts or {}), notes=str(notes))
@@ -242,6 +273,17 @@ def check_protocol(proto):
         bad.append("все реплики на одном сиде D1: обобщения на метод нет")
     if len({k[1] for k in keys}) < 2:
         bad.append("все реплики на одном сиде RL")
+    # ТОЧНОЕ ДЕКАРТОВО ПРОИЗВЕДЕНИЕ, а не просто «есть два сида каждого вида»:
+    # диагональ [(0,0), (1,1)] тоже даёт два сида D1 и два сида RL, но в ней
+    # нельзя отделить вклад сида D1 от вклада сида RL — именно для этого
+    # дизайн и задуман как 2 x 2
+    if keys:
+        want = {(a, b) for a in {k[0] for k in keys}
+                for b in {k[1] for k in keys}}
+        if set(keys) != want:
+            bad.append(f"реплики {sorted(keys)} не образуют полного "
+                       f"произведения сидов {sorted(want)}: вклад сида D1 и "
+                       f"сида RL не разделить")
 
     if proto.get("gate_rule") not in GATE_RULES:
         bad.append(f"правило гейта {proto.get('gate_rule')} не из {GATE_RULES}")
@@ -315,6 +357,10 @@ def check_protocol(proto):
                    "(states_common_fresh): тогда final можно задать любыми "
                    "числами, которых зонд вообще не наблюдал")
     else:
+        # СВЕЖИМИ ОБЯЗАНЫ БЫТЬ ВСЕ ТРИ НАБОРА, не только final: на dev
+        # выбираются sigma и чекпойнт, и делать это на состояниях, где sigma уже
+        # выбиралась в K-11g, значит выбирать на обучающей выборке. Отсюда и
+        # требование к объёму пересечения: не 80, а |train|+|dev|+|final|.
         for name in SPLITS:
             out = sorted(set(proto["splits"].get(name, [])) - cf)
             if out:
@@ -322,12 +368,33 @@ def check_protocol(proto):
                            f"свежих: {out[:8]} ({len(out)} шт.) — зонд их либо "
                            f"не видел, либо они заняты прежними прогонами, "
                            f"либо годны не для всех задач")
+        need_total = sum(len(proto["splits"].get(n, [])) for n in SPLITS)
+        if len(cf) < need_total:
+            bad.append(f"пересечение свежих состояний {len(cf)} меньше суммы "
+                       f"наборов {need_total}: часть состояний пришлось бы "
+                       f"использовать дважды")
         if len(proto["splits"].get("final", [])) != int(
                 proto.get("n_episodes_final", -1)):
             bad.append(f"в final {len(proto['splits'].get('final', []))} "
                        f"состояний, а эпизодов на задачу "
                        f"{proto.get('n_episodes_final')}: это должно быть одно "
                        f"и то же число")
+
+    # ---- фактические условия исполнения ----
+    ex = proto.get("execution") or {}
+    miss_ex = [k for k in EXEC_REQUIRED if ex.get(k) in (None, "")]
+    if miss_ex:
+        bad.append(f"в разделе execution нет {miss_ex}: эти поля писались в "
+                   f"ячейки, но ни с чем не сверялись, и буфер из ячеек с "
+                   f"разным горизонтом, числом холостых шагов или базовым "
+                   f"чекпойнтом принимался как один прогон")
+    if ex.get("hf_revision") in (None, "", "main"):
+        bad.append("не зафиксирована revision базового чекпойнта HF: 'main' "
+                   "означает «какая окажется», и прогон станет "
+                   "невоспроизводимым при первом же обновлении репозитория")
+    if ex.get("head_precision") != "fp32":
+        bad.append("в execution точность головы не fp32: раскатка считает её в "
+                   "fp32, и расхождение с регистрацией обессмыслило бы обе")
 
     bs = proto.get("bootstrap") or {}
     if int(bs.get("n_boot", 0)) < 2000:
@@ -419,9 +486,33 @@ def seal_decisions(path, proto, *, sigma, checkpoints, dev_evidence,
     for k, c in checkpoints.items():
         if not isinstance(c, dict) or not c.get("sha1") or not c.get("path"):
             raise ProtocolError(f"чекпойнт {k} без path и sha1")
-    if not dev_evidence or not dev_evidence.get("source"):
-        raise ProtocolError("нет ссылки на измерение на dev, по которому "
-                            "выбраны sigma и чекпойнт")
+    if not dev_evidence or not dev_evidence.get("source") \
+            or not dev_evidence.get("sha1"):
+        raise ProtocolError(
+            "измерение на dev обязано быть задано И путём, И sha1: без sha "
+            "печать ссылается на файл, который можно переписать после выбора, "
+            "и «выбрано на dev» перестаёт быть проверяемым")
+    # ВСЕ ФАЙЛЫ ПРОВЕРЯЮТСЯ ДО ЗАПИСИ. Иначе первая неудачная печать оставляла
+    # на диске decisions.json, и исправленную печать уже нельзя было записать:
+    # перерегистрация запрещена.
+    if verify_files:
+        probs = []
+        for rk, c in sorted(checkpoints.items()):
+            if not os.path.exists(c["path"]):
+                probs.append(f"чекпойнт реплики {rk} не найден: {c['path']}")
+            elif _sha12(c["path"]) != c["sha1"]:
+                probs.append(f"чекпойнт реплики {rk} на диске имеет sha "
+                             f"{_sha12(c['path'])}, а печатается "
+                             f"{c['sha1']}")
+        src = dev_evidence["source"]
+        if not os.path.exists(src):
+            probs.append(f"измерение на dev не найдено: {src}")
+        elif _sha12(src) != dev_evidence["sha1"]:
+            probs.append(f"измерение на dev имеет sha {_sha12(src)}, а "
+                         f"печатается {dev_evidence['sha1']}")
+        if probs:
+            raise ProtocolError("печать не записана, файлы не сходятся:\n  - "
+                                + "\n  - ".join(probs))
     dec = dict(protocol_sha1=proto["sha1"], sigma=sig,
                checkpoints=dict(checkpoints), dev_evidence=dict(dev_evidence),
                sealed=time.strftime("%Y-%m-%dT%H:%M:%S"))
@@ -585,7 +676,7 @@ def check_replica_identity(proto, replica, *, d1_seed, rl_seed, d1_sha):
 
 # ---------------------------- сверка прогона ------------------------------
 
-def check_run(proto, record, *, decisions=None, final_open=None,
+def check_run(proto, record, *, decisions_path=None, final_open_path=None,
               partial=False):
     """Соответствует ли прогон протоколу. Отказов сразу все.
 
@@ -593,6 +684,11 @@ def check_run(proto, record, *, decisions=None, final_open=None,
     прогона целиком: тогда проверяется включение в набор, но не полнота. Полнота
     финальной оценки проверяется отдельно, `check_final_complete`: иначе
     «final на одном состоянии из 80» прошёл бы как финальный прогон.
+
+    ПЕЧАТЬ РЕШЕНИЙ ПЕРЕДАЁТСЯ ПУТЯМИ, А НЕ СЛОВАРЯМИ, и читается здесь же. Пока
+    принимался словарь, достаточно было поставить в нём `_verified=True` руками
+    — и правленая sigma проходила без пересчёта sha. Единственная дверь в
+    печать — `load_decisions`.
 
     ОБЯЗАТЕЛЬНЫЕ ПОЛЯ ТРЕБУЮТСЯ, А НЕ ПРОВЕРЯЮТСЯ ПРИ НАЛИЧИИ. Проверка вида
     «если поле есть, оно должно быть верным» пропускает запись без поля, то
@@ -684,18 +780,19 @@ def check_run(proto, record, *, decisions=None, final_open=None,
             elif int(n_per) != int(proto["n_episodes_final"]):
                 bad.append(f"эпизодов на задачу {n_per}, зарегистрировано "
                            f"{proto['n_episodes_final']}")
-        if decisions is None or final_open is None:
-            bad.append("финальный прогон без запечатанных решений или без "
-                       "записи об открытии final")
+        decisions = final_open = None
+        if not decisions_path or not final_open_path:
+            bad.append("финальный прогон без путей к печати решений и записи "
+                       "об открытии final: проверять нечего")
         else:
-            # ПЕЧАТЬ ОБЯЗАНА БЫТЬ УДОСТОВЕРЕНА, А НЕ ПРОСТО ПЕРЕДАНА. Словарь с
-            # правленой sigma и прежним sha раньше принимался как есть.
-            if not decisions.get("_verified"):
-                bad.append("печать решений не прошла load_decisions: её sha и "
-                           "файлы чекпойнтов не пересчитывались")
-            if not final_open.get("_verified"):
-                bad.append("запись об открытии final не прошла "
-                           "load_final_open")
+            try:
+                decisions = load_decisions(decisions_path, proto)
+                final_open = load_final_open(final_open_path, proto, decisions)
+            except (ProtocolError, OSError, ValueError) as e:
+                bad.append(f"печать решений не читается: {e}")
+        if decisions is None or final_open is None:
+            pass
+        else:
             if decisions.get("protocol_sha1") != proto.get("sha1"):
                 bad.append("решения от другого протокола")
             if final_open.get("decisions_sha1") != decisions.get("sha1"):
@@ -731,7 +828,25 @@ def check_run(proto, record, *, decisions=None, final_open=None,
     return True
 
 
-def check_final_complete(proto, records, *, decisions, final_open):
+def check_execution(proto, meta, tag="ячейка"):
+    """Фактические условия ячейки против раздела execution. Одна функция.
+
+    Её вызывают и обучающие раскатки, и ячейки финальной оценки: разойдясь,
+    две копии проверки снова позволили бы собрать результат из прогонов с
+    разными горизонтом, сидом или базовым чекпойнтом.
+    """
+    ex = proto.get("execution") or {}
+    bad = []
+    for key in EXEC_REQUIRED:
+        want, got = ex.get(key), meta.get(key)
+        if got is None:
+            bad.append(f"{tag}: нет поля условий '{key}'")
+        elif str(got) != str(want):
+            bad.append(f"{tag}: {key}={got}, а зарегистрировано {want}")
+    return bad
+
+
+def check_final_complete(proto, records, *, decisions_path, final_open_path):
     """Полнота финальной оценки по набору ЯЧЕЕК.
 
     Каждая ячейка проверяется как частичная (`partial=True`), а полнота — здесь:
@@ -746,8 +861,8 @@ def check_final_complete(proto, records, *, decisions, final_open):
     seen = {}
     for rec in records:
         try:
-            check_run(proto, rec, decisions=decisions, final_open=final_open,
-                      partial=True)
+            check_run(proto, rec, decisions_path=decisions_path,
+                      final_open_path=final_open_path, partial=True)
         except ProtocolError as e:
             bad.append(f"ячейка {rec.get('replica')}/{rec.get('task_ids')}: {e}")
             continue
@@ -953,6 +1068,17 @@ def _proto_ok(**over):
         d1_checkpoints={0: dict(path="data/k11c/s0.pt", sha1="a" * 12),
                         1: dict(path="data/k11c/s1.pt", sha1="b" * 12)},
         bootstrap=dict(n_boot=2000, alpha=0.05, seed=0),
+        execution=dict(ckpt="data/ckpt_base", hf_revision="a" * 40,
+                       joint_sha1="j" * 12, suite="10", horizon=8,
+                       max_steps=600, waiting_steps=10, n_envs=5, seed=0,
+                       rollout_seed_mode="block",
+                       preprocess="CenterCrop(196)->Resize(224)",
+                       ckpt_fingerprint="f" * 12,
+                       offset_table_sha1="o" * 12, trunk_dtype="float16",
+                       head_precision="fp32", script_sha1="d" * 12,
+                       step_script_sha1="e" * 12, hicora_g_sha1="g" * 12,
+                       hicora_vla_sha1="v" * 12, joint12_vla_sha1="w" * 12,
+                       k9h_sha1="k" * 12),
         sigma_grid=[0.03, 0.05, 0.10],
         tasks=range(10), n_episodes_final=80,
         delta_target=0.05, discord_max=0.05,
@@ -1131,7 +1257,18 @@ def selftest(tmpdir=None):
     _expect(lambda: seal_decisions(dpath, p, sigma=0.03, checkpoints=part,
                                    dev_evidence=ev), "утечка")
     _expect(lambda: seal_decisions(dpath, p, sigma=0.03, checkpoints=cks,
-                                   dev_evidence={}), "выбраны sigma")
+                                   dev_evidence={}), "И путём, И sha1")
+    # путь без sha — тоже отказ: файл можно переписать после выбора
+    _expect(lambda: seal_decisions(dpath, p, sigma=0.03, checkpoints=cks,
+                                   dev_evidence=dict(source=evp)),
+            "И путём, И sha1")
+    _expect(lambda: seal_decisions(dpath, p, sigma=0.03, checkpoints=cks,
+                                   dev_evidence=dict(source="нет.json",
+                                                     sha1="f" * 12)),
+            "не найдено")
+    # НЕУДАЧНАЯ ПЕЧАТЬ НЕ ОСТАВЛЯЕТ ФАЙЛА: иначе исправленную уже не записать,
+    # ведь перерегистрация запрещена
+    assert not os.path.exists(dpath), "decisions.json записан при отказе"
     dec = seal_decisions(dpath, p, sigma=0.03, checkpoints=cks,
                          dev_evidence=ev)
     assert dec["_verified"] is True, dec
@@ -1141,8 +1278,10 @@ def selftest(tmpdir=None):
                                    dev_evidence=ev), "уже запечатаны")
     assert load_decisions(dpath, p)["sha1"] == dec["sha1"]
 
-    # ПРАВКА ПОЛЯ ПРИ ПРЕЖНЕМ sha БОЛЬШЕ НЕ ПРОХОДИТ
+    # ПРАВКА ПОЛЯ ПРИ ПРЕЖНЕМ sha БОЛЬШЕ НЕ ПРОХОДИТ, и словарь с _verified
+    # тоже: check_run читает файл
     tampered = json.load(open(dpath))
+    tampered["_verified"] = True
     tampered["sigma"] = 0.10
     tpath = os.path.join(tmp, "dec_tampered.json")
     json.dump(tampered, open(tpath, "w"))
@@ -1195,18 +1334,20 @@ def selftest(tmpdir=None):
                state_ids=p["splits"]["final"], task_ids=p["tasks"],
                sigma=0.03, replica="d10_rl0", n_episodes_per_task=80,
                ckpt_sha1=cks["d10_rl0"]["sha1"])
-    assert check_run(p, fin, decisions=dec, final_open=fo)
-    _expect(lambda: check_run(p, fin), "без запечатанных решений")
-    _expect(lambda: check_run(p, dict(fin, sigma=0.05), decisions=dec,
-                              final_open=fo), "выбор после открытия final")
-    _expect(lambda: check_run(p, dict(fin, ckpt_sha1="9" * 12), decisions=dec,
-                              final_open=fo), "не тот, что запечатан")
+    assert check_run(p, fin, decisions_path=dpath, final_open_path=fpath)
+    _expect(lambda: check_run(p, fin), "без путей к печати решений")
+    _expect(lambda: check_run(p, dict(fin, sigma=0.05), decisions_path=dpath,
+                              final_open_path=fpath), "выбор после открытия final")
+    _expect(lambda: check_run(p, dict(fin, ckpt_sha1="9" * 12), decisions_path=dpath,
+                              final_open_path=fpath), "не тот, что запечатан")
     _expect(lambda: check_run(p, dict(fin, n_episodes_per_task=40),
-                              decisions=dec, final_open=fo),
+                              decisions_path=dpath, final_open_path=fpath),
             "зарегистрировано 80")
-    _expect(lambda: check_run(p, fin, decisions=dec,
-                              final_open=dict(fo, decisions_sha1="0" * 12)),
-            "под другие решения")
+    # правленая печать не проходит, даже если в словаре поставить _verified:
+    # check_run читает ФАЙЛ, а словарей больше не принимает
+    _expect(lambda: check_run(p, fin, decisions_path=tpath,
+                              final_open_path=fpath),
+            "файл правили после печати")
 
     # --- ФИНАЛЬНАЯ ОЦЕНКА: ДВЕ РУКИ, ПАРЫ, ПОЛНОТА ------------------------
     fin_ids = list(p["splits"]["final"])
@@ -1242,33 +1383,33 @@ def selftest(tmpdir=None):
 
     cells = ([_pol_cell(rk, t) for rk in reps_keys for t in p["tasks"]]
              + [_base_cell(sd, t) for sd in (0, 1) for t in p["tasks"]])
-    info = check_final_complete(p, cells, decisions=dec, final_open=fo)
+    info = check_final_complete(p, cells, decisions_path=dpath, final_open_path=fpath)
     assert info["baselines"] == ["base0", "base1"], info
     assert info["n_episodes"] == 6 * 10 * 80, info
     # без опорной руки полнота не подтверждается
     _expect(lambda: check_final_complete(
-        p, [c for c in cells if c.get("arm") != "baseline"], decisions=dec,
-        final_open=fo), "без опорной руки")
+        p, [c for c in cells if c.get("arm") != "baseline"], decisions_path=dpath,
+        final_open_path=fpath), "без опорной руки")
     short = [dict(c) for c in cells]
     short[3] = dict(short[3], state_ids=fin_ids[:40],
                     episodes=short[3]["episodes"][:40])
-    _expect(lambda: check_final_complete(p, short, decisions=dec,
-                                         final_open=fo), "состояний 40 из 80")
+    _expect(lambda: check_final_complete(p, short, decisions_path=dpath,
+                                         final_open_path=fpath), "состояний 40 из 80")
     three = [c for c in cells if c.get("replica") != "d11_rl1"]
-    _expect(lambda: check_final_complete(p, three, decisions=dec,
-                                         final_open=fo),
+    _expect(lambda: check_final_complete(p, three, decisions_path=dpath,
+                                         final_open_path=fpath),
             "нет ячеек для ['d11_rl1']")
-    _expect(lambda: check_final_complete(p, cells + [cells[0]], decisions=dec,
-                                         final_open=fo), "посчитано дважды")
+    _expect(lambda: check_final_complete(p, cells + [cells[0]], decisions_path=dpath,
+                                         final_open_path=fpath), "посчитано дважды")
     # опорная рука с шумом — не опора
     _expect(lambda: check_final_complete(
         p, [dict(c, sigma=0.03) if c.get("arm") == "baseline" else c
-            for c in cells], decisions=dec, final_open=fo),
+            for c in cells], decisions_path=dpath, final_open_path=fpath),
             "детерминированная D1, а не политика с шумом")
     # опорная рука чужим чекпойнтом
     _expect(lambda: check_final_complete(
         p, [dict(c, ckpt_sha1="z" * 12) if c.get("arm") == "baseline" else c
-            for c in cells], decisions=dec, final_open=fo),
+            for c in cells], decisions_path=dpath, final_open_path=fpath),
             "зарегистрирован")
 
     # --- ПАРЫ СОБИРАЮТСЯ ИЗ СЫРЫХ ЭПИЗОДОВ -------------------------------
@@ -1344,27 +1485,29 @@ def selftest(tmpdir=None):
     tiny = dict(stage="final", protocol_sha1=p["sha1"], replica="d10_rl0",
                 task_ids=[0], state_ids=[p["splits"]["final"][0]], sigma=0.03,
                 ckpt_sha1=cks["d10_rl0"]["sha1"], n_episodes_per_task=80)
-    _expect(lambda: check_run(p, tiny, decisions=dec, final_open=fo),
+    _expect(lambda: check_run(p, tiny, decisions_path=dpath, final_open_path=fpath),
             "не на зарегистрированном наборе")
-    _expect(lambda: check_run(p, tiny, decisions=dec, final_open=fo),
+    _expect(lambda: check_run(p, tiny, decisions_path=dpath, final_open_path=fpath),
             "выбор подмножества задач")
     # но как ЯЧЕЙКА она законна
-    assert check_run(p, tiny, decisions=dec, final_open=fo, partial=True)
+    assert check_run(p, tiny, decisions_path=dpath, final_open_path=fpath,
+                     partial=True)
     # final без ckpt_sha1 — отказ на любом уровне
     no_ck = dict(tiny)
     no_ck.pop("ckpt_sha1")
-    _expect(lambda: check_run(p, no_ck, decisions=dec, final_open=fo,
-                              partial=True), "без ckpt_sha1")
+    _expect(lambda: check_run(p, no_ck, decisions_path=dpath,
+                              final_open_path=fpath, partial=True),
+            "без ckpt_sha1")
     # final без n_episodes_per_task
     no_n = dict(fin)
     no_n.pop("n_episodes_per_task")
-    _expect(lambda: check_run(p, no_n, decisions=dec, final_open=fo),
+    _expect(lambda: check_run(p, no_n, decisions_path=dpath, final_open_path=fpath),
             "нет n_episodes_per_task")
     # реплика, которой нет в протоколе, и чекпойнт чужой реплики
-    _expect(lambda: check_run(p, dict(fin, replica="d19_rl9"), decisions=dec,
-                              final_open=fo), "не зарегистрирована")
+    _expect(lambda: check_run(p, dict(fin, replica="d19_rl9"), decisions_path=dpath,
+                              final_open_path=fpath), "не зарегистрирована")
     _expect(lambda: check_run(p, dict(fin, ckpt_sha1=cks["d11_rl1"]["sha1"]),
-                              decisions=dec, final_open=fo),
+                              decisions_path=dpath, final_open_path=fpath),
             "не тот, что запечатан")
 
     # --- параметры бутстрапа обязаны быть зарегистрированы ----------------
@@ -1416,6 +1559,44 @@ def selftest(tmpdir=None):
         path="s", sha1="x", min_fresh=80, any_silent_clamp=False)),
         "не помечен как прошедший")
 
+    # --- РАЗДЕЛ execution ОБЯЗАТЕЛЕН ---------------------------------------
+    for drop in ("ckpt", "horizon", "waiting_steps", "joint_sha1", "seed",
+                 "offset_table_sha1", "k9h_sha1"):
+        ex = dict(_proto_ok()["execution"])
+        ex.pop(drop)
+        _expect(lambda e=ex: _proto_ok(execution=e), f"'{drop}'")
+    _expect(lambda: _proto_ok(execution=dict(
+        _proto_ok()["execution"], hf_revision="main")), "означает «какая "
+                                                        "окажется»")
+    _expect(lambda: _proto_ok(execution=dict(
+        _proto_ok()["execution"], head_precision="fp16")), "не fp32")
+    _expect(lambda: _proto_ok(execution={}), "в разделе execution нет")
+
+    # --- реплики обязаны быть полным произведением -------------------------
+    _expect(lambda: _proto_ok(replicas=[(0, 0), (1, 1)]),
+            "не образуют полного произведения")
+    _expect(lambda: _proto_ok(replicas=[(0, 0), (0, 1), (1, 0)]),
+            "не образуют полного произведения")
+    assert _proto_ok(replicas=[(0, 0), (0, 1), (1, 0), (1, 1)])
+
+    # --- пересечения свежих должно хватать на ВСЕ наборы ------------------
+    _expect(lambda: _proto_ok(common_fresh_ids=list(range(100, 224)),
+                              splits={"train": "100-129", "dev": "130-144",
+                                      "final": "145-224"}),
+            "меньше суммы наборов")
+
+    # --- отпечаток каталога чекпойнта --------------------------------------
+    cdir = os.path.join(tmp, "ckpt_dir")
+    os.makedirs(os.path.join(cdir, "sub"), exist_ok=True)
+    open(os.path.join(cdir, "config.json"), "w").write("{}")
+    open(os.path.join(cdir, "sub", "w.bin"), "wb").write(b"0" * 16)
+    f1_ = ckpt_fingerprint(cdir)
+    assert f1_ == ckpt_fingerprint(cdir), "отпечаток не воспроизводится"
+    open(os.path.join(cdir, "sub", "w.bin"), "wb").write(b"0" * 17)
+    assert ckpt_fingerprint(cdir) != f1_, "изменённый файл не замечен"
+    os.makedirs(os.path.join(tmp, "пусто"), exist_ok=True)
+    _expect(lambda: ckpt_fingerprint(os.path.join(tmp, "пусто")), "нет файлов")
+
     print("самопроверка k12b_protocol пройдена")
 
 
@@ -1424,9 +1605,15 @@ def main():
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--init", action="store_true")
     ap.add_argument("--out", default="data/k12b/protocol.json")
-    ap.add_argument("--train-ids", default="0-29")
-    ap.add_argument("--dev-ids", default="30-44")
-    ap.add_argument("--final-ids", required=False)
+    # НАБОРЫ ВЫВОДЯТСЯ ИЗ АРТЕФАКТА ЗОНДА, а не задаются числами по умолчанию.
+    # Прежние 0-29 / 30-44 противоречили самой проверке: состояния 0..44 заняты
+    # прежними прогонами и в пересечение свежих не входят по определению.
+    ap.add_argument("--train-n", type=int, default=30)
+    ap.add_argument("--dev-n", type=int, default=15)
+    ap.add_argument("--train-ids", default=None,
+                    help="по умолчанию первые --train-n свежих общих состояний")
+    ap.add_argument("--dev-ids", default=None)
+    ap.add_argument("--final-ids", default=None)
     ap.add_argument("--sigma-grid", default="0.03,0.05,0.10")
     ap.add_argument("--tasks", default="0,1,2,3,4,5,6,7,8,9")
     ap.add_argument("--episodes-final", type=int, default=80)
@@ -1453,6 +1640,9 @@ def main():
     ap.add_argument("--k11e-protocol", default="data/k11e/protocol.json")
     ap.add_argument("--script", action="append", default=[],
                     help="путь к скрипту, чей sha войдёт в протокол")
+    ap.add_argument("--execution", default=None,
+                    help="JSON с разделом execution: фактические условия "
+                         "исполнения, с которыми сверяется каждая ячейка")
     ap.add_argument("--notes", default="")
     args = ap.parse_args()
     if args.selftest:
@@ -1460,9 +1650,6 @@ def main():
         return
     if not args.init:
         ap.error("нужен --selftest или --init")
-    if not args.final_ids:
-        ap.error("--final-ids обязателен: набор final регистрируется явно, "
-                 "а не выводится из остальных")
     for f_ in (args.d1_s0, args.d1_s1):
         if not os.path.exists(f_):
             ap.error(f"нет чекпойнта D1 {f_}: карта сид -> чекпойнт "
@@ -1496,9 +1683,30 @@ def main():
     scripts = {os.path.basename(s): _sha12(s) for s in args.script}
     scripts[os.path.basename(__file__)] = _sha12(os.path.abspath(__file__))
 
+    # РАЗБИЕНИЕ: непересекающиеся отрезки пересечения свежих состояний в
+    # порядке возрастания id. Детерминированно и воспроизводимо из артефакта
+    # зонда; явные --*-ids остаются, но проверяются той же проверкой.
+    need_total = args.train_n + args.dev_n + args.episodes_final
+    if len(common) < need_total:
+        raise SystemExit(
+            f"общих свежих состояний {len(common)}, а на train+dev+final нужно "
+            f"{need_total} ({args.train_n}+{args.dev_n}+"
+            f"{args.episodes_final}): все три набора обязаны быть свежими, "
+            f"иначе sigma и чекпойнт выбирались бы на состояниях прежних "
+            f"прогонов")
+    auto_tr = common[:args.train_n]
+    auto_dv = common[args.train_n:args.train_n + args.dev_n]
+    auto_fn = common[args.train_n + args.dev_n:need_total]
+    splits = {
+        "train": args.train_ids or ",".join(str(i) for i in auto_tr),
+        "dev": args.dev_ids or ",".join(str(i) for i in auto_dv),
+        "final": args.final_ids or ",".join(str(i) for i in auto_fn)}
+    print(f"  наборы из пересечения свежих ({len(common)} состояний): "
+          f"train {auto_tr[0]}..{auto_tr[-1]}, dev {auto_dv[0]}..{auto_dv[-1]}, "
+          f"final {auto_fn[0]}..{auto_fn[-1]}")
+
     proto = init_protocol(
-        splits={"train": args.train_ids, "dev": args.dev_ids,
-                "final": args.final_ids},
+        splits=splits,
         sigma_grid=[float(x) for x in args.sigma_grid.split(",")],
         tasks=[int(x) for x in args.tasks.split(",")],
         n_episodes_final=args.episodes_final,
@@ -1523,6 +1731,7 @@ def main():
                            sha1=_sha12(args.k11g_protocol)),
         k11e_protocol=dict(path=args.k11e_protocol,
                            sha1=_sha12(args.k11e_protocol)),
+        execution=json.load(open(args.execution)) if args.execution else None,
         scripts=scripts, notes=args.notes)
     fresh = write_protocol(args.out, proto)
     print(f"{'записан' if fresh else 'уже был'} {args.out}, "

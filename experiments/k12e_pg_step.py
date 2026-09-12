@@ -282,6 +282,27 @@ def check_rollouts(files, proto, *, replica, stage, sigma=None):
                 bad.append(f"{tag}: эпизод {k} без успеха")
             if not e.get("init_hash_full"):
                 bad.append(f"{tag}: эпизод {k} без init_hash_full")
+    # ---- ФАКТИЧЕСКИЕ УСЛОВИЯ ИСПОЛНЕНИЯ ПРОТИВ РАЗДЕЛА execution ----
+    # Раньше эти поля писались в ячейку и не сверялись ни с чем: две ячейки с
+    # разным горизонтом, числом холостых шагов или базовым чекпойнтом
+    # складывались в один обучающий буфер.
+    for f in files:
+        m = f["meta"]
+        bad += kb.check_execution(
+            proto, m, os.path.basename(str(m.get("path", "?"))))
+    # rollout_seed зависит от init_start по правилу режима, поэтому равенства
+    # между ячейками требовать нельзя — но ОДИН init_start обязан давать один
+    # сид, иначе сид подменялся вручную
+    by_start = {}
+    for f in files:
+        m = f["meta"]
+        k = int(m.get("init_start", -1))
+        v = m.get("rollout_seed")
+        if k in by_start and by_start[k] != v:
+            bad.append(f"init_start {k} даёт сиды раскатки {by_start[k]} и {v}: "
+                       f"сид задан не правилом режима, а вручную")
+        by_start[k] = v
+
     # набор состояний и задач — против зарегистрированных
     allowed = set(proto["splits"].get(stage, []))
     leaked = sorted({s for (_t, s) in seen} - allowed)
@@ -586,11 +607,15 @@ def _fake_rollout(head, *, tasks, states, calls, d_h, d_l, n_pos, rank, sigma,
     data = dict(h=torch.cat(H), q0=torch.cat(Q), u=torch.cat(U),
                 mu=torch.cat(MU), logp=torch.cat(LP), task=torch.cat(T),
                 state=torch.cat(S), call=torch.cat(C))
-    meta = dict(path="fake.pt", protocol_sha1=proto["sha1"], replica=replica,
+    # условия исполнения берутся ИЗ ПРОТОКОЛА: синтетическая ячейка обязана
+    # проходить ту же сверку, что настоящая, иначе тест слабее проверки
+    meta = dict(proto["execution"], path="fake.pt",
+                protocol_sha1=proto["sha1"], replica=replica,
                 stage=stage, head_precision="fp32", sigma=sigma,
                 d_hidden=d_h, rank=rank, head_sha1="h" * 12,
-                policy_sha1="p" * 12, step_index=0,
-                codebooks_sha1="c" * 12, joint_sha1="j" * 12, episodes=eps)
+                policy_sha1="p" * 12, step_index=0, init_start=0,
+                rollout_seed=123,
+                codebooks_sha1="c" * 12, episodes=eps)
     return dict(meta=meta, data=data), cb0
 
 
@@ -894,6 +919,31 @@ def selftest():
     _expect(lambda: check_rollouts([f1, two_step], proto, replica="d10_rl0",
                                    stage="train", sigma=sigma),
             "раскатки с разных шагов")
+
+    # --- УСЛОВИЯ ИСПОЛНЕНИЯ СВЕРЯЮТСЯ, А НЕ ТОЛЬКО ЗАПИСЫВАЮТСЯ ------------
+    for key, val in (("horizon", 3), ("waiting_steps", 99), ("ckpt", "другой"),
+                     ("suite", "90"), ("seed", 7),
+                     ("ckpt_fingerprint", "z" * 12)):
+        bad_ex = dict(meta=dict(f1["meta"], **{key: val}), data=f1["data"])
+        _expect(lambda b=bad_ex: check_rollouts([b], proto,
+                                                replica="d10_rl0",
+                                                stage="train", sigma=sigma),
+                f"{key}={val}")
+    no_ex = dict(meta={k: v for k, v in f1["meta"].items() if k != "horizon"},
+                 data=f1["data"])
+    _expect(lambda: check_rollouts([no_ex], proto, replica="d10_rl0",
+                                   stage="train", sigma=sigma),
+            "нет поля условий 'horizon'")
+    # ячейки РАЗНЫХ условий больше не складываются в один буфер
+    mixed = dict(meta=dict(f_dev["meta"], horizon=3,
+                           episodes=f1["meta"]["episodes"]), data=f1["data"])
+    _expect(lambda: check_rollouts([f1, mixed], proto, replica="d10_rl0",
+                                   stage="train", sigma=sigma), "horizon=3")
+    # один init_start с двумя разными сидами раскатки — подмена вручную
+    same_start = dict(meta=dict(f1["meta"], rollout_seed=999), data=f1["data"])
+    _expect(lambda: check_rollouts([f1, same_start], proto,
+                                   replica="d10_rl0", stage="train",
+                                   sigma=sigma), "сид задан не правилом")
 
     print("самопроверка k12e_pg_step пройдена")
 

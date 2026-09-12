@@ -99,18 +99,34 @@ def draw(mean, sd, rng, tag=""):
     return draw_r_rec(mean, eff, rng)
 
 
-def sim_replica(rates, n_ep, r_rec, r_loss, task_sd, rng):
+def draw_baseline(rates, n_ep, rng):
+    """Опорные исходы ОДНОГО сида D1: по задаче свой вектор успехов.
+
+    Рисуются один раз на сид D1, а не на реплику: в фактическом дизайне
+    детерминированная D1 не зависит от сида RL, поэтому две RL-реплики одного
+    сида D1 делят ОДНУ опору. Независимые опоры делали бы реплики менее
+    коррелированными, чем они есть, и завышали бы эффективный размер выборки.
+    """
+    return [rng.random(n_ep) < p for p in rates]
+
+
+def sim_replica(rates, n_ep, r_rec, r_loss, task_sd, rng, base_by_task=None):
     """Одна реплика: по задаче свои доли, затем парные исходы.
+
+    `base_by_task` — общая опора сида D1 (см. `draw_baseline`). Если не задана,
+    опора рисуется заново: этот режим оставлен только для сравнения в
+    самопроверке, фактический дизайн — общая опора.
 
     Возвращает список (средняя разность по задаче, число пар) и фактическую
     дискордантность — её надо видеть, потому что именно она ограничивает
     достижимость.
     """
     out, disc = [], []
-    for p in rates:
+    for i, p in enumerate(rates):
         rr = draw(r_rec, task_sd, rng, "задача/r_rec")
         rl = draw(r_loss, task_sd, rng, "задача/r_loss")
-        base = rng.random(n_ep) < p
+        base = (base_by_task[i] if base_by_task is not None
+                else rng.random(n_ep) < p)
         flip = np.where(base, rng.random(n_ep) < rl, rng.random(n_ep) < rr)
         new = np.where(flip, ~base, base)
         out.append((float((new.astype(float) - base.astype(float)).mean()),
@@ -120,14 +136,22 @@ def sim_replica(rates, n_ep, r_rec, r_loss, task_sd, rng):
 
 
 def sim_study(rates_by_head, n_ep, r_rec, r_loss, rep_sd, task_sd, rng,
-              n_rl=2):
-    """Все реплики: по каждой D1-голове и каждому RL-сиду."""
+              n_rl=2, share_baseline=True):
+    """Все реплики: по каждой D1-голове и каждому RL-сиду.
+
+    `share_baseline=True` воспроизводит фактический дизайн: одна опора на сид
+    D1, общая для его RL-реплик. Это положительно коррелирует такие реплики, и
+    средний эффект по четырём репликам имеет меньше независимой информации, чем
+    при четырёх независимых опорах.
+    """
     reps, discs = [], []
     for _h, rates in sorted(rates_by_head.items()):
+        base = draw_baseline(rates, n_ep, rng) if share_baseline else None
         for _s in range(n_rl):
             rr = draw(r_rec, rep_sd, rng, "реплика/r_rec")
             rl = draw(r_loss, rep_sd, rng, "реплика/r_loss")
-            d, dc = sim_replica(rates, n_ep, rr, rl, task_sd, rng)
+            d, dc = sim_replica(rates, n_ep, rr, rl, task_sd, rng,
+                                base_by_task=base)
             reps.append(d)
             discs.append(dc)
     return reps, discs
@@ -168,7 +192,8 @@ R_REC_MAX = 0.90    # выше этого калибровка содержат�
 
 def power_study(rates_by_head, n_ep, delta, discord, rule="mean",
                 rep_sd=0.05, task_sd=0.10, n_sim=300, n_boot=300, seed=0,
-                n_rl=2, alpha=ALPHA, r_rec_max=R_REC_MAX):
+                n_rl=2, alpha=ALPHA, r_rec_max=R_REC_MAX,
+                share_baseline=True):
     """Мощность при заданном правиле гейта. Калибровка — по ХУДШЕЙ опоре.
 
     Калибровка делается по голове с НАИМЕНЬШЕЙ долей провалов: если для неё
@@ -208,7 +233,8 @@ def power_study(rates_by_head, n_ep, delta, discord, rule="mean",
     hit, lows, dcs = 0, [], []
     for _ in range(n_sim):
         reps, dd = sim_study(rates_by_head, n_ep, cal["r_rec"], cal["r_loss"],
-                             rep_sd, task_sd, rng, n_rl)
+                             rep_sd, task_sd, rng, n_rl,
+                             share_baseline=share_baseline)
         dcs += dd
         if rule == "all":
             lo = lower_all(reps, n_boot, rng, alpha)
@@ -223,6 +249,7 @@ def power_study(rates_by_head, n_ep, delta, discord, rule="mean",
                 discord_mean=float(np.mean(dcs)),
                 r_rec=cal["r_rec"], r_loss=cal["r_loss"],
                 calibrated_on=worst, p_fails=p_fails,
+                share_baseline=bool(share_baseline),
                 n_replicas=len(rates_by_head) * n_rl)
 
 
@@ -375,6 +402,31 @@ def selftest():
     else:
         raise AssertionError("неполный набор принят")
 
+    # --- ОПОРА ОБЩАЯ НА СИД D1: ЭТО И ЕСТЬ ФАКТИЧЕСКИЙ ДИЗАЙН -------------
+    # При r_rec=1 и r_loss=0 разность задачи равна 1 - доля успехов опоры,
+    # поэтому две RL-реплики одного сида D1 обязаны дать ПОБИТОВО одинаковые
+    # строки при общей опоре и разные при своей у каждой.
+    one = {"s0": [0.8, 0.7, 0.9, 0.6]}
+    rr = np.random.default_rng(0)
+    sh, _d = sim_study(one, 50, 1.0, 0.0, 0.0, 0.0, rr, n_rl=2,
+                       share_baseline=True)
+    assert sh[0] == sh[1], (sh[0], sh[1])
+    rr = np.random.default_rng(0)
+    ind, _d = sim_study(one, 50, 1.0, 0.0, 0.0, 0.0, rr, n_rl=2,
+                        share_baseline=False)
+    assert ind[0] != ind[1], "своя опора дала те же исходы: тест пустой"
+
+    # и мощность при общей опоре НЕ ВЫШЕ, чем при независимых опорах:
+    # положительная корреляция реплик уменьшает независимую информацию
+    het = {"s0": [1.0, 0.95, 0.9, 0.85, 0.8, 0.8, 0.7, 0.55],
+           "s1": [1.0, 1.0, 0.95, 0.9, 0.9, 0.85, 0.8, 0.75]}
+    ps = power_study(het, 80, 0.03, 0.06, "mean", 0.05, 0.10, n_sim=120,
+                     n_boot=120, seed=5, share_baseline=True)
+    pi = power_study(het, 80, 0.03, 0.06, "mean", 0.05, 0.10, n_sim=120,
+                     n_boot=120, seed=5, share_baseline=False)
+    assert ps["share_baseline"] is True and pi["share_baseline"] is False
+    assert ps["power"] <= pi["power"] + 0.03, (ps["power"], pi["power"])
+
     print("самопроверка k12b пройдена: разбросы по реплике и задаче сохраняют "
           "среднее,\n  правило «каждая реплика» строго жёстче «среднего», "
           "ресэмплирование реплик\n  расширяет интервал, неоднородность по "
@@ -402,6 +454,10 @@ def main():
                          "K-11g давал 60-67%%, и 99%% от обучения ожидать не "
                          "из чего")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--independent-baseline", action="store_true",
+                    help="диагностика: своя опора каждой реплике. Фактический "
+                         "дизайн не такой — две RL-реплики одного сида D1 "
+                         "делят одну детерминированную опору")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     if a.selftest:
@@ -418,6 +474,10 @@ def main():
               f"{100 * (r_loss_max(pf, 0.05) or 0):.2f}%")
     print(f"  разброс: по реплике sd={a.rep_sd}, по задаче sd={a.task_sd}; "
           f"реплик {2 * len(rates)}")
+    print("  опора: "
+          + ("СВОЯ каждой реплике (диагностика, дизайну не соответствует)"
+             if a.independent_baseline else
+             "ОДНА на сид D1, общая для его RL-реплик (фактический дизайн)"))
 
     res = {}
     print(f"\n  МОЩНОСТЬ. Правило гейта указано столбцом; «каждая» требует "
@@ -433,7 +493,8 @@ def main():
                 for rule in a.rules.split(","):
                     p = power_study(rates, n_ep, dl / 100.0, dsc, rule,
                                     a.rep_sd, a.task_sd, a.n_sim, a.n_boot,
-                                    a.seed, r_rec_max=a.r_rec_max)
+                                    a.seed, r_rec_max=a.r_rec_max,
+                                    share_baseline=not a.independent_baseline)
                     res[f"{dl}|{dsc}|{n_ep}|{rule}"] = p
                     if p["power"] is None:
                         skip = p["reason"]
