@@ -157,6 +157,83 @@ def accept_step(meas, trust):
     return (len(why) == 0), why
 
 
+# --------------------- цепочка шагов и состояние Adam ----------------------
+
+def check_resume_chain(prev, *, protocol_sha1, replica, step_index, d1_sha,
+                       d1_seed, sigma, require_optimizer):
+    """Сверка головы предыдущего шага. ОДНА функция на раскатку и на шаг.
+
+    Проверяется не только протокол: реплика, сид D1, исходный чекпойнт D1,
+    sigma и НОМЕР ШАГА. Без номера шага можно было бы дважды обучить от одной
+    головы и посчитать это двумя шагами; без реплики — подать голову одной
+    реплики другой, и четыре «независимых» прогона оказались бы одним.
+
+    `require_optimizer` — для шага: состояние Adam обязано переезжать между
+    командами, иначе каждый шаг начинается с нулевых моментов, то есть
+    алгоритм не тот, который зарегистрирован.
+    """
+    import k12b_protocol as kb
+    bad = []
+    if prev.get("protocol_sha1") != protocol_sha1:
+        bad.append(f"голова под протоколом {prev.get('protocol_sha1')}, а "
+                   f"прогон под {protocol_sha1}")
+    if prev.get("replica") != replica:
+        bad.append(f"голова реплики {prev.get('replica')}, а прогон реплики "
+                   f"{replica}: это смешало бы реплики, которые обязаны быть "
+                   f"независимыми")
+    want_prev = int(step_index) - 1
+    if int(prev.get("step_index", -10 ** 9)) != want_prev:
+        bad.append(f"голова с шага {prev.get('step_index')}, а ожидался "
+                   f"{want_prev}: цепочка шагов разорвана, и номер шага "
+                   f"перестал означать число сделанных обновлений")
+    if d1_sha is not None and prev.get("d1_head_sha1") != d1_sha:
+        bad.append(f"голова выросла из D1 {prev.get('d1_head_sha1')}, а подан "
+                   f"D1 {d1_sha}")
+    if d1_seed is not None and prev.get("d1_seed") != d1_seed:
+        bad.append(f"сид D1 головы {prev.get('d1_seed')} вместо {d1_seed}")
+    if sigma is not None and abs(float(prev.get("sigma", -1))
+                                 - float(sigma)) > 1e-9:
+        bad.append(f"голова обучалась при sigma {prev.get('sigma')}, а раскатка"
+                   f" при {sigma}")
+    if require_optimizer and not prev.get("optimizer_state"):
+        bad.append("в голове нет состояния оптимизатора: моменты Adam начались "
+                   "бы с нуля, и это другой алгоритм, а не продолжение")
+    if bad:
+        raise kb.ProtocolError("продолжение не сходится с протоколом:\n  - "
+                               + "\n  - ".join(bad))
+    return True
+
+
+def load_optimizer_state(opt, state, train_params):
+    """Восстановление моментов Adam с проверкой, что они действительно легли.
+
+    Пустая проверка была бы бесполезна: load_state_dict молча принимает
+    состояние с другим числом параметров, если совпадает число групп, и тогда
+    моменты относились бы к другим весам.
+    """
+    import torch
+    got = state.get("state") or {}
+    if len(got) != len(train_params):
+        raise ValueError(f"в состоянии Adam {len(got)} параметров, а обучаемых "
+                         f"{len(train_params)}: моменты относятся к другим "
+                         f"весам")
+    for i, p_ in enumerate(train_params):
+        sd = got.get(i) if i in got else got.get(str(i))
+        if sd is None:
+            raise ValueError(f"в состоянии Adam нет параметра {i}")
+        for k in ("exp_avg", "exp_avg_sq"):
+            if tuple(sd[k].shape) != tuple(p_.shape):
+                raise ValueError(f"момент {k} параметра {i} формы "
+                                 f"{tuple(sd[k].shape)} против "
+                                 f"{tuple(p_.shape)}")
+    opt.load_state_dict(state)
+    steps = [float(v["step"]) for v in opt.state.values()]
+    if not steps or min(steps) < 1:
+        raise ValueError(f"счётчики шагов Adam {steps}: состояние не "
+                         f"восстановилось, продолжения нет")
+    return dict(n_params=len(steps), step_min=min(steps), step_max=max(steps))
+
+
 # ----------------------------- буфер раскаток ------------------------------
 
 REC_KEYS = ("h", "q0", "u", "mu", "logp", "task", "state", "call")
@@ -181,6 +258,9 @@ def check_rollouts(files, proto, *, replica, stage, sigma=None):
             bad.append(f"{tag}: реплика {m.get('replica')} вместо {replica}")
         if m.get("stage") != stage:
             bad.append(f"{tag}: этап {m.get('stage')} вместо {stage}")
+        if not m.get("policy_sha1"):
+            bad.append(f"{tag}: нет policy_sha1 — происхождение действующей "
+                       f"политики не проверить")
         if m.get("head_precision") != "fp32":
             bad.append(f"{tag}: голова считалась в {m.get('head_precision')}, "
                        f"а не fp32: отношение правдоподобий нельзя было бы "
@@ -214,7 +294,12 @@ def check_rollouts(files, proto, *, replica, stage, sigma=None):
     # единая геометрия и единая голова
     for key, why in (("d_hidden", "разная размерность отвода"),
                      ("rank", "разный ранг"),
-                     ("head_sha1", "разные исходные головы"),
+                     ("head_sha1", "разные исходные головы D1"),
+                     # policy_sha1 — sha ДЕЙСТВУЮЩЕЙ политики, а не D1: после
+                     # первого шага две разные обученные головы имеют один и
+                     # тот же head_sha1, и без этого поля их нельзя различить
+                     ("policy_sha1", "раскатки разными политиками"),
+                     ("step_index", "раскатки с разных шагов обучения"),
                      ("codebooks_sha1", "разные кодовые книги"),
                      ("joint_sha1", "разные стволы")):
         vals = {str(m.get(key)) for m in metas}
@@ -504,6 +589,7 @@ def _fake_rollout(head, *, tasks, states, calls, d_h, d_l, n_pos, rank, sigma,
     meta = dict(path="fake.pt", protocol_sha1=proto["sha1"], replica=replica,
                 stage=stage, head_precision="fp32", sigma=sigma,
                 d_hidden=d_h, rank=rank, head_sha1="h" * 12,
+                policy_sha1="p" * 12, step_index=0,
                 codebooks_sha1="c" * 12, joint_sha1="j" * 12, episodes=eps)
     return dict(meta=meta, data=data), cb0
 
@@ -730,6 +816,85 @@ def selftest():
     _expect(lambda: concat_buffer([f_dup], cb0, _t.device("cpu")),
             "повторяющиеся (задача, состояние, вызов)")
 
+    # --- 7. ЦЕПОЧКА ШАГОВ И НЕПРЕРЫВНОСТЬ Adam ----------------------------
+    ok_prev = dict(protocol_sha1=proto["sha1"], replica="d10_rl0",
+                   step_index=0, d1_head_sha1="d" * 12, d1_seed=7,
+                   sigma=sigma, optimizer_state={"state": {}, "param_groups": []})
+    assert check_resume_chain(ok_prev, protocol_sha1=proto["sha1"],
+                              replica="d10_rl0", step_index=1,
+                              d1_sha="d" * 12, d1_seed=7, sigma=sigma,
+                              require_optimizer=True)
+    for over, needle in ((dict(replica="d11_rl1"), "смешало бы реплики"),
+                         (dict(step_index=3), "цепочка шагов разорвана"),
+                         (dict(d1_head_sha1="z" * 12), "выросла из D1"),
+                         (dict(d1_seed=9), "сид D1"),
+                         (dict(sigma=0.2), "обучалась при sigma"),
+                         (dict(protocol_sha1="0" * 12), "под протоколом"),
+                         (dict(optimizer_state=None), "моменты Adam начались")):
+        _expect(lambda o=over: check_resume_chain(
+            dict(ok_prev, **o), protocol_sha1=proto["sha1"],
+            replica="d10_rl0", step_index=1, d1_sha="d" * 12, d1_seed=7,
+            sigma=sigma, require_optimizer=True), needle)
+
+    # непрерывность НАСТОЯЩАЯ: шаг с восстановленными моментами отличается от
+    # шага свежего Adam при том же градиенте — иначе проверка ничего не значит
+    hA = _stub_head(d_h, d_l, rank, sigma)
+    optA = torch.optim.Adam([p_ for n_, p_ in hA.named_parameters()], lr=1e-3)
+    grad_pass(hA, buf, adv, hA.std(), 6, micro=10)
+    optA.step()
+    w_mid = {k: v.detach().clone() for k, v in hA.state_dict().items()}
+    ost = copy.deepcopy(optA.state_dict())
+    grad_pass(hA, buf, adv, hA.std(), 6, micro=10)
+    optA.step()
+    w_cont = {k: v.detach().clone() for k, v in hA.state_dict().items()}
+
+    hB = _stub_head(d_h, d_l, rank, sigma)
+    hB.load_state_dict(w_mid)
+    tpB = [p_ for n_, p_ in hB.named_parameters()]
+    optB = torch.optim.Adam(tpB, lr=1e-3)
+    info = load_optimizer_state(optB, ost, tpB)
+    assert info["step_min"] == 1.0, info
+    grad_pass(hB, buf, adv, hB.std(), 6, micro=10)
+    optB.step()
+    for k in w_cont:
+        assert torch.allclose(w_cont[k], hB.state_dict()[k], atol=1e-7), k
+
+    hC = _stub_head(d_h, d_l, rank, sigma)
+    hC.load_state_dict(w_mid)
+    optC = torch.optim.Adam([p_ for n_, p_ in hC.named_parameters()], lr=1e-3)
+    grad_pass(hC, buf, adv, hC.std(), 6, micro=10)
+    optC.step()
+    assert any(not torch.allclose(w_cont[k], hC.state_dict()[k], atol=1e-7)
+               for k in w_cont), ("свежий Adam дал тот же шаг, что "
+                                  "продолженный: тест непрерывности пустой")
+
+    # состояние не от тех весов отвергается, а не применяется молча
+    _expect(lambda: load_optimizer_state(
+        torch.optim.Adam([p_ for p_ in hC.parameters()], lr=1e-3),
+        {"state": {0: ost["state"][0]}, "param_groups": ost["param_groups"]},
+        tpB), "относятся к другим весам")
+    bad_shape = copy.deepcopy(ost)
+    bad_shape["state"][0]["exp_avg"] = torch.zeros(3, 3)
+    _expect(lambda: load_optimizer_state(
+        torch.optim.Adam([p_ for p_ in hC.parameters()], lr=1e-3), bad_shape,
+        tpB), "формы")
+
+    # раскатка без policy_sha1 больше не принимается
+    no_pol = dict(meta={k: v for k, v in f1["meta"].items()
+                        if k != "policy_sha1"}, data=f1["data"])
+    _expect(lambda: check_rollouts([no_pol], proto, replica="d10_rl0",
+                                   stage="train", sigma=sigma),
+            "нет policy_sha1")
+    two_pol = dict(meta=dict(f1["meta"], policy_sha1="q" * 12),
+                   data=f1["data"])
+    _expect(lambda: check_rollouts([f1, two_pol], proto, replica="d10_rl0",
+                                   stage="train", sigma=sigma),
+            "раскатки разными политиками")
+    two_step = dict(meta=dict(f1["meta"], step_index=5), data=f1["data"])
+    _expect(lambda: check_rollouts([f1, two_step], proto, replica="d10_rl0",
+                                   stage="train", sigma=sigma),
+            "раскатки с разных шагов")
+
     print("самопроверка k12e_pg_step пройдена")
 
 
@@ -829,13 +994,36 @@ def main():
     meta0 = files[0]["meta"]
     head = build_head(h_obj, int(meta0["d_hidden"]), int(basis.shape[0]),
                       basis, rho, dev)
+    d1_sha = k9h.file_sha12(args.head_ckpt)
+    d1_seed = h_obj.get("seed")
+    prev = None
     if args.resume_head:
-        sd = torch.load(args.resume_head, map_location="cpu",
-                        weights_only=False)
-        if sd.get("protocol_sha1") != proto["sha1"]:
-            raise SystemExit("продолжение от головы под другим протоколом")
+        prev = torch.load(args.resume_head, map_location="cpu",
+                          weights_only=False)
+        check_resume_chain(prev, protocol_sha1=proto["sha1"],
+                           replica=args.replica, step_index=args.step_index,
+                           d1_sha=d1_sha, d1_seed=d1_seed, sigma=sigma,
+                           require_optimizer=True)
         head.load_state_dict({k: v.to(dev, torch.float32)
-                              for k, v in sd["state"].items()})
+                              for k, v in prev["state"].items()})
+        policy_sha = k9h.file_sha12(args.resume_head)
+    else:
+        if int(args.step_index) != 0:
+            raise SystemExit(f"--step-index {args.step_index} без "
+                             f"--resume-head: шаг не первый, а голова взята "
+                             f"исходная, то есть предыдущий шаг потерян")
+        policy_sha = d1_sha
+    # РАСКАТКИ ОБЯЗАНЫ БЫТЬ СОБРАНЫ ИМЕННО ЭТОЙ ПОЛИТИКОЙ. Иначе обновление
+    # идёт по сэмплам другой политики без всякой поправки, и отношение
+    # правдоподобий стартует не с единицы — это уже не тот алгоритм
+    roll_pol = {str(f["meta"].get("policy_sha1")) for f in files}
+    if roll_pol != {policy_sha}:
+        raise SystemExit(f"раскатки собраны политикой {sorted(roll_pol)}, а "
+                         f"шаг делается от {policy_sha}")
+    roll_step = {int(f["meta"].get("step_index", -1)) for f in files}
+    if roll_step != {int(args.step_index)}:
+        raise SystemExit(f"раскатки с шага {sorted(roll_step)}, а шаг "
+                         f"{args.step_index}")
     with torch.no_grad():
         head.log_std.fill_(float(np.log(sigma)))
     std = head.std().detach()
@@ -886,6 +1074,13 @@ def main():
     adv = episode_advantages(buf, adv_std)
 
     opt = torch.optim.Adam(train_params, lr=float(sg["lr"]))
+    adam_info = None
+    if prev is not None:
+        adam_info = load_optimizer_state(opt, prev["optimizer_state"],
+                                         train_params)
+        print(f"состояние Adam восстановлено: параметров "
+              f"{adam_info['n_params']}, счётчик шагов "
+              f"{adam_info['step_min']:.0f}..{adam_info['step_max']:.0f}")
     t0 = time.time()
     rec = one_step(head, opt, buf, adv, std,
                    n_episodes=len(buf["episodes"]), lr=float(sg["lr"]),
@@ -899,7 +1094,11 @@ def main():
                rollouts=[f["meta"]["path"] for f in files],
                head_ckpt=args.head_ckpt, head_sha1=k9h.file_sha12(
                    args.head_ckpt),
-               resume_head=args.resume_head, cb0_sha1=cb_sha,
+               resume_head=args.resume_head,
+               resume_head_sha1=(None if prev is None
+                                 else k9h.file_sha12(args.resume_head)),
+               policy_sha1=policy_sha, d1_head_sha1=d1_sha, d1_seed=d1_seed,
+               adam_resumed=adam_info, cb0_sha1=cb_sha,
                device=str(dev), dtype="float32",
                torch_version=torch.__version__,
                script_sha1=k9h.file_sha12(os.path.abspath(__file__)),
@@ -909,10 +1108,19 @@ def main():
     if rec["status"] == "stepped":
         os.makedirs(os.path.dirname(os.path.abspath(args.out_head)) or ".",
                     exist_ok=True)
+        # СОСТОЯНИЕ ОПТИМИЗАТОРА СОХРАНЯЕТСЯ ВМЕСТЕ С ВЕСАМИ. Без него
+        # следующая команда создала бы новый Adam с нулевыми моментами: точный
+        # откат внутри одной попытки есть, а непрерывности между шагами не
+        # было бы, и зарегистрированный алгоритм не выполнялся бы.
         torch.save(dict(state={k: v.detach().cpu()
                               for k, v in head.state_dict().items()},
+                        optimizer_state=opt.state_dict(),
                         protocol_sha1=proto["sha1"], replica=args.replica,
                         step_index=int(args.step_index), sigma=sigma,
+                        d1_head_sha1=d1_sha, d1_seed=d1_seed,
+                        prev_head_sha1=(None if prev is None else
+                                        k9h.file_sha12(args.resume_head)),
+                        policy_sha1_in=policy_sha,
                         lr_used=rec["lr_used"], halvings=rec["halvings"],
                         from_head=args.resume_head or args.head_ckpt,
                         order_sha1=buf["order_sha1"]), args.out_head)

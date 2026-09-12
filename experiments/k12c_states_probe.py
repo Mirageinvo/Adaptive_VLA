@@ -68,8 +68,13 @@ def dedup(hash_by_id):
     for i in sorted(hash_by_id):
         by_hash.setdefault(hash_by_id[i], []).append(int(i))
     groups = sorted([g for g in by_hash.values() if len(g) > 1])
+    # usable_ids — ПЕРВОЕ вхождение каждого различного состояния. Именно этот
+    # список, а не range(n_distinct), задаёт бюджет: при дубликатах число
+    # различных состояний и множество пригодных id — разные вещи, и отсчёт «от
+    # нуля до n_distinct» молча включил бы копии и исключил настоящие состояния
     return dict(n_ids=len(hash_by_id), n_distinct=len(by_hash),
                 dup_groups=groups,
+                usable_ids=sorted(g[0] for g in by_hash.values()),
                 n_dup_ids=sum(len(g) - 1 for g in groups))
 
 
@@ -155,16 +160,17 @@ def crosscheck(recorded, observed, waiting):
     return res
 
 
-def budget(n_distinct, used_ids, need_per_task):
+def budget(usable_ids, used_ids, need_per_task):
     """Сколько СВЕЖИХ состояний осталось и хватает ли их.
 
     «Свежие» — не использованные ни в K-11e (0..39), ни в K-11g (40..44), ни в
     пилоте. Повторное использование состояния, на котором уже выбирались sigma
     и чекпойнт, превращает финальную оценку в оценку на обучающей выборке.
     """
+    usable = sorted({int(i) for i in usable_ids})
     used = sorted({int(i) for i in used_ids})
-    fresh = sorted(set(range(n_distinct)) - set(used))
-    return dict(n_distinct=int(n_distinct), n_used=len(used),
+    fresh = sorted(set(usable) - set(used))
+    return dict(n_usable=len(usable), n_used=len(used),
                 n_fresh=len(fresh), need_per_task=int(need_per_task),
                 enough=bool(len(fresh) >= int(need_per_task)),
                 fresh_first=fresh[:8], fresh_last=fresh[-4:])
@@ -308,12 +314,19 @@ def selftest():
     b = find_bound({0: "a", 1: "b"}, {}, [0, 1])
     assert b["verdict"] == "граница не найдена", b
 
-    # 5. бюджет состояний
-    bg = budget(50, list(range(40)) + [40, 41, 42, 43, 44], 80)
+    # 5. бюджет строится из ПОДТВЕРЖДЁННЫХ id, а не из их количества
+    bg = budget(range(50), list(range(40)) + [40, 41, 42, 43, 44], 80)
     assert bg["n_fresh"] == 5 and not bg["enough"], bg
-    assert budget(200, range(45), 80)["enough"], budget(200, range(45), 80)
-    # повторное использование занятого id не считается свежим
-    assert budget(10, [0, 0, 1], 1)["n_fresh"] == 8
+    assert budget(range(200), range(45), 80)["enough"]
+    assert budget(range(10), [0, 0, 1], 1)["n_fresh"] == 8
+    # дубликаты: различных состояний 3, но пригодные id — 0, 1, 5, а НЕ 0,1,2.
+    # Прежний расчёт от количества объявил бы свежим id 2, который является
+    # копией, и пропустил бы настоящее состояние 5
+    dd = dedup({0: "a", 1: "b", 2: "a", 5: "c"})
+    assert dd["usable_ids"] == [0, 1, 5], dd
+    bg2 = budget(dd["usable_ids"], [0, 1], 1)
+    assert bg2["n_fresh"] == 1 and bg2["fresh_first"] == [5], bg2
+    assert budget(dd["usable_ids"], [0, 1], 2)["enough"] is False
 
     # 6. хэш воспроизводим и зависит от ВСЕХ частей
     a = np.arange(6, dtype=np.float64)
@@ -332,7 +345,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--seed-b", type=int, default=7,
                     help="второй сид: проверка, создаёт ли сид новые состояния")
-    ap.add_argument("--enum-max", type=int, default=60,
+    ap.add_argument("--enum-max", type=int, default=200,
                     help="докуда перечислять id после разведки границы")
     ap.add_argument("--stage", default="all",
                     choices=["bound", "all"])
@@ -345,7 +358,33 @@ def main():
     args = ap.parse_args()
     if args.selftest:
         selftest()
-        return
+        return 0
+
+    used = []
+    for part in args.used_ids.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-")
+            used += list(range(int(a), int(b) + 1))
+        else:
+            used.append(int(part))
+
+    # КОНФИГУРАЦИЯ, КОТОРАЯ НЕ МОЖЕТ ПОДТВЕРДИТЬ ТРЕБОВАНИЕ, ОТВЕРГАЕТСЯ
+    # СРАЗУ. При enum_max=60 и занятых 0..44 свежих не больше 15, и прогон на
+    # десять задач заведомо кончился бы «НЕ ХВАТАЕТ» — но по причине настроек,
+    # а не по свойствам сюиты, и это нельзя перепутать.
+    if args.stage == "all":
+        reach = len(set(range(args.enum_max)) - set(used))
+        if reach < args.need_per_task:
+            raise SystemExit(
+                f"--enum-max {args.enum_max} при занятых {len(set(used))} id "
+                f"даёт максимум {reach} свежих состояний, а нужно "
+                f"{args.need_per_task}: такой прогон не может подтвердить "
+                f"требование независимо от того, сколько состояний есть в "
+                f"сюите. Нужно --enum-max не меньше "
+                f"{args.need_per_task + len(set(used))}")
 
     sys.path.insert(0, os.path.abspath("experiments"))
     from utils import get_envs, seed_everything   # noqa: E402
@@ -361,17 +400,6 @@ def main():
     except Exception as e:                         # noqa: BLE001
         print(f"  исходник недоступен: {e}", flush=True)
     print("--- конец исходника ---", flush=True)
-
-    used = []
-    for part in args.used_ids.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            a, b = part.split("-")
-            used += list(range(int(a), int(b) + 1))
-        else:
-            used.append(int(part))
 
     task_ids = [int(x) for x in args.task_ids.split(",") if x.strip()]
     out = dict(suite=args.suite, waiting_steps=args.waiting_steps,
@@ -406,7 +434,7 @@ def main():
             hs.update({k: v for k, v in h0.items() if k < lim})
             rec["enum"] = dedup(hs)
             rec["enum_errors"] = es
-            rec["budget"] = budget(rec["enum"]["n_distinct"], used,
+            rec["budget"] = budget(rec["enum"]["usable_ids"], used,
                                    args.need_per_task)
             for j, h in hs.items():
                 observed_all[(t, int(j))] = h
@@ -450,6 +478,13 @@ def main():
             min_distinct=mnd, min_fresh=mn,
             enough_everywhere=all(r["budget"]["enough"]
                                   for r in out["tasks"].values()),
+            # дубликаты ПОЛНОГО перечисления — тот же дефект, что кламп на
+            # разведке: «разные» эпизоды оказываются копиями. Раньше они
+            # попадали только в запись по задаче и не влияли на вердикт
+            any_duplicate_states=any(r["enum"]["dup_groups"]
+                                     for r in out["tasks"].values()),
+            n_duplicate_ids=sum(r["enum"]["n_dup_ids"]
+                                for r in out["tasks"].values()),
             any_silent_clamp=any(r["bound"]["silent_clamp_pairs"]
                                  for r in out["tasks"].values()),
             seed_creates_states=any(
@@ -463,13 +498,45 @@ def main():
     json.dump(out, open(tmp, "w"), ensure_ascii=False, indent=1)
     os.replace(tmp, args.out)
     print(f"\nсохранено: {args.out}")
+    # ВЕРДИКТ ВЛИЯЕТ НА КОД ВОЗВРАТА. Раньше расхождение хэшей с прежними
+    # артефактами записывалось в JSON и молча завершалось нулём: в скрипте
+    # запуска это выглядело бы как успешная проверка.
+    red = []
     if "summary" in out:
-        s = out["summary"]
-        print(f"ИТОГ: минимум различных состояний на задачу {s['min_distinct']},"
-              f" свежих {s['min_fresh']} при нужных {args.need_per_task}; "
-              f"молчаливый кламп: {s['any_silent_clamp']}; сид создаёт "
-              f"состояния: {s['seed_creates_states']}")
+        sm = out["summary"]
+        print(f"ИТОГ: минимум различных состояний на задачу "
+              f"{sm['min_distinct']}, свежих {sm['min_fresh']} при нужных "
+              f"{args.need_per_task}; молчаливый кламп: "
+              f"{sm['any_silent_clamp']}; дубликаты состояний: "
+              f"{sm['any_duplicate_states']} ({sm['n_duplicate_ids']} id); "
+              f"сид создаёт состояния: {sm['seed_creates_states']}")
+        if not sm["enough_everywhere"]:
+            red.append(f"свежих состояний {sm['min_fresh']} < "
+                       f"{args.need_per_task}")
+        if sm["any_silent_clamp"]:
+            red.append("молчаливый кламп id")
+        if sm["any_duplicate_states"]:
+            red.append(f"дубликаты состояний: {sm['n_duplicate_ids']} id")
+    cc = out.get("crosscheck")
+    if cc:
+        if cc["mismatched"]:
+            red.append(f"хэши расходятся с прежними артефактами: "
+                       f"{len(cc['mismatched'])} записей — id больше не задаёт "
+                       f"то же состояние, и прежние пары эпизодов были не "
+                       f"парными")
+        if cc["recorded_conflicts"]:
+            red.append(f"противоречия внутри прежних артефактов: "
+                       f"{len(cc['recorded_conflicts'])}")
+        if cc["bad_files"]:
+            red.append(f"нечитаемые артефакты: {len(cc['bad_files'])}")
+    if red:
+        print("\nНЕ ГОТОВО К РЕГИСТРАЦИИ:")
+        for r in red:
+            print(f"  - {r}")
+        return 1
+    print("\nвсе проверки чисты: число эпизодов можно регистрировать")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

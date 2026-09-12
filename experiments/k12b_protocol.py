@@ -127,8 +127,9 @@ def r_loss_max(p_fail, delta):
 def init_protocol(*, splits, sigma_grid, tasks, n_episodes_final,
                   delta_target, discord_max, p_fail_by_head, replicas,
                   gate_rule=REGISTERED_RULE, stop=None, step=None,
-                  states_json=None, power_json=None, scripts=None,
-                  k11g_protocol=None, k11e_protocol=None, notes=""):
+                  bootstrap=None, states_json=None, power_json=None,
+                  scripts=None, k11g_protocol=None, k11e_protocol=None,
+                  notes=""):
     """Собрать протокол. НЕ пишет файл: запись — отдельное решение."""
     stop = dict(stop or {})
     step = dict(step or {})
@@ -147,6 +148,7 @@ def init_protocol(*, splits, sigma_grid, tasks, n_episodes_final,
         gate_rule=str(gate_rule),
         gate_rules_secondary=[r for r in GATE_RULES if r != gate_rule],
         stop=stop, step=step,
+        bootstrap=dict(bootstrap or dict(n_boot=20000, alpha=0.05, seed=0)),
         states_json=states_json, power_json=power_json,
         k11g_protocol=k11g_protocol, k11e_protocol=k11e_protocol,
         scripts=dict(scripts or {}), notes=str(notes))
@@ -289,6 +291,16 @@ def check_protocol(proto):
                    f"параметров, и следующий шаг пошёл бы по устаревшему "
                    f"направлению")
 
+    bs = proto.get("bootstrap") or {}
+    if int(bs.get("n_boot", 0)) < 2000:
+        bad.append(f"n_boot={bs.get('n_boot')}: квантиль бутстрапа при таком "
+                   f"числе повторов шумит сильнее, чем сам эффект")
+    if not 0.0 < float(bs.get("alpha", 0)) < 0.5:
+        bad.append(f"alpha={bs.get('alpha')} вне (0, 0.5): односторонний "
+                   f"уровень должен быть зарегистрирован явно")
+    if "seed" not in bs:
+        bad.append("не зарегистрирован сид бутстрапа: без него границу можно "
+                   "пересчитывать до нужного результата")
     for key in ("states_json", "power_json", "k11g_protocol", "k11e_protocol"):
         ref = proto.get(key)
         if not ref or not isinstance(ref, dict) or not ref.get("sha1"):
@@ -419,8 +431,19 @@ def replica_key(r):
 
 # ---------------------------- сверка прогона ------------------------------
 
-def check_run(proto, record, *, decisions=None, final_open=None):
-    """Соответствует ли прогон протоколу. Отказов сразу все."""
+def check_run(proto, record, *, decisions=None, final_open=None,
+              partial=False):
+    """Соответствует ли прогон протоколу. Отказов сразу все.
+
+    `partial=True` — запись ОДНОЙ ячейки (блок состояний одной задачи), а не
+    прогона целиком: тогда проверяется включение в набор, но не полнота. Полнота
+    финальной оценки проверяется отдельно, `check_final_complete`: иначе
+    «final на одном состоянии из 80» прошёл бы как финальный прогон.
+
+    ОБЯЗАТЕЛЬНЫЕ ПОЛЯ ТРЕБУЮТСЯ, А НЕ ПРОВЕРЯЮТСЯ ПРИ НАЛИЧИИ. Проверка вида
+    «если поле есть, оно должно быть верным» пропускает запись без поля, то
+    есть ровно тот случай, когда сверять нечего.
+    """
     bad = []
     stage = record.get("stage")
     if stage not in STAGES:
@@ -428,6 +451,9 @@ def check_run(proto, record, *, decisions=None, final_open=None):
     if record.get("protocol_sha1") != proto.get("sha1"):
         bad.append(f"прогон помечен протоколом {record.get('protocol_sha1')}, "
                    f"а проверяется против {proto.get('sha1')}")
+    for need in ("replica", "sigma", "state_ids", "task_ids"):
+        if record.get(need) in (None, "", [], {}):
+            bad.append(f"в записи прогона нет обязательного поля '{need}'")
     ids = sorted({int(i) for i in record.get("state_ids") or []})
     if not ids:
         bad.append("в записи прогона нет начальных состояний")
@@ -448,6 +474,10 @@ def check_run(proto, record, *, decisions=None, final_open=None):
     unknown = sorted(set(tasks) - set(proto["tasks"]))
     if unknown:
         bad.append(f"задачи {unknown} не зарегистрированы")
+    if not partial and stage == "final" and set(tasks) != set(proto["tasks"]):
+        bad.append(f"финальная оценка по задачам {tasks}, а зарегистрированы "
+                   f"{proto['tasks']}: выбор подмножества задач после "
+                   f"обучения — это выбор результата")
 
     sig = record.get("sigma")
     if sig is None:
@@ -456,11 +486,30 @@ def check_run(proto, record, *, decisions=None, final_open=None):
         if round(float(sig), 6) not in [round(float(s), 6)
                                         for s in proto["sigma_grid"]]:
             bad.append(f"sigma={sig} вне сетки {proto['sigma_grid']}")
-    if record.get("replica") and record["replica"] not in [
-            replica_key(r) for r in proto["replicas"]]:
-        bad.append(f"реплика {record['replica']} не зарегистрирована")
+    if record.get("replica") not in [replica_key(r) for r in proto["replicas"]]:
+        bad.append(f"реплика {record.get('replica')} не зарегистрирована")
 
     if stage == "final":
+        if not record.get("ckpt_sha1"):
+            bad.append("финальный прогон без ckpt_sha1: нечего сверять с "
+                       "запечатанным решением, и подменённый чекпойнт прошёл "
+                       "бы незамеченным")
+        if not partial:
+            want_ids = set(proto["splits"]["final"])
+            if set(ids) != want_ids:
+                miss = sorted(want_ids - set(ids))[:6]
+                extra = sorted(set(ids) - want_ids)[:6]
+                bad.append(f"финальная оценка не на зарегистрированном наборе: "
+                           f"не хватает {len(want_ids - set(ids))} "
+                           f"({miss}), лишних "
+                           f"{len(set(ids) - want_ids)} ({extra})")
+            n_per = record.get("n_episodes_per_task")
+            if n_per is None:
+                bad.append("нет n_episodes_per_task: число эпизодов на задачу "
+                           "зарегистрировано и обязано быть записано")
+            elif int(n_per) != int(proto["n_episodes_final"]):
+                bad.append(f"эпизодов на задачу {n_per}, зарегистрировано "
+                           f"{proto['n_episodes_final']}")
         if decisions is None or final_open is None:
             bad.append("финальный прогон без запечатанных решений или без "
                        "записи об открытии final")
@@ -469,43 +518,150 @@ def check_run(proto, record, *, decisions=None, final_open=None):
                 bad.append("решения от другого протокола")
             if final_open.get("decisions_sha1") != decisions.get("sha1"):
                 bad.append("final открывался под другие решения")
-            if sig is not None and round(float(sig), 6) != round(
+            if sig is None or round(float(sig), 6) != round(
                     float(decisions["sigma"]), 6):
                 bad.append(f"в финальном прогоне sigma={sig}, а запечатана "
                            f"{decisions['sigma']}: это выбор после открытия "
                            f"final")
             rk = record.get("replica")
             ck = (decisions.get("checkpoints") or {}).get(rk)
-            if rk and ck and record.get("ckpt_sha1") not in (None, ck["sha1"]):
-                bad.append(f"чекпойнт реплики {rk} не тот, что запечатан")
-            n_per = record.get("n_episodes_per_task")
-            if n_per is not None and int(n_per) != int(
-                    proto["n_episodes_final"]):
-                bad.append(f"эпизодов на задачу {n_per}, зарегистрировано "
-                           f"{proto['n_episodes_final']}")
+            if ck is None:
+                bad.append(f"для реплики {rk} нет запечатанного чекпойнта")
+            elif record.get("ckpt_sha1") != ck["sha1"]:
+                bad.append(f"чекпойнт реплики {rk} ({record.get('ckpt_sha1')}) "
+                           f"не тот, что запечатан ({ck['sha1']})")
     if bad:
         raise ProtocolError("прогон не соответствует протоколу:\n  - "
                             + "\n  - ".join(bad))
     return True
 
 
-def gate(proto, per_replica_lower):
-    """Итог гейта по зарегистрированному правилу.
+def check_final_complete(proto, records, *, decisions, final_open):
+    """Полнота финальной оценки по набору ЯЧЕЕК.
 
-    Возвращает и вторичные правила — но именно зарегистрированное помечено
-    `registered`, чтобы при чтении результата нельзя было выбрать то, которое
-    прошло.
+    Каждая ячейка проверяется как частичная (`partial=True`), а полнота — здесь:
+    для каждой реплики объединение состояний по каждой задаче обязано в точности
+    совпасть с зарегистрированным набором final, без повторов. Без этой функции
+    «финальный прогон» на одном состоянии одной задачи выглядел бы законным.
     """
-    vals = [float(v) for v in per_replica_lower]
-    if len(vals) != len(proto["replicas"]):
-        raise ProtocolError(f"подано {len(vals)} реплик, зарегистрировано "
-                            f"{len(proto['replicas'])}")
-    mean_v = sum(vals) / len(vals)
+    bad = []
+    want_ids = set(proto["splits"]["final"])
+    want_reps = {replica_key(r) for r in proto["replicas"]}
+    seen = {}
+    for rec in records:
+        try:
+            check_run(proto, rec, decisions=decisions, final_open=final_open,
+                      partial=True)
+        except ProtocolError as e:
+            bad.append(f"ячейка {rec.get('replica')}/{rec.get('task_ids')}: {e}")
+            continue
+        if rec.get("stage") != "final":
+            bad.append(f"ячейка на этапе {rec.get('stage')}, а не final")
+            continue
+        for t in rec["task_ids"]:
+            key = (rec["replica"], int(t))
+            for i in rec["state_ids"]:
+                dup = seen.setdefault(key, [])
+                if int(i) in dup:
+                    bad.append(f"{key}: состояние {i} посчитано дважды — "
+                               f"эпизод вошёл бы в оценку с двойным весом")
+                dup.append(int(i))
+    missing_reps = sorted(want_reps - {k[0] for k in seen})
+    if missing_reps:
+        bad.append(f"нет ячеек для реплик {missing_reps}: гейт по среднему "
+                   f"четырёх реплик нельзя считать по трём")
+    for rk in sorted(want_reps & {k[0] for k in seen}):
+        for t in proto["tasks"]:
+            got = set(seen.get((rk, int(t)), []))
+            if got != want_ids:
+                bad.append(
+                    f"{rk}, задача {t}: состояний {len(got)} из "
+                    f"{len(want_ids)}, не хватает "
+                    f"{sorted(want_ids - got)[:6]}")
+    if bad:
+        raise ProtocolError("финальная оценка неполна:\n  - "
+                            + "\n  - ".join(bad))
+    return dict(replicas=sorted(want_reps), tasks=list(proto["tasks"]),
+                n_states=len(want_ids),
+                n_episodes=len(want_reps) * len(proto["tasks"]) * len(want_ids))
+
+
+def gate(proto, diffs, *, n_boot=None, seed=None, alpha=None):
+    """Итог гейта по зарегистрированному правилу. СОВМЕСТНЫЙ бутстрап.
+
+    `diffs` — {реплика: {задача: (средняя парная разность, число пар)}}.
+
+    ПОЧЕМУ НЕ СРЕДНЕЕ НИЖНИХ ГРАНИЦ. Среднее четырёх односторонних границ —
+    не граница среднего: каждая из них уже сдвинута вниз на свой запас, и их
+    среднее не имеет заявленного покрытия. Нижняя граница СРЕДНЕГО получается
+    только совместным ресэмплированием задач, когда на каждой итерации
+    бутстрапа берутся ОДНИ И ТЕ ЖЕ задачи у всех реплик и усредняется уже
+    результат. Поэтому вычисление делегировано `k12b_power_hier.lower_mean`,
+    тому же коду, которым считалась мощность: расчёт мощности и гейт обязаны
+    быть одной процедурой, иначе зарегистрированная мощность относится не к
+    тому правилу, по которому принимается решение.
+
+    Наивное среднее границ всё же считается и возвращается — но под именем
+    `naive_mean_of_lowers` и с пометкой, что границей оно не является: иначе
+    это число однажды снова прочитают как вывод.
+
+    ЗАДАЧИ ВЫРАВНИВАЮТСЯ МЕЖДУ РЕПЛИКАМИ. Совместный бутстрап индексирует
+    столбцы, и если у реплик разный набор задач, то ресэмплирование смешало бы
+    разные задачи в один столбец.
+    """
+    import numpy as np
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import k12b_power_hier as ph
+
+    bs = proto.get("bootstrap") or {}
+    n_boot = int(n_boot if n_boot is not None else bs["n_boot"])
+    seed = int(seed if seed is not None else bs["seed"])
+    alpha = float(alpha if alpha is not None else bs["alpha"])
+
+    keys = [replica_key(r) for r in proto["replicas"]]
+    if not isinstance(diffs, dict):
+        raise ProtocolError(
+            "gate ожидает {реплика: {задача: (разность, число пар)}}, а не "
+            "список нижних границ: среднее границ границей среднего не "
+            "является")
+    if set(diffs) != set(keys):
+        raise ProtocolError(f"поданы реплики {sorted(diffs)}, "
+                            f"зарегистрированы {sorted(keys)}")
+    tasks = [int(t) for t in proto["tasks"]]
+    reps = []
+    for rk in keys:
+        d = {int(k): v for k, v in diffs[rk].items()}
+        if set(d) != set(tasks):
+            raise ProtocolError(
+                f"реплика {rk}: задачи {sorted(d)} вместо {tasks} — "
+                f"совместный бутстрап смешал бы разные задачи в один столбец")
+        row = []
+        for t in tasks:
+            diff, w = float(d[t][0]), float(d[t][1])
+            if not w > 0:
+                raise ProtocolError(f"реплика {rk}, задача {t}: вес {w} не "
+                                    f"положителен")
+            row.append((diff, w))
+        reps.append(row)
+
+    lo_mean = ph.lower_mean(reps, n_boot, np.random.default_rng(seed),
+                            resample_replicas=False, alpha=alpha)
+    lo_rep = ph.lower_mean(reps, n_boot, np.random.default_rng(seed + 1),
+                           resample_replicas=True, alpha=alpha)
+    lo_all = ph.lower_all(reps, n_boot, np.random.default_rng(seed + 2),
+                          alpha=alpha)
+    per_rep = [ph.cluster_lower(r, n_boot,
+                                np.random.default_rng(seed + 10 + i), alpha)
+               for i, r in enumerate(reps)]
+    point = [sum(d * w for d, w in r) / sum(w for _d, w in r) for r in reps]
     res = dict(registered=proto["gate_rule"],
-               values=dict(mean=mean_v > 0,
-                           mean_rep=mean_v > 0,
-                           all=all(v > 0 for v in vals)),
-               mean_lower=mean_v, per_replica=vals)
+               lower=dict(mean=lo_mean, mean_rep=lo_rep, all=lo_all),
+               values=dict(mean=bool(lo_mean > 0), mean_rep=bool(lo_rep > 0),
+                           all=bool(lo_all > 0)),
+               per_replica_lower=per_rep, per_replica_point=point,
+               naive_mean_of_lowers=sum(per_rep) / len(per_rep),
+               naive_is_not_a_bound=True,
+               n_boot=n_boot, alpha=alpha, seed=seed)
     res["passed"] = bool(res["values"][proto["gate_rule"]])
     return res
 
@@ -734,13 +890,117 @@ def selftest(tmpdir=None):
                               final_open=dict(fo, decisions_sha1="0" * 12)),
             "под другие решения")
 
-    # --- гейт --------------------------------------------------------------
-    g = gate(p, [0.01, 0.02, -0.005, 0.03])
-    assert g["registered"] == "mean" and g["passed"] is True
-    assert g["values"]["all"] is False, g
-    g2 = gate(p, [-0.01, -0.02, -0.005, 0.001])
-    assert g2["passed"] is False
-    _expect(lambda: gate(p, [0.01, 0.02]), "подано 2 реплик")
+    # --- ПОЛНОТА ФИНАЛЬНОЙ ОЦЕНКИ -----------------------------------------
+    cells = [dict(stage="final", protocol_sha1=p["sha1"], replica=rk,
+                  task_ids=[t], state_ids=p["splits"]["final"], sigma=0.03,
+                  ckpt_sha1=cks[rk]["sha1"])
+             for rk in [replica_key(r) for r in p["replicas"]]
+             for t in p["tasks"]]
+    info = check_final_complete(p, cells, decisions=dec, final_open=fo)
+    assert info["n_episodes"] == 4 * 10 * 80, info
+    # одна задача без части состояний — отказ
+    short = [dict(c) for c in cells]
+    short[3] = dict(short[3], state_ids=p["splits"]["final"][:40])
+    _expect(lambda: check_final_complete(p, short, decisions=dec,
+                                         final_open=fo), "состояний 40 из 80")
+    # целой реплики нет — отказ
+    three = [c for c in cells if c["replica"] != "d11_rl1"]
+    _expect(lambda: check_final_complete(p, three, decisions=dec,
+                                         final_open=fo),
+            "нельзя считать по трём")
+    # состояние посчитано дважды
+    dbl = cells + [cells[0]]
+    _expect(lambda: check_final_complete(p, dbl, decisions=dec, final_open=fo),
+            "посчитано дважды")
+
+    # --- ГЕЙТ: совместный бутстрап, а не среднее границ -------------------
+    rng_tasks = list(p["tasks"])
+    # РАЗБРОС ПО ЗАДАЧАМ ОБЯЗАТЕЛЕН В ТЕСТЕ: при одинаковых задачах у бутстрапа
+    # нулевая дисперсия, граница совпадает с точечной оценкой, и разница между
+    # правильным и наивным правилом исчезает — тест проверял бы тождество
+    _jit = [0.04, -0.03, 0.02, -0.01, 0.03, -0.02, 0.01, 0.0, -0.04, 0.02]
+
+    def _diffs(by_rep):
+        # СДВИГ УЗОРА НА КАЖДУЮ РЕПЛИКУ: при одинаковом разбросе по задачам у
+        # всех реплик среднее границ тождественно равно границе среднего, и
+        # разница правил снова была бы не видна. Независимые узоры — это и есть
+        # то, за счёт чего усреднение реплик снижает дисперсию
+        return {replica_key(r): {t: (by_rep[i] + _jit[(j + 3 * i) % len(_jit)],
+                                     40.0)
+                                 for j, t in enumerate(rng_tasks)}
+                for i, r in enumerate(p["replicas"])}
+    # список границ больше не принимается: именно так и возникла ошибка
+    _expect(lambda: gate(p, [0.01, 0.02, -0.005, 0.03]),
+            "границей среднего не является")
+    g = gate(p, _diffs([0.05, 0.05, 0.05, 0.05]), n_boot=2000, seed=1)
+    assert g["registered"] == "mean" and g["passed"] is True, g
+    assert g["lower"]["mean"] > 0 and g["lower"]["all"] > 0, g["lower"]
+    # нулевой эффект у всех: граница не выше нуля
+    g0 = gate(p, {replica_key(r): {t: (0.0, 40.0) for t in rng_tasks}
+                  for r in p["replicas"]}, n_boot=2000, seed=1)
+    assert g0["passed"] is False and abs(g0["lower"]["mean"]) < 1e-9, g0
+    # mean и mean_rep РАЗЛИЧАЮТСЯ: вторая обобщает на метод и потому шире
+    spread = gate(p, _diffs([0.10, 0.02, 0.01, -0.02]), n_boot=4000, seed=2)
+    assert spread["lower"]["mean_rep"] < spread["lower"]["mean"], spread["lower"]
+    assert spread["lower"]["all"] <= spread["lower"]["mean"], spread["lower"]
+    # наивное среднее границ НЕ совпадает с границей среднего и помечено.
+    # Направление расхождения тоже содержательно: усреднение снижает
+    # дисперсию, поэтому настоящая граница среднего ВЫШЕ среднего границ, и
+    # наивное правило занижало бы результат, а не завышало
+    assert spread["naive_is_not_a_bound"]
+    assert spread["lower"]["mean"] > spread["naive_mean_of_lowers"] + 1e-6, (
+        spread["lower"], spread["naive_mean_of_lowers"])
+    # разнобой задач между репликами — отказ выравнивания
+    bad_al = _diffs([0.05] * 4)
+    bad_al["d10_rl0"] = {t: (0.05, 40.0) for t in rng_tasks[:-1]}
+    _expect(lambda: gate(p, bad_al, n_boot=1000), "в один столбец")
+    _expect(lambda: gate(p, {"d10_rl0": {t: (0.0, 40.0) for t in rng_tasks}},
+                         n_boot=1000), "поданы реплики")
+    bad_w = _diffs([0.05] * 4)
+    bad_w["d10_rl0"][rng_tasks[0]] = (0.05, 0.0)
+    _expect(lambda: gate(p, bad_w, n_boot=1000), "не положителен")
+
+    # --- ТО, ЧТО РАНЬШЕ ПРОХОДИЛО МОЛЧА ----------------------------------
+    # запись без реплики, без задач, без sigma
+    for miss in ("replica", "task_ids", "sigma"):
+        rec = dict(base)
+        rec.pop(miss)
+        _expect(lambda r=rec: check_run(p, r), f"нет обязательного поля "
+                                               f"'{miss}'")
+    # final на одном состоянии одной задачи больше не «финальный прогон»
+    tiny = dict(stage="final", protocol_sha1=p["sha1"], replica="d10_rl0",
+                task_ids=[0], state_ids=[p["splits"]["final"][0]], sigma=0.03,
+                ckpt_sha1=cks["d10_rl0"]["sha1"], n_episodes_per_task=80)
+    _expect(lambda: check_run(p, tiny, decisions=dec, final_open=fo),
+            "не на зарегистрированном наборе")
+    _expect(lambda: check_run(p, tiny, decisions=dec, final_open=fo),
+            "выбор подмножества задач")
+    # но как ЯЧЕЙКА она законна
+    assert check_run(p, tiny, decisions=dec, final_open=fo, partial=True)
+    # final без ckpt_sha1 — отказ на любом уровне
+    no_ck = dict(tiny)
+    no_ck.pop("ckpt_sha1")
+    _expect(lambda: check_run(p, no_ck, decisions=dec, final_open=fo,
+                              partial=True), "без ckpt_sha1")
+    # final без n_episodes_per_task
+    no_n = dict(fin)
+    no_n.pop("n_episodes_per_task")
+    _expect(lambda: check_run(p, no_n, decisions=dec, final_open=fo),
+            "нет n_episodes_per_task")
+    # реплика, которой нет в протоколе, и чекпойнт чужой реплики
+    _expect(lambda: check_run(p, dict(fin, replica="d19_rl9"), decisions=dec,
+                              final_open=fo), "не зарегистрирована")
+    _expect(lambda: check_run(p, dict(fin, ckpt_sha1=cks["d11_rl1"]["sha1"]),
+                              decisions=dec, final_open=fo),
+            "не тот, что запечатан")
+
+    # --- параметры бутстрапа обязаны быть зарегистрированы ----------------
+    _expect(lambda: _proto_ok(bootstrap=dict(n_boot=100, alpha=0.05, seed=0)),
+            "шумит сильнее")
+    _expect(lambda: _proto_ok(bootstrap=dict(n_boot=20000, alpha=0.9, seed=0)),
+            "вне (0, 0.5)")
+    _expect(lambda: _proto_ok(bootstrap=dict(n_boot=20000, alpha=0.05)),
+            "сид бутстрапа")
 
     print("самопроверка k12b_protocol пройдена")
 

@@ -96,8 +96,13 @@ def build_meta(**kw):
     агрегатора один раз уже разошёлся (K-11i), и ловить это в конце долгой
     раскатки недопустимо."""
     need = ("protocol_sha1", "replica", "stage", "sigma", "episodes",
-            "d_hidden", "rank", "head_sha1", "codebooks_sha1", "joint_sha1")
+            "d_hidden", "rank", "head_sha1", "policy_sha1", "codebooks_sha1",
+            "joint_sha1")
     miss = [k for k in need if kw.get(k) in (None, "", [])]
+    # step_index проверяется отдельно: ноль — законное значение, и проверка на
+    # «пустоту» пропустила бы его отсутствие ровно на первом шаге
+    if kw.get("step_index") is None:
+        miss.append("step_index")
     if miss:
         raise ValueError(f"в мете нет обязательных полей: {miss}")
     m = dict(kw)
@@ -234,7 +239,8 @@ def check_names(root="third_party/actioncodec"):
     need(kb, ("load_protocol", "check_run", "ProtocolError"), "k12b_protocol")
     import k12e_pg_step as k12e
     need(k12e, ("check_rollouts", "concat_buffer", "parity_check",
-                "loo_advantage", "one_step"), "k12e_pg_step")
+                "loo_advantage", "one_step", "check_resume_chain",
+                "load_optimizer_state"), "k12e_pg_step")
 
     # подписи, на которые опирается код
     try:
@@ -349,6 +355,7 @@ def selftest():
     meta = build_meta(protocol_sha1=proto["sha1"], replica="d10_rl0",
                       stage="train", sigma=sigma, episodes=eps_rows,
                       d_hidden=d_h, rank=rank, head_sha1="a" * 12,
+                      policy_sha1="a" * 12, step_index=0,
                       codebooks_sha1="b" * 12, joint_sha1="c" * 12)
     meta["path"] = "cell.pt"
     cell = dict(meta=meta, data=st2.stack())
@@ -363,9 +370,17 @@ def selftest():
         build_meta(protocol_sha1="x", replica="r", stage="train", sigma=0.1,
                    episodes=eps_rows, d_hidden=d_h, rank=rank)
     except ValueError as e:
-        assert "head_sha1" in str(e), e
+        assert "head_sha1" in str(e) and "policy_sha1" in str(e), e
     else:
         raise AssertionError("мета без sha принята")
+    # номер шага ноль — законное значение, а его ОТСУТСТВИЕ — нет
+    assert build_meta(**dict(meta, step_index=0))["step_index"] == 0
+    try:
+        build_meta(**{k: v for k, v in meta.items() if k != "step_index"})
+    except ValueError as e:
+        assert "step_index" in str(e), e
+    else:
+        raise AssertionError("мета без step_index принята")
 
     # --- книга черновика: повтор с другой книгой отвергается ---------------
     import tempfile
@@ -595,7 +610,14 @@ def run(args):
     if stray:
         raise SystemExit(f"ключи вне hicora_head.: {stray[:5]}")
     heads = {}
-    for which, cls in (("det", hv.make_residual_head()),
+    for which, cls in (("det_d1", hv.make_residual_head()),
+                      # ДВЕ детерминированные головы, а не одна: одна навсегда
+                      # остаётся D1 (мера того, насколько обучение ушло от
+                      # старта), вторая несёт ДЕЙСТВУЮЩИЕ веса. Сверять
+                      # обученную гауссову голову с исходной D1 означало бы
+                      # требовать, чтобы обучение ничего не изменило, и вторая
+                      # же раскатка остановилась бы как «паритет не сошёлся»
+                       ("det_cur", hv.make_residual_head()),
                        ("gau", hg.make_gaussian_residual_head())):
         h_ = cls(d_h, int(E.shape[-1]), **kw).to(dev, torch.float32)
         h_.set_basis(torch.as_tensor(B))
@@ -608,7 +630,7 @@ def run(args):
                 h_.state_dict()[k].copy_(v.to(dev, torch.float32))
         h_.eval()
         heads[which] = h_
-    det_h, gau_h = heads["det"], heads["gau"]
+    det_d1, det_cur, gau_h = heads["det_d1"], heads["det_cur"], heads["gau"]
     # ОТДЕЛЬНОЙ ГОЛОВЫ В fp16 НЕТ, И ЭТО НЕ УПРОЩЕНИЕ. set_basis проверяет
     # ортонормированность с допуском 1e-4, а в fp16 произведение B^T B на 512
     # слагаемых этот допуск не выдерживает: голова, приведённая к fp16, просто
@@ -616,18 +638,37 @@ def run(args):
     # считалась ПОД autocast. Цена точности мерится тем же способом: та же
     # голова внутри autocast против неё же вне его.
 
+    d1_seed = h_obj.get("seed")
     if args.resume_head:
         sd = torch.load(args.resume_head, map_location="cpu",
                         weights_only=False)
-        if sd.get("protocol_sha1") != proto["sha1"]:
-            raise SystemExit("продолжение от головы под другим протоколом")
-        if sd.get("replica") != args.replica:
-            raise SystemExit(f"голова от реплики {sd.get('replica')}, а "
-                             f"раскатка для {args.replica}")
+        # ТА ЖЕ функция, что в шаге: реплика, сид D1, исходный D1, sigma и
+        # номер шага. Состояние оптимизатора раскатке не нужно, поэтому
+        # require_optimizer=False — но всё остальное совпадает дословно
+        k12e.check_resume_chain(sd, protocol_sha1=proto["sha1"],
+                                replica=args.replica,
+                                step_index=int(args.step_index),
+                                d1_sha=head_sha, d1_seed=d1_seed, sigma=sigma,
+                                require_optimizer=False)
         gau_h.load_state_dict({k: v.to(dev, torch.float32)
                                for k, v in sd["state"].items()})
-        print(f"  продолжение от {args.resume_head}, шаг "
-              f"{sd.get('step_index')}", flush=True)
+        policy_sha = k9h.file_sha12(args.resume_head)
+        print(f"  продолжение от {args.resume_head} (шаг "
+              f"{sd.get('step_index')}), политика {policy_sha}", flush=True)
+    else:
+        if int(args.step_index) != 0:
+            raise SystemExit(f"--step-index {args.step_index} без "
+                             f"--resume-head: раскатка шла бы исходной D1, а "
+                             f"помечалась бы номером шага, которого не было")
+        policy_sha = head_sha
+    # ДЕЙСТВУЮЩИЕ ВЕСА ПЕРЕНОСЯТСЯ В ДЕТЕРМИНИРОВАННУЮ ГОЛОВУ: паритет и
+    # forward_hicora обязаны проверяться против той политики, которая
+    # исполняется, а не против той, с которой всё начиналось
+    with torch.no_grad():
+        cur = {k: v for k, v in gau_h.state_dict().items()
+               if k.startswith(("proj.", "net."))}
+        for k, v in cur.items():
+            det_cur.state_dict()[k].copy_(v)
     with torch.no_grad():
         gau_h.log_std.fill_(float(np.log(sigma)))
     std = gau_h.std().detach()
@@ -708,8 +749,8 @@ def run(args):
                 z0 = model.codebooks[0][q0]
                 h24 = model.res_norm(taps[max(model.taps)]).float()
                 if not parity["ok"]:
-                    dz_ac, _c_ac = det_h(h24, z0)     # путь K-11g: fp32-голова
-                    model.hicora_head = det_h         # внутри autocast fp16
+                    dz_ac, _c_ac = det_cur(h24, z0)   # путь K-11g: fp32-голова
+                    model.hicora_head = det_cur       # внутри autocast fp16
                     o_fw = model.forward_hicora(
                         vlm_inputs_embeds=v_,
                         attention_mask=batch.get("attention_mask"),
@@ -724,8 +765,13 @@ def run(args):
                 eps = torch.empty_like(o_mean["mu"]).normal_(generator=gen)
                 o_exec = gau_h(h32, z32, u=o_mean["mu"] + sigma * eps)
                 if not parity["ok"]:
-                    dz_d, _c = det_h(h32, z32)
+                    dz_d, _c = det_cur(h32, z32)
+                    dz_0, _c0 = det_d1(h32, z32)
                     d_head = float((o_mean["dz"] - dz_d).abs().max())
+                    # ДРЕЙФ ОТ D1 — не гейт на совпадение, а гейт на ИЗМЕНЕНИЕ:
+                    # при продолжении он обязан быть положительным, иначе
+                    # resume молча не применился; без продолжения — строго нулём
+                    d_drift = float((dz_d - dz_0).abs().max())
                     # ЭТА сверка воспроизводит проверку K-11g один в один:
                     # обе величины считаны под autocast, поэтому порог 1e-4
                     # здесь тот же, что там, и она ГЕЙТИРУЕТ прогон
@@ -734,22 +780,32 @@ def run(args):
                     # а ЭТА — не гейт, а измеренная цена перехода головы в
                     # fp32: из-за неё базовые доли успеха придётся перемерить
                     d_prec = float((dz_d - dz_ac.float()).abs().max())
-                    parity = dict(gauss_mean_vs_d1_fp32=d_head,
-                                  d1_vs_forward_hicora_autocast=d_full,
+                    drift_ok = (d_drift > 0.0 if args.resume_head
+                                else d_drift == 0.0)
+                    parity = dict(gauss_mean_vs_current_fp32=d_head,
+                                  current_vs_forward_hicora_autocast=d_full,
                                   fp32_vs_autocast_head=d_prec,
+                                  drift_from_d1=d_drift,
+                                  resumed=bool(args.resume_head),
+                                  drift_ok=bool(drift_ok),
                                   rho_norm=rho_norm, layers_run=n_lay,
                                   ok=bool(d_head <= 1e-4 and d_full <= 1e-4
-                                          and n_lay == 24))
-                    print(f"  паритет: гауссова(mean) против D1 в fp32 "
-                          f"{d_head:.2e}; D1 против forward_hicora под "
-                          f"autocast {d_full:.2e}; ЦЕНА перехода в fp32 "
-                          f"{d_prec:.2e} при ||rho||={rho_norm:.4f}; слоёв "
-                          f"{n_lay}", flush=True)
+                                          and n_lay == 24 and drift_ok))
+                    print(f"  паритет: гауссова(mean) против ДЕЙСТВУЮЩЕЙ "
+                          f"головы в fp32 {d_head:.2e}; она же против "
+                          f"forward_hicora под autocast {d_full:.2e}; ЦЕНА "
+                          f"перехода в fp32 {d_prec:.2e}; дрейф от D1 "
+                          f"{d_drift:.2e} ({'продолжение' if args.resume_head else 'шаг 0'}); "
+                          f"||rho||={rho_norm:.4f}; слоёв {n_lay}", flush=True)
                     if not parity["ok"]:
                         raise SystemExit(
-                            "ПАРИТЕТ НЕ СОШЁЛСЯ: в режиме среднего гауссова "
-                            "голова обязана давать в fp32\n  ровно то же, что "
-                            "D1, иначе обучение стартует не из D1")
+                            "ПАРИТЕТ НЕ СОШЁЛСЯ. В режиме среднего гауссова "
+                            "голова обязана давать\n  ровно то же, что "
+                            "детерминированная с ТЕМИ ЖЕ весами; а дрейф от D1 "
+                            "обязан быть\n  нулевым на шаге 0 и "
+                            "положительным при продолжении — нулевой дрейф\n  "
+                            "при --resume-head означает, что обученные веса не "
+                            "загрузились")
                 if not torch.isfinite(o_exec["dz"]).all():
                     raise SystemExit("в поправке nan или inf")
                 dzn = float(torch.linalg.norm(o_exec["dz"], dim=-1).max())
@@ -795,6 +851,9 @@ def run(args):
         protocol_sha1=proto["sha1"], replica=args.replica, stage=args.stage,
         step_index=int(args.step_index), sigma=sigma, episodes=eps_rows,
         d_hidden=d_h, rank=int(h_obj["rank"]), head_sha1=head_sha,
+        policy_sha1=policy_sha, d1_seed=d1_seed,
+        resume_head_sha1=(None if not args.resume_head
+                          else k9h.file_sha12(args.resume_head)),
         codebooks_sha1=cb_sha, joint_sha1=joint_sha, cb0_sha1=cb0_sha,
         cb0_path=args.cb0_out, res_norm_sha1=rn_sha,
         basis_sha1=h_obj["basis_sha1"], rho_sha1=h_obj["rho_sha1"],
