@@ -659,12 +659,11 @@ def selftest():
         raise AssertionError("несовпадение форм правдоподобий принято")
 
     # --- 4. буфер, паритет и накопление градиента -------------------------
-    proto = kb._proto_ok(splits={"train": "0-9", "dev": "10-14",
-                                 "final": "15-94"},
-                         n_episodes_final=80)
+    proto = kb._proto_ok()
+    tr = proto["splits"]["train"]
     d_h, d_l, n_pos, rank, sigma = 12, 16, 5, 3, 0.1
     head = _stub_head(d_h, d_l, rank, sigma)
-    f1, cb0 = _fake_rollout(head, tasks=[0, 1], states=[0, 1, 2], calls=4,
+    f1, cb0 = _fake_rollout(head, tasks=[0, 1], states=tr[:3], calls=4,
                             d_h=d_h, d_l=d_l, n_pos=n_pos, rank=rank,
                             sigma=sigma, proto=proto, replica="d10_rl0",
                             stage="train")
@@ -764,7 +763,8 @@ def selftest():
             return
         raise AssertionError(f"отказа «{needle}» не было")
 
-    f_dev, _ = _fake_rollout(head, tasks=[0], states=[10, 11], calls=2,
+    f_dev, _ = _fake_rollout(head, tasks=[0],
+                             states=proto["splits"]["dev"][:2], calls=2,
                              d_h=d_h, d_l=d_l, n_pos=n_pos, rank=rank,
                              sigma=sigma, proto=proto, replica="d10_rl0",
                              stage="train", seed=5)
@@ -787,13 +787,13 @@ def selftest():
     _expect(lambda: check_rollouts([bad_sha], proto, replica="d10_rl0",
                                    stage="train", sigma=sigma), "протокол")
     bad_task = dict(meta=dict(f1["meta"], episodes=[
-        dict(task_id=77, state_id=0, success=True, init_hash_full="x")]),
+        dict(task_id=77, state_id=tr[0], success=True, init_hash_full="x")]),
         data=f1["data"])
     _expect(lambda: check_rollouts([bad_task], proto, replica="d10_rl0",
                                    stage="train", sigma=sigma),
             "не зарегистрированы")
     no_succ = dict(meta=dict(f1["meta"], episodes=[
-        dict(task_id=0, state_id=0, success=None, init_hash_full="x")]),
+        dict(task_id=0, state_id=tr[0], success=None, init_hash_full="x")]),
         data=f1["data"])
     _expect(lambda: check_rollouts([no_succ], proto, replica="d10_rl0",
                                    stage="train", sigma=sigma), "без успеха")
@@ -805,7 +805,7 @@ def selftest():
     _expect(lambda: concat_buffer([f_miss], cb0, _t.device("cpu")),
             "вызовы без эпизода")
     f_extra = dict(meta=dict(f1["meta"], episodes=f1["meta"]["episodes"]
-                             + [dict(task_id=1, state_id=9, success=True,
+                             + [dict(task_id=1, state_id=tr[9], success=True,
                                      init_hash_full="q")]),
                    data=f1["data"])
     _expect(lambda: concat_buffer([f_extra], cb0, _t.device("cpu")),

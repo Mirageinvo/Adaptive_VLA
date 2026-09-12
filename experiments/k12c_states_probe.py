@@ -120,7 +120,7 @@ def collect_recorded(paths):
     return rows
 
 
-def crosscheck(recorded, observed, waiting):
+def crosscheck(recorded, observed, waiting, expected=None):
     """Сверка записанных хэшей с измеренными сейчас.
 
     НЕСОВПАДЕНИЕ — это не «мелкое расхождение»: оно означает, что id больше не
@@ -128,7 +128,8 @@ def crosscheck(recorded, observed, waiting):
     сравнивались не на общих состояниях.
     """
     res = dict(checked=0, matched=0, mismatched=[], skipped_waiting=0,
-               skipped_no_obs=0, bad_files=[], recorded_conflicts=[])
+               skipped_no_obs=0, bad_files=[], recorded_conflicts=[],
+               expected=(None if expected is None else int(expected)))
     seen = {}
     for r in recorded:
         if r.get("error"):
@@ -146,6 +147,7 @@ def crosscheck(recorded, observed, waiting):
                 dict(key=[str(x) for x in key], a=seen[key],
                      b=r["init_hash_full"], src=r["src"]))
         seen[key] = r["init_hash_full"]
+    res["n_recorded_keys"] = len(seen)
     for key, h in sorted(seen.items(), key=lambda kv: str(kv[0])):
         okey = (key[1], key[2])
         if okey not in observed:
@@ -157,6 +159,15 @@ def crosscheck(recorded, observed, waiting):
         else:
             res["mismatched"].append(dict(task_id=key[1], init_state_id=key[2],
                                           recorded=h, observed=observed[okey]))
+    # НУЛЕВОЕ ИЛИ НЕПОЛНОЕ ПОКРЫТИЕ — ОТКАЗ, А НЕ ЧИСТАЯ СВЕРКА. Пустая сверка
+    # проходила как «расхождений нет», хотя не проверила ничего: именно так
+    # отсутствие данных выглядело бы подтверждением.
+    res["enough_coverage"] = bool(
+        res["checked"] > 0
+        and (expected is None or res["checked"] >= int(expected)))
+    res["ok"] = bool(res["enough_coverage"] and not res["mismatched"]
+                     and not res["recorded_conflicts"]
+                     and not res["bad_files"])
     return res
 
 
@@ -173,6 +184,12 @@ def budget(usable_ids, used_ids, need_per_task):
     return dict(n_usable=len(usable), n_used=len(used),
                 n_fresh=len(fresh), need_per_task=int(need_per_task),
                 enough=bool(len(fresh) >= int(need_per_task)),
+                # СПИСОК, А НЕ ТОЛЬКО ЧИСЛО. «Свежих 80 на каждой задаче» не
+                # означает, что существует ОДИН набор из 80 id, пригодный для
+                # всех задач: у разных задач это могут быть разные id. Без
+                # самих списков пересечение не построить, а регистрировать
+                # final можно только по пересечению.
+                fresh_usable_ids=fresh,
                 fresh_first=fresh[:8], fresh_last=fresh[-4:])
 
 
@@ -305,6 +322,14 @@ def selftest():
     rec2 = rec + [dict(src="b", task_id=1, suite="10", waiting_steps=10,
                        init_state_id=0, init_hash_full="other")]
     assert crosscheck(rec2, obs, 10)["recorded_conflicts"], "конфликт пропущен"
+    # ПУСТАЯ СВЕРКА НЕ ЧИСТАЯ: раньше она считалась успешной
+    empty = crosscheck([], {}, 10)
+    assert not empty["enough_coverage"] and not empty["ok"], empty
+    assert not empty["mismatched"], empty      # расхождений нет — и всё же отказ
+    # недобор покрытия тоже отказ
+    part = crosscheck(rec, obs, 10, expected=5)
+    assert part["checked"] == 2 and not part["enough_coverage"], part
+    assert crosscheck(rec, {(1, 0): "h0"}, 10, expected=1)["ok"] is True
 
     # 4. граница: молчаливый кламп и честный отказ различаются
     b = find_bound({0: "a", 1: "b", 50: "a"}, {}, [0, 1, 50])
@@ -326,7 +351,16 @@ def selftest():
     assert dd["usable_ids"] == [0, 1, 5], dd
     bg2 = budget(dd["usable_ids"], [0, 1], 1)
     assert bg2["n_fresh"] == 1 and bg2["fresh_first"] == [5], bg2
+    assert bg2["fresh_usable_ids"] == [5], bg2
     assert budget(dd["usable_ids"], [0, 1], 2)["enough"] is False
+
+    # 7. «свежих хватает на каждой задаче» НЕ значит «есть общий набор».
+    #    Две задачи по три свежих состояния, но пересечение пустое.
+    b_a = budget([0, 1, 2], [], 3)
+    b_b = budget([3, 4, 5], [], 3)
+    assert b_a["enough"] and b_b["enough"], (b_a, b_b)
+    common = set(b_a["fresh_usable_ids"]) & set(b_b["fresh_usable_ids"])
+    assert common == set(), common
 
     # 6. хэш воспроизводим и зависит от ВСЕХ частей
     a = np.arange(6, dtype=np.float64)
@@ -352,6 +386,12 @@ def main():
     ap.add_argument("--used-ids", default="0-44",
                     help="занятые прежними прогонами id, например 0-39,40-44")
     ap.add_argument("--need-per-task", type=int, default=80)
+    ap.add_argument("--crosscheck-frac", type=float, default=1.0,
+                    help="доля ожидаемого покрытия сверки; 1.0 — все занятые "
+                         "состояния всех задач обязаны быть сверены")
+    ap.add_argument("--require-crosscheck", action="store_true", default=True)
+    ap.add_argument("--no-require-crosscheck", dest="require_crosscheck",
+                    action="store_false")
     ap.add_argument("--recorded", default="",
                     help="через запятую: артефакты K-11e/K-11g для сверки")
     ap.add_argument("--out", default="data/k12c_states.json")
@@ -463,19 +503,41 @@ def main():
     paths = [p for p in args.recorded.split(",") if p.strip()]
     if paths:
         rows = collect_recorded(paths)
-        out["crosscheck"] = crosscheck(rows, observed_all, args.waiting_steps)
+        # ОЖИДАЕМОЕ ПОКРЫТИЕ: прежние прогоны заняли состояния used_ids на всех
+        # задачах, и все те из них, что попали в перечисление, обязаны быть
+        # сверены. Иначе «сверка прошла» означало бы лишь, что артефактов не
+        # нашлось.
+        exp = sum(1 for t in task_ids for j in set(used)
+                  if (t, int(j)) in observed_all)
+        exp = int(exp * args.crosscheck_frac)
+        out["crosscheck"] = crosscheck(rows, observed_all, args.waiting_steps,
+                                       expected=exp)
         out["crosscheck"]["n_recorded_rows"] = len(rows)
         cc = out["crosscheck"]
-        print(f"\nсверка с прежними артефактами: сверено {cc['checked']}, "
-              f"совпало {cc['matched']}, расхождений "
+        print(f"\nсверка с прежними артефактами: сверено {cc['checked']} при "
+              f"ожидаемых {exp}, совпало {cc['matched']}, расхождений "
               f"{len(cc['mismatched'])}, конфликтов внутри артефактов "
               f"{len(cc['recorded_conflicts'])}", flush=True)
+    elif args.require_crosscheck:
+        out["crosscheck"] = dict(checked=0, matched=0, mismatched=[],
+                                 recorded_conflicts=[], bad_files=[],
+                                 expected=None, enough_coverage=False,
+                                 ok=False, n_recorded_rows=0,
+                                 note="артефакты для сверки не переданы")
 
     if out["tasks"] and all("budget" in r for r in out["tasks"].values()):
         mn = min(r["budget"]["n_fresh"] for r in out["tasks"].values())
         mnd = min(r["enum"]["n_distinct"] for r in out["tasks"].values())
+        common = None
+        for r in out["tasks"].values():
+            ids = set(r["budget"]["fresh_usable_ids"])
+            common = ids if common is None else (common & ids)
+        out["common_fresh_ids"] = sorted(common or [])
         out["summary"] = dict(
             min_distinct=mnd, min_fresh=mn,
+            n_common_fresh=len(out["common_fresh_ids"]),
+            common_enough=bool(len(out["common_fresh_ids"])
+                               >= args.need_per_task),
             enough_everywhere=all(r["budget"]["enough"]
                                   for r in out["tasks"].values()),
             # дубликаты ПОЛНОГО перечисления — тот же дефект, что кламп на
@@ -492,16 +554,21 @@ def main():
                 < len(r.get("seed_effect", {}).get("ids", []))
                 for r in out["tasks"].values()))
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".",
-                exist_ok=True)
-    tmp = args.out + ".tmp"
-    json.dump(out, open(tmp, "w"), ensure_ascii=False, indent=1)
-    os.replace(tmp, args.out)
-    print(f"\nсохранено: {args.out}")
+    def _save():
+        os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".",
+                    exist_ok=True)
+        tmp = args.out + ".tmp"
+        json.dump(out, open(tmp, "w"), ensure_ascii=False, indent=1)
+        os.replace(tmp, args.out)
     # ВЕРДИКТ ВЛИЯЕТ НА КОД ВОЗВРАТА. Раньше расхождение хэшей с прежними
     # артефактами записывалось в JSON и молча завершалось нулём: в скрипте
     # запуска это выглядело бы как успешная проверка.
     red = []
+    if "summary" in out and not out["summary"].get("common_enough", True):
+        red.append(f"общее пересечение свежих id "
+                   f"{out['summary']['n_common_fresh']} < "
+                   f"{args.need_per_task}: одного набора состояний, годного "
+                   f"для всех задач, не существует")
     if "summary" in out:
         sm = out["summary"]
         print(f"ИТОГ: минимум различных состояний на задачу "
@@ -519,6 +586,11 @@ def main():
             red.append(f"дубликаты состояний: {sm['n_duplicate_ids']} id")
     cc = out.get("crosscheck")
     if cc:
+        if not cc.get("enough_coverage"):
+            red.append(f"сверка ничего не покрыла: проверено "
+                       f"{cc.get('checked')} при ожидаемых "
+                       f"{cc.get('expected')} — отсутствие расхождений здесь "
+                       f"не значит, что id задаёт то же состояние")
         if cc["mismatched"]:
             red.append(f"хэши расходятся с прежними артефактами: "
                        f"{len(cc['mismatched'])} записей — id больше не задаёт "
@@ -529,12 +601,21 @@ def main():
                        f"{len(cc['recorded_conflicts'])}")
         if cc["bad_files"]:
             red.append(f"нечитаемые артефакты: {len(cc['bad_files'])}")
+    # ВЕРДИКТ ЛЕЖИТ В АРТЕФАКТЕ. Код возврата виден только тому, кто запускал;
+    # регистрация читает файл, и без вердикта внутри она приняла бы JSON
+    # проваленного зонда, если в нём достаточное min_fresh.
+    out["verdict"] = dict(ok=not red, red=list(red),
+                          probed_tasks=[int(t) for t in task_ids],
+                          need_per_task=int(args.need_per_task),
+                          used_ids=sorted(set(used)))
+    _save()
+    print(f"\nсохранено: {args.out}")
     if red:
-        print("\nНЕ ГОТОВО К РЕГИСТРАЦИИ:")
+        print("НЕ ГОТОВО К РЕГИСТРАЦИИ:")
         for r in red:
             print(f"  - {r}")
         return 1
-    print("\nвсе проверки чисты: число эпизодов можно регистрировать")
+    print("все проверки чисты: число эпизодов можно регистрировать")
     return 0
 
 

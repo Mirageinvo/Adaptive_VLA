@@ -119,6 +119,21 @@ def save_cell(path, meta, data):
     return path                    # полуячейку, которую шаг примет за целую
 
 
+def save_final_cell(path, rec):
+    """Ячейка финальной оценки — обычный JSON с эпизодами.
+
+    Буфер входа головы здесь не нужен: на final ничего не обучается, а пары
+    строятся по успеху и `init_hash_full`. Отдельный формат, потому что
+    проверки обучающих раскаток (policy_sha1, правдоподобия, активные среды) к
+    оценке не относятся и требовать их значило бы носить за собой ненужное.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    json.dump(rec, open(tmp, "w"), ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+    return path
+
+
 def write_cb0(path, E0):
     """Книга черновика — один файл на прогон, с проверкой при повторе.
 
@@ -190,10 +205,32 @@ def check_orchestration(path=None):
             raise AssertionError(f"в main нет вызова {a} или {b}")
         if seq.index(a) > seq.index(b):
             raise AssertionError(f"{a} вызывается после {b}: {why}")
-    for must in ("check_rollouts", "write_cb0", "parity"):
+    for must in ("check_rollouts", "write_cb0", "parity",
+                 "check_replica_identity", "load_decisions",
+                 "save_final_cell"):
         if must not in src:
             raise AssertionError(f"в файле нет {must}")
     return True
+
+
+def final_cell_fields(path=None):
+    """Набор полей, который воркер пишет в ячейку final — ИЗ ЕГО ИСХОДНИКА.
+
+    Читается разбором, а не повторяется списком: список разошёлся бы с кодом
+    ровно так, как разошлись воркер и агрегатор в K-11i, и выяснилось бы это
+    после финальной оценки, которую нельзя повторить.
+    """
+    src = open(path or os.path.abspath(__file__)).read()
+    tree = ast.parse(src)
+    fn = [n for n in tree.body
+          if isinstance(n, ast.FunctionDef) and n.name == "run"][0]
+    for node in ast.walk(fn):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "common"
+                and isinstance(node.value, ast.Call)):
+            return {k.arg for k in node.value.keywords if k.arg}
+    raise AssertionError("в run не нашёлся словарь ячейки final (common)")
 
 
 def check_names(root="third_party/actioncodec"):
@@ -329,15 +366,17 @@ def selftest():
         raise AssertionError("пустой буфер сохранён")
 
     # --- КОНТРАКТ С ШАГОМ: мета и данные воркера проходят проверки шага ----
-    proto = kb._proto_ok(splits={"train": "0-9", "dev": "10-14",
-                                 "final": "15-94"}, n_episodes_final=80)
+    # наборы берутся из эталонного протокола, а не выдумываются: они обязаны
+    # лежать в пересечении свежих состояний, и своя выдумка просто не пройдёт
+    proto = kb._proto_ok()
+    tr = proto["splits"]["train"]
     sigma = 0.1
     head = k12e._stub_head(d_h, 5, rank, sigma)
     cb0 = torch.randn(50, 5)
     st2 = Store()
     eps_rows = []
     for task in (0, 1):
-        for state in (0, 1):
+        for state in (tr[0], tr[1]):
             for call in (0, 1):
                 h = torch.randn(1, n_pos, d_h)
                 q0 = torch.randint(0, 50, (1, n_pos))
@@ -382,6 +421,55 @@ def selftest():
     else:
         raise AssertionError("мета без step_index принята")
 
+    # --- КОНТРАКТ ЯЧЕЙКИ final: поля берутся из исходника воркера ---------
+    got = final_cell_fields()
+    need = {"protocol_sha1", "arm", "stage", "replica", "d1_seed", "sigma",
+            "episodes", "task_ids", "state_ids", "ckpt_sha1"}
+    assert need <= got, f"в ячейке final нет полей {sorted(need - got)}"
+
+    # и сама ячейка проходит проверки протокола — обе руки
+    import tempfile as _tf
+    td = _tf.mkdtemp(prefix="k12d_fin_")
+    cks = {}
+    for r in proto["replicas"]:
+        rk = kb.replica_key(r)
+        fp = os.path.join(td, f"ck_{rk}.pt")
+        open(fp, "wb").write(f"веса {rk}".encode())
+        cks[rk] = dict(path=fp, sha1=kb._sha12(fp))
+    evp = os.path.join(td, "dev.json")
+    json.dump(dict(sigma=0.03), open(evp, "w"))
+    dec = kb.seal_decisions(os.path.join(td, "dec.json"), proto, sigma=0.03,
+                            checkpoints=cks,
+                            dev_evidence=dict(source=evp,
+                                              sha1=kb._sha12(evp)))
+    fop = os.path.join(td, "fo.json")
+    kb.open_final(fop, proto, dec)
+    fo = kb.load_final_open(fop, proto, dec)
+    fin_ids = list(proto["splits"]["final"])
+    eps = [dict(task_id=0, state_id=int(i), init_hash_full=f"h{i}",
+                success=bool(i % 3), env_steps=80) for i in fin_ids[:5]]
+    pol_cell = {k: None for k in got}
+    pol_cell.update(protocol_sha1=proto["sha1"], arm="policy", stage="final",
+                    replica="d10_rl0", d1_seed=0, sigma=0.03, episodes=eps,
+                    task_ids=[0], state_ids=fin_ids[:5],
+                    ckpt_sha1=cks["d10_rl0"]["sha1"])
+    assert kb.check_run(proto, pol_cell, decisions=dec, final_open=fo,
+                        partial=True)
+    base_cell = dict(pol_cell, arm="baseline", replica=None, sigma=0.0,
+                     ckpt_sha1=proto["d1_checkpoints"]["0"]["sha1"])
+    assert kb.check_run(proto, base_cell, decisions=dec, final_open=fo,
+                       partial=True)
+    # опора с шумом или чужим чекпойнтом не проходит
+    for over, needle in ((dict(sigma=0.03), "детерминированная D1"),
+                         (dict(ckpt_sha1="z" * 12), "зарегистрирован")):
+        try:
+            kb.check_run(proto, dict(base_cell, **over), decisions=dec,
+                         final_open=fo, partial=True)
+        except kb.ProtocolError as e:
+            assert needle in str(e), e
+        else:
+            raise AssertionError(f"опора принята при {over}")
+
     # --- книга черновика: повтор с другой книгой отвергается ---------------
     import tempfile
     tmpd = tempfile.mkdtemp(prefix="k12d_")
@@ -412,7 +500,12 @@ def main() -> None:
     ap.add_argument("--check-names", action="store_true")
     ap.add_argument("--protocol", default="data/k12b/protocol.json")
     ap.add_argument("--replica", required=False)
-    ap.add_argument("--stage", default="train", choices=["train", "dev"])
+    ap.add_argument("--stage", default="train",
+                    choices=["train", "dev", "final"])
+    ap.add_argument("--arm", default="policy", choices=["policy", "baseline"],
+                    help="baseline — детерминированная D1 как опора пар")
+    ap.add_argument("--decisions", default="data/k12b/decisions.json")
+    ap.add_argument("--final-open", default="data/k12b/final_open.json")
     ap.add_argument("--step-index", type=int, default=0)
     ap.add_argument("--sigma", type=float, required=False)
     ap.add_argument("--ckpt", required=False)
@@ -449,9 +542,18 @@ def main() -> None:
         check_names(args.root)
     else:
         check_orchestration()
-        for need in ("replica", "sigma", "ckpt", "head_ckpt", "out"):
-            if getattr(args, need) in (None, ""):
-                ap.error(f"нужен --{need.replace('_', '-')}")
+        need = ["ckpt", "head_ckpt", "out"]
+        # у опорной руки нет ни реплики, ни sigma: она детерминированная и
+        # зависит только от сида D1 — см. k12b_protocol.check_run
+        need += [] if args.arm == "baseline" else ["replica", "sigma"]
+        for nm in need:
+            if getattr(args, nm) in (None, ""):
+                ap.error(f"нужен --{nm.replace('_', '-')}")
+        if args.arm == "baseline" and args.resume_head:
+            ap.error("--resume-head у опорной руки: опора — это исходная D1, "
+                     "иначе она перестаёт быть опорой")
+        if args.arm == "baseline" and args.stage != "final":
+            ap.error("опорная рука нужна только на этапе final")
         run(args)
 
 
@@ -467,14 +569,13 @@ def run(args):
     import k12e_pg_step as k12e
 
     proto = kb.load_protocol(args.protocol)
-    sigma = round(float(args.sigma), 6)
-    if sigma not in [round(float(s), 6) for s in proto["sigma_grid"]]:
+    det_mode = (args.arm == "baseline")
+    sigma = 0.0 if det_mode else round(float(args.sigma), 6)
+    if not det_mode and sigma not in [round(float(s), 6)
+                                      for s in proto["sigma_grid"]]:
         raise SystemExit(f"sigma={sigma} вне зарегистрированной сетки "
                          f"{proto['sigma_grid']}")
     state_ids = [args.init_start + i for i in range(args.n_envs)]
-    kb.check_run(proto, dict(stage=args.stage, protocol_sha1=proto["sha1"],
-                             state_ids=state_ids, task_ids=[args.task_id],
-                             sigma=sigma, replica=args.replica))
     if proto["step"].get("head_precision") != "fp32":
         raise SystemExit("протокол требует не fp32 для головы, а эта раскатка "
                          "считает её в fp32")
@@ -496,6 +597,49 @@ def run(args):
     h_obj = torch.load(args.head_ckpt, map_location="cpu", weights_only=False)
     k9h.check_hicora_ckpt(h_obj, "hicora", args.expect_hicora_target)
     head_sha = k9h.file_sha12(args.head_ckpt)
+    d1_seed = h_obj.get("seed")
+
+    # МЕТКА РЕПЛИКИ СВЕРЯЕТСЯ С ФАКТИЧЕСКИМИ СИДАМИ НА КАЖДОМ ПРОГОНЕ, а не
+    # только при продолжении: иначе четыре реплики можно подписать неверно или
+    # продублировать, и гейт по среднему считал бы одно и то же дважды
+    if not det_mode:
+        kb.check_replica_identity(proto, args.replica, d1_seed=d1_seed,
+                                  rl_seed=args.rl_seed, d1_sha=head_sha)
+    else:
+        reg = (proto.get("d1_checkpoints") or {}).get(str(int(d1_seed)))
+        if reg is None or reg.get("sha1") != head_sha:
+            raise SystemExit(
+                f"опорная рука считается чекпойнтом {head_sha} сида "
+                f"{d1_seed}, а зарегистрирован "
+                f"{None if reg is None else reg.get('sha1')}")
+
+    # ЭТАП final ОТКРЫВАЕТСЯ ТОЛЬКО ПО УДОСТОВЕРЕННОЙ ПЕЧАТИ РЕШЕНИЙ
+    dec = fo = None
+    if args.stage == "final":
+        dec = kb.load_decisions(args.decisions, proto)
+        fo = kb.load_final_open(args.final_open, proto, dec)
+        if not det_mode:
+            sealed = dec["checkpoints"][args.replica]
+            if abs(float(dec["sigma"]) - sigma) > 1e-9:
+                raise SystemExit(f"на final sigma={sigma}, а запечатана "
+                                 f"{dec['sigma']}")
+            if args.resume_head is None:
+                args.resume_head = sealed["path"]
+            if k9h.file_sha12(args.resume_head) != sealed["sha1"]:
+                raise SystemExit(
+                    f"голова {args.resume_head} имеет sha "
+                    f"{k9h.file_sha12(args.resume_head)}, а запечатана "
+                    f"{sealed['sha1']}: финальная оценка считалась бы не тем "
+                    f"чекпойнтом, который выбран на dev")
+
+    rec0 = dict(stage=args.stage, protocol_sha1=proto["sha1"], arm=args.arm,
+                state_ids=state_ids, task_ids=[args.task_id], sigma=sigma,
+                replica=(None if det_mode else args.replica),
+                d1_seed=(int(d1_seed) if d1_seed is not None else None),
+                ckpt_sha1=(head_sha if det_mode
+                           else (None if args.resume_head is None
+                                 else k9h.file_sha12(args.resume_head))))
+    kb.check_run(proto, rec0, decisions=dec, final_open=fo, partial=True)
     j_obj = torch.load(args.policy_ckpt, map_location="cpu",
                        weights_only=False)
     joint_sha = k9h.file_sha12(args.policy_ckpt)
@@ -638,7 +782,6 @@ def run(args):
     # считалась ПОД autocast. Цена точности мерится тем же способом: та же
     # голова внутри autocast против неё же вне его.
 
-    d1_seed = h_obj.get("seed")
     if args.resume_head:
         sd = torch.load(args.resume_head, map_location="cpu",
                         weights_only=False)
@@ -669,14 +812,21 @@ def run(args):
                if k.startswith(("proj.", "net."))}
         for k, v in cur.items():
             det_cur.state_dict()[k].copy_(v)
-    with torch.no_grad():
-        gau_h.log_std.fill_(float(np.log(sigma)))
-    std = gau_h.std().detach()
-    if abs(float(std.max()) - sigma) > 1e-6 or \
-            float(std.min()) != float(std.max()):
-        raise SystemExit(f"std политики {float(std.max())} не равна sigma "
-                         f"{sigma}: действие сэмплировалось бы под одним "
-                         f"распределением, а правдоподобие под другим")
+    if det_mode:
+        # НУЛЕВОЙ sigma НЕ ЗАДАЁТСЯ log_std: exp(log_std) не бывает нулём, и
+        # «почти нуль» всё равно был бы шумом. Опора исполняет СРЕДНЕЕ,
+        # u = mu, и правдоподобие у неё не определено — его и не пишем.
+        print("  опорная рука: детерминированное среднее, шума нет",
+              flush=True)
+    else:
+        with torch.no_grad():
+            gau_h.log_std.fill_(float(np.log(sigma)))
+        std = gau_h.std().detach()
+        if abs(float(std.max()) - sigma) > 1e-6 or \
+                float(std.min()) != float(std.max()):
+            raise SystemExit(f"std политики {float(std.max())} не равна sigma "
+                             f"{sigma}: действие сэмплировалось бы под одним "
+                             f"распределением, а правдоподобие под другим")
 
     ac16 = torch.autocast("cuda", dtype=torch.float16)
     parity = {"ok": False}
@@ -759,11 +909,15 @@ def run(args):
             with torch.no_grad():
                 h32, z32 = h24.float(), z0.float()
                 o_mean = gau_h(h32, z32, deterministic=True)
-                gen = torch.Generator(device=h32.device)
-                gen.manual_seed(k11g.eps_seed(args.task_id, args.init_start,
-                                              calls, salt) % (2 ** 63))
-                eps = torch.empty_like(o_mean["mu"]).normal_(generator=gen)
-                o_exec = gau_h(h32, z32, u=o_mean["mu"] + sigma * eps)
+                if det_mode:
+                    o_exec = o_mean
+                else:
+                    gen = torch.Generator(device=h32.device)
+                    gen.manual_seed(k11g.eps_seed(args.task_id,
+                                                  args.init_start,
+                                                  calls, salt) % (2 ** 63))
+                    eps = torch.empty_like(o_mean["mu"]).normal_(generator=gen)
+                    o_exec = gau_h(h32, z32, u=o_mean["mu"] + sigma * eps)
                 if not parity["ok"]:
                     dz_d, _c = det_cur(h32, z32)
                     dz_0, _c0 = det_d1(h32, z32)
@@ -816,7 +970,7 @@ def run(args):
                 sat = float((o_exec["coeffs"].abs() > SAT_THR).float().mean())
             # ТОЛЬКО АКТИВНЫЕ СРЕДЫ (п.4 шапки)
             sel = np.flatnonzero(active)
-            if sel.size:
+            if sel.size and not det_mode:
                 idx = torch.as_tensor(sel, device=h32.device)
                 store.add(h=h32.index_select(0, idx),
                           q0=q0.index_select(0, idx),
@@ -845,6 +999,43 @@ def run(args):
                          rollout_seed=roll_seed) for i in range(n)]
     finally:
         envs.close()
+
+    common = dict(
+        protocol_sha1=proto["sha1"], arm=args.arm, stage=args.stage,
+        replica=(None if det_mode else args.replica),
+        d1_seed=(int(d1_seed) if d1_seed is not None else None),
+        step_index=int(args.step_index), sigma=sigma, episodes=eps_rows,
+        task_ids=[int(args.task_id)], state_ids=state_ids,
+        ckpt_sha1=(head_sha if det_mode
+                   else (None if args.resume_head is None
+                         else k9h.file_sha12(args.resume_head))),
+        suite=args.task_suite, task_description=task_desc,
+        waiting_steps=int(args.waiting_steps), horizon=int(args.horizon),
+        max_steps=int(args.max_steps), pos_offset=pos_off,
+        offset_table_sha1=off_sha, image_size=224, ckpt=args.ckpt,
+        parity=parity, device=str(dev), trunk_dtype=args.dtype,
+        head_precision="fp32", seed=int(args.seed), rollout_seed=roll_seed,
+        rollout_seed_mode=args.rollout_seed_mode,
+        head_sha1=head_sha, policy_sha1=policy_sha,
+        res_norm_sha1=rn_sha, basis_sha1=h_obj["basis_sha1"],
+        rho_sha1=h_obj["rho_sha1"], rho_norm=rho_norm,
+        script_sha1=k9h.file_sha12(os.path.abspath(__file__)),
+        protocol_script_sha1=k9h.file_sha12(kb.__file__),
+        hicora_g_sha1=k9h.file_sha12(hg.__file__),
+        hicora_vla_sha1=k9h.file_sha12(hv.__file__),
+        k9h_sha1=k9h.file_sha12(k9h.__file__),
+        minutes=(time.time() - t0) / 60.0)
+
+    # ЭТАП final ПИШЕТ ЯЧЕЙКУ ОЦЕНКИ, А НЕ БУФЕР ОБУЧЕНИЯ: на final ничего не
+    # обучается, пары строятся по успеху и init_hash_full
+    if args.stage == "final":
+        kb.check_run(proto, common, decisions=dec, final_open=fo, partial=True)
+        save_final_cell(args.out, common)
+        succ = sum(1 for e in eps_rows if e["success"])
+        print(f"\n  {args.arm}, задача {args.task_id}, состояния "
+              f"{state_ids[0]}..{state_ids[-1]}: успех {succ}/{len(eps_rows)}")
+        print(f"  сохранено: {args.out} ({common['minutes']:.1f} мин)")
+        return
 
     data = store.stack()
     meta = build_meta(
