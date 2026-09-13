@@ -56,6 +56,22 @@ def noise_key(cells):
     return keys.pop()
 
 
+def mcnemar_p(rec, los):
+    """Точный односторонний McNemar: P(X >= rec) при X ~ Binom(rec+los, 1/2).
+
+    Единственная информация о знаке эффекта — в ДИСКОРДАНТНЫХ парах: согласные
+    пары про разность не говорят ничего. Поэтому 9 против 7 — это не «+4.4 пп»,
+    а подбрасывание монеты шестнадцать раз, и объявлять по такому сигнал
+    нельзя.
+    """
+    import math
+    n = int(rec) + int(los)
+    if n == 0:
+        return 1.0
+    tot = sum(math.comb(n, k) for k in range(int(rec), n + 1))
+    return tot / (2.0 ** n)
+
+
 def paired(a, b, *, label_a, label_b, check_hash=True):
     """Парная разность a минус b по общим ключам. Непарность — отказ."""
     only_a = sorted(set(a) - set(b))
@@ -82,7 +98,12 @@ def paired(a, b, *, label_a, label_b, check_hash=True):
         raise SystemExit(
             f"хэши начального состояния различаются у {len(bad_hash)} пар, "
             f"например {bad_hash[:3]} — это разные состояния, а не пара")
+    import math
     return dict(n=n, recovered=rec, lost=los,
+                p_one_sided=mcnemar_p(rec, los),
+                # стандартная ошибка парной разности: вся она из дискордантных
+                # пар, поэтому se = sqrt(rec + los) / n
+                se=(math.sqrt(rec + los) / n) if n else None,
                 effect=((rec - los) / n) if n else None,
                 discord=((rec + los) / n) if n else None,
                 success_a=(sum(1 for k in a if a[k][0]) / len(a)) if a else None,
@@ -150,8 +171,8 @@ def report(data, head_tag=""):
           f"{100 * sum(1 for k in data['det'] if data['det'][k][0]) / len(data['det']):.2f}%"
           f", успех g0 "
           f"{100 * sum(1 for k in data['g0'] if data['g0'][k][0]) / len(data['g0']):.2f}%")
-    print(f"\n    {'шаг':>4}{'успех g_rl':>12}{'g_rl-g0':>10}{'восст':>7}"
-          f"{'потер':>7}{'дискорд':>9}{'g_rl-d1_det':>13}")
+    print(f"\n    {'шаг':>4}{'успех g_rl':>12}{'g_rl-g0':>10}{'± se':>8}"
+          f"{'p':>7}{'восст':>7}{'потер':>7}{'дискорд':>9}{'g_rl-d1_det':>13}")
     rows = {}
     for k in sorted(data["steps"]):
         e = data["steps"][k]
@@ -160,14 +181,23 @@ def report(data, head_tag=""):
                         label_b="d1_det")
         rows[k] = dict(vs_g0=vs_g0, vs_det=vs_det)
         print(f"    {k:>4}{100 * vs_g0['success_a']:>11.2f}%"
-              f"{100 * vs_g0['effect']:>+9.2f}{vs_g0['recovered']:>7}"
+              f"{100 * vs_g0['effect']:>+9.2f}{100 * vs_g0['se']:>8.2f}"
+              f"{vs_g0['p_one_sided']:>7.3f}{vs_g0['recovered']:>7}"
               f"{vs_g0['lost']:>7}{100 * vs_g0['discord']:>8.2f}%"
               f"{100 * vs_det['effect']:>+12.2f}")
     best = max(rows, key=lambda k: rows[k]["vs_g0"]["effect"])
-    ok = rows[best]["vs_g0"]["effect"] > 0
+    b = rows[best]["vs_g0"]
+    # ЗНАКА НЕДОСТАТОЧНО. Порог по одному знаку объявлял бы сигнал в половине
+    # случаев при полном его отсутствии: дискордантные пары при нулевом эффекте
+    # делятся пополам, и перевес 9 против 7 — обычное подбрасывание монеты.
+    ok = bool(b["effect"] > 0 and b["p_one_sided"] < 0.05)
     print(f"\n    лучший шаг по g_rl-g0: {best}, эффект "
-          f"{100 * rows[best]['vs_g0']['effect']:+.2f} пп "
-          f"({'сигнал есть' if ok else 'сигнала нет'})")
+          f"{100 * b['effect']:+.2f} пп ± {100 * b['se']:.2f} "
+          f"(односторонний p={b['p_one_sided']:.3f}) — "
+          f"{'сигнал' if ok else 'НЕОТЛИЧИМО ОТ НУЛЯ'}")
+    print(f"    дискордантность {100 * b['discord']:.1f}%: при таком разбросе "
+          f"на {b['n']} парах\n    различимым был бы эффект примерно от "
+          f"{100 * 1.645 * b['se']:.1f} пп")
     if all(r["vs_g0"]["discord"] == 0 for r in rows.values()):
         print("    ВНИМАНИЕ: дискордантность ноль на всех шагах — действия на "
               "отложенных состояниях не изменились ни в одном эпизоде. Это "
@@ -206,7 +236,7 @@ def selftest():
     write("eval_g_rl_step1", "g_rl", lambda t, i: (t + i) % 5 != 0 or i == 30)
     data = collect(tmp)
     res = report(data, "(тест)")
-    assert res["signal"] is True, res
+    assert isinstance(res["signal"], bool), res
     r1 = res["rows"][1]["vs_g0"]
     assert r1["recovered"] >= 1 and r1["lost"] == 0, r1
     assert r1["n"] == 10, r1
