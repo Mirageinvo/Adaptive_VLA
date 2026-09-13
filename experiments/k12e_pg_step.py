@@ -346,6 +346,35 @@ def check_rollouts(files, proto, *, replica, stage, sigma=None, diag=False):
                 tasks=sorted({t for (t, _s) in seen}))
 
 
+def codebook_sha(cb0_t):
+    return hashlib.sha1(np.ascontiguousarray(
+        cb0_t.float().cpu().numpy()).tobytes()).hexdigest()[:12]
+
+
+def check_codebook(cb0_t, meta):
+    """Книга ЧЕРНОВИКА против записанной в раскатке.
+
+    Сверять с `codebooks_sha1` нельзя: там sha ВСЕХ уровней RVQ, а z0
+    восстанавливается из нулевого, и его sha записан отдельно как `cb0_sha1`.
+    Сравнение двух разных величин отвергало бы любой корректный прогон — и
+    отвергало: шаг падал сразу после часа раскатки. Проверка живёт функцией, а
+    не строкой в main, именно поэтому: в main её не видела ни одна
+    самопроверка.
+    """
+    want = meta.get("cb0_sha1")
+    if not want:
+        raise SystemExit(
+            "в раскатке нет cb0_sha1: происхождение книги черновика не "
+            "проверить, а z0 мог бы восстановиться из другой книги")
+    got = codebook_sha(cb0_t)
+    if got != want:
+        raise SystemExit(
+            f"книга черновика sha {got}, раскатки писались под {want}: z0 "
+            f"восстановился бы из другой книги, и правдоподобия относились бы "
+            f"к другим действиям")
+    return got
+
+
 def concat_buffer(files, cb0, device):
     """Склейка файлов в один буфер в ФИКСИРОВАННОМ порядке.
 
@@ -836,7 +865,10 @@ def selftest():
     def _expect(fn, needle):
         try:
             fn()
-        except (kb.ProtocolError, ValueError) as e:
+        # SystemExit тоже ловится: отказы, ведущие к завершению прогона, —
+        # такая же проверяемая часть контракта, как исключения библиотек, и без
+        # этого самопроверка молча падала бы вместо проверки
+        except (kb.ProtocolError, ValueError, SystemExit) as e:
             assert needle in str(e), f"ожидал «{needle}», получил: {e}"
             return
         raise AssertionError(f"отказа «{needle}» не было")
@@ -956,6 +988,18 @@ def selftest():
     _expect(lambda: load_optimizer_state(
         torch.optim.Adam([p_ for p_ in hC.parameters()], lr=1e-3), bad_shape,
         tpB), "формы")
+
+    # --- 8. КНИГА ЧЕРНОВИКА: сверяется нулевой уровень, а не все ----------
+    cb_fake = torch.randn(7, 3)
+    m_ok = dict(cb0_sha1=codebook_sha(cb_fake), codebooks_sha1="всё" * 4)
+    assert check_codebook(cb_fake, m_ok) == codebook_sha(cb_fake)
+    _expect(lambda: check_codebook(cb_fake + 1.0, m_ok), "из другой книги")
+    _expect(lambda: check_codebook(cb_fake, dict(codebooks_sha1="x" * 12)),
+            "нет cb0_sha1")
+    # именно та подмена, что ломала прогон: sha всех уровней против нулевого
+    _expect(lambda: check_codebook(
+        cb_fake, dict(cb0_sha1=codebook_sha(torch.randn(3, 7, 3)))),
+        "из другой книги")
 
     # раскатка без policy_sha1 больше не принимается
     no_pol = dict(meta={k: v for k, v in f1["meta"].items()
@@ -1170,12 +1214,7 @@ def main():
 
     cb0 = torch.load(args.cb0, map_location="cpu", weights_only=False)
     cb0_t = cb0["codebook0"] if isinstance(cb0, dict) else cb0
-    cb_sha = hashlib.sha1(np.ascontiguousarray(
-        cb0_t.float().cpu().numpy()).tobytes()).hexdigest()[:12]
-    if cb_sha != meta0["codebooks_sha1"]:
-        raise SystemExit(f"кодовая книга sha {cb_sha}, раскатки писались под "
-                         f"{meta0['codebooks_sha1']}: черновик z0 "
-                         f"восстановился бы из другой книги")
+    cb_sha = check_codebook(cb0_t, meta0)
     buf = concat_buffer(files, cb0_t, dev)
 
     par = parity_check(head, buf, std)
