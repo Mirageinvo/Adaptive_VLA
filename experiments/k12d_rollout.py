@@ -1062,15 +1062,27 @@ def run(args):
               hicora_vla_sha1=k9h.file_sha12(hv.__file__),
               joint12_vla_sha1=k9h.file_sha12(jv.__file__),
               k9h_sha1=k9h.file_sha12(k9h.__file__))
-    build_meta(**ex, protocol_sha1=(None if diag else proto["sha1"]),
-               replica=args.replica, stage=args.stage,
-               step_index=int(args.step_index), sigma=sigma,
-               episodes=[dict(probe=True)], d_hidden=d_h,
-               rank=int(h_obj["rank"]), head_sha1=head_sha,
-               policy_sha1=policy_sha, codebooks_sha1=cb_sha)
-    if not diag:
-        # head_precision уже в ex: подставлять его ещё раз значило бы сверять
-        # протокол с подсунутым значением, а не с фактическим
+    probe_meta = build_meta(
+        **ex, protocol_sha1=(None if diag else proto["sha1"]),
+        replica=args.replica, stage=args.stage,
+        step_index=int(args.step_index), sigma=sigma,
+        d_hidden=d_h, rank=int(h_obj["rank"]), head_sha1=head_sha,
+        policy_sha1=policy_sha, codebooks_sha1=cb_sha,
+        # эпизоды-заглушки той же формы и с теми же id, что будут настоящие:
+        # так проверка увидит и набор состояний, и набор задач
+        episodes=[dict(task_id=int(args.task_id), state_id=int(j),
+                       success=False, init_hash_full="0" * 16, env_steps=0,
+                       policy_calls=0, n_records=0, rollout_seed=roll_seed)
+                  for j in state_ids])
+    probe_meta["path"] = args.out
+    # ТЕМИ ЖЕ ПРОВЕРКАМИ, ЧТО БУДУТ ЧИТАТЬ ЯЧЕЙКУ. Сборка меты без них
+    # пропустила отказ, который срабатывал в конце раскатки: час работы
+    # уходил, потому что дорогая часть шла до проверки пригодности.
+    if not det_mode and not args.no_buffer:
+        k12e.check_rollouts([dict(meta=probe_meta, data=None)], proto,
+                            replica=args.replica, stage=args.stage,
+                            sigma=sigma, diag=diag)
+    elif not diag:
         probs = kb.check_execution(proto, ex, "условия прогона")
         if probs:
             raise SystemExit("условия исполнения не совпали с протоколом:\n"
@@ -1334,7 +1346,8 @@ def run(args):
     # ЯЧЕЙКА ПРОВЕРЯЕТСЯ ТЕМ ЖЕ КОДОМ, ЧТО БУДЕТ ЕЁ ЧИТАТЬ: рассогласование
     # воркера и агрегатора один раз уже обесценило целый перебор
     k12e.check_rollouts([dict(meta=meta, data=data)], proto,
-                        replica=args.replica, stage=args.stage, sigma=sigma)
+                        replica=args.replica, stage=args.stage, sigma=sigma,
+                        diag=diag)
     save_cell(args.out, meta, data)
     succ = sum(1 for e in eps_rows if e["success"])
     print(f"\n  задача {args.task_id}, состояния {state_ids}: успех "
