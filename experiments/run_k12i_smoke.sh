@@ -19,7 +19,14 @@ DEV="${1:?нужно устройство}"
 HEADTAG="${2:?нужна голова: s0 или s1}"
 TASKS="${3:?нужны задачи в кавычках, например \"0 2 6\"}"
 SIGMA="${SIGMA:-0.10}"
-LR="${LR:-3e-6}"
+# СТАРТ СВЕРХУ, А НЕ СНИЗУ. Дробление шага задумано как поиск наибольшего
+# допустимого шага: при lr 3e-6 область доверия расходуется на 0.1%, сдвиг mu
+# оказывается на четыре порядка ниже шума sigma, и лестница измеряла бы не
+# «работает ли RL», а «различимо ли изменение, которого нет». K-11i это не
+# нарушает: там lr 3e-6 был безопасен БЕЗ проверки приемлемости, а здесь она
+# считается прямо на буфере.
+LR="${LR:-1e-2}"
+HALVINGS="${HALVINGS:-12}"
 TRAIN_STARTS="${TRAIN_STARTS:-0 5 10 15 20 25}"   # состояния 0..29
 EVAL_STARTS="${EVAL_STARTS:-30 35 40}"            # состояния 30..44, отложенные
 LADDER="${LADDER:-1 2 4}"                         # после каких шагов оценивать
@@ -82,7 +89,7 @@ step () {
   local dir="$1" resume="$2" idx="$3" outhead="$4" a=() rc
   a=(--stage diag --rollouts "$(ls "$dir"/*.pt | tr '\n' ',')"
      --replica "smoke_$HEADTAG" --head-ckpt "$HEAD" --step-index "$idx"
-     --cb0 data/k12d/cb0.pt --lr "$LR" --device "$DEV"
+     --cb0 data/k12d/cb0.pt --lr "$LR" --halvings "$HALVINGS" --device "$DEV"
      --out-head "$outhead" --out "${outhead%.pt}.json")
   [ -n "$resume" ] && a+=(--resume-head "$resume")
   "$PY" experiments/k12e_pg_step.py "${a[@]}" 2>&1 | tee -a "$LOG"
