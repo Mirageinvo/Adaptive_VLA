@@ -51,14 +51,18 @@ mkdir -p "$ROOT" "$(dirname "$LOG")"
 say () { echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG"; }
 
 # --- состав прогона фиксируется один раз и дальше только сверяется ---------
+# БЛОКИРУЕТ ТОЛЬКО НАУЧНЫЙ СОСТАВ: сиды, sigma, задачи, состояния. Версия кода
+# в него НЕ входит и записывается отдельно, историей: иначе исправление любой
+# ошибки делало бы каталог «чужим», и продолжить начатый прогон было бы нельзя
+# — а несовместимость кода и данных всё равно ловится построчной сверкой
+# происхождения каждой ячейки.
 CFG="$ROOT/config.json"
-NEW=$(printf '{"d1_seed":%d,"rl_seed":%d,"sigma":%s,"tasks":"%s","train_starts":"%s","eval_starts":"%s","n_envs":%d,"eval_eps_seed":%d,"head":"%s","script_sha1":"%s"}' \
+NEW=$(printf '{"d1_seed":%d,"rl_seed":%d,"sigma":%s,"tasks":"%s","train_starts":"%s","eval_starts":"%s","n_envs":%d,"eval_eps_seed":%d,"head":"%s"}' \
   "$D1SEED" "$RL_SEED" "$SIGMA" "$TASKS" "$TRAIN_STARTS" "$EVAL_STARTS" \
-  "$NENV" "$EVAL_SEED" "$HEAD" \
-  "$($PY -c "import hashlib,sys;print(hashlib.sha1(open('experiments/k12d_rollout.py','rb').read()).hexdigest()[:12])")")
+  "$NENV" "$EVAL_SEED" "$HEAD")
 if [ -f "$CFG" ]; then
   if [ "$(cat "$CFG")" != "$NEW" ]; then
-    echo "конфигурация каталога $ROOT не совпадает с запрошенной:"
+    echo "научный состав каталога $ROOT не совпадает с запрошенным:"
     echo "  было:  $(cat "$CFG")"
     echo "  стало: $NEW"
     echo "старые файлы не трогаю — задайте другой TAG"; exit 1
@@ -66,6 +70,11 @@ if [ -f "$CFG" ]; then
 else
   printf '%s' "$NEW" > "$CFG"
 fi
+printf '{"time":"%s","k12d":"%s","k12e":"%s","target":%s}\n' \
+  "$(date -Is)" \
+  "$($PY -c "import hashlib;print(hashlib.sha1(open('experiments/k12d_rollout.py','rb').read()).hexdigest()[:12])")" \
+  "$($PY -c "import hashlib;print(hashlib.sha1(open('experiments/k12e_pg_step.py','rb').read()).hexdigest()[:12])")" \
+  "$TARGET" >> "$ROOT/script_versions.jsonl"
 
 # --- раскатка: $1 рука, $2 каталог, $3 starts, $4 resume, $5 принято шагов --
 roll () {
