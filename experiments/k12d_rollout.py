@@ -593,6 +593,9 @@ def main() -> None:
                     help="train — шум зависит от номера шага; eval — только от "
                          "--eval-eps-seed")
     ap.add_argument("--eval-eps-seed", type=int, default=None)
+    ap.add_argument("--no-buffer", action="store_true",
+                    help="оценка: писать только исходы эпизодов, без буфера "
+                         "входа головы — он нужен лишь для шага градиента")
     ap.add_argument("--cb0-only", action="store_true",
                     help="построить книгу черновика и выйти: её надо создать "
                          "ОДИН раз до параллельных прогонов")
@@ -1167,7 +1170,7 @@ def run(args):
                 sat = float((o_exec["coeffs"].abs() > SAT_THR).float().mean())
             # ТОЛЬКО АКТИВНЫЕ СРЕДЫ (п.4 шапки)
             sel = np.flatnonzero(active)
-            if sel.size and not det_mode:
+            if sel.size and not det_mode and not args.no_buffer:
                 idx = torch.as_tensor(sel, device=h32.device)
                 store.add(h=h32.index_select(0, idx),
                           q0=q0.index_select(0, idx),
@@ -1229,10 +1232,13 @@ def run(args):
 
     # ЭТАП final ПИШЕТ ЯЧЕЙКУ ОЦЕНКИ, А НЕ БУФЕР ОБУЧЕНИЯ: на final ничего не
     # обучается, пары строятся по успеху и init_hash_full
-    if args.stage == "final" or (diag and det_mode):
+    # БЕЗ БУФЕРА — ЗНАЧИТ ЯЧЕЙКА ОЦЕНКИ: обновлять по ней нечего, и хранить
+    # 138 МБ входа головы на каждую оценочную ячейку незачем
+    if args.stage == "final" or (diag and (det_mode or args.no_buffer)):
         if diag:
             common["note"] = ("диагностика до регистрации: для гейта "
                               "непригодна")
+            common["no_buffer"] = bool(args.no_buffer)
         else:
             probs = kb.check_execution(proto, common,
                                       os.path.basename(args.out))
