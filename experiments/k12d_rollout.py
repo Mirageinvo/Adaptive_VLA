@@ -1017,6 +1017,34 @@ def run(args):
                              f"{sigma}: действие сэмплировалось бы под одним "
                              f"распределением, а правдоподобие под другим")
 
+    # УСЛОВИЯ ИСПОЛНЕНИЯ И ПРОБНАЯ СБОРКА МЕТЫ — ДО РАСКАТКИ. Ошибка в полях
+    # ячейки обнаруживалась в самом конце: раскатка отработала, буфер собран, а
+    # сохранить его нечем — и час работы пропадал. Здесь та же ошибка стоит
+    # секунды. Это ровно тот класс, что и недостижимый хвост main в K-11h:
+    # дорогая работа выполнялась до того, как проверялась её пригодность.
+    ex = exec_fields(args, joint_sha=joint_sha, pos_off=pos_off,
+                     off_sha=off_sha, ckpt_fp=ckpt_fp, ckpt_path=ckpt_path,
+                     hf_revision=hf_rev)
+    ex.update(script_sha1=k9h.file_sha12(os.path.abspath(__file__)),
+              step_script_sha1=k9h.file_sha12(k12e.__file__),
+              hicora_g_sha1=k9h.file_sha12(hg.__file__),
+              hicora_vla_sha1=k9h.file_sha12(hv.__file__),
+              joint12_vla_sha1=k9h.file_sha12(jv.__file__),
+              k9h_sha1=k9h.file_sha12(k9h.__file__))
+    build_meta(**ex, protocol_sha1=(None if diag else proto["sha1"]),
+               replica=args.replica, stage=args.stage,
+               step_index=int(args.step_index), sigma=sigma,
+               episodes=[dict(probe=True)], d_hidden=d_h,
+               rank=int(h_obj["rank"]), head_sha1=head_sha,
+               policy_sha1=policy_sha, codebooks_sha1=cb_sha,
+               joint_sha1=joint_sha)
+    if not diag:
+        probs = kb.check_execution(proto, dict(ex, head_precision="fp32"),
+                                  "условия прогона")
+        if probs:
+            raise SystemExit("условия исполнения не совпали с протоколом:\n"
+                             "  - " + "\n  - ".join(probs))
+
     ac16 = torch.autocast("cuda", dtype=torch.float16)
     parity = {"ok": False}
     store = Store()
@@ -1200,15 +1228,6 @@ def run(args):
     finally:
         envs.close()
 
-    ex = exec_fields(args, joint_sha=joint_sha, pos_off=pos_off,
-                     off_sha=off_sha, ckpt_fp=ckpt_fp, ckpt_path=ckpt_path,
-                     hf_revision=hf_rev)
-    ex.update(script_sha1=k9h.file_sha12(os.path.abspath(__file__)),
-              step_script_sha1=k9h.file_sha12(k12e.__file__),
-              hicora_g_sha1=k9h.file_sha12(hg.__file__),
-              hicora_vla_sha1=k9h.file_sha12(hv.__file__),
-              joint12_vla_sha1=k9h.file_sha12(jv.__file__),
-              k9h_sha1=k9h.file_sha12(k9h.__file__))
     common = dict(
         ex,
         protocol_sha1=(None if diag else proto["sha1"]), arm=args.arm,
@@ -1257,7 +1276,8 @@ def run(args):
     data = store.stack()
     meta = build_meta(
         **ex,
-        protocol_sha1=proto["sha1"], replica=args.replica, stage=args.stage,
+        protocol_sha1=(None if diag else proto["sha1"]),
+        replica=args.replica, stage=args.stage,
         step_index=int(args.step_index), sigma=sigma, episodes=eps_rows,
         d_hidden=d_h, rank=int(h_obj["rank"]), head_sha1=head_sha,
         policy_sha1=policy_sha, d1_seed=d1_seed,
