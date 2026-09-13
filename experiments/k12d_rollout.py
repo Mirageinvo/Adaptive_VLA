@@ -257,6 +257,47 @@ def check_orchestration(path=None):
             raise AssertionError(f"в main нет вызова {a} или {b}")
         if seq.index(a) > seq.index(b):
             raise AssertionError(f"{a} вызывается после {b}: {why}")
+    # КАЖДОЕ ОБРАЩЕНИЕ К proto ВНУТРИ run ОБЯЗАНО БЫТЬ ПОД УСЛОВИЕМ С diag.
+    # В диагностике протокола нет, proto равен None, и незащищённое обращение
+    # даёт TypeError — но не сразу, а когда до него дойдёт выполнение: ветка
+    # продолжения не выполняется на шаге 0, поэтому такой промах пережил три
+    # запуска и обнаружился только на шаге 1, стоив каждый раз прогона.
+    parent = {}
+    for node in ast.walk(fn[0]):
+        for ch in ast.iter_child_nodes(node):
+            parent[ch] = node
+
+    def mentions_diag(node):
+        return any(isinstance(x, ast.Name) and x.id == "diag"
+                   for x in ast.walk(node))
+
+    def guarded(node):
+        cur = node
+        while cur in parent:
+            up = parent[cur]
+            if isinstance(up, ast.If) and mentions_diag(up.test):
+                return True
+            if isinstance(up, ast.IfExp) and mentions_diag(up.test):
+                return True
+            if isinstance(up, ast.BoolOp) and mentions_diag(up):
+                return True
+            cur = up
+        return False
+
+    for node in ast.walk(fn[0]):
+        hit = None
+        if isinstance(node, ast.Subscript) and \
+                isinstance(node.value, ast.Name) and node.value.id == "proto":
+            hit = "proto[...]"
+        if isinstance(node, ast.Attribute) and node.attr == "get" and \
+                isinstance(node.value, ast.Name) and node.value.id == "proto":
+            hit = "proto.get(...)"
+        if hit and not guarded(node):
+            raise AssertionError(
+                f"строка {node.lineno}: {hit} вне условия с diag — в "
+                f"диагностике proto равен None, и это TypeError в тот момент, "
+                f"когда до строки дойдёт выполнение")
+
     # ДУБЛИКАТЫ МЕЖДУ ex И ЯВНЫМИ АРГУМЕНТАМИ — ошибка, ловимая разбором.
     # `build_meta(**ex, joint_sha1=...)` падает с TypeError только в прогоне, а
     # `dict(ex, joint_sha1=...)` не падает вовсе: он молча переопределяет поле
@@ -1008,11 +1049,13 @@ def run(args):
         # ТА ЖЕ функция, что в шаге: реплика, сид D1, исходный D1, sigma и
         # номер шага. Состояние оптимизатора раскатке не нужно, поэтому
         # require_optimizer=False — но всё остальное совпадает дословно
-        k12e.check_resume_chain(sd, protocol_sha1=proto["sha1"],
+        k12e.check_resume_chain(sd,
+                                protocol_sha1=(None if diag
+                                               else proto["sha1"]),
                                 replica=args.replica,
                                 step_index=int(args.step_index),
                                 d1_sha=head_sha, d1_seed=d1_seed, sigma=sigma,
-                                require_optimizer=False)
+                                require_optimizer=False, stage=args.stage)
         gau_h.load_state_dict({k: v.to(dev, torch.float32)
                                for k, v in sd["state"].items()})
         policy_sha = k9h.file_sha12(args.resume_head)
