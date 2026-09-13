@@ -257,6 +257,37 @@ def check_orchestration(path=None):
             raise AssertionError(f"в main нет вызова {a} или {b}")
         if seq.index(a) > seq.index(b):
             raise AssertionError(f"{a} вызывается после {b}: {why}")
+    # ДУБЛИКАТЫ МЕЖДУ ex И ЯВНЫМИ АРГУМЕНТАМИ — ошибка, ловимая разбором.
+    # `build_meta(**ex, joint_sha1=...)` падает с TypeError только в прогоне, а
+    # `dict(ex, joint_sha1=...)` не падает вовсе: он молча переопределяет поле
+    # условий исполнения, и сверка с протоколом пошла бы против подменённого
+    # значения. И то и другое видно здесь, до всякого запуска.
+    ex_keys = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "exec_fields":
+            for st in ast.walk(node):
+                if isinstance(st, ast.Return) and isinstance(st.value, ast.Call):
+                    ex_keys = {k.arg for k in st.value.keywords if k.arg}
+    if not ex_keys:
+        raise AssertionError("не удалось прочитать поля exec_fields")
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = getattr(node.func, "id", None)
+        if name not in ("build_meta", "dict"):
+            continue
+        has_ex = any(k.arg is None and getattr(k.value, "id", "") == "ex"
+                     for k in node.keywords) or any(
+            isinstance(a, ast.Name) and a.id == "ex" for a in node.args)
+        if not has_ex:
+            continue
+        dup = sorted({k.arg for k in node.keywords if k.arg} & ex_keys)
+        if dup:
+            raise AssertionError(
+                f"строка {node.lineno}: {dup} передаётся и через ex, и явно — "
+                f"в build_meta это TypeError в прогоне, в dict() молчаливое "
+                f"переопределение условий исполнения")
+
     for must in ("check_rollouts", "write_cb0", "parity",
                  "check_replica_identity", "load_decisions",
                  "save_final_cell"):
@@ -1036,11 +1067,11 @@ def run(args):
                step_index=int(args.step_index), sigma=sigma,
                episodes=[dict(probe=True)], d_hidden=d_h,
                rank=int(h_obj["rank"]), head_sha1=head_sha,
-               policy_sha1=policy_sha, codebooks_sha1=cb_sha,
-               joint_sha1=joint_sha)
+               policy_sha1=policy_sha, codebooks_sha1=cb_sha)
     if not diag:
-        probs = kb.check_execution(proto, dict(ex, head_precision="fp32"),
-                                  "условия прогона")
+        # head_precision уже в ex: подставлять его ещё раз значило бы сверять
+        # протокол с подсунутым значением, а не с фактическим
+        probs = kb.check_execution(proto, ex, "условия прогона")
         if probs:
             raise SystemExit("условия исполнения не совпали с протоколом:\n"
                              "  - " + "\n  - ".join(probs))
@@ -1283,7 +1314,7 @@ def run(args):
         policy_sha1=policy_sha, d1_seed=d1_seed,
         resume_head_sha1=(None if not args.resume_head
                           else k9h.file_sha12(args.resume_head)),
-        codebooks_sha1=cb_sha, joint_sha1=joint_sha, cb0_sha1=cb0_sha,
+        codebooks_sha1=cb_sha, cb0_sha1=cb0_sha,
         cb0_path=args.cb0_out, res_norm_sha1=rn_sha,
         basis_sha1=h_obj["basis_sha1"], rho_sha1=h_obj["rho_sha1"],
         rho_norm=rho_norm, hicora_seed=h_obj.get("seed"),
