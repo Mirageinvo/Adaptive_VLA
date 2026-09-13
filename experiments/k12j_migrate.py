@@ -65,6 +65,23 @@ def migrate(src, dst, *, apply=False):
             os.replace(tmp, b)
         else:
             shutil.copytree(a, b)
+            # СПУТНИКИ ДЛЯ СТАРЫХ БУФЕРОВ. Их не было до введения .meta.json, а
+            # без них раннер не может сверить происхождение и пересчитал бы
+            # готовый буфер заново — полчаса на шаг вместо пары минут чтения.
+            for f in sorted(os.listdir(b)):
+                if not f.endswith(".pt"):
+                    continue
+                side = os.path.join(b, f + ".meta.json")
+                if os.path.exists(side):
+                    continue
+                obj = torch.load(os.path.join(b, f), map_location="cpu",
+                                 weights_only=False)
+                meta = dict(obj.get("meta") or {})
+                meta["migrated_sidecar"] = True
+                tmp = side + f".tmp.{os.getpid()}"
+                json.dump(meta, open(tmp, "w"), ensure_ascii=False,
+                          default=str)
+                os.replace(tmp, side)
         done.append((kind, a, b, k))
     return done, skipped
 
@@ -105,12 +122,21 @@ def selftest():
                    os.path.join(src, f"head_step{k}.pt"))
         d = os.path.join(src, f"train_step{k - 1}")
         os.makedirs(d, exist_ok=True)
-        json.dump(dict(step_index=k - 1), open(os.path.join(d, "t0.pt.meta.json"), "w"))
+        # буфер БЕЗ спутника — как у старых прогонов
+        torch.save(dict(meta=dict(step_index=k - 1, arm="policy", sigma=0.1,
+                                  task_id=3, init_start=0, d1_seed=0,
+                                  rl_seed=0),
+                        data={}), os.path.join(d, "t0.pt"))
     pl = plan(src, dst)
     assert len(pl) == 4, pl
     done, skipped = migrate(src, dst, apply=True)
     assert len(done) == 4 and not skipped, (done, skipped)
     assert verify(dst) == 2
+    # спутник появился и несёт мету буфера
+    side = os.path.join(dst, "train_after_0", "t0.pt.meta.json")
+    assert os.path.exists(side), "спутник не создан"
+    sm = json.load(open(side))
+    assert sm["step_index"] == 0 and sm["migrated_sidecar"] is True, sm
     o = torch.load(os.path.join(dst, "head_after_0001.pt"), map_location="cpu",
                    weights_only=False)
     assert o["step_index"] == 1 and o["migrated_step_index_was"] == 0, o
