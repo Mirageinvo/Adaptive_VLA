@@ -1,0 +1,109 @@
+{
+  "protocol_version": 1,
+  "status": "frozen_except_measured_200_step_hardware_budget",
+  "source": {
+    "calvin_spec": "HiCoRA_CALVIN_SPEC.md sections 12 and 15",
+    "actioncodec_paper": "arXiv:2602.15397 Appendix A.3 Table 7",
+    "released_config": "third_party/actioncodec/config/train/bar.yaml"
+  },
+  "primary_model": {
+    "backbone": "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
+    "full_parameter_finetuning": true,
+    "use_lora": false,
+    "seeds": [0, 1],
+    "rvq_levels": 3,
+    "action_tokens": 48,
+    "bar_passes": 3
+  },
+  "training": {
+    "peak_learning_rate": 0.0001,
+    "final_learning_rate": 0.00001,
+    "warmup_steps": 1000,
+    "max_steps": 30000,
+    "global_batch_size": 128,
+    "optimizer": "AdamW",
+    "optimizer_betas": [0.9, 0.999],
+    "weight_decay": 1e-10,
+    "weight_decay_source": "released ActionCodec bar.yaml; not reported in Table 7",
+    "scheduler": "linear_warmup_then_cosine",
+    "gradient_clip_norm": 1.0
+  },
+  "v100_execution": {
+    "precision": "fp16_mixed",
+    "attention": "sdpa",
+    "fsdp": "full_shard",
+    "activation_checkpointing": true,
+    "gpu_count": 2,
+    "micro_batch_size_per_gpu": 1,
+    "gradient_accumulation_steps": 64,
+    "require_exclusive_gpus": true
+  },
+  "hardware_benchmark": {
+    "required_before_full_run": true,
+    "steps": 200,
+    "must_report": [
+      "peak_vram_mib_per_gpu",
+      "micro_steps_per_second",
+      "optimizer_seconds_per_step",
+      "estimated_gpu_hours_per_seed",
+      "loss_finite",
+      "gradient_norm_finite"
+    ],
+    "pass_criteria": {
+      "loss_finite_on_all_200_steps": true,
+      "gradient_norm_finite_on_all_200_steps": true,
+      "no_oom": true,
+      "architecture_or_metric_changes_forbidden_after_benchmark": true,
+      "steps_per_second_threshold": null,
+      "steps_per_second_threshold_note": "No invented throughput gate. Throughput only sets the GPU-hour budget; OOM or non-finite loss/grad moves the 2.2B run to another cluster. 256M is not a scientific substitute."
+    },
+    "oom_decision": "move full 2.2B run to another cluster",
+    "slow_decision": "keep 2.2B; freeze measured GPU-hour budget; move cluster if exclusive 2xV100 unavailable",
+    "allow_256m_pipeline_smoke": true,
+    "allow_256m_scientific_substitution": false
+  },
+  "data": {
+    "manifest_required": true,
+    "train_split": "train",
+    "selection_split": "dev",
+    "evaluation_domain_split": "val",
+    "validation_split": "val",
+    "forbid_selection_on_official_validation": true,
+    "test_split_forbidden_for_decisions": true,
+    "action_key": "rel_actions",
+    "converted_chunk_index_stride": 1,
+    "vla_sampling_stride": null,
+    "vla_sampling_stride_status": "freeze before VLA training; select without rebuilding converted data",
+    "image_modalities": ["rgb_static", "rgb_gripper"],
+    "image_size": [224, 448],
+    "use_proprioception": true
+  },
+  "validation": {
+    "evaluate_complete_validation_split": true,
+    "interval_steps": 1000,
+    "save_raw_predictions": true,
+    "metrics": [
+      "token_accuracy_level0",
+      "token_accuracy_level1",
+      "token_accuracy_level2",
+      "decoded_position_mse",
+      "decoded_rotation_mse",
+      "decoded_gripper_sign_accuracy"
+    ]
+  },
+  "baseline_go_condition": {
+    "require_finite_training_and_validation_losses": true,
+    "require_nonzero_long_horizon_result": true,
+    "require_two_seeds_reported_separately": true,
+    "numeric_success_threshold": null,
+    "note": "The CALVIN specification requires a stable nonzero baseline but does not provide a defensible numeric threshold; do not invent one."
+  },
+  "forbidden_adaptations": [
+    "using_test_split_for_any_decision",
+    "changing_backbone_after_observing_vla_results",
+    "changing_precision_or_attention_after_observing_results",
+    "replacing_full_parameter_training_with_LoRA",
+    "reporting_256M_as_the_registered_scientific_baseline",
+    "pooling_training_seeds_to_hide_instability"
+  ]
+}

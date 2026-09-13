@@ -1,0 +1,79 @@
+model:
+  # Source of truth for these fields is protocols/codec_protocol.json
+  # under geometry + architecture. Keep this YAML mirrored; do not diverge.
+  embodiment:
+    name: franka_calvin_30hz
+    action_dim: 7
+    freq: 30
+    duration: 1
+    description: CALVIN relative Cartesian actions at 30 Hz for one second
+  n_tokens: 48
+  n_quantizers: 3
+  z_dim: 512
+  vq_type: rvq
+  vq_codebook_size: 2048
+  vq_commitment_weight: 0.25
+  vq_decay: 0.99
+  vq_kmeans_init: true
+  vq_threshold_ema_dead_code: 2
+  vq_quantizer_dropout: 0.25
+  encoder_dim: 384
+  encoder_n_layers: 12
+  encoder_n_heads: 8
+  decoder_dim: 384
+  decoder_n_layers: 6
+  decoder_n_heads: 8
+
+data:
+  action_key: rel_actions
+  chunk_length: 30
+  execution_horizon: 12
+  clip_actions: [-1.0, 1.0]
+  additional_normalization: false
+  flip_gripper_sign: false
+
+training:
+  seeds: [0, 1]
+  global_batch_size: 8192
+  micro_batch_size_candidate_for_benchmark: 2048
+  gradient_accumulation_steps_candidate_for_benchmark: 4
+  num_workers: 8
+  precision: fp32
+  gradient_clip_norm: 1.0
+  validation_interval: 1000
+  checkpoint_interval: 5000
+  early_stopping_validation_patience: 5
+  optimizer:
+    name: AdamW
+    betas_status: not_disclosed
+    betas_implementation_candidate: [0.9, 0.95]
+    weight_decay_status: not_disclosed
+    weight_decay_implementation_candidate: 0.01
+    eps: 1.0e-8
+  base_vq:
+    n_tokens: 16
+    n_quantizers: 1
+    vq_type: vq
+    source: ActionCodec Appendix A.3
+    learning_rate: 2.0e-4
+    max_steps: 100000
+  rvq_posttrain:
+    latent_positions: 16
+    n_quantizers: 3
+    freeze_encoder: true
+    freeze_primary_codebook: true
+    train_decoder: true
+    train_residual_codebooks: true
+    learning_rate:
+    learning_rate_status: not_disclosed_in_ActionCodec_Appendix_C_do_not_invent
+    learning_rate_implementation_candidate: 2.0e-4
+    max_steps:
+    max_steps_status: not_disclosed_in_ActionCodec_Appendix_C_do_not_invent
+
+secondary_ablation:
+  pretrained_transfer:
+    status: descriptive_only
+    checkpoint: ZibinDong/ActionCodec-Base-RVQft
+    may_not_replace_primary: true
+
+protocol: ../protocols/codec_protocol.json

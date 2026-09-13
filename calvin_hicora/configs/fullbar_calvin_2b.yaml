@@ -1,0 +1,88 @@
+strategy: bar
+
+model:
+  backbone: HuggingFaceTB/SmolVLM2-2.2B-Instruct
+  action_codec_config: actioncodec_calvin.yaml
+  action_vocab_size: 2048
+  token_budget: 48
+  num_blocks: 3
+  dtype: float16
+  attention_implementation: sdpa
+
+data:
+  root: ${oc.env:CALVIN_DATA_ROOT}
+  manifest: ${oc.env:CALVIN_DATA_MANIFEST}
+  train_split: train
+  validation_split: val
+  action_key: rel_actions
+  require_manifest_sha256: true
+  forbid_test_split: true
+
+training:
+  seeds: [0, 1]
+  full_parameter_finetuning: true
+  use_lora: false
+  devices: 2
+  distributed_strategy: fsdp_full_shard
+  activation_checkpointing: true
+  precision: 16-mixed
+  micro_batch_size_per_gpu: 1
+  gradient_accumulation_steps: 64
+  effective_batch_size: 128
+  max_steps: 30000
+  warmup_steps: 1000
+  validation_interval: 1000
+  checkpoint_interval: 5000
+  gradient_clip_norm: 1.0
+  optimizer:
+    name: AdamW
+    # ActionCodec Appendix A.3 Table 7: full-parameter SmolVLM2-2.2B.
+    learning_rate: 1.0e-4
+    final_learning_rate: 1.0e-5
+    # Released ActionCodec bar.yaml; effectively disables weight decay.
+    weight_decay: 1.0e-10
+    eps: 1.0e-8
+    betas: [0.9, 0.999]
+  scheduler: cosine_to_final_learning_rate
+
+validation:
+  interval: 1000
+  num_batches: all
+  save_raw_predictions: true
+  metrics:
+    - token_accuracy_level0
+    - token_accuracy_level1
+    - token_accuracy_level2
+    - decoded_position_mse
+    - decoded_rotation_mse
+    - decoded_gripper_sign_accuracy
+
+output:
+  dir: ${oc.env:CALVIN_OUTPUT_ROOT}
+  checkpoint_dir: ${oc.env:CALVIN_OUTPUT_ROOT}/checkpoints
+  log_interval: 10
+  save_optimizer_state: true
+  save_scheduler_state: true
+  save_every_steps: 5000
+
+hardware:
+  cluster: ccmplanner.mipt.ru
+  gpu_ids: [V100-0, V100-1]
+  target: 2x_Tesla_V100_SXM2_32GB_NVLink
+  vram_mib_nvidia_smi_per_gpu: 32768
+  vram_mib_torch_per_gpu: 32494
+  supports_bf16: false
+  supports_flash_attention_2: false
+  forbid_bfloat16: true
+  forbid_flash_attention_2: true
+  require_exclusive_gpus: true
+
+budget:
+  status: pending_required_200_step_benchmark
+  benchmark_steps: 200
+  freeze_budget_only_after_benchmark: true
+  fallback_if_initial_cluster_is_inadequate: move_full_2b_run_to_another_cluster
+  allow_256m_for_pipeline_smoke_only: true
+  allow_256m_as_scientific_baseline: false
+
+protocol: ../protocols/baseline_protocol.json

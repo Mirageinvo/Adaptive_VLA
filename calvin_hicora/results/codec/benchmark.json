@@ -1,0 +1,84 @@
+{
+  "assert_note": "smoke and memory_smoke skip micro*accum==8192; benchmark and scientific runs enforce it",
+  "benchmark_configuration_note": "The completed 200-step run used the prior candidate 256x32; re-benchmark at 2048x4 is recommended before freezing the final codec GPU-hour budget.",
+  "benchmark_steps": 200,
+  "budget_status": "frozen_for_base_vq_using_2048x4_timing",
+  "codec_gpu_budget_base_vq_100k_hours": 120.77,
+  "completed_runs": {
+    "benchmark_200_256x32": {
+      "estimated_gpu_hours_base_vq_100k": 130.57,
+      "gradient_norm_finite": true,
+      "loss_finite": true,
+      "micro_steps_per_second": 6.808,
+      "optimizer_seconds_per_step": 4.700353,
+      "optimizer_steps_per_second": 0.21275,
+      "peak_cuda_memory_mib": 3651.733
+    },
+    "timing_50_2048x4": {
+      "estimated_gpu_hours_base_vq_100k": 120.77,
+      "loss_finite": true,
+      "optimizer_steps_per_second": 0.23,
+      "peak_cuda_memory_mib": 25052.939
+    }
+  },
+  "container": "avla_hicora_askhabaliev_gs",
+  "device": "cuda:0",
+  "effective_global_batch_size": 8192,
+  "estimated_gpu_hours_base_vq_100k": 120.77,
+  "estimated_gpu_hours_rvq_posttrain": null,
+  "format_version": 1,
+  "gpu": "Tesla V100-SXM2-32GB",
+  "gradient_accumulation_steps": 4,
+  "gradient_norm_finite": true,
+  "host": "ccmplanner.mipt.ru",
+  "loss_finite": true,
+  "micro_batch_size": 2048,
+  "micro_steps_per_second": 6.808,
+  "microbatch_probes": {
+    "2048_accum_1_memory_smoke": {
+      "optimizer_steps_per_second": 0.415,
+      "peak_cuda_memory_mib": 24928.376
+    },
+    "256_accum_1_memory_smoke": {
+      "optimizer_steps_per_second": 0.909,
+      "peak_cuda_memory_mib": 3522.4
+    },
+    "4096_accum_1": {
+      "status": "not_vram_tested_on_debug_only_2742_train_chunks"
+    },
+    "8192_accum_1": {
+      "status": "not_vram_tested_on_debug_only_2742_train_chunks; linear estimate likely OOM"
+    }
+  },
+  "notes": [
+    "Benchmark enforces micro*accum==8192; smoke/memory-smoke skip that assert.",
+    "VRAM headroom suggests larger micro-batch candidates should be probed next."
+  ],
+  "optimizer_seconds_per_step": 4.347826,
+  "optimizer_steps_per_second": 0.23,
+  "peak_cuda_memory_mib": 25052.939,
+  "precision": "fp32",
+  "prior_probes": {
+    "memory_smoke_batch_256_accum_1": {
+      "optimizer_steps_per_second": 0.909,
+      "peak_cuda_memory_mib": 3522.4
+    },
+    "smoke_batch_4": {
+      "optimizer_steps_per_second": 3.218,
+      "peak_cuda_memory_mib": 641.7
+    }
+  },
+  "registered_global_batch_size": 8192,
+  "rvq_posttrain_steps_status": "not_disclosed",
+  "selected_execution": {
+    "effective_global_batch_size": 8192,
+    "estimated_gpu_hours_base_vq_100k": 120.77,
+    "gradient_accumulation_steps": 4,
+    "micro_batch_size": 2048,
+    "optimizer_seconds_per_step_50step": 4.347826,
+    "optimizer_steps_per_second_50step": 0.23,
+    "peak_cuda_memory_mib_50step": 25052.939,
+    "selection_basis": "fits V100 32GiB (~25GiB); preserves global batch 8192; slightly faster than 256x32"
+  },
+  "stage": "base_vq"
+}

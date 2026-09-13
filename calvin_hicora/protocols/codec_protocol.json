@@ -1,0 +1,312 @@
+{
+  "protocol_version": 1,
+  "status": "frozen_except_measured_budgets_and_undisclosed_rvq_posttrain_step_count",
+  "freeze_policy": {
+    "all_scientific_fields_frozen": true,
+    "pending_fields": [
+      "measured VLA GPU-hour budget derived from the registered 200-step benchmark",
+      "RVQ post-training step count, which is not disclosed in ActionCodec Appendix C",
+      "tokenizer optimizer betas/weight_decay and RVQ post-train learning rate"
+    ],
+    "benchmark_may_not_change_backbone_precision_attention_metrics_or_test_policy": true
+  },
+  "action_representation": {
+    "source_key": "rel_actions",
+    "continuous_channels": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "gripper_channel": 6,
+    "clip_min": -1.0,
+    "clip_max": 1.0,
+    "apply_additional_normalization": false,
+    "flip_gripper_sign": false,
+    "conditional_normalization_arm": {
+      "enabled_if_any_continuous_std_below": 0.05,
+      "enabled_if_any_continuous_q99_abs_below": 0.2,
+      "scale": "max_abs_q01_q99_from_train_only"
+    }
+  },
+  "geometry": {
+    "embodiment": "franka_calvin_30hz",
+    "action_dim": 7,
+    "frequency_hz": 30,
+    "duration_seconds": 1,
+    "chunk_length": 30,
+    "execution_horizon": 12,
+    "latent_positions": 16,
+    "latent_dim": 512,
+    "rvq_levels": 3,
+    "total_tokens": 48,
+    "codebook_size": 2048,
+    "quantizer_dropout": 0.25
+  },
+  "architecture": {
+    "source_of_truth": "this protocol; configs/actioncodec_calvin.yaml must mirror these fields",
+    "vq_commitment_weight": 0.25,
+    "vq_decay": 0.99,
+    "vq_kmeans_init": true,
+    "vq_threshold_ema_dead_code": 2,
+    "encoder_dim": 384,
+    "encoder_n_layers": 12,
+    "encoder_n_heads": 8,
+    "encoder_add_self_attn": false,
+    "encoder_add_causal_mask": false,
+    "encoder_pos_encoding_type": "fourier",
+    "decoder_dim": 384,
+    "decoder_n_layers": 6,
+    "decoder_n_heads": 8,
+    "decoder_add_self_attn": false,
+    "decoder_add_causal_mask": false,
+    "decoder_pos_encoding_type": "fourier",
+    "decoder_cls_size": 1
+  },
+  "seeds": [
+    0,
+    1
+  ],
+  "codec_primary_protocol": {
+    "source": "ActionCodec section 5 and Appendix C; CALVIN specification section 11.3",
+    "stage_1": "train CALVIN-native single-layer VQ with 16 tokens",
+    "stage_2": "initialize RVQ depth 3 from stage 1; freeze encoder and primary codebook; train decoder and residual codebooks",
+    "primary_output": "stage_2_rvq",
+    "pretrained_transfer_is_primary": false
+  },
+  "pretrained_transfer_ablation": {
+    "status": "descriptive_secondary_only",
+    "checkpoint": "ZibinDong/ActionCodec-Base-RVQft",
+    "may_not_replace_failed_calvin_native_primary": true
+  },
+  "codec_gate": {
+    "status": "partially_frozen",
+    "evaluation_mode_required": true,
+    "frozen_checks": {
+      "require_decode_path_parity": true,
+      "maximum_decode_path_latent_absolute_delta": 1e-06,
+      "require_monotonic_mse": true
+    },
+    "provisional_numeric_candidates_not_paper_or_spec_sourced": {
+      "status": "unfrozen_do_not_use_for_scientific_go_no_go",
+      "note": "SPEC section 11.3 go-criterion is qualitative. These numbers are operational candidates only until an advisor-sourced provenance is registered.",
+      "minimum_level0_to_full_mse_ratio": 1.5,
+      "minimum_level0_position_r2": 0.8,
+      "maximum_level0_position_r2": 0.99,
+      "minimum_level0_rotation_r2": 0.8,
+      "maximum_level0_rotation_r2": 0.99,
+      "minimum_level0_gripper_sign_accuracy": 0.95,
+      "maximum_dead_code_fraction_per_level": 0.1
+    }
+  },
+  "expand_embodiment_gate": {
+    "required_for_pretrained_arm": true,
+    "maximum_libero_encoder_latent_absolute_delta": 0.0,
+    "require_input_projection_shape_unchanged": true,
+    "require_libero_decoder_output_bitwise_equal": true
+  },
+  "overfit_gate": {
+    "num_chunks": 8,
+    "steps": 200,
+    "test_codebook_size": 64,
+    "kmeans_init": false,
+    "minimum_bypass_mse_reduction_orders": 2.0,
+    "minimum_quantized_mse_reduction_orders": 1.0
+  },
+  "training": {
+    "codec": {
+      "global_batch_size": 8192,
+      "micro_batch_size_candidate_for_benchmark": 2048,
+      "gradient_accumulation_steps_candidate_for_benchmark": 4,
+      "require_micro_batch_times_accumulation_equals_global_batch": true,
+      "num_workers": 8,
+      "precision": "fp32",
+      "optimizer": "AdamW",
+      "betas_status": "not_disclosed_in_ActionCodec_paper_or_released_training_code",
+      "betas_implementation_candidate": [
+        0.9,
+        0.95
+      ],
+      "weight_decay_status": "not_disclosed_in_ActionCodec_paper_or_released_training_code",
+      "weight_decay_implementation_candidate": 0.01,
+      "eps": 1e-08,
+      "gradient_clip_norm": 1.0,
+      "validation_interval": 1000,
+      "checkpoint_interval": 5000,
+      "early_stopping_validation_patience": 5,
+      "selection_split": "dev",
+      "selection_split_note": "episode-disjoint carve from official training/; official validation/ is evaluation-domain only",
+      "reported_actioncodec_recipe": {
+        "learning_rate": 0.0002,
+        "max_steps": 100000,
+        "source": "ActionCodec Appendix A.3"
+      },
+      "base_vq": {
+        "n_tokens": 16,
+        "n_quantizers": 1,
+        "learning_rate": 0.0002,
+        "max_steps": 100000
+      },
+      "rvq_posttrain": {
+        "latent_positions": 16,
+        "n_quantizers": 3,
+        "freeze_encoder": true,
+        "freeze_primary_codebook": true,
+        "train_decoder": true,
+        "train_residual_codebooks": true,
+        "losses": [
+          "reconstruction",
+          "rvq_objectives"
+        ],
+        "learning_rate": null,
+        "learning_rate_status": "not_disclosed_in_ActionCodec_Appendix_C_do_not_invent",
+        "learning_rate_implementation_candidate": 0.0002,
+        "max_steps": null,
+        "max_steps_status": "not_disclosed_in_ActionCodec_Appendix_C_do_not_invent"
+      },
+      "microbatch_selection_note": "Chosen after V100 probes: batch256~3.5GiB, batch2048~24.9GiB fits; 4096/8192 not probed for VRAM on debug because drop-last needs >=batch chunks (debug train has 2742). Linear estimate suggests 4096 would OOM. 2048*4=8192 preserves registered global batch."
+    },
+    "vla": {
+      "backbone": "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
+      "backbone_decision": "CALVIN spec section 12; preserves the 24-layer HiCoRA 12-to-24 contract",
+      "full_parameter_finetuning": true,
+      "use_lora": false,
+      "precision": "16-mixed",
+      "attention_implementation": "sdpa",
+      "distributed_strategy": "fsdp_full_shard",
+      "devices": 2,
+      "micro_batch_size_per_gpu": 1,
+      "gradient_accumulation_steps": 64,
+      "effective_batch_size": 128,
+      "learning_rate": 0.0001,
+      "learning_rate_source": "ActionCodec Appendix A.3 Table 7 for full-parameter SmolVLM2-2.2B tokenizer comparison",
+      "final_learning_rate": 1e-05,
+      "weight_decay": 1e-10,
+      "betas": [
+        0.9,
+        0.999
+      ],
+      "eps": 1e-08,
+      "gradient_clip_norm": 1.0,
+      "warmup_steps": 1000,
+      "scheduler": "cosine_to_final_learning_rate",
+      "max_steps": 30000,
+      "validation_interval": 1000,
+      "checkpoint_interval": 5000,
+      "activation_checkpointing": true
+    }
+  },
+  "budget": {
+    "codec_gpu_budget_status": "frozen_base_vq_from_v100_2048x4_timing",
+    "codec_benchmark_steps_per_stage": 200,
+    "vla_gpu_budget_status": "pending_required_200_step_benchmark",
+    "vla_benchmark_steps": 200,
+    "vla_benchmark_must_precede_budget_freeze": true,
+    "minimum_free_disk_gb_before_task_D_D_download": 500,
+    "codec_base_vq_estimated_gpu_hours_per_seed_100k": 120.77,
+    "codec_execution": {
+      "micro_batch_size": 2048,
+      "gradient_accumulation_steps": 4,
+      "global_batch_size": 8192,
+      "precision": "fp32",
+      "device_class": "Tesla_V100_SXM2_32GB"
+    }
+  },
+  "hardware": {
+    "cluster": "ccmplanner.mipt.ru",
+    "gpu_ids": [
+      "V100-0",
+      "V100-1"
+    ],
+    "gpu_model": "Tesla V100-SXM2",
+    "gpu_count": 2,
+    "vram_mib_nvidia_smi_per_gpu": 32768,
+    "vram_mib_torch_per_gpu": 32494,
+    "interconnect": "NVLink NV2",
+    "supports_bf16": false,
+    "supports_flash_attention_2": false,
+    "driver_version": "560.28.03",
+    "driver_reported_cuda_version": "12.6",
+    "requires_exclusive_gpus_for_vla": true
+  },
+  "registered_codec_failure_ablations_in_order": [
+    {
+      "name": "latent_positions",
+      "allowed_values": [
+        24,
+        32
+      ]
+    },
+    {
+      "name": "chunk_length",
+      "allowed_values": [
+        20,
+        45
+      ],
+      "require_same_physical_execution_horizon": true
+    },
+    {
+      "name": "codebook_size",
+      "allowed_values": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "name": "quantizer_dropout",
+      "allowed_values": [
+        0.5
+      ]
+    },
+    {
+      "name": "loss_weighting",
+      "allowed_values": [
+        "position_rotation_gripper_weights",
+        "separate_gripper_bce_head"
+      ]
+    }
+  ],
+  "registered_training_debug_changes": {
+    "scope": "optimization debugging only; not scientific codec ablations",
+    "allowed_before_observing_validation_or_test_results": [
+      "learning_rate",
+      "max_steps",
+      "batch_size"
+    ],
+    "must_be_recorded_in_findings": true
+  },
+  "data": {
+    "selection_split": "dev",
+    "evaluation_domain_split": "val",
+    "forbid_selection_on_official_validation": true,
+    "development_split": {
+      "source": "episode_disjoint_carve_from_official_training",
+      "fraction": 0.05,
+      "seed": 0,
+      "stratify_by_scene": true
+    }
+  },
+  "open_decisions_before_scientific_codec_training": {
+    "tokenizer_optimizer_betas": "not disclosed",
+    "tokenizer_weight_decay": "not disclosed",
+    "rvq_posttrain_learning_rate": "not disclosed",
+    "rvq_posttrain_max_steps": "not disclosed",
+    "development_split_for_codec_selection": "registered: episode-disjoint 5% carve from training/, seed 0, stratified by scene",
+    "micro_batch_and_accumulation": "registered: micro 2048, accum 4, global 8192 (V100 probe)",
+    "codec_gpu_budget": "base_vq ~120.8 GPU-h/seed at 2048x4; RVQ post-train pending step count",
+    "full_2b_fallback_cluster": "TBD; 256M is not an allowed scientific substitute"
+  },
+  "forbidden_adaptations": [
+    "selecting_configuration_on_CALVIN_test",
+    "using_test_split_for_any_decision",
+    "selecting_configuration_on_long_horizon_results",
+    "changing_backbone_after_observing_vla_results",
+    "changing_precision_or_attention_after_observing_results",
+    "changing_gate_thresholds_after_observing_results",
+    "adding_seeds_to_rescue_a_failed_gate",
+    "using_LIBERO_action_statistics_or_pos_offset",
+    "silently_changing_the_registered_metric"
+  ]
+}
