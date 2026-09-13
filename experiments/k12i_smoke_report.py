@@ -56,6 +56,109 @@ def noise_key(cells):
     return keys.pop()
 
 
+def by_block(cells):
+    """Ячейки по (задача, init_start). Дубликаты блока — отказ."""
+    out = {}
+    for c in cells:
+        k = (int(c["task_ids"][0]), int(c["init_start"]))
+        if k in out:
+            raise SystemExit(f"{c['_path']}: блок {k} уже есть в "
+                             f"{out[k]['_path']}")
+        out[k] = c
+    return out
+
+
+def check_eps_streams(a_cells, b_cells, *, label_a, label_b):
+    """ФАКТИЧЕСКИЕ реализации шума, а не совпадение метаданных о сиде.
+
+    Сверяется общий префикс повызовных хэшей: после расхождения траекторий
+    число вызовов у двух политик разное, и это нормально — а вот разные
+    реализации при одинаковых сиде и соли означают, что вместе с весами
+    сменился и случайный поток, и разницу исходов нельзя отнести к обучению.
+    """
+    A, B = by_block(a_cells), by_block(b_cells)
+    common = sorted(set(A) & set(B))
+    if not common:
+        raise SystemExit(f"у {label_a} и {label_b} нет общих блоков")
+    miss = sorted((set(A) | set(B)) - (set(A) & set(B)))
+    if miss:
+        raise SystemExit(f"блоки {miss[:6]} есть только у одной из рук "
+                         f"{label_a}/{label_b}")
+    n_cmp = 0
+    for k in common:
+        ea = A[k].get("eps_sha1_by_call")
+        eb = B[k].get("eps_sha1_by_call")
+        if not ea or not eb:
+            raise SystemExit(
+                f"блок {k}: нет повызовных хэшей шума (eps_sha1_by_call) — "
+                f"проверить общий поток нечем, а совпадение сида его не "
+                f"доказывает")
+        n = min(len(ea), len(eb))
+        if ea[:n] != eb[:n]:
+            first = next(i for i in range(n) if ea[i] != eb[i])
+            raise SystemExit(
+                f"блок {k}: реализации шума расходятся с вызова {first} "
+                f"({ea[first]} против {eb[first]}) при одинаковых сиде и соли "
+                f"— это разные случайные числа, а не разные веса")
+        n_cmp += n
+    return dict(blocks=len(common), calls_compared=n_cmp)
+
+
+def check_provenance(cells, *, arm, d1_seed=None, rl_seed=None, sigma=None,
+                     step_index=None, head_sha1=None, policy_sha1=None):
+    """Состав руки: та ли рука, те ли сиды, головы, шаг и sigma."""
+    bad = []
+    for c in cells:
+        tag = os.path.basename(c["_path"])
+        if c.get("arm") != arm:
+            bad.append(f"{tag}: рука {c.get('arm')} вместо {arm}")
+        for nm, want, got in (("d1_seed", d1_seed, c.get("d1_seed")),
+                              ("rl_seed", rl_seed, c.get("rl_seed")),
+                              ("step_index", step_index, c.get("step_index")),
+                              ("head_sha1", head_sha1, c.get("head_sha1")),
+                              ("policy_sha1", policy_sha1,
+                               c.get("policy_sha1"))):
+            if want is not None and got != want:
+                bad.append(f"{tag}: {nm}={got}, ожидалось {want}")
+        if sigma is not None and abs(float(c.get("sigma", -1))
+                                     - float(sigma)) > 1e-9:
+            bad.append(f"{tag}: sigma={c.get('sigma')} вместо {sigma}")
+        par = c.get("parity") or {}
+        if par and not par.get("ok", True):
+            bad.append(f"{tag}: паритет не сошёлся: {par}")
+    if bad:
+        raise SystemExit("состав руки не сходится:\n  - " + "\n  - ".join(bad))
+    # единство происхождения внутри руки
+    for nm in ("policy_sha1", "step_index", "sigma", "d1_seed", "rl_seed"):
+        vals = {str(c.get(nm)) for c in cells}
+        if len(vals) > 1:
+            raise SystemExit(f"внутри руки {arm} разные {nm}: {sorted(vals)}")
+    return True
+
+
+def train_states(root):
+    """Обучающие состояния — ИЗ МЕТАДАННЫХ раскаток, а не из имён файлов.
+
+    Имя не несёт ни числа сред, ни списка состояний; прежняя версия разбирала
+    имя и достраивала `range(5)` по захардкоженной пятёрке, то есть при другом
+    --n-envs молча теряла часть состояний и пропускала пересечение с оценкой.
+    """
+    out = set()
+    for side in sorted(glob.glob(os.path.join(root, "train_step*",
+                                              "*.pt.meta.json"))):
+        m = json.load(open(side))
+        ids = m.get("state_ids")
+        if not ids:
+            ids = [e["state_id"] for e in m.get("episodes") or []]
+        if not ids:
+            raise SystemExit(f"{side}: в мете нет состояний, пересечение с "
+                             f"оценкой не проверить")
+        for t in m.get("task_ids") or [m.get("task_id")]:
+            for i in ids:
+                out.add((int(t), int(i)))
+    return out
+
+
 def mcnemar_p(rec, los):
     """Точный односторонний McNemar: P(X >= rec) при X ~ Binom(rec+los, 1/2).
 
@@ -115,52 +218,63 @@ def collect(root, ladder=None):
     g0 = load_cells(root, "eval_g0")
     if not det or not g0:
         raise SystemExit(f"в {root} нет оценочных ячеек d1_det или g0")
-    ndet, ng0 = noise_key(det), noise_key(g0)
+    ng0 = noise_key(g0)
     if ng0[0] != "eval":
         raise SystemExit(f"g0 снята в режиме шума {ng0[0]!r}, а не 'eval': "
                          f"сравнивать с g_rl нельзя")
+    d1_seed = det[0].get("d1_seed")
     sig = {float(c["sigma"]) for c in g0}
+    if len(sig) != 1:
+        raise SystemExit(f"у g0 разные sigma: {sorted(sig)}")
+    sigma = sig.pop()
+    check_provenance(det, arm="baseline", d1_seed=d1_seed, sigma=0.0,
+                     step_index=0)
+    check_provenance(g0, arm="g0", d1_seed=d1_seed, sigma=sigma, step_index=0)
     e_det, e_g0 = episodes(det), episodes(g0)
-    steps = {}
-    pat = os.path.join(root, "eval_g_rl_step*")
-    for d in sorted(glob.glob(pat)):
+
+    steps, means, noise_ok = {}, {}, {}
+    for d in sorted(glob.glob(os.path.join(root, "eval_g_rl_step*"))):
         k = int(os.path.basename(d).replace("eval_g_rl_step", ""))
         if ladder and k not in ladder:
             continue
         cells = load_cells(root, os.path.basename(d))
         if not cells:
             continue
-        nk = noise_key(cells)
-        if nk != ng0:
+        if noise_key(cells) != ng0:
             raise SystemExit(
-                f"шаг {k}: поток шума {nk} против {ng0} у g0 — вместе с весами "
-                f"сменились случайные числа, и эффект обучения неотделим от "
-                f"другого сэмпла")
-        if {float(c["sigma"]) for c in cells} != sig:
-            raise SystemExit(f"шаг {k}: другая sigma")
+                f"шаг {k}: метаданные потока шума {noise_key(cells)} против "
+                f"{ng0} у g0")
+        check_provenance(cells, arm="g_rl", d1_seed=d1_seed, sigma=sigma,
+                         step_index=k)
+        # ФАКТИЧЕСКИЕ реализации, а не только совпадение сида
+        noise_ok[k] = check_eps_streams(cells, g0, label_a=f"g_rl шаг {k}",
+                                        label_b="g0")
         steps[k] = episodes(cells)
+    for d in sorted(glob.glob(os.path.join(root, "eval_g_rl_mean_step*"))):
+        k = int(os.path.basename(d).replace("eval_g_rl_mean_step", ""))
+        if ladder and k not in ladder:
+            continue
+        cells = load_cells(root, os.path.basename(d))
+        if not cells:
+            continue
+        check_provenance(cells, arm="g_rl_mean", d1_seed=d1_seed, sigma=0.0,
+                         step_index=k)
+        means[k] = episodes(cells)
     if not steps:
         raise SystemExit(f"в {root} нет ни одной оценки g_rl")
-    # обучающие состояния не должны попасть в оценку
-    tr = set()
-    for d in sorted(glob.glob(os.path.join(root, "train_step*"))):
-        for p in glob.glob(os.path.join(d, "*.pt")):
-            b = os.path.basename(p)
-            try:
-                t = int(b.split("_")[0][1:])
-                s0_ = int(b.split("_")[1][1:].split(".")[0])
-            except (IndexError, ValueError):
-                continue
-            tr |= {(t, s0_ + i) for i in range(5)}
+
+    tr = train_states(root)
     leak = sorted(set(e_g0) & tr)
     if leak:
         raise SystemExit(
             f"оценочные состояния {leak[:8]} ({len(leak)}) встречаются среди "
             f"обучающих: улучшение заявлялось бы на тех же состояниях, на "
             f"которых собран градиент")
-    return dict(det=e_det, g0=e_g0, steps=steps, sigma=sorted(sig),
+    return dict(det=e_det, g0=e_g0, steps=steps, means=means, sigma=[sigma],
                 noise=dict(mode=ng0[0], eval_eps_seed=ng0[1], salt=ng0[2]),
-                n_eval=len(e_g0), train_states=len(tr))
+                noise_checked=noise_ok, d1_seed=d1_seed,
+                rl_seed=g0[0].get("rl_seed"), n_eval=len(e_g0),
+                train_states=len(tr))
 
 
 def report(data, head_tag=""):
@@ -185,6 +299,16 @@ def report(data, head_tag=""):
               f"{vs_g0['p_one_sided']:>7.3f}{vs_g0['recovered']:>7}"
               f"{vs_g0['lost']:>7}{100 * vs_g0['discord']:>8.2f}%"
               f"{100 * vs_det['effect']:>+12.2f}")
+    if data.get("means"):
+        print(f"\n    среднее обученной политики (u=mu) против "
+              f"детерминированной D1:")
+        for k in sorted(data["means"]):
+            vm = paired(data["means"][k], data["det"],
+                        label_a=f"g_rl_mean шаг {k}", label_b="d1_det")
+            print(f"      шаг {k}: успех {100 * vm['success_a']:.2f}%, "
+                  f"g_rl_mean - d1_det {100 * vm['effect']:+.2f} пп "
+                  f"(восст {vm['recovered']}, потер {vm['lost']}, p="
+                  f"{vm['p_one_sided']:.3f})")
     best = max(rows, key=lambda k: rows[k]["vs_g0"]["effect"])
     b = rows[best]["vs_g0"]
     # ЗНАКА НЕДОСТАТОЧНО. Порог по одному знаку объявлял бы сигнал в половине
@@ -207,39 +331,57 @@ def report(data, head_tag=""):
 
 
 def selftest():
+    import shutil
     import tempfile
     tmp = tempfile.mkdtemp(prefix="k12i_")
+    SEED, SIG, D1, RL = 777, 0.10, 0, 0
 
-    def write(sub, arm, succ_fn, seed=777, sigma=0.10, hash_fn=None):
+    def write(sub, arm, succ_fn, *, step=0, seed=SEED, sigma=None,
+              eps_tag="e", policy="pol0", head="hd0", states=range(30, 35),
+              tasks=(0, 1)):
         d = os.path.join(tmp, sub)
         os.makedirs(d, exist_ok=True)
-        for t in (0, 1):
-            eps = []
-            for i in range(30, 35):
-                hs = (hash_fn or (lambda tt, ii: f"h{tt}_{ii}"))(t, i)
-                eps.append(dict(state_id=i, init_hash_full=hs,
-                                success=bool(succ_fn(t, i))))
-            json.dump(dict(stage="diag", arm=arm, sigma=sigma,
-                           eps_mode=("eval" if arm in ("g0", "g_rl")
-                                     else "train"),
-                           eval_eps_seed=(seed if arm in ("g0", "g_rl")
-                                          else None),
-                           eps_salt=(seed * 7 if arm in ("g0", "g_rl")
-                                     else 11),
-                           task_ids=[t], state_ids=list(range(30, 35)),
-                           episodes=eps),
-                      open(os.path.join(d, f"t{t}_s30.json"), "w"))
+        sigma = (0.0 if arm in ("baseline", "g_rl_mean")
+                 else (SIG if sigma is None else sigma))
+        for t in tasks:
+            eps = [dict(state_id=i, init_hash_full=f"h{t}_{i}",
+                        success=bool(succ_fn(t, i))) for i in states]
+            json.dump(dict(
+                stage="diag", arm=arm, sigma=sigma, d1_seed=D1, rl_seed=RL,
+                step_index=step, head_sha1=head, policy_sha1=policy,
+                eps_mode=("eval" if arm in ("g0", "g_rl") else "train"),
+                eval_eps_seed=(seed if arm in ("g0", "g_rl") else None),
+                eps_salt=(seed * 7 if arm in ("g0", "g_rl") else 11),
+                eps_sha1_by_call=[f"{eps_tag}{t}_{c}" for c in range(6)],
+                init_start=list(states)[0], task_ids=[t],
+                state_ids=list(states), parity=dict(ok=True), episodes=eps),
+                open(os.path.join(d, f"t{t}_s{list(states)[0]}.json"), "w"))
+
+    def write_train(step, states=range(0, 5), tasks=(0, 1), n_envs=5):
+        d = os.path.join(tmp, f"train_step{step}")
+        os.makedirs(d, exist_ok=True)
+        for t in tasks:
+            json.dump(dict(task_ids=[t], state_ids=list(states),
+                           n_envs=n_envs, step_index=step),
+                      open(os.path.join(d,
+                                        f"t{t}_s{list(states)[0]}.pt.meta.json"),
+                           "w"))
 
     write("eval_d1_det", "baseline", lambda t, i: (t + i) % 4 != 0)
     write("eval_g0", "g0", lambda t, i: (t + i) % 5 != 0)
-    # шаг 1 восстанавливает один провал g0 и ничего не теряет
-    write("eval_g_rl_step1", "g_rl", lambda t, i: (t + i) % 5 != 0 or i == 30)
+    write("eval_g_rl_step1", "g_rl", lambda t, i: (t + i) % 5 != 0 or i == 30,
+          step=1, policy="pol1")
+    write("eval_g_rl_mean_step1", "g_rl_mean", lambda t, i: (t + i) % 4 != 0,
+          step=1, policy="pol1")
+    write_train(0)
     data = collect(tmp)
     res = report(data, "(тест)")
-    assert isinstance(res["signal"], bool), res
     r1 = res["rows"][1]["vs_g0"]
-    assert r1["recovered"] >= 1 and r1["lost"] == 0, r1
-    assert r1["n"] == 10, r1
+    assert r1["recovered"] >= 1 and r1["lost"] == 0 and r1["n"] == 10, r1
+    assert data["noise_checked"][1]["blocks"] == 2, data["noise_checked"]
+    assert isinstance(res["signal"], bool)
+    # знака мало: 1 против 0 даёт p = 0.5
+    assert res["signal"] is False, res
 
     def _expect(fn, needle):
         try:
@@ -249,36 +391,85 @@ def selftest():
             return
         raise AssertionError(f"отказа «{needle}» не было")
 
-    # ДРУГОЙ ПОТОК ШУМА — отказ
-    write("eval_g_rl_step2", "g_rl", lambda t, i: True, seed=999)
-    _expect(lambda: collect(tmp), "сменились случайные числа")
-    import shutil
+    # --- ОТРИЦАТЕЛЬНЫЕ ТЕСТЫ (пункт 4.6) ---------------------------------
+    def _redo(sub, **kw):
+        shutil.rmtree(os.path.join(tmp, sub), ignore_errors=True)
+        write(sub, **kw)
+
+    # 1. результат ДРУГОЙ sigma в том же каталоге
+    _redo("eval_g_rl_step2", arm="g_rl", succ_fn=lambda t, i: True, step=2,
+          sigma=0.03, policy="pol2")
+    _expect(lambda: collect(tmp), "sigma=0.03 вместо 0.1")
     shutil.rmtree(os.path.join(tmp, "eval_g_rl_step2"))
 
-    # ДРУГИЕ ХЭШИ — не пара
-    write("eval_g_rl_step2", "g_rl", lambda t, i: True,
-          hash_fn=lambda t, i: "ДРУГОЙ")
-    _expect(lambda: report(collect(tmp)), "это разные состояния")
+    # 2. другие ФАКТИЧЕСКИЕ реализации шума при тех же метаданных
+    _redo("eval_g_rl_step2", arm="g_rl", succ_fn=lambda t, i: True, step=2,
+          eps_tag="ДРУГОЙ", policy="pol2")
+    _expect(lambda: collect(tmp), "разные случайные числа, а не разные веса")
     shutil.rmtree(os.path.join(tmp, "eval_g_rl_step2"))
 
-    # ОБУЧАЮЩЕЕ СОСТОЯНИЕ В ОЦЕНКЕ — отказ
-    d = os.path.join(tmp, "train_step0")
-    os.makedirs(d, exist_ok=True)
-    open(os.path.join(d, "t0_s30.pt"), "wb").write(b"x")
+    # 3. разные policy_sha1 внутри одной руки
+    write("eval_g_rl_step2", "g_rl", lambda t, i: True, step=2,
+          policy="pol2", tasks=(0,))
+    write("eval_g_rl_step2", "g_rl", lambda t, i: True, step=2,
+          policy="ДРУГАЯ", tasks=(1,))
+    _expect(lambda: collect(tmp), "разные policy_sha1")
+    shutil.rmtree(os.path.join(tmp, "eval_g_rl_step2"))
+
+    # 4. неполный набор: у шага нет одного блока
+    _redo("eval_g_rl_step2", arm="g_rl", succ_fn=lambda t, i: True, step=2,
+          policy="pol2", tasks=(0,))
+    _expect(lambda: collect(tmp), "только у одной из рук")
+    shutil.rmtree(os.path.join(tmp, "eval_g_rl_step2"))
+
+    # 5. дубликат блока
+    _redo("eval_g_rl_step2", arm="g_rl", succ_fn=lambda t, i: True, step=2,
+          policy="pol2")
+    d2 = os.path.join(tmp, "eval_g_rl_step2")
+    shutil.copy(os.path.join(d2, "t0_s30.json"),
+                os.path.join(d2, "t0_s30_копия.json"))
+    _expect(lambda: collect(tmp), "уже есть в")
+    shutil.rmtree(d2)
+
+    # 6. пересечение train и eval — по МЕТАДАННЫМ, а не по имени файла
+    write_train(1, states=range(30, 35))
     _expect(lambda: collect(tmp), "собран градиент")
-    os.remove(os.path.join(d, "t0_s30.pt"))
-    open(os.path.join(d, "t0_s0.pt"), "wb").write(b"x")
-    assert collect(tmp)["train_states"] == 5
+    shutil.rmtree(os.path.join(tmp, "train_step1"))
+    # и число сред берётся из меты: при n_envs=10 пересечение всё равно видно
+    write_train(1, states=range(28, 38), n_envs=10)
+    _expect(lambda: collect(tmp), "собран градиент")
+    shutil.rmtree(os.path.join(tmp, "train_step1"))
 
-    # НЕПАРНЫЕ ЭПИЗОДЫ — отказ
+    # 7. номер шага не тот
+    _redo("eval_g_rl_step2", arm="g_rl", succ_fn=lambda t, i: True, step=9,
+          policy="pol2")
+    _expect(lambda: collect(tmp), "step_index=9, ожидалось 2")
+    shutil.rmtree(os.path.join(tmp, "eval_g_rl_step2"))
+
+    # 8. паритет не сошёлся
+    d = os.path.join(tmp, "eval_g_rl_step2")
+    write("eval_g_rl_step2", "g_rl", lambda t, i: True, step=2, policy="pol2")
+    for f in glob.glob(os.path.join(d, "*.json")):
+        o = json.load(open(f))
+        o["parity"] = dict(ok=False, drift_from_d1=0.0)
+        json.dump(o, open(f, "w"))
+    _expect(lambda: collect(tmp), "паритет не сошёлся")
+    shutil.rmtree(d)
+
+    # 9. чужая рука в каталоге шага
+    _redo("eval_g_rl_step2", arm="g0", succ_fn=lambda t, i: True, step=2)
+    _expect(lambda: collect(tmp), "рука g0 вместо g_rl")
+    shutil.rmtree(os.path.join(tmp, "eval_g_rl_step2"))
+
+    # 10. непарные эпизоды в самой разности
     a = {(0, 30): (True, "h"), (0, 31): (False, "h")}
     b = {(0, 30): (False, "h")}
     _expect(lambda: paired(a, b, label_a="a", label_b="b"), "непарные эпизоды")
+    # 11. хэши начального состояния различаются
+    _expect(lambda: paired({(0, 30): (True, "h1")}, {(0, 30): (True, "h2")},
+                           label_a="a", label_b="b"), "это разные состояния")
 
-    # g0 в режиме train — сравнивать нельзя
-    shutil.rmtree(os.path.join(tmp, "eval_g0"))
-    write("eval_g0", "baseline", lambda t, i: True)
-    _expect(lambda: collect(tmp), "а не 'eval'")
+    assert collect(tmp)["n_eval"] == 10
     print("\nсамопроверка k12i_smoke_report пройдена")
 
 

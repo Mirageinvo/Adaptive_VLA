@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# K-12j: development-обучение HiCoRA-G. Настоящий цикл, а не предварительный
+# замер.
+#
+# ОДИН ПРИНЯТЫЙ ШАГ = один свежий on-policy буфер. Буфер, по которому уже
+# сделано обновление, для второго обновления не используется: политика после
+# шага другая, и сэмплы к ней не относятся.
+#
+# ПРОДОЛЖЕНИЕ С ЛЮБОГО ПРИНЯТОГО ШАГА. Раннер находит последнюю голову
+# head_after_NNNN.pt, проверяет цепочку и продолжает с N+1; шаги 1..N не
+# пересчитываются. step_index всюду означает ЧИСЛО УЖЕ ПРИНЯТЫХ ОБНОВЛЕНИЙ.
+#
+# ИЗОЛЯЦИЯ. Каталог включает сид D1, сид RL, sigma и список задач; состав
+# прогона записан в config.json и сверяется. Готовая ячейка пропускается только
+# после сверки ЕЁ конфигурации, а не по признаку «файл непустой».
+#
+#   bash experiments/run_k12j_dev.sh cuda:0 s0 4          # довести до 4 шагов
+#   TARGET=10 bash experiments/run_k12j_dev.sh cuda:0 s0  # продолжить до 10
+set -u -o pipefail
+
+DEV="${1:?нужно устройство}"
+HEADTAG="${2:?нужна голова: s0 или s1}"
+TARGET="${3:-${TARGET:-4}}"
+SIGMA="${SIGMA:-0.10}"
+RL_SEED="${RL_SEED:-0}"
+TASKS="${TASKS:-3 6 8}"
+TRAIN_STARTS="${TRAIN_STARTS:-0 5 10 15 20 25}"
+EVAL_STARTS="${EVAL_STARTS:-30 35 40}"
+LADDER="${LADDER:-1 2 4 6 8 10 12 16 20}"
+NENV="${NENV:-5}"
+EVAL_SEED="${EVAL_SEED:-777}"
+LR="${LR:-1e-2}"
+HALVINGS="${HALVINGS:-12}"
+CKPT="${CKPT:-ZibinDong/SmolVLM2-2.2B-ActionCodec-BAR-LIBERO}"
+case "$HEADTAG" in
+  s0) HEAD="${HEAD:-data/k11d/d1_mlp_coef_0.001_wd0_s0.pt}"; D1SEED=0 ;;
+  s1) HEAD="${HEAD:-data/k11d/d1_mlp_coef_0.001_wd0_s1.pt}"; D1SEED=1 ;;
+  *) echo "голова должна быть s0 или s1"; exit 1 ;;
+esac
+TAG="${TAG:-${HEADTAG}_sig${SIGMA}_rl${RL_SEED}_t$(echo $TASKS | tr -d ' ')}"
+ROOT="${ROOT:-data/k12j/$TAG}"
+LOG="${LOG:-logs/k12j/$TAG.log}"
+PY="${PY:-python}"
+ENVP=(env PYTHONPATH="$HOME/LIBERO" MUJOCO_GL=egl)
+
+mkdir -p "$ROOT" "$(dirname "$LOG")"
+[ -f "$HEAD" ] || { echo "нет головы D1: $HEAD"; exit 1; }
+[ -s data/k12d/cb0.pt ] || { echo "нет data/k12d/cb0.pt: создайте её однажды "\
+"через --cb0-only"; exit 1; }
+
+say () { echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG"; }
+
+# --- состав прогона фиксируется один раз и дальше только сверяется ---------
+CFG="$ROOT/config.json"
+NEW=$(printf '{"d1_seed":%d,"rl_seed":%d,"sigma":%s,"tasks":"%s","train_starts":"%s","eval_starts":"%s","n_envs":%d,"eval_eps_seed":%d,"head":"%s","script_sha1":"%s"}' \
+  "$D1SEED" "$RL_SEED" "$SIGMA" "$TASKS" "$TRAIN_STARTS" "$EVAL_STARTS" \
+  "$NENV" "$EVAL_SEED" "$HEAD" \
+  "$($PY -c "import hashlib,sys;print(hashlib.sha1(open('experiments/k12d_rollout.py','rb').read()).hexdigest()[:12])")")
+if [ -f "$CFG" ]; then
+  if [ "$(cat "$CFG")" != "$NEW" ]; then
+    echo "конфигурация каталога $ROOT не совпадает с запрошенной:"
+    echo "  было:  $(cat "$CFG")"
+    echo "  стало: $NEW"
+    echo "старые файлы не трогаю — задайте другой TAG"; exit 1
+  fi
+else
+  printf '%s' "$NEW" > "$CFG"
+fi
+
+# --- раскатка: $1 рука, $2 каталог, $3 starts, $4 resume, $5 принято шагов --
+roll () {
+  local arm="$1" dir="$2" starts="$3" resume="$4" step="$5" rc out ext sg
+  mkdir -p "$dir"
+  # расширение и ожидаемая sigma — по руке, без цепочек && ||, где первый же
+  # ложный шаг молча меняет смысл выражения
+  case "$arm" in
+    policy)              ext="pt";   sg="$SIGMA" ;;
+    g0|g_rl)             ext="json"; sg="$SIGMA" ;;
+    baseline|g_rl_mean)  ext="json"; sg="0.0" ;;
+    *) say "неизвестная рука $arm"; return 1 ;;
+  esac
+  for T in $TASKS; do
+    for S in $starts; do
+      out="$dir/t${T}_s${S}.$ext"
+      $PY experiments/k12j_cell_ok.py "$out" arm="$arm" sigma="$sg" \
+        step_index="$step" task_id="$T" init_start="$S" d1_seed="$D1SEED" \
+        rl_seed="$RL_SEED" >/dev/null 2>>"$LOG"
+      case $? in
+        0) continue ;;                      # годная ячейка уже есть
+        2) say "ЯЧЕЙКА $out ЕСТЬ, НО ОТ ДРУГОЙ КОНФИГУРАЦИИ — остановка"
+           return 2 ;;
+      esac
+      local a=(--stage diag --arm "$arm" --task-suite 10 --task-id "$T"
+               --init-start "$S" --n-envs "$NENV" --device "$DEV"
+               --rl-seed "$RL_SEED" --step-index "$step" --ckpt "$CKPT"
+               --head-ckpt "$HEAD" --expect-d1-seed "$D1SEED"
+               --replica "dev_${HEADTAG}_rl${RL_SEED}" --out "$out")
+      case "$arm" in
+        baseline) ;;
+        g_rl_mean) ;;
+        policy)   a+=(--sigma "$SIGMA" --eps-mode train) ;;
+        g0|g_rl)  a+=(--sigma "$SIGMA" --eps-mode eval
+                      --eval-eps-seed "$EVAL_SEED" --no-buffer) ;;
+      esac
+      [ -n "$resume" ] && a+=(--resume-head "$resume")
+      "${ENVP[@]}" "$PY" experiments/k12d_rollout.py "${a[@]}" >> "$LOG" 2>&1
+      rc=$?
+      [ "$rc" -eq 0 ] || { say "ОТКАЗ $arm t$T s$S rc=$rc"; return 1; }
+    done
+  done
+  return 0
+}
+
+head_path () { printf "%s/head_after_%04d.pt" "$ROOT" "$1"; }
+
+# --- сколько обновлений уже принято ---------------------------------------
+DONE=0
+while [ -s "$(head_path $((DONE + 1)))" ]; do DONE=$((DONE + 1)); done
+say "принято обновлений: $DONE, цель $TARGET (каталог $ROOT)"
+
+# --- опорные руки считаются один раз --------------------------------------
+say "=== опорные руки на отложенных состояниях ($EVAL_STARTS) ==="
+roll baseline "$ROOT/eval_d1_det" "$EVAL_STARTS" "" 0 || exit 1
+roll g0       "$ROOT/eval_g0"     "$EVAL_STARTS" "" 0 || exit 1
+
+in_ladder () { for L in $LADDER; do [ "$L" -eq "$1" ] && return 0; done; return 1; }
+
+evaluate () {
+  local n="$1" hp; hp="$(head_path "$n")"
+  say "=== оценка после $n обновлений ==="
+  roll g_rl      "$ROOT/eval_g_rl_step$n"      "$EVAL_STARTS" "$hp" "$n" || return 1
+  roll g_rl_mean "$ROOT/eval_g_rl_mean_step$n" "$EVAL_STARTS" "$hp" "$n" || return 1
+}
+
+# уже принятые шаги, попавшие в лестницу: evaluate идемпотентна — годные
+# ячейки она пропустит после сверки конфигурации, а недостающие досчитает.
+# Угадывать имя первой ячейки, чтобы решить, считать ли, значило бы снова
+# полагаться на имя файла вместо его содержимого.
+for n in $LADDER; do
+  [ "$n" -le "$DONE" ] || continue
+  evaluate "$n" || exit 1
+done
+
+while [ "$DONE" -lt "$TARGET" ]; do
+  N=$DONE; K=$((DONE + 1))
+  PREV=""; [ "$N" -gt 0 ] && PREV="$(head_path "$N")"
+  say "=== обновление $K: свежий буфер политикой после $N обновлений ==="
+  roll policy "$ROOT/train_after_$N" "$TRAIN_STARTS" "$PREV" "$N" || exit 1
+  say "=== обновление $K: градиент ==="
+  ARGS=(--stage diag --rollouts "$(ls "$ROOT/train_after_$N"/*.pt | tr '\n' ',')"
+        --replica "dev_${HEADTAG}_rl${RL_SEED}" --head-ckpt "$HEAD"
+        --step-index "$N" --rl-seed "$RL_SEED" --cb0 data/k12d/cb0.pt
+        --lr "$LR" --halvings "$HALVINGS" --device "$DEV"
+        --out-head "$(head_path "$K")" --out "$ROOT/step_$K.json")
+  [ -n "$PREV" ] && ARGS+=(--resume-head "$PREV")
+  "$PY" experiments/k12e_pg_step.py "${ARGS[@]}" 2>&1 | tee -a "$LOG"
+  rc=${PIPESTATUS[0]}
+  [ "$rc" -eq 0 ] || { say "ШАГ $K ОТКАЗАЛ rc=$rc"; exit 1; }
+  [ -s "$(head_path "$K")" ] || { say "ШАГ $K НЕ ПРИНЯТ (no_step) — остановка"
+                                  exit 3; }
+  DONE=$K
+  in_ladder "$K" && { evaluate "$K" || exit 1; }
+done
+
+say "=== готово: принято $DONE обновлений ==="
+echo "$PY experiments/k12i_smoke_report.py --root $ROOT" | tee -a "$LOG"

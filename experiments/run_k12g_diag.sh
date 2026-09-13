@@ -34,7 +34,9 @@ for SU in ${SUITES//,/ }; do
   LOG="$LOGDIR/diag_$SU.log"
   for T in $TASKS; do
     for S in $STARTS; do
-      OUT="$OUTDIR/${SU}_t${T}_s${S}.json"
+      # ИМЯ ВКЛЮЧАЕТ СИД D1: иначе прогон для s1 пропустил бы файл,
+      # созданный для s0, и вторая голова осталась бы неизмеренной
+      OUT="$OUTDIR/${SU}_d1${D1SEED}_t${T}_s${S}.json"
       if [ -s "$OUT" ]; then skip_n=$((skip_n+1)); continue; fi
       echo "[$(date +%H:%M:%S)] $SU задача $T состояния $S..$((S+NENV-1))" \
         | tee -a "$LOG"

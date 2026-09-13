@@ -120,19 +120,23 @@ def diag_summary(cells):
                          f"{bad[:5]}")
     by = {}
     for c in cells:
-        key = (str(c.get("suite")), int(c["task_ids"][0]))
-        r = by.setdefault(key, dict(n=0, ok=0, states=set(),
-                                    d1_seed=c.get("d1_seed")))
+        # КЛЮЧ ВКЛЮЧАЕТ СИД D1 И РУКУ. Без сида результаты двух голов
+        # складывались бы в одну строку, и доля провалов «в среднем по двум
+        # головам» не относилась бы ни к одной из них.
+        key = (str(c.get("suite")), int(c["task_ids"][0]),
+               (None if c.get("d1_seed") is None else int(c["d1_seed"])),
+               str(c.get("arm")))
+        r = by.setdefault(key, dict(n=0, ok=0, states=set()))
         for e in c["episodes"]:
             r["n"] += 1
             r["ok"] += int(bool(e["success"]))
             r["states"].add(int(e["state_id"]))
     rows, by_suite = [], {}
-    for (su, t), r in sorted(by.items()):
+    for (su, t, sd, arm), r in sorted(by.items(), key=lambda kv: str(kv[0])):
         p = r["ok"] / r["n"]
-        rows.append(dict(suite=su, task_id=t, n=r["n"], success=p,
-                         p_fail=1.0 - p, n_states=len(r["states"])))
-        s_ = by_suite.setdefault(su, dict(n=0, ok=0, tasks=0))
+        rows.append(dict(suite=su, task_id=t, d1_seed=sd, arm=arm, n=r["n"],
+                         success=p, p_fail=1.0 - p, n_states=len(r["states"])))
+        s_ = by_suite.setdefault(f"{su}/d1{sd}", dict(n=0, ok=0, tasks=0))
         s_["n"] += r["n"]
         s_["ok"] += r["ok"]
         s_["tasks"] += 1
@@ -152,18 +156,20 @@ def report_diag(res):
     print(f"\n  ДИАГНОСТИКА: исходная детерминированная D1 на нетронутых "
           f"сюитах.\n  Потолок эффекта равен доле провалов — это и есть "
           f"критерий пригодности сюиты.")
-    print(f"    {'сюита':<10}{'задач':>6}{'эпиз':>6}{'успех':>9}{'провалов':>10}"
+    print(f"    {'сюита/сид':<14}{'задач':>6}{'эпиз':>6}{'успех':>9}"
+          f"{'провалов':>10}"
           f"{'потолок':>9}  пригодна для +5 пп")
     for su, r in sorted(res["by_suite"].items()):
-        print(f"    {su:<10}{r['tasks']:>6}{r['episodes']:>6}"
+        print(f"    {su:<14}{r['tasks']:>6}{r['episodes']:>6}"
               f"{100 * r['success']:>8.2f}%{100 * r['p_fail']:>9.2f}%"
               f"{100 * r['delta_ceiling']:>8.2f}%"
               f"{'   да' if r['usable_for_5pp'] else '   НЕТ'}")
-    print(f"\n    {'сюита':<10}{'задача':>7}{'эпиз':>6}{'успех':>9}"
-          f"{'провалов':>10}")
+    print(f"\n    {'сюита':<10}{'задача':>7}{'сид D1':>7}{'эпиз':>6}"
+          f"{'успех':>9}{'провалов':>10}")
     for r in res["by_task"]:
-        print(f"    {r['suite']:<10}{r['task_id']:>7}{r['n']:>6}"
-              f"{100 * r['success']:>8.2f}%{100 * r['p_fail']:>9.2f}%")
+        print(f"    {r['suite']:<10}{r['task_id']:>7}{str(r['d1_seed']):>7}"
+              f"{r['n']:>6}{100 * r['success']:>8.2f}%"
+              f"{100 * r['p_fail']:>9.2f}%")
     hard = [r for r in res["by_task"] if r["p_fail"] <= 0.0]
     easy = [r for r in res["by_task"] if r["success"] <= 0.2]
     if hard:
@@ -384,12 +390,17 @@ def selftest():
         dgs.append(dict(stage="diag", arm="baseline", suite="object",
                         task_ids=[t], state_ids=list(range(10)), sigma=0.0,
                         d1_seed=0, episodes=eps, _path=f"d{t}.json"))
+    # две головы на тех же задачах не должны схлопываться в одну строку
+    dgs += [dict(d, d1_seed=1, _path=d["_path"] + ".s1") for d in list(dgs)]
     ds = diag_summary(dgs)
-    assert ds["by_suite"]["object"]["tasks"] == 2, ds
-    assert abs(ds["by_suite"]["object"]["p_fail"]
-               - sum(1 for c in dgs for e in c["episodes"]
-                     if not e["success"]) / 20) < 1e-12, ds
-    assert ds["by_suite"]["object"]["usable_for_5pp"] is True
+    assert set(ds["by_suite"]) == {"object/d10", "object/d11"}, ds["by_suite"]
+    assert ds["by_suite"]["object/d10"]["tasks"] == 2, ds
+    # доля провалов считается ПО СВОЕЙ голове, а не по обеим сразу
+    fails_s0 = sum(1 for c in dgs if c.get("d1_seed") == 0
+                   for e in c["episodes"] if not e["success"])
+    assert abs(ds["by_suite"]["object/d10"]["p_fail"]
+               - fails_s0 / 20) < 1e-12, (ds["by_suite"], fails_s0)
+    assert ds["by_suite"]["object/d10"]["usable_for_5pp"] is True
     report_diag(ds)
     _expect(lambda: diag_summary(cells), "не диагностические ячейки")
 

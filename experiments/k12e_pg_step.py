@@ -186,11 +186,14 @@ def check_resume_chain(prev, *, protocol_sha1, replica, step_index, d1_sha,
         bad.append(f"голова реплики {prev.get('replica')}, а прогон реплики "
                    f"{replica}: это смешало бы реплики, которые обязаны быть "
                    f"независимыми")
-    want_prev = int(step_index) - 1
-    if int(prev.get("step_index", -10 ** 9)) != want_prev:
-        bad.append(f"голова с шага {prev.get('step_index')}, а ожидался "
-                   f"{want_prev}: цепочка шагов разорвана, и номер шага "
-                   f"перестал означать число сделанных обновлений")
+    # step_index — ЧИСЛО УЖЕ ПРИНЯТЫХ ОБНОВЛЕНИЙ в политике, которой собран
+    # буфер. Голова после N обновлений несёт N, буфер, снятый ею, тоже N, а шаг
+    # по этому буферу производит N+1. Прежнее «step0 = первый шаг» допускало
+    # два прочтения, и цепочку нельзя было проверить однозначно.
+    if int(prev.get("step_index", -10 ** 9)) != int(step_index):
+        bad.append(f"голова после {prev.get('step_index')} обновлений, а буфер "
+                   f"помечен {step_index}: цепочка разорвана — либо буфер снят "
+                   f"не этой головой, либо пропущено обновление")
     if d1_sha is not None and prev.get("d1_head_sha1") != d1_sha:
         bad.append(f"голова выросла из D1 {prev.get('d1_head_sha1')}, а подан "
                    f"D1 {d1_sha}")
@@ -927,15 +930,17 @@ def selftest():
             "повторяющиеся (задача, состояние, вызов)")
 
     # --- 7. ЦЕПОЧКА ШАГОВ И НЕПРЕРЫВНОСТЬ Adam ----------------------------
+    # голова после одного обновления и буфер, ею снятый, несут одно и то же
+    # число обновлений
     ok_prev = dict(protocol_sha1=proto["sha1"], replica="d10_rl0",
-                   step_index=0, d1_head_sha1="d" * 12, d1_seed=7,
+                   step_index=1, d1_head_sha1="d" * 12, d1_seed=7,
                    sigma=sigma, optimizer_state={"state": {}, "param_groups": []})
     assert check_resume_chain(ok_prev, protocol_sha1=proto["sha1"],
                               replica="d10_rl0", step_index=1,
                               d1_sha="d" * 12, d1_seed=7, sigma=sigma,
                               require_optimizer=True)
     for over, needle in ((dict(replica="d11_rl1"), "смешало бы реплики"),
-                         (dict(step_index=3), "цепочка шагов разорвана"),
+                         (dict(step_index=3), "цепочка разорвана"),
                          (dict(d1_head_sha1="z" * 12), "выросла из D1"),
                          (dict(d1_seed=9), "сид D1"),
                          (dict(sigma=0.2), "обучалась при sigma"),
@@ -1091,7 +1096,10 @@ def main():
     ap.add_argument("--cb0", default="data/k12d/cb0.pt")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--micro", type=int, default=256)
-    ap.add_argument("--step-index", type=int, default=0)
+    ap.add_argument("--step-index", type=int, default=0,
+                    help="сколько обновлений УЖЕ принято в политике, которой "
+                         "собран буфер; результат получит на единицу больше")
+    ap.add_argument("--rl-seed", type=int, default=0)
     ap.add_argument("--out-head", required=False)
     ap.add_argument("--out", required=False)
     args = ap.parse_args()
@@ -1288,19 +1296,25 @@ def main():
         # следующая команда создала бы новый Adam с нулевыми моментами: точный
         # откат внутри одной попытки есть, а непрерывности между шагами не
         # было бы, и зарегистрированный алгоритм не выполнялся бы.
+        # АТОМАРНАЯ ЗАПИСЬ: оборванное сохранение оставило бы голову, которую
+        # следующий шаг принял бы за целую
+        tmp_head = args.out_head + f".tmp.{os.getpid()}"
         torch.save(dict(state={k: v.detach().cpu()
                               for k, v in head.state_dict().items()},
                         optimizer_state=opt.state_dict(), stage=args.stage,
                         protocol_sha1=proto["sha1"], replica=args.replica,
-                        step_index=int(args.step_index), sigma=sigma,
+                        # +1: столько обновлений теперь принято
+                        step_index=int(args.step_index) + 1, sigma=sigma,
                         d1_head_sha1=d1_sha, d1_seed=d1_seed,
                         prev_head_sha1=(None if prev is None else
                                         k9h.file_sha12(args.resume_head)),
-                        policy_sha1_in=policy_sha,
+                        policy_sha1_in=policy_sha, rl_seed=args.rl_seed,
                         lr_used=rec["lr_used"], halvings=rec["halvings"],
                         from_head=args.resume_head or args.head_ckpt,
-                        order_sha1=buf["order_sha1"]), args.out_head)
-        print(f"голова сохранена: {args.out_head}")
+                        order_sha1=buf["order_sha1"]), tmp_head)
+        os.replace(tmp_head, args.out_head)
+        print(f"голова сохранена: {args.out_head} "
+              f"(принято обновлений: {int(args.step_index) + 1})")
     else:
         print("ШАГА НЕ БЫЛО: ни одно дробление не прошло область доверия; "
               "параметры возвращены побитово")

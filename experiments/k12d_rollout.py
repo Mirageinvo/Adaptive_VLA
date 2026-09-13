@@ -48,6 +48,28 @@ SAT_THR = 0.99
 PREPROCESS = "CenterCrop(196)->Resize(224)"
 
 
+def run_config(args, *, d1_seed, script_sha):
+    """Конфигурация прогона и её хэш. По нему изолируются каталоги.
+
+    Условие «файл непустой» не годится для пропуска готовой ячейки: другая
+    sigma, другой сид или другой список состояний дают файл с тем же именем и
+    другим смыслом. Хэш собирается из всего, что меняет смысл ячейки.
+    """
+    cfg = dict(d1_seed=int(d1_seed), rl_seed=int(args.rl_seed),
+               sigma=(0.0 if args.arm in ("baseline", "g_rl_mean")
+                      else round(float(args.sigma), 6)),
+               arm=args.arm, suite=str(args.task_suite),
+               task_id=int(args.task_id), init_start=int(args.init_start),
+               n_envs=int(args.n_envs), horizon=int(args.horizon),
+               max_steps=int(args.max_steps),
+               waiting_steps=int(args.waiting_steps),
+               eps_mode=(args.eps_mode or ""),
+               eval_eps_seed=args.eval_eps_seed,
+               step_index=int(args.step_index), script_sha1=script_sha)
+    blob = json.dumps(cfg, sort_keys=True, ensure_ascii=False)
+    return cfg, hashlib.sha1(blob.encode()).hexdigest()[:12]
+
+
 def exec_fields(args, *, joint_sha, pos_off, off_sha, ckpt_fp, ckpt_path,
                 hf_revision):
     """Поля условий исполнения — ОДИН набор на оба этапа.
@@ -656,11 +678,14 @@ def main() -> None:
     ap.add_argument("--stage", default="train",
                     choices=["train", "dev", "final", "diag"])
     ap.add_argument("--arm", default="policy",
-                    choices=["policy", "g0", "g_rl", "baseline"],
+                    choices=["policy", "g0", "g_rl", "g_rl_mean", "baseline"],
                     help="baseline — детерминированная D1; g0 — гауссова "
                          "голова БЕЗ RL; g_rl — она же после RL. Главное "
                          "сравнение g_rl минус g0, а не минус baseline: иначе "
-                         "выигрыш может объясняться одним шумом")
+                         "выигрыш может объясняться одним шумом. g_rl_mean — "
+                         "обученная голова, исполняемая по среднему u=mu: "
+                         "показывает, сдвинулось ли САМО среднее политики, а "
+                         "не только её стохастическое исполнение")
     ap.add_argument("--eps-mode", default=None, choices=["train", "eval"],
                     help="train — шум зависит от номера шага; eval — только от "
                          "--eval-eps-seed")
@@ -721,10 +746,14 @@ def main() -> None:
             need.append("out")
         # у опорной руки нет ни реплики, ни sigma: она детерминированная и
         # зависит только от сида D1 — см. k12b_protocol.check_run
-        need += [] if args.arm == "baseline" else ["replica", "sigma"]
+        need += ([] if args.arm in ("baseline", "g_rl_mean")
+             else ["replica", "sigma"])
         for nm in need:
             if getattr(args, nm) in (None, ""):
                 ap.error(f"нужен --{nm.replace('_', '-')}")
+        if args.arm == "g_rl_mean" and not args.resume_head:
+            ap.error("--arm g_rl_mean без --resume-head: без обученной головы "
+                     "это просто D1")
         if args.arm in ("baseline", "g0") and args.resume_head:
             ap.error(f"--resume-head у руки {args.arm}: и опора, и g0 — это "
                      f"ИСХОДНЫЕ политики, от которых отсчитывается эффект RL")
@@ -765,7 +794,9 @@ def run(args):
     # нельзя получить ни одного зарегистрированного числа.
     diag = (args.stage == "diag")
     proto = None if diag else kb.load_protocol(args.protocol)
-    det_mode = (args.arm == "baseline")
+    # ДЕТЕРМИНИРОВАННОЕ ИСПОЛНЕНИЕ — у опоры И у g_rl_mean: обе исполняют
+    # среднее, отличаются только весами головы
+    det_mode = args.arm in ("baseline", "g_rl_mean")
     eps_mode = args.eps_mode or ("eval" if args.arm in ("g0", "g_rl")
                                  else "train")
     if diag and not det_mode:
@@ -1099,6 +1130,9 @@ def run(args):
     ex = exec_fields(args, joint_sha=joint_sha, pos_off=pos_off,
                      off_sha=off_sha, ckpt_fp=ckpt_fp, ckpt_path=ckpt_path,
                      hf_revision=hf_rev)
+    cfg, cfg_sha = run_config(args, d1_seed=d1_seed,
+                              script_sha=k9h.file_sha12(
+                                  os.path.abspath(__file__)))
     ex.update(script_sha1=k9h.file_sha12(os.path.abspath(__file__)),
               step_script_sha1=k9h.file_sha12(k12e.__file__),
               hicora_g_sha1=k9h.file_sha12(hg.__file__),
@@ -1138,6 +1172,7 @@ def run(args):
                     eval_seed=args.eval_eps_seed)
     eps_hash_all = hashlib.sha1()
     eps_hash_first = None
+    eps_by_call = []          # хэш реализации на каждом вызове политики
 
     def decode_latent(z):
         x, _ = codec._decode(z.float(), embodiment_ids=0)
@@ -1229,8 +1264,14 @@ def run(args):
                     eb = np.ascontiguousarray(
                         eps.detach().float().cpu().numpy()).tobytes()
                     eps_hash_all.update(eb)
+                    hc = hashlib.sha1(eb).hexdigest()[:16]
+                    # ПОВЫЗОВНЫЕ ХЭШИ, а не только первый: после расхождения
+                    # траекторий число вызовов у двух политик разное, и сверять
+                    # можно лишь общий префикс — но сверять надо ФАКТИЧЕСКИЕ
+                    # реализации, а не совпадение метаданных о сиде
+                    eps_by_call.append(hc)
                     if eps_hash_first is None:
-                        eps_hash_first = hashlib.sha1(eb).hexdigest()[:16]
+                        eps_hash_first = hc
                     o_exec = gau_h(h32, z32, u=o_mean["mu"] + sigma * eps)
                 if not parity["ok"]:
                     dz_d, _c = det_cur(h32, z32)
@@ -1320,9 +1361,12 @@ def run(args):
         stage=args.stage, replica=(None if det_mode else args.replica),
         d1_seed=(int(d1_seed) if d1_seed is not None else None),
         step_index=int(args.step_index), sigma=sigma, episodes=eps_rows,
+        run_config=cfg, run_config_sha1=cfg_sha,
         eps_mode=eps_mode, eval_eps_seed=args.eval_eps_seed,
         eps_salt=int(salt), eps_sha1_first=eps_hash_first,
+        eps_sha1_by_call=eps_by_call,
         eps_sha1_all=eps_hash_all.hexdigest()[:16],
+        rl_seed=int(args.rl_seed),
         task_ids=[int(args.task_id)], state_ids=state_ids,
         ckpt_sha1=(head_sha if det_mode
                    else (None if args.resume_head is None
@@ -1375,8 +1419,9 @@ def run(args):
         rho_norm=rho_norm, hicora_seed=h_obj.get("seed"),
         selected_epoch=h_obj.get("selected_epoch"),
         resume_head=args.resume_head, eps_salt=int(salt),
+        run_config=cfg, run_config_sha1=cfg_sha,
         eps_mode=eps_mode, eval_eps_seed=args.eval_eps_seed,
-        eps_sha1_first=eps_hash_first,
+        eps_sha1_first=eps_hash_first, eps_sha1_by_call=eps_by_call,
         eps_sha1_all=eps_hash_all.hexdigest()[:16],
         rl_seed=int(args.rl_seed), rollout_seed=roll_seed,
         task_description=task_desc, init_start=int(args.init_start),
