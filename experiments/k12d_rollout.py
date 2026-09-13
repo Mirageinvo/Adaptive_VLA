@@ -279,6 +279,27 @@ def check_orchestration(path=None):
             raise AssertionError(f"в main нет вызова {a} или {b}")
         if seq.index(a) > seq.index(b):
             raise AssertionError(f"{a} вызывается после {b}: {why}")
+    # ЗАТЕНЕНИЕ КОНФИГУРАЦИИ МОДЕЛИ. `cfg` в run — это объект настроек модели,
+    # у которого читаются cfg.MODEL...; присваивание того же имени чему-то ещё
+    # ломает вызов политики в середине раскатки, где ошибку уже дорого ловить.
+    cfg_srcs = set()
+    for node in ast.walk(fn[0]):
+        if isinstance(node, ast.Assign):
+            names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            names += [e.id for t in node.targets
+                      if isinstance(t, ast.Tuple)
+                      for e in t.elts if isinstance(e, ast.Name)]
+            if "cfg" not in names:
+                continue
+            val = node.value          # не src: им ниже проверяется текст файла
+            fname = getattr(getattr(val, "func", None), "id", None)
+            cfg_srcs.add(fname or type(val).__name__)
+    if cfg_srcs - {"get_cfg"}:
+        raise AssertionError(
+            f"имя cfg в run присваивается не только из get_cfg, а из "
+            f"{sorted(cfg_srcs)}: это затеняет конфигурацию модели, от которой "
+            f"читается cfg.MODEL")
+
     # КАЖДОЕ ОБРАЩЕНИЕ К proto ВНУТРИ run ОБЯЗАНО БЫТЬ ПОД УСЛОВИЕМ С diag.
     # В диагностике протокола нет, proto равен None, и незащищённое обращение
     # даёт TypeError — но не сразу, а когда до него дойдёт выполнение: ветка
@@ -1130,9 +1151,11 @@ def run(args):
     ex = exec_fields(args, joint_sha=joint_sha, pos_off=pos_off,
                      off_sha=off_sha, ckpt_fp=ckpt_fp, ckpt_path=ckpt_path,
                      hf_revision=hf_rev)
-    cfg, cfg_sha = run_config(args, d1_seed=d1_seed,
-                              script_sha=k9h.file_sha12(
-                                  os.path.abspath(__file__)))
+    # ИМЯ rcfg, А НЕ cfg: ниже cfg — это конфигурация модели (cfg.MODEL...),
+    # и одноимённая переменная её затеняла
+    rcfg, rcfg_sha = run_config(args, d1_seed=d1_seed,
+                                script_sha=k9h.file_sha12(
+                                    os.path.abspath(__file__)))
     ex.update(script_sha1=k9h.file_sha12(os.path.abspath(__file__)),
               step_script_sha1=k9h.file_sha12(k12e.__file__),
               hicora_g_sha1=k9h.file_sha12(hg.__file__),
@@ -1361,7 +1384,7 @@ def run(args):
         stage=args.stage, replica=(None if det_mode else args.replica),
         d1_seed=(int(d1_seed) if d1_seed is not None else None),
         step_index=int(args.step_index), sigma=sigma, episodes=eps_rows,
-        run_config=cfg, run_config_sha1=cfg_sha,
+        run_config=rcfg, run_config_sha1=rcfg_sha,
         eps_mode=eps_mode, eval_eps_seed=args.eval_eps_seed,
         eps_salt=int(salt), eps_sha1_first=eps_hash_first,
         eps_sha1_by_call=eps_by_call,
@@ -1419,7 +1442,7 @@ def run(args):
         rho_norm=rho_norm, hicora_seed=h_obj.get("seed"),
         selected_epoch=h_obj.get("selected_epoch"),
         resume_head=args.resume_head, eps_salt=int(salt),
-        run_config=cfg, run_config_sha1=cfg_sha,
+        run_config=rcfg, run_config_sha1=rcfg_sha,
         eps_mode=eps_mode, eval_eps_seed=args.eval_eps_seed,
         eps_sha1_first=eps_hash_first, eps_sha1_by_call=eps_by_call,
         eps_sha1_all=eps_hash_all.hexdigest()[:16],
