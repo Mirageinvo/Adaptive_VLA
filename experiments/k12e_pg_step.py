@@ -1186,13 +1186,29 @@ def main():
                            require_optimizer=True, stage=args.stage)
         head.load_state_dict({k: v.to(dev, torch.float32)
                               for k, v in prev["state"].items()})
-        policy_sha = k9h.file_sha12(args.resume_head)
+        policy_file_sha = k9h.file_sha12(args.resume_head)
     else:
         if int(args.step_index) != 0:
             raise SystemExit(f"--step-index {args.step_index} без "
                              f"--resume-head: шаг не первый, а голова взята "
                              f"исходная, то есть предыдущий шаг потерян")
-        policy_sha = d1_sha
+        policy_file_sha = d1_sha
+    # SIGMA ЗАДАЁТСЯ ДО ВЫЧИСЛЕНИЯ ХЭША ПОЛИТИКИ. Хэш берётся от состояния,
+    # которым политика действительно исполняется, а log_std входит в это
+    # состояние: посчитав его раньше, мы сравнивали бы голову с начальной
+    # log_std против раскатки, где она уже равна log(sigma).
+    with torch.no_grad():
+        head.log_std.fill_(float(np.log(sigma)))
+    std = head.std().detach()
+    if abs(float(std.max()) - sigma) > 1e-6 or \
+            float(std.min()) != float(std.max()):
+        raise SystemExit(f"std головы {float(std.max())} не равна sigma "
+                         f"{sigma}")
+
+    # ТОЖДЕСТВО ПОЛИТИКИ — ПО ВЕСАМ, А НЕ ПО ФАЙЛУ: хэш файла меняется от
+    # любого пересохранения при тех же весах.
+    policy_sha = tensor_sha(head.state_dict().items())
+
     # РАСКАТКИ ОБЯЗАНЫ БЫТЬ СОБРАНЫ ИМЕННО ЭТОЙ ПОЛИТИКОЙ. Иначе обновление
     # идёт по сэмплам другой политики без всякой поправки, и отношение
     # правдоподобий стартует не с единицы — это уже не тот алгоритм
@@ -1204,13 +1220,6 @@ def main():
     if roll_step != {int(args.step_index)}:
         raise SystemExit(f"раскатки с шага {sorted(roll_step)}, а шаг "
                          f"{args.step_index}")
-    with torch.no_grad():
-        head.log_std.fill_(float(np.log(sigma)))
-    std = head.std().detach()
-    if abs(float(std.max()) - sigma) > 1e-6 or \
-            float(std.min()) != float(std.max()):
-        raise SystemExit(f"std головы {float(std.max())} не равна sigma "
-                         f"{sigma}")
     if sg.get("train_log_std"):
         raise SystemExit("протокол разрешает учить log_std, а этот шаг его "
                          "морозит: расхождение кода и регистрации")
@@ -1278,7 +1287,8 @@ def main():
                resume_head=args.resume_head,
                resume_head_sha1=(None if prev is None
                                  else k9h.file_sha12(args.resume_head)),
-               policy_sha1=policy_sha, d1_head_sha1=d1_sha, d1_seed=d1_seed,
+               policy_sha1=policy_sha, policy_file_sha1=policy_file_sha,
+               d1_head_sha1=d1_sha, d1_seed=d1_seed,
                adam_resumed=adam_info, cb0_sha1=cb_sha,
                device=str(dev), dtype="float32",
                torch_version=torch.__version__,
@@ -1308,7 +1318,9 @@ def main():
                         d1_head_sha1=d1_sha, d1_seed=d1_seed,
                         prev_head_sha1=(None if prev is None else
                                         k9h.file_sha12(args.resume_head)),
-                        policy_sha1_in=policy_sha, rl_seed=args.rl_seed,
+                        policy_sha1_in=policy_sha,
+                        policy_file_sha1_in=policy_file_sha,
+                        rl_seed=args.rl_seed,
                         lr_used=rec["lr_used"], halvings=rec["halvings"],
                         from_head=args.resume_head or args.head_ckpt,
                         order_sha1=buf["order_sha1"]), tmp_head)

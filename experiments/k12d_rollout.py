@@ -1119,7 +1119,7 @@ def run(args):
                                 require_optimizer=False, stage=args.stage)
         gau_h.load_state_dict({k: v.to(dev, torch.float32)
                                for k, v in sd["state"].items()})
-        policy_sha = k9h.file_sha12(args.resume_head)
+        policy_file_sha = k9h.file_sha12(args.resume_head)
         print(f"  продолжение от {args.resume_head} (шаг "
               f"{sd.get('step_index')}), политика {policy_sha}", flush=True)
     else:
@@ -1127,7 +1127,7 @@ def run(args):
             raise SystemExit(f"--step-index {args.step_index} без "
                              f"--resume-head: раскатка шла бы исходной D1, а "
                              f"помечалась бы номером шага, которого не было")
-        policy_sha = head_sha
+        policy_file_sha = head_sha
     # ДЕЙСТВУЮЩИЕ ВЕСА ПЕРЕНОСЯТСЯ В ДЕТЕРМИНИРОВАННУЮ ГОЛОВУ: паритет и
     # forward_hicora обязаны проверяться против той политики, которая
     # исполняется, а не против той, с которой всё начиналось
@@ -1151,6 +1151,13 @@ def run(args):
             raise SystemExit(f"std политики {float(std.max())} не равна sigma "
                              f"{sigma}: действие сэмплировалось бы под одним "
                              f"распределением, а правдоподобие под другим")
+
+    # ТОЖДЕСТВО ПОЛИТИКИ — ПО ВЕСАМ, А НЕ ПО ФАЙЛУ. Хэш файла меняется от
+    # любого пересохранения (перенос правил метку шага — веса те же, байты
+    # другие), и две ячейки одной политики выглядели бы снятыми разными.
+    # Хэш считается ПОСЛЕ загрузки продолжения и после установки log_std,
+    # то есть от того состояния, которым действительно исполняется политика.
+    policy_sha = k12e.tensor_sha(gau_h.state_dict().items())
 
     # УСЛОВИЯ ИСПОЛНЕНИЯ И ПРОБНАЯ СБОРКА МЕТЫ — ДО РАСКАТКИ. Ошибка в полях
     # ячейки обнаруживалась в самом конце: раскатка отработала, буфер собран, а
@@ -1406,6 +1413,7 @@ def run(args):
         task_description=task_desc, image_size=224, init_start=int(
             args.init_start), rollout_seed=roll_seed, parity=parity,
         device=str(dev), head_sha1=head_sha, policy_sha1=policy_sha,
+        policy_file_sha1=policy_file_sha,
         res_norm_sha1=rn_sha, basis_sha1=h_obj["basis_sha1"],
         rho_sha1=h_obj["rho_sha1"], rho_norm=rho_norm,
         protocol_script_sha1=k9h.file_sha12(kb.__file__),
@@ -1442,7 +1450,8 @@ def run(args):
         replica=args.replica, stage=args.stage,
         step_index=int(args.step_index), sigma=sigma, episodes=eps_rows,
         d_hidden=d_h, rank=int(h_obj["rank"]), head_sha1=head_sha,
-        policy_sha1=policy_sha, d1_seed=d1_seed,
+        policy_sha1=policy_sha, policy_file_sha1=policy_file_sha,
+        d1_seed=d1_seed,
         resume_head_sha1=(None if not args.resume_head
                           else k9h.file_sha12(args.resume_head)),
         codebooks_sha1=cb_sha, cb0_sha1=cb0_sha,
