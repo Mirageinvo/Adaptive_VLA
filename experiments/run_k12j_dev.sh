@@ -106,7 +106,8 @@ roll () {
                --replica "dev_${HEADTAG}_rl${RL_SEED}" --out "$out")
       case "$arm" in
         baseline) ;;
-        g_rl_mean) ;;
+        # sigma ВЕТВИ: исполняется среднее, но голова должна быть из этой ветви
+        g_rl_mean) a+=(--sigma "$SIGMA") ;;
         policy)   a+=(--sigma "$SIGMA" --eps-mode train) ;;
         g0|g_rl)  a+=(--sigma "$SIGMA" --eps-mode eval
                       --eval-eps-seed "$EVAL_SEED" --no-buffer) ;;

@@ -43,6 +43,33 @@ def plan(src, dst):
     return out
 
 
+def relabel(dst, replica):
+    """Переименовать реплику у уже перенесённых голов, записав прежнее имя.
+
+    Метка реплики участвует в проверке цепочки — она не даёт смешать прогоны.
+    Старый раннер писал `smoke_s0`, новый использует `dev_s0_rl0`, и без
+    переименования продолжение отказывает по делу. Прежнее имя сохраняется:
+    переименование — операция, о которой попросили, а не потеря происхождения.
+    """
+    import re
+    import torch
+    done = []
+    for f in sorted(os.listdir(dst)):
+        if not re.fullmatch(r"head_after_\d{4}\.pt", f):
+            continue
+        path = os.path.join(dst, f)
+        obj = torch.load(path, map_location="cpu", weights_only=False)
+        if obj.get("replica") == replica:
+            continue
+        obj["relabeled_replica_was"] = obj.get("replica")
+        obj["replica"] = replica
+        tmp = path + f".tmp.{os.getpid()}"
+        torch.save(obj, tmp)
+        os.replace(tmp, path)
+        done.append((f, obj["relabeled_replica_was"], replica))
+    return done
+
+
 def migrate(src, dst, *, apply=False):
     import torch
     os.makedirs(dst, exist_ok=True)
@@ -143,6 +170,19 @@ def selftest():
     # повторный перенос ничего не трогает
     done2, skipped2 = migrate(src, dst, apply=True)
     assert not done2 and len(skipped2) == 4, (done2, skipped2)
+    # переименование реплики: прежнее имя сохраняется
+    o = torch.load(os.path.join(dst, "head_after_0001.pt"), map_location="cpu",
+                   weights_only=False)
+    o["replica"] = "smoke_s0"
+    torch.save(o, os.path.join(dst, "head_after_0001.pt"))
+    ch = relabel(dst, "dev_s0_rl0")
+    assert ch and ch[0][1] == "smoke_s0" and ch[0][2] == "dev_s0_rl0", ch
+    o = torch.load(os.path.join(dst, "head_after_0001.pt"), map_location="cpu",
+                   weights_only=False)
+    assert o["replica"] == "dev_s0_rl0" and o["relabeled_replica_was"] == \
+        "smoke_s0", o
+    assert relabel(dst, "dev_s0_rl0") == [], "повторное переименование не пусто"
+
     # разрыв цепочки виден
     os.remove(os.path.join(dst, "head_after_0001.pt"))
     try:
@@ -159,6 +199,9 @@ def main():
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--src")
     ap.add_argument("--dst")
+    ap.add_argument("--replica",
+                    help="новая метка реплики для перенесённых голов, "
+                         "например dev_s0_rl0")
     ap.add_argument("--apply", action="store_true",
                     help="без него только показывает, что будет скопировано")
     a = ap.parse_args()
@@ -173,6 +216,9 @@ def main():
               + (f" (step_index={k})" if kind == "head" else ""))
     for y, why in skipped:
         print(f"  пропущено: {y} — {why}")
+    if a.apply and a.replica:
+        for f, was, now in relabel(a.dst, a.replica):
+            print(f"  реплика {f}: {was} -> {now}")
     if a.apply:
         n = verify(a.dst)
         print(f"цепочка проверена: {n} принятых обновлений в {a.dst}")

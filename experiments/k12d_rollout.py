@@ -765,10 +765,12 @@ def main() -> None:
         need = ["ckpt", "head_ckpt"]
         if not args.cb0_only:
             need.append("out")
-        # у опорной руки нет ни реплики, ни sigma: она детерминированная и
-        # зависит только от сида D1 — см. k12b_protocol.check_run
-        need += ([] if args.arm in ("baseline", "g_rl_mean")
-             else ["replica", "sigma"])
+        # У ОПОРНОЙ РУКИ нет ни реплики, ни sigma: она детерминированная и
+        # зависит только от сида D1. У g_rl_mean шума тоже нет, но она
+        # принадлежит ветви со своей sigma, и по ней сверяется, что оценивается
+        # голова ИМЕННО ЭТОЙ ветви, а не принесённая из соседней; в ячейку при
+        # этом пишется исполненная sigma, то есть ноль.
+        need += [] if args.arm == "baseline" else ["replica", "sigma"]
         for nm in need:
             if getattr(args, nm) in (None, ""):
                 ap.error(f"нужен --{nm.replace('_', '-')}")
@@ -818,6 +820,8 @@ def run(args):
     # ДЕТЕРМИНИРОВАННОЕ ИСПОЛНЕНИЕ — у опоры И у g_rl_mean: обе исполняют
     # среднее, отличаются только весами головы
     det_mode = args.arm in ("baseline", "g_rl_mean")
+    branch_sigma = (None if args.sigma in (None, "")
+                    else round(float(args.sigma), 6))
     eps_mode = args.eps_mode or ("eval" if args.arm in ("g0", "g_rl")
                                  else "train")
     if diag and not det_mode:
@@ -1106,7 +1110,12 @@ def run(args):
                                                else proto["sha1"]),
                                 replica=args.replica,
                                 step_index=int(args.step_index),
-                                d1_sha=head_sha, d1_seed=d1_seed, sigma=sigma,
+                                d1_sha=head_sha, d1_seed=d1_seed,
+                                # у руки среднего исполненная sigma равна нулю,
+                                # а сверять надо sigma ВЕТВИ, при которой
+                                # голова обучалась
+                                sigma=(branch_sigma
+                                       if args.arm == "g_rl_mean" else sigma),
                                 require_optimizer=False, stage=args.stage)
         gau_h.load_state_dict({k: v.to(dev, torch.float32)
                                for k, v in sd["state"].items()})
