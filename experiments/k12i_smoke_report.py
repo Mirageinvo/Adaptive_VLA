@@ -218,7 +218,34 @@ def paired(a, b, *, label_a, label_b, check_hash=True):
                 success_b=(sum(1 for k in b if b[k][0]) / len(b)) if b else None)
 
 
-def collect(root, ladder=None):
+def check_versions(cells, allow_mixed=False):
+    """Одна версия кода на весь отчёт, либо ЯВНОЕ разрешение смешать.
+
+    Молчаливое смешение результатов до и после исправления ошибки — то, от чего
+    журнал версий не защищает. Но и механический отказ не всегда верен: правка
+    может менять только записываемые поля, не трогая исполнение. Поэтому
+    исключение возможно, но лишь явным флагом и с перечислением расхождений.
+    """
+    import k12b_protocol as kb
+    try:
+        return kb.check_code_version(cells, tag="отчёт")
+    except kb.ProtocolError as e:
+        if not allow_mixed:
+            raise SystemExit(
+                str(e) + "\n  Если расхождение заведомо не влияет на "
+                "траектории (изменились только записываемые поля), повторите "
+                "с --allow-mixed-versions и укажите это в отчёте.")
+        vers = sorted({json.dumps(c.get("code_version"), sort_keys=True)
+                       for c in cells if c.get("code_version")})
+        n_no = sum(1 for c in cells if not c.get("code_version"))
+        print(f"\n  ВНИМАНИЕ: отчёт смешивает {len(vers)} версии кода"
+              + (f" и {n_no} ячеек без записи версии" if n_no else "")
+              + ".\n  Это разрешено явным флагом; расхождение обязано быть "
+                "описано в тексте отчёта.")
+        return None
+
+
+def collect(root, ladder=None, allow_mixed=False):
     det = load_cells(root, "eval_d1_det")
     g0 = load_cells(root, "eval_g0")
     if not det or not g0:
@@ -267,6 +294,11 @@ def collect(root, ladder=None):
         means[k] = episodes(cells)
     if not steps:
         raise SystemExit(f"в {root} нет ни одной оценки g_rl")
+
+    all_cells = list(det) + list(g0)
+    for d in sorted(glob.glob(os.path.join(root, "eval_g_rl*step*"))):
+        all_cells += load_cells(root, os.path.basename(d))
+    check_versions(all_cells, allow_mixed)
 
     tr = train_states(root)
     leak = sorted(set(e_g0) & tr)
@@ -398,7 +430,7 @@ def selftest():
     write("eval_g_rl_mean_step1", "g_rl_mean", lambda t, i: (t + i) % 4 != 0,
           step=1, policy="pol1")
     write_train(0)
-    data = collect(tmp)
+    data = collect(tmp, allow_mixed=True)
     res = report(data, "(тест)")
     r1 = res["rows"][1]["vs_g0"]
     assert r1["recovered"] >= 1 and r1["lost"] == 0 and r1["n"] == 10, r1
@@ -423,13 +455,13 @@ def selftest():
     # 1. результат ДРУГОЙ sigma в том же каталоге
     _redo("eval_g_rl_step2", arm="g_rl", succ_fn=lambda t, i: True, step=2,
           sigma=0.03, policy="pol2")
-    _expect(lambda: collect(tmp), "sigma=0.03 вместо 0.1")
+    _expect(lambda: collect(tmp, allow_mixed=True), "sigma=0.03 вместо 0.1")
     shutil.rmtree(os.path.join(tmp, "eval_g_rl_step2"))
 
     # 2. другие ФАКТИЧЕСКИЕ реализации шума при тех же метаданных
     _redo("eval_g_rl_step2", arm="g_rl", succ_fn=lambda t, i: True, step=2,
           eps_tag="ДРУГОЙ", policy="pol2")
-    _expect(lambda: collect(tmp), "разные случайные числа, а не разные веса")
+    _expect(lambda: collect(tmp, allow_mixed=True), "разные случайные числа, а не разные веса")
     shutil.rmtree(os.path.join(tmp, "eval_g_rl_step2"))
 
     # 3. разные policy_sha1 внутри одной руки
@@ -437,13 +469,13 @@ def selftest():
           policy="pol2", tasks=(0,))
     write("eval_g_rl_step2", "g_rl", lambda t, i: True, step=2,
           policy="ДРУГАЯ", tasks=(1,))
-    _expect(lambda: collect(tmp), "разные policy_sha1")
+    _expect(lambda: collect(tmp, allow_mixed=True), "разные policy_sha1")
     shutil.rmtree(os.path.join(tmp, "eval_g_rl_step2"))
 
     # 4. неполный набор: у шага нет одного блока
     _redo("eval_g_rl_step2", arm="g_rl", succ_fn=lambda t, i: True, step=2,
           policy="pol2", tasks=(0,))
-    _expect(lambda: collect(tmp), "только у одной из рук")
+    _expect(lambda: collect(tmp, allow_mixed=True), "только у одной из рук")
     shutil.rmtree(os.path.join(tmp, "eval_g_rl_step2"))
 
     # 5. дубликат блока
@@ -452,22 +484,22 @@ def selftest():
     d2 = os.path.join(tmp, "eval_g_rl_step2")
     shutil.copy(os.path.join(d2, "t0_s30.json"),
                 os.path.join(d2, "t0_s30_копия.json"))
-    _expect(lambda: collect(tmp), "уже есть в")
+    _expect(lambda: collect(tmp, allow_mixed=True), "уже есть в")
     shutil.rmtree(d2)
 
     # 6. пересечение train и eval — по МЕТАДАННЫМ, а не по имени файла
     write_train(1, states=range(30, 35))
-    _expect(lambda: collect(tmp), "собран градиент")
+    _expect(lambda: collect(tmp, allow_mixed=True), "собран градиент")
     shutil.rmtree(os.path.join(tmp, "train_step1"))
     # и число сред берётся из меты: при n_envs=10 пересечение всё равно видно
     write_train(1, states=range(28, 38), n_envs=10)
-    _expect(lambda: collect(tmp), "собран градиент")
+    _expect(lambda: collect(tmp, allow_mixed=True), "собран градиент")
     shutil.rmtree(os.path.join(tmp, "train_step1"))
 
     # 7. номер шага не тот
     _redo("eval_g_rl_step2", arm="g_rl", succ_fn=lambda t, i: True, step=9,
           policy="pol2")
-    _expect(lambda: collect(tmp), "step_index=9, ожидалось 2")
+    _expect(lambda: collect(tmp, allow_mixed=True), "step_index=9, ожидалось 2")
     shutil.rmtree(os.path.join(tmp, "eval_g_rl_step2"))
 
     # 8. паритет не сошёлся
@@ -477,12 +509,12 @@ def selftest():
         o = json.load(open(f))
         o["parity"] = dict(ok=False, drift_from_d1=0.0)
         json.dump(o, open(f, "w"))
-    _expect(lambda: collect(tmp), "паритет не сошёлся")
+    _expect(lambda: collect(tmp, allow_mixed=True), "паритет не сошёлся")
     shutil.rmtree(d)
 
     # 9. чужая рука в каталоге шага
     _redo("eval_g_rl_step2", arm="g0", succ_fn=lambda t, i: True, step=2)
-    _expect(lambda: collect(tmp), "рука g0 вместо g_rl")
+    _expect(lambda: collect(tmp, allow_mixed=True), "рука g0 вместо g_rl")
     shutil.rmtree(os.path.join(tmp, "eval_g_rl_step2"))
 
     # 10. непарные эпизоды в самой разности
@@ -493,7 +525,7 @@ def selftest():
     _expect(lambda: paired({(0, 30): (True, "h1")}, {(0, 30): (True, "h2")},
                            label_a="a", label_b="b"), "это разные состояния")
 
-    assert collect(tmp)["n_eval"] == 10
+    assert collect(tmp, allow_mixed=True)["n_eval"] == 10
     print("\nсамопроверка k12i_smoke_report пройдена")
 
 
@@ -502,6 +534,9 @@ def main():
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--root", default=None)
     ap.add_argument("--ladder", default="")
+    ap.add_argument("--allow-mixed-versions", action="store_true",
+                    help="разрешить отчёт по ячейкам разных версий кода; "
+                         "расхождение печатается и должно быть описано")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     if a.selftest:
@@ -510,7 +545,7 @@ def main():
     if not a.root:
         ap.error("нужен --root, например data/k12i/s0")
     lad = [int(x) for x in a.ladder.split(",") if x.strip()] or None
-    data = collect(a.root, lad)
+    data = collect(a.root, lad, a.allow_mixed_versions)
     res = report(data, os.path.basename(a.root.rstrip("/")))
     out = a.out or os.path.join(a.root, "smoke_report.json")
     json.dump(dict(root=a.root, sigma=data["sigma"], noise=data["noise"],
