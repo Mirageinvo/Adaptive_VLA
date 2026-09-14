@@ -43,6 +43,47 @@ def plan(src, dst):
     return out
 
 
+def fill_provenance(dst):
+    """Достроить run_config в УЖЕ созданных спутниках.
+
+    Прошлый перенос сделал спутники до того, как появилась эта достройка;
+    переносить заново нечего, а без происхождения раннер пересчитывает готовые
+    буферы. Функция трогает только спутники и только отсутствующее поле.
+    """
+    import torch
+    done = []
+    for d in sorted(os.listdir(dst)):
+        if not d.startswith("train_after_"):
+            continue
+        dd = os.path.join(dst, d)
+        if not os.path.isdir(dd):
+            continue
+        for f in sorted(os.listdir(dd)):
+            if not f.endswith(".pt.meta.json"):
+                continue
+            path = os.path.join(dd, f)
+            meta = json.load(open(path))
+            if "run_config" in meta:
+                continue
+            eps = meta.get("episodes") or []
+            tasks = sorted({int(e["task_id"]) for e in eps
+                            if e.get("task_id") is not None})
+            rc = dict(arm="policy", sigma=meta.get("sigma"),
+                      step_index=meta.get("step_index"),
+                      init_start=meta.get("init_start"),
+                      d1_seed=meta.get("d1_seed"),
+                      rl_seed=meta.get("rl_seed"))
+            if len(tasks) == 1:
+                rc["task_id"] = tasks[0]
+            meta["run_config"] = {k: v for k, v in rc.items() if v is not None}
+            meta["run_config_reconstructed"] = True
+            tmp = path + f".tmp.{os.getpid()}"
+            json.dump(meta, open(tmp, "w"), ensure_ascii=False, default=str)
+            os.replace(tmp, path)
+            done.append(path)
+    return done
+
+
 def relabel(dst, replica):
     """Переименовать реплику у уже перенесённых голов, записав прежнее имя.
 
@@ -105,6 +146,25 @@ def migrate(src, dst, *, apply=False):
                                  weights_only=False)
                 meta = dict(obj.get("meta") or {})
                 meta["migrated_sidecar"] = True
+                # ДОСТРАИВАЕМ ПРОИСХОЖДЕНИЕ ИЗ ТОГО, ЧТО В МЕТЕ ЕСТЬ. Старые
+                # буферы писались до появления run_config, и без него раннер
+                # пересчитал бы их заново — полчаса на шаг. Рука здесь известна
+                # из назначения каталога: train_* — это обучающая раскатка;
+                # задача и состояние берутся из эпизодов, а не из имени файла.
+                if "run_config" not in meta:
+                    eps = meta.get("episodes") or []
+                    tasks = sorted({int(e["task_id"]) for e in eps
+                                    if e.get("task_id") is not None})
+                    rc = dict(arm="policy", sigma=meta.get("sigma"),
+                              step_index=meta.get("step_index"),
+                              init_start=meta.get("init_start"),
+                              d1_seed=meta.get("d1_seed"),
+                              rl_seed=meta.get("rl_seed"))
+                    if len(tasks) == 1:
+                        rc["task_id"] = tasks[0]
+                    meta["run_config"] = {k: v for k, v in rc.items()
+                                          if v is not None}
+                    meta["run_config_reconstructed"] = True
                 tmp = side + f".tmp.{os.getpid()}"
                 json.dump(meta, open(tmp, "w"), ensure_ascii=False,
                           default=str)
@@ -150,9 +210,10 @@ def selftest():
         d = os.path.join(src, f"train_step{k - 1}")
         os.makedirs(d, exist_ok=True)
         # буфер БЕЗ спутника — как у старых прогонов
-        torch.save(dict(meta=dict(step_index=k - 1, arm="policy", sigma=0.1,
-                                  task_id=3, init_start=0, d1_seed=0,
-                                  rl_seed=0),
+        # старый буфер: run_config ещё не писался, arm и task_id отсутствуют
+        torch.save(dict(meta=dict(step_index=k - 1, sigma=0.1, init_start=0,
+                                  d1_seed=0, rl_seed=0,
+                                  episodes=[dict(task_id=3, state_id=0)]),
                         data={}), os.path.join(d, "t0.pt"))
     pl = plan(src, dst)
     assert len(pl) == 4, pl
@@ -164,6 +225,15 @@ def selftest():
     assert os.path.exists(side), "спутник не создан"
     sm = json.load(open(side))
     assert sm["step_index"] == 0 and sm["migrated_sidecar"] is True, sm
+    # происхождение достроено, и по нему ячейка годна для пропуска
+    rc = sm["run_config"]
+    assert rc["arm"] == "policy" and rc["task_id"] == 3 and rc["sigma"] == 0.1, rc
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import k12j_cell_ok as ok
+    conf, miss = ok.compare(sm, dict(arm="policy", sigma=0.1, step_index=0,
+                                     task_id=3, init_start=0, d1_seed=0,
+                                     rl_seed=0))
+    assert conf == [] and miss == [], (conf, miss)
     o = torch.load(os.path.join(dst, "head_after_0001.pt"), map_location="cpu",
                    weights_only=False)
     assert o["step_index"] == 1 and o["migrated_step_index_was"] == 0, o
@@ -216,6 +286,10 @@ def main():
               + (f" (step_index={k})" if kind == "head" else ""))
     for y, why in skipped:
         print(f"  пропущено: {y} — {why}")
+    if a.apply:
+        filled = fill_provenance(a.dst)
+        if filled:
+            print(f"  достроено происхождение у {len(filled)} спутников")
     if a.apply and a.replica:
         for f, was, now in relabel(a.dst, a.replica):
             print(f"  реплика {f}: {was} -> {now}")
