@@ -28,6 +28,11 @@ TRAIN_STARTS="${TRAIN_STARTS:-0 5 10 15 20 25}"
 EVAL_STARTS="${EVAL_STARTS:-30 35 40}"
 LADDER="${LADDER:-1 2 4 6 8 10 12 16 20}"
 NENV="${NENV:-5}"
+# Машина общая: чужой процесс может занять карту целиком, и один такой отказ
+# роняет всю лестницу. Повтор делается ТОЛЬКО при нехватке памяти — по тексту
+# ошибки, а не по коду возврата: слепой повтор прятал бы настоящие ошибки.
+RETRIES="${RETRIES:-3}"
+RETRY_WAIT="${RETRY_WAIT:-300}"
 EVAL_SEED="${EVAL_SEED:-777}"
 LR="${LR:-1e-2}"
 HALVINGS="${HALVINGS:-12}"
@@ -113,9 +118,22 @@ roll () {
                       --eval-eps-seed "$EVAL_SEED" --no-buffer) ;;
       esac
       [ -n "$resume" ] && a+=(--resume-head "$resume")
-      "${ENVP[@]}" "$PY" experiments/k12d_rollout.py "${a[@]}" >> "$LOG" 2>&1
-      rc=$?
-      [ "$rc" -eq 0 ] || { say "ОТКАЗ $arm t$T s$S rc=$rc"; return 1; }
+      local try=0
+      while : ; do
+        "${ENVP[@]}" "$PY" experiments/k12d_rollout.py "${a[@]}" >> "$LOG" 2>&1
+        rc=$?
+        [ "$rc" -eq 0 ] && break
+        if tail -40 "$LOG" | grep -q "OutOfMemoryError" \
+           && [ "$try" -lt "$RETRIES" ]; then
+          try=$((try + 1))
+          say "нехватка памяти на $DEV ($arm t$T s$S), попытка $try из "\
+"$RETRIES через $RETRY_WAIT с"
+          sleep "$RETRY_WAIT"
+          continue
+        fi
+        say "ОТКАЗ $arm t$T s$S rc=$rc"
+        return 1
+      done
     done
   done
   return 0
