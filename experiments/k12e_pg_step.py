@@ -52,25 +52,30 @@ import numpy as np
 def loo_advantage(rewards, tasks):
     """Преимущество с базой leave-one-out внутри задачи.
 
+    `tasks` — ключи задач; для многосюитного набора это ПАРЫ (сюита, задача).
+    Одним числом их различать нельзя: `object/0` и `goal/0` схлопнулись бы в
+    одну задачу, и база вычиталась бы по смеси двух разных распределений.
+
     Возвращает (adv, info). Задача с единственным эпизодом даёт нулевое
     преимущество: базы из «остальных» там нет, и любое другое решение было бы
     молчаливым сравнением эпизода с самим собой.
     """
     r = np.asarray(rewards, dtype=np.float64)
-    t = np.asarray(tasks)
+    keys = [str(x) for x in tasks]
+    t = np.asarray(keys, dtype=object)
     adv = np.zeros_like(r)
     info = dict(by_task={}, singleton_tasks=[], flat_tasks=[])
-    for task in sorted(set(t.tolist())):
-        m = t == task
+    for task in sorted(set(keys)):
+        m = np.array([k == task for k in keys])
         n = int(m.sum())
         rt = r[m]
         if n < 2:
-            info["singleton_tasks"].append(task)
+            info["singleton_tasks"].append(str(task))
             continue
         base = (rt.sum() - rt) / (n - 1)
         adv[m] = rt - base
         if float(rt.std()) == 0.0:
-            info["flat_tasks"].append(task)
+            info["flat_tasks"].append(str(task))
         info["by_task"][str(task)] = dict(n=n, mean_reward=float(rt.mean()),
                                           adv_abs_mean=float(np.abs(
                                               rt - base).mean()))
@@ -105,7 +110,7 @@ def kl_mu(mu_old, mu_new, std):
     return 0.5 * (d * d).flatten(1).sum(-1)
 
 
-def ratio_stats(lp_new, lp_old, ratio_max):
+def ratio_stats(lp_new, lp_old, ratio_max, ratio_hard=None):
     """Хвост отношения правдоподобий — в fp64 И как его увидел бы fp32.
 
     В fp64 считается настоящая величина, а доля нулей в fp32 — то, что
@@ -132,13 +137,26 @@ def ratio_stats(lp_new, lp_old, ratio_max):
         nonfinite=int((~fin).sum()),
         zero_frac_f32=float((r32 == 0).double().mean()),
         inf_frac_f32=float((~torch.isfinite(r32)).double().mean()))
+    import math
     out["logdiff_q99"] = float(d.abs().double().quantile(0.99))
     out["over_frac"] = float((r > ratio_max).double().mean())
     out["under_frac"] = float((r < 1.0 / ratio_max).double().mean())
+    # ПРИЁМКА ПО КВАНТИЛЮ, А НЕ ПО АБСОЛЮТНОМУ МАКСИМУМУ. Максимум растёт с
+    # размером буфера просто потому, что выбросов становится больше: узкий
+    # предел по нему наказывал бы за увеличение буфера, а не за величину шага.
+    # Абсолютный максимум остаётся аварийным предохранителем с широким порогом.
+    lim = math.log(float(ratio_max))
+    hard = (math.log(float(ratio_hard)) if ratio_hard else float("inf"))
+    worst = max(abs(out["logdiff_max"]), abs(out["logdiff_min"]))
+    out["q99_ok"] = bool(out["logdiff_q99"] <= lim)
+    out["hard_ok"] = bool(worst <= hard)
+    out["logdiff_worst"] = worst
+    out["ratio_max_limit"] = float(ratio_max)
+    out["ratio_hard_limit"] = (None if ratio_hard is None
+                               else float(ratio_hard))
     out["ok"] = bool(out["nonfinite"] == 0 and out["zero_frac_f32"] == 0.0
                      and out["inf_frac_f32"] == 0.0
-                     and out["ratio_max"] <= ratio_max
-                     and out["ratio_min"] >= 1.0 / ratio_max)
+                     and out["q99_ok"] and out["hard_ok"])
     return out
 
 
@@ -147,9 +165,13 @@ def accept_step(meas, trust):
     why = []
     if not meas["ratio"]["ok"]:
         r = meas["ratio"]
-        why.append(f"хвост отношения: max {r['ratio_max']:.4g}, min "
-                   f"{r['ratio_min']:.4g}, нулей в fp32 "
-                   f"{100 * r['zero_frac_f32']:.2f}%, нечисел {r['nonfinite']}")
+        why.append(f"хвост отношения: q99 |log r| {r['logdiff_q99']:.4g} при "
+                   f"пределе {np.log(r['ratio_max_limit']):.4g}"
+                   + ("" if r["hard_ok"] else
+                      f"; АВАРИЙНЫЙ предел превышен: |log r| макс "
+                      f"{r['logdiff_worst']:.4g}")
+                   + f"; нулей в fp32 {100 * r['zero_frac_f32']:.2f}%, "
+                     f"нечисел {r['nonfinite']}")
     if meas["kl_mean"] > float(trust["kl_max"]):
         why.append(f"KL среднее {meas['kl_mean']:.5f} > "
                    f"{float(trust['kl_max']):.5f}")
@@ -300,6 +322,13 @@ def check_rollouts(files, proto, *, replica, stage, sigma=None, diag=False):
     # Раньше эти поля писались в ячейку и не сверялись ни с чем: две ячейки с
     # разным горизонтом, числом холостых шагов или базовым чекпойнтом
     # складывались в один обучающий буфер.
+    # ВЕРСИЯ КОДА ОДНА НА ВЕСЬ БУФЕР. Журнал версий фиксирует, что менялось,
+    # но не мешает смешать в одном обновлении ячейки, снятые до и после
+    # исправления ошибки; эта проверка мешает.
+    try:
+        kb.check_code_version([f["meta"] for f in files], tag="буфер")
+    except kb.ProtocolError as e:
+        bad.append(str(e))
     if not diag:
         for f in files:
             m = f["meta"]
@@ -378,6 +407,17 @@ def check_codebook(cb0_t, meta):
     return got
 
 
+def suite_codes(files):
+    """Числовой код сюиты на файл — по отсортированному списку имён.
+
+    В буфере лежат тензоры, а сюита это строка; код нужен, чтобы ключ
+    (сюита, задача, состояние) можно было сравнивать тензорами. Порядок
+    берётся сортировкой, поэтому один и тот же набор всегда даёт те же коды.
+    """
+    names = sorted({str(f["meta"].get("suite")) for f in files})
+    return {n: i for i, n in enumerate(names)}, names
+
+
 def concat_buffer(files, cb0, device):
     """Склейка файлов в один буфер в ФИКСИРОВАННОМ порядке.
 
@@ -388,26 +428,35 @@ def concat_buffer(files, cb0, device):
     import torch
     order = sorted(range(len(files)),
                    key=lambda i: str(files[i]["meta"].get("path")))
+    codes, names = suite_codes(files)
     parts = {k: [] for k in REC_KEYS}
+    suites = []
     ep_rows, h = [], hashlib.sha1()
     for i in order:
         d = files[i]["data"]
         for k in REC_KEYS:
             parts[k].append(d[k])
+        su = str(files[i]["meta"].get("suite"))
+        suites.append(torch.full((d["task"].shape[0],), codes[su],
+                                 dtype=torch.int32))
         for e in files[i]["meta"]["episodes"]:
-            ep_rows.append(dict(e))
+            r = dict(e)
+            r.setdefault("suite", su)
+            ep_rows.append(r)
         h.update(str(files[i]["meta"].get("path")).encode())
     buf = {k: torch.cat(parts[k]) for k in REC_KEYS}
+    buf["suite"] = torch.cat(suites)
+    buf["suite_names"] = names
     n = buf["h"].shape[0]
     for k in REC_KEYS:
         if buf[k].shape[0] != n:
             raise ValueError(f"поле {k} имеет {buf[k].shape[0]} записей "
                              f"вместо {n}")
-    key = torch.stack([buf["task"].long(), buf["state"].long(),
-                       buf["call"].long()], dim=-1)
+    key = torch.stack([buf["suite"].long(), buf["task"].long(),
+                       buf["state"].long(), buf["call"].long()], dim=-1)
     if key.unique(dim=0).shape[0] != n:
-        raise ValueError("повторяющиеся (задача, состояние, вызов): один вызов "
-                         "политики попал в буфер дважды")
+        raise ValueError("повторяющиеся (сюита, задача, состояние, вызов): "
+                         "один вызов политики попал в буфер дважды")
     h.update(np.ascontiguousarray(key.cpu().numpy().astype(np.int64)).tobytes())
     buf["order_sha1"] = h.hexdigest()[:12]
     buf["n"] = n
@@ -417,9 +466,11 @@ def concat_buffer(files, cb0, device):
         buf[k] = buf[k].to(device)
     # СОБЫТИЯ БЕЗ ЭПИЗОДА И ЭПИЗОДЫ БЕЗ СОБЫТИЙ — отказ: и то и другое
     # означает, что часть градиента или часть награды потеряна
-    have = {(int(r["task_id"]), int(r["state_id"])) for r in ep_rows}
-    got = {(int(a), int(b)) for a, b in
-           zip(buf["task"].cpu().tolist(), buf["state"].cpu().tolist())}
+    have = {(str(r.get("suite")), int(r["task_id"]), int(r["state_id"]))
+            for r in ep_rows}
+    got = {(names[int(c)], int(a), int(b)) for c, a, b in
+           zip(buf["suite"].cpu().tolist(), buf["task"].cpu().tolist(),
+               buf["state"].cpu().tolist())}
     if got - have:
         raise ValueError(f"вызовы без эпизода: {sorted(got - have)[:5]}")
     if have - got:
@@ -429,13 +480,16 @@ def concat_buffer(files, cb0, device):
 
 def episode_advantages(buf, adv_by_ep):
     import torch
-    idx = {(int(r["task_id"]), int(r["state_id"])): i
+    idx = {(str(r.get("suite")), int(r["task_id"]), int(r["state_id"])): i
            for i, r in enumerate(buf["episodes"])}
     a = torch.zeros(buf["n"], dtype=torch.float64, device=buf["h"].device)
+    names = buf["suite_names"]
+    cl = buf["suite"].cpu().tolist()
     tl = buf["task"].cpu().tolist()
     sl = buf["state"].cpu().tolist()
     for j in range(buf["n"]):
-        a[j] = float(adv_by_ep[idx[(int(tl[j]), int(sl[j]))]])
+        a[j] = float(adv_by_ep[idx[(names[int(cl[j])], int(tl[j]),
+                                    int(sl[j]))]])
     return a
 
 
@@ -589,15 +643,16 @@ def one_step(head, opt, buf, adv, std, *, n_episodes, lr, trust,
         opt.step()
         lp_new, meas = measure(head, buf, std, micro)
         meas["ratio"] = ratio_stats(lp_new, buf["logp"].float(),
-                                    float(trust["ratio_max"]))
+                                    float(trust["ratio_max"]),
+                                    trust.get("ratio_hard"))
         ok, why = accept_step(meas, trust)
         attempts.append(dict(halving=k, lr=cur_lr, accepted=bool(ok),
                              refused=why, kl_mean=meas["kl_mean"],
                              kl_max=meas["kl_max"],
                              ratio=meas["ratio"]))
         log(f"  дробление {k}: lr={cur_lr:.3g}, KL={meas['kl_mean']:.6f}, "
-            f"отношение [{meas['ratio']['ratio_min']:.4f}, "
-            f"{meas['ratio']['ratio_max']:.4f}] -> "
+            f"q99 |log r| {meas['ratio']['logdiff_q99']:.4f}, макс "
+            f"{meas['ratio']['logdiff_worst']:.4f} -> "
             f"{'принято' if ok else 'отказ: ' + '; '.join(why)}")
         if ok:
             return dict(status="stepped", loss=loss, grad_norm=gnorm,
@@ -699,7 +754,8 @@ def _fake_rollout(head, *, tasks, states, calls, d_h, d_l, n_pos, rank, sigma,
                 stage=stage, head_precision="fp32", sigma=sigma,
                 d_hidden=d_h, rank=rank, head_sha1="h" * 12,
                 policy_sha1="p" * 12, step_index=0, init_start=0,
-                rollout_seed=123,
+                rollout_seed=123, suite="10",
+                code_version=dict(k12d="a" * 12, k12e="b" * 12),
                 codebooks_sha1="c" * 12, episodes=eps)
     return dict(meta=meta, data=data), cb0
 
@@ -710,6 +766,12 @@ def selftest():
     import k12b_protocol as kb
 
     # --- 1. преимущества: база по задаче, leave-one-out --------------------
+    # РАЗНЫЕ СЮИТЫ С ОДНИМ НОМЕРОМ ЗАДАЧИ — РАЗНЫЕ ЗАДАЧИ
+    a_s, i_s = loo_advantage([1, 0, 1, 1], ["object/0", "object/0",
+                                            "goal/0", "goal/0"])
+    assert abs(a_s[0] - 1.0) < 1e-12 and abs(a_s[1] + 1.0) < 1e-12, a_s
+    assert float(np.abs(a_s[2:]).max()) == 0.0, a_s   # в goal/0 исходы равны
+    assert i_s["flat_tasks"] == ["goal/0"], i_s
     a, info = loo_advantage([1, 0, 1, 0], [0, 0, 1, 1])
     assert abs(a[0] - 1.0) < 1e-12 and abs(a[1] + 1.0) < 1e-12, a
     # одна задача, три успеха из четырёх: успех стоит меньше, провал дороже
@@ -722,9 +784,9 @@ def selftest():
     assert abs(a.sum()) < 1e-12, a.sum()
     # задача, где все эпизоды одинаковы, не даёт градиента — и это видно
     a3, i3 = loo_advantage([1, 1, 1], [5, 5, 5])
-    assert float(np.abs(a3).max()) == 0.0 and i3["flat_tasks"] == [5], i3
+    assert float(np.abs(a3).max()) == 0.0 and i3["flat_tasks"] == ["5"], i3
     a4, i4 = loo_advantage([1], [7])
-    assert float(a4[0]) == 0.0 and i4["singleton_tasks"] == [7], i4
+    assert float(a4[0]) == 0.0 and i4["singleton_tasks"] == ["7"], i4
     # задачи разной трудности НЕ сравниваются между собой
     a5, _ = loo_advantage([1, 1, 0, 0], [0, 0, 1, 1])
     assert abs(a5[0] - 0.0) < 1e-12 and abs(a5[2] - 0.0) < 1e-12, a5
@@ -753,6 +815,19 @@ def selftest():
     assert not rs["ok"] and rs["ratio_min"] > 0.0, rs
     rs2 = ratio_stats(torch.tensor([0.0, 0.05, -0.05, 0.02]), lp_o, 1.5)
     assert rs2["ok"] and rs2["zero_frac_f32"] == 0.0, rs2
+    # ОДИН ВЫБРОС НЕ ВАЛИТ ШАГ, если квантиль в пределах, — но аварийный
+    # предохранитель его ловит
+    many = torch.zeros(200)
+    many[0] = 1.0                      # |log r| = 1.0 при пределе log(1.5)=0.405
+    rq = ratio_stats(many, torch.zeros(200), 1.5, ratio_hard=3.0)
+    assert rq["q99_ok"] and rq["ok"], rq
+    assert rq["logdiff_worst"] == 1.0 and rq["hard_ok"], rq
+    rh = ratio_stats(many * 2, torch.zeros(200), 1.5, ratio_hard=3.0)
+    assert not rh["hard_ok"] and not rh["ok"], rh   # 2.0 > log(3)=1.099
+    # а систематический сдвиг всего распределения валит по квантилю
+    rw = ratio_stats(torch.full((200,), 0.5), torch.zeros(200), 1.5,
+                     ratio_hard=3.0)
+    assert not rw["q99_ok"] and not rw["ok"], rw
     rs3 = ratio_stats(torch.tensor([0.0, 110.0]), torch.zeros(2), 1.5)
     assert rs3["inf_frac_f32"] > 0 and not rs3["ok"], rs3
     # ровно на границе — принимается, за границей — нет
@@ -918,8 +993,8 @@ def selftest():
     _expect(lambda: concat_buffer([f_miss], cb0, _t.device("cpu")),
             "вызовы без эпизода")
     f_extra = dict(meta=dict(f1["meta"], episodes=f1["meta"]["episodes"]
-                             + [dict(task_id=1, state_id=tr[9], success=True,
-                                     init_hash_full="q")]),
+                             + [dict(task_id=1, state_id=tr[9], suite="10",
+                                     success=True, init_hash_full="q")]),
                    data=f1["data"])
     _expect(lambda: concat_buffer([f_extra], cb0, _t.device("cpu")),
             "эпизоды без вызовов")
@@ -927,7 +1002,17 @@ def selftest():
              for k, v in f1["data"].items()}
     f_dup = dict(meta=f1["meta"], data=d_dup)
     _expect(lambda: concat_buffer([f_dup], cb0, _t.device("cpu")),
-            "повторяющиеся (задача, состояние, вызов)")
+            "повторяющиеся (сюита, задача, состояние, вызов)")
+    # ДВЕ СЮИТЫ В ОДНОМ БУФЕРЕ: одинаковые номера задач не смешиваются
+    import copy as _c
+    f_goal = dict(meta=dict(_c.deepcopy(f1["meta"]), suite="goal",
+                            path="goal.pt"), data=f1["data"])
+    for e in f_goal["meta"]["episodes"]:
+        e["suite"] = "goal"
+    two = concat_buffer([f1, f_goal], cb0, _t.device("cpu"))
+    assert two["n"] == 2 * buf["n"], two["n"]
+    assert two["suite_names"] == ["10", "goal"], two["suite_names"]
+    assert len(two["episodes"]) == 12, len(two["episodes"])
 
     # --- 7. ЦЕПОЧКА ШАГОВ И НЕПРЕРЫВНОСТЬ Adam ----------------------------
     # голова после одного обновления и буфер, ею снятый, несут одно и то же
@@ -1005,6 +1090,19 @@ def selftest():
     _expect(lambda: check_codebook(
         cb_fake, dict(cb0_sha1=codebook_sha(torch.randn(3, 7, 3)))),
         "из другой книги")
+
+    # РАЗНЫЕ ВЕРСИИ КОДА В ОДНОМ БУФЕРЕ — отказ
+    other_ver = dict(meta=dict(f1["meta"],
+                               code_version=dict(k12d="z" * 12, k12e="b" * 12)),
+                     data=f1["data"])
+    _expect(lambda: check_rollouts([f1, other_ver], proto, replica="d10_rl0",
+                                   stage="train", sigma=sigma),
+            "от разных версий кода")
+    no_ver = dict(meta={k: v for k, v in f1["meta"].items()
+                        if k != "code_version"}, data=f1["data"])
+    _expect(lambda: check_rollouts([no_ver], proto, replica="d10_rl0",
+                                   stage="train", sigma=sigma),
+            "без code_version")
 
     # раскатка без policy_sha1 больше не принимается
     no_pol = dict(meta={k: v for k, v in f1["meta"].items()
@@ -1085,7 +1183,10 @@ def main():
                     help="только для --stage diag; в зарегистрированном "
                          "прогоне lr берётся из протокола")
     ap.add_argument("--kl-max", type=float, default=0.02)
-    ap.add_argument("--ratio-max", type=float, default=1.5)
+    ap.add_argument("--ratio-max", type=float, default=1.5,
+                    help="предел для q99 |log r| — по нему идёт приёмка")
+    ap.add_argument("--ratio-hard", type=float, default=3.0,
+                    help="аварийный предел для АБСОЛЮТНОГО максимума |log r|")
     ap.add_argument("--halvings", type=int, default=4)
     ap.add_argument("--rollouts", default="",
                     help="файлы раскаток через запятую")
@@ -1125,12 +1226,14 @@ def main():
         proto = dict(sha1=None, step=dict(
             full_batch=True, lr=float(args.lr), head_precision="fp32",
             train_log_std=False,
-            trust=dict(kl_max=args.kl_max, ratio_max=args.ratio_max),
+            trust=dict(kl_max=args.kl_max, ratio_max=args.ratio_max,
+                       ratio_hard=args.ratio_hard),
             backtrack=dict(max_halvings=args.halvings,
                            accept="net_effect_dev"),
             rollback=["params", "optimizer_state"]))
         print(f"  ДИАГНОСТИЧЕСКИЙ ШАГ: lr={args.lr:g}, KL<={args.kl_max}, "
-              f"отношение<={args.ratio_max}, дроблений до {args.halvings}. "
+              f"q99 отношения<={args.ratio_max}, аварийный предел "
+              f"{args.ratio_hard}, дроблений до {args.halvings}. "
               f"Протокол не используется.")
     else:
         proto = kb.load_protocol(args.protocol)
@@ -1244,7 +1347,9 @@ def main():
             "политики, и отношение правдоподобий начиналось бы не с единицы")
 
     rew = [1.0 if e["success"] else 0.0 for e in buf["episodes"]]
-    tsk = [int(e["task_id"]) for e in buf["episodes"]]
+    # КЛЮЧ ЗАДАЧИ — ПАРА: база преимуществ вычитается внутри своей задачи своей
+    # сюиты, иначе object/0 и goal/0 делили бы одну базу
+    tsk = [f"{e.get('suite')}/{int(e['task_id'])}" for e in buf["episodes"]]
     adv_raw, adv_info = loo_advantage(rew, tsk)
     adv_std, sc = standardize(adv_raw)
     print(f"успех в буфере {np.mean(rew):.4f}; масштаб преимуществ "

@@ -161,7 +161,7 @@ def build_meta(**kw):
     раскатки недопустимо."""
     need = ("protocol_sha1", "replica", "stage", "sigma", "episodes",
             "d_hidden", "rank", "head_sha1", "policy_sha1", "codebooks_sha1",
-            "joint_sha1")
+            "joint_sha1", "code_version")
     if kw.get("stage") == "diag":
         # У ДИАГНОСТИКИ ПРОТОКОЛА НЕТ ПО ОПРЕДЕЛЕНИЮ, и требовать его sha
         # значило бы вынуждать подставить любой. Взамен stage="diag" несёт
@@ -649,7 +649,8 @@ def selftest():
                       stage="train", sigma=sigma, episodes=eps_rows,
                       d_hidden=d_h, rank=rank, head_sha1="a" * 12,
                       policy_sha1="a" * 12, step_index=0, init_start=tr[0],
-                      rollout_seed=7, codebooks_sha1="b" * 12)
+                      rollout_seed=7, codebooks_sha1="b" * 12,
+                      code_version=dict(k12d="v" * 12, k12e="w" * 12))
     meta["path"] = "cell.pt"
     cell = dict(meta=meta, data=st2.stack())
     info = k12e.check_rollouts([cell], proto, replica="d10_rl0",
@@ -663,7 +664,8 @@ def selftest():
         build_meta(protocol_sha1="x", replica="r", stage="train", sigma=0.1,
                    episodes=eps_rows, d_hidden=d_h, rank=rank)
     except ValueError as e:
-        assert "head_sha1" in str(e) and "policy_sha1" in str(e), e
+        assert "head_sha1" in str(e) and "policy_sha1" in str(e) \
+            and "code_version" in str(e), e
     else:
         raise AssertionError("мета без sha принята")
     # номер шага ноль — законное значение, а его ОТСУТСТВИЕ — нет
@@ -1235,6 +1237,13 @@ def run(args):
     rcfg, rcfg_sha = run_config(args, d1_seed=d1_seed,
                                 script_sha=k9h.file_sha12(
                                     os.path.abspath(__file__)))
+    # ВЕРСИЯ КОДА ПО СМЫСЛУ, а не по байтам: правка сообщения или комментария
+    # её не меняет, правка логики раскатки, политики, шума или шага — меняет
+    here_ = os.path.dirname(os.path.abspath(__file__))
+    cver = kb.code_version([os.path.abspath(__file__),
+                            os.path.join(here_, "k12e_pg_step.py"),
+                            os.path.join(here_, "hicora_g.py"),
+                            os.path.join(here_, "hicora_vla.py")])
     ex.update(script_sha1=k9h.file_sha12(os.path.abspath(__file__)),
               step_script_sha1=k9h.file_sha12(k12e.__file__),
               hicora_g_sha1=k9h.file_sha12(hg.__file__),
@@ -1448,7 +1457,7 @@ def run(args):
                 obs, r_, done, _ = envs.step(action[:, t])
                 reward = np.clip(reward + r_, 0, 1)
                 steps += 1
-        eps_rows = [dict(task_id=int(args.task_id),
+        eps_rows = [dict(task_id=int(args.task_id), suite=str(args.task_suite),
                          state_id=int(state_ids[i]),
                          env_index=i, init_hash_full=init_hash_full[i],
                          success=bool(reward[i] >= 1.0), env_steps=steps,
@@ -1463,7 +1472,7 @@ def run(args):
         stage=args.stage, replica=(None if det_mode else args.replica),
         d1_seed=(int(d1_seed) if d1_seed is not None else None),
         step_index=int(args.step_index), sigma=sigma, episodes=eps_rows,
-        run_config=rcfg, run_config_sha1=rcfg_sha,
+        run_config=rcfg, run_config_sha1=rcfg_sha, code_version=cver,
         eps_mode=eps_mode, eval_eps_seed=args.eval_eps_seed,
         eps_salt=int(salt), eps_sha1_first=eps_hash_first,
         eps_sha1_by_call=eps_by_call,
@@ -1523,7 +1532,7 @@ def run(args):
         rho_norm=rho_norm, hicora_seed=h_obj.get("seed"),
         selected_epoch=h_obj.get("selected_epoch"),
         resume_head=args.resume_head, eps_salt=int(salt),
-        run_config=rcfg, run_config_sha1=rcfg_sha,
+        run_config=rcfg, run_config_sha1=rcfg_sha, code_version=cver,
         eps_mode=eps_mode, eval_eps_seed=args.eval_eps_seed,
         eps_sha1_first=eps_hash_first, eps_sha1_by_call=eps_by_call,
         eps_sha1_all=eps_hash_all.hexdigest()[:16],

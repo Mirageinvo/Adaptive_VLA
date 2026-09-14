@@ -34,12 +34,17 @@ def load_cells(root, sub):
 
 
 def episodes(cells):
-    """{(задача, состояние): (успех, хэш)} с отказом на дублях."""
+    """{(сюита, задача, состояние): (успех, хэш)} с отказом на дублях.
+
+    Сюита входит в ключ: object/0 и goal/0 — разные задачи, и без неё их
+    эпизоды слились бы в одну пару.
+    """
     out = {}
     for c in cells:
+        su = str(c.get("suite"))
         for t in c["task_ids"]:
             for e in c["episodes"]:
-                k = (int(t), int(e["state_id"]))
+                k = (su, int(t), int(e["state_id"]))
                 if k in out:
                     raise SystemExit(f"{c['_path']}: эпизод {k} встречается "
                                      f"дважды")
@@ -60,7 +65,7 @@ def by_block(cells):
     """Ячейки по (задача, init_start). Дубликаты блока — отказ."""
     out = {}
     for c in cells:
-        k = (int(c["task_ids"][0]), int(c["init_start"]))
+        k = (str(c.get("suite")), int(c["task_ids"][0]), int(c["init_start"]))
         if k in out:
             raise SystemExit(f"{c['_path']}: блок {k} уже есть в "
                              f"{out[k]['_path']}")
@@ -155,7 +160,7 @@ def train_states(root):
                              f"оценкой не проверить")
         for t in m.get("task_ids") or [m.get("task_id")]:
             for i in ids:
-                out.add((int(t), int(i)))
+                out.add((str(m.get("suite")), int(t), int(i)))
     return out
 
 
@@ -285,7 +290,22 @@ def report(data, head_tag=""):
           f"{100 * sum(1 for k in data['det'] if data['det'][k][0]) / len(data['det']):.2f}%"
           f", успех g0 "
           f"{100 * sum(1 for k in data['g0'] if data['g0'][k][0]) / len(data['g0']):.2f}%")
-    print(f"\n    {'шаг':>4}{'успех g_rl':>12}{'g_rl-g0':>10}{'± se':>8}"
+    # ПЕРВИЧНАЯ МЕТРИКА — СРЕДНЕЕ ОБУЧЕННОЙ ПОЛИТИКИ ПРОТИВ D1. Именно
+    # детерминированное среднее применяется при выводе; шумная рука отвечает на
+    # вопрос про политику, которую мы не собираемся применять.
+    if data.get("means"):
+        print(f"\n  ПЕРВИЧНО: g_rl_mean - d1_det (исполняется среднее)")
+        print(f"    {'шаг':>4}{'успех':>9}{'эффект':>9}{'± se':>8}{'p':>7}"
+              f"{'восст':>7}{'потер':>7}{'дискорд':>9}")
+        for k in sorted(data["means"]):
+            vm = paired(data["means"][k], data["det"],
+                        label_a=f"g_rl_mean шаг {k}", label_b="d1_det")
+            print(f"    {k:>4}{100 * vm['success_a']:>8.2f}%"
+                  f"{100 * vm['effect']:>+8.2f}{100 * vm['se']:>8.2f}"
+                  f"{vm['p_one_sided']:>7.3f}{vm['recovered']:>7}"
+                  f"{vm['lost']:>7}{100 * vm['discord']:>8.2f}%")
+    print(f"\n  ВТОРИЧНО (диагностика обучения шумной политики):")
+    print(f"    {'шаг':>4}{'успех g_rl':>12}{'g_rl-g0':>10}{'± se':>8}"
           f"{'p':>7}{'восст':>7}{'потер':>7}{'дискорд':>9}{'g_rl-d1_det':>13}")
     rows = {}
     for k in sorted(data["steps"]):
@@ -299,16 +319,20 @@ def report(data, head_tag=""):
               f"{vs_g0['p_one_sided']:>7.3f}{vs_g0['recovered']:>7}"
               f"{vs_g0['lost']:>7}{100 * vs_g0['discord']:>8.2f}%"
               f"{100 * vs_det['effect']:>+12.2f}")
+    # ИТОГ — ПО ПЕРВИЧНОЙ МЕТРИКЕ, если она есть
     if data.get("means"):
-        print(f"\n    среднее обученной политики (u=mu) против "
-              f"детерминированной D1:")
-        for k in sorted(data["means"]):
-            vm = paired(data["means"][k], data["det"],
-                        label_a=f"g_rl_mean шаг {k}", label_b="d1_det")
-            print(f"      шаг {k}: успех {100 * vm['success_a']:.2f}%, "
-                  f"g_rl_mean - d1_det {100 * vm['effect']:+.2f} пп "
-                  f"(восст {vm['recovered']}, потер {vm['lost']}, p="
-                  f"{vm['p_one_sided']:.3f})")
+        mrows = {k: paired(data["means"][k], data["det"],
+                           label_a=f"g_rl_mean шаг {k}", label_b="d1_det")
+                 for k in sorted(data["means"])}
+        kb_ = max(mrows, key=lambda k: mrows[k]["effect"])
+        mb = mrows[kb_]
+        ok_m = bool(mb["effect"] > 0 and mb["p_one_sided"] < 0.05)
+        print(f"\n    ПЕРВИЧНЫЙ ИТОГ: лучший шаг {kb_}, "
+              f"g_rl_mean - d1_det {100 * mb['effect']:+.2f} пп ± "
+              f"{100 * mb['se']:.2f} (p={mb['p_one_sided']:.3f}) — "
+              f"{'сигнал' if ok_m else 'НЕОТЛИЧИМО ОТ НУЛЯ'}")
+        print(f"    динамика: " + ", ".join(
+            f"шаг {k} {100 * mrows[k]['effect']:+.2f}" for k in sorted(mrows)))
     best = max(rows, key=lambda k: rows[k]["vs_g0"]["effect"])
     b = rows[best]["vs_g0"]
     # ЗНАКА НЕДОСТАТОЧНО. Порог по одному знаку объявлял бы сигнал в половине

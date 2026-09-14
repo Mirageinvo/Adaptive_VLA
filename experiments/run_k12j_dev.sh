@@ -23,6 +23,8 @@ HEADTAG="${2:?нужна голова: s0 или s1}"
 TARGET="${3:-${TARGET:-4}}"
 SIGMA="${SIGMA:-0.10}"
 RL_SEED="${RL_SEED:-0}"
+# Задачи задаются ПАРАМИ сюита:номер — object/0 и goal/0 это разные задачи.
+# Голое число понимается как задача сюиты 10 (совместимость с этапом A).
 TASKS="${TASKS:-3 6 8}"
 TRAIN_STARTS="${TRAIN_STARTS:-0 5 10 15 20 25}"
 EVAL_STARTS="${EVAL_STARTS:-30 35 40}"
@@ -47,7 +49,7 @@ case "$HEADTAG" in
   s1) HEAD="${HEAD:-data/k11d/d1_mlp_coef_0.001_wd0_s1.pt}"; D1SEED=1 ;;
   *) echo "голова должна быть s0 или s1"; exit 1 ;;
 esac
-TAG="${TAG:-${HEADTAG}_sig${SIGMA}_rl${RL_SEED}_t$(echo $TASKS | tr -d ' ')}"
+TAG="${TAG:-${HEADTAG}_sig${SIGMA}_rl${RL_SEED}_t$(echo $TASKS | tr -d ' :')}"
 ROOT="${ROOT:-data/k12j/$TAG}"
 LOG="${LOG:-logs/k12j/$TAG.log}"
 PY="${PY:-python}"
@@ -88,7 +90,7 @@ printf '{"time":"%s","k12d":"%s","k12e":"%s","target":%s}\n' \
 
 # --- раскатка: $1 рука, $2 каталог, $3 starts, $4 resume, $5 принято шагов --
 roll () {
-  local arm="$1" dir="$2" starts="$3" resume="$4" step="$5" rc out ext sg
+  local arm="$1" dir="$2" starts="$3" resume="$4" step="$5" rc out ext sg SU T
   mkdir -p "$dir"
   # расширение и ожидаемая sigma — по руке, без цепочек && ||, где первый же
   # ложный шаг молча меняет смысл выражения
@@ -98,23 +100,29 @@ roll () {
     baseline|g_rl_mean)  ext="json"; sg="0.0" ;;
     *) say "неизвестная рука $arm"; return 1 ;;
   esac
-  for T in $TASKS; do
+  for TT in $TASKS; do
+    # ЗАДАЧА — ПАРА сюита:номер. object/0 и goal/0 это разные задачи, и
+    # различать их одним числом нельзя. Голое число понимается как сюита 10.
+    case "$TT" in
+      *:*) SU="${TT%%:*}"; T="${TT##*:}" ;;
+      *)   SU="10";        T="$TT"       ;;
+    esac
     for S in $starts; do
-      out="$dir/t${T}_s${S}.$ext"
+      out="$dir/${SU}_t${T}_s${S}.$ext"
       # ПРЕДЕЛ ШАГОВ И ЧИСЛО СРЕД — ЧАСТЬ СОСТАВА ЯЧЕЙКИ. Без их сверки
       # ячейка, посчитанная с укороченным пределом (проверочный прогон), молча
       # подошла бы настоящему: там, где эпизод обрывается раньше, успех
       # означает другое.
       $PY experiments/k12j_cell_ok.py "$out" arm="$arm" sigma="$sg" \
         step_index="$step" task_id="$T" init_start="$S" d1_seed="$D1SEED" \
-        rl_seed="$RL_SEED" max_steps="$MAXSTEPS" n_envs="$NENV" \
+        rl_seed="$RL_SEED" max_steps="$MAXSTEPS" n_envs="$NENV" suite="$SU" \
         >/dev/null 2>>"$LOG"
       case $? in
         0) continue ;;                      # годная ячейка уже есть
         2) say "ЯЧЕЙКА $out ЕСТЬ, НО ОТ ДРУГОЙ КОНФИГУРАЦИИ — остановка"
            return 2 ;;
       esac
-      local a=(--stage diag --arm "$arm" --task-suite 10 --task-id "$T"
+      local a=(--stage diag --arm "$arm" --task-suite "$SU" --task-id "$T"
                --init-start "$S" --n-envs "$NENV" --device "$DEV"
                --rl-seed "$RL_SEED" --step-index "$step" --ckpt "$CKPT"
                --head-ckpt "$HEAD" --expect-d1-seed "$D1SEED"
@@ -137,12 +145,21 @@ roll () {
         if tail -40 "$LOG" | grep -q "OutOfMemoryError" \
            && [ "$try" -lt "$RETRIES" ]; then
           try=$((try + 1))
-          say "нехватка памяти на $DEV ($arm t$T s$S), попытка $try из "\
+          say "нехватка памяти на $DEV ($arm $SU/$T s$S), попытка $try из "\
 "$RETRIES через $RETRY_WAIT с"
           sleep "$RETRY_WAIT"
           continue
         fi
-        say "ОТКАЗ $arm t$T s$S rc=$rc"
+        # rc=137 — SIGKILL, на этой машине это системный OOM-killer: питон не
+        # успевает ничего написать, поэтому распознаётся по коду, а не по тексту
+        if [ "$rc" -eq 137 ] && [ "$try" -lt "$RETRIES" ]; then
+          try=$((try + 1))
+          say "процесс убит по памяти ($arm $SU/$T s$S), попытка $try из "\
+"$RETRIES через $RETRY_WAIT с"
+          sleep "$RETRY_WAIT"
+          continue
+        fi
+        say "ОТКАЗ $arm $SU/t$T s$S rc=$rc"
         return 1
       done
     done
