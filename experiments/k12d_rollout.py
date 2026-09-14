@@ -279,6 +279,68 @@ def check_orchestration(path=None):
             raise AssertionError(f"в main нет вызова {a} или {b}")
         if seq.index(a) > seq.index(b):
             raise AssertionError(f"{a} вызывается после {b}: {why}")
+    # ИСПОЛЬЗОВАНИЕ ЛОКАЛЬНОГО ИМЕНИ РАНЬШЕ ПРИСВАИВАНИЯ. Python этого не
+    # видит до выполнения строки, и в `run` такая опечатка стоит прогона:
+    # ошибка вылезает там, где до неё дошло исполнение. Проверка приблизительная
+    # (ветки и циклы не разбираются), поэтому она только для линейного тела run
+    # и сравнивает НОМЕРА СТРОК первого чтения и первой записи.
+    store, load = {}, {}
+    for node in ast.walk(fn[0]):
+        if isinstance(node, ast.Name):
+            d = store if isinstance(node.ctx, ast.Store) else load
+            d.setdefault(node.id, node.lineno)
+            if isinstance(node.ctx, ast.Store):
+                store[node.id] = min(store[node.id], node.lineno)
+            else:
+                load[node.id] = min(load[node.id], node.lineno)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for al in node.names:
+                nm = (al.asname or al.name).split(".")[0]
+                store[nm] = min(store.get(nm, node.lineno), node.lineno)
+        elif isinstance(node, ast.For):
+            for t in ast.walk(node.target):
+                if isinstance(t, ast.Name):
+                    store[t.id] = min(store.get(t.id, t.lineno), t.lineno)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            store[node.name] = min(store.get(node.name, node.lineno),
+                                   node.lineno)
+    args_ = {a.arg for a in fn[0].args.args + fn[0].args.kwonlyargs}
+    # ИМЕНА ГЕНЕРАТОРОВ И ЛЯМБД ЖИВУТ В СВОЕЙ ОБЛАСТИ, и в многострочном
+    # выражении чтение стоит раньше `for`: сравнение номеров строк там
+    # бессмысленно
+    scoped = set()
+    for node in ast.walk(fn[0]):
+        if isinstance(node, ast.comprehension):
+            for t in ast.walk(node.target):
+                if isinstance(t, ast.Name):
+                    scoped.add(t.id)
+        elif isinstance(node, ast.Lambda):
+            scoped |= {a.arg for a in node.args.args + node.args.kwonlyargs}
+    # ИМЕНА МОДУЛЯ — ТОЛЬКО С ВЕРХНЕГО УРОВНЯ. Обход всего дерева собирал бы и
+    # локальные имена функций, и тогда фильтр гасил бы ровно то, что ищем.
+    module_names = set()
+    for st_ in tree.body:
+        if isinstance(st_, (ast.Import, ast.ImportFrom)):
+            module_names |= {(al.asname or al.name).split(".")[0]
+                             for al in st_.names}
+        elif isinstance(st_, (ast.FunctionDef, ast.ClassDef)):
+            module_names.add(st_.name)
+        elif isinstance(st_, ast.Assign):
+            module_names |= {t.id for t in st_.targets
+                             if isinstance(t, ast.Name)}
+    module_names |= set(dir(__builtins__) if not isinstance(__builtins__, dict)
+                        else __builtins__.keys())
+    early = sorted((nm, load[nm], store[nm]) for nm in load
+                   if nm in store and load[nm] < store[nm]
+                   and nm not in args_ and nm not in module_names
+                   and nm not in scoped)
+    if early:
+        nm, l_, s_ = early[0]
+        raise AssertionError(
+            f"в run имя {nm!r} читается на строке {l_}, а присваивается только "
+            f"на {s_}: это UnboundLocalError в момент, когда до строки дойдёт "
+            f"исполнение")
+
     # ЗАТЕНЕНИЕ КОНФИГУРАЦИИ МОДЕЛИ. `cfg` в run — это объект настроек модели,
     # у которого читаются cfg.MODEL...; присваивание того же имени чему-то ещё
     # ломает вызов политики в середине раскатки, где ошибку уже дорого ловить.
@@ -1121,7 +1183,8 @@ def run(args):
                                for k, v in sd["state"].items()})
         policy_file_sha = k9h.file_sha12(args.resume_head)
         print(f"  продолжение от {args.resume_head} (шаг "
-              f"{sd.get('step_index')}), политика {policy_sha}", flush=True)
+              f"{sd.get('step_index')}), файл {policy_file_sha}",
+              flush=True)
     else:
         if int(args.step_index) != 0:
             raise SystemExit(f"--step-index {args.step_index} без "
