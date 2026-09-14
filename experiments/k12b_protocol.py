@@ -45,6 +45,7 @@ fail-open: он перечислял поля, но никто не провер
      другим сидом раскатки независимым эпизодом не является.
 """
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -144,6 +145,88 @@ def ckpt_fingerprint(path):
     if not rows:
         raise ProtocolError(f"в каталоге чекпойнта {path} нет файлов")
     return hashlib.sha1("\n".join(sorted(rows)).encode()).hexdigest()[:12]
+
+
+def _strip_noise(tree):
+    """Убрать из дерева то, что на поведение не влияет.
+
+    Убираются строки документации и операторы-выражения, состоящие из вызова
+    печати (`print`, `say`, `logging.*`). Именно это и отличает «поменялась
+    только печать» от «поменялась логика»: первое совместимо со старыми
+    ячейками, второе требует нового каталога или пересчёта.
+    """
+    printers = {"print", "say", "pprint"}
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if not isinstance(body, list):
+            continue
+        # строка документации
+        if body and isinstance(body[0], ast.Expr) and \
+                isinstance(body[0].value, ast.Constant) and \
+                isinstance(body[0].value.value, str) and \
+                isinstance(node, (ast.Module, ast.FunctionDef,
+                                  ast.AsyncFunctionDef, ast.ClassDef)):
+            body.pop(0)
+        keep = []
+        for st in body:
+            if isinstance(st, ast.Expr) and isinstance(st.value, ast.Call):
+                f = st.value.func
+                nm = getattr(f, "id", None) or getattr(f, "attr", None)
+                if nm in printers or (
+                        isinstance(f, ast.Attribute)
+                        and getattr(f.value, "id", None) == "logging"):
+                    continue
+            keep.append(st)
+        node.body = keep
+    return tree
+
+
+def semantic_sha(path):
+    """Отпечаток СМЫСЛА кода: дерево разбора без печати и документации.
+
+    Номер версии, который надо поднимать руками, забывается ровно тогда, когда
+    он нужен. Здесь версия вычисляется: правка сообщения или комментария её не
+    меняет, правка логики раскатки, политики, шума, награды или шага — меняет.
+    """
+    tree = ast.parse(open(path, "rb").read())
+    return hashlib.sha1(
+        ast.dump(_strip_noise(tree), annotate_fields=True,
+                 include_attributes=False).encode()).hexdigest()[:12]
+
+
+def code_version(paths):
+    """{имя файла: семантический отпечаток} — то, что пишется в каждую ячейку."""
+    return {os.path.basename(p): semantic_sha(p) for p in paths}
+
+
+def check_code_version(cells, *, current=None, tag="набор"):
+    """Все ячейки одной СОВМЕСТИМОЙ версии; при `current` — ещё и текущей.
+
+    Журнал версий (`script_versions.jsonl`) фиксирует, что менялось, но не
+    мешает смешать в одном выводе ячейки, снятые до и после исправления
+    ошибки. Эта проверка мешает.
+    """
+    seen = {}
+    for c in cells:
+        cv = c.get("code_version")
+        if not cv:
+            raise ProtocolError(
+                f"{tag}: ячейка {c.get('_path', c.get('path', '?'))} без "
+                f"code_version — совместимость версий не проверить")
+        seen[json.dumps(cv, sort_keys=True)] = c.get("_path", c.get("path"))
+    if len(seen) > 1:
+        raise ProtocolError(
+            f"{tag}: ячейки от разных версий кода:\n  - "
+            + "\n  - ".join(f"{v}: {k}" for k, v in sorted(seen.items())))
+    if current is not None:
+        got = json.loads(next(iter(seen)))
+        diff = sorted(k for k in set(got) | set(current)
+                      if got.get(k) != current.get(k))
+        if diff:
+            raise ProtocolError(
+                f"{tag}: ячейки сняты версией, отличной от текущей, по файлам "
+                f"{diff}: нужен новый каталог или пересчёт затронутых ячеек")
+    return json.loads(next(iter(seen)))
 
 
 def canon(obj):
@@ -1674,6 +1757,39 @@ def selftest(tmpdir=None):
                              "f" * 40), exist_ok=True)
     _expect(lambda: hf_snapshot("Org/Model", hh), "несколько снапшотов")
     _expect(lambda: resolve_ckpt("Org/Нет", hh), "не найден в кэше HF")
+
+    # --- СЕМАНТИЧЕСКАЯ ВЕРСИЯ КОДА ----------------------------------------
+    a_py = os.path.join(tmp, "a.py")
+    base = ('"""Документация."""\n'
+            "import os\n\n\n"
+            "def f(x):\n"
+            '    """Что делает."""\n'
+            "    print('считаю', x)\n"
+            "    return x + 1\n")
+    open(a_py, "w").write(base)
+    v0 = semantic_sha(a_py)
+    # правка ТОЛЬКО печати и комментариев версию не меняет
+    open(a_py, "w").write(base.replace("print('считаю', x)",
+                                       "print('теперь другое сообщение', x)")
+                          .replace('"""Что делает."""', '"""Другой текст."""')
+                          + "# комментарий\n")
+    assert semantic_sha(a_py) == v0, "печать изменила семантическую версию"
+    # правка логики — меняет
+    open(a_py, "w").write(base.replace("return x + 1", "return x + 2"))
+    assert semantic_sha(a_py) != v0, "изменение логики не замечено"
+    open(a_py, "w").write(base)
+    assert semantic_sha(a_py) == v0
+
+    cv = code_version([a_py])
+    cells_ok = [dict(_path="c1", code_version=cv),
+                dict(_path="c2", code_version=dict(cv))]
+    assert check_code_version(cells_ok, current=cv) == cv
+    _expect(lambda: check_code_version(
+        cells_ok + [dict(_path="c3", code_version={"a.py": "0" * 12})]),
+        "от разных версий кода")
+    _expect(lambda: check_code_version(cells_ok, current={"a.py": "9" * 12}),
+            "нужен новый каталог или пересчёт")
+    _expect(lambda: check_code_version([dict(_path="c4")]), "без code_version")
 
     print("самопроверка k12b_protocol пройдена")
 
