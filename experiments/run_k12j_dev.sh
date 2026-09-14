@@ -101,9 +101,14 @@ roll () {
   for T in $TASKS; do
     for S in $starts; do
       out="$dir/t${T}_s${S}.$ext"
+      # ПРЕДЕЛ ШАГОВ И ЧИСЛО СРЕД — ЧАСТЬ СОСТАВА ЯЧЕЙКИ. Без их сверки
+      # ячейка, посчитанная с укороченным пределом (проверочный прогон), молча
+      # подошла бы настоящему: там, где эпизод обрывается раньше, успех
+      # означает другое.
       $PY experiments/k12j_cell_ok.py "$out" arm="$arm" sigma="$sg" \
         step_index="$step" task_id="$T" init_start="$S" d1_seed="$D1SEED" \
-        rl_seed="$RL_SEED" >/dev/null 2>>"$LOG"
+        rl_seed="$RL_SEED" max_steps="$MAXSTEPS" n_envs="$NENV" \
+        >/dev/null 2>>"$LOG"
       case $? in
         0) continue ;;                      # годная ячейка уже есть
         2) say "ЯЧЕЙКА $out ЕСТЬ, НО ОТ ДРУГОЙ КОНФИГУРАЦИИ — остановка"
