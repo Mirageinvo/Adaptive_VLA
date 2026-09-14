@@ -1255,10 +1255,11 @@ def run(args):
         replica=args.replica, stage=args.stage,
         step_index=int(args.step_index), sigma=sigma,
         d_hidden=d_h, rank=int(h_obj["rank"]), head_sha1=head_sha,
-        policy_sha1=policy_sha, codebooks_sha1=cb_sha,
+        policy_sha1=policy_sha, codebooks_sha1=cb_sha, code_version=cver,
         # эпизоды-заглушки той же формы и с теми же id, что будут настоящие:
         # так проверка увидит и набор состояний, и набор задач
-        episodes=[dict(task_id=int(args.task_id), state_id=int(j),
+        episodes=[dict(task_id=int(args.task_id), suite=str(args.task_suite),
+                       state_id=int(j),
                        success=False, init_hash_full="0" * 16, env_steps=0,
                        policy_calls=0, n_records=0, rollout_seed=roll_seed)
                   for j in state_ids])
