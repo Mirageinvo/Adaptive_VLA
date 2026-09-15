@@ -62,6 +62,21 @@ def make_gaussian_trajectory_head():
                     f"границы, и обучение начиналось с обрезанного градиента")
             self.log_std = nn.Parameter(torch.full((self.rank,), v))
 
+        def freeze_log_std(self):
+            """Заморозить sigma ДЕЙСТВИЕМ, а не комментарием.
+
+            На первой лестнице sigma фиксируется калибровкой. Если оставить
+            log_std обучаемым «по договорённости», один недосмотр в списке
+            параметров оптимизатора сделает sigma обучаемой, и выбор sigma
+            смешается с обучением — а заметить это будет нечем.
+            """
+            self.log_std.requires_grad_(False)
+            return self
+
+        def trainable_prefixes(self):
+            """Что обучается на первой лестнице. log_std СЮДА НЕ ВХОДИТ."""
+            return ("proj_h.", "proj_z.", "net.")
+
         def std(self):
             return torch.exp(self.log_std.clamp(self.LOG_STD_MIN,
                                                 self.LOG_STD_MAX))
@@ -118,6 +133,17 @@ def make_gaussian_trajectory_head():
     return GaussianTrajectoryHead
 
 
+def fixed_eps(n_rows, rank, seed=0):
+    """ОДИН И ТОТ ЖЕ набор eps для всех sigma при калибровке.
+
+    Со свежим шумом на каждом измерении RMS гуляет от выборки, и двоичный
+    поиск гоняется за собственным шумом вместо величины. Общий набор делает
+    измерение детерминированной функцией sigma.
+    """
+    return np.random.default_rng(seed).normal(
+        size=(int(n_rows), int(rank))).astype(np.float32)
+
+
 def rms_action_change(decode, z0, dz_a, dz_b, max_act_q=None):
     """RMS изменения ДЕКОДИРОВАННЫХ действий между двумя поправками.
 
@@ -133,8 +159,30 @@ def rms_action_change(decode, z0, dz_a, dz_b, max_act_q=None):
     return float(np.sqrt((d ** 2).mean()))
 
 
+def check_monotone(measure, lo=1e-3, hi=1.0, n=7, log=print):
+    """Монотонность RMS по sigma на логарифмической сетке.
+
+    Проверки двух концов мало: декодер нелинеен, tanh насыщается, и величина
+    могла бы иметь плато или излом внутри. Двоичный поиск при этом вернул бы
+    произвольное число, не сообщив об этом.
+    """
+    grid = np.geomspace(lo, hi, n)
+    vals = [measure(float(s)) for s in grid]
+    for s_, v in zip(grid, vals):
+        log(f"    сетка: sigma {s_:.5f} -> RMS {v:.5f}")
+    bad = [(float(grid[i]), vals[i], float(grid[i + 1]), vals[i + 1])
+           for i in range(len(vals) - 1) if vals[i + 1] < vals[i]]
+    if bad:
+        raise SystemExit(
+            "RMS не монотонен по sigma: "
+            + "; ".join(f"{a:.4f}->{b:.5f} больше {c:.4f}->{d:.5f}"
+                        for a, b, c, d in bad[:3])
+            + ". Двоичный поиск дал бы произвольное значение")
+    return list(zip([float(x) for x in grid], vals))
+
+
 def calibrate_sigma(target_rms, measure, lo=1e-3, hi=1.0, tol=0.02,
-                    max_iter=30, log=print):
+                    max_iter=30, log=print, grid_n=7):
     """Подобрать sigma_T, дающую заданный RMS изменения действий.
 
     ДЕЛЕНИЕМ ОТРЕЗКА, А НЕ ПЕРЕБОРОМ СЕТКИ: величина монотонна по sigma (шум
@@ -145,7 +193,9 @@ def calibrate_sigma(target_rms, measure, lo=1e-3, hi=1.0, tol=0.02,
     Монотонность ПРОВЕРЯЕТСЯ на концах: если её нет, двоичный поиск вернул бы
     произвольное число.
     """
-    r_lo, r_hi = measure(lo), measure(hi)
+    grid = check_monotone(measure, lo, hi, grid_n, log) if grid_n else None
+    r_lo, r_hi = (grid[0][1], grid[-1][1]) if grid else (measure(lo),
+                                                         measure(hi))
     if not (r_lo < r_hi):
         raise SystemExit(
             f"RMS не растёт с sigma: {r_lo:.5f} при {lo} и {r_hi:.5f} при "
@@ -161,7 +211,7 @@ def calibrate_sigma(target_rms, measure, lo=1e-3, hi=1.0, tol=0.02,
         hist.append(dict(sigma=mid, rms=r))
         log(f"    sigma {mid:.5f} -> RMS {r:.5f} (цель {target_rms:.5f})")
         if abs(r - target_rms) <= tol * target_rms:
-            return mid, r, hist
+            return mid, r, dict(search=hist, grid=grid)
         if r < target_rms:
             lo = mid
         else:
@@ -275,9 +325,25 @@ def selftest():
                                      log=lambda *_: None)
     assert abs(rms - 0.02) <= 0.02 * 0.02, (got, rms)
     assert abs(got - 0.04) < 0.01, got
+    assert len(hist["grid"]) == 7 and hist["search"], hist
+    # НЕМОНОТОННОСТЬ ВНУТРИ отрезка ловится, хотя концы в порядке
+    def humped(s_):
+        return 0.1 * np.sqrt(s_) * (0.3 if 0.01 < s_ < 0.1 else 1.0)
+    try:
+        calibrate_sigma(0.02, humped, log=lambda *_: None)
+    except SystemExit as e:
+        assert "не монотонен" in str(e), e
+    else:
+        raise AssertionError("немонотонность внутри отрезка пропущена")
+    # ОДИН НАБОР eps: измерение детерминировано по sigma
+    e1, e2 = fixed_eps(8, RK, 0), fixed_eps(8, RK, 0)
+    assert np.array_equal(e1, e2) and e1.shape == (8, RK)
+    assert not np.array_equal(e1, fixed_eps(8, RK, 1))
     # цель ВНЕ отрезка: при 10*s минимум на sigma=1e-3 равен 0.01, и 0.001
     # недостижимо ни при каком sigma из [1e-3, 1]
-    for tgt, meas, needle in ((0.02, lambda s: 0.5 - s, "не растёт"),
+    # убывающую величину теперь ловит проверка сетки — раньше и подробнее,
+    # чем прежняя проверка двух концов
+    for tgt, meas, needle in ((0.02, lambda s: 0.5 - s, "не монотонен"),
                               (0.001, lambda s: 10.0 * s, "вне достижимого"),
                               (99.0, lambda s: 10.0 * s, "вне достижимого")):
         try:
@@ -290,6 +356,44 @@ def selftest():
     got2, rms2, _ = calibrate_sigma(0.02, lambda s: 10.0 * s,
                                     log=lambda *_: None)
     assert abs(got2 - 0.002) < 1e-4, got2
+
+    # --- 8b. ГРАДИЕНТ ТОЛЬКО ЧЕРЕЗ log_prob С СОХРАНЁННЫМ u ---------------
+    # Изоляция score-function пути: прежний тест пускал градиент и через dz, и
+    # не отличил бы репараметризацию от правильного пути.
+    gg = mk()
+    with torch.no_grad():
+        for p_ in list(gg.net.parameters()):
+            p_.normal_(0, 0.1)
+    with torch.no_grad():
+        u_saved = gg(h, z)["u"]
+    o_up = gg(h, z, u=u_saved)
+    assert not o_up["u"].requires_grad, "сохранённый u не отцеплен"
+    o_up["log_prob_u"].sum().backward()
+    for nm, p_ in gg.named_parameters():
+        if nm.startswith("net."):
+            assert p_.grad is not None and float(p_.grad.abs().max()) > 0, nm
+    # dz при сохранённом u ВООБЩЕ не требует градиента: он зависит только от
+    # u, а u — константа. Это и отличает score-function путь от
+    # репараметризованного: там градиент шёл бы в net через dz.
+    gg.zero_grad(set_to_none=True)
+    o_up2 = gg(h, z, u=u_saved)
+    assert not o_up2["dz"].requires_grad, \
+        "dz при сохранённом u требует градиента: путь репараметризованный"
+    assert not o_up2["coeffs"].requires_grad
+    # а при СЭМПЛИРОВАНИИ градиент через dz есть — иначе тест был бы пуст
+    assert gg(h, z)["dz"].requires_grad
+
+    # --- 8c. ЗАМОРОЗКА log_std ДЕЙСТВИЕМ ----------------------------------
+    gf = mk().freeze_log_std()
+    assert not gf.log_std.requires_grad
+    before = gf.log_std.detach().clone()
+    opt = torch.optim.Adam([p_ for n_, p_ in gf.named_parameters()
+                            if n_.startswith(gf.trainable_prefixes())], lr=0.1)
+    o = gf(h, z)
+    (o["log_prob_u"].sum() + o["dz"].sum()).backward()
+    opt.step()
+    assert torch.equal(gf.log_std.detach(), before), "log_std изменилась"
+    assert "log_std" not in " ".join(gf.trainable_prefixes())
 
     # --- 9. ПРЕДЕЛЫ log_std КОНЕЧНЫ ---------------------------------------
     for bad in (-9.0, 5.0):
@@ -304,8 +408,12 @@ def selftest():
         assert float(g.std().max()) <= float(np.exp(LOG_STD_MAX)) + 1e-6
         g.log_std.fill_(-100.0)
         assert float(g.std().min()) >= float(np.exp(LOG_STD_MIN)) - 1e-12
-    print(f"самопроверка hicora_t_g пройдена: шум в {RK} измерениях на чанк "
-          f"против {NP_ * RK} у гауссовой HiCoRA при том же ранге")
+    # РАНГ HiCoRA НА ПОЗИЦИЮ — 32, А НЕ 64: сравнение 64 против 16*32 = 512,
+    # то есть восьмикратное сокращение. Цифра 1024 вышла бы при сравнении с
+    # позиционной головой ранга 64, какой в прогонах не было.
+    print(f"самопроверка hicora_t_g пройдена: шум в 64 измерениях на чанк "
+          f"против 16*32 = 512 у фактически использованной HiCoRA — "
+          f"сокращение в 8 раз")
 
 
 if __name__ == "__main__":

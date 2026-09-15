@@ -54,6 +54,52 @@ def arm_needs_head(arm):
     return arm in ("hicora_d1_det", "hicora_t_d1_det")
 
 
+FIELDS_SAME = ("ckpt", "max_steps", "horizon", "rollout_seed_mode",
+               "waiting_steps", "joint_sha1", "preprocess", "pos_offset",
+               "image_size", "res_norm_sha1")
+
+
+def index_episodes(eps, arm):
+    """{(задача, состояние): (успех, хэш)} с отказом на дублях.
+
+    Словарь молча перезаписывал бы повтор, и одна ячейка, посчитанная дважды,
+    осталась бы незамеченной.
+    """
+    out = {}
+    for e in eps:
+        k = (int(e["task_id"]), int(e["state_id"]))
+        if k in out:
+            raise SystemExit(f"{arm}: эпизод {k} встречается дважды")
+        out[k] = (bool(e["success"]), str(e.get("init_hash_full") or ""))
+    return out
+
+
+def check_same_states(idx_by_arm):
+    """У всех рук ОДНО И ТО ЖЕ начальное состояние в каждой паре.
+
+    Совпадения (задача, состояние) недостаточно: если хэш начального
+    состояния различается, это разные состояния под одним номером, и парная
+    разность ничего не измеряет.
+    """
+    bad = []
+    arms = sorted(idx_by_arm)
+    ref = arms[0]
+    for k, (_s, h) in sorted(idx_by_arm[ref].items()):
+        if not h:
+            bad.append(f"{ref}: у {k} нет init_hash_full")
+            continue
+        for other in arms[1:]:
+            if k not in idx_by_arm[other]:
+                continue
+            h2 = idx_by_arm[other][k][1]
+            if h2 != h:
+                bad.append(f"{k}: {ref} {h} против {other} {h2}")
+    if bad:
+        raise SystemExit("начальные состояния расходятся между руками:\n  - "
+                         + "\n  - ".join(bad[:8]))
+    return True
+
+
 def pair_table(by_arm, want_states, log=print):
     """Парные разности по общим (задача, состояние).
 
@@ -62,8 +108,9 @@ def pair_table(by_arm, want_states, log=print):
     состояний при полном покрытии — отказ: это разные наборы, и разность по
     ним ничего не измеряет.
     """
-    sets = {arm: {(int(e["task_id"]), int(e["state_id"])) for e in eps}
-            for arm, eps in by_arm.items()}
+    idx_by_arm = {arm: index_episodes(eps, arm)
+                  for arm, eps in by_arm.items()}
+    sets = {arm: set(d) for arm, d in idx_by_arm.items()}
     full = {arm: k for arm, k in sets.items()
             if not want_states or len(k) >= want_states}
     partial = {arm: len(k) for arm, k in sets.items() if arm not in full}
@@ -82,12 +129,10 @@ def pair_table(by_arm, want_states, log=print):
                          f"состояниях: {bad}")
     if want_states and len(keys) != want_states:
         raise SystemExit(f"общих пар {len(keys)}, ожидалось {want_states}")
+    check_same_states({a: idx_by_arm[a] for a in full})
     by_arm = {a: by_arm[a] for a in full}
-    succ = {}
-    for arm, eps in by_arm.items():
-        d = {(int(e["task_id"]), int(e["state_id"])): bool(e["success"])
-             for e in eps}
-        succ[arm] = {k: d[k] for k in sorted(keys)}
+    succ = {arm: {k: idx_by_arm[arm][k][0] for k in sorted(keys)}
+            for arm in by_arm}
     return succ, sorted(keys)
 
 
@@ -117,17 +162,18 @@ def verdict(delta_pp, n=45):
 
 def selftest():
     # --- недосчитанная рука исключается, а не роняет отчёт ----------------
-    mk9 = lambda ok: [dict(task_id=3, state_id=i, success=(i in ok))
-                      for i in range(30, 35)]
+    mk9 = lambda ok: [dict(task_id=3, state_id=i, success=(i in ok),
+                           init_hash_full=f"h3_{i}") for i in range(30, 35)]
     part = {"fast12": mk9({30, 31}), "coarse24": [
-        dict(task_id=3, state_id=30, success=True)]}
+        dict(task_id=3, state_id=30, success=True, init_hash_full="h3_30")]}
     msgs = []
     sp, kp = pair_table(part, 5, log=msgs.append)
     assert set(sp) == {"fast12"}, sp
     assert any("coarse24 исключена" in m for m in msgs), msgs
     # но РАСХОЖДЕНИЕ при полном покрытии — по-прежнему отказ
     diff = {"fast12": mk9({30}), "coarse24": [
-        dict(task_id=3, state_id=i, success=True) for i in range(40, 45)]}
+        dict(task_id=3, state_id=i, success=True, init_hash_full=f"h3_{i}")
+        for i in range(40, 45)]}
     try:
         pair_table(diff, 5, log=lambda *_: None)
     except SystemExit as e:
@@ -136,8 +182,8 @@ def selftest():
         raise AssertionError("расхождение при полном покрытии принято")
 
     # --- парность и отказ на расхождении ----------------------------------
-    mk = lambda ok: [dict(task_id=3, state_id=i, success=(i in ok))
-                     for i in range(30, 35)]
+    mk = lambda ok: [dict(task_id=3, state_id=i, success=(i in ok),
+                          init_hash_full=f"h3_{i}") for i in range(30, 35)]
     by = {"fast12": mk({30, 31, 32}), "hicora_t_d1_det": mk({30, 31, 32, 33})}
     succ, keys = pair_table(by, 5)
     assert len(keys) == 5
@@ -145,14 +191,44 @@ def selftest():
     assert c["recovered"] == 1 and c["lost"] == 0 and c["n"] == 5, c
     assert abs(c["effect"] - 0.2) < 1e-12
     bad = dict(by)
-    bad["coarse24"] = [dict(task_id=3, state_id=i, success=True)
-                       for i in range(40, 45)]
+    bad["coarse24"] = [dict(task_id=3, state_id=i, success=True,
+                            init_hash_full=f"h3_{i}") for i in range(40, 45)]
     try:
         pair_table(bad, 5)
     except SystemExit as e:
         assert "на РАЗНЫХ состояниях" in str(e), e
     else:
         raise AssertionError("непарные руки приняты")
+
+    # --- ДУБЛЬ ЭПИЗОДА — ОТКАЗ, а не молчаливая перезапись ----------------
+    dup = {"fast12": mk({30}) + [dict(task_id=3, state_id=30, success=False,
+                                      init_hash_full="h3_30")]}
+    try:
+        pair_table(dup, 5, log=lambda *_: None)
+    except SystemExit as e:
+        assert "встречается дважды" in str(e), e
+    else:
+        raise AssertionError("дубль эпизода принят")
+
+    # --- РАЗНЫЕ НАЧАЛЬНЫЕ СОСТОЯНИЯ ПОД ОДНИМ НОМЕРОМ — отказ -------------
+    other = [dict(task_id=3, state_id=i, success=True,
+                  init_hash_full="ДРУГОЙ") for i in range(30, 35)]
+    try:
+        pair_table({"fast12": mk({30}), "coarse24": other}, 5,
+                   log=lambda *_: None)
+    except SystemExit as e:
+        assert "начальные состояния расходятся" in str(e), e
+    else:
+        raise AssertionError("разные состояния под одним номером приняты")
+    # и отсутствие хэша тоже
+    nohash = [dict(task_id=3, state_id=i, success=True) for i in range(30, 35)]
+    try:
+        pair_table({"fast12": nohash, "coarse24": nohash}, 5,
+                   log=lambda *_: None)
+    except SystemExit as e:
+        assert "нет init_hash_full" in str(e), e
+    else:
+        raise AssertionError("эпизоды без хэша приняты")
 
     # --- порог go/no-go ---------------------------------------------------
     assert verdict(0.0)[0] == "continue"
@@ -271,20 +347,55 @@ def main():
     # ОДИНАКОВЫЕ УСЛОВИЯ У ВСЕХ РУК: иначе разность рук смешана с разницей
     # горизонта, предела шагов или чекпойнта
     for key, ms in meta_by_arm.items():
-        for fld in ("ckpt", "max_steps", "horizon", "rollout_seed_mode"):
+        for fld in FIELDS_SAME:
             vals = {str(m.get(fld)) for m in ms}
             if len(vals) > 1:
                 raise SystemExit(f"{key}: разные {fld} в ячейках {vals}")
     allf = [m for ms in meta_by_arm.values() for m in ms]
-    for fld in ("ckpt", "max_steps", "horizon", "rollout_seed_mode"):
+    for fld in FIELDS_SAME:
         vals = {str(m.get(fld)) for m in allf}
         if len(vals) > 1:
             raise SystemExit(f"руки считаны при разных {fld}: {vals}")
+    # ТОЧНОСТЬ ИСПОЛНЕНИЯ — ЧАСТЬ СРАВНЕНИЯ, А НЕ ДЕТАЛЬ. Ствол под autocast и
+    # голова в fp32 — то, как считались переиспользуемые ячейки D1; иначе
+    # сравнивались бы архитектуры вместе с разной точностью.
+    modes = {str(m.get("precision_mode")) for m in allf}
+    if modes != {"trunk_autocast_head_fp32"}:
+        raise SystemExit(
+            f"руки считаны в разных режимах точности {modes}: ожидался "
+            f"единый trunk_autocast_head_fp32. Ячейки без этого поля сняты до "
+            f"разделения точности и непригодны для сравнения")
+    # ТОЖДЕСТВО — УСЛОВИЕ ПРИГОДНОСТИ, А НЕ ЗАМЕЧАНИЕ
+    t_cells = [c for c in cells if c.get("arm") == "hicora_t_d1_det"]
+    idents = [c.get("identity") for c in t_cells]
+    if not any(idents):
+        raise SystemExit("ни одна ячейка HiCoRA-T не несёт проверки тождества")
+    bad_id = [c["_path"] for c, i in zip(t_cells, idents)
+              if i and not i.get("ok")]
+    if bad_id:
+        raise SystemExit(f"тождество не выполнено в {bad_id[:5]}")
+    # МЕТКА ГОЛОВЫ ПРОТИВ СИДА В ЧЕКПОЙНТЕ
+    for c in cells:
+        if not c.get("head"):
+            continue
+        sd = c.get("head_seed")
+        if sd is not None and f"s{int(sd)}" != c["head"]:
+            raise SystemExit(f"{c['_path']}: метка {c['head']}, а сид "
+                             f"чекпойнта {sd}")
 
     tasks = [int(x) for x in a.tasks.split(",")]
     starts = [int(x) for x in a.states.split(",")]
     want = len(tasks) * len(starts) * a.n_envs
     succ, keys = pair_table(by_arm, want)
+    want_keys = {(t, s0) for t in tasks for st in starts
+                 for s0 in range(st, st + a.n_envs)}
+    if set(keys) != want_keys:
+        miss = sorted(want_keys - set(keys))[:6]
+        extra = sorted(set(keys) - want_keys)[:6]
+        raise SystemExit(
+            f"фактический набор не равен запрошенному: не хватает {miss} "
+            f"({len(want_keys - set(keys))}), лишних {extra} "
+            f"({len(set(keys) - want_keys)})")
 
     # РУКИ БЕРУТСЯ ИЗ ПОСЧИТАННОГО, а не из прочитанного: исключённая
     # недосчитанная рука в by_arm остаётся, и отчёт спотыкался бы о неё

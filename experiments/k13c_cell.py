@@ -281,6 +281,7 @@ def run(a):
     rn_sha = rn.hexdigest()[:12]
 
     head_sha = basis_sha = rho_sha = None
+    head_seed = None
     t_head = None
     if a.arm == "hicora_d1_det":
         h_obj = torch.load(a.hicora_ckpt, map_location="cpu",
@@ -288,6 +289,7 @@ def run(a):
         k9h.check_hicora_ckpt(h_obj, f"hicora_s{h_obj['seed']}",
                               h_obj.get("target", "coef"))
         head_sha = k9h.file_sha12(a.hicora_ckpt)
+        head_seed = h_obj.get("seed")
         if h_obj["res_norm_sha1"] != rn_sha:
             raise SystemExit(f"res_norm sha {rn_sha}, голова обучена на "
                              f"{h_obj['res_norm_sha1']}")
@@ -310,6 +312,7 @@ def run(a):
         t_obj = torch.load(a.hicora_t_ckpt, map_location="cpu",
                            weights_only=False)
         head_sha = k9h.file_sha12(a.hicora_t_ckpt)
+        head_seed = t_obj.get("seed")
         if t_obj["res_norm_sha1"] != rn_sha:
             raise SystemExit(f"res_norm sha {rn_sha}, голова обучена на "
                              f"{t_obj['res_norm_sha1']}")
@@ -400,6 +403,13 @@ def run(a):
             batch = dict_apply(lambda x: x.to(dev, dt), batch)
             cnt.reset()
 
+            # РАЗДЕЛЕНИЕ ТОЧНОСТИ ТАКОЕ ЖЕ, КАК В K-12d, И ЭТО НЕ ДЕТАЛЬ.
+            # Там ствол идёт под autocast fp16, а голова и декодирование — в
+            # fp32 вне autocast. Переиспользуемые ячейки D1 сняты именно так;
+            # посчитав HiCoRA-T целиком внутри autocast, мы сравнивали бы
+            # архитектуры вместе с разной точностью исполнения. В K-12 это
+            # различие уже признавалось достаточным, чтобы перемерять опору.
+            codes = z_lat = h24 = None
             with torch.no_grad(), ac16:
                 if a.arm == "coarse24":
                     with only_blocks(model, 1):
@@ -425,97 +435,78 @@ def run(a):
                                 "блок полного generate: экономия изменила бы "
                                 "политику")
                         cnt.n.update(saved_counts)
-                    z = E[0][codes.long()]
-                    a_exec = decode_latent(z)
                 else:
                     v_, p_ = model.build_inputs(position_offset=pos_off,
                                                 **batch)
                     if a.arm == "fast12":
-                        out = model.forward_joint_fast(
+                        jf = model.forward_joint_fast(
                             vlm_inputs_embeds=v_,
                             attention_mask=batch.get("attention_mask"),
                             position_ids=p_)
-                        z = E[0][out["pred_codes"].long()]
-                        a_exec = decode_latent(z)
-                    elif a.arm == "hicora_d1_det":
-                        out = model.forward_hicora(
-                            vlm_inputs_embeds=v_,
-                            attention_mask=batch.get("attention_mask"),
-                            position_ids=p_)
-                        a_exec = decode_latent(out["z"])
+                        codes = jf["pred_codes"]
                     else:
-                        out = model.forward_hicora_t(
+                        taps = model.forward_taps(
                             vlm_inputs_embeds=v_,
                             attention_mask=batch.get("attention_mask"),
                             position_ids=p_)
-                        a_exec = decode_latent(out["z"])
-                        if ident is None:
-                            # СНИМОК СЧЁТЧИКОВ. Сверка делает лишние проходы и
-                            # декодирования, и их надо исключить из измерения
-                            # «один проход на вызов политики». Ручное вычитание
-                            # уже ошиблось: forward_joint_fast не идёт через
-                            # forward_taps, и «минус два» обнулило счётчик.
-                            # Снимок от устройства вызовов не зависит.
-                            saved_counts = dict(cnt.n)
-                            # ТОЖДЕСТВО НА НАСТОЯЩЕМ БАТЧЕ: голова обнуляется,
-                            # и выход обязан совпасть с fast12 точно
-                            jf = model.forward_joint_fast(
-                                vlm_inputs_embeds=v_,
-                                attention_mask=batch.get("attention_mask"),
-                                position_ids=p_)
-                            z_f = E[0][jf["pred_codes"].long()]
-                            a_f = decode_latent(z_f)
-                            sd = {k: v.detach().clone()
-                                  for k, v in t_head.state_dict().items()}
-                            with torch.no_grad():
-                                t_head.net[-1].weight.zero_()
-                                t_head.net[-1].bias.zero_()
-                                # СВЕЖИЙ КОНТЕКСТ autocast И БЕЗ КЭША ВЕСОВ.
-                                # autocast кэширует fp16-копии весов на время
-                                # своего контекста и предполагает, что веса
-                                # внутри не меняются. Обнуление fp32-весов
-                                # внутри уже открытого контекста НЕ ВИДНО
-                                # прямому проходу: он берёт копию, снятую до
-                                # обнуления. Измерено: |c| до и после
-                                # обнуления совпадали до последнего знака.
-                                with torch.autocast(
-                                        "cuda", dtype=torch.float16,
-                                        cache_enabled=False):
-                                    out0 = model.forward_hicora_t(
-                                        vlm_inputs_embeds=v_,
-                                        attention_mask=batch.get(
-                                            "attention_mask"),
-                                        position_ids=p_)
-                                c_max = float(out0["coeffs"].abs().max())
-                            # ЗАЩИТА ОТ ВОЗВРАТА ТОЙ ЖЕ ЛОВУШКИ: при нулевом
-                            # последнем слое коэффициенты обязаны быть ровно
-                            # нулём, иначе обнуление до прохода не дошло, и
-                            # «тождество» проверяло бы не то
-                            if c_max != 0.0:
-                                t_head.load_state_dict(sd)
-                                raise SystemExit(
-                                    f"после обнуления последнего слоя |c| = "
-                                    f"{c_max:.3e}, а обязан быть нулём: "
-                                    f"обнуление не дошло до прямого прохода "
-                                    f"(кэш весов autocast?)")
-                            ident = check_identity(
-                                t_head, jf["pred_codes"], z_f, a_f, out0,
-                                decode_latent)
-                            print(f"  тождество с fast12: q0 "
-                                  f"{ident['q0_equal']}, |dZ| "
-                                  f"{ident['dz_max']:.2e}, |dZ_latent| "
-                                  f"{ident['z_max_diff']:.2e}, |d действий| "
-                                  f"{ident['action_max_diff']:.2e} -> "
-                                  f"{'ОК' if ident['ok'] else 'НЕ СОШЛОСЬ'}",
-                                  flush=True)
-                            if not ident["ok"]:
-                                t_head.load_state_dict(sd)
-                                raise SystemExit(
-                                    "тождество не выполнено: при нулевой "
-                                    "голове HiCoRA-T обязана совпадать с "
-                                    "fast12 точно")
-                            t_head.load_state_dict(sd)
-                            cnt.n.update(saved_counts)
+                        _lg, q0 = model.q0_from(taps[model.q0_depth])
+                        codes = q0
+                        h24 = model.res_norm(
+                            taps[max(model.taps)]).float()
+
+            # --- ГОЛОВА И ДЕКОДИРОВАНИЕ: fp32, ВНЕ autocast ----------------
+            with torch.no_grad():
+                z0 = E[0][codes.long()].float()
+                if a.arm in ("fast12", "coarse24"):
+                    z_lat = z0
+                else:
+                    head_mod = (model.hicora_t_head
+                                if a.arm == "hicora_t_d1_det"
+                                else model.hicora_head)
+                    dz, _c = head_mod(h24.float(), z0)
+                    if not (torch.isfinite(dz).all()
+                            and torch.isfinite(z0).all()):
+                        raise SystemExit("в поправке или черновике nan/inf")
+                    z_lat = z0 + dz
+                a_exec = decode_latent(z_lat)
+
+                if a.arm == "hicora_t_d1_det" and ident is None:
+                    # СНИМОК СЧЁТЧИКОВ: сверка делает лишние проходы, и они не
+                    # должны попасть в измерение «один проход на вызов»
+                    saved_counts = dict(cnt.n)
+                    with ac16:
+                        jf = model.forward_joint_fast(
+                            vlm_inputs_embeds=v_,
+                            attention_mask=batch.get("attention_mask"),
+                            position_ids=p_)
+                    z_f = E[0][jf["pred_codes"].long()].float()
+                    a_f = decode_latent(z_f)
+                    sd = {k: v.detach().clone()
+                          for k, v in t_head.state_dict().items()}
+                    t_head.net[-1].weight.zero_()
+                    t_head.net[-1].bias.zero_()
+                    dz0, c0 = t_head(h24.float(), z0)
+                    c_max = float(c0.abs().max())
+                    if c_max != 0.0:
+                        t_head.load_state_dict(sd)
+                        raise SystemExit(
+                            f"после обнуления последнего слоя |c| = "
+                            f"{c_max:.3e}, а обязан быть нулём")
+                    ident = check_identity(
+                        t_head, jf["pred_codes"], z_f, a_f,
+                        dict(q0=codes, dz=dz0, z=z0 + dz0), decode_latent)
+                    t_head.load_state_dict(sd)
+                    cnt.n.update(saved_counts)
+                    print(f"  тождество с fast12: q0 {ident['q0_equal']}, "
+                          f"|dZ| {ident['dz_max']:.2e}, |dZ_latent| "
+                          f"{ident['z_max_diff']:.2e}, |d действий| "
+                          f"{ident['action_max_diff']:.2e} -> "
+                          f"{'ОК' if ident['ok'] else 'НЕ СОШЛОСЬ'}",
+                          flush=True)
+                    if not ident["ok"]:
+                        raise SystemExit(
+                            "тождество не выполнено: при нулевой голове "
+                            "HiCoRA-T обязана совпадать с fast12 точно")
             if not per_call:
                 per_call = dict(cnt.n)
             calls += 1
@@ -564,8 +555,17 @@ def run(a):
         raise SystemExit(f"проходов трансформера на вызов политики {n_pass}, "
                          f"а заявлен один: {per_call}")
 
+    rcfg = dict(arm=a.arm, head=str(a.head), suite=str(a.task_suite),
+                task_id=int(a.task_id), init_start=int(a.init_start),
+                n_envs=int(a.n_envs), horizon=int(a.horizon),
+                max_steps=int(a.max_steps),
+                waiting_steps=int(a.waiting_steps), seed=int(a.seed),
+                head_sha1=str(head_sha),
+                precision_mode="trunk_autocast_head_fp32")
     cell = dict(
-        arm=a.arm, head=a.head, stage="k13c_det", suite=a.task_suite,
+        run_config=rcfg,
+        arm=a.arm, head=a.head, head_seed=head_seed, stage="k13c_det",
+        suite=a.task_suite,
         task_id=int(a.task_id), task_ids=[int(a.task_id)],
         state_ids=state_ids, init_start=int(a.init_start),
         n_envs=int(a.n_envs), episodes=eps, horizon=int(a.horizon),
@@ -576,6 +576,7 @@ def run(a):
         rho_sha1=rho_sha, res_norm_sha1=rn_sha, pos_offset=pos_off,
         offset_table_sha1=off_sha, preprocess=PREPROCESS, image_size=224,
         device=str(dev), dtype=a.dtype, identity=ident,
+        head_precision="fp32", precision_mode="trunk_autocast_head_fp32",
         coarse_one_block=coarse_check, calls_per_policy=per_call,
         task_description=task_desc,
         code_version=kb.code_version([

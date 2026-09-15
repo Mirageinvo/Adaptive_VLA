@@ -40,7 +40,23 @@ for W in $WHAT; do
   for T in $TASKS; do
     for S in $STARTS; do
       OUT="$OUTDIR/${W}_t${T}_s${S}.json"
-      if [ -s "$OUT" ]; then skip_n=$((skip_n+1)); continue; fi
+      # ПРОПУСК ТОЛЬКО ПОСЛЕ СВЕРКИ СОСТАВА. «Файл непустой» пропустило бы
+      # ячейку от другой задачи, другого предела шагов или, что случилось
+      # сейчас, от другого режима точности исполнения.
+      HS=""
+      case "$W" in
+        t_s0) HS=$($PY -c "import hashlib,sys;print(hashlib.sha1(open('data/k13b_hicora_t_s0.pt','rb').read()).hexdigest()[:12])") ;;
+        t_s1) HS=$($PY -c "import hashlib,sys;print(hashlib.sha1(open('data/k13b_hicora_t_s1.pt','rb').read()).hexdigest()[:12])") ;;
+        *)    HS="None" ;;
+      esac
+      $PY experiments/k12j_cell_ok.py "$OUT" arm="$ARM" \
+        head="${HEAD:-None}" task_id="$T" init_start="$S" n_envs="$NENV" \
+        max_steps=600 head_sha1="$HS" \
+        precision_mode=trunk_autocast_head_fp32 >/dev/null 2>>"$LOG"
+      case $? in
+        0) skip_n=$((skip_n+1)); continue ;;
+        2) say "ЯЧЕЙКА $OUT ОТ ДРУГОЙ КОНФИГУРАЦИИ — остановка"; exit 2 ;;
+      esac
       say "$W: задача $T, состояния $S..$((S+NENV-1))"
       A=(--arm "$ARM" --ckpt "$CKPT" --task-id "$T" --init-start "$S"
          --n-envs "$NENV" --device "$DEV" --out "$OUT" "${EXTRA[@]}")
