@@ -34,6 +34,14 @@ for W in $WHAT; do
               EXTRA=(--hicora-t-ckpt data/k13b_hicora_t_s0.pt) ;;
     t_s1)     ARM=hicora_t_d1_det; HEAD=s1
               EXTRA=(--hicora-t-ckpt data/k13b_hicora_t_s1.pt) ;;
+    # D1 ПЕРЕСЧИТЫВАЕТСЯ, А НЕ ПЕРЕИСПОЛЬЗУЕТСЯ. Ячейки K-12j сняты в том же
+    # режиме точности, но поля precision_mode не несут — оно появилось позже.
+    # Подставить его «по коду» значило бы заявить, а не измерить; пересчёт
+    # стоит получаса и снимает допущение целиком.
+    d1_s0)    ARM=hicora_d1_det;   HEAD=s0
+              EXTRA=(--hicora-ckpt data/k11d/d1_mlp_coef_0.001_wd0_s0.pt) ;;
+    d1_s1)    ARM=hicora_d1_det;   HEAD=s1
+              EXTRA=(--hicora-ckpt data/k11d/d1_mlp_coef_0.001_wd0_s1.pt) ;;
     *) echo "неизвестно: $W"; exit 1 ;;
   esac
   LOG="$LOGDIR/$W.log"
@@ -45,9 +53,15 @@ for W in $WHAT; do
       # сейчас, от другого режима точности исполнения.
       HS=""
       case "$W" in
-        t_s0) HS=$($PY -c "import hashlib,sys;print(hashlib.sha1(open('data/k13b_hicora_t_s0.pt','rb').read()).hexdigest()[:12])") ;;
-        t_s1) HS=$($PY -c "import hashlib,sys;print(hashlib.sha1(open('data/k13b_hicora_t_s1.pt','rb').read()).hexdigest()[:12])") ;;
-        *)    HS="None" ;;
+        t_s0)  CK=data/k13b_hicora_t_s0.pt ;;
+        t_s1)  CK=data/k13b_hicora_t_s1.pt ;;
+        d1_s0) CK=data/k11d/d1_mlp_coef_0.001_wd0_s0.pt ;;
+        d1_s1) CK=data/k11d/d1_mlp_coef_0.001_wd0_s1.pt ;;
+        *)     CK="" ;;
+      esac
+      case "$W" in
+        fast12|coarse24) HS="None" ;;
+        *) HS=$($PY -c "import hashlib;print(hashlib.sha1(open('$CK','rb').read()).hexdigest()[:12])") ;;
       esac
       $PY experiments/k12j_cell_ok.py "$OUT" arm="$ARM" \
         head="${HEAD:-None}" task_id="$T" init_start="$S" n_envs="$NENV" \
