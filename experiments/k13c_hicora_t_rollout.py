@@ -176,16 +176,25 @@ def report(res, want_pairs=45):
     print(f"\n  ДЕТЕРМИНИРОВАННОЕ СРАВНЕНИЕ, {res['n_pairs']} пар на руку, "
           f"задачи {res['tasks']}, состояния {res['states'][0]}.."
           f"{res['states'][-1]}")
-    print(f"    {'рука':<20}{'успех':>9}{'к fast12':>11}{'к coarse24':>12}")
+    # ЭФФЕКТ БЕЗ ВОССТАНОВЛЕНИЙ И ПОТЕРЬ ОБМАНЧИВ: +6.67 пп из трёх чистых
+    # исходов и из тринадцати против десяти — разные утверждения
+    print(f"    {'рука':<20}{'успех':>9}"
+          f"{'к fast12':>11}{'в/п':>9}{'p':>7}"
+          f"{'к coarse24':>12}{'в/п':>9}{'p':>7}")
     base = succ.get("fast12")
     c24 = succ.get("coarse24")
+
+    def col(s_, ref):
+        if not ref:
+            return f"{'—':>11}{'—':>9}{'—':>7}"
+        c = compare(s_, ref)
+        return (f"{100 * c['effect']:>+10.2f}"
+                f"{c['recovered']:>5}/{c['lost']:<3}"
+                f"{c['p_one_sided']:>7.3f}")
     for arm in res["arms"]:
         s = succ[arm]
-        v1 = compare(s, base)["effect"] * 100 if base else None
-        v2 = compare(s, c24)["effect"] * 100 if c24 else None
         print(f"    {arm:<20}{100 * sum(s.values()) / len(s):>8.2f}%"
-              + (f"{v1:>+10.2f}" if v1 is not None else f"{'—':>11}")
-              + (f"{v2:>+11.2f}" if v2 is not None else f"{'—':>12}"))
+              + col(s, base) + col(s, c24))
     print(f"\n  ГЛАВНОЕ СРАВНЕНИЕ, попарно по головам:")
     for head, pair in res["head_pairs"].items():
         t, d = pair["t"], pair["d1"]
