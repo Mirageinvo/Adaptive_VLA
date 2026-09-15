@@ -407,7 +407,10 @@ def run(a):
                                               initial_position_shift=1)
                     codes = toks[:, :16]
                     if coarse_check is None and a.verify_coarse:
-                        # ОДИН БЛОК ПРОТИВ ПЕРВОГО БЛОКА ПОЛНОГО generate
+                        # ОДИН БЛОК ПРОТИВ ПЕРВОГО БЛОКА ПОЛНОГО generate.
+                        # Снимок счётчиков, а не вычитание: сверочный вызов не
+                        # должен попасть в измерение стоимости политики.
+                        saved_counts = dict(cnt.n)
                         full = model.generate(**batch, position_offset=pos_off,
                                               do_sample=False,
                                               initial_position_shift=1)
@@ -420,7 +423,7 @@ def run(a):
                                 "only_blocks(1) дал не те коды, что первый "
                                 "блок полного generate: экономия изменила бы "
                                 "политику")
-                        cnt.n["generate"] -= 1      # сверка не в счёт
+                        cnt.n.update(saved_counts)
                     z = E[0][codes.long()]
                     a_exec = decode_latent(z)
                 else:
@@ -446,6 +449,13 @@ def run(a):
                             position_ids=p_)
                         a_exec = decode_latent(out["z"])
                         if ident is None:
+                            # СНИМОК СЧЁТЧИКОВ. Сверка делает лишние проходы и
+                            # декодирования, и их надо исключить из измерения
+                            # «один проход на вызов политики». Ручное вычитание
+                            # уже ошиблось: forward_joint_fast не идёт через
+                            # forward_taps, и «минус два» обнулило счётчик.
+                            # Снимок от устройства вызовов не зависит.
+                            saved_counts = dict(cnt.n)
                             # ТОЖДЕСТВО НА НАСТОЯЩЕМ БАТЧЕ: голова обнуляется,
                             # и выход обязан совпасть с fast12 точно
                             jf = model.forward_joint_fast(
@@ -504,9 +514,7 @@ def run(a):
                                     "голове HiCoRA-T обязана совпадать с "
                                     "fast12 точно")
                             t_head.load_state_dict(sd)
-                            # сверка не должна попасть в счётчики
-                            cnt.n["forward_taps"] -= 2
-                            cnt.n["_decode"] -= 2
+                            cnt.n.update(saved_counts)
             if not per_call:
                 per_call = dict(cnt.n)
             calls += 1
