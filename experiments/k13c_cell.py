@@ -459,44 +459,37 @@ def run(a):
                             with torch.no_grad():
                                 t_head.net[-1].weight.zero_()
                                 t_head.net[-1].bias.zero_()
-                                # ОБНУЛЕНИЕ ПРОВЕРЯЕТСЯ, А НЕ ПРЕДПОЛАГАЕТСЯ:
-                                # если голова, которую исполняет модель, —
-                                # другой объект, zero_() не даст эффекта, и
-                                # тождество провалится без объяснения
-                                w_max = float(
-                                    t_head.net[-1].weight.abs().max())
-                                b_max = float(t_head.net[-1].bias.abs().max())
-                                same_obj = (model.hicora_t_head is t_head)
-                                out0 = model.forward_hicora_t(
-                                    vlm_inputs_embeds=v_,
-                                    attention_mask=batch.get("attention_mask"),
-                                    position_ids=p_)
+                                # СВЕЖИЙ КОНТЕКСТ autocast И БЕЗ КЭША ВЕСОВ.
+                                # autocast кэширует fp16-копии весов на время
+                                # своего контекста и предполагает, что веса
+                                # внутри не меняются. Обнуление fp32-весов
+                                # внутри уже открытого контекста НЕ ВИДНО
+                                # прямому проходу: он берёт копию, снятую до
+                                # обнуления. Измерено: |c| до и после
+                                # обнуления совпадали до последнего знака.
+                                with torch.autocast(
+                                        "cuda", dtype=torch.float16,
+                                        cache_enabled=False):
+                                    out0 = model.forward_hicora_t(
+                                        vlm_inputs_embeds=v_,
+                                        attention_mask=batch.get(
+                                            "attention_mask"),
+                                        position_ids=p_)
                                 c_max = float(out0["coeffs"].abs().max())
-                                # РЕШАЮЩЕЕ РАЗЛИЧЕНИЕ: если коэффициенты не
-                                # изменились, прямой проход идёт мимо
-                                # обнулённого модуля
-                                c_before = float(out["coeffs"].abs().max())
-                                mod_id = (id(t_head.net[-1])
-                                          == id(model.hicora_t_head.net[-1]))
-                                direct = float(torch.tanh(
-                                    t_head.mean_coeffs(
-                                        model.res_norm(
-                                            model.forward_taps(
-                                                vlm_inputs_embeds=v_,
-                                                attention_mask=batch.get(
-                                                    "attention_mask"),
-                                                position_ids=p_)[24]).float(),
-                                        out0["z0"])).abs().max())
-                            print(f"    обнуление: |W| {w_max:.2e}, |b| "
-                                  f"{b_max:.2e}, та же голова {same_obj}, тот "
-                                  f"же модуль {mod_id}\n    |c| до "
-                                  f"{c_before:.3e} -> после {c_max:.3e}; "
-                                  f"прямой вызов головы даёт {direct:.3e}",
-                                  flush=True)
+                            # ЗАЩИТА ОТ ВОЗВРАТА ТОЙ ЖЕ ЛОВУШКИ: при нулевом
+                            # последнем слое коэффициенты обязаны быть ровно
+                            # нулём, иначе обнуление до прохода не дошло, и
+                            # «тождество» проверяло бы не то
+                            if c_max != 0.0:
+                                t_head.load_state_dict(sd)
+                                raise SystemExit(
+                                    f"после обнуления последнего слоя |c| = "
+                                    f"{c_max:.3e}, а обязан быть нулём: "
+                                    f"обнуление не дошло до прямого прохода "
+                                    f"(кэш весов autocast?)")
                             ident = check_identity(
                                 t_head, jf["pred_codes"], z_f, a_f, out0,
                                 decode_latent)
-                            t_head.load_state_dict(sd)
                             print(f"  тождество с fast12: q0 "
                                   f"{ident['q0_equal']}, |dZ| "
                                   f"{ident['dz_max']:.2e}, |dZ_latent| "
@@ -505,10 +498,12 @@ def run(a):
                                   f"{'ОК' if ident['ok'] else 'НЕ СОШЛОСЬ'}",
                                   flush=True)
                             if not ident["ok"]:
+                                t_head.load_state_dict(sd)
                                 raise SystemExit(
                                     "тождество не выполнено: при нулевой "
                                     "голове HiCoRA-T обязана совпадать с "
                                     "fast12 точно")
+                            t_head.load_state_dict(sd)
                             # сверка не должна попасть в счётчики
                             cnt.n["forward_taps"] -= 2
                             cnt.n["_decode"] -= 2
