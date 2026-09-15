@@ -459,10 +459,23 @@ def run(a):
                             with torch.no_grad():
                                 t_head.net[-1].weight.zero_()
                                 t_head.net[-1].bias.zero_()
+                                # ОБНУЛЕНИЕ ПРОВЕРЯЕТСЯ, А НЕ ПРЕДПОЛАГАЕТСЯ:
+                                # если голова, которую исполняет модель, —
+                                # другой объект, zero_() не даст эффекта, и
+                                # тождество провалится без объяснения
+                                w_max = float(
+                                    t_head.net[-1].weight.abs().max())
+                                b_max = float(t_head.net[-1].bias.abs().max())
+                                same_obj = (model.hicora_t_head is t_head)
                                 out0 = model.forward_hicora_t(
                                     vlm_inputs_embeds=v_,
                                     attention_mask=batch.get("attention_mask"),
                                     position_ids=p_)
+                                c_max = float(out0["coeffs"].abs().max())
+                            print(f"    обнуление: |W| {w_max:.2e}, |b| "
+                                  f"{b_max:.2e}, та же голова {same_obj}, "
+                                  f"|c| после обнуления {c_max:.2e}",
+                                  flush=True)
                             ident = check_identity(
                                 t_head, jf["pred_codes"], z_f, a_f, out0,
                                 decode_latent)
