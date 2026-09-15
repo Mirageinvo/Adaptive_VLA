@@ -54,16 +54,26 @@ def targets_from_coef(coef, rho, eps=1e-8):
     return np.clip(np.asarray(coef, np.float32), -r, r) / r
 
 
-def split_val(idx, frac=0.5, seed=0):
-    """Val делится надвое: отбор эпохи и подтверждение.
+SPLIT_SEED = 61          # тот же, что в K-11c: разбиение val одно на все головы
 
-    Число, по которому выбрана эпоха, смещено вниз просто потому, что эпоха
-    выбиралась по нему. Подтверждение на непересекающейся половине даёт
-    честную величину — но и она описательная: решение принимается по rollout.
+
+def split_val_by_episode(idx, epi, frac=0.4, seed=SPLIT_SEED):
+    """Val делится ПО ЭПИЗОДАМ, а не по наблюдениям.
+
+    Кадры одного эпизода сильно зависимы; разделив их по наблюдениям, мы
+    получили бы одни и те же эпизоды в обеих половинах, и «подтверждающая»
+    половина не была бы независимой.
+
+    СИД ФИКСИРОВАН И НЕ РАВЕН СИДУ ГОЛОВЫ: разбиение обязано совпадать у s0 и
+    s1, иначе их числа считаются на разных наборах и попарно не сравнимы.
+    Меняется только инициализация головы.
     """
-    r = np.random.default_rng(seed).permutation(len(idx))
-    cut = int(len(idx) * frac)
-    return np.sort(idx[r[:cut]]), np.sort(idx[r[cut:]])
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from k11c_train_d1 import split_episodes
+    sel_eps, hold_eps = split_episodes(epi[idx], frac, seed=seed)
+    sel = idx[np.isin(epi[idx], list(sel_eps))]
+    hold = idx[np.isin(epi[idx], list(hold_eps))]
+    return np.sort(sel), np.sort(hold), len(sel_eps), len(hold_eps)
 
 
 def batches(n, size):
@@ -113,12 +123,20 @@ def selftest():
     # без деления на rho мишень была бы недостижима для tanh
     assert np.abs(np.clip(coef, -rho, rho)).max() > 1.0
 
-    # --- деление val надвое ------------------------------------------------
-    idx = np.arange(100)
-    a, b = split_val(idx, 0.5, 0)
-    assert len(a) == 50 and len(b) == 50
-    assert len(np.intersect1d(a, b)) == 0, "половины val пересекаются"
-    assert np.array_equal(np.sort(np.concatenate([a, b])), idx)
+    # --- деление val ПО ЭПИЗОДАМ -------------------------------------------
+    # По четыре кадра на эпизод: если делить по наблюдениям, эпизоды окажутся
+    # в обеих половинах, и подтверждение перестанет быть независимым.
+    idx = np.arange(160)
+    epi = np.repeat(np.arange(40), 4)
+    sel, hold, n_es, n_ec = split_val_by_episode(idx, epi, 0.4)
+    assert len(np.intersect1d(sel, hold)) == 0, "половины пересекаются"
+    assert len(sel) + len(hold) == len(idx)
+    assert n_es + n_ec == 40 and min(n_es, n_ec) >= 8, (n_es, n_ec)
+    e_sel, e_hold = set(epi[sel].tolist()), set(epi[hold].tolist())
+    assert not (e_sel & e_hold), "эпизод попал в обе половины"
+    # разбиение НЕ зависит от сида головы: у s0 и s1 оно обязано совпасть
+    sel2, hold2, _, _ = split_val_by_episode(idx, epi, 0.4)
+    assert np.array_equal(sel, sel2) and np.array_equal(hold, hold2)
 
     # --- соответствие мишени и строк при перемешивании --------------------
     # Ошибка «мишень от другого батча» тихая: потеря считается, обучение идёт,
@@ -192,9 +210,15 @@ def main():
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--epochs", type=int, default=12)
     ap.add_argument("--patience", type=int, default=3)
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="сид ИНИЦИАЛИЗАЦИИ ГОЛОВЫ; разбиение val от него не "
+                         "зависит и одинаково у всех голов")
+    ap.add_argument("--sel-frac", type=float, default=0.4)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--no-stamp", action="store_true",
+                    help="пропустить заверение входа K-11b (только для "
+                         "отладки: h24 останется непроверенным)")
     ap.add_argument("--out", default="data/k13b_hicora_t_s0.pt")
     a = ap.parse_args()
     if a.selftest:
@@ -210,6 +234,15 @@ def main():
     bmeta = json.load(open(f"{a.basis}.meta.json"))
     B = np.load(f"{a.basis}.basis.npy")
     rho = np.load(f"{a.basis}.rho.npy")
+    # СВЕРКА ФАКТИЧЕСКИ ЗАГРУЖЕННЫХ МАССИВОВ С ИХ ЖЕ ОТПЕЧАТКАМИ. Файл на
+    # диске мог быть перезаписан другим прогоном после того, как meta была
+    # записана, и тогда голова обучалась бы под один базис, а исполнялась под
+    # другой.
+    for nm, arr, want in (("базис", B, bmeta["basis_sha1"]),
+                          ("rho", rho, bmeta["rho_sha1"])):
+        if arr_sha(arr) != want:
+            raise SystemExit(f"{nm} на диске имеет sha {arr_sha(arr)}, а в "
+                             f"meta базиса {want}")
     if bmeta.get("centered") is not False:
         raise SystemExit("базис центрированный: тождество u=0 -> dZ=0 не "
                          "выполнялось бы, и нулевая инициализация не давала "
@@ -227,22 +260,38 @@ def main():
         raise SystemExit("черновик q0hat не тот, на котором построен базис: "
                          "целевые коэффициенты относились бы к другому "
                          "остатку")
+    for nm, path, want in (("ktrue", f"{a.cache}.ktrue.npy",
+                            bmeta.get("ktrue_sha1")),
+                           ("split", f"{a.cache}.split.npy",
+                            bmeta.get("split_sha1"))):
+        if want and sha12(path) != want:
+            raise SystemExit(f"{nm} изменился после построения базиса: "
+                             f"{sha12(path)} против {want}")
     n_obs, d_hidden = H24.shape[0], H24.shape[-1]
     if H24.shape[1] != n_pos:
         raise SystemExit(f"в кэше {H24.shape[1]} позиций, базис на {n_pos}")
 
     idx, _sp = k13a.load_split(f"{a.cache}.split.npy", n_obs)
-    tr = idx["train"]
-    vsel, vcnf = split_val(idx["val"], 0.5, a.seed)
+    tr, va = idx["train"], idx["val"]
+    # ЭПИЗОДЫ ИЗ ИСХОДНОГО КЭША: в производном их нет, а делить val надо по
+    # ним, иначе кадры одного эпизода попадут в обе половины
+    src = cmeta.get("cache")
+    if not src or not os.path.exists(src):
+        raise SystemExit(f"исходный кэш {src} недоступен: без эпизодов val "
+                         f"нельзя разделить честно")
+    epi = np.asarray(np.load(src, allow_pickle=True)["episode"]).astype(
+        np.int64)[:n_obs]
+    vsel, vcnf, n_es, n_ec = split_val_by_episode(va, epi, a.sel_frac)
+    print(f"  val разделён ПО ЭПИЗОДАМ (сид {SPLIT_SEED}): {n_es} эпизодов "
+          f"({len(vsel)} набл.) на выбор эпохи, {n_ec} эпизодов "
+          f"({len(vcnf)} набл.) на подтверждение")
     if a.limit:
         tr = tr[:a.limit]
-        vsel, vcnf = vsel[:a.limit // 4], vcnf[:a.limit // 4]
     print(f"  кэш {a.cache}: {n_obs} наблюдений, d_hidden {d_hidden}, "
           f"позиций {n_pos}, латент {d_lat}")
     print(f"  базис {a.basis}: ранг {rank}, ||rho|| {bmeta['rho_norm']:.4f}, "
           f"объяснено {100 * bmeta['explained']:.2f}%")
-    print(f"  train {len(tr)}, val отбор {len(vsel)}, val подтверждение "
-          f"{len(vcnf)}")
+    print(f"  train {len(tr)}")
 
     dev = torch.device(a.device)
     torch.manual_seed(a.seed)
@@ -266,17 +315,22 @@ def main():
 
     Et = torch.from_numpy(E).to(dev)
 
+    # ТОТ ЖЕ dtype, ЧТО В ПРОГОНЕ: там norm получает h24 в fp16 и результат
+    # приводится к float. Подача fp32 на вход дала бы другой результат нормы,
+    # то есть обучение на входе, которого при исполнении не бывает.
+    rn_dtype = next(res_norm.parameters()).dtype
+
     def feed(s):
-        hb = torch.from_numpy(np.asarray(H24[s])).to(dev)
+        hb = torch.from_numpy(np.asarray(H24[s])).to(dev, rn_dtype)
         with torch.no_grad():
-            hn = res_norm(hb.float()).float()
+            hn = res_norm(hb).float()
             z0 = Et[0][torch.from_numpy(
                 np.asarray(q0hat[s]).astype(np.int64)).to(dev)]
         return hn, z0
 
     # НОРМА ДЕЙСТВИТЕЛЬНО МЕНЯЕТ ВХОД — проверяется, а не предполагается
     probe = np.asarray(tr[:64])
-    hraw = torch.from_numpy(np.asarray(H24[probe])).to(dev).float()
+    hraw = torch.from_numpy(np.asarray(H24[probe])).to(dev, rn_dtype).float()
     hn0, _z = feed(probe)
     d_norm = float((hn0 - hraw).abs().max())
     if d_norm < 1e-3:
@@ -286,35 +340,100 @@ def main():
     print(f"  res_norm применена: max|h_norm - h_raw| = {d_norm:.3f}, "
           f"sha {rn_sha}")
 
-    # --- целевые коэффициенты ---------------------------------------------
-    def coef_for(ix):
-        return k13a.coeffs_stream(E, k_true, q0hat, ix, B, 4096, n_pos, d_lat)
+    # ЗАВЕРЕНИЕ ВХОДА K-11b. Проверка «норма что-то изменила» показывает лишь,
+    # что преобразование не тождественно; что загружена ПРАВИЛЬНАЯ res_norm и
+    # тот самый h24, подтверждает только отпечаток K-11b, снятый сверкой с
+    # живым проходом. Базис и rho там относятся к ЛОКАЛЬНОМУ базису K-11a —
+    # это другой артефакт, и наш траекторный сверяется своей meta выше.
+    if not a.no_stamp:
+        import k11a_build_hicora_cache as k11a
+        import k11p_residual_probe as k11p
+        stamp_p = f"{a.cache}.artifacts.json"
+        if not os.path.exists(stamp_p):
+            raise SystemExit(
+                f"нет {stamp_p}: правильность позднего входа не подтверждена "
+                f"(K-11b). Запустите его или, если это осознанно, укажите "
+                f"--no-stamp — тогда обучение пойдёт на непроверенном h24")
+        stamp = json.load(open(stamp_p))
+        tap = max(cmeta["saved_taps"])
+        ash = {f"h{tap}": k11a.file_sha1(f"{a.cache}.h{tap}.npy")}
+        for nm in ("q0hat", "ktrue", "split", "codebooks"):
+            p_ = f"{a.cache}.{nm}.npy"
+            if os.path.exists(p_):
+                ash[nm] = k11a.file_sha1(p_)
+        k11p.check_stamp(stamp, ash, rn_sha, tap,
+                         k11a.file_sha1(f"{a.cache}.meta.json"),
+                         k11a.file_sha1(f"{a.cache}.basis.npy"),
+                         k11a.file_sha1(f"{a.cache}.rho.npy"),
+                         stamp.get("script_sha1"))
+        print(f"  вход заверён K-11b ({stamp['script_sha1']}): отпечатки "
+              f"{len(ash)} массивов и res_norm совпали")
 
+    # --- целевые коэффициенты ---------------------------------------------
+    # КОЭФФИЦИЕНТЫ БЕРУТСЯ ИЗ АРТЕФАКТА K-13a, а не считаются заново: это то
+    # же произведение на 121 тысяче строк по 8192 измерения, и повторять его
+    # для каждой головы незачем. Порядок строк тот же — оба скрипта берут
+    # индексы одной и той же load_split, — и это проверяется по длине.
     t0 = time.time()
-    T_tr = targets_from_coef(coef_for(tr), rho)
-    T_sel = targets_from_coef(coef_for(vsel), rho)
-    T_cnf = targets_from_coef(coef_for(vcnf), rho)
+    cf_tr = np.load(f"{a.basis}.coef_train.npy")
+    cf_va = np.load(f"{a.basis}.coef_val.npy")
+    if len(cf_tr) != len(idx["train"]) or len(cf_va) != len(va):
+        raise SystemExit(
+            f"коэффициенты не соответствуют split: train {len(cf_tr)} против "
+            f"{len(idx['train'])}, val {len(cf_va)} против {len(va)}")
+    if cf_tr.shape[1] != rank:
+        raise SystemExit(f"коэффициенты ранга {cf_tr.shape[1]}, базис {rank}")
+    # ВЫБОРОЧНАЯ СВЕРКА С ПЕРЕСЧЁТОМ: равенство длин не доказывает, что
+    # порядок строк тот же
+    chk = np.asarray(idx["train"][:64])
+    ref = k13a.coeffs_stream(E, k_true, q0hat, chk, B, 64, n_pos, d_lat)
+    d_coef = float(np.abs(ref - cf_tr[:64]).max())
+    if d_coef > 1e-3:
+        raise SystemExit(f"сохранённые коэффициенты расходятся с пересчётом "
+                         f"на {d_coef:.3e}: порядок строк не тот")
+    pos_tr = {int(v): i for i, v in enumerate(idx["train"])}
+    pos_va = {int(v): i for i, v in enumerate(va)}
+    T_tr = targets_from_coef(cf_tr[[pos_tr[int(v)] for v in tr]], rho)
+    T_sel = targets_from_coef(cf_va[[pos_va[int(v)] for v in vsel]], rho)
+    T_cnf = targets_from_coef(cf_va[[pos_va[int(v)] for v in vcnf]], rho)
+    print(f"  коэффициенты прочитаны из {a.basis}.coef_*.npy, сверка с "
+          f"пересчётом: max|d| = {d_coef:.2e}")
     sat = float((np.abs(T_tr) >= 1.0 - 1e-6).mean())
     print(f"  мишени готовы за {time.time() - t0:.0f} с; доля координат на "
           f"пределе rho: {100 * sat:.2f}%")
 
     head = build_head(d_hidden, d_lat, n_pos, rank, a.proj, a.hidden, B, rho,
                       dev)
-    train_p = [p for n_, p in head.named_parameters()
-               if n_.startswith(("proj_h.", "proj_z.", "net."))]
-    frozen = [n_ for n_, p in head.named_parameters() if p not in train_p]
+    # ПО ИМЕНАМ, А НЕ ПО ОБЪЕКТАМ: `p not in train_p` сравнивает тензоры
+    # через ==, и bool() на многоэлементном результате падает
+    pref = ("proj_h.", "proj_z.", "net.")
+    named = list(head.named_parameters())
+    train_p = [p for n_, p in named if n_.startswith(pref)]
+    frozen = [n_ for n_, _p in named if not n_.startswith(pref)]
     n_par = sum(p.numel() for p in train_p)
-    print(f"  голова: обучаемых параметров {n_par}, заморожено {frozen}")
+    # БАЗИС И rho — БУФЕРЫ, их нет в named_parameters вовсе: они не заморожены
+    # оптимизатором, а не могут обучаться по построению. Печатать пустой
+    # список «заморожено» было бы обманчиво.
+    bufs = [n_ for n_, _b in head.named_buffers()]
+    print(f"  голова: обучаемых параметров {n_par} в {len(train_p)} тензорах; "
+          f"не-обучаемых параметров {frozen or 'нет'}; буферы (не обучаются "
+          f"по построению): {bufs}")
     opt = torch.optim.Adam(train_p, lr=a.lr, weight_decay=a.wd)
 
     base_sel = evaluate(head, feed, vsel, T_sel, a.batch, dev)
-    print(f"\n  до обучения (поправка тождественно нулевая): потеря на val "
-          f"отборе {base_sel:.5f}")
+    base_cnf = evaluate(head, feed, vcnf, T_cnf, a.batch, dev)
+    print(f"\n  эпоха 0 (поправка тождественно нулевая, это coarse24): val "
+          f"отбор {base_sel:.5f}, val подтверждение {base_cnf:.5f}")
 
-    best = dict(loss=float("inf"), epoch=-1, state=None)
+    # НУЛЕВАЯ ГОЛОВА — ПОЛНОПРАВНЫЙ УЧАСТНИК ОТБОРА. С best=inf первая же
+    # обученная эпоха сохранялась бы, даже будучи хуже coarse24, и при этом
+    # называлась бы «эпоха 0». Теперь эпоха 0 — это и есть необученная голова.
+    best = dict(loss=base_sel, epoch=0,
+                state={k: v.detach().cpu().clone()
+                       for k, v in head.state_dict().items()})
     hist, bad = [], 0
     rng = np.random.default_rng(a.seed)
-    for ep in range(a.epochs):
+    for ep in range(1, a.epochs + 1):
         order = rng.permutation(len(tr))
         run, nb = 0.0, 0
         for i, j in batches(len(tr), a.batch):
@@ -332,7 +451,7 @@ def main():
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
-            run += float(loss)
+            run += float(loss.detach())
             nb += 1
             if nb % 200 == 0:
                 print(f"      эпоха {ep}, батч {nb}/{len(tr) // a.batch + 1}, "
@@ -352,14 +471,16 @@ def main():
                 print(f"    остановка: {bad} эпох без улучшения")
                 break
 
-    if best["state"] is None:
-        raise SystemExit("ни одна эпоха не улучшила потерю")
     head.load_state_dict(best["state"])
     cnf = evaluate(head, feed, vcnf, T_cnf, a.batch, dev)
-    print(f"\n  выбрана эпоха {best['epoch']}: val отбор {best['loss']:.5f}, "
-          f"val подтверждение {cnf:.5f}")
-    print(f"    до обучения было {base_sel:.5f} — доля снятой потери "
-          f"{100 * (1 - best['loss'] / base_sel):.1f}%")
+    print(f"\n  выбрана эпоха {best['epoch']}"
+          + (" — НУЛЕВАЯ ГОЛОВА: обучение не улучшило ни одной эпохи"
+             if best["epoch"] == 0 else ""))
+    print(f"    val отбор {best['loss']:.5f} (было {base_sel:.5f}), снято "
+          f"{100 * (1 - best['loss'] / base_sel):.1f}% — но по этому числу "
+          f"эпоха и выбиралась")
+    print(f"    val ПОДТВЕРЖДЕНИЕ {cnf:.5f} (было {base_cnf:.5f}), снято "
+          f"{100 * (1 - cnf / base_cnf):.1f}% — честная величина")
 
     ck = dict(
         state={k: v.detach().cpu() for k, v in head.state_dict().items()},
@@ -376,6 +497,10 @@ def main():
         lr=a.lr, wd=a.wd, batch=int(a.batch), epochs_run=len(hist),
         loss="smooth_l1_on_clamped_coef",
         val_sel=best["loss"], val_confirm=cnf, val_sel_before=base_sel,
+        val_confirm_before=base_cnf,
+        val_confirm_gain=float(1 - cnf / base_cnf) if base_cnf else None,
+        split_seed=SPLIT_SEED, sel_frac=a.sel_frac,
+        n_val_sel=int(len(vsel)), n_val_confirm=int(len(vcnf)),
         target_saturated_frac=sat, history=hist,
         code_version=kb.code_version([
             os.path.abspath(__file__), os.path.join(here, "hicora_t_vla.py"),
