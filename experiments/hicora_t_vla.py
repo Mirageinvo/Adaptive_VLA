@@ -88,7 +88,12 @@ def make_trajectory_head():
             if not torch.isfinite(b).all():
                 raise ValueError("в базисе есть nan или inf")
             g = b @ b.T
-            off = float((g - torch.eye(self.rank, dtype=g.dtype)).abs().max())
+            # ЕДИНИЧНАЯ МАТРИЦА НА УСТРОЙСТВЕ САМОГО БАЗИСА: torch.eye без
+            # device создаёт её на CPU, и если голова уже на карте, вычитание
+            # падает. В hicora_vla это не всплывало, потому что там базис
+            # задают до переноса на устройство.
+            off = float((g - torch.eye(self.rank, dtype=g.dtype,
+                                       device=g.device)).abs().max())
             if off > 1e-4:
                 raise ValueError(f"базис не ортонормирован: max|B B^T - I| = "
                                  f"{off:.2e}")
