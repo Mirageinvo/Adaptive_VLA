@@ -277,7 +277,9 @@ def main():
     want = len(tasks) * len(starts) * a.n_envs
     succ, keys = pair_table(by_arm, want)
 
-    arms_present = [k for k in by_arm]
+    # РУКИ БЕРУТСЯ ИЗ ПОСЧИТАННОГО, а не из прочитанного: исключённая
+    # недосчитанная рука в by_arm остаётся, и отчёт спотыкался бы о неё
+    arms_present = list(succ)
     res = dict(arms=sorted(arms_present), success=succ, n_pairs=len(keys),
                tasks=tasks, states=sorted({k[1] for k in keys}),
                head_pairs={h: dict(t=f"hicora_t_d1_det:{h}",
