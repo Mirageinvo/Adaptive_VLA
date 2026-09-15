@@ -177,6 +177,9 @@ def main():
     ap.add_argument("--states", default="30,35,40")
     ap.add_argument("--n-envs", type=int, default=5)
     ap.add_argument("--heads", default="s0,s1")
+    ap.add_argument("--d1-cells", action="append", default=[],
+                    help="маска готовых ячеек D1 и голова через '=', "
+                         "например 'data/k12j/s0_*/eval_d1_det/*.json=s0'")
     ap.add_argument("--out", default="data/k13c/summary.json")
     a = ap.parse_args()
     if a.selftest:
@@ -189,6 +192,25 @@ def main():
         c = json.load(open(p))
         c["_path"] = p
         cells.append(c)
+    # ГОТОВЫЕ ЯЧЕЙКИ D1 ПЕРЕИСПОЛЬЗУЮТСЯ, А НЕ ПЕРЕСЧИТЫВАЮТСЯ. В K-12j рука
+    # называлась `baseline` (детерминированная D1 при sigma=0) — это та же
+    # политика при тех же условиях, и условия сверяются ниже наравне со всеми.
+    # Файлы НЕ переписываются: имя руки подставляется при чтении.
+    for spec in a.d1_cells:
+        if "=" not in spec:
+            raise SystemExit(f"--d1-cells ждёт вид 'маска=голова', дано {spec}")
+        pat, head = spec.rsplit("=", 1)
+        found = sorted(glob.glob(pat))
+        if not found:
+            raise SystemExit(f"по маске {pat} нет ячеек")
+        for p in found:
+            c = json.load(open(p))
+            if c.get("arm") != "baseline" or float(c.get("sigma", -1)) != 0.0:
+                raise SystemExit(
+                    f"{p}: рука {c.get('arm')} при sigma {c.get('sigma')} — "
+                    f"это не детерминированная D1")
+            c["arm"], c["head"], c["_path"] = "hicora_d1_det", head, p
+            cells.append(c)
     if not cells:
         raise SystemExit(f"в {a.cells} нет ячеек")
 
