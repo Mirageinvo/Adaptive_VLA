@@ -244,9 +244,10 @@ def main():
             raise SystemExit(f"{nm} на диске имеет sha {arr_sha(arr)}, а в "
                              f"meta базиса {want}")
     if bmeta.get("centered") is not False:
-        raise SystemExit("базис центрированный: тождество u=0 -> dZ=0 не "
-                         "выполнялось бы, и нулевая инициализация не давала "
-                         "бы совпадения с coarse24")
+        raise SystemExit(
+            "базис центрированный. Тождество u=0 -> dZ=0 он сам по себе не "
+            "нарушает; он задаёт ДРУГОЕ подпространство, то есть другой "
+            "эксперимент, и смешивать его с уже построенным нельзя")
     rank, n_pos, d_lat = bmeta["rank"], bmeta["n_pos"], bmeta["d_latent"]
 
     k_true = np.load(f"{a.cache}.ktrue.npy", mmap_mode="r")
@@ -422,11 +423,11 @@ def main():
 
     base_sel = evaluate(head, feed, vsel, T_sel, a.batch, dev)
     base_cnf = evaluate(head, feed, vcnf, T_cnf, a.batch, dev)
-    print(f"\n  эпоха 0 (поправка тождественно нулевая, это coarse24): val "
+    print(f"\n  эпоха 0 (поправка тождественно нулевая, это fast12): val "
           f"отбор {base_sel:.5f}, val подтверждение {base_cnf:.5f}")
 
     # НУЛЕВАЯ ГОЛОВА — ПОЛНОПРАВНЫЙ УЧАСТНИК ОТБОРА. С best=inf первая же
-    # обученная эпоха сохранялась бы, даже будучи хуже coarse24, и при этом
+    # обученная эпоха сохранялась бы, даже будучи хуже fast12, и при этом
     # называлась бы «эпоха 0». Теперь эпоха 0 — это и есть необученная голова.
     best = dict(loss=base_sel, epoch=0,
                 state={k: v.detach().cpu().clone()
