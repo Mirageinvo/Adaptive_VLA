@@ -472,9 +472,26 @@ def run(a):
                                     attention_mask=batch.get("attention_mask"),
                                     position_ids=p_)
                                 c_max = float(out0["coeffs"].abs().max())
+                                # РЕШАЮЩЕЕ РАЗЛИЧЕНИЕ: если коэффициенты не
+                                # изменились, прямой проход идёт мимо
+                                # обнулённого модуля
+                                c_before = float(out["coeffs"].abs().max())
+                                mod_id = (id(t_head.net[-1])
+                                          == id(model.hicora_t_head.net[-1]))
+                                direct = float(torch.tanh(
+                                    t_head.mean_coeffs(
+                                        model.res_norm(
+                                            model.forward_taps(
+                                                vlm_inputs_embeds=v_,
+                                                attention_mask=batch.get(
+                                                    "attention_mask"),
+                                                position_ids=p_)[24]).float(),
+                                        out0["z0"])).abs().max())
                             print(f"    обнуление: |W| {w_max:.2e}, |b| "
-                                  f"{b_max:.2e}, та же голова {same_obj}, "
-                                  f"|c| после обнуления {c_max:.2e}",
+                                  f"{b_max:.2e}, та же голова {same_obj}, тот "
+                                  f"же модуль {mod_id}\n    |c| до "
+                                  f"{c_before:.3e} -> после {c_max:.3e}; "
+                                  f"прямой вызов головы даёт {direct:.3e}",
                                   flush=True)
                             ident = check_identity(
                                 t_head, jf["pred_codes"], z_f, a_f, out0,
