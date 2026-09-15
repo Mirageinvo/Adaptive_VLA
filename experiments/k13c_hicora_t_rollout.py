@@ -54,20 +54,35 @@ def arm_needs_head(arm):
     return arm in ("hicora_d1_det", "hicora_t_d1_det")
 
 
-def pair_table(by_arm, want_states):
-    """Парные разности по общим (задача, состояние). Непарность — отказ."""
-    keys = None
-    for arm, eps in by_arm.items():
-        k = {(int(e["task_id"]), int(e["state_id"])) for e in eps}
-        keys = k if keys is None else (keys & k)
-    miss = {arm: sorted({(int(e["task_id"]), int(e["state_id"]))
-                         for e in eps} - keys)[:5]
+def pair_table(by_arm, want_states, log=print):
+    """Парные разности по общим (задача, состояние).
+
+    НЕДОСЧИТАННАЯ РУКА ИСКЛЮЧАЕТСЯ С ОБЪЯСНЕНИЕМ, а не роняет отчёт: пока
+    одна рука считается, остальные сравнивать можно и нужно. А вот РАСХОЖДЕНИЕ
+    состояний при полном покрытии — отказ: это разные наборы, и разность по
+    ним ничего не измеряет.
+    """
+    sets = {arm: {(int(e["task_id"]), int(e["state_id"])) for e in eps}
             for arm, eps in by_arm.items()}
-    bad = {a: m for a, m in miss.items() if m}
+    full = {arm: k for arm, k in sets.items()
+            if not want_states or len(k) >= want_states}
+    partial = {arm: len(k) for arm, k in sets.items() if arm not in full}
+    for arm, n in sorted(partial.items()):
+        log(f"    рука {arm} исключена: {n} пар из {want_states} — ещё "
+            f"считается или прервана")
+    if not full:
+        raise SystemExit("ни одна рука не покрывает нужные состояния")
+    keys = None
+    for k in full.values():
+        keys = k if keys is None else (keys & k)
+    extra = {arm: sorted(k - keys)[:5] for arm, k in full.items()}
+    bad = {a: m for a, m in extra.items() if m}
     if bad:
-        raise SystemExit(f"руки считаны на разных состояниях: {bad}")
+        raise SystemExit(f"руки с полным покрытием считаны на РАЗНЫХ "
+                         f"состояниях: {bad}")
     if want_states and len(keys) != want_states:
         raise SystemExit(f"общих пар {len(keys)}, ожидалось {want_states}")
+    by_arm = {a: by_arm[a] for a in full}
     succ = {}
     for arm, eps in by_arm.items():
         d = {(int(e["task_id"]), int(e["state_id"])): bool(e["success"])
@@ -101,6 +116,25 @@ def verdict(delta_pp, n=45):
 
 
 def selftest():
+    # --- недосчитанная рука исключается, а не роняет отчёт ----------------
+    mk9 = lambda ok: [dict(task_id=3, state_id=i, success=(i in ok))
+                      for i in range(30, 35)]
+    part = {"fast12": mk9({30, 31}), "coarse24": [
+        dict(task_id=3, state_id=30, success=True)]}
+    msgs = []
+    sp, kp = pair_table(part, 5, log=msgs.append)
+    assert set(sp) == {"fast12"}, sp
+    assert any("coarse24 исключена" in m for m in msgs), msgs
+    # но РАСХОЖДЕНИЕ при полном покрытии — по-прежнему отказ
+    diff = {"fast12": mk9({30}), "coarse24": [
+        dict(task_id=3, state_id=i, success=True) for i in range(40, 45)]}
+    try:
+        pair_table(diff, 5, log=lambda *_: None)
+    except SystemExit as e:
+        assert "РАЗНЫХ состояниях" in str(e), e
+    else:
+        raise AssertionError("расхождение при полном покрытии принято")
+
     # --- парность и отказ на расхождении ----------------------------------
     mk = lambda ok: [dict(task_id=3, state_id=i, success=(i in ok))
                      for i in range(30, 35)]
@@ -116,7 +150,7 @@ def selftest():
     try:
         pair_table(bad, 5)
     except SystemExit as e:
-        assert "на разных состояниях" in str(e), e
+        assert "на РАЗНЫХ состояниях" in str(e), e
     else:
         raise AssertionError("непарные руки приняты")
 
