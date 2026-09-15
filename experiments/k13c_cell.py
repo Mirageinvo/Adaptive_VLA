@@ -344,6 +344,7 @@ def run(a):
 
     cnt = Counter()
     cnt.wrap(model, "forward_taps")
+    cnt.wrap(model, "forward_joint_fast")
     cnt.wrap(model, "generate")
     cnt.wrap(codec, "_decode")
     ac16 = torch.autocast("cuda", dtype=torch.float16)
@@ -536,15 +537,32 @@ def run(a):
     finally:
         envs.close()
 
-    # ОДИН ПРОХОД И ОДНО ДЕКОДИРОВАНИЕ — ИЗМЕРЕНО, А НЕ ЗАЯВЛЕНО
-    want_pass = 1 if a.arm != "coarse24" else 0
-    want_gen = 1 if a.arm == "coarse24" else 0
-    if per_call.get("forward_taps", 0) != want_pass or \
-            per_call.get("generate", 0) != want_gen or \
-            per_call.get("_decode", 0) != 1:
-        raise SystemExit(f"на вызов политики пришлось {per_call}, ожидалось "
-                         f"forward_taps={want_pass}, generate={want_gen}, "
-                         f"_decode=1")
+    # ОДИН ПРОХОД И ОДНО ДЕКОДИРОВАНИЕ — ИЗМЕРЕНО, А НЕ ЗАЯВЛЕНО.
+    # У каждой руки свой ВХОД в модель, и ожидания разные: fast12 идёт через
+    # forward_joint_fast и forward_taps НЕ вызывает вовсе, coarse24 — через
+    # generate, обе поправки — через forward_taps. Общее у всех одно: ровно
+    # один проход трансформера и ровно одно декодирование на вызов политики.
+    want = {
+        "fast12": dict(forward_joint_fast=1, forward_taps=0, generate=0),
+        "coarse24": dict(forward_joint_fast=0, forward_taps=0, generate=1),
+        "hicora_d1_det": dict(forward_joint_fast=0, forward_taps=1,
+                              generate=0),
+        "hicora_t_d1_det": dict(forward_joint_fast=0, forward_taps=1,
+                                generate=0),
+    }[a.arm]
+    want["_decode"] = 1
+    bad = {k: (per_call.get(k, 0), v) for k, v in want.items()
+           if per_call.get(k, 0) != v}
+    if bad:
+        raise SystemExit(
+            f"на вызов политики пришлось {per_call}; расходится: "
+            + ", ".join(f"{k}: было {g}, ожидалось {w}"
+                        for k, (g, w) in sorted(bad.items())))
+    n_pass = sum(per_call.get(k, 0) for k in
+                 ("forward_taps", "forward_joint_fast", "generate"))
+    if n_pass != 1:
+        raise SystemExit(f"проходов трансформера на вызов политики {n_pass}, "
+                         f"а заявлен один: {per_call}")
 
     cell = dict(
         arm=a.arm, head=a.head, stage="k13c_det", suite=a.task_suite,
