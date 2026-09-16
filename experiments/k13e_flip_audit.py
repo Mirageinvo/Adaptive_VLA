@@ -60,11 +60,46 @@ def index_cells(paths, arm_from=None, head_from=None):
     return out
 
 
-def compare(a, b):
+def check_coverage(a, b, mode, expect):
+    """Покрытие ключей — ЧАСТЬ ПРОВЕРКИ, а не предварительное условие.
+
+    Сверка по пересечению множеств проходит и на одной общей паре: набор,
+    посчитанный наполовину, дал бы «ноль переворотов» и выглядел бы как
+    подтверждение. Поэтому режим задаёт, что именно требуется.
+
+        exact   множества ключей РАВНЫ и их ровно `expect` — так сверяется
+                пересчёт одной и той же руки;
+        covers  весь первый набор содержится во втором, общих ровно `expect` —
+                так сверяется старый набор против нового, который шире.
+    """
+    ka, kb = set(a), set(b)
+    common = ka & kb
+    if mode == "exact" and ka != kb:
+        raise SystemExit(
+            f"множества пар не равны: только в первом {len(ka - kb)} "
+            f"(например {sorted(ka - kb)[:3]}), только во втором "
+            f"{len(kb - ka)} (например {sorted(kb - ka)[:3]})")
+    if mode == "covers" and (ka - kb):
+        raise SystemExit(
+            f"{len(ka - kb)} пар первого набора нет во втором, например "
+            f"{sorted(ka - kb)[:3]}: сверять нечем")
+    if expect is not None and len(common) != expect:
+        raise SystemExit(f"общих пар {len(common)}, требовалось {expect}")
+    return sorted(common)
+
+
+def compare(a, b, common=None):
     """Разбивка по рукам: перевороты в обе стороны и точный p."""
-    common = sorted(set(a) & set(b))
+    common = sorted(set(a) & set(b)) if common is None else common
     if not common:
         raise SystemExit("у наборов нет общих пар — сверять нечего")
+    # ПУСТОЙ ХЭШ НЕ СЧИТАЕТСЯ СОВПАВШИМ. Два None равны друг другу, и сверка
+    # начальных состояний прошла бы там, где их просто не записывали.
+    no_hash = [k for k in common if not a[k][1] or not b[k][1]]
+    if no_hash:
+        raise SystemExit(
+            f"у {len(no_hash)} пар нет хэша начального состояния, например "
+            f"{no_hash[:3]}: совпадение состояний подтвердить нечем")
     bad_hash = [k for k in common if a[k][1] != b[k][1]]
     rows = {}
     for k in common:
@@ -105,6 +140,33 @@ def selftest():
     # ноль переворотов — тоже результат, и он должен проходить
     rows, _, _ = compare(A, dict(A))
     assert rows["f:None"]["flips"] == 0
+
+    # --- ПОКРЫТИЕ: одной общей пары недостаточно -------------------------
+    one = {("f", "None", 3, 0): A[("f", "None", 3, 0)]}
+    for mode, why in (("exact", "не равны"), ("covers", "нет во втором")):
+        try:
+            check_coverage(A, one, mode, None)
+        except SystemExit as e:
+            assert why in str(e), (mode, str(e))
+        else:
+            raise AssertionError(f"режим {mode} принял неполный набор")
+    assert len(check_coverage(one, A, "covers", 1)) == 1
+    assert len(check_coverage(A, dict(A), "exact", 10)) == 10
+    try:
+        check_coverage(A, dict(A), "exact", 9)
+    except SystemExit as e:
+        assert "требовалось 9" in str(e), e
+    else:
+        raise AssertionError("неверное число пар пропущено")
+
+    # --- ПУСТОЙ ХЭШ НЕ РАВЕН ПУСТОМУ ------------------------------------
+    nohash = {k: (v[0], None) for k, v in A.items()}
+    try:
+        compare(nohash, dict(nohash))
+    except SystemExit as e:
+        assert "нет хэша" in str(e), e
+    else:
+        raise AssertionError("отсутствие хэшей засчитано как совпадение")
     print("самопроверка k13e_flip_audit пройдена")
 
 
@@ -118,6 +180,15 @@ def main():
     ap.add_argument("--label-a", default="старый")
     ap.add_argument("--label-b", default="новый")
     ap.add_argument("--out", default="")
+    ap.add_argument("--mode", choices=("exact", "covers", "none"),
+                    default="none",
+                    help="exact: множества пар равны; covers: первый набор "
+                         "целиком внутри второго")
+    ap.add_argument("--expect-pairs", type=int, default=None,
+                    help="сколько общих пар обязано быть")
+    ap.add_argument("--require-identical", action="store_true",
+                    help="ненулевое число переворотов — ОТКАЗ. Так сверяется "
+                         "пересчёт одной и той же руки другим скриптом")
     a = ap.parse_args()
     if a.selftest:
         selftest()
@@ -141,7 +212,8 @@ def main():
         return acc
 
     A, B = load(a.a), load(a.b)
-    rows, common, bad = compare(A, B)
+    common0 = check_coverage(A, B, a.mode, a.expect_pairs)
+    rows, common, bad = compare(A, B, common0)
     print(f"\n  СВЕРКА «{a.label_a}» против «{a.label_b}»")
     print(f"    общих пар: {len(common)} "
           f"(в первом {len(A)}, во втором {len(B)})")
@@ -167,6 +239,13 @@ def main():
     else:
         print("\n    исходы совпадают НЕ на всех парах — совпадение средних, "
               "если оно есть, воспроизведением пути не является")
+    if a.require_identical and tot_f:
+        # ОТКАЗ, А НЕ СТРОЧКА В ЛОГЕ. Утверждение «пересчёт воспроизводит
+        # прежний путь» либо проверяемо машиной, либо его нет.
+        raise SystemExit(
+            f"требовалось точное совпадение исходов, перевернулось {tot_f} "
+            f"пар из {tot_n}: это РАЗНЫЕ вычисления, и заменять одно другим "
+            f"нельзя")
     if a.out:
         os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".",
                     exist_ok=True)

@@ -223,6 +223,63 @@ def check_pos_offsets(cells):
     return {k: next(iter(v)) for k, v in by_task.items()}
 
 
+def check_final_composition(cells, meta_by_arm, heads, expect_cells,
+                            log=print):
+    """Состав итоговой сводки: какие руки, сколько ячеек, чем подтверждены.
+
+    ВЫНЕСЕНО ФУНКЦИЕЙ РАДИ САМОПРОВЕРКИ. Проверка, живущая только внутри
+    main, испытывается лишь настоящим прогоном — то есть тогда, когда ошибаться
+    уже поздно.
+    """
+    # ТОЧНОЕ МНОЖЕСТВО РУК, А НЕ ИХ ЧИСЛО. Полностью отсутствующая голова
+    # не попадает в «недосчитанные»: её просто нет, основное сравнение её
+    # молча пропускает, и сводка выглядит целой. Проверять надо состав.
+    want_arms = set(SHARED_ARMS) | {f"{arm}:{h}" for h in heads
+                                    for arm in ("hicora_d1_det",
+                                                "hicora_t_d1_det")}
+    got_arms = set(meta_by_arm)
+    if got_arms != want_arms:
+        raise SystemExit(
+            f"итоговый режим: нет рук {sorted(want_arms - got_arms)}, "
+            f"лишние {sorted(got_arms - want_arms)}")
+    per_arm = expect_cells // len(want_arms)
+    wrong = {k: len(v) for k, v in meta_by_arm.items()
+             if len(v) != per_arm}
+    if wrong:
+        raise SystemExit(f"итоговый режим: ячеек на руку не по "
+                         f"{per_arm}: {wrong}")
+    if len(cells) != expect_cells:
+        raise SystemExit(
+            f"итоговый режим: ячеек {len(cells)}, ожидалось "
+            f"{expect_cells} ({len(want_arms)} рук по {per_arm})")
+    # ОТПЕЧАТКИ ОБУЧЕННЫХ РУК ОБЯЗАНЫ БЫТЬ НЕПУСТЫ. Внутри руки
+    # отсутствующие head_sha1/basis_sha1/rho_sha1 одинаковы как None и
+    # проходят проверку равенства, не подтвердив ничего.
+    for key, ms in meta_by_arm.items():
+        if key in SHARED_ARMS:
+            continue
+        empty = [f for f in FIELDS_SAME_ARM
+                 if any(m.get(f) in (None, "None") for m in ms)]
+        if empty:
+            raise SystemExit(
+                f"итоговый режим: у руки {key} пусты {empty} — "
+                f"происхождение головы не подтверждено")
+    t_cells_f = [c for c in cells if c.get("arm") == "hicora_t_d1_det"]
+    n_t = len(t_cells_f)
+    n_id = len([c for c in t_cells_f
+                if (c.get("identity") or {}).get("ok")])
+    want_t = per_arm * len(heads)
+    if n_t != want_t:
+        raise SystemExit(f"итоговый режим: ячеек HiCoRA-T {n_t}, "
+                         f"ожидалось {want_t}")
+    if n_t != n_id:
+        raise SystemExit(f"итоговый режим: тождество подтверждено в "
+                         f"{n_id} из {n_t} ячеек HiCoRA-T")
+    log(f"  итоговый режим: {len(cells)} ячеек, {len(want_arms)} рук по "
+        f"{per_arm}, тождество {n_id}/{n_t}, отпечатки голов непусты")
+    return want_arms
+
+
 def selftest():
     # --- КАЖДОЕ ПРОВЕРЯЕМОЕ ПОЛЕ ДОЛЖНО ДОЙТИ ДО ПРОВЕРКИ -----------------
     # Ровно на этом сводка и обманулась: список ключей задавался отдельно от
@@ -236,6 +293,50 @@ def selftest():
         assert f in FIELDS_SAME, f
     assert not set(FIELDS_SAME) & set(FIELDS_SAME_ARM)
     assert set(FIELDS_SAME_ARM) <= set(META_KEYS)
+
+    # --- ИТОГОВЫЙ СОСТАВ: отсутствующая рука не «недосчитана», её нет ----
+    def _mkcells(arms, per=9, ok=True, blank=()):
+        out = []
+        for arm, head in arms:
+            for i in range(per):
+                c = dict(arm=arm, head=head, _path=f"{arm}_{head}_{i}.json",
+                         head_sha1="hh", basis_sha1="bb", rho_sha1="rr",
+                         head_seed=0)
+                for f in blank:
+                    c[f] = None
+                if arm == "hicora_t_d1_det":
+                    c["identity"] = dict(ok=ok)
+                out.append(c)
+        return out
+
+    six = [("fast12", None), ("coarse24", None),
+           ("hicora_d1_det", "s0"), ("hicora_d1_det", "s1"),
+           ("hicora_t_d1_det", "s0"), ("hicora_t_d1_det", "s1")]
+
+    def _meta(cs):
+        mb = {}
+        for c in cs:
+            key = (c["arm"] if c["arm"] in SHARED_ARMS
+                   else f"{c['arm']}:{c['head']}")
+            mb.setdefault(key, []).append(c)
+        return mb
+
+    good = _mkcells(six)
+    check_final_composition(good, _meta(good), ["s0", "s1"], 54,
+                            log=lambda *_: None)
+    for cs, why in (
+            (_mkcells([x for x in six if x != ("hicora_t_d1_det", "s1")]),
+             "нет рук"),
+            (_mkcells(six, per=8), "ячеек"),
+            (_mkcells(six, ok=False), "тождество подтверждено"),
+            (_mkcells(six, blank=("basis_sha1",)), "пусты")):
+        try:
+            check_final_composition(cs, _meta(cs), ["s0", "s1"],
+                                    54, log=lambda *_: None)
+        except SystemExit as e:
+            assert why in str(e), (why, str(e))
+        else:
+            raise AssertionError(f"итоговый режим пропустил: {why}")
 
 
     # --- смещение позиций: по задаче, а не по всему прогону ---------------
@@ -509,20 +610,8 @@ def main():
     starts = [int(x) for x in a.states.split(",")]
     want = len(tasks) * len(starts) * a.n_envs
     if a.final:
-        n_arms = len(SHARED_ARMS) + 2 * len(heads)
-        if len(cells) != a.expect_cells:
-            raise SystemExit(
-                f"итоговый режим: ячеек {len(cells)}, ожидалось "
-                f"{a.expect_cells} ({n_arms} рук по "
-                f"{a.expect_cells // max(n_arms, 1)})")
-        n_t = len([c for c in cells if c.get("arm") == "hicora_t_d1_det"])
-        n_id = len([c for c in cells if c.get("arm") == "hicora_t_d1_det"
-                    and (c.get("identity") or {}).get("ok")])
-        if n_t != n_id or n_t == 0:
-            raise SystemExit(f"итоговый режим: тождество подтверждено в "
-                             f"{n_id} из {n_t} ячеек HiCoRA-T")
-        print(f"  итоговый режим: {len(cells)} ячеек, {n_arms} рук, "
-              f"тождество в {n_id} из {n_t} ячеек HiCoRA-T")
+        check_final_composition(
+            cells, meta_by_arm, heads, a.expect_cells)
     succ, keys = pair_table(by_arm, want, final=a.final)
     want_keys = {(t, s0) for t in tasks for st in starts
                  for s0 in range(st, st + a.n_envs)}

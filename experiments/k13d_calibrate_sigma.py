@@ -44,6 +44,32 @@ def arr_sha(a):
     return hashlib.sha1(np.ascontiguousarray(a).tobytes()).hexdigest()[:12]
 
 
+# ДВА ВИДА ОТПЕЧАТКА, И ОНИ НЕ ВЗАИМОЗАМЕНЯЕМЫ. K-11c записывал в чекпойнт D1
+# `file_sha1` самого .npy, а K-13a для траекторного базиса — sha МАССИВА. Байты
+# разные: заголовок .npy входит только в файловый отпечаток. Оба усечены до 12
+# знаков, поэтому подмена одного другим не видна по длине и проявилась бы как
+# отказ на совершенно исправном чекпойнте.
+SHA_OF = {"file": lambda path, arr: sha12(path),
+          "array": lambda path, arr: arr_sha(arr)}
+
+
+def check_provenance(pairs, kind):
+    """Сверка базиса и rho с тем, на чём голова обучена.
+
+    `kind` выбирается по ТОМУ, ЧТО ЗАПИСАЛ ОБУЧАЮЩИЙ СКРИПТ, а не по удобству:
+    угадывать формат отпечатка значит считать проверку пройденной там, где она
+    не проводилась.
+    """
+    fn = SHA_OF[kind]
+    for nm, path, arr, want in pairs:
+        got = fn(path, arr)
+        if got != want:
+            raise SystemExit(
+                f"{nm}: на диске {got} ({kind}), голова обучена на {want}. "
+                f"Базис задаёт пространство поправки, и чужой дал бы другую "
+                f"голову при исправном виде")
+
+
 def rms_of(a, b, max_act_q=None, horizon=None, breakdown=False):
     """RMS разности действий В ТЕХ ЖЕ ЕДИНИЦАХ, ЧТО ПОЛУЧАЕТ РОБОТ.
 
@@ -151,6 +177,28 @@ def selftest():
     # --- один набор шума делает измерение детерминированным -------------
     e1, e2 = fixed_eps(16, 8, 3), fixed_eps(16, 8, 3)
     assert np.array_equal(e1, e2)
+
+    # --- ДВА ФОРМАТА ОТПЕЧАТКА, ВОСПРОИЗВЕДЁННЫЕ НАСТОЯЩИМ .npy ----------
+    # Регрессия на реальный блокер: D1 сверялся по sha массива, а K-11c писал
+    # sha файла. Оба по 12 знаков, по длине не различимы, и исправный
+    # чекпойнт отвергался бы.
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        arr = np.arange(12, dtype=np.float32).reshape(3, 4)
+        fp = os.path.join(td, "basis.npy")
+        np.save(fp, arr)
+        f_sha, a_sha = sha12(fp), arr_sha(arr)
+        assert f_sha != a_sha, "форматы совпали — тест ничего не проверяет"
+        check_provenance((("файловый", fp, arr, f_sha),), "file")
+        check_provenance((("массивный", fp, arr, a_sha),), "array")
+        for kind, wrong in (("file", a_sha), ("array", f_sha)):
+            try:
+                check_provenance((("перепутанный", fp, arr, wrong),), kind)
+            except SystemExit as e:
+                assert "обучена на" in str(e), e
+            else:
+                raise AssertionError(
+                    f"вид {kind} принял отпечаток другого вида")
 
     # --- строгая загрузка: отсутствующий ключ — отказ ---------------------
     class _Toy:
@@ -324,14 +372,16 @@ def main():
     pref = d1["cache"]
     B_d1 = np.load(pref + ".basis.npy").astype(np.float32)
     rho_d1 = np.load(pref + ".rho.npy").astype(np.float32)
-    # БАЗИС И rho СВЕРЯЮТСЯ И У D1 ТОЖЕ. Раньше они здесь просто загружались:
-    # подменённый на диске базис дал бы другое пространство поправки, и опора
-    # калибровки считалась бы не той головой, что исполнялась в K-13c.
-    for nm, arr, want in (("базис D1", B_d1, d1["basis_sha1"]),
-                          ("rho D1", rho_d1, d1["rho_sha1"])):
-        if arr_sha(arr) != want:
-            raise SystemExit(f"{nm} на диске {arr_sha(arr)}, голова обучена "
-                             f"на {want}")
+    # БАЗИС И rho СВЕРЯЮТСЯ И У D1 ТОЖЕ, НО ПО ФАЙЛОВОМУ ОТПЕЧАТКУ: именно
+    # его записывал K-11c. Сверка по sha массива отвергла бы исправный
+    # чекпойнт.
+    check_provenance((("базис D1", pref + ".basis.npy", B_d1,
+                       d1["basis_sha1"]),
+                      ("rho D1", pref + ".rho.npy", rho_d1,
+                       d1["rho_sha1"])), "file")
+    if str(d1.get("cache")) != str(a.cache):
+        raise SystemExit(f"опора обучена на кэше {d1.get('cache')}, а "
+                         f"калибровка идёт по {a.cache}")
     d_h = int(h24.shape[-1])
     gd = hg.make_gaussian_residual_head()(
         d_h, int(E.shape[-1]), rank=int(d1["rank"]),
@@ -380,11 +430,33 @@ def main():
     bmeta = json.load(open(f"{a.basis_t}.meta.json"))
     B_t = np.load(f"{a.basis_t}.basis.npy")
     rho_t = np.load(f"{a.basis_t}.rho.npy")
-    for nm, arr, want in (("базис", B_t, t_obj["basis_sha1"]),
-                          ("rho", rho_t, t_obj["rho_sha1"])):
-        if arr_sha(arr) != want:
-            raise SystemExit(f"{nm} на диске {arr_sha(arr)}, голова обучена "
-                             f"на {want}")
+    # У ТРАЕКТОРНОГО БАЗИСА ОТПЕЧАТОК МАССИВА: так пишет K-13a, и так же его
+    # переносил в чекпойнт K-13b. Сверяются ОБА источника — и чекпойнт головы,
+    # и meta самого базиса: расхождение между ними означало бы, что meta
+    # переписана после обучения.
+    check_provenance((("базис T", f"{a.basis_t}.basis.npy", B_t,
+                       t_obj["basis_sha1"]),
+                      ("rho T", f"{a.basis_t}.rho.npy", rho_t,
+                       t_obj["rho_sha1"]),
+                      ("базис T против meta", f"{a.basis_t}.basis.npy", B_t,
+                       bmeta["basis_sha1"]),
+                      ("rho T против meta", f"{a.basis_t}.rho.npy", rho_t,
+                       bmeta["rho_sha1"])), "array")
+    # ОДНА ГОЛОВА, ОДИН КЭШ, ОДИН ЧЕКПОЙНТ, ОДИН СИД. Без этого T-s1 можно
+    # было бы откалибровать относительно опоры s0 и не получить отказа:
+    # перенос рабочей точки шёл бы между разными инициализациями.
+    for nm, got, want in (("кэш", t_obj.get("cache"), a.cache),
+                          ("чекпойнт", t_obj.get("ckpt"), a.ckpt)):
+        if str(got) != str(want):
+            raise SystemExit(f"HiCoRA-T обучена на {nm} {got}, а калибровка "
+                             f"идёт по {want}")
+    if int(t_obj["seed"]) != int(d1["seed"]):
+        raise SystemExit(
+            f"HiCoRA-T сида {t_obj['seed']} калибруется по опоре сида "
+            f"{d1['seed']}: рабочая точка переносилась бы между разными "
+            f"инициализациями")
+    print(f"  происхождение сверено: обе головы сид {t_obj['seed']}, кэш "
+          f"{a.cache}")
     gt = make_gaussian_trajectory_head()(
         d_h, int(t_obj["d_latent"]), n_pos=int(t_obj["n_pos"]),
         rank=int(t_obj["rank"]), proj=int(t_obj["proj"]),
@@ -469,6 +541,7 @@ def main():
                decoder_probe=cmeta.get("decoder_probe"),
                codec_state_sha1=cmeta.get("codec_state_sha1"),
                rank_t=int(t_obj["rank"]), rank_d1=int(d1["rank"]),
+               head_seed=int(t_obj["seed"]),
                n_pos=n_pos, mean_vs_det=d_head,
                head_t=a.head_t, head_t_sha1=sha12(a.head_t),
                head_d1=a.head_d1, head_d1_sha1=sha12(a.head_d1),
