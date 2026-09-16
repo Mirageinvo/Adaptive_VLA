@@ -16,10 +16,17 @@ mkdir -p logs/k13d data
 
 ts() { date +%H:%M:%S; }
 
+# LIBERO ПОДКЛЮЧАЕТСЯ ЧЕРЕЗ PYTHONPATH. Editable-установка в этом окружении не
+# работает, и без переменной падает даже то, что симулятор не использует:
+# `utils` из actioncodec тянет `libero.libero` на уровне импорта модуля.
+# MUJOCO_GL=egl нужен по той же причине — импорт robosuite происходит в любом
+# случае.
+ENVP=(env PYTHONPATH="${PYTHONPATH:-$HOME/LIBERO}" MUJOCO_GL=egl)
+
 # КАРТЫ ПРОВЕРЯЮТСЯ ДО ЗАГРУЗКИ МОДЕЛЕЙ. Контейнер периодически теряет GPU, и
 # без этой проверки отказ пришёл бы через минуту из середины скрипта, где его
 # легко принять за ошибку эксперимента.
-python - "$DEV" <<'PY' || exit 1
+"${ENVP[@]}" python - "$DEV" <<'PY' || exit 1
 import sys
 import torch
 dev = sys.argv[1]
@@ -42,7 +49,7 @@ for S in s0 s1; do
         continue
     fi
     echo "[$(ts)] $S: старт"
-    python experiments/k13d_calibrate_sigma.py \
+    "${ENVP[@]}" python experiments/k13d_calibrate_sigma.py \
         --device "$DEV" --horizon "$HORIZON" \
         --head-t "data/k13b_hicora_t_${S}.pt" \
         --head-d1 "data/k11d/d1_mlp_coef_0.001_wd0_${S}.pt" \
