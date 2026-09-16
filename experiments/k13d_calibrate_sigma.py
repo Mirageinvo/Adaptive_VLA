@@ -44,8 +44,15 @@ def arr_sha(a):
     return hashlib.sha1(np.ascontiguousarray(a).tobytes()).hexdigest()[:12]
 
 
-def rms_of(a, b, max_act_q=None):
+def rms_of(a, b, max_act_q=None, horizon=None, breakdown=False):
     """RMS разности действий В ТЕХ ЖЕ ЕДИНИЦАХ, ЧТО ПОЛУЧАЕТ РОБОТ.
+
+    ТОЛЬКО ПЕРВЫЕ `horizon` ПОЗИЦИЙ. Декодируется чанк из 16 действий, а
+    исполняются первые 8 (k13c_cell: цикл по `range(a.horizon)`), после чего
+    политика вызывается заново. Возмущение в позициях 8..15 до робота не
+    доходит вообще. Считать RMS по всем шестнадцати значило бы калибровать шум
+    по величине, которой никто не исполняет: если энергия траекторного базиса
+    распределена по половинам чанка неравномерно, sigma_T сместится.
 
     Без масштаба сравнивались бы нормированные величины, а каналы имеют разные
     диапазоны: одно и то же нормированное возмущение означает разный сдвиг
@@ -57,11 +64,60 @@ def rms_of(a, b, max_act_q=None):
     не то возмущение, которое исполняется.
     """
     d = np.asarray(a, np.float64) - np.asarray(b, np.float64)
+    if horizon is not None:
+        if int(horizon) > d.shape[1]:
+            raise ValueError(f"горизонт {horizon} больше длины чанка "
+                             f"{d.shape[1]}")
+        d = d[:, :int(horizon)]
     if max_act_q is not None:
         q = np.asarray(max_act_q, np.float64)[:d.shape[-1]].copy()
         q[-1] = 1.0
         d = d * q
-    return float(np.sqrt((d ** 2).mean()))
+    r = float(np.sqrt((d ** 2).mean()))
+    if not breakdown:
+        return r
+    # РАЗБИВКА: одинаковый общий RMS может скрывать перераспределение из
+    # перемещения в поворот или в схват, а это разные по смыслу возмущения.
+    return r, dict(by_channel=[float(x) for x in np.sqrt((d ** 2).mean((0, 1)))],
+                   by_step=[float(x) for x in np.sqrt((d ** 2).mean((0, 2)))])
+
+
+def load_exact(head, state, name, allowed=("basis", "rho", "basis_set",
+                                            "rho_set", "log_std")):
+    """Загрузка с ТОЧНОЙ сверкой множеств ключей.
+
+    Копирование по существующим ключам молча проглатывает отсутствующий: голова
+    осталась бы частично в нулевой инициализации, а калибровка мерила бы шум
+    вокруг неправильного среднего и выглядела бы исправной.
+
+    `allowed` — буферы, расхождение по которым законно: базис и rho ставятся
+    отдельно через set_basis/set_rho и уже сверены по sha; log_std есть только
+    у гауссовой головы.
+    """
+    import torch
+    have = set(head.state_dict())
+    want = set(state)
+    miss = sorted((want - have) - set(allowed))
+    extra = sorted((have - want) - set(allowed))
+    if miss or extra:
+        raise SystemExit(
+            f"{name}: ключи не совпали — нет в голове {miss}, нет в "
+            f"чекпойнте {extra}. Частичная загрузка оставила бы часть весов "
+            f"нулевыми")
+    n = 0
+    with torch.no_grad():
+        for k, v in state.items():
+            if k in allowed and k not in have:
+                continue
+            tgt = head.state_dict()[k]
+            if tuple(tgt.shape) != tuple(v.shape):
+                raise SystemExit(f"{name}: ключ {k} формы {tuple(v.shape)}, "
+                                 f"в голове {tuple(tgt.shape)}")
+            if k in ("basis", "rho"):
+                continue        # уже поставлены и сверены по sha
+            tgt.copy_(v.to(tgt.device, torch.float32))
+            n += 1
+    return n
 
 
 def selftest():
@@ -82,9 +138,42 @@ def selftest():
     q2 = np.full(7, 10.0)
     assert abs(rms_of(a, b2, q2) - np.sqrt(1.0 / 7)) < 1e-12
 
+    # --- горизонт отсекает неисполняемый хвост чанка ---------------------
+    c = np.zeros((2, 16, 7))
+    c[:, 8:, 0] = 5.0                      # возмущение только в хвосте
+    assert rms_of(np.zeros((2, 16, 7)), c, horizon=8) == 0.0, \
+        "хвост чанка попал в меру, хотя он не исполняется"
+    assert rms_of(np.zeros((2, 16, 7)), c) > 0.0
+    r_, br = rms_of(np.zeros((2, 16, 7)), c, horizon=16, breakdown=True)
+    assert len(br["by_channel"]) == 7 and len(br["by_step"]) == 16
+    assert br["by_step"][0] == 0.0 and br["by_step"][8] > 0.0
+
     # --- один набор шума делает измерение детерминированным -------------
     e1, e2 = fixed_eps(16, 8, 3), fixed_eps(16, 8, 3)
     assert np.array_equal(e1, e2)
+
+    # --- строгая загрузка: отсутствующий ключ — отказ ---------------------
+    class _Toy:
+        def __init__(self, d):
+            self._d = d
+
+        def state_dict(self):
+            return self._d
+
+    import torch as _t
+    full = {"net.0.weight": _t.zeros(2, 2), "proj.weight": _t.zeros(2, 2)}
+    h = _Toy({k: v.clone() for k, v in full.items()})
+    assert load_exact(h, {k: _t.ones_like(v) for k, v in full.items()},
+                      "игрушка") == 2
+    assert float(h.state_dict()["net.0.weight"].sum()) == 4.0
+    for bad, why in ((dict(list(full.items())[:1]), "нет в чекпойнте"),
+                     (dict(full, **{"лишний": _t.zeros(1)}), "нет в голове")):
+        try:
+            load_exact(_Toy({k: v.clone() for k, v in full.items()}), bad, "x")
+        except SystemExit as e:
+            assert why in str(e), (why, str(e))
+        else:
+            raise AssertionError(f"частичная загрузка пропущена: {why}")
 
     # --- поиск на модели «RMS растёт линейно по sigma» ------------------
     got, r, hist = calibrate_sigma(0.05, lambda s: 0.5 * s,
@@ -115,6 +204,9 @@ def main():
     ap.add_argument("--root", default="third_party/actioncodec")
     ap.add_argument("--cfg-path", default="config/eval/bar.yaml")
     ap.add_argument("--sigma-ref", type=float, default=0.10)
+    ap.add_argument("--horizon", type=int, default=8,
+                    help="сколько позиций чанка реально исполняется; "
+                         "должно совпадать с --horizon прогона")
     ap.add_argument("--n-rows", type=int, default=2048)
     ap.add_argument("--n-eps", type=int, default=8,
                     help="сколько реализаций шума усредняется на строку")
@@ -137,6 +229,7 @@ def main():
             sys.path.insert(0, p)
 
     import torch
+    import k11a_build_hicora_cache as k11a
     import k12b_protocol as kb
     import k13a_build_trajectory_basis as k13a
     from hicora_t_g import (calibrate_sigma, fixed_eps, make_gaussian_trajectory_head)
@@ -153,6 +246,9 @@ def main():
     E = np.load(f"{a.cache}.codebooks.npy")
     H24 = np.load(f"{a.cache}.h24.npy", mmap_mode="r")
     cmeta = json.load(open(f"{a.cache}.meta.json"))
+    if cmeta.get("ckpt") != a.ckpt:
+        raise SystemExit(f"кэш собран чекпойнтом {cmeta.get('ckpt')}, а "
+                         f"декодер берётся из {a.ckpt}")
     idx, _sp = k13a.load_split(f"{a.cache}.split.npy", H24.shape[0])
     rng = np.random.default_rng(a.seed)
     rows = np.sort(rng.choice(idx["train"],
@@ -190,6 +286,26 @@ def main():
     codec = ac if hasattr(ac, "vq") else getattr(ac, "codec", None)
     codec = codec.to(dev).eval()
 
+    # ДЕКОДЕР СВЕРЯЕТСЯ С ТЕМ, КОТОРЫМ СОБРАН КЭШ. Совпадения имени чекпойнта
+    # мало: локальный кэш HuggingFace мог смениться под тем же именем, и тогда
+    # шум калибровался бы в одних координатах, а исполнялся в других. Книги,
+    # поведение декодера и его веса проверяются по отдельности — книги могут
+    # совпасть, а сеть за ними смениться.
+    with torch.no_grad():
+        ii = torch.arange(int(codec.vocab_size), device=dev).unsqueeze(0)
+        Ecur = torch.stack([q.out_project(q.decode_code(ii))[0]
+                            for q in codec.vq.quantizers]).float()
+    dmax = float((Ecur.cpu() - torch.from_numpy(E)).abs().max())
+    if dmax > 1e-5:
+        raise SystemExit(f"кодовые книги разошлись с кэшем на {dmax:.3e}: "
+                         f"декодер не тот, которым собран кэш")
+    k11a.check_fingerprints(cmeta, dict(
+        codebooks_sha1=arr_sha(np.asarray(E, np.float32)),
+        decoder_probe=k11a.decoder_probe(codec, Ecur.to(dev), dev),
+        codec_state_sha1=k11a.state_sha1(codec)))
+    print(f"  декодер сверен с кэшем: книги max|Δ| = {dmax:.3e}, проба и веса "
+          f"совпали")
+
     def decode(z, batch=256):
         out = []
         with torch.no_grad():
@@ -208,6 +324,14 @@ def main():
     pref = d1["cache"]
     B_d1 = np.load(pref + ".basis.npy").astype(np.float32)
     rho_d1 = np.load(pref + ".rho.npy").astype(np.float32)
+    # БАЗИС И rho СВЕРЯЮТСЯ И У D1 ТОЖЕ. Раньше они здесь просто загружались:
+    # подменённый на диске базис дал бы другое пространство поправки, и опора
+    # калибровки считалась бы не той головой, что исполнялась в K-13c.
+    for nm, arr, want in (("базис D1", B_d1, d1["basis_sha1"]),
+                          ("rho D1", rho_d1, d1["rho_sha1"])):
+        if arr_sha(arr) != want:
+            raise SystemExit(f"{nm} на диске {arr_sha(arr)}, голова обучена "
+                             f"на {want}")
     d_h = int(h24.shape[-1])
     gd = hg.make_gaussian_residual_head()(
         d_h, int(E.shape[-1]), rank=int(d1["rank"]),
@@ -215,9 +339,7 @@ def main():
     gd.set_basis(torch.as_tensor(B_d1).to(dev))
     gd.set_rho(torch.as_tensor(rho_d1).to(dev))
     st = {k[len("hicora_head."):]: v for k, v in d1["state"].items()}
-    with torch.no_grad():
-        for k, v in st.items():
-            gd.state_dict()[k].copy_(v.to(dev, torch.float32))
+    n_d1 = load_exact(gd, st, "HiCoRA (опора)")
     gd.eval()
 
     n_pos = int(h24.shape[1])
@@ -228,15 +350,27 @@ def main():
     with torch.no_grad():
         mu_d1 = gd.mean_coeffs(h24, z0)
         a_mean_d1 = decode(z0 + gd(h24, z0, u=mu_d1)["dz"])
-    ref_vals = []
+    ref_vals, ref_br = [], None
     for i in range(a.n_eps):
         with torch.no_grad():
             o = gd(h24, z0, u=mu_d1 + a.sigma_ref * eps_d1[i])
-            ref_vals.append(rms_of(decode(z0 + o["dz"]), a_mean_d1, max_act_q))
+            v, br = rms_of(decode(z0 + o["dz"]), a_mean_d1, max_act_q,
+                           horizon=a.horizon, breakdown=True)
+            ref_vals.append(v)
+            ref_br = br if ref_br is None else ref_br
     target = float(np.mean(ref_vals))
     print(f"  опора: HiCoRA (ранг {d1['rank']}, {n_pos} позиций) при sigma="
-          f"{a.sigma_ref}: RMS изменения действий {target:.5f} "
-          f"(разброс по {a.n_eps} реализациям {np.std(ref_vals):.5f})")
+          f"{a.sigma_ref}: RMS изменения ПЕРВЫХ {a.horizon} действий "
+          f"{target:.5f} (разброс по {a.n_eps} реализациям "
+          f"{np.std(ref_vals):.5f})")
+    print("    по каналам: " + " ".join(f"{x:.4f}"
+                                        for x in ref_br["by_channel"]))
+    print("    по шагам:   " + " ".join(f"{x:.4f}" for x in ref_br["by_step"]))
+    full_ref = rms_of(decode(z0 + gd(h24, z0,
+                                     u=mu_d1 + a.sigma_ref * eps_d1[0])["dz"]),
+                      a_mean_d1, max_act_q)
+    print(f"    для сведения: по всем {n_pos} позициям было бы "
+          f"{full_ref:.5f} — эти позиции не исполняются")
 
     # --- HiCoRA-T -----------------------------------------------------------
     t_obj = torch.load(a.head_t, map_location="cpu", weights_only=False)
@@ -257,12 +391,9 @@ def main():
         hidden=int(t_obj["hidden"])).to(dev)
     gt.set_basis(torch.as_tensor(B_t).to(dev))
     gt.set_rho(torch.as_tensor(rho_t).to(dev))
-    with torch.no_grad():
-        for k, v in t_obj["state"].items():
-            if k in ("basis", "rho", "basis_set", "rho_set"):
-                continue
-            gt.state_dict()[k].copy_(v.to(dev, torch.float32))
+    n_t = load_exact(gt, t_obj["state"], "HiCoRA-T")
     gt.freeze_log_std().eval()
+    print(f"  веса загружены строго: опора {n_d1} тензоров, HiCoRA-T {n_t}")
 
     # СРЕДНЕЕ ОБЯЗАНО СОВПАСТЬ С D1-ВЕРСИЕЙ ГОЛОВЫ: гауссова голова при
     # deterministic=True — это ровно та же поправка, что исполнялась в K-13c
@@ -273,12 +404,9 @@ def main():
         hidden=int(t_obj["hidden"])).to(dev)
     det.set_basis(torch.as_tensor(B_t).to(dev))
     det.set_rho(torch.as_tensor(rho_t).to(dev))
+    load_exact(det, t_obj["state"], "HiCoRA-T (детерминированная)")
+    det.eval()
     with torch.no_grad():
-        for k, v in t_obj["state"].items():
-            if k in ("basis", "rho", "basis_set", "rho_set"):
-                continue
-            det.state_dict()[k].copy_(v.to(dev, torch.float32))
-        det.eval()
         dz_det, _c = det(h24, z0)
         mu_t = gt.mean_coeffs(h24, z0)
         dz_g = gt(h24, z0, u=mu_t)["dz"]
@@ -295,26 +423,51 @@ def main():
         fixed_eps(a.n_eps * len(rows), int(t_obj["rank"]), a.seed + 2)
     ).to(dev).reshape(a.n_eps, len(rows), int(t_obj["rank"]))
 
-    def measure(sig):
+    last_br = {}
+
+    def measure(sig, keep=False):
         vals = []
         for i in range(a.n_eps):
             with torch.no_grad():
                 o = gt(h24, z0, u=mu_t + float(sig) * eps_t[i])
-                vals.append(rms_of(decode(z0 + o["dz"]), a_mean_t, max_act_q))
+                v, br = rms_of(decode(z0 + o["dz"]), a_mean_t, max_act_q,
+                               horizon=a.horizon, breakdown=True)
+                vals.append(v)
+                if keep and i == 0:
+                    last_br.update(br)
         return float(np.mean(vals))
 
     t0 = time.time()
     sigma_t, rms_t, hist = calibrate_sigma(target, measure, a.lo, a.hi, a.tol)
+    naive = measure(a.sigma_ref)
+    rms_t = measure(sigma_t, keep=True)
     print(f"\n  sigma_T = {sigma_t:.5f} даёт RMS {rms_t:.5f} против цели "
           f"{target:.5f} ({time.time() - t0:.0f} с)")
+    print("    по каналам: " + " ".join(f"{x:.4f}"
+                                        for x in last_br["by_channel"]))
+    print("    по шагам:   " + " ".join(f"{x:.4f}" for x in last_br["by_step"]))
     print(f"    для сравнения: та же sigma, что у HiCoRA ({a.sigma_ref}), "
-          f"дала бы RMS {measure(a.sigma_ref):.5f}")
+          f"дала бы RMS {naive:.5f}")
+    # РАЗБИВКА СРАВНИВАЕТСЯ, А НЕ ТОЛЬКО ПЕЧАТАЕТСЯ. Один и тот же общий RMS
+    # может быть набран поворотом вместо перемещения — это другое возмущение.
+    ch_ratio = [float(t_ / r_) if r_ > 0 else float("nan")
+                for t_, r_ in zip(last_br["by_channel"],
+                                  ref_br["by_channel"])]
+    print("    отношение к опоре по каналам: "
+          + " ".join(f"{x:.2f}" for x in ch_ratio))
 
     out = dict(sigma_t=sigma_t, rms_t=rms_t, target_rms=target,
+               horizon=int(a.horizon), n_pos_decoded=n_pos,
+               rms_ref_all_positions=full_ref,
+               breakdown_ref=ref_br, breakdown_t=dict(last_br),
+               channel_ratio=ch_ratio,
                sigma_ref=a.sigma_ref, ref_spread=float(np.std(ref_vals)),
-               rms_at_sigma_ref=measure(a.sigma_ref),
+               rms_at_sigma_ref=naive,
                n_rows=int(len(rows)), n_eps=int(a.n_eps), split="train",
                res_norm_sha1=rn_sha,
+               codebooks_sha1=cmeta.get("codebooks_sha1"),
+               decoder_probe=cmeta.get("decoder_probe"),
+               codec_state_sha1=cmeta.get("codec_state_sha1"),
                rank_t=int(t_obj["rank"]), rank_d1=int(d1["rank"]),
                n_pos=n_pos, mean_vs_det=d_head,
                head_t=a.head_t, head_t_sha1=sha12(a.head_t),

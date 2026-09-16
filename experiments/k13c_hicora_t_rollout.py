@@ -61,7 +61,14 @@ def arm_needs_head(arm):
 FIELDS_SAME = ("ckpt", "max_steps", "horizon", "rollout_seed_mode",
                "waiting_steps", "joint_sha1", "preprocess",
                "image_size", "res_norm_sha1", "precision_mode",
-               "offset_table_sha1")
+               "offset_table_sha1", "suite", "dtype", "head_precision",
+               "stage", "script_sha1", "code_version")
+
+# ПОЛЯ, ПОСТОЯННЫЕ ВНУТРИ РУКИ, НО РАЗНЫЕ МЕЖДУ РУКАМИ. Отпечаток головы у
+# fast12 и у HiCoRA-T не обязан совпадать — это разные руки. А вот внутри
+# одной руки он обязан: смена головы посреди девяти ячеек означала бы, что
+# «рука» собрана из двух разных политик, и её успех ничей.
+FIELDS_SAME_ARM = ("head_sha1", "basis_sha1", "rho_sha1", "head_seed")
 
 # offset_table_sha1 ЗАКОННО ПУСТ, если смещение задано явным --pos-offset.
 # Тогда оно пусто у всех ячеек, и проверка равенства всё равно поймает смесь.
@@ -71,9 +78,8 @@ FIELDS_REQUIRED = tuple(f for f in FIELDS_SAME if f != "offset_table_sha1")
 # Раньше он задавался руками и разошёлся: поля, которых в нём не было,
 # доставались как None, сравнивались None с None и подтверждали «одинаковые
 # условия», ничего не проверив.
-META_KEYS = tuple(dict.fromkeys(
-    FIELDS_SAME + ("code_version", "head_sha1", "basis_sha1", "rho_sha1",
-                   "identity")))
+META_KEYS = tuple(dict.fromkeys(FIELDS_SAME + FIELDS_SAME_ARM
+                                + ("identity",)))
 
 
 def index_episodes(eps, arm):
@@ -117,13 +123,18 @@ def check_same_states(idx_by_arm):
     return True
 
 
-def pair_table(by_arm, want_states, log=print):
+def pair_table(by_arm, want_states, log=print, final=False):
     """Парные разности по общим (задача, состояние).
 
     НЕДОСЧИТАННАЯ РУКА ИСКЛЮЧАЕТСЯ С ОБЪЯСНЕНИЕМ, а не роняет отчёт: пока
     одна рука считается, остальные сравнивать можно и нужно. А вот РАСХОЖДЕНИЕ
     состояний при полном покрытии — отказ: это разные наборы, и разность по
     ним ничего не измеряет.
+
+    В ИТОГОВОМ РЕЖИМЕ (`final=True`) исключение запрещено. Сводка, из которой
+    молча выпала рука, выглядит точно так же, как полная, и разность рук в ней
+    посчитана не по тому набору, который заявлен. Промежуточный отчёт этим
+    пользоваться может, итоговый — нет.
     """
     idx_by_arm = {arm: index_episodes(eps, arm)
                   for arm, eps in by_arm.items()}
@@ -131,6 +142,12 @@ def pair_table(by_arm, want_states, log=print):
     full = {arm: k for arm, k in sets.items()
             if not want_states or len(k) >= want_states}
     partial = {arm: len(k) for arm, k in sets.items() if arm not in full}
+    if partial and final:
+        raise SystemExit(
+            "итоговый режим: недосчитаны руки "
+            + ", ".join(f"{a} ({n} из {want_states})"
+                        for a, n in sorted(partial.items()))
+            + ". Сводка без руки неотличима от полной")
     for arm, n in sorted(partial.items()):
         log(f"    рука {arm} исключена: {n} пар из {want_states} — ещё "
             f"считается или прервана")
@@ -168,13 +185,19 @@ def compare(a, b):
 
 
 def verdict(delta_pp, n=45):
-    """Инженерный порог из плана. Это go/no-go, а не вывод о значимости."""
+    """Инженерный порог из плана. Это go/no-go, а не вывод о значимости.
+
+    СЧИТАЕТСЯ ЧИСТЫЙ ДЕФИЦИТ, А НЕ ЧИСЛО ПОТЕРЬ. Потери есть всегда: при
+    дискордантности около четверти (§39) пары расходятся в обе стороны, и
+    «потерь ноль» — неверная формулировка даже при положительной разности.
+    Порог смотрит на сальдо, и называть его надо так же.
+    """
     lost = -round(delta_pp * n / 100.0)
     if lost <= 3:
-        return "continue", f"проигрыш {max(lost, 0)} исходов из {n} <= 3"
+        return "continue", f"чистый дефицит {max(lost, 0)} исходов из {n} <= 3"
     if lost <= 5:
-        return "check", f"проигрыш {lost} исходов из {n} в диапазоне 4..5"
-    return "fix_head", f"проигрыш {lost} исходов из {n} > 5"
+        return "check", f"чистый дефицит {lost} исходов из {n} в диапазоне 4..5"
+    return "fix_head", f"чистый дефицит {lost} исходов из {n} > 5"
 
 
 def check_pos_offsets(cells):
@@ -208,6 +231,12 @@ def selftest():
         sorted(set(FIELDS_SAME) - set(META_KEYS))
     assert "precision_mode" in FIELDS_SAME
     assert "pos_offset" not in FIELDS_SAME, "смещение зависит от задачи"
+    for f in ("script_sha1", "code_version", "suite", "dtype",
+              "head_precision", "stage"):
+        assert f in FIELDS_SAME, f
+    assert not set(FIELDS_SAME) & set(FIELDS_SAME_ARM)
+    assert set(FIELDS_SAME_ARM) <= set(META_KEYS)
+
 
     # --- смещение позиций: по задаче, а не по всему прогону ---------------
     ok_cells = [dict(suite="libero_10", task_id=t, pos_offset=o,
@@ -234,6 +263,13 @@ def selftest():
     sp, kp = pair_table(part, 5, log=msgs.append)
     assert set(sp) == {"fast12"}, sp
     assert any("coarse24 исключена" in m for m in msgs), msgs
+    # тот же набор в ИТОГОВОМ режиме — отказ, а не исключение руки
+    try:
+        pair_table(part, 5, log=lambda *_: None, final=True)
+    except SystemExit as e:
+        assert "недосчитаны" in str(e), e
+    else:
+        raise AssertionError("итоговый режим принял неполную руку")
     # но РАСХОЖДЕНИЕ при полном покрытии — по-прежнему отказ
     diff = {"fast12": mk9({30}), "coarse24": [
         dict(task_id=3, state_id=i, success=True, init_hash_full=f"h3_{i}")
@@ -364,6 +400,11 @@ def main():
                     help="маска готовых ячеек D1 и голова через '=', "
                          "например 'data/k12j/s0_*/eval_d1_det/*.json=s0'")
     ap.add_argument("--out", default="data/k13c/summary.json")
+    ap.add_argument("--final", action="store_true",
+                    help="итоговый режим: требовать ровно --expect-cells "
+                         "ячеек, все руки полностью, тождество во всех "
+                         "ячейках HiCoRA-T")
+    ap.add_argument("--expect-cells", type=int, default=54)
     a = ap.parse_args()
     if a.selftest:
         selftest()
@@ -422,7 +463,7 @@ def main():
     # ОДИНАКОВЫЕ УСЛОВИЯ У ВСЕХ РУК: иначе разность рук смешана с разницей
     # горизонта, предела шагов или чекпойнта
     for key, ms in meta_by_arm.items():
-        for fld in FIELDS_SAME:
+        for fld in FIELDS_SAME + FIELDS_SAME_ARM:
             vals = {str(m.get(fld)) for m in ms}
             if len(vals) > 1:
                 raise SystemExit(f"{key}: разные {fld} в ячейках {vals}")
@@ -442,12 +483,17 @@ def main():
             f"единый trunk_autocast_head_fp32. Ячейки без этого поля сняты до "
             f"разделения точности и непригодны для сравнения")
     # ТОЖДЕСТВО — УСЛОВИЕ ПРИГОДНОСТИ, А НЕ ЗАМЕЧАНИЕ
+    # ТОЖДЕСТВО ТРЕБУЕТСЯ ОТ КАЖДОЙ ЯЧЕЙКИ T, А НЕ ОТ ХОТЯ БЫ ОДНОЙ. Проверка
+    # снимается в самой ячейке на её первом батче; ячейка без неё исполнялась
+    # неизвестно чем, и одной удачной проверки в соседней ячейке это не
+    # заменяет.
     t_cells = [c for c in cells if c.get("arm") == "hicora_t_d1_det"]
-    idents = [c.get("identity") for c in t_cells]
-    if not any(idents):
-        raise SystemExit("ни одна ячейка HiCoRA-T не несёт проверки тождества")
-    bad_id = [c["_path"] for c, i in zip(t_cells, idents)
-              if i and not i.get("ok")]
+    no_id = [c["_path"] for c in t_cells if not c.get("identity")]
+    if no_id:
+        raise SystemExit(
+            f"{len(no_id)} ячеек HiCoRA-T без проверки тождества: "
+            f"{no_id[:5]}. Тождество проверяется в каждой ячейке")
+    bad_id = [c["_path"] for c in t_cells if not c["identity"].get("ok")]
     if bad_id:
         raise SystemExit(f"тождество не выполнено в {bad_id[:5]}")
     # МЕТКА ГОЛОВЫ ПРОТИВ СИДА В ЧЕКПОЙНТЕ
@@ -462,7 +508,22 @@ def main():
     tasks = [int(x) for x in a.tasks.split(",")]
     starts = [int(x) for x in a.states.split(",")]
     want = len(tasks) * len(starts) * a.n_envs
-    succ, keys = pair_table(by_arm, want)
+    if a.final:
+        n_arms = len(SHARED_ARMS) + 2 * len(heads)
+        if len(cells) != a.expect_cells:
+            raise SystemExit(
+                f"итоговый режим: ячеек {len(cells)}, ожидалось "
+                f"{a.expect_cells} ({n_arms} рук по "
+                f"{a.expect_cells // max(n_arms, 1)})")
+        n_t = len([c for c in cells if c.get("arm") == "hicora_t_d1_det"])
+        n_id = len([c for c in cells if c.get("arm") == "hicora_t_d1_det"
+                    and (c.get("identity") or {}).get("ok")])
+        if n_t != n_id or n_t == 0:
+            raise SystemExit(f"итоговый режим: тождество подтверждено в "
+                             f"{n_id} из {n_t} ячеек HiCoRA-T")
+        print(f"  итоговый режим: {len(cells)} ячеек, {n_arms} рук, "
+              f"тождество в {n_id} из {n_t} ячеек HiCoRA-T")
+    succ, keys = pair_table(by_arm, want, final=a.final)
     want_keys = {(t, s0) for t in tasks for st in starts
                  for s0 in range(st, st + a.n_envs)}
     if set(keys) != want_keys:
