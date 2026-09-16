@@ -405,8 +405,13 @@ def main():
     gd = hg.make_gaussian_residual_head()(
         d_h, int(E.shape[-1]), rank=int(d1["rank"]),
         hidden=int(d1.get("hidden", 512)), proj=int(d1.get("proj", 64))).to(dev)
-    gd.set_basis(torch.as_tensor(B_d1).to(dev))
-    gd.set_rho(torch.as_tensor(rho_d1).to(dev))
+    # БАЗИС ПЕРЕДАЁТСЯ НА CPU, И ЭТО НЕ НЕБРЕЖНОСТЬ. `set_basis` в
+    # hicora_vla.py проверяет ортонормированность через torch.eye без явного
+    # устройства, поэтому на входе с CUDA падает; сам он переносит базис на
+    # устройство головы последней строкой. Так его вызывает и k13c_cell.
+    # Править hicora_vla.py нельзя: его sha записан в готовых артефактах.
+    gd.set_basis(torch.as_tensor(B_d1))
+    gd.set_rho(torch.as_tensor(rho_d1))
     st = {k[len("hicora_head."):]: v for k, v in d1["state"].items()}
     n_d1 = load_exact(gd, st, "HiCoRA (опора)")
     gd.eval()
@@ -483,8 +488,8 @@ def main():
         d_h, int(t_obj["d_latent"]), n_pos=int(t_obj["n_pos"]),
         rank=int(t_obj["rank"]), proj=int(t_obj["proj"]),
         hidden=int(t_obj["hidden"])).to(dev)
-    gt.set_basis(torch.as_tensor(B_t).to(dev))
-    gt.set_rho(torch.as_tensor(rho_t).to(dev))
+    gt.set_basis(torch.as_tensor(B_t))
+    gt.set_rho(torch.as_tensor(rho_t))
     n_t = load_exact(gt, t_obj["state"], "HiCoRA-T")
     gt.freeze_log_std().eval()
     print(f"  веса загружены строго: опора {n_d1} тензоров, HiCoRA-T {n_t}")
@@ -496,8 +501,8 @@ def main():
         d_h, int(t_obj["d_latent"]), n_pos=int(t_obj["n_pos"]),
         rank=int(t_obj["rank"]), proj=int(t_obj["proj"]),
         hidden=int(t_obj["hidden"])).to(dev)
-    det.set_basis(torch.as_tensor(B_t).to(dev))
-    det.set_rho(torch.as_tensor(rho_t).to(dev))
+    det.set_basis(torch.as_tensor(B_t))
+    det.set_rho(torch.as_tensor(rho_t))
     load_exact(det, t_obj["state"], "HiCoRA-T (детерминированная)")
     det.eval()
     with torch.no_grad():
