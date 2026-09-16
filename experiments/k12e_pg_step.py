@@ -182,9 +182,34 @@ def accept_step(meas, trust):
 
 # --------------------- цепочка шагов и состояние Adam ----------------------
 
+def check_no_step_terminal(out_path):
+    """Отказ, если этот шаг уже был и не состоялся. §40.1.
+
+    `no_step` означает, что политика не изменилась и step_index не вырос.
+    Повторная попытка того же шага с новым буфером — это повторение до успеха:
+    число обновлений перестаёт быть зарегистрированной величиной, а
+    `step_K.json` молча перезаписывается, и следа от отказа не остаётся.
+    """
+    if not out_path or not os.path.exists(out_path):
+        return False
+    try:
+        prev_rec = json.load(open(out_path))
+    except (ValueError, OSError):
+        return False
+    if str(prev_rec.get("status")) == "no_step":
+        raise SystemExit(
+            f"{out_path}: этот шаг уже выполнялся и ЗАКОНЧИЛСЯ no_step. По "
+            f"§40.1 первый no_step терминален: повтор того же step_index и "
+            f"сбор нового буфера не допускаются. Ветка не проходит гейт — "
+            f"результата шага получить не удалось. Удалять файл, чтобы "
+            f"попробовать снова, значит повторять до успеха")
+    return False
+
+
 def check_resume_chain(prev, *, protocol_sha1, replica, step_index, d1_sha,
                        d1_seed, sigma, require_optimizer, stage=None,
-                       head_kind=None, n_trainable=None):
+                       head_kind=None, n_trainable=None,
+                       traj_provenance=None):
     """Сверка головы предыдущего шага. ОДНА функция на раскатку и на шаг.
 
     Проверяется не только протокол: реплика, сид D1, исходный чекпойнт D1,
@@ -212,6 +237,17 @@ def check_resume_chain(prev, *, protocol_sha1, replica, step_index, d1_sha,
             bad.append(f"на прошлом шаге обучалось "
                        f"{prev['n_trainable']} тензоров, сейчас "
                        f"{n_trainable}: обучается другая часть головы")
+    # РАБОЧАЯ ТОЧКА НЕ МЕНЯЕТСЯ ПОСРЕДИ ЛЕСТНИЦЫ. Записывать провенанс ветви и
+    # не сверять его значило бы завести поле, которое никогда не срабатывает:
+    # шаг с другой sigma_T или от другой калибровки продолжил бы цепочку молча.
+    if traj_provenance is not None and prev.get("traj_provenance"):
+        pp = prev["traj_provenance"]
+        for k_ in ("sigma_t", "calibration_horizon", "calibration_head_sha1",
+                   "k13d_script_sha1", "sigma_json_sha1"):
+            a_, b_ = pp.get(k_), traj_provenance.get(k_)
+            if a_ is not None and b_ is not None and str(a_) != str(b_):
+                bad.append(f"провенанс ветви разошёлся по {k_}: было {a_}, "
+                           f"стало {b_}")
     if stage is not None and prev.get("stage", "train") != stage:
         bad.append(f"голова с этапа {prev.get('stage')}, а прогон на {stage}: "
                    f"диагностическую голову нельзя продолжить как "
@@ -1230,6 +1266,55 @@ def selftest():
             if k not in ("head_kind", "n_trainable")}
     check_resume_chain(dict(_old), head_kind="positional", **_kw)
 
+    # --- §40.1: ТЕРМИНАЛЬНЫЙ no_step --------------------------------------
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as _td:
+        _p = os.path.join(_td, "step_1.json")
+        assert check_no_step_terminal(_p) is False        # файла нет
+        json.dump(dict(status="stepped"), open(_p, "w"))
+        assert check_no_step_terminal(_p) is False        # шаг состоялся
+        json.dump(dict(status="no_step"), open(_p, "w"))
+        try:
+            check_no_step_terminal(_p)
+        except SystemExit as e:
+            assert "терминален" in str(e), e
+        else:
+            raise AssertionError("повтор шага после no_step разрешён")
+
+    # --- провенанс ветви в цепочке ----------------------------------------
+    _pv = dict(sigma_t=0.088168, calibration_horizon=8,
+               calibration_head_sha1="h", k13d_script_sha1="d",
+               sigma_json_sha1="s")
+    _b2 = dict(_base, traj_provenance=_pv)
+    check_resume_chain(dict(_b2), head_kind="trajectory",
+                       traj_provenance=dict(_pv), **_kw)
+    try:
+        check_resume_chain(dict(_b2), head_kind="trajectory",
+                           traj_provenance=dict(_pv, sigma_t=0.2), **_kw)
+    except (_kb.ProtocolError, SystemExit) as e:
+        assert "sigma_t" in str(e), e
+    else:
+        raise AssertionError("смена рабочей точки посреди лестницы принята")
+
+    # --- ЕДИНЫЙ СЕЛЕКТОР И ГЕЙТ ------------------------------------------
+    _sel = select_train_params(_g, "trajectory")
+    assert len(_sel) == 10 and not _g.log_std.requires_grad
+    _b = torch.randn(3, 4, 24), torch.randn(3, 4, 32)
+    _mu = _g.mean_coeffs(*_b)
+    _mu.sum().backward()
+    _have, _nz = check_grad_gate(_g, _sel, log=lambda *_: None)
+    assert len(_nz) >= 1
+    # отсутствующий градиент ДОПУСТИМ (так делает grad_pass), нечисловой — нет
+    dict(_g.named_parameters())["proj_z.bias"].grad = None
+    check_grad_gate(_g, _sel, log=lambda *_: None)
+    dict(_g.named_parameters())["proj_z.weight"].grad[0, 0] = float("nan")
+    try:
+        check_grad_gate(_g, _sel, log=lambda *_: None)
+    except SystemExit as e:
+        assert "нечисловой" in str(e), e
+    else:
+        raise AssertionError("нечисловой градиент пропущен")
+
     print("самопроверка k12e_pg_step пройдена")
 
 
@@ -1270,6 +1355,49 @@ def check_trainable(head, train_named, head_kind):
         if n not in want and p.requires_grad:
             raise SystemExit(f"{n} не в обучаемых, но requires_grad=True")
     return names
+
+
+def select_train_params(head, head_kind, freeze_log_std=True):
+    """ЕДИНЫЙ выбор обучаемых параметров: и для шага, и для стендов.
+
+    ВЫНЕСЕНО ПОСЛЕ РЕАЛЬНОГО ДЕФЕКТА. Стенд K-13f выбирал параметры своим
+    кодом, шаг — своим; жёсткий список ("proj.", "net.") у траекторной головы
+    давал 6 тензоров из 10, и стенд этого не видел, потому что проверял себя,
+    а не исполняемый путь. Всякая проверка, повторяющая логику вместо вызова,
+    проверяет собственную копию.
+    """
+    if freeze_log_std and hasattr(head, "log_std"):
+        head.log_std.requires_grad_(False)
+    named = [(n, p) for n, p in head.named_parameters()
+             if n.startswith(TRAIN_PREFIXES_BY_KIND[head_kind])]
+    check_trainable(head, named, head_kind)
+    return named
+
+
+def check_grad_gate(head, named, log=print):
+    """Гейт по градиентам ровно в той форме, в какой его применяет grad_pass.
+
+    `grad_pass` пропускает параметры с `grad is None` и падает на нечисловых.
+    Стенд, требующий градиента у ВСЕХ тензоров, строже исполняемого кода:
+    он отверг бы прогон, который на самом деле корректен. Поэтому здесь
+    воспроизводится то же правило: нечисловой градиент — отказ, отсутствующий
+    — допустим, но хотя бы один обязан быть ненулевым, иначе шаг ничего не
+    меняет.
+    """
+    import torch
+    nonfin = sorted(n for n, p in named
+                    if p.grad is not None and not torch.isfinite(p.grad).all())
+    if nonfin:
+        raise SystemExit(f"нечисловой градиент у {nonfin}")
+    have = [n for n, p in named if p.grad is not None]
+    nz = [n for n, p in named
+          if p.grad is not None and float(p.grad.abs().max()) > 0]
+    if not nz:
+        raise SystemExit("все градиенты обучаемой ветви нулевые или "
+                         "отсутствуют: шаг ничего не изменит")
+    log(f"    градиент: {len(have)} из {len(named)} тензоров получили его, "
+        f"{len(nz)} ненулевых, нечисловых нет")
+    return have, nz
 
 
 def build_head(h_obj, d_h, d_l, basis, rho, dev, gaussian=True,
@@ -1403,6 +1531,10 @@ def main():
     print(f"раскатки приняты: файлов {info['n_files']}, эпизодов "
           f"{info['n_episodes']}, задач {len(info['tasks'])}, sigma {sigma}")
 
+    # §40.1: ПОВТОР ШАГА, ЗАКОНЧИВШЕГОСЯ no_step, НЕ ДОПУСКАЕТСЯ. Проверка
+    # стоит до загрузки чего бы то ни было: отказ должен прийти сразу.
+    check_no_step_terminal(args.out)
+
     h_obj = torch.load(args.head_ckpt, map_location="cpu", weights_only=False)
     meta0 = files[0]["meta"]
     # ВИД ГОЛОВЫ БЕРЁТСЯ ИЗ РАСКАТОК, А НЕ ИЗ АРГУМЕНТА. Шаг обязан строить ту
@@ -1461,7 +1593,12 @@ def main():
                            replica=args.replica, step_index=args.step_index,
                            d1_sha=d1_sha, d1_seed=d1_seed, sigma=sigma,
                            require_optimizer=True, stage=args.stage,
-                           head_kind=head_kind)
+                           head_kind=head_kind,
+                           # ЗАРЕГИСТРИРОВАННАЯ КОНСТАНТА, а не длина списка,
+                           # который собирается ниже: сверять надо с тем, что
+                           # положено виду головы, а не с тем, что получилось
+                           n_trainable=N_TRAINABLE_BY_KIND[head_kind],
+                           traj_provenance=traj_prov)
         head.load_state_dict({k: v.to(dev, torch.float32)
                               for k, v in prev["state"].items()})
         policy_file_sha = k9h.file_sha12(args.resume_head)
@@ -1508,11 +1645,9 @@ def main():
     # оставив 6 обучаемых тензоров из 10. Обучалась бы другая модель, чем та,
     # что проверена стендом, и ни одна проверка шага этого не увидела бы:
     # правдоподобие, KL и предел амплитуды остаются исправными.
-    train_prefixes = (TRAIN_PREFIXES_BY_KIND[head_kind])
-    train_named = [(n, p) for n, p in head.named_parameters()
-                   if n.startswith(train_prefixes)]
+    train_prefixes = TRAIN_PREFIXES_BY_KIND[head_kind]
+    train_named = select_train_params(head, head_kind)
     train_params = [p for _, p in train_named]
-    check_trainable(head, train_named, head_kind)
 
     cb0 = torch.load(args.cb0, map_location="cpu", weights_only=False)
     cb0_t = cb0["codebook0"] if isinstance(cb0, dict) else cb0

@@ -169,10 +169,12 @@ def check_grad_paths(head, u, z0, log=print):
             if n.startswith(head.trainable_prefixes())}
     if not want:
         bad.append("у головы нет обучаемых параметров")
+    # ОТСУТСТВУЮЩИЙ ГРАДИЕНТ НЕ ОТВЕРГАЕТСЯ: `grad_pass` в K-12e пропускает
+    # параметры с `grad is None`, и стенд, требующий его у всех, был бы строже
+    # исполняемого кода. Состав обучаемых тензоров проверяет
+    # k12e.select_train_params, а не эта функция.
     none_grad = sorted(n for n in want
                        if dict(head.named_parameters())[n].grad is None)
-    if none_grad:
-        bad.append(f"нет градиента у {none_grad}: эти веса не обучаются")
     nonfin = sorted(n for n, p in head.named_parameters()
                     if p.grad is not None and not torch.isfinite(p.grad).all())
     if nonfin:
@@ -304,6 +306,8 @@ def selftest():
     head.log_prob_u(buf["u"], mu_g, std).sum().backward()
     check_grad_paths(head, buf["u"], zg, log=lambda *_: None)
     assert head.log_std.grad is None, "замороженная log_std получила градиент"
+    # СЕЛЕКТОР K-12e — ЕДИНСТВЕННЫЙ ИСТОЧНИК СОСТАВА ОБУЧАЕМЫХ ТЕНЗОРОВ
+    assert len(k12e.select_train_params(head, "trajectory")) == 10
     leaked = head(h, z0)["u"]                       # с историей
     try:
         check_grad_paths(head, leaked, z0, log=lambda *_: None)
@@ -320,13 +324,9 @@ def selftest():
              if p_.grad is not None}
     # один тензор mu-ветви «отвалился» от графа
     victim = sorted(n_ for n_ in saved if n_.startswith("proj_z."))[0]
+    # ОТСУТСТВУЮЩИЙ ГРАДИЕНТ ДОПУСТИМ — так же его трактует grad_pass
     dict(head.named_parameters())[victim].grad = None
-    try:
-        check_grad_paths(head, buf["u"], z0, log=lambda *_: None)
-    except SystemExit as e:
-        assert "не обучаются" in str(e), e
-    else:
-        raise AssertionError("отсутствующий градиент mu-ветви пропущен")
+    check_grad_paths(head, buf["u"], z0, log=lambda *_: None)
     # нечисловой градиент
     dict(head.named_parameters())[victim].grad = saved[victim].clone()
     dict(head.named_parameters())[victim].grad[0] = float("nan")
@@ -637,12 +637,24 @@ def main():
         mu_g = head.mean_coeffs(h24, zg)
         head.log_prob_u(buf["u"], mu_g, std).sum().backward()
         trainable = check_grad_paths(head, buf["u"], zg, log=print)
+        # ГЕЙТ ПО ГРАДИЕНТАМ — ТОТ ЖЕ, ЧТО ПРИМЕНЯЕТ grad_pass: отсутствующий
+        # градиент там допустим, нечисловой — нет. Более строгий стенд отверг
+        # бы прогон, который исполняемый код считает корректным.
+        k12e.check_grad_gate(head, list(zip(
+            [n for n, _ in head.named_parameters()
+             if n.startswith(k12e.TRAIN_PREFIXES_BY_KIND["trajectory"])],
+            [p for n, p in head.named_parameters()
+             if n.startswith(k12e.TRAIN_PREFIXES_BY_KIND["trajectory"])])),
+            log=print)
         if head.log_std.grad is not None:
             raise SystemExit("замороженная log_std получила градиент")
 
         ls_before = head.log_std.detach().clone()
-        params = [p for n, p in head.named_parameters()
-                  if n.startswith(head.trainable_prefixes())]
+        # ПАРАМЕТРЫ ВЫБИРАЕТ K-12e, А НЕ СТЕНД. Собственный выбор — ровно тот
+        # дефект, из-за которого стенд не заметил, что лестница обучала 6
+        # тензоров из 10: он проверял свою копию логики, а не исполняемую.
+        train_named = k12e.select_train_params(head, "trajectory")
+        params = [p for _, p in train_named]
         opt = torch.optim.Adam(params, lr=a.lr)
         rec = k12e.one_step(head, opt, buf, adv, std,
                             n_episodes=len(rows), lr=a.lr, trust=trust,
