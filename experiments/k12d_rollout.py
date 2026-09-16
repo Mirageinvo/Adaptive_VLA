@@ -1362,10 +1362,18 @@ def run(args):
     # ВЕРСИЯ КОДА ПО СМЫСЛУ, а не по байтам: правка сообщения или комментария
     # её не меняет, правка логики раскатки, политики, шума или шага — меняет
     here_ = os.path.dirname(os.path.abspath(__file__))
-    cver = kb.code_version([os.path.abspath(__file__),
-                            os.path.join(here_, "k12e_pg_step.py"),
-                            os.path.join(here_, "hicora_g.py"),
-                            os.path.join(here_, "hicora_vla.py")])
+    # ВЕРСИЯ КОДА ВКЛЮЧАЕТ ФАЙЛЫ ИСПОЛНЯЕМОЙ ВЕТВИ. Без этого изменение
+    # адаптера или траекторной головы между ячейками не обнаружилось бы:
+    # ячейки выглядели бы снятыми одной версией, будучи снятыми разными.
+    _cv = [os.path.abspath(__file__),
+           os.path.join(here_, "k12e_pg_step.py"),
+           os.path.join(here_, "hicora_g.py"),
+           os.path.join(here_, "hicora_vla.py")]
+    if traj:
+        _cv += [os.path.join(here_, "k13g_traj_adapter.py"),
+                os.path.join(here_, "hicora_t_vla.py"),
+                os.path.join(here_, "hicora_t_g.py")]
+    cver = kb.code_version(_cv)
     ex.update(script_sha1=k9h.file_sha12(os.path.abspath(__file__)),
               step_script_sha1=k9h.file_sha12(k12e.__file__),
               hicora_g_sha1=k9h.file_sha12(hg.__file__),

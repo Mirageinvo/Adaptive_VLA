@@ -195,6 +195,15 @@ def meta_fields(*, head_ckpt, head_sha, sigma_json, sigma_obj, k13d_path,
     # ячейка уже несёт: возврат их отсюда давал бы либо TypeError при
     # `build_meta(**ex, head_sha1=...)`, либо молчаливое переопределение при
     # слиянии словарей. Свои поля называются с префиксом ветви.
+    # ВЕРСИЯ КАЛИБРАТОРА НА ДИСКЕ И В АРТЕФАКТЕ ОБЯЗАНЫ СОВПАСТЬ. Записать оба
+    # числа и не сравнить их значило бы завести поле, которое никогда не
+    # срабатывает: расхождение означает, что калибровку надо повторить.
+    k13d_now = file_sha(k13d_path)
+    if str(sigma_obj["script_sha1"]) != str(k13d_now):
+        raise SystemExit(
+            f"калибровка снята версией K-13d {sigma_obj['script_sha1']}, а на "
+            f"диске {k13d_now}: sigma относилась бы к другой мере, калибровку "
+            f"надо повторить")
     return dict(
         traj_head_ckpt=str(head_ckpt), traj_basis=str(basis_path),
         sigma_json=str(sigma_json), sigma_json_sha1=file_sha(sigma_json),
@@ -204,7 +213,7 @@ def meta_fields(*, head_ckpt, head_sha, sigma_json, sigma_obj, k13d_path,
         calibration_rms=float(sigma_obj["rms_t"]),
         calibration_head_sha1=str(sigma_obj["head_t_sha1"]),
         k13d_script_sha1=str(sigma_obj["script_sha1"]),
-        k13d_path_sha1=file_sha(k13d_path),
+        k13d_path_sha1=k13d_now,
         head_seed=int(sigma_obj["head_seed"]))
 
 
@@ -321,7 +330,17 @@ def selftest():
                 head_seed=0)
     m = meta_fields(head_ckpt="h.pt", head_sha="hhhhhhhhhhhh",
                     sigma_json="s.json", sigma_obj=sobj, k13d_path="k.py",
-                    basis_path="b", file_sha=lambda _p: "ffffffffffff")
+                    basis_path="b", file_sha=lambda p_: (
+                        "dddddddddddd" if p_ == "k.py" else "ffffffffffff"))
+    # РАСХОЖДЕНИЕ ВЕРСИЙ КАЛИБРАТОРА — ОТКАЗ, а не два поля в артефакте
+    try:
+        meta_fields(head_ckpt="h.pt", head_sha="hhhhhhhhhhhh",
+                    sigma_json="s.json", sigma_obj=sobj, k13d_path="k.py",
+                    basis_path="b", file_sha=lambda _p: "0000")
+    except SystemExit as e:
+        assert "повторить" in str(e), e
+    else:
+        raise AssertionError("расхождение версий K-13d пропущено")
     assert m["calibration_horizon"] == 8
     assert m["k13d_script_sha1"] == "dddddddddddd"
     # СТОЛКНОВЕНИЕ ИМЁН С ПОЛЯМИ ЯЧЕЙКИ — ошибка, которая стоила прогона:
@@ -336,7 +355,9 @@ def selftest():
     try:
         meta_fields(head_ckpt="h.pt", head_sha="ДРУГАЯ",
                     sigma_json="s.json", sigma_obj=sobj, k13d_path="k.py",
-                    basis_path="b", file_sha=lambda _p: "f")
+                    basis_path="b",
+                    file_sha=lambda p_: ("dddddddddddd" if p_ == "k.py"
+                                         else "f"))
     except SystemExit as e:
         assert "другой политике" in str(e), e
     else:
@@ -348,7 +369,8 @@ def selftest():
                         sigma_obj={kk: vv for kk, vv in sobj.items()
                                    if kk != k_},
                         k13d_path="k.py", basis_path="b",
-                        file_sha=lambda _p: "f")
+                        file_sha=lambda p_: ("dddddddddddd" if p_ == "k.py"
+                                             else "f"))
         except SystemExit as e:
             assert "нет полей" in str(e) or "другой политике" in str(e), e
         else:

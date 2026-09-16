@@ -58,15 +58,27 @@ def compare_cells(a, b, fields, log=print):
     for f in fields:
         if f in da and f in db:
             ta, tb = da[f], db[f]
+            # `torch.equal` СРАВНИВАЕТ ЗНАЧЕНИЯ, А НЕ БАЙТЫ: +0.0 и -0.0 равны,
+            # а тип он и вовсе не обязан различать так, как нам нужно. Поэтому
+            # сверяются три вещи: форма, dtype и sha сырых байтов.
             if tuple(ta.shape) != tuple(tb.shape):
                 bad.append(f"{f}: форма {tuple(ta.shape)} против "
                            f"{tuple(tb.shape)}")
-            elif not torch.equal(ta, tb):
+                continue
+            if ta.dtype != tb.dtype:
+                bad.append(f"{f}: тип {ta.dtype} против {tb.dtype}")
+                continue
+            sa, sb = tensor_sha(ta), tensor_sha(tb)
+            if sa != sb:
                 d = float((ta.double() - tb.double()).abs().max())
-                bad.append(f"{f}: не совпал побитово, max|Δ| = {d:.3e}")
+                extra = ("" if not torch.equal(ta, tb) else
+                         " (значения равны, различаются БАЙТЫ: например "
+                         "+0.0 против -0.0)")
+                bad.append(f"{f}: байты не совпали, sha {sa} против {sb}, "
+                           f"max|Δ| = {d:.3e}{extra}")
             else:
                 log(f"    {f}: совпало побитово {tuple(ta.shape)} "
-                    f"sha {tensor_sha(ta)}")
+                    f"{ta.dtype} sha {sa}")
     ma, mb = a.get("meta") or {}, b.get("meta") or {}
     for k in ("policy_sha1", "head_sha1", "eps_sha1_all", "eps_sha1_first",
               "eps_mode", "eps_salt", "sigma", "stage", "arm", "suite",
@@ -134,6 +146,23 @@ def selftest():
     F = ("h", "q0", "u", "mu", "logp", "task", "state", "call")
     a = cell()
     assert compare_cells(a, cell(), F, log=lambda *_: None) == []
+
+    # --- РАВНЫЕ ЗНАЧЕНИЯ ПРИ РАЗНЫХ БАЙТАХ: torch.equal этого не видит -----
+    b = cell()
+    b["data"]["h"] = b["data"]["h"] * 1.0
+    b["data"]["h"][0, 0] = -0.0
+    a2 = cell()
+    a2["data"]["h"][0, 0] = 0.0
+    assert torch.equal(a2["data"]["h"], b["data"]["h"]), \
+        "тест бессмыслен: значения обязаны быть равны"
+    bad0 = compare_cells(a2, b, F, log=lambda *_: None)
+    assert any("байты не совпали" in x for x in bad0), bad0
+
+    # --- СМЕНА ТИПА ------------------------------------------------------
+    b = cell()
+    b["data"]["logp"] = b["data"]["logp"].double()
+    assert any("тип" in x
+               for x in compare_cells(a, b, F, log=lambda *_: None))
 
     # --- расхождение в ЛЮБОМ поле буфера обязано быть замечено ------------
     for f in F:

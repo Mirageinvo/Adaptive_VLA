@@ -57,6 +57,7 @@ case "$HEADKIND" in
       *) echo "голова должна быть s0 или s1"; exit 1 ;;
     esac
     KINDARGS=()
+    OKARGS=()
     ;;
   trajectory)
     case "$HEADTAG" in
@@ -74,6 +75,13 @@ case "$HEADKIND" in
     SIGMA=$($PY -c "import json;print(round(json.load(open('$SIGMA_JSON'))['sigma_t'],6))")
     KINDARGS=(--head-kind trajectory --traj-basis "$TRAJ_BASIS"
               --sigma-json "$SIGMA_JSON")
+    # ПРИ ПРОПУСКЕ ГОТОВОЙ ЯЧЕЙКИ СВЕРЯЕТСЯ И ВЕТВЬ. Без этого ячейка, лежащая
+    # по тому же пути, но снятая другой головой или другой калибровкой, была бы
+    # принята: имя файла о них ничего не говорит.
+    HSHA=$($PY -c "import hashlib;print(hashlib.sha1(open('$HEAD','rb').read()).hexdigest()[:12])")
+    SJSHA=$($PY -c "import hashlib;print(hashlib.sha1(open('$SIGMA_JSON','rb').read()).hexdigest()[:12])")
+    OKARGS=(head_kind=trajectory head_sha1="$HSHA"
+            sigma_json_sha1="$SJSHA")
     ;;
   *) echo "HEADKIND должен быть positional или trajectory"; exit 1 ;;
 esac
@@ -159,7 +167,7 @@ roll () {
       $PY experiments/k12j_cell_ok.py "$out" arm="$arm" sigma="$sg" \
         step_index="$step" task_id="$T" init_start="$S" d1_seed="$D1SEED" \
         rl_seed="$RL_SEED" max_steps="$MAXSTEPS" n_envs="$NENV" suite="$SU" \
-        >/dev/null 2>>"$LOG"
+        ${OKARGS[@]+"${OKARGS[@]}"} >/dev/null 2>>"$LOG"
       case $? in
         0) continue ;;                      # годная ячейка уже есть
         2) say "ЯЧЕЙКА $out ЕСТЬ, НО ОТ ДРУГОЙ КОНФИГУРАЦИИ — остановка"

@@ -183,7 +183,8 @@ def accept_step(meas, trust):
 # --------------------- цепочка шагов и состояние Adam ----------------------
 
 def check_resume_chain(prev, *, protocol_sha1, replica, step_index, d1_sha,
-                       d1_seed, sigma, require_optimizer, stage=None):
+                       d1_seed, sigma, require_optimizer, stage=None,
+                       head_kind=None, n_trainable=None):
     """Сверка головы предыдущего шага. ОДНА функция на раскатку и на шаг.
 
     Проверяется не только протокол: реплика, сид D1, исходный чекпойнт D1,
@@ -197,6 +198,20 @@ def check_resume_chain(prev, *, protocol_sha1, replica, step_index, d1_sha,
     """
     import k12b_protocol as kb
     bad = []
+    # ВИД ГОЛОВЫ — ЧАСТЬ ЦЕПОЧКИ. Голова, обученная траекторным шагом, не
+    # продолжается позиционным и наоборот: у них разная форма действия.
+    # Чекпойнты, снятые до введения поля, считаются позиционными — такими они
+    # и были.
+    if head_kind is not None:
+        got_kind = prev.get("head_kind", "positional")
+        if str(got_kind) != str(head_kind):
+            bad.append(f"голова предыдущего шага вида {got_kind}, а шаг "
+                       f"идёт как {head_kind}")
+    if n_trainable is not None and prev.get("n_trainable") is not None:
+        if int(prev["n_trainable"]) != int(n_trainable):
+            bad.append(f"на прошлом шаге обучалось "
+                       f"{prev['n_trainable']} тензоров, сейчас "
+                       f"{n_trainable}: обучается другая часть головы")
     if stage is not None and prev.get("stage", "train") != stage:
         bad.append(f"голова с этапа {prev.get('stage')}, а прогон на {stage}: "
                    f"диагностическую голову нельзя продолжить как "
@@ -1145,10 +1160,117 @@ def selftest():
                                    replica="d10_rl0", stage="train",
                                    sigma=sigma), "сид задан не правилом")
 
+    # --- СОСТАВ ОБУЧАЕМЫХ ТЕНЗОРОВ ПО ВИДУ ГОЛОВЫ -------------------------
+    # Регрессия на реальный блокер: жёсткий список ("proj.", "net.") у
+    # траекторной головы даёт 6 тензоров из 10 — proj_h. и proj_z. под "proj."
+    # не подходят. Шаг при этом проходит все проверки и обучает другую модель.
+    import hicora_vla as _hv
+    import hicora_t_vla as _ht
+    _pos = _hv.make_residual_head()(24, 32, rank=6, hidden=16, proj=8)
+    _trj = _ht.make_trajectory_head()(24, 32, n_pos=4, rank=6, proj=8,
+                                      hidden=16)
+    for _h, _kind, _n in ((_pos, "positional", 8), (_trj, "trajectory", 10)):
+        _named = [(n, q) for n, q in _h.named_parameters()
+                  if n.startswith(TRAIN_PREFIXES_BY_KIND[_kind])]
+        assert len(_named) == _n, (_kind, len(_named))
+        check_trainable(_h, _named, _kind)
+    # СТАРЫЙ СПИСОК НА ТРАЕКТОРНОЙ ГОЛОВЕ ОБЯЗАН БЫТЬ ОТВЕРГНУТ
+    _wrong = [(n, q) for n, q in _trj.named_parameters()
+              if n.startswith(("proj.", "net."))]
+    assert len(_wrong) == 6, len(_wrong)
+    try:
+        check_trainable(_trj, _wrong, "trajectory")
+    except SystemExit as e:
+        assert "не совпали" in str(e) or "замороженной" in str(e), e
+    else:
+        raise AssertionError("шесть тензоров из десяти приняты как обучаемые")
+    # log_std в обучаемых — отказ. Берётся ГАУССОВА голова: именно она
+    # исполняется в лестнице, и именно у неё log_std существует.
+    import hicora_t_g as _htg
+    _g = _htg.make_gaussian_trajectory_head()(24, 32, n_pos=4, rank=6, proj=8,
+                                              hidden=16)
+    _gn = [(n, q) for n, q in _g.named_parameters()
+           if n.startswith(TRAIN_PREFIXES_BY_KIND["trajectory"])]
+    # ПОРЯДОК ТОТ ЖЕ, ЧТО В ПРОГОНЕ: log_std морозится ДО сборки оптимизатора.
+    # Проверка требует именно этого, и её зависимость от порядка намеренна.
+    try:
+        check_trainable(_g, _gn, "trajectory")
+    except SystemExit as e:
+        assert "log_std" in str(e), e
+    else:
+        raise AssertionError("незамороженная log_std пропущена")
+    _g.log_std.requires_grad_(False)
+    check_trainable(_g, _gn, "trajectory")
+    try:
+        check_trainable(_g, _gn + [("log_std", _g.log_std)], "trajectory")
+    except SystemExit as e:
+        assert "log_std" in str(e) or "не совпали" in str(e), e
+    else:
+        raise AssertionError("log_std принята в обучаемые")
+
+    # --- ВИД ГОЛОВЫ В ЦЕПОЧКЕ ПРОДОЛЖЕНИЯ --------------------------------
+    _base = dict(protocol_sha1="p", replica="r", step_index=1, sigma=0.1,
+                 d1_head_sha1="d", d1_seed=0, stage="train",
+                 optimizer_state={"state": {}, "param_groups": []},
+                 state={}, head_kind="trajectory", n_trainable=10)
+    _kw = dict(protocol_sha1="p", replica="r", step_index=1, d1_sha="d",
+               d1_seed=0, sigma=0.1, require_optimizer=False, stage="train")
+    import k12b_protocol as _kb
+    for _kwargs, _why in ((dict(head_kind="positional"), "вида trajectory"),
+                          (dict(head_kind="trajectory", n_trainable=6),
+                           "другая часть головы")):
+        try:
+            check_resume_chain(dict(_base), **_kwargs, **_kw)
+        except (_kb.ProtocolError, SystemExit) as e:
+            assert _why in str(e), (_why, str(e))
+        else:
+            raise AssertionError(f"цепочка приняла: {_why}")
+    # чекпойнт без поля считается позиционным — таким он и был
+    _old = {k: v for k, v in _base.items()
+            if k not in ("head_kind", "n_trainable")}
+    check_resume_chain(dict(_old), head_kind="positional", **_kw)
+
     print("самопроверка k12e_pg_step пройдена")
 
 
 # -------------------------------- прогон ----------------------------------
+
+# СКОЛЬКО ТЕНЗОРОВ ОБУЧАЕТСЯ У КАЖДОГО ВИДА ГОЛОВЫ. Число зафиксировано, а не
+# выведено: именно оно отличает исправный шаг от шага, где часть головы молча
+# заморожена, и «сколько получилось» тут не ответ.
+TRAIN_PREFIXES_BY_KIND = {"positional": ("proj.", "net."),
+                          "trajectory": ("proj_h.", "proj_z.", "net.")}
+N_TRAINABLE_BY_KIND = {"positional": 8, "trajectory": 10}
+
+
+def check_trainable(head, train_named, head_kind):
+    """Точное множество обучаемых тензоров, а не «хотя бы сколько-то».
+
+    Промах по префиксу не ломает ни правдоподобие, ни KL, ни предел
+    амплитуды: шаг проходит все проверки и обучает другую модель. Поймать это
+    можно только пересчётом состава.
+    """
+    names = [n for n, _ in train_named]
+    want = {n for n, _ in head.named_parameters()
+            if n.startswith(TRAIN_PREFIXES_BY_KIND[head_kind])}
+    if set(names) != want:
+        raise SystemExit(f"обучаемые тензоры не совпали: {sorted(want)}")
+    if any(n.startswith("log_std") for n in names):
+        raise SystemExit("log_std попала в обучаемые: рабочая точка sigma "
+                         "уехала бы из откалиброванной")
+    n_want = N_TRAINABLE_BY_KIND[head_kind]
+    if len(names) != n_want:
+        raise SystemExit(
+            f"обучаемых тензоров {len(names)}, у головы вида {head_kind} их "
+            f"{n_want}: {sorted(names)}. Часть головы осталась бы замороженной,"
+            f" и обучалась бы не та модель, что проверена стендом")
+    # ВСЕ ОСТАЛЬНЫЕ ОБЯЗАНЫ БЫТЬ ЗАМОРОЖЕНЫ: базис и rho задают предел
+    # амплитуды, и их обучение сделало бы его недействительным.
+    for n, p in head.named_parameters():
+        if n not in want and p.requires_grad:
+            raise SystemExit(f"{n} не в обучаемых, но requires_grad=True")
+    return names
+
 
 def build_head(h_obj, d_h, d_l, basis, rho, dev, gaussian=True,
                head_kind="positional"):
@@ -1311,6 +1433,23 @@ def main():
                                  f"{want_}")
     head = build_head(h_obj, int(meta0["d_hidden"]), d_lat,
                       basis, rho, dev, head_kind=head_kind)
+    # ПРОВЕНАНС ВЕТВИ БЕРЁТСЯ ИЗ РАСКАТОК, а не собирается заново: шаг обязан
+    # унаследовать ровно ту рабочую точку, при которой собран буфер.
+    traj_prov = None
+    if head_kind == "trajectory":
+        keys = ("sigma_t", "sigma_json", "sigma_json_sha1",
+                "calibration_horizon", "calibration_head_sha1",
+                "k13d_script_sha1", "traj_basis", "head_seed")
+        vals = {k: {str((f["meta"] or {}).get(k)) for f in files}
+                for k in keys}
+        mixed = {k: v for k, v in vals.items() if len(v) > 1}
+        if mixed:
+            raise SystemExit(f"раскатки собраны при разных {sorted(mixed)}: "
+                             f"шаг смешал бы разные рабочие точки")
+        traj_prov = {k: (files[0]["meta"] or {}).get(k) for k in keys}
+        if traj_prov["sigma_t"] is None:
+            raise SystemExit("в раскатках нет провенанса sigma_T: буфер снят "
+                             "до его введения и для шага непригоден")
     print(f"  голова шага: {head_kind}, ранг {h_obj['rank']}")
     d1_sha = k9h.file_sha12(args.head_ckpt)
     d1_seed = h_obj.get("seed")
@@ -1321,7 +1460,8 @@ def main():
         check_resume_chain(prev, protocol_sha1=proto["sha1"],
                            replica=args.replica, step_index=args.step_index,
                            d1_sha=d1_sha, d1_seed=d1_seed, sigma=sigma,
-                           require_optimizer=True, stage=args.stage)
+                           require_optimizer=True, stage=args.stage,
+                           head_kind=head_kind)
         head.load_state_dict({k: v.to(dev, torch.float32)
                               for k, v in prev["state"].items()})
         policy_file_sha = k9h.file_sha12(args.resume_head)
@@ -1362,10 +1502,17 @@ def main():
         raise SystemExit("протокол разрешает учить log_std, а этот шаг его "
                          "морозит: расхождение кода и регистрации")
     head.log_std.requires_grad_(False)
-    train_params = [p for n, p in head.named_parameters()
-                    if n.startswith(("proj.", "net."))]
-    if not train_params:
-        raise SystemExit("нет обучаемых параметров ветви mu")
+    # ПРЕФИКСЫ ОБУЧАЕМЫХ ВЕСОВ ЗАВИСЯТ ОТ ВИДА ГОЛОВЫ. У траекторной входные
+    # проекции называются proj_h. и proj_z. — под "proj." они НЕ подходят
+    # (пятый символ `_`, а не `.`), и жёсткий список молча заморозил бы обе,
+    # оставив 6 обучаемых тензоров из 10. Обучалась бы другая модель, чем та,
+    # что проверена стендом, и ни одна проверка шага этого не увидела бы:
+    # правдоподобие, KL и предел амплитуды остаются исправными.
+    train_prefixes = (TRAIN_PREFIXES_BY_KIND[head_kind])
+    train_named = [(n, p) for n, p in head.named_parameters()
+                   if n.startswith(train_prefixes)]
+    train_params = [p for _, p in train_named]
+    check_trainable(head, train_named, head_kind)
 
     cb0 = torch.load(args.cb0, map_location="cpu", weights_only=False)
     cb0_t = cb0["codebook0"] if isinstance(cb0, dict) else cb0
@@ -1398,6 +1545,8 @@ def main():
     adv = episode_advantages(buf, adv_std)
 
     opt = torch.optim.Adam(train_params, lr=float(sg["lr"]))
+    print(f"  обучаемых тензоров: {len(train_params)} "
+          f"({head_kind}), префиксы {train_prefixes}")
     adam_info = None
     if prev is not None:
         adam_info = load_optimizer_state(opt, prev["optimizer_state"],
@@ -1463,6 +1612,13 @@ def main():
                         rl_seed=args.rl_seed,
                         lr_used=rec["lr_used"], halvings=rec["halvings"],
                         from_head=args.resume_head or args.head_ckpt,
+                        # ВИД ГОЛОВЫ И ПРОВЕНАНС ВЕТВИ ЕДУТ С ЧЕКПОЙНТОМ.
+                        # Иначе голову траекторной ветви можно продолжить
+                        # позиционным шагом: формы сойдутся не везде, а где
+                        # сойдутся — обучалась бы другая модель.
+                        head_kind=head_kind,
+                        traj_provenance=traj_prov,
+                        n_trainable=len(train_params),
                         order_sha1=buf["order_sha1"]), tmp_head)
         os.replace(tmp_head, args.out_head)
         print(f"голова сохранена: {args.out_head} "
