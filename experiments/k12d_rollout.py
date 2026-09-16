@@ -1329,6 +1329,15 @@ def run(args):
                      off_sha=off_sha, ckpt_fp=ckpt_fp, ckpt_path=ckpt_path,
                      hf_revision=hf_rev)
     if traj_meta:
+        # ЯВНЫЙ ЗАПРЕТ СТОЛКНОВЕНИЯ. Статическая проверка дубликатов между `ex`
+        # и явными аргументами читает ЛИТЕРАЛЬНЫЕ ключи exec_fields и слияния
+        # словаря не видит — этот дубль она пропустила, и TypeError пришёл
+        # после раскатки. Здесь он приходит до неё.
+        clash = sorted(set(traj_meta) & set(ex))
+        if clash:
+            raise SystemExit(
+                f"поля траекторной ветви сталкиваются с условиями исполнения: "
+                f"{clash}. Одно из них молча переопределило бы другое")
         ex = dict(ex, **traj_meta)
     # ИМЯ rcfg, А НЕ cfg: ниже cfg — это конфигурация модели (cfg.MODEL...),
     # и одноимённая переменная её затеняла

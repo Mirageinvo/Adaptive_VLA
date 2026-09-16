@@ -191,10 +191,12 @@ def meta_fields(*, head_ckpt, head_sha, sigma_json, sigma_obj, k13d_path,
         raise SystemExit(
             f"калибровка снята с головы {sigma_obj['head_t_sha1']}, а "
             f"исполняется {head_sha}: sigma относится к другой политике")
+    # ИМЕНА НЕ ДОЛЖНЫ СТАЛКИВАТЬСЯ С ПОЛЯМИ ЯЧЕЙКИ. `head_sha1` и `head_kind`
+    # ячейка уже несёт: возврат их отсюда давал бы либо TypeError при
+    # `build_meta(**ex, head_sha1=...)`, либо молчаливое переопределение при
+    # слиянии словарей. Свои поля называются с префиксом ветви.
     return dict(
-        head_kind=KIND,
-        head_ckpt=str(head_ckpt), head_sha1=str(head_sha),
-        traj_basis=str(basis_path),
+        traj_head_ckpt=str(head_ckpt), traj_basis=str(basis_path),
         sigma_json=str(sigma_json), sigma_json_sha1=file_sha(sigma_json),
         sigma_t=float(sigma_obj["sigma_t"]),
         calibration_horizon=int(sigma_obj["horizon"]),
@@ -320,8 +322,16 @@ def selftest():
     m = meta_fields(head_ckpt="h.pt", head_sha="hhhhhhhhhhhh",
                     sigma_json="s.json", sigma_obj=sobj, k13d_path="k.py",
                     basis_path="b", file_sha=lambda _p: "ffffffffffff")
-    assert m["head_kind"] == KIND and m["calibration_horizon"] == 8
+    assert m["calibration_horizon"] == 8
     assert m["k13d_script_sha1"] == "dddddddddddd"
+    # СТОЛКНОВЕНИЕ ИМЁН С ПОЛЯМИ ЯЧЕЙКИ — ошибка, которая стоила прогона:
+    # build_meta(**ex, head_sha1=...) падал с TypeError уже после раскатки.
+    RESERVED = {"head_sha1", "head_kind", "policy_sha1", "rank", "d_hidden",
+                "sigma", "stage", "replica", "step_index", "episodes",
+                "protocol_sha1", "codebooks_sha1", "code_version",
+                "joint_sha1", "script_sha1"}
+    clash = RESERVED & set(m)
+    assert not clash, f"поля адаптера сталкиваются с полями ячейки: {clash}"
     # голова, с которой снята калибровка, обязана совпасть с исполняемой
     try:
         meta_fields(head_ckpt="h.pt", head_sha="ДРУГАЯ",
