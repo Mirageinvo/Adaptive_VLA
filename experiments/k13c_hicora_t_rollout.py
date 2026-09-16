@@ -54,9 +54,18 @@ def arm_needs_head(arm):
     return arm in ("hicora_d1_det", "hicora_t_d1_det")
 
 
+# pos_offset СЮДА НЕ ВХОДИТ. Оно берётся из таблицы по паре (набор, задача) и
+# у разных задач разное: требовать одно значение на все ячейки значило бы
+# требовать одинаковой длины промпта у разных задач. Вместо этого сверяется
+# таблица целиком, а совпадение по задаче — отдельной проверкой ниже.
 FIELDS_SAME = ("ckpt", "max_steps", "horizon", "rollout_seed_mode",
-               "waiting_steps", "joint_sha1", "preprocess", "pos_offset",
-               "image_size", "res_norm_sha1", "precision_mode")
+               "waiting_steps", "joint_sha1", "preprocess",
+               "image_size", "res_norm_sha1", "precision_mode",
+               "offset_table_sha1")
+
+# offset_table_sha1 ЗАКОННО ПУСТ, если смещение задано явным --pos-offset.
+# Тогда оно пусто у всех ячеек, и проверка равенства всё равно поймает смесь.
+FIELDS_REQUIRED = tuple(f for f in FIELDS_SAME if f != "offset_table_sha1")
 
 # СПИСОК КЛЮЧЕЙ СВОДКИ ВЫВОДИТСЯ ИЗ FIELDS_SAME, А НЕ ПИШЕТСЯ ОТДЕЛЬНО.
 # Раньше он задавался руками и разошёлся: поля, которых в нём не было,
@@ -168,6 +177,29 @@ def verdict(delta_pp, n=45):
     return "fix_head", f"проигрыш {lost} исходов из {n} > 5"
 
 
+def check_pos_offsets(cells):
+    """Одна задача — одно смещение позиций у ВСЕХ рук.
+
+    Смещение задаёт, с какой позиции модель читает свой вход, и разное
+    смещение на одной задаче означало бы, что руки решали её из разных
+    начальных условий. Равенства «по всем ячейкам» здесь требовать нельзя:
+    у разных задач смещение разное по построению.
+    """
+    by_task = {}
+    for c in cells:
+        k = (str(c.get("suite")), int(c["task_id"]))
+        by_task.setdefault(k, {}).setdefault(
+            int(c["pos_offset"]), []).append(c.get("_path"))
+    bad = {k: v for k, v in by_task.items() if len(v) > 1}
+    if bad:
+        (suite, task), v = sorted(bad.items())[0]
+        raise SystemExit(
+            f"набор {suite}, задача {task}: разные pos_offset "
+            f"{sorted(v)} — руки читали вход с разных позиций. "
+            f"Например {sorted(vv[0] for vv in v.values())}")
+    return {k: next(iter(v)) for k, v in by_task.items()}
+
+
 def selftest():
     # --- КАЖДОЕ ПРОВЕРЯЕМОЕ ПОЛЕ ДОЛЖНО ДОЙТИ ДО ПРОВЕРКИ -----------------
     # Ровно на этом сводка и обманулась: список ключей задавался отдельно от
@@ -175,6 +207,23 @@ def selftest():
     assert set(FIELDS_SAME) <= set(META_KEYS), \
         sorted(set(FIELDS_SAME) - set(META_KEYS))
     assert "precision_mode" in FIELDS_SAME
+    assert "pos_offset" not in FIELDS_SAME, "смещение зависит от задачи"
+
+    # --- смещение позиций: по задаче, а не по всему прогону ---------------
+    ok_cells = [dict(suite="libero_10", task_id=t, pos_offset=o,
+                     _path=f"{arm}_t{t}.json")
+                for arm in ("fast12", "coarse24")
+                for t, o in ((3, 3), (6, 4), (8, 4))]
+    got = check_pos_offsets(ok_cells)
+    assert got[("libero_10", 3)] == 3 and got[("libero_10", 6)] == 4, got
+    bad = ok_cells + [dict(suite="libero_10", task_id=3, pos_offset=9,
+                           _path="t_s0_t3.json")]
+    try:
+        check_pos_offsets(bad)
+    except SystemExit as e:
+        assert "задача 3" in str(e), e
+    else:
+        raise AssertionError("разное смещение на одной задаче пропущено")
 
     # --- недосчитанная рука исключается, а не роняет отчёт ----------------
     mk9 = lambda ok: [dict(task_id=3, state_id=i, success=(i in ok),
@@ -362,11 +411,14 @@ def main():
     # как условие стали записывать, не сравнима с остальными, и разница в
     # условиях выглядела бы как разница рук.
     for c in cells:
-        miss = [f for f in FIELDS_SAME if c.get(f) is None]
+        miss = [f for f in FIELDS_REQUIRED if c.get(f) is None]
         if miss:
             raise SystemExit(
                 f"{c.get('_path')}: нет полей {miss}. Их отсутствие нельзя "
                 f"считать совпадением с остальными руками")
+    offs = check_pos_offsets(cells)
+    print(f"  смещение позиций: {len(offs)} задач, по одному значению на "
+          f"каждую у всех рук")
     # ОДИНАКОВЫЕ УСЛОВИЯ У ВСЕХ РУК: иначе разность рук смешана с разницей
     # горизонта, предела шагов или чекпойнта
     for key, ms in meta_by_arm.items():
