@@ -1303,11 +1303,24 @@ def run(args):
             sigma_obj=json.load(open(args.sigma_json)),
             k13d_path=os.path.join(here, "k13d_calibrate_sigma.py"),
             basis_path=args.traj_basis, file_sha=k9h.file_sha12)
-        if abs(float(traj_meta["sigma_t"]) - sigma) > 1e-9 and not det_mode:
+        # СРАВНЕНИЕ ПОСЛЕ ОДИНАКОВОГО ОКРУГЛЕНИЯ. `sigma` округлена до шести
+        # знаков выше, а в артефакте лежит полное число: строгое равенство
+        # отвергало бы исправный запуск, а широкий допуск пропускал бы чужую
+        # рабочую точку. Округляются обе стороны одинаково.
+        want_sigma = round(float(traj_meta["sigma_t"]), 6)
+        if not det_mode and want_sigma != sigma:
             raise SystemExit(
-                f"--sigma {sigma}, а калибровка K-13d дала "
-                f"{traj_meta['sigma_t']}: исполнялась бы не та рабочая точка, "
-                f"под которую подобрано возмущение действий")
+                f"--sigma {sigma}, а калибровка K-13d дала {want_sigma} "
+                f"(в артефакте {traj_meta['sigma_t']!r}): исполнялась бы не та "
+                f"рабочая точка, под которую подобрано возмущение действий")
+        # ГОРИЗОНТ КАЛИБРОВКИ И ГОРИЗОНТ ИСПОЛНЕНИЯ — ОДНО И ТО ЖЕ ЧИСЛО.
+        # sigma подобрана по возмущению первых `horizon` действий; при другом
+        # горизонте она относится к величине, которой робот не исполняет.
+        if int(traj_meta["calibration_horizon"]) != int(args.horizon):
+            raise SystemExit(
+                f"калибровка на горизонте "
+                f"{traj_meta['calibration_horizon']}, а раскатка исполняет "
+                f"{args.horizon}")
         print(f"  рабочая точка: sigma_T {traj_meta['sigma_t']:.5f} из "
               f"{os.path.basename(args.sigma_json)} (горизонт "
               f"{traj_meta['calibration_horizon']}, K-13d "
