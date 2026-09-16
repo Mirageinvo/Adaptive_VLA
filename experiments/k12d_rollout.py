@@ -534,10 +534,17 @@ def check_names(root="third_party/actioncodec"):
     # методы модели, которые использует раскатка
     try:
         from smolvla.bar import SmolVLABlockwiseAR
-        Cls = hv.make_hicora_class(jv.make_joint12_class(SmolVLABlockwiseAR))
+        Base = jv.make_joint12_class(SmolVLABlockwiseAR)
+        Cls = hv.make_hicora_class(Base)
         need(Cls, ("build_inputs", "forward_taps", "q0_from", "init_joint_fast",
                    "set_codebooks", "set_res_norm", "forward_hicora"),
              "класс модели")
+        # ТРАЕКТОРНЫЙ КЛАСС ПРОВЕРЯЕТСЯ ЗДЕСЬ ЖЕ. Его отсутствие обнаружилось
+        # бы иначе после подъёма сред и загрузки модели — то есть в прогоне.
+        import hicora_t_vla as htv
+        need(htv.make_hicora_t_class(Base),
+             ("init_hicora_t", "forward_hicora_t", "forward_hicora",
+              "build_inputs", "forward_taps"), "траекторный класс модели")
     except Exception as e:                          # noqa: BLE001
         bad.append(f"класс модели не собирается: {type(e).__name__}: {e}")
 
@@ -1141,7 +1148,15 @@ def run(args):
         E = torch.stack([q.out_project(q.decode_code(ii))[0]
                          for q in codec.vq.quantizers]).float().to(dev)
 
-    model.__class__ = hv.make_hicora_class(type(model))
+    # КЛАСС МОДЕЛИ — ЧАСТЬ ШВА. `make_hicora_t_class` наследует от
+    # `make_hicora_class`, поэтому позиционный путь у него тот же, но
+    # добавляются init_hicora_t и forward_hicora_t. Строить траекторную ветвь
+    # на позиционном классе нельзя: сросшегося прохода там просто нет.
+    if traj:
+        import hicora_t_vla as htv
+        model.__class__ = htv.make_hicora_t_class(type(model))
+    else:
+        model.__class__ = hv.make_hicora_class(type(model))
     model.set_codebooks(E)
     model.set_res_norm(res_norm_orig.to(dev))
     model.taps, model.q0_depth = (12, 18, 24), args.expect_depth
