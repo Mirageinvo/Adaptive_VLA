@@ -40,6 +40,17 @@ def sha12(path, chunk=1 << 22):
     return h.hexdigest()[:12]
 
 
+def same_path(a, b):
+    """Сравнение путей ПО СОДЕРЖАНИЮ, а не по написанию.
+
+    Чекпойнт хранит путь таким, каким его передали при обучении: там он был
+    абсолютным, а в командной строке калибровки — относительный. Это один и тот
+    же кэш, и отказ по разнице написания — ложный. Сравнивать голые строки
+    здесь значит проверять форму записи вместо того, что проверяется.
+    """
+    return os.path.realpath(str(a)) == os.path.realpath(str(b))
+
+
 def arr_sha(a):
     return hashlib.sha1(np.ascontiguousarray(a).tobytes()).hexdigest()[:12]
 
@@ -177,6 +188,14 @@ def selftest():
     # --- один набор шума делает измерение детерминированным -------------
     e1, e2 = fixed_eps(16, 8, 3), fixed_eps(16, 8, 3)
     assert np.array_equal(e1, e2)
+
+    # --- путь сравнивается по содержанию, а не по написанию ---------------
+    # Регрессия на ложный отказ: чекпойнт хранил абсолютный путь, в команде
+    # был относительный, и калибровка не запускалась на исправных данных.
+    assert same_path("data/k11a_joint12",
+                     os.path.join(os.getcwd(), "data", "k11a_joint12"))
+    assert same_path("./data/x", "data/x")
+    assert not same_path("data/k11a_joint12", "data/k11a_other")
 
     # --- ДВА ФОРМАТА ОТПЕЧАТКА, ВОСПРОИЗВЕДЁННЫЕ НАСТОЯЩИМ .npy ----------
     # Регрессия на реальный блокер: D1 сверялся по sha массива, а K-11c писал
@@ -379,7 +398,7 @@ def main():
                        d1["basis_sha1"]),
                       ("rho D1", pref + ".rho.npy", rho_d1,
                        d1["rho_sha1"])), "file")
-    if str(d1.get("cache")) != str(a.cache):
+    if not same_path(d1.get("cache"), a.cache):
         raise SystemExit(f"опора обучена на кэше {d1.get('cache')}, а "
                          f"калибровка идёт по {a.cache}")
     d_h = int(h24.shape[-1])
@@ -445,11 +464,14 @@ def main():
     # ОДНА ГОЛОВА, ОДИН КЭШ, ОДИН ЧЕКПОЙНТ, ОДИН СИД. Без этого T-s1 можно
     # было бы откалибровать относительно опоры s0 и не получить отказа:
     # перенос рабочей точки шёл бы между разными инициализациями.
-    for nm, got, want in (("кэш", t_obj.get("cache"), a.cache),
-                          ("чекпойнт", t_obj.get("ckpt"), a.ckpt)):
-        if str(got) != str(want):
-            raise SystemExit(f"HiCoRA-T обучена на {nm} {got}, а калибровка "
-                             f"идёт по {want}")
+    if not same_path(t_obj.get("cache"), a.cache):
+        raise SystemExit(f"HiCoRA-T обучена на кэше {t_obj.get('cache')}, а "
+                         f"калибровка идёт по {a.cache}")
+    # ЧЕКПОЙНТ СРАВНИВАЕТСЯ КАК СТРОКА: это имя репозитория HuggingFace, а не
+    # путь, и нормализовать его нельзя.
+    if str(t_obj.get("ckpt")) != str(a.ckpt):
+        raise SystemExit(f"HiCoRA-T обучена на чекпойнте {t_obj.get('ckpt')}, "
+                         f"а калибровка идёт по {a.ckpt}")
     if int(t_obj["seed"]) != int(d1["seed"]):
         raise SystemExit(
             f"HiCoRA-T сида {t_obj['seed']} калибруется по опоре сида "
