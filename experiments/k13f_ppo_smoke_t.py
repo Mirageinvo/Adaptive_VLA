@@ -46,6 +46,48 @@ import sys
 import numpy as np
 
 
+TRAIN_PREFIXES = ("proj_h.", "proj_z.", "net.")
+BUFFERS = ("basis", "rho", "basis_set", "rho_set", "log_std")
+
+
+def check_sigma_artifact(o, path, head_path, horizon=8):
+    """Артефакт калибровки — ВХОДНЫЕ ДАННЫЕ, а не справка.
+
+    Из него берётся рабочая точка исследования RL. Принять его, не проверив,
+    значит стартовать лестницу при sigma, про которую неизвестно, чему она
+    соответствует и от какой головы получена.
+    """
+    bad = []
+    if o.get("split") != "train":
+        bad.append(f"калибровка на {o.get('split')}, а не train")
+    if int(o.get("horizon", -1)) != int(horizon):
+        bad.append(f"горизонт {o.get('horizon')}, а исполняется {horizon}: "
+                   f"sigma подобрана по возмущению, которого робот не видит")
+    mv = o.get("mean_vs_det")
+    if mv is None or float(mv) > 1e-5:
+        bad.append(f"mean_vs_det {mv}: среднее гауссовой головы расходится с "
+                   f"детерминированной, RL стартовал бы не из проверенной "
+                   f"точки")
+    grid = (o.get("history") or {}).get("grid")
+    if not grid or len(grid) < 7:
+        bad.append(f"в истории {0 if not grid else len(grid)} точек сетки "
+                   f"вместо семи: монотонность не проверялась")
+    else:
+        vals = [v for _s, v in grid]
+        if any(vals[i + 1] < vals[i] for i in range(len(vals) - 1)):
+            bad.append("RMS на сетке не монотонен")
+    off = abs(o["rms_t"] - o["target_rms"]) / o["target_rms"]
+    if off > 0.02:
+        bad.append(f"RMS отклоняется от цели на {100 * off:.1f}%")
+    got = sha12(head_path)
+    if str(o.get("head_t_sha1")) != got:
+        bad.append(f"калибровка снята с головы {o.get('head_t_sha1')}, а "
+                   f"подана {got}")
+    if bad:
+        raise SystemExit(f"{path}: " + "; ".join(bad))
+    return True
+
+
 def sha12(path, chunk=1 << 22):
     h = hashlib.sha1()
     with open(path, "rb") as f:
@@ -130,6 +172,33 @@ def selftest():
     else:
         raise AssertionError("сдвиг замороженного параметра пропущен")
 
+    # --- АРТЕФАКТ КАЛИБРОВКИ ПРОВЕРЯЕТСЯ, А НЕ ПРИНИМАЕТСЯ НА ВЕРУ -------
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        hp = os.path.join(td, "head.pt")
+        open(hp, "wb").write(b"head-bytes")
+        good = dict(split="train", horizon=8, mean_vs_det=0.0,
+                    rms_t=1.0, target_rms=1.0, head_t_sha1=sha12(hp),
+                    history=dict(grid=[[0.001 * (i + 1), 0.01 * (i + 1)]
+                                       for i in range(7)]))
+        check_sigma_artifact(good, "тест", hp)
+        for bad, why in (
+                (dict(good, split="dev"), "не train"),
+                (dict(good, horizon=16), "горизонт"),
+                (dict(good, mean_vs_det=1e-3), "mean_vs_det"),
+                (dict(good, history=dict(grid=[[1, 1], [2, 2]])), "точек"),
+                (dict(good, history=dict(grid=[[0.1, 5.0], [0.2, 1.0]]
+                                         + [[0.3 + i, 9.0 + i]
+                                            for i in range(5)])), "монотонен"),
+                (dict(good, rms_t=1.5), "отклоняется"),
+                (dict(good, head_t_sha1="deadbeef0000"), "снята с головы")):
+            try:
+                check_sigma_artifact(bad, "тест", hp)
+            except SystemExit as e:
+                assert why in str(e), (why, str(e))
+            else:
+                raise AssertionError(f"артефакт калибровки пропущен: {why}")
+
     # --- настоящая траекторная голова -------------------------------------
     torch.manual_seed(0)
     D_H, D_L, NP_, RK, N = 24, 32, 4, 6, 64
@@ -183,6 +252,44 @@ def selftest():
         assert "grad_fn" in str(e), e
     else:
         raise AssertionError("утечка сохранённого действия пропущена")
+
+    # --- ЧАСТИЧНАЯ ЗАГРУЗКА: ТОЖДЕСТВО log pi ЕЁ НЕ ЛОВИТ ----------------
+    # Ключевой сценарий рецензента: один ключ головы не загружен, буфер
+    # сэмплирован ЭТОЙ ЖЕ головой, и тождество сходится вокруг неправильного
+    # среднего. Ловит его только сверка с независимо собранной головой.
+    import k13g_traj_adapter as adp
+    obj = dict(state={k_: v_.clone() for k_, v_ in head.state_dict().items()},
+               arch="trajectory_mlp", target="coef", rank=RK, n_pos=NP_,
+               d_latent=D_L, d_hidden=D_H, proj=8, hidden=16, cache="c",
+               res_norm_sha1="a", basis_sha1=adp.array_sha(B.numpy()),
+               rho_sha1=adp.array_sha(head.rho.detach().cpu().numpy()),
+               selected_epoch=1, seed=0, script_sha1="b")
+    ref_det = adp.build_heads(obj, B.numpy(),
+                              head.rho.detach().cpu().numpy(), D_H, D_L,
+                              torch.device("cpu"), torch)["det_cur"]
+    with torch.no_grad():
+        dz_ok = float((ref_det(h, z0)[0]
+                       - head(h, z0, deterministic=True)["dz"]).abs().max())
+    assert dz_ok <= 1e-5, dz_ok
+    broken = make_gaussian_trajectory_head()(
+        D_H, D_L, n_pos=NP_, rank=RK, proj=8, hidden=16, init_log_std=-2.3)
+    broken.set_basis(B)
+    broken.set_rho(head.rho.detach().cpu())
+    with torch.no_grad():
+        for k_, v_ in head.state_dict().items():
+            if k_ in BUFFERS or k_.startswith("proj_z."):
+                continue                       # «забытый» слой
+            broken.state_dict()[k_].copy_(v_)
+    broken.freeze_log_std()
+    with torch.no_grad():
+        ob = broken(h, z0)
+        same = broken(h, z0, u=ob["u"])
+        d_self = float((ob["log_prob_u"] - same["log_prob_u"]).abs().max())
+        d_ind = float((ref_det(h, z0)[0]
+                       - broken(h, z0, deterministic=True)["dz"]).abs().max())
+    assert d_self <= 1e-6, "тождество должно сойтись даже у сломанной головы"
+    assert d_ind > 1e-5, (
+        "сверка с независимой головой обязана поймать неполную загрузку")
 
     # --- ШАГ С TRUST REGION: ПРИНЯТИЕ И ОТКАЗ -----------------------------
     adv = torch.randn(N)
@@ -257,16 +364,23 @@ def main():
     # породила. Здесь читается тот самый файл, и его происхождение сверяется.
     if len(a.sigma_json) != 2:
         raise SystemExit("нужны два --sigma-json: по одному на голову")
+    by_seed_ckpt = {}
+    for path in (a.head_s0, a.head_s1):
+        ob = torch.load(path, map_location="cpu", weights_only=False)
+        by_seed_ckpt[int(ob["seed"])] = path
     sig = {}
     for p in a.sigma_json:
         o = json.load(open(p))
-        if o["split"] != "train":
-            raise SystemExit(f"{p}: калибровка на {o['split']}, а не train")
-        off = abs(o["rms_t"] - o["target_rms"]) / o["target_rms"]
-        if off > 0.02:
-            raise SystemExit(f"{p}: RMS отклоняется от цели на {100*off:.1f}%")
-        sig[int(o["head_seed"])] = dict(sigma=float(o["sigma_t"]), path=p,
-                                        sha=sha12(p), horizon=o["horizon"])
+        sd = int(o["head_seed"])
+        if sd not in by_seed_ckpt:
+            raise SystemExit(f"{p}: калибровка для сида {sd}, а поданы головы "
+                             f"сидов {sorted(by_seed_ckpt)}")
+        check_sigma_artifact(o, p, by_seed_ckpt[sd], horizon=8)
+        sig[sd] = dict(sigma=float(o["sigma_t"]), path=p, sha=sha12(p),
+                       horizon=int(o["horizon"]))
+        print(f"  калибровка {os.path.basename(p)}: sigma {o['sigma_t']:.5f}, "
+              f"горизонт {o['horizon']}, mean_vs_det {o['mean_vs_det']:.1e}, "
+              f"семь точек сетки монотонны, снята с головы {o['head_t_sha1']}")
     if set(sig) != {0, 1}:
         raise SystemExit(f"артефакты калибровки для сидов {sorted(sig)}, "
                          f"нужны 0 и 1")
@@ -320,15 +434,35 @@ def main():
             init_log_std=float(np.log(sig[sd]["sigma"]))).to(dev)
         g.set_basis(torch.as_tensor(B_t))
         g.set_rho(torch.as_tensor(rho_t))
-        have = set(g.state_dict())
-        miss = sorted(set(o["state"]) - have)
-        if miss:
-            raise SystemExit(f"{tag}: ключей нет в голове: {miss}")
+        # РАВЕНСТВО МНОЖЕСТВ В ОБЕ СТОРОНЫ. Проверка только «ключи чекпойнта
+        # есть в голове» пропускает главный случай: ключ головы, которого нет
+        # в чекпойнте, остаётся в начальной инициализации. Дальше буфер
+        # сэмплируется ЭТОЙ ЖЕ частично загруженной головой, и тождество
+        # log pi сходится вокруг неправильного среднего — стенд говорит
+        # «всё хорошо» о политике, которой не существует.
+        want = {k for k in g.state_dict() if k.startswith(TRAIN_PREFIXES)}
+        got = {k for k in o["state"] if k not in BUFFERS}
+        if got != want:
+            raise SystemExit(
+                f"{tag}: обучаемые ключи не совпали — нет в чекпойнте "
+                f"{sorted(want - got)[:5]}, нет в голове {sorted(got - want)[:5]}")
+        stray = [k for k in o["state"]
+                 if k not in BUFFERS and not k.startswith(TRAIN_PREFIXES)]
+        if stray:
+            raise SystemExit(f"{tag}: веса вне {TRAIN_PREFIXES}: {stray[:5]}")
+        n_loaded = 0
         with torch.no_grad():
             for k, v in o["state"].items():
-                if k in ("basis", "rho", "basis_set", "rho_set", "log_std"):
+                if k in BUFFERS:
                     continue
-                g.state_dict()[k].copy_(v.to(dev, torch.float32))
+                tgt = g.state_dict()[k]
+                if tuple(tgt.shape) != tuple(v.shape):
+                    raise SystemExit(f"{tag}: ключ {k} формы {tuple(v.shape)}, "
+                                     f"в голове {tuple(tgt.shape)}")
+                tgt.copy_(v.to(dev, torch.float32))
+                n_loaded += 1
+        if n_loaded != len(want):
+            raise SystemExit(f"{tag}: загружено {n_loaded} из {len(want)}")
         g.freeze_log_std()
         s_got = float(g.std().max())
         if abs(s_got - sig[sd]["sigma"]) > 1e-6:
@@ -349,6 +483,32 @@ def main():
         np.asarray(q0hat[rows]).astype(np.int64)).to(dev)
     trust = dict(kl_max=float(a.kl_max), ratio_max=float(a.ratio_max),
                  ratio_hard=float(a.ratio_hard))
+    # СВЕРКА С ДЕТЕРМИНИРОВАННОЙ ГОЛОВОЙ НА НАСТОЯЩЕМ БАТЧЕ. Это последняя
+    # защита от частичной загрузки: детерминированная голова строится
+    # НЕЗАВИСИМО, тем же кодом, что исполнялся в K-13c, и её поправка обязана
+    # совпасть со средним гауссовой. Тождество log pi этого не даёт — оно
+    # сходится и вокруг неправильного среднего, потому что буфер сэмплирован
+    # той же головой.
+    import k13g_traj_adapter as adp
+    mean_vs_det = {}
+    for tag, head in heads.items():
+        o = objs[tag]
+        det = adp.build_heads(o, B_t, rho_t, int(o["d_hidden"]),
+                              int(o["d_latent"]), dev, torch)["det_cur"]
+        with torch.no_grad():
+            dz_det, _c = det(h24, z0)
+            dz_gau = head(h24, z0, deterministic=True)["dz"]
+        d = float((dz_det - dz_gau).abs().max())
+        if d > 1e-5:
+            raise SystemExit(
+                f"{tag}: среднее гауссовой головы расходится с независимо "
+                f"собранной детерминированной на {d:.2e} при допуске 1e-5. "
+                f"Это признак неполной загрузки весов: тождество log pi "
+                f"сошлось бы и в этом случае")
+        mean_vs_det[tag] = d
+        print(f"  {tag}: среднее совпало с независимой детерминированной "
+              f"головой, max|Δdz| = {d:.2e}")
+
     res = {}
     for tag, head in heads.items():
         print(f"\n  === {tag} ===")
@@ -426,6 +586,7 @@ def main():
                         sigma_json_sha1=sig[int(objs[tag]["seed"])]["sha"],
                         n_trainable=len(trainable), bound=lim,
                         dz_norm_max=nrm, parity=par, step=rec,
+                        mean_vs_independent_det=float(mean_vs_det[tag]),
                         kl_dims=int(buf["u"].shape[-1]))
 
     out = dict(arms=res, batch=int(len(rows)), split="train",
