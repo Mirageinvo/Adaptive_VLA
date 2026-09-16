@@ -8,6 +8,14 @@
 правдоподобий суммируются по другому числу координат, и переносить выводы
 K-11i сюда нельзя — их надо получить заново.
 
+ВОСПРОИЗВОДИТСЯ ПРОЦЕДУРА ЛЕСТНИЦЫ, А НЕ УЧЕБНЫЙ PPO. Обновление здесь — тот
+самый `k12e.one_step`: один полнобатчевый шаг policy gradient, затем приёмка по
+trust region (`q99 |log r|`, аварийный предел по абсолютному максимуму, предел
+на KL), при отказе — дробление шага вдвое и побитовый откат параметров И
+моментов Adam. Первая версия этого стенда гоняла clipped PPO с эпохами, то есть
+проверяла процедуру, которой мы не пользуемся: её расхождение говорило о стенде,
+а не о голове.
+
 ЧТО НАСТОЯЩЕЕ И ЧТО НЕТ. Настоящие: активации h24 и черновики z0 из кэша
 K-11a, веса обеих голов, sigma_T из K-13d, вся механика обновления.
 ПОДДЕЛЬНЫЕ: преимущества — случайные нормированные числа, награды здесь нет.
@@ -105,14 +113,8 @@ def check_grad_paths(head, u, z0, log=print):
 def selftest():
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import torch
-    import k11i_ppo_smoke as k11i
+    import k12e_pg_step as k12e
     from hicora_t_g import make_gaussian_trajectory_head
-
-    # --- механика PPO переиспользуется, а не переписывается ---------------
-    lp = torch.zeros(8)
-    t = k11i.ppo_terms(lp, lp.clone(), torch.randn(8))
-    assert abs(t["kl_k1"]) < 1e-12 and t["clip_frac"] == 0.0
-    assert t["ratio_ok"]
 
     # --- заморозка проверяется ПОБИТОВО ----------------------------------
     a = torch.tensor([-2.3, -2.3])
@@ -128,52 +130,83 @@ def selftest():
     else:
         raise AssertionError("сдвиг замороженного параметра пропущен")
 
-    # --- тождество на настоящей траекторной голове ------------------------
+    # --- настоящая траекторная голова -------------------------------------
     torch.manual_seed(0)
-    D_H, D_L, NP_, RK = 24, 32, 4, 6
+    D_H, D_L, NP_, RK, N = 24, 32, 4, 6, 64
     q, _ = torch.linalg.qr(torch.randn(NP_ * D_L, RK, dtype=torch.float64))
     B = q.T.to(torch.float32).contiguous()          # [rank, n_pos*d_latent]
     head = make_gaussian_trajectory_head()(
-        D_H, D_L, n_pos=NP_, rank=RK, proj=8, hidden=16)
+        D_H, D_L, n_pos=NP_, rank=RK, proj=8, hidden=16, init_log_std=-2.3)
     head.set_basis(B)
     head.set_rho(torch.full((RK,), 0.5))
-    for p in head.net.parameters():
-        torch.nn.init.normal_(p, 0.0, 0.2)
-    head.freeze_log_std().eval()
+    for p_ in head.net.parameters():
+        torch.nn.init.normal_(p_, 0.0, 0.2)
+    head.freeze_log_std()
 
-    h = torch.randn(5, NP_, D_H)
-    z = torch.randn(5, NP_, D_L)
+    h = torch.randn(N, NP_, D_H)
+    cb0 = torch.randn(16, D_L)
+    q0 = torch.randint(0, 16, (N, NP_))
+    z0 = cb0[q0]
+    std = head.std().detach()
     with torch.no_grad():
-        o = head(h, z)
-    u_buf = o["u"].detach().clone()
-    assert tuple(u_buf.shape) == (5, RK), tuple(u_buf.shape)
-    again = head(h, z, u=u_buf)
-    tt = k11i.ppo_terms(again["log_prob_u"], o["log_prob_u"].detach(),
-                        torch.randn(5))
-    dev = float((tt["ratio"] - 1.0).abs().max())
-    assert dev < 1e-5, f"отношение не единица до шага: {dev:.3e}"
-    assert abs(tt["kl_k1"]) < 1e-9 and tt["clip_frac"] == 0.0
+        o0 = head(h, z0)
+    assert tuple(o0["u"].shape) == (N, RK), tuple(o0["u"].shape)
+    buf = dict(n=N, h=h, q0=q0, cb0=cb0, u=o0["u"].clone(),
+               mu=o0["mu"].clone(), logp=o0["log_prob_u"].clone(),
+               order_sha1="test")
 
-    # --- KL по 64 координатам суммируется, а не усредняется ---------------
-    kl = k11i.analytic_kl(o["mu"], o["std"], o["mu"], o["std"])
-    assert kl["n_dim"] == RK, (kl["n_dim"], RK)
-    assert abs(kl["joint_mean"]) < 1e-9
+    # --- ЧЁТНОСТЬ И ТОЖДЕСТВО ДО ШАГА -------------------------------------
+    par = k12e.parity_check(head, buf, std)
+    assert par["ok"], par
+    st = k12e.ratio_stats(buf["logp"].float(), buf["logp"].float(), 1.5, 3.0)
+    assert st["ok"] and st["logdiff_q99"] == 0.0, st
 
-    # --- градиентные пути --------------------------------------------------
-    zg = z.clone().requires_grad_(True)
-    out = head(h, zg, u=u_buf)
-    (out["log_prob_u"].sum()).backward()
-    check_grad_paths(head, u_buf, zg, log=lambda *_: None)
+    # --- KL СУММИРУЕТСЯ ПО 64 КООРДИНАТАМ, А НЕ ПО 512 --------------------
+    # Ради этого стенд и отделён от K-11i: там действие имеет 16*32 координат,
+    # здесь одно решение на чанк, и предел KL относится к другой величине.
+    kl = k12e.kl_mu(buf["mu"], buf["mu"], std)
+    assert tuple(kl.shape) == (N,) and float(kl.abs().max()) == 0.0
+    kl2 = k12e.kl_mu(buf["mu"], buf["mu"] + float(std[0]), std)
+    assert abs(float(kl2.mean()) - 0.5 * RK) < 1e-6, float(kl2.mean())
+
+    # --- ГРАДИЕНТНЫЕ ПУТИ --------------------------------------------------
+    head.zero_grad(set_to_none=True)
+    zg = z0.clone().requires_grad_(True)
+    mu_g = head.mean_coeffs(h, zg)
+    head.log_prob_u(buf["u"], mu_g, std).sum().backward()
+    check_grad_paths(head, buf["u"], zg, log=lambda *_: None)
     assert head.log_std.grad is None, "замороженная log_std получила градиент"
-
-    # --- утечка действия в граф обязана быть замечена ----------------------
-    leaked = head(h, z)["u"]          # с историей
+    leaked = head(h, z0)["u"]                       # с историей
     try:
-        check_grad_paths(head, leaked, z, log=lambda *_: None)
+        check_grad_paths(head, leaked, z0, log=lambda *_: None)
     except SystemExit as e:
         assert "grad_fn" in str(e), e
     else:
         raise AssertionError("утечка сохранённого действия пропущена")
+
+    # --- ШАГ С TRUST REGION: ПРИНЯТИЕ И ОТКАЗ -----------------------------
+    adv = torch.randn(N)
+    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+    trust = dict(kl_max=0.02, ratio_max=1.5, ratio_hard=3.0)
+    ls0 = head.log_std.detach().clone()
+    params = [p_ for n_, p_ in head.named_parameters()
+              if n_.startswith(head.trainable_prefixes())]
+    opt = torch.optim.Adam(params, lr=1e-5)
+    rec = k12e.one_step(head, opt, buf, adv, std, n_episodes=N, lr=1e-5,
+                        trust=trust, max_halvings=8, micro=32,
+                        log=lambda *_: None)
+    assert rec["status"] == "stepped", rec["attempts"][-1]
+    check_frozen(ls0, head.log_std.detach())
+
+    # заведомо огромный шаг обязан быть отвергнут ЦЕЛИКОМ, с точным откатом
+    snap = {k_: v_.detach().clone() for k_, v_ in head.state_dict().items()}
+    opt2 = torch.optim.Adam(params, lr=1e9)
+    rec2 = k12e.one_step(head, opt2, buf, adv, std, n_episodes=N, lr=1e9,
+                         trust=trust, max_halvings=1, micro=32,
+                         log=lambda *_: None)
+    assert rec2["status"] == "no_step", rec2["status"]
+    for k_, v_ in head.state_dict().items():
+        assert torch.equal(v_.detach(), snap[k_]), f"откат неточен по {k_}"
     print("самопроверка k13f_ppo_smoke_t пройдена")
 
 
@@ -188,9 +221,15 @@ def main():
                     help="артефакты K-13d, по одному на голову")
     ap.add_argument("--res-norm-cache", default="data/k11c_res_norm.pt")
     ap.add_argument("--batch", type=int, default=256)
-    ap.add_argument("--minibatch", type=int, default=64)
-    ap.add_argument("--epochs", type=int, default=4)
+    ap.add_argument("--micro", type=int, default=256)
     ap.add_argument("--lr", type=float, default=1e-4)
+    # ПРЕДЕЛЫ ТЕ ЖЕ, ЧТО В K-12e. Здесь они не подбираются: стенд обязан
+    # принять или отвергнуть шаг по тому же правилу, по которому это сделает
+    # лестница, иначе он проверяет другую процедуру.
+    ap.add_argument("--kl-max", type=float, default=0.02)
+    ap.add_argument("--ratio-max", type=float, default=1.5)
+    ap.add_argument("--ratio-hard", type=float, default=3.0)
+    ap.add_argument("--max-halvings", type=int, default=8)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="data/k13f/ppo_smoke_t.json")
@@ -303,41 +342,52 @@ def main():
     if int(objs["s0"]["seed"]) == int(objs["s1"]["seed"]):
         raise SystemExit("у голов один сид: это не две реплики")
 
-    # --- прогон -------------------------------------------------------------
+    # --- прогон: ТОТ ЖЕ ШАГ, ЧТО В ЛЕСТНИЦЕ ---------------------------------
+    import k12e_pg_step as k12e
+    cb0 = torch.from_numpy(E[0]).to(dev).float()
+    q0_idx = torch.from_numpy(
+        np.asarray(q0hat[rows]).astype(np.int64)).to(dev)
+    trust = dict(kl_max=float(a.kl_max), ratio_max=float(a.ratio_max),
+                 ratio_hard=float(a.ratio_hard))
     res = {}
     for tag, head in heads.items():
         print(f"\n  === {tag} ===")
-        # ГЕНЕРАТОР НА УСТРОЙСТВЕ ГОЛОВЫ. `normal_` требует совпадения
-        # устройств генератора и тензора; перекладывать батч на CPU ради
-        # сэмплирования значило бы получить падение при --device cuda.
+        std = head.std().detach()
         gen = torch.Generator(device=dev).manual_seed(a.seed + 1)
         with torch.no_grad():
             o0 = head(h24, z0, generator=gen)
-        u_buf = o0["u"].detach().clone()
-        mu_old = o0["mu"].detach().clone()
-        std_old = o0["std"].detach().clone()
-        logp_old = o0["log_prob_u"].detach().clone()
+        buf = dict(n=len(rows), h=h24.detach(), q0=q0_idx, cb0=cb0,
+                   u=o0["u"].detach().clone(),
+                   mu=o0["mu"].detach().clone(),
+                   logp=o0["log_prob_u"].detach().clone(),
+                   order_sha1="smoke")
         adv = torch.from_numpy(
             rng.normal(size=len(rows)).astype(np.float32)).to(dev)
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-        # ТОЖДЕСТВО ДО ПЕРВОГО ШАГА
-        with torch.no_grad():
-            rep = head(h24, z0, u=u_buf)
-            t0 = k11i.ppo_terms(rep["log_prob_u"], logp_old, adv)
-            t0["ratio_cpu"] = t0["ratio"].cpu().numpy()
-        k11i.check_identity(t0)
-        kl0 = k11i.analytic_kl(mu_old, std_old, rep["mu"], rep["std"])
-        print(f"    тождество до шага: отношение 1 +- "
-              f"{float(np.abs(t0['ratio_cpu'] - 1).max()):.1e}, KL "
-              f"{kl0['joint_mean']:.2e} по {kl0['n_dim']} координатам")
+        # ЧЁТНОСТЬ: пересчитанное log pi обязано совпасть с записанным.
+        par = k12e.parity_check(head, buf, std)
+        if not par["ok"]:
+            raise SystemExit(
+                f"{tag}: пересчитанное log pi расходится с записанным на "
+                f"{par['logp_max_abs_diff']:.3e} (mu на "
+                f"{par['mu_max_abs_diff']:.3e}). Отношение правдоподобий "
+                f"начиналось бы не с единицы, и шаг считался бы не по тем "
+                f"сэмплам")
+        t0 = k12e.ratio_stats(buf["logp"].float(), buf["logp"].float(),
+                              float(a.ratio_max), float(a.ratio_hard))
+        if not t0["ok"] or t0["logdiff_q99"] != 0.0:
+            raise SystemExit(f"{tag}: тождество до шага нарушено: {t0}")
+        print(f"    чётность: log pi совпало до {par['logp_max_abs_diff']:.1e}"
+              f", mu до {par['mu_max_abs_diff']:.1e}; отношение до шага ровно "
+              f"единица по {int(buf['u'].shape[-1])} координатам")
 
-        # ГРАДИЕНТНЫЕ ПУТИ
+        # ГРАДИЕНТНЫЕ ПУТИ — до шага, на отдельном проходе
         head.zero_grad(set_to_none=True)
         zg = z0.clone().requires_grad_(True)
-        out = head(h24, zg, u=u_buf)
-        k11i.ppo_terms(out["log_prob_u"], logp_old, adv)["loss"].backward()
-        trainable = check_grad_paths(head, u_buf, zg, log=print)
+        mu_g = head.mean_coeffs(h24, zg)
+        head.log_prob_u(buf["u"], mu_g, std).sum().backward()
+        trainable = check_grad_paths(head, buf["u"], zg, log=print)
         if head.log_std.grad is not None:
             raise SystemExit("замороженная log_std получила градиент")
 
@@ -345,63 +395,49 @@ def main():
         params = [p for n, p in head.named_parameters()
                   if n.startswith(head.trainable_prefixes())]
         opt = torch.optim.Adam(params, lr=a.lr)
-        hist = []
-        for ep in range(a.epochs):
-            perm = torch.randperm(len(rows), device=dev)
-            for i in range(0, len(rows), a.minibatch):
-                s_ = perm[i:i + a.minibatch]
-                opt.zero_grad(set_to_none=True)
-                o_ = head(h24[s_], z0[s_], u=u_buf[s_])
-                t_ = k11i.ppo_terms(o_["log_prob_u"], logp_old[s_], adv[s_])
-                if not t_["ratio_ok"]:
-                    raise SystemExit(
-                        f"{tag}, эпоха {ep}: отношение правдоподобий "
-                        f"непригодно (обнулилось {100*t_['ratio_zero_frac']:.1f}%"
-                        f", конечно: {t_['ratio_finite']})")
-                t_["loss"].backward()
-                opt.step()
-            with torch.no_grad():
-                o_ = head(h24, z0, u=u_buf)
-                t_ = k11i.ppo_terms(o_["log_prob_u"], logp_old, adv)
-                kl = k11i.analytic_kl(mu_old, std_old, o_["mu"], o_["std"])
-                nrm = float(torch.linalg.norm(
-                    o_["dz"].flatten(1), dim=-1).max())
-            hist.append(dict(epoch=ep + 1, kl_joint=kl["joint_mean"],
-                             kl_per_dim=kl["per_dim_mean"],
-                             clip_frac=t_["clip_frac"],
-                             log_ratio_absmax=t_["log_ratio_absmax"],
-                             dz_norm_max=nrm))
-            print(f"    эпоха {ep + 1}: KL {kl['joint_mean']:.4f} "
-                  f"(на координату {kl['per_dim_mean']:.2e}), обрезано "
-                  f"{100 * t_['clip_frac']:.1f}%, max|log r| "
-                  f"{t_['log_ratio_absmax']:.3f}, max||dz|| {nrm:.4f}")
+        rec = k12e.one_step(head, opt, buf, adv, std,
+                            n_episodes=len(rows), lr=a.lr, trust=trust,
+                            max_halvings=a.max_halvings, micro=a.micro,
+                            log=lambda m: print("    " + m))
         check_frozen(ls_before, head.log_std.detach())
+        with torch.no_grad():
+            nrm = float(torch.linalg.norm(
+                head(h24, z0, u=buf["u"])["dz"].flatten(1), dim=-1).max())
         lim = head.bound()
-        worst = max(h_["dz_norm_max"] for h_ in hist)
-        if worst > lim + 1e-4:
-            raise SystemExit(f"{tag}: ||dz|| дошла до {worst:.4f} при пределе "
+        if nrm > lim + 1e-4:
+            raise SystemExit(f"{tag}: ||dz|| дошла до {nrm:.4f} при пределе "
                              f"{lim:.4f}: ограничение перестало держаться")
-        print(f"    log_std не сдвинулась ни на бит; max||dz|| {worst:.4f} "
+        if rec["status"] != "stepped":
+            raise SystemExit(
+                f"{tag}: шаг не принят ни при одном из {a.max_halvings} "
+                f"дроблений. Это не поломка стенда, а свойство рабочей точки: "
+                f"при sigma_T={float(std.max()):.5f} и lr={a.lr} любой шаг "
+                f"выходит за trust region. До лестницы нужно выбрать lr, "
+                f"а не запускать её вслепую")
+        print(f"    шаг принят после {rec['halvings']} дроблений при "
+              f"lr={rec['lr_used']:.3g}: KL {rec['kl_mean']:.5f}, q99 |log r| "
+              f"{rec['ratio']['logdiff_q99']:.4f}, сдвиг mu макс "
+              f"{rec['mu_absdiff_max']:.4f}")
+        print(f"    log_std не сдвинулась ни на бит; max||dz|| {nrm:.4f} "
               f"при пределе {lim:.4f}")
         res[tag] = dict(seed=int(objs[tag]["seed"]),
-                        sigma=float(head.std().max()),
+                        sigma=float(std.max()),
                         sigma_json=sig[int(objs[tag]["seed"])]["path"],
                         sigma_json_sha1=sig[int(objs[tag]["seed"])]["sha"],
                         n_trainable=len(trainable), bound=lim,
-                        identity_ratio_dev=float(
-                            np.abs(t0["ratio_cpu"] - 1).max()),
-                        kl_dims=kl0["n_dim"], history=hist)
+                        dz_norm_max=nrm, parity=par, step=rec,
+                        kl_dims=int(buf["u"].shape[-1]))
 
     out = dict(arms=res, batch=int(len(rows)), split="train",
-               epochs=int(a.epochs), lr=float(a.lr),
-               minibatch=int(a.minibatch), cache=a.cache,
+               lr=float(a.lr), trust=trust, micro=int(a.micro),
+               max_halvings=int(a.max_halvings), cache=a.cache,
                res_norm_sha1=rn_sha, basis_sha1=arr_sha(B_t),
                rho_sha1=arr_sha(rho_t), advantages="fake_normalized_gaussian",
                note="механика обновления, не обучение: награды нет",
                code_version=kb.code_version([
                    os.path.abspath(__file__),
                    os.path.join(here, "hicora_t_g.py"),
-                   os.path.join(here, "k11i_ppo_smoke.py")]),
+                   os.path.join(here, "k12e_pg_step.py")]),
                script_sha1=sha12(os.path.abspath(__file__)))
     os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
     tmp = f"{a.out}.tmp.{os.getpid()}"
