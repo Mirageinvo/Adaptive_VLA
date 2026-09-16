@@ -87,6 +87,10 @@ def exec_fields(args, *, joint_sha, pos_off, off_sha, ckpt_fp, ckpt_path,
                 rollout_seed_mode=args.rollout_seed_mode,
                 preprocess=PREPROCESS, offset_table_sha1=off_sha,
                 trunk_dtype=args.dtype, head_precision="fp32",
+                # ВИД ГОЛОВЫ — УСЛОВИЕ ИСПОЛНЕНИЯ, а не деталь реализации:
+                # у двух видов разная форма действия и разный по смыслу предел
+                # амплитуды, и смешивать их ячейки нельзя.
+                head_kind=args.head_kind,
                 pos_offset=pos_off)
 
 
@@ -787,6 +791,16 @@ def main() -> None:
     ap.add_argument("--sigma", type=float, required=False)
     ap.add_argument("--ckpt", required=False)
     ap.add_argument("--policy-ckpt", default="data/k9d_ep3.pt")
+    # ВИД ГОЛОВЫ — ШОВ, А НЕ ПЕРЕПИСЫВАНИЕ. По умолчанию позиционная, и её
+    # путь остаётся прежним побитово: у траекторной другая форма действия
+    # ([batch, 64] против [batch, 16, 32]), другой префикс весов и глобальный,
+    # а не позиционный предел амплитуды. Всё это живёт в k13g_traj_adapter.
+    ap.add_argument("--head-kind", choices=("positional", "trajectory"),
+                    default="positional")
+    ap.add_argument("--traj-basis", default="data/k13a_traj_basis",
+                    help="префикс траекторного базиса (--head-kind trajectory)")
+    ap.add_argument("--sigma-json", default=None,
+                    help="артефакт K-13d: провенанс рабочей точки sigma_T")
     ap.add_argument("--head-ckpt", required=False,
                     help="чекпойнт D1 (s0 или s1) — начало обучения")
     ap.add_argument("--resume-head", default=None,
@@ -862,6 +876,43 @@ def main() -> None:
         run(args)
 
 
+def _build_positional(hv, hg, h_obj, B, rho, d_h, d_latent, dev, torch):
+    """Позиционные головы. ТЕЛО ПЕРЕНЕСЕНО ДОСЛОВНО из run().
+
+    Вынесено ради шва по виду головы, а не переписано: любое изменение здесь
+    сдвинуло бы путь, который обязан остаться прежним побитово.
+    """
+    kw = dict(rank=int(h_obj["rank"]), hidden=int(h_obj.get("hidden", 512)),
+              proj=int(h_obj.get("proj", 64)))
+    st_h = {k[len("hicora_head."):]: v for k, v in h_obj["state"].items()}
+    stray = [k for k in h_obj["state"] if not k.startswith("hicora_head.")]
+    if stray:
+        raise SystemExit(f"ключи вне hicora_head.: {stray[:5]}")
+    heads = {}
+    for which, cls in (("det_d1", hv.make_residual_head()),
+                      # ДВЕ детерминированные головы, а не одна: одна навсегда
+                      # остаётся D1 (мера того, насколько обучение ушло от
+                      # старта), вторая несёт ДЕЙСТВУЮЩИЕ веса. Сверять
+                      # обученную гауссову голову с исходной D1 означало бы
+                      # требовать, чтобы обучение ничего не изменило, и вторая
+                      # же раскатка остановилась бы как «паритет не сошёлся»
+                       ("det_cur", hv.make_residual_head()),
+                       ("gau", hg.make_gaussian_residual_head())):
+        h_ = cls(d_h, int(d_latent), **kw).to(dev, torch.float32)
+        h_.set_basis(torch.as_tensor(B))
+        h_.set_rho(torch.as_tensor(rho))
+        want = {k for k in h_.state_dict() if k.startswith(("proj.", "net."))}
+        if set(st_h) != want:
+            raise SystemExit(f"набор весов головы не совпал ({which})")
+        with torch.no_grad():
+            for k, v in st_h.items():
+                h_.state_dict()[k].copy_(v.to(dev, torch.float32))
+        h_.eval()
+        heads[which] = h_
+    return (heads["det_d1"], heads["det_cur"], heads["gau"],
+            ("proj.", "net."))
+
+
 def run(args):
     here = os.path.dirname(os.path.abspath(__file__))
     root = os.path.abspath(args.root)
@@ -884,6 +935,7 @@ def run(args):
     # ДЕТЕРМИНИРОВАННОЕ ИСПОЛНЕНИЕ — у опоры И у g_rl_mean: обе исполняют
     # среднее, отличаются только весами головы
     det_mode = args.arm in ("baseline", "g_rl_mean")
+    traj = (args.head_kind == "trajectory")
     branch_sigma = (None if args.sigma in (None, "")
                     else round(float(args.sigma), 6))
     eps_mode = args.eps_mode or ("eval" if args.arm in ("g0", "g_rl")
@@ -935,8 +987,19 @@ def run(args):
                 and int(args.expect_d1_seed) != want_seed:
             raise SystemExit(f"--expect-d1-seed {args.expect_d1_seed}, а метка "
                              f"реплики {args.replica} означает сид {want_seed}")
-    k9h.check_hicora_ckpt(h_obj, f"hicora_s{want_seed}",
-                          args.expect_hicora_target)
+    if traj:
+        import k13g_traj_adapter as adp
+        adp.check_traj_ckpt(h_obj, f"hicora_t_s{want_seed}",
+                            args.expect_hicora_target)
+        if not args.sigma_json and not det_mode:
+            raise SystemExit(
+                "--head-kind trajectory без --sigma-json: рабочая точка "
+                "sigma_T подобрана K-13d, и одного числа недостаточно — по "
+                "нему ячейки разных голов неразличимы")
+    else:
+        adp = None
+        k9h.check_hicora_ckpt(h_obj, f"hicora_s{want_seed}",
+                              args.expect_hicora_target)
     head_sha = k9h.file_sha12(args.head_ckpt)
     d1_seed = h_obj.get("seed")
 
@@ -1097,15 +1160,27 @@ def run(args):
         raise SystemExit(f"res_norm sha {rn_sha}, голова обучена на "
                          f"{h_obj['res_norm_sha1']}")
     pref = h_obj["cache"]
-    bp, rp, mp = pref + ".basis.npy", pref + ".rho.npy", pref + ".meta.json"
+    if traj:
+        bp = args.traj_basis + ".basis.npy"
+        rp = args.traj_basis + ".rho.npy"
+        mp = pref + ".meta.json"
+    else:
+        bp, rp = pref + ".basis.npy", pref + ".rho.npy"
+        mp = pref + ".meta.json"
     for f_ in (bp, rp, mp):
         if not os.path.exists(f_):
             raise SystemExit(f"нет {f_}")
-    for f_, want_, lbl in ((bp, h_obj["basis_sha1"], "базис"),
-                           (rp, h_obj["rho_sha1"], "предел")):
-        got_ = k9h.file_sha12(f_)
-        if got_ != want_:
-            raise SystemExit(f"{lbl} sha {got_}, голова обучена на {want_}")
+    # ОТПЕЧАТКИ РАЗНОГО ВИДА. K-11c писал sha ФАЙЛА .npy, K-13a — sha
+    # МАССИВА: байты разные, заголовок .npy входит только в файловый. Сверка
+    # не тем видом отвергла бы исправный чекпойнт.
+    if traj:
+        pass            # сверяется ниже, вместе с загрузкой массивов
+    else:
+        for f_, want_, lbl in ((bp, h_obj["basis_sha1"], "базис"),
+                               (rp, h_obj["rho_sha1"], "предел")):
+            got_ = k9h.file_sha12(f_)
+            if got_ != want_:
+                raise SystemExit(f"{lbl} sha {got_}, голова обучена на {want_}")
     meta_c = json.load(open(mp))
     k9h.check_hicora_meta(meta_c, args.ckpt, joint_sha,
                           k9h.file_sha12(hv.__file__),
@@ -1128,34 +1203,21 @@ def run(args):
     rho = np.load(rp).astype(np.float32)
     rho_norm = float(np.linalg.norm(rho))
     d_h = int(model.fast_head.in_features)
-    kw = dict(rank=int(h_obj["rank"]), hidden=int(h_obj.get("hidden", 512)),
-              proj=int(h_obj.get("proj", 64)))
-    st_h = {k[len("hicora_head."):]: v for k, v in h_obj["state"].items()}
-    stray = [k for k in h_obj["state"] if not k.startswith("hicora_head.")]
-    if stray:
-        raise SystemExit(f"ключи вне hicora_head.: {stray[:5]}")
-    heads = {}
-    for which, cls in (("det_d1", hv.make_residual_head()),
-                      # ДВЕ детерминированные головы, а не одна: одна навсегда
-                      # остаётся D1 (мера того, насколько обучение ушло от
-                      # старта), вторая несёт ДЕЙСТВУЮЩИЕ веса. Сверять
-                      # обученную гауссову голову с исходной D1 означало бы
-                      # требовать, чтобы обучение ничего не изменило, и вторая
-                      # же раскатка остановилась бы как «паритет не сошёлся»
-                       ("det_cur", hv.make_residual_head()),
-                       ("gau", hg.make_gaussian_residual_head())):
-        h_ = cls(d_h, int(E.shape[-1]), **kw).to(dev, torch.float32)
-        h_.set_basis(torch.as_tensor(B))
-        h_.set_rho(torch.as_tensor(rho))
-        want = {k for k in h_.state_dict() if k.startswith(("proj.", "net."))}
-        if set(st_h) != want:
-            raise SystemExit(f"набор весов головы не совпал ({which})")
-        with torch.no_grad():
-            for k, v in st_h.items():
-                h_.state_dict()[k].copy_(v.to(dev, torch.float32))
-        h_.eval()
-        heads[which] = h_
-    det_d1, det_cur, gau_h = heads["det_d1"], heads["det_cur"], heads["gau"]
+    if traj:
+        # ТРАЕКТОРНАЯ ВЕТВЬ: отпечатки массивов, свой набор префиксов весов,
+        # свой конструктор. Всё — в адаптере, чтобы здесь не появилось второй
+        # копии правил происхождения.
+        adp.check_basis_provenance(h_obj, B, rho)
+        heads = adp.build_heads(h_obj, B, rho, d_h, int(E.shape[-1]),
+                                dev, torch)
+        det_d1, det_cur, gau_h = (heads["det_d1"], heads["det_cur"],
+                                  heads["gau"])
+        train_prefixes = adp.TRAIN_PREFIXES
+        print(f"  голова: траекторная, ранг {h_obj['rank']}, одна поправка на "
+              f"чанк из {h_obj['n_pos']} позиций", flush=True)
+    else:
+        det_d1, det_cur, gau_h, train_prefixes = _build_positional(
+            hv, hg, h_obj, B, rho, d_h, int(E.shape[-1]), dev, torch)
     # ОТДЕЛЬНОЙ ГОЛОВЫ В fp16 НЕТ, И ЭТО НЕ УПРОЩЕНИЕ. set_basis проверяет
     # ортонормированность с допуском 1e-4, а в fp16 произведение B^T B на 512
     # слагаемых этот допуск не выдерживает: голова, приведённая к fp16, просто
@@ -1198,7 +1260,7 @@ def run(args):
     # исполняется, а не против той, с которой всё начиналось
     with torch.no_grad():
         cur = {k: v for k, v in gau_h.state_dict().items()
-               if k.startswith(("proj.", "net."))}
+               if k.startswith(train_prefixes)}
         for k, v in cur.items():
             det_cur.state_dict()[k].copy_(v)
     if det_mode:
@@ -1229,9 +1291,32 @@ def run(args):
     # сохранить его нечем — и час работы пропадал. Здесь та же ошибка стоит
     # секунды. Это ровно тот класс, что и недостижимый хвост main в K-11h:
     # дорогая работа выполнялась до того, как проверялась её пригодность.
+    traj_meta = None
+    if traj and args.sigma_json:
+        # ОДНОГО ЧИСЛА --sigma НЕДОСТАТОЧНО: обе калибровки дали 0.08817, и по
+        # нему ячейки s0 и s1 были бы неразличимы. Записывается происхождение
+        # рабочей точки целиком, и адаптер отказывает, если калибровка снята с
+        # другой головы.
+        traj_meta = adp.meta_fields(
+            head_ckpt=args.head_ckpt, head_sha=head_sha,
+            sigma_json=args.sigma_json,
+            sigma_obj=json.load(open(args.sigma_json)),
+            k13d_path=os.path.join(here, "k13d_calibrate_sigma.py"),
+            basis_path=args.traj_basis, file_sha=k9h.file_sha12)
+        if abs(float(traj_meta["sigma_t"]) - sigma) > 1e-9 and not det_mode:
+            raise SystemExit(
+                f"--sigma {sigma}, а калибровка K-13d дала "
+                f"{traj_meta['sigma_t']}: исполнялась бы не та рабочая точка, "
+                f"под которую подобрано возмущение действий")
+        print(f"  рабочая точка: sigma_T {traj_meta['sigma_t']:.5f} из "
+              f"{os.path.basename(args.sigma_json)} (горизонт "
+              f"{traj_meta['calibration_horizon']}, K-13d "
+              f"{traj_meta['k13d_script_sha1']})", flush=True)
     ex = exec_fields(args, joint_sha=joint_sha, pos_off=pos_off,
                      off_sha=off_sha, ckpt_fp=ckpt_fp, ckpt_path=ckpt_path,
                      hf_revision=hf_rev)
+    if traj_meta:
+        ex = dict(ex, **traj_meta)
     # ИМЯ rcfg, А НЕ cfg: ниже cfg — это конфигурация модели (cfg.MODEL...),
     # и одноимённая переменная её затеняла
     rcfg, rcfg_sha = run_config(args, d1_seed=d1_seed,
@@ -1353,11 +1438,19 @@ def run(args):
                 h24 = model.res_norm(taps[max(model.taps)]).float()
                 if not parity["ok"]:
                     dz_ac, _c_ac = det_cur(h24, z0)   # путь K-11g: fp32-голова
-                    model.hicora_head = det_cur       # внутри autocast fp16
-                    o_fw = model.forward_hicora(
-                        vlm_inputs_embeds=v_,
-                        attention_mask=batch.get("attention_mask"),
-                        position_ids=p_)
+                    if traj:
+                        adp.attach(model, det_cur, h_obj, model.q0_depth)
+                        o_fw = adp.fused_forward(
+                            model,
+                            vlm_inputs_embeds=v_,
+                            attention_mask=batch.get("attention_mask"),
+                            position_ids=p_)
+                    else:
+                        model.hicora_head = det_cur   # внутри autocast fp16
+                        o_fw = model.forward_hicora(
+                            vlm_inputs_embeds=v_,
+                            attention_mask=batch.get("attention_mask"),
+                            position_ids=p_)
             # ГОЛОВА — В fp32, ВНЕ autocast: см. п.1 шапки
             with torch.no_grad():
                 h32, z32 = h24.float(), z0.float()
@@ -1429,7 +1522,14 @@ def run(args):
                             "загрузились")
                 if not torch.isfinite(o_exec["dz"]).all():
                     raise SystemExit("в поправке nan или inf")
-                dzn = float(torch.linalg.norm(o_exec["dz"], dim=-1).max())
+                # ПРЕДЕЛ У ДВУХ ГОЛОВ РАЗНЫЙ ПО СМЫСЛУ. У позиционной rho
+                # ограничивает КАЖДУЮ позицию, у траекторной — весь чанк
+                # целиком. Позиционная формула для траекторной дала бы
+                # величину меньше в sqrt(n_pos) раз при том же пороге, и
+                # проверка проходила бы всегда, ничего не гарантируя.
+                dzn = (adp.bound_norm(o_exec["dz"], torch) if traj
+                       else float(torch.linalg.norm(o_exec["dz"],
+                                                    dim=-1).max()))
                 if dzn > rho_norm + 1e-4:
                     raise SystemExit(f"||dz|| = {dzn:.4f} превысила предел "
                                      f"{rho_norm:.4f}")
