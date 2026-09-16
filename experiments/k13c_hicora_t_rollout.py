@@ -56,7 +56,15 @@ def arm_needs_head(arm):
 
 FIELDS_SAME = ("ckpt", "max_steps", "horizon", "rollout_seed_mode",
                "waiting_steps", "joint_sha1", "preprocess", "pos_offset",
-               "image_size", "res_norm_sha1")
+               "image_size", "res_norm_sha1", "precision_mode")
+
+# СПИСОК КЛЮЧЕЙ СВОДКИ ВЫВОДИТСЯ ИЗ FIELDS_SAME, А НЕ ПИШЕТСЯ ОТДЕЛЬНО.
+# Раньше он задавался руками и разошёлся: поля, которых в нём не было,
+# доставались как None, сравнивались None с None и подтверждали «одинаковые
+# условия», ничего не проверив.
+META_KEYS = tuple(dict.fromkeys(
+    FIELDS_SAME + ("code_version", "head_sha1", "basis_sha1", "rho_sha1",
+                   "identity")))
 
 
 def index_episodes(eps, arm):
@@ -161,6 +169,13 @@ def verdict(delta_pp, n=45):
 
 
 def selftest():
+    # --- КАЖДОЕ ПРОВЕРЯЕМОЕ ПОЛЕ ДОЛЖНО ДОЙТИ ДО ПРОВЕРКИ -----------------
+    # Ровно на этом сводка и обманулась: список ключей задавался отдельно от
+    # FIELDS_SAME, отстал от него, и половина проверок сравнивала None с None.
+    assert set(FIELDS_SAME) <= set(META_KEYS), \
+        sorted(set(FIELDS_SAME) - set(META_KEYS))
+    assert "precision_mode" in FIELDS_SAME
+
     # --- недосчитанная рука исключается, а не роняет отчёт ----------------
     mk9 = lambda ok: [dict(task_id=3, state_id=i, success=(i in ok),
                            init_hash_full=f"h3_{i}") for i in range(30, 35)]
@@ -339,11 +354,19 @@ def main():
         arm = c["arm"]
         key = arm if arm in SHARED_ARMS else f"{arm}:{c['head']}"
         by_arm.setdefault(key, []).extend(c["episodes"])
-        meta_by_arm.setdefault(key, []).append(
-            {k: c.get(k) for k in ("ckpt", "max_steps", "horizon",
-                                   "rollout_seed_mode", "code_version",
-                                   "head_sha1", "basis_sha1", "rho_sha1",
-                                   "identity")})
+        m = {k: c.get(k) for k in META_KEYS}
+        m["_path"] = c.get("_path")
+        meta_by_arm.setdefault(key, []).append(m)
+    # ОТСУТСТВУЮЩЕЕ ПОЛЕ ПРОХОДИТ ЛЮБУЮ ПРОВЕРКУ НА РАВЕНСТВО. Поэтому его
+    # отсутствие — отказ, а не молчаливое согласие: ячейка, снятая до того,
+    # как условие стали записывать, не сравнима с остальными, и разница в
+    # условиях выглядела бы как разница рук.
+    for c in cells:
+        miss = [f for f in FIELDS_SAME if c.get(f) is None]
+        if miss:
+            raise SystemExit(
+                f"{c.get('_path')}: нет полей {miss}. Их отсутствие нельзя "
+                f"считать совпадением с остальными руками")
     # ОДИНАКОВЫЕ УСЛОВИЯ У ВСЕХ РУК: иначе разность рук смешана с разницей
     # горизонта, предела шагов или чекпойнта
     for key, ms in meta_by_arm.items():
@@ -357,8 +380,9 @@ def main():
         if len(vals) > 1:
             raise SystemExit(f"руки считаны при разных {fld}: {vals}")
     # ТОЧНОСТЬ ИСПОЛНЕНИЯ — ЧАСТЬ СРАВНЕНИЯ, А НЕ ДЕТАЛЬ. Ствол под autocast и
-    # голова в fp32 — то, как считались переиспользуемые ячейки D1; иначе
-    # сравнивались бы архитектуры вместе с разной точностью.
+    # голова в fp32; иначе сравнивались бы архитектуры вместе с разной
+    # точностью. Равенство режимов уже проверено выше через FIELDS_SAME —
+    # здесь закрепляется, что режим именно тот, а не просто общий.
     modes = {str(m.get("precision_mode")) for m in allf}
     if modes != {"trunk_autocast_head_fp32"}:
         raise SystemExit(
