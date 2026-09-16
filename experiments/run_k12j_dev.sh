@@ -44,15 +44,43 @@ EVAL_SEED="${EVAL_SEED:-777}"
 LR="${LR:-1e-2}"
 HALVINGS="${HALVINGS:-12}"
 CKPT="${CKPT:-ZibinDong/SmolVLM2-2.2B-ActionCodec-BAR-LIBERO}"
-case "$HEADTAG" in
-  s0) HEAD="${HEAD:-data/k11d/d1_mlp_coef_0.001_wd0_s0.pt}"; D1SEED=0 ;;
-  s1) HEAD="${HEAD:-data/k11d/d1_mlp_coef_0.001_wd0_s1.pt}"; D1SEED=1 ;;
-  *) echo "голова должна быть s0 или s1"; exit 1 ;;
+# ВИД ГОЛОВЫ — ПЕРЕМЕННАЯ СО СТАРЫМ ЗНАЧЕНИЕМ ПО УМОЛЧАНИЮ. Позиционные
+# прогоны K-12j должны запускаться ровно так же, как запускались, вплоть до
+# строки config.json: иначе уже посчитанные каталоги стали бы «чужими».
+PY="${PY:-python}"
+HEADKIND="${HEADKIND:-positional}"
+case "$HEADKIND" in
+  positional)
+    case "$HEADTAG" in
+      s0) HEAD="${HEAD:-data/k11d/d1_mlp_coef_0.001_wd0_s0.pt}"; D1SEED=0 ;;
+      s1) HEAD="${HEAD:-data/k11d/d1_mlp_coef_0.001_wd0_s1.pt}"; D1SEED=1 ;;
+      *) echo "голова должна быть s0 или s1"; exit 1 ;;
+    esac
+    KINDARGS=()
+    ;;
+  trajectory)
+    case "$HEADTAG" in
+      s0) HEAD="${HEAD:-data/k13b_hicora_t_s0.pt}"; D1SEED=0 ;;
+      s1) HEAD="${HEAD:-data/k13b_hicora_t_s1.pt}"; D1SEED=1 ;;
+      *) echo "голова должна быть s0 или s1"; exit 1 ;;
+    esac
+    TRAJ_BASIS="${TRAJ_BASIS:-data/k13a_traj_basis}"
+    SIGMA_JSON="${SIGMA_JSON:-data/k13d_sigma_t_${HEADTAG}.json}"
+    [ -s "$SIGMA_JSON" ] || { echo "нет артефакта калибровки $SIGMA_JSON: "\
+"рабочая точка sigma_T берётся из него, а не из командной строки"; exit 1; }
+    # SIGMA БЕРЁТСЯ ИЗ АРТЕФАКТА, А НЕ ИЗ ОКРУЖЕНИЯ. Набранное руками число
+    # разошлось бы с калиброванным в последнем знаке, и k12d отверг бы запуск —
+    # правильно, но бессмысленно.
+    SIGMA=$($PY -c "import json;print(round(json.load(open('$SIGMA_JSON'))['sigma_t'],6))")
+    KINDARGS=(--head-kind trajectory --traj-basis "$TRAJ_BASIS"
+              --sigma-json "$SIGMA_JSON")
+    ;;
+  *) echo "HEADKIND должен быть positional или trajectory"; exit 1 ;;
 esac
-TAG="${TAG:-${HEADTAG}_sig${SIGMA}_rl${RL_SEED}_t$(echo $TASKS | tr -d ' :')}"
+KINDTAG=""; [ "$HEADKIND" = "trajectory" ] && KINDTAG="t_"
+TAG="${TAG:-${KINDTAG}${HEADTAG}_sig${SIGMA}_rl${RL_SEED}_t$(echo $TASKS | tr -d ' :')}"
 ROOT="${ROOT:-data/k12j/$TAG}"
 LOG="${LOG:-logs/k12j/$TAG.log}"
-PY="${PY:-python}"
 ENVP=(env PYTHONPATH="$HOME/LIBERO" MUJOCO_GL=egl)
 
 mkdir -p "$ROOT" "$(dirname "$LOG")"
@@ -69,9 +97,19 @@ say () { echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG"; }
 # — а несовместимость кода и данных всё равно ловится построчной сверкой
 # происхождения каждой ячейки.
 CFG="$ROOT/config.json"
-NEW=$(printf '{"d1_seed":%d,"rl_seed":%d,"sigma":%s,"tasks":"%s","train_starts":"%s","eval_starts":"%s","n_envs":%d,"eval_eps_seed":%d,"head":"%s"}' \
-  "$D1SEED" "$RL_SEED" "$SIGMA" "$TASKS" "$TRAIN_STARTS" "$EVAL_STARTS" \
-  "$NENV" "$EVAL_SEED" "$HEAD")
+# СТРОКА СОСТАВА ДЛЯ ПОЗИЦИОННЫХ ПРОГОНОВ ОСТАЁТСЯ ПРЕЖНЕЙ ДО СИМВОЛА:
+# добавление поля сделало бы уже посчитанные каталоги K-12j несовпадающими, и
+# продолжить начатый прогон стало бы нельзя. У траекторной ветви каталоги
+# новые, поэтому там состав пишется расширенным.
+if [ "$HEADKIND" = "trajectory" ]; then
+  NEW=$(printf '{"d1_seed":%d,"rl_seed":%d,"sigma":%s,"tasks":"%s","train_starts":"%s","eval_starts":"%s","n_envs":%d,"eval_eps_seed":%d,"head":"%s","head_kind":"%s","sigma_json":"%s","traj_basis":"%s"}' \
+    "$D1SEED" "$RL_SEED" "$SIGMA" "$TASKS" "$TRAIN_STARTS" "$EVAL_STARTS" \
+    "$NENV" "$EVAL_SEED" "$HEAD" "$HEADKIND" "$SIGMA_JSON" "$TRAJ_BASIS")
+else
+  NEW=$(printf '{"d1_seed":%d,"rl_seed":%d,"sigma":%s,"tasks":"%s","train_starts":"%s","eval_starts":"%s","n_envs":%d,"eval_eps_seed":%d,"head":"%s"}' \
+    "$D1SEED" "$RL_SEED" "$SIGMA" "$TASKS" "$TRAIN_STARTS" "$EVAL_STARTS" \
+    "$NENV" "$EVAL_SEED" "$HEAD")
+fi
 if [ -f "$CFG" ]; then
   if [ "$(cat "$CFG")" != "$NEW" ]; then
     echo "научный состав каталога $ROOT не совпадает с запрошенным:"
@@ -131,8 +169,9 @@ roll () {
                --init-start "$S" --n-envs "$NENV" --device "$DEV"
                --rl-seed "$RL_SEED" --step-index "$step" --ckpt "$CKPT"
                --head-ckpt "$HEAD" --expect-d1-seed "$D1SEED"
-               --replica "dev_${HEADTAG}_rl${RL_SEED}"
-               --max-steps "$MAXSTEPS" --out "$out")
+               --replica "dev_${KINDTAG}${HEADTAG}_rl${RL_SEED}"
+               --max-steps "$MAXSTEPS" --out "$out"
+               ${KINDARGS[@]+"${KINDARGS[@]}"})
       case "$arm" in
         baseline) ;;
         # sigma ВЕТВИ: исполняется среднее, но голова должна быть из этой ветви
@@ -209,10 +248,12 @@ while [ "$DONE" -lt "$TARGET" ]; do
   roll policy "$ROOT/train_after_$N" "$TRAIN_STARTS" "$PREV" "$N" || exit 1
   say "=== обновление $K: градиент ==="
   ARGS=(--stage diag --rollouts "$(ls "$ROOT/train_after_$N"/*.pt | tr '\n' ',')"
-        --replica "dev_${HEADTAG}_rl${RL_SEED}" --head-ckpt "$HEAD"
+        --replica "dev_${KINDTAG}${HEADTAG}_rl${RL_SEED}" --head-ckpt "$HEAD"
         --step-index "$N" --rl-seed "$RL_SEED" --cb0 data/k12d/cb0.pt
         --lr "$LR" --halvings "$HALVINGS" --device "$DEV"
         --out-head "$(head_path "$K")" --out "$ROOT/step_$K.json")
+  # ВИД ГОЛОВЫ ШАГ ОПРЕДЕЛЯЕТ ПО РАСКАТКАМ САМ; ему нужен только путь базиса.
+  [ "$HEADKIND" = "trajectory" ] && ARGS+=(--traj-basis "$TRAJ_BASIS")
   [ -n "$PREV" ] && ARGS+=(--resume-head "$PREV")
   "$PY" experiments/k12e_pg_step.py "${ARGS[@]}" 2>&1 | tee -a "$LOG"
   rc=${PIPESTATUS[0]}

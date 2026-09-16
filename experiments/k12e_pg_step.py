@@ -1150,10 +1150,23 @@ def selftest():
 
 # -------------------------------- прогон ----------------------------------
 
-def build_head(h_obj, d_h, d_l, basis, rho, dev, gaussian=True):
+def build_head(h_obj, d_h, d_l, basis, rho, dev, gaussian=True,
+               head_kind="positional"):
+    """Голова для шага градиента.
+
+    ШОВ ПО ВИДУ ГОЛОВЫ — ТОТ ЖЕ, ЧТО В K-12d. Здесь он обязателен отдельно:
+    шаг строит голову сам, и если он соберёт позиционную там, где раскатка
+    исполняла траекторную, правдоподобие пересчитается по другой форме
+    действия, а отношение правдоподобий потеряет смысл.
+    """
     import torch
     import hicora_g as hg
     import hicora_vla as hv
+    if head_kind == "trajectory":
+        import k13g_traj_adapter as adp
+        adp.check_basis_provenance(h_obj, basis, rho)
+        heads = adp.build_heads(h_obj, basis, rho, d_h, d_l, dev, torch)
+        return heads["gau" if gaussian else "det_cur"]
     cls = (hg.make_gaussian_residual_head() if gaussian
            else hv.make_residual_head())
     kw = dict(rank=int(h_obj["rank"]), hidden=int(h_obj.get("hidden", 512)),
@@ -1177,6 +1190,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--protocol", default="data/k12b/protocol.json")
+    ap.add_argument("--traj-basis", default="data/k13a_traj_basis",
+                    help="префикс траекторного базиса; используется, если "
+                         "раскатки собраны траекторной головой")
     ap.add_argument("--replica", required=False)
     ap.add_argument("--stage", default="train", choices=["train", "diag"])
     ap.add_argument("--lr", type=float, default=3e-6,
@@ -1266,17 +1282,36 @@ def main():
           f"{info['n_episodes']}, задач {len(info['tasks'])}, sigma {sigma}")
 
     h_obj = torch.load(args.head_ckpt, map_location="cpu", weights_only=False)
-    pref = h_obj["cache"]
-    basis = np.load(pref + ".basis.npy").astype(np.float32)
-    rho = np.load(pref + ".rho.npy").astype(np.float32)
-    for f_, want_, lbl in ((pref + ".basis.npy", h_obj["basis_sha1"], "базис"),
-                           (pref + ".rho.npy", h_obj["rho_sha1"], "предел")):
-        got_ = k9h.file_sha12(f_)
-        if got_ != want_:
-            raise SystemExit(f"{lbl} sha {got_}, голова обучена на {want_}")
     meta0 = files[0]["meta"]
-    head = build_head(h_obj, int(meta0["d_hidden"]), int(basis.shape[0]),
-                      basis, rho, dev)
+    # ВИД ГОЛОВЫ БЕРЁТСЯ ИЗ РАСКАТОК, А НЕ ИЗ АРГУМЕНТА. Шаг обязан строить ту
+    # же голову, какой собран буфер; заявление в командной строке могло бы с
+    # ним разойтись, и тогда правдоподобие считалось бы по другой форме
+    # действия.
+    kinds = {str((f["meta"] or {}).get("head_kind", "positional"))
+             for f in files}
+    if len(kinds) > 1:
+        raise SystemExit(f"раскатки собраны головами разных видов {kinds}")
+    head_kind = kinds.pop()
+    if head_kind == "trajectory":
+        basis = np.load(args.traj_basis + ".basis.npy").astype(np.float32)
+        rho = np.load(args.traj_basis + ".rho.npy").astype(np.float32)
+        d_lat = int(h_obj["d_latent"])
+    else:
+        pref = h_obj["cache"]
+        basis = np.load(pref + ".basis.npy").astype(np.float32)
+        rho = np.load(pref + ".rho.npy").astype(np.float32)
+        d_lat = int(basis.shape[0])
+        for f_, want_, lbl in ((pref + ".basis.npy", h_obj["basis_sha1"],
+                                "базис"),
+                               (pref + ".rho.npy", h_obj["rho_sha1"],
+                                "предел")):
+            got_ = k9h.file_sha12(f_)
+            if got_ != want_:
+                raise SystemExit(f"{lbl} sha {got_}, голова обучена на "
+                                 f"{want_}")
+    head = build_head(h_obj, int(meta0["d_hidden"]), d_lat,
+                      basis, rho, dev, head_kind=head_kind)
+    print(f"  голова шага: {head_kind}, ранг {h_obj['rank']}")
     d1_sha = k9h.file_sha12(args.head_ckpt)
     d1_seed = h_obj.get("seed")
     prev = None
