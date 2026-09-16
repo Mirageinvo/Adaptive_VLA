@@ -147,6 +147,19 @@ def build_heads(obj, basis, rho, d_hidden, d_latent, dev, torch):
     return heads
 
 
+def bound_norm(dz, torch):
+    """‖dz‖ ДЛЯ ТРАЕКТОРНОЙ ПОПРАВКИ: одна норма на чанк, а не на позицию.
+
+    В K-12d предел меряется как `norm(dz, dim=-1).max()` — и это верно для
+    позиционной HiCoRA, где rho ограничивает КАЖДУЮ позицию отдельно. У
+    траекторной головы коэффициентов 64 на весь чанк, и предел ‖rho‖ относится
+    к норме по всему чанку целиком. Применить к ней позиционную формулу значит
+    сравнивать величину, меньшую в sqrt(n_pos) раз, с тем же порогом: проверка
+    прошла бы всегда и ничего бы не гарантировала.
+    """
+    return float(torch.linalg.norm(dz.flatten(1), dim=-1).max())
+
+
 def attach(model, head, obj, q0_depth):
     """Поставить голову в модель для СРОСШЕГОСЯ прохода forward_hicora_t."""
     model.init_hicora_t(q0_depth=int(q0_depth), rank=int(obj["rank"]),
@@ -158,6 +171,39 @@ def attach(model, head, obj, q0_depth):
 
 def fused_forward(model, **kw):
     return model.forward_hicora_t(**kw)
+
+
+def meta_fields(*, head_ckpt, head_sha, sigma_json, sigma_obj, k13d_path,
+                basis_path, file_sha):
+    """Поля провенанса траекторной ветви для ячейки.
+
+    ОДНОГО ЧИСЛА --sigma НЕДОСТАТОЧНО. Оно не говорит, какой мерой подобрано,
+    на каком горизонте, от какой головы и какой версией калибратора. Обе
+    калибровки дали 0.08817 — по этому числу ячейки s0 и s1 были бы
+    неразличимы, и подмена головы не обнаружилась бы.
+    """
+    need = ("sigma_t", "horizon", "target_rms", "rms_t", "head_t_sha1",
+            "script_sha1", "head_seed")
+    miss = [k for k in need if sigma_obj.get(k) is None]
+    if miss:
+        raise SystemExit(f"в артефакте калибровки нет полей {miss}")
+    if str(sigma_obj["head_t_sha1"]) != str(head_sha):
+        raise SystemExit(
+            f"калибровка снята с головы {sigma_obj['head_t_sha1']}, а "
+            f"исполняется {head_sha}: sigma относится к другой политике")
+    return dict(
+        head_kind=KIND,
+        head_ckpt=str(head_ckpt), head_sha1=str(head_sha),
+        traj_basis=str(basis_path),
+        sigma_json=str(sigma_json), sigma_json_sha1=file_sha(sigma_json),
+        sigma_t=float(sigma_obj["sigma_t"]),
+        calibration_horizon=int(sigma_obj["horizon"]),
+        calibration_target_rms=float(sigma_obj["target_rms"]),
+        calibration_rms=float(sigma_obj["rms_t"]),
+        calibration_head_sha1=str(sigma_obj["head_t_sha1"]),
+        k13d_script_sha1=str(sigma_obj["script_sha1"]),
+        k13d_path_sha1=file_sha(k13d_path),
+        head_seed=int(sigma_obj["head_seed"]))
 
 
 def selftest():
@@ -244,6 +290,22 @@ def selftest():
         "среднее гауссовой головы не совпало с детерминированной"
     assert tuple(og["u"].shape) == (5, RK), tuple(og["u"].shape)
 
+    # --- ГЛОБАЛЬНАЯ НОРМА ПРОТИВ ПОЗИЦИОННОЙ ------------------------------
+    # Позиционная формула даёт величину меньше в sqrt(n_pos) раз и прошла бы
+    # предел всегда. Проверяется, что это действительно разные числа и что
+    # ограничение считается по глобальной.
+    with torch.no_grad():
+        dz_big, _ = heads["det_d1"](h, z)
+        dz_big = dz_big + 0.0
+    per_pos = float(torch.linalg.norm(dz_big, dim=-1).max())
+    glob = bound_norm(dz_big, torch)
+    assert glob >= per_pos, (glob, per_pos)
+    ones = torch.ones(2, NP_, D_L)
+    assert abs(bound_norm(ones, torch)
+               - float(np.sqrt(NP_ * D_L))) < 1e-4
+    assert abs(float(torch.linalg.norm(ones, dim=-1).max())
+               - float(np.sqrt(D_L))) < 1e-4
+
     # --- несовпадение размерности модели ловится --------------------------
     try:
         build_heads(obj, B, rho, D_H + 1, D_L, torch.device("cpu"), torch)
@@ -251,6 +313,37 @@ def selftest():
         assert "d_hidden" in str(e), e
     else:
         raise AssertionError("другая ширина ствола принята")
+    # --- ПОЛЯ ПРОВЕНАНСА: одного числа sigma недостаточно ----------------
+    sobj = dict(sigma_t=0.08817, horizon=8, target_rms=0.0424, rms_t=0.0427,
+                head_t_sha1="hhhhhhhhhhhh", script_sha1="dddddddddddd",
+                head_seed=0)
+    m = meta_fields(head_ckpt="h.pt", head_sha="hhhhhhhhhhhh",
+                    sigma_json="s.json", sigma_obj=sobj, k13d_path="k.py",
+                    basis_path="b", file_sha=lambda _p: "ffffffffffff")
+    assert m["head_kind"] == KIND and m["calibration_horizon"] == 8
+    assert m["k13d_script_sha1"] == "dddddddddddd"
+    # голова, с которой снята калибровка, обязана совпасть с исполняемой
+    try:
+        meta_fields(head_ckpt="h.pt", head_sha="ДРУГАЯ",
+                    sigma_json="s.json", sigma_obj=sobj, k13d_path="k.py",
+                    basis_path="b", file_sha=lambda _p: "f")
+    except SystemExit as e:
+        assert "другой политике" in str(e), e
+    else:
+        raise AssertionError("sigma от чужой головы принята")
+    for k_ in ("horizon", "head_t_sha1"):
+        try:
+            meta_fields(head_ckpt="h.pt", head_sha="hhhhhhhhhhhh",
+                        sigma_json="s.json",
+                        sigma_obj={kk: vv for kk, vv in sobj.items()
+                                   if kk != k_},
+                        k13d_path="k.py", basis_path="b",
+                        file_sha=lambda _p: "f")
+        except SystemExit as e:
+            assert "нет полей" in str(e) or "другой политике" in str(e), e
+        else:
+            raise AssertionError(f"артефакт без {k_} принят")
+
     print("самопроверка k13g_traj_adapter пройдена")
 
 

@@ -50,7 +50,17 @@ TRAIN_PREFIXES = ("proj_h.", "proj_z.", "net.")
 BUFFERS = ("basis", "rho", "basis_set", "rho_set", "log_std")
 
 
-def check_sigma_artifact(o, path, head_path, horizon=8):
+def finite(x):
+    """NaN не больше и не меньше ничего.
+
+    `float("nan") > 1e-5` даёт False, поэтому ЛЮБАЯ проверка вида «величина не
+    превышает порог» пропускает NaN молча. Здесь конечность требуется явно, и
+    отсутствие значения тоже считается отказом.
+    """
+    return x is not None and bool(np.isfinite(float(x)))
+
+
+def check_sigma_artifact(o, path, head_path, horizon=8, k13d_sha=None):
     """Артефакт калибровки — ВХОДНЫЕ ДАННЫЕ, а не справка.
 
     Из него берётся рабочая точка исследования RL. Принять его, не проверив,
@@ -60,11 +70,22 @@ def check_sigma_artifact(o, path, head_path, horizon=8):
     bad = []
     if o.get("split") != "train":
         bad.append(f"калибровка на {o.get('split')}, а не train")
+    # КАЛИБРОВКА ОБЯЗАНА БЫТЬ СНЯТА ТЕКУЩИМ K-13d. Она стоит 26 секунд, и
+    # любое изменение калибратора требует её повторения: старое sigma
+    # относилось бы к другой мере.
+    if k13d_sha is not None and str(o.get("script_sha1")) != str(k13d_sha):
+        bad.append(f"снята версией K-13d {o.get('script_sha1')}, а сейчас "
+                   f"{k13d_sha}: калибровку надо повторить")
+    for nm in ("sigma_t", "rms_t", "target_rms", "mean_vs_det"):
+        if not finite(o.get(nm)):
+            bad.append(f"{nm} = {o.get(nm)}: не число")
+    if bad:
+        raise SystemExit(f"{path}: " + "; ".join(bad))
     if int(o.get("horizon", -1)) != int(horizon):
         bad.append(f"горизонт {o.get('horizon')}, а исполняется {horizon}: "
                    f"sigma подобрана по возмущению, которого робот не видит")
     mv = o.get("mean_vs_det")
-    if mv is None or float(mv) > 1e-5:
+    if not finite(mv) or float(mv) > 1e-5:
         bad.append(f"mean_vs_det {mv}: среднее гауссовой головы расходится с "
                    f"детерминированной, RL стартовал бы не из проверенной "
                    f"точки")
@@ -73,9 +94,12 @@ def check_sigma_artifact(o, path, head_path, horizon=8):
         bad.append(f"в истории {0 if not grid else len(grid)} точек сетки "
                    f"вместо семи: монотонность не проверялась")
     else:
-        vals = [v for _s, v in grid]
-        if any(vals[i + 1] < vals[i] for i in range(len(vals) - 1)):
-            bad.append("RMS на сетке не монотонен")
+        if not all(finite(x) for pair in grid for x in pair):
+            bad.append("в сетке есть нечисловые значения sigma или RMS")
+        else:
+            vals = [v for _s, v in grid]
+            if any(vals[i + 1] < vals[i] for i in range(len(vals) - 1)):
+                bad.append("RMS на сетке не монотонен")
     off = abs(o["rms_t"] - o["target_rms"]) / o["target_rms"]
     if off > 0.02:
         bad.append(f"RMS отклоняется от цели на {100 * off:.1f}%")
@@ -138,17 +162,33 @@ def check_grad_paths(head, u, z0, log=print):
             if float(p.grad.abs().max()) > 0.0:
                 bad.append(f"{nm} получил градиент: он обязан быть заморожен, "
                            f"иначе предел амплитуды перестаёт держаться")
-    got = [n for n, p in head.named_parameters()
-           if p.grad is not None and torch.isfinite(p.grad).all()
-           and float(p.grad.abs().max()) > 0]
-    if not got:
-        bad.append("ни один параметр головы не получил градиента: "
-                   "обновление ничего не меняет")
+    # ТОЧНОЕ МНОЖЕСТВО, А НЕ «ХОТЯ БЫ ОДИН». Проверка «есть хоть один
+    # градиент» проходит и когда половина mu-ветви отсоединена от графа: тогда
+    # обучается часть головы, а отчёт говорит, что обучение идёт.
+    want = {n for n, _ in head.named_parameters()
+            if n.startswith(head.trainable_prefixes())}
+    if not want:
+        bad.append("у головы нет обучаемых параметров")
+    none_grad = sorted(n for n in want
+                       if dict(head.named_parameters())[n].grad is None)
+    if none_grad:
+        bad.append(f"нет градиента у {none_grad}: эти веса не обучаются")
+    nonfin = sorted(n for n, p in head.named_parameters()
+                    if p.grad is not None and not torch.isfinite(p.grad).all())
+    if nonfin:
+        bad.append(f"нечисловой градиент у {nonfin}")
+    got = [n for n in sorted(want)
+           if dict(head.named_parameters())[n].grad is not None]
+    nz = [n for n in got
+          if float(dict(head.named_parameters())[n].grad.abs().max()) > 0]
+    if not nz:
+        bad.append("все градиенты mu-ветви нулевые: обновление ничего не "
+                   "меняет")
     if bad:
         raise SystemExit("ГРАДИЕНТНЫЕ ПУТИ НЕВЕРНЫ:\n    "
                          + "\n    ".join(bad))
-    log(f"    градиент идёт в {len(got)} тензоров mu-ветви; u константа, "
-        f"z0, базис и rho не учатся")
+    log(f"    градиент конечен во всех {len(got)} тензорах mu-ветви "
+        f"({len(nz)} ненулевых); u константа, z0, базис и rho не учатся")
     return got
 
 
@@ -177,11 +217,19 @@ def selftest():
     with tempfile.TemporaryDirectory() as td:
         hp = os.path.join(td, "head.pt")
         open(hp, "wb").write(b"head-bytes")
-        good = dict(split="train", horizon=8, mean_vs_det=0.0,
+        good = dict(split="train", horizon=8, mean_vs_det=0.0, sigma_t=0.08,
                     rms_t=1.0, target_rms=1.0, head_t_sha1=sha12(hp),
                     history=dict(grid=[[0.001 * (i + 1), 0.01 * (i + 1)]
                                        for i in range(7)]))
         check_sigma_artifact(good, "тест", hp)
+        good_v = dict(good, script_sha1="abcdef012345")
+        check_sigma_artifact(good_v, "тест", hp, k13d_sha="abcdef012345")
+        try:
+            check_sigma_artifact(good_v, "тест", hp, k13d_sha="000000000000")
+        except SystemExit as e:
+            assert "повторить" in str(e), e
+        else:
+            raise AssertionError("калибровка чужой версии K-13d принята")
         for bad, why in (
                 (dict(good, split="dev"), "не train"),
                 (dict(good, horizon=16), "горизонт"),
@@ -191,13 +239,24 @@ def selftest():
                                          + [[0.3 + i, 9.0 + i]
                                             for i in range(5)])), "монотонен"),
                 (dict(good, rms_t=1.5), "отклоняется"),
-                (dict(good, head_t_sha1="deadbeef0000"), "снята с головы")):
+                (dict(good, head_t_sha1="deadbeef0000"), "снята с головы"),
+                (dict(good, mean_vs_det=float("nan")), "не число"),
+                (dict(good, sigma_t=float("nan")), "не число"),
+                (dict(good, history=dict(
+                    grid=[[0.1 * (i + 1), float("nan")]
+                          for i in range(7)])), "нечисловые")):
             try:
                 check_sigma_artifact(bad, "тест", hp)
             except SystemExit as e:
                 assert why in str(e), (why, str(e))
             else:
                 raise AssertionError(f"артефакт калибровки пропущен: {why}")
+
+    # --- NaN НЕ ПРОХОДИТ НИ ОДНУ ЧИСЛОВУЮ ПРОВЕРКУ -----------------------
+    # `float("nan") > 1e-5` равно False, поэтому без явной проверки
+    # конечности NaN прошёл бы каждый порог вида «не превышает».
+    assert not finite(float("nan")) and not finite(float("inf"))
+    assert not finite(None) and finite(0.0)
 
     # --- настоящая траекторная голова -------------------------------------
     torch.manual_seed(0)
@@ -252,6 +311,32 @@ def selftest():
         assert "grad_fn" in str(e), e
     else:
         raise AssertionError("утечка сохранённого действия пропущена")
+
+    # --- ГРАДИЕНТЫ: ОТСУТСТВУЮЩИЙ И НЕЧИСЛОВОЙ -------------------------
+    head.zero_grad(set_to_none=True)
+    mu_part = head.mean_coeffs(h, z0)
+    head.log_prob_u(buf["u"], mu_part, std).sum().backward()
+    saved = {n_: p_.grad.clone() for n_, p_ in head.named_parameters()
+             if p_.grad is not None}
+    # один тензор mu-ветви «отвалился» от графа
+    victim = sorted(n_ for n_ in saved if n_.startswith("proj_z."))[0]
+    dict(head.named_parameters())[victim].grad = None
+    try:
+        check_grad_paths(head, buf["u"], z0, log=lambda *_: None)
+    except SystemExit as e:
+        assert "не обучаются" in str(e), e
+    else:
+        raise AssertionError("отсутствующий градиент mu-ветви пропущен")
+    # нечисловой градиент
+    dict(head.named_parameters())[victim].grad = saved[victim].clone()
+    dict(head.named_parameters())[victim].grad[0] = float("nan")
+    try:
+        check_grad_paths(head, buf["u"], z0, log=lambda *_: None)
+    except SystemExit as e:
+        assert "нечисловой" in str(e), e
+    else:
+        raise AssertionError("нечисловой градиент пропущен")
+    dict(head.named_parameters())[victim].grad = saved[victim]
 
     # --- ЧАСТИЧНАЯ ЗАГРУЗКА: ТОЖДЕСТВО log pi ЕЁ НЕ ЛОВИТ ----------------
     # Ключевой сценарий рецензента: один ключ головы не загружен, буфер
@@ -375,7 +460,9 @@ def main():
         if sd not in by_seed_ckpt:
             raise SystemExit(f"{p}: калибровка для сида {sd}, а поданы головы "
                              f"сидов {sorted(by_seed_ckpt)}")
-        check_sigma_artifact(o, p, by_seed_ckpt[sd], horizon=8)
+        check_sigma_artifact(o, p, by_seed_ckpt[sd], horizon=8,
+                             k13d_sha=sha12(os.path.join(
+                                 here, "k13d_calibrate_sigma.py")))
         sig[sd] = dict(sigma=float(o["sigma_t"]), path=p, sha=sha12(p),
                        horizon=int(o["horizon"]))
         print(f"  калибровка {os.path.basename(p)}: sigma {o['sigma_t']:.5f}, "
@@ -465,6 +552,8 @@ def main():
             raise SystemExit(f"{tag}: загружено {n_loaded} из {len(want)}")
         g.freeze_log_std()
         s_got = float(g.std().max())
+        if not finite(s_got):
+            raise SystemExit(f"{tag}: sigma головы не число")
         if abs(s_got - sig[sd]["sigma"]) > 1e-6:
             raise SystemExit(f"{tag}: sigma головы {s_got:.6f}, "
                              f"калибровка дала {sig[sd]['sigma']:.6f}")
@@ -499,7 +588,7 @@ def main():
             dz_det, _c = det(h24, z0)
             dz_gau = head(h24, z0, deterministic=True)["dz"]
         d = float((dz_det - dz_gau).abs().max())
-        if d > 1e-5:
+        if not finite(d) or d > 1e-5:
             raise SystemExit(
                 f"{tag}: среднее гауссовой головы расходится с независимо "
                 f"собранной детерминированной на {d:.2e} при допуске 1e-5. "
@@ -564,6 +653,8 @@ def main():
             nrm = float(torch.linalg.norm(
                 head(h24, z0, u=buf["u"])["dz"].flatten(1), dim=-1).max())
         lim = head.bound()
+        if not finite(nrm) or not finite(lim):
+            raise SystemExit(f"{tag}: ‖dz‖ {nrm} или предел {lim} не число")
         if nrm > lim + 1e-4:
             raise SystemExit(f"{tag}: ||dz|| дошла до {nrm:.4f} при пределе "
                              f"{lim:.4f}: ограничение перестало держаться")
