@@ -720,8 +720,12 @@ def main():
     # сверены, но сам массив `action` теперь определяет z_e, а значит и всю
     # вторую таблицу. Переставленные или изменённые действия оставили бы
     # остальные заверенные массивы нетронутыми и молча сдвинули бы оракул.
+    # ПРОБА БЕРЁТСЯ ТОЛЬКО ИЗ train. Проверка происхождения не должна касаться
+    # финальной выборки: читать её нельзя вообще, даже ради сверки.
+    probe_pool = idx["train"]
     probe_rows = np.sort(np.random.default_rng(20260917).choice(
-        N, size=min(int(a.probe_rows), N), replace=False))
+        probe_pool, size=min(int(a.probe_rows), len(probe_pool)),
+        replace=False))
     with torch.no_grad():
         z_probe = codec._encode(
             torch.from_numpy(np.asarray(ACT[probe_rows], np.float32)).to(dev),
@@ -815,10 +819,19 @@ def main():
         r["recovery_012_ze_vs_action"] = recovery(
             r["vs_action.A0"]["rms"], r["vs_action.A012_ze"]["rms"],
             r["vs_action.Acodec"]["rms"])
-        r["frac_A01_better"] = float(
+        # ДОЛИ СЧИТАЮТСЯ В ОБЕИХ ТАБЛИЦАХ ОТДЕЛЬНО. Прежде существовала только
+        # первая, а в отчёте она называлась долей улучшения «против настоящего
+        # действия» — это были улучшения против ПОТОЛКА КОДЕКА и мишени от z_q.
+        r["frac_A01_better_vs_codec"] = float(
             (r["A01"]["per_row"] < r["A0"]["per_row"]).mean())
-        r["frac_A012_better"] = float(
+        r["frac_A012_better_vs_codec"] = float(
             (r["A012"]["per_row"] < r["A01"]["per_row"]).mean())
+        r["frac_A01_ze_better_vs_action"] = float(
+            (r["vs_action.A01_ze"]["per_row"]
+             < r["vs_action.A0"]["per_row"]).mean())
+        r["frac_A012_ze_better_vs_action"] = float(
+            (r["vs_action.A012_ze"]["per_row"]
+             < r["vs_action.A01_ze"]["per_row"]).mean())
         wrong = (q0 != k[:, 0, :]).any(-1).cpu().numpy()
         r["frac_rows_with_wrong_q0"] = float(wrong.mean())
         for tag, m in (("q0_wrong", wrong), ("q0_right", ~wrong)):
@@ -836,6 +849,17 @@ def main():
         r["dynamic_ze_vs_static_q2_disagree"] = float(
             (q2e != k[:, 2, :]).float().mean())
         r["ze_vs_zq_q1_disagree"] = float((q1e != q1s).float().mean())
+        # ОТПЕЧАТКИ МЕТОК, А НЕ ТОЛЬКО ИХ ДОЛИ РАСХОЖДЕНИЯ. Равенство скаляра
+        # «доля несовпадений со статической целью» НЕ доказывает, что метки
+        # одинаковы: одна позиция могла перейти из совпадения в расхождение, а
+        # другая обратно, сохранив среднее. Сравнивать надо сами массивы.
+        for nm_, arr_ in (("q1_ze", q1e), ("q2_ze", q2e),
+                          ("q1_zq", q1s), ("q2_zq", q2s)):
+            a_ = arr_.detach().cpu().numpy()
+            r[nm_ + "_shape"] = list(a_.shape)
+            r[nm_ + "_dtype"] = str(a_.dtype)
+            r[nm_ + "_sha1"] = hashlib.sha1(
+                np.ascontiguousarray(a_).tobytes()).hexdigest()[:12]
         r["n_rows"] = int(len(rows))
         for nm in list(r):
             if isinstance(r[nm], dict) and "per_row" in r[nm]:
@@ -862,9 +886,13 @@ def main():
               f"{100*r['ze_vs_zq_q1_disagree']:.1f}% позиций")
         print(f"    восстановление: q0->q01 {r['recovery_01']}, "
               f"q0->q012 {r['recovery_012']}")
-        print(f"    доля улучшившихся: A01 лучше A0 у "
-              f"{100 * r['frac_A01_better']:.1f}%, A012 лучше A01 у "
-              f"{100 * r['frac_A012_better']:.1f}%")
+        print(f"    доля улучшившихся против ПОТОЛКА КОДЕКА (мишени z_q): "
+              f"A01 лучше A0 у {100 * r['frac_A01_better_vs_codec']:.1f}%, "
+              f"A012 лучше A01 у {100 * r['frac_A012_better_vs_codec']:.1f}%")
+        print(f"    доля улучшившихся против ДЕЙСТВИЯ (мишени z_e): "
+              f"A01 лучше A0 у "
+              f"{100 * r['frac_A01_ze_better_vs_action']:.1f}%, A012 лучше "
+              f"A01 у {100 * r['frac_A012_ze_better_vs_action']:.1f}%")
         print(f"    динамическая цель q1 отличается от истинной: от z_e у "
               f"{100 * r['dynamic_ze_vs_static_q1_disagree']:.1f}%, от z_q у "
               f"{100 * r['dynamic_zq_vs_static_q1_disagree']:.1f}% позиций")

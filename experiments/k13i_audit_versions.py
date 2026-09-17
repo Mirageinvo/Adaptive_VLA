@@ -58,8 +58,20 @@ def collect(root, head, load_pt):
     return rows
 
 
-def summarize(rows, expect):
-    """Сводка по видам артефактов и общий вердикт."""
+# СКОЛЬКО АРТЕФАКТОВ ОБЯЗАНО БЫТЬ. Состав прогона: 6 обновлений, по 18
+# обучающих ячеек на каждое, и 6 оценочных каталогов по 9 ячеек.
+EXPECT_COUNTS = {"step": 6, "cell": 54, "buffer": 108}
+
+
+def summarize(rows, expect, counts=None):
+    """Сводка по видам артефактов и общий вердикт.
+
+    ЧИСЛА ПРОВЕРЯЮТСЯ, А НЕ ТОЛЬКО ВЕРСИИ. Прежде пустой набор давал
+    `all_ok = True`: множеств версий не было, расхождений тоже, и отсутствие
+    артефактов выглядело как их согласованность. Отчёт о том, чего нет, не
+    может быть положительным.
+    """
+    counts = EXPECT_COUNTS if counts is None else counts
     kinds = {}
     for _p, kind, _h, _k, sha in rows:
         d = kinds.setdefault(kind, dict(n=0, missing=0, shas=set()))
@@ -69,6 +81,15 @@ def summarize(rows, expect):
         else:
             d["shas"].add(str(sha))
     bad = []
+    for kind, want_n in sorted(counts.items()):
+        if kind not in kinds:
+            bad.append(f"{kind}: артефактов нет вовсе, ожидалось {want_n}")
+        elif kinds[kind]["n"] != want_n:
+            bad.append(f"{kind}: {kinds[kind]['n']} артефактов, ожидалось "
+                       f"{want_n}")
+    extra_kinds = sorted(set(kinds) - set(counts))
+    if extra_kinds:
+        bad.append(f"неожиданные виды артефактов: {extra_kinds}")
     for kind, d in kinds.items():
         if d["missing"]:
             bad.append(f"{kind}: {d['missing']} записей без script_sha1")
@@ -95,22 +116,42 @@ def selftest():
     fake = [("a.json", "step", "s0", "1", "AAA"),
             ("d/b.json", "cell", "s0", "", "BBB"),
             ("d/c.pt", "buffer", "s0", "", "BBB")]
-    out, bad = summarize(fake, dict(k12e="AAA", k12d="BBB"))
+    C = {"step": 1, "cell": 1, "buffer": 1}
+    out, bad = summarize(fake, dict(k12e="AAA", k12d="BBB"), C)
     assert not bad, bad
     assert out["cell"]["n"] == 1 and out["buffer"]["shas"] == ["BBB"]
 
+    # --- ПУСТОЙ НАБОР НЕ МОЖЕТ БЫТЬ ПОЛОЖИТЕЛЬНЫМ -------------------------
+    _o, bad = summarize([], dict(k12e="AAA", k12d="BBB"), C)
+    assert bad and all("нет вовсе" in x for x in bad), bad
+    _o, bad = summarize([], dict(k12e="AAA", k12d="BBB"))
+    assert bad, "пустой набор при умолчательных числах прошёл"
+    # --- НЕВЕРНОЕ ЧИСЛО ---------------------------------------------------
+    _o, bad = summarize(fake + [("d/d.pt", "buffer", "s0", "", "BBB")],
+                        dict(k12e="AAA", k12d="BBB"), C)
+    assert any("2 артефактов, ожидалось 1" in x for x in bad), bad
+    # --- ОТСУТСТВУЮЩИЙ ВИД ------------------------------------------------
+    _o, bad = summarize(fake[:2], dict(k12e="AAA", k12d="BBB"), C)
+    assert any("buffer" in x and "нет вовсе" in x for x in bad), bad
+    # --- НЕОЖИДАННЫЙ ВИД --------------------------------------------------
+    _o, bad = summarize(fake + [("x", "странное", "s0", "", "BBB")],
+                        dict(k12e="AAA", k12d="BBB"), C)
+    assert any("неожиданные виды" in x for x in bad), bad
+
     # смешение версий
     mix = fake + [("d/e.json", "cell", "s0", "", "CCC")]
-    _o, bad = summarize(mix, dict(k12e="AAA", k12d="BBB"))
+    _o, bad = summarize(mix, dict(k12e="AAA", k12d="BBB"),
+                        dict(C, cell=2))
     assert any("несколько версий" in x for x in bad), bad
 
     # отсутствующая версия — отказ, а не пустое множество
     miss = fake + [("d/f.pt", "buffer", "s0", "", None)]
-    _o, bad = summarize(miss, dict(k12e="AAA", k12d="BBB"))
+    _o, bad = summarize(miss, dict(k12e="AAA", k12d="BBB"),
+                        dict(C, buffer=2))
     assert any("без script_sha1" in x for x in bad), bad
 
     # расхождение с записью запуска
-    _o, bad = summarize(fake, dict(k12e="AAA", k12d="ZZZ"))
+    _o, bad = summarize(fake, dict(k12e="AAA", k12d="ZZZ"), C)
     assert any("в записи запуска" in x for x in bad), bad
 
     # отпечаток списка меняется от подмены и не зависит от порядка
@@ -126,6 +167,10 @@ def main():
     ap.add_argument("--root", action="append", default=[],
                     help="каталог прогона; можно несколько")
     ap.add_argument("--out", default="reports/k13i/version_audit.json")
+    ap.add_argument("--expect-steps", type=int, default=6)
+    ap.add_argument("--train-cells", type=int, default=18)
+    ap.add_argument("--eval-dirs", type=int, default=6)
+    ap.add_argument("--eval-cells", type=int, default=9)
     a = ap.parse_args()
     if a.selftest:
         selftest()
@@ -142,6 +187,10 @@ def main():
         except Exception:                                  # noqa: BLE001
             return None
 
+    counts = {"step": int(a.expect_steps),
+              "cell": int(a.eval_dirs) * int(a.eval_cells),
+              "buffer": int(a.expect_steps) * int(a.train_cells)}
+    print(f"  ожидается на голову: {counts}")
     per_root, all_rows, all_bad = {}, [], []
     for root in a.root:
         head = os.path.basename(root.rstrip("/"))
@@ -155,9 +204,10 @@ def main():
             all_bad.append(f"{head}: в script_versions.jsonl несколько "
                            f"разных версий запуска")
         rows = collect(root, head, load_pt)
-        kinds, bad = summarize(rows, expect)
+        kinds, bad = summarize(rows, expect, counts)
         per_root[head] = dict(
-            root=root, expect=expect, kinds=kinds, n_rows=len(rows),
+            root=root, expect=expect, expect_counts=counts,
+            kinds=kinds, n_rows=len(rows),
             rows_sha1=rows_sha(rows),
             script_versions_sha1=sha12(vp), failures=bad)
         all_rows += rows
