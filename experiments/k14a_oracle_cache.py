@@ -748,7 +748,7 @@ def main():
           f"кодов {100 * dis:.4f}% при допуске "
           f"{100 * float(a.probe_tol):.3f}%")
 
-    res, extra = {}, {}
+    res, extra, labels = {}, {}, {}
     for name, rows in parts.items():
         k = torch.from_numpy(np.asarray(ktrue[rows]).astype(np.int64)).to(dev)
         q0 = torch.from_numpy(np.asarray(q0hat[rows]).astype(np.int64)).to(dev)
@@ -855,11 +855,19 @@ def main():
         # другая обратно, сохранив среднее. Сравнивать надо сами массивы.
         for nm_, arr_ in (("q1_ze", q1e), ("q2_ze", q2e),
                           ("q1_zq", q1s), ("q2_zq", q2s)):
-            a_ = arr_.detach().cpu().numpy()
+            a_ = arr_.detach().cpu().numpy().astype(np.int32)
             r[nm_ + "_shape"] = list(a_.shape)
             r[nm_ + "_dtype"] = str(a_.dtype)
             r[nm_ + "_sha1"] = hashlib.sha1(
                 np.ascontiguousarray(a_).tobytes()).hexdigest()[:12]
+            # САМИ МЕТКИ СОХРАНЯЮТСЯ. Отпечаток говорит только «одинаково или
+            # нет»; при расхождении нужен его РАЗМЕР, а по хешу его не
+            # восстановить. Метки — это будущие мишени тренера, и знать, на
+            # скольких позициях они зависят от устройства, обязательно.
+            labels[f"{name}.{nm_}"] = a_
+        # ЗАПАС ПО РАССТОЯНИЮ до второго ближайшего кода: он объясняет, почему
+        # уровень 2 чувствительнее уровня 1 — там остаток уже дважды уменьшен.
+        labels[f"{name}.rows"] = np.asarray(rows, np.int64)
         r["n_rows"] = int(len(rows))
         for nm in list(r):
             if isinstance(r[nm], dict) and "per_row" in r[nm]:
@@ -935,6 +943,7 @@ def main():
                torch_version=str(torch.__version__),
                cuda_version=str(getattr(torch.version, "cuda", None)),
                probe_rows=int(a.probe_rows), probe_tol=float(a.probe_tol),
+               labels_path=out_labels,
                decoder_probe_matches_cache=bool(probe_same),
                decoder_probe_now=probe_now,
                allow_probe_device_drift=bool(a.allow_probe_device_drift),
@@ -947,6 +956,12 @@ def main():
                    os.path.join(here, "depth_rvq_joint12.py")]),
                script_sha1=sha12(os.path.abspath(__file__)))
     os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
+    lab_p = a.out + ".labels.npz"
+    tmp_l = lab_p + f".tmp.{os.getpid()}"
+    np.savez_compressed(tmp_l, **labels)
+    os.replace(tmp_l, lab_p)
+    out_labels = lab_p
+    print(f"  метки сохранены: {lab_p} ({len(labels)} массивов)")
     tmp = f"{a.out}.tmp.{os.getpid()}"
     json.dump(out, open(tmp, "w"), ensure_ascii=False, indent=1, default=str)
     os.replace(tmp, a.out)

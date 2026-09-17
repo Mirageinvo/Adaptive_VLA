@@ -95,6 +95,7 @@ for part in ("val_confirm", "val_sel"):
 # МЕТКИ СРАВНИВАЮТСЯ ПО ОТПЕЧАТКУ, А НЕ ПО ДОЛЕ РАСХОЖДЕНИЯ. Одинаковая доля
 # несовпадений со статической целью не доказывает, что метки те же: одна
 # позиция могла перейти из совпадения в расхождение, а другая обратно.
+flips = []
 for part in ("train", "val_sel", "val_confirm"):
     for nm in ("q1_ze", "q2_ze", "q1_zq", "q2_zq"):
         ka, kb = a["parts"][part], b["parts"][part]
@@ -106,6 +107,23 @@ for part in ("train", "val_sel", "val_confirm"):
               + ("" if same else "   <-- МЕТКИ РАЗЛИЧАЮТСЯ"))
         if not same:
             bad.append(f"{part}.{nm}")
+            flips.append((part, nm))
+# РАЗМЕР РАСХОЖДЕНИЯ, А НЕ ТОЛЬКО ЕГО НАЛИЧИЕ. Отпечаток говорит «различно»,
+# и без числа непонятно, три это позиции из трёхсот тысяч или треть из них.
+if flips:
+    import numpy as _np
+    la = _np.load(a["labels_path"]); lb = _np.load(b["labels_path"])
+    print("\n  РАЗМЕР РАСХОЖДЕНИЯ МЕТОК:")
+    for part, nm in flips:
+        k = f"{part}.{nm}"
+        if k not in la or k not in lb:
+            print(f"    {k}: массив не сохранён, размер неизвестен")
+            continue
+        xa, xb = la[k], lb[k]
+        d = int((xa != xb).sum())
+        print(f"    {k}: {d} из {xa.size} позиций "
+              f"({100.0 * d / xa.size:.4f}%), строк затронуто "
+              f"{int((xa != xb).any(-1).sum())} из {xa.shape[0]}")
 print("\n  РЕШЕНИЯ И МЕТКИ СОВПАЛИ" if not bad else
       f"\n  РАСХОЖДЕНИЕ ПО {bad}: оракул и тренер нельзя считать в "
       f"разных режимах, это надо внести в план ДО тренера")
