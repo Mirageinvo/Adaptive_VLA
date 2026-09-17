@@ -42,6 +42,7 @@ k13c_cell). Улучшение, живущее в позициях 8..15, до �
 метрики считаются и по восьми, и по шестнадцати, а gate смотрит на восемь.
 """
 import argparse
+import glob
 import hashlib
 import json
 import os
@@ -257,6 +258,36 @@ def gate(res, log=print):
     return (not bad_cap), (not bad_act), bool(dynamic_ok), bad_cap, bad_act, note
 
 
+def save_labels(path, arrays):
+    """Атомарно сохранить метки и вернуть (путь, sha).
+
+    ДВЕ ОШИБКИ, РАДИ КОТОРЫХ ЭТО ВЫНЕСЕНО ФУНКЦИЕЙ.
+
+    Первая: `np.savez_compressed` ДОПИСЫВАЕТ `.npz`, если имя на него не
+    кончается. Временный файл `x.npz.tmp.123` превращался в
+    `x.npz.tmp.123.npz`, и `os.replace` не находил источник. Ровно это уже
+    случалось в K-13a с `np.save` и `.npy` — повторено во второй раз, теперь
+    закрыто проверкой.
+
+    Вторая: путь подставлялся в запись результата ДО присваивания, то есть
+    падал `UnboundLocalError` после всего долгого счёта. Функция возвращает
+    значение, и подставить несуществующее имя больше нельзя.
+    """
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "wb") as fh:
+        np.savez_compressed(fh, **arrays)
+    os.replace(tmp, path)
+    with np.load(path) as z:
+        miss = sorted(set(arrays) - set(z.files))
+        if miss:
+            raise SystemExit(f"{path}: не сохранились массивы {miss[:5]}")
+        for k in arrays:
+            if not np.array_equal(z[k], arrays[k]):
+                raise SystemExit(f"{path}: массив {k} прочитался иначе, чем "
+                                 f"записан")
+    return os.path.abspath(path), sha12(path)
+
+
 def build_parts(idx, epi, sel_frac, seed, n_rows, rng, split_episodes):
     """train / val_sel / val_confirm из разбиения кэша. ЧИСТАЯ ФУНКЦИЯ.
 
@@ -423,6 +454,22 @@ def selftest():
                                          log=lambda *_: None)
     assert cap and act and dyn, note
 
+    # --- СОХРАНЕНИЕ МЕТОК: ФАЙЛ ОБЯЗАН ПОЯВИТЬСЯ И ПРОЧИТАТЬСЯ ------------
+    import tempfile as _tf2
+    with _tf2.TemporaryDirectory() as _td2:
+        _lp = os.path.join(_td2, "x.json.labels.npz")
+        _arr = {"train.q1_ze": np.arange(12, dtype=np.int32).reshape(3, 4),
+                "train.rows": np.arange(3, dtype=np.int64)}
+        _p, _sha = save_labels(_lp, _arr)
+        assert os.path.exists(_lp), "файл меток не создан"
+        assert not glob.glob(_lp + ".tmp*"), "временный файл остался"
+        assert not glob.glob(_lp + "*.npz.npz"), \
+            "npz дописан к временному имени — ровно та ошибка, что в K-13a"
+        with np.load(_lp) as _z:
+            assert sorted(_z.files) == sorted(_arr)
+            assert np.array_equal(_z["train.q1_ze"], _arr["train.q1_ze"])
+        assert _sha == sha12(_lp) and os.path.isabs(_p)
+
     # --- ПОСТРОЕНИЕ ЧАСТЕЙ НА НАСТОЯЩИХ КЛЮЧАХ РАЗБИЕНИЯ ------------------
     # Регрессия на реальное падение: тут стояло idx["dev"], а load_split даёт
     # train/val/test. Самопроверка это место не исполняла и была зелёной.
@@ -484,6 +531,9 @@ def main():
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="data/k14a/oracle_cache.json")
+    ap.add_argument("--run-id", default="",
+                    help="номер запуска; сверяется бегунком, чтобы сравнение "
+                         "не взяло артефакт от предыдущего прогона")
     a = ap.parse_args()
     if a.selftest:
         selftest()
@@ -942,8 +992,8 @@ def main():
                device=str(dev), dtype="float32",
                torch_version=str(torch.__version__),
                cuda_version=str(getattr(torch.version, "cuda", None)),
+               run_id=str(a.run_id),
                probe_rows=int(a.probe_rows), probe_tol=float(a.probe_tol),
-               labels_path=out_labels,
                decoder_probe_matches_cache=bool(probe_same),
                decoder_probe_now=probe_now,
                allow_probe_device_drift=bool(a.allow_probe_device_drift),
@@ -956,12 +1006,11 @@ def main():
                    os.path.join(here, "depth_rvq_joint12.py")]),
                script_sha1=sha12(os.path.abspath(__file__)))
     os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
-    lab_p = a.out + ".labels.npz"
-    tmp_l = lab_p + f".tmp.{os.getpid()}"
-    np.savez_compressed(tmp_l, **labels)
-    os.replace(tmp_l, lab_p)
-    out_labels = lab_p
-    print(f"  метки сохранены: {lab_p} ({len(labels)} массивов)")
+    lab_p, lab_sha = save_labels(a.out + ".labels.npz", labels)
+    out["labels_path"] = lab_p
+    out["labels_sha1"] = lab_sha
+    print(f"  метки сохранены: {lab_p} ({len(labels)} массивов), sha "
+          f"{lab_sha}")
     tmp = f"{a.out}.tmp.{os.getpid()}"
     json.dump(out, open(tmp, "w"), ensure_ascii=False, indent=1, default=str)
     os.replace(tmp, a.out)

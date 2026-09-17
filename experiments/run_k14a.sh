@@ -46,7 +46,7 @@ for DEV in cuda:0 cpu; do
     [ "$DEV" = "cpu" ] && EXTRA=(--allow-probe-device-drift)
     "${ENVP[@]}" "$PY" experiments/k14a_oracle_cache.py \
         --device "$DEV" --n-rows "$N_ROWS" --out "$OUT" \
-        ${EXTRA[@]+"${EXTRA[@]}"} > "$LOG" 2>&1
+        --run-id "$RUN_ID" ${EXTRA[@]+"${EXTRA[@]}"} > "$LOG" 2>&1
     RC[$DEV]=$?
     echo "[$(ts)] $DEV: код возврата ${RC[$DEV]}"
     # 0 — обучать головы, 4 — гейт не пройден. Остальное это сбой.
@@ -67,13 +67,28 @@ if [ "$FAILED" -ne 0 ]; then
 fi
 
 echo "[$(ts)] сравнение режимов"
-"$PY" - <<'PY'
+RUN_ID="$RUN_ID" "$PY" - <<'PY'
 import json, os, sys
 pa, pb = 'data/k14a/oracle_cache_cuda0.json', 'data/k14a/oracle_cache_cpu.json'
 if not (os.path.exists(pa) and os.path.exists(pb)):
-    print("  один из артефактов отсутствует — сравнивать нечего")
-    sys.exit(0)
+    # ОТСУТСТВИЕ АРТЕФАКТА — ОТКАЗ, А НЕ «сравнивать нечего». Нулевой выход
+    # здесь означал бы, что бегунок отчитался об успехе, ничего не сравнив.
+    print("  ОТКАЗ: один из артефактов отсутствует")
+    sys.exit(8)
 a, b = json.load(open(pa)), json.load(open(pb))
+# АРТЕФАКТЫ ОБЯЗАНЫ БЫТЬ ОТ ЭТОГО ЗАПУСКА. Иначе сравнение возьмёт файл от
+# предыдущего прогона, оставшийся после сбоя, и объявит режимы совпавшими.
+run_id = os.environ.get("RUN_ID", "")
+wrong = [p for p, o in ((pa, a), (pb, b)) if str(o.get("run_id")) != run_id]
+if wrong:
+    print(f"  ОТКАЗ: артефакты {wrong} не от запуска {run_id} "
+          f"(в них {[json.load(open(p)).get('run_id') for p in wrong]})")
+    sys.exit(9)
+for p, o in ((pa, a), (pb, b)):
+    lp = o.get("labels_path")
+    if not lp or not os.path.exists(lp):
+        print(f"  ОТКАЗ: в {p} нет сохранённых меток ({lp})")
+        sys.exit(10)
 bad = []
 for k in ("latent_capacity_ok", "action_oracle_ok",
           "dynamic_q1_relabeling_supported", "train_heads"):
