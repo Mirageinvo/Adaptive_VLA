@@ -95,6 +95,12 @@ def err_blocks(a, b, max_act_q, horizon):
                by_step=[float(x) for x in np.sqrt((d ** 2).mean((0, 2)))])
     # ПОСТРОЧНАЯ ошибка нужна для доли улучшившихся примеров: среднее по всем
     # строкам может падать за счёт немногих, при том что большинство хуже.
+    # MISMATCH СХВАТА — ОТДЕЛЬНАЯ ВЕЛИЧИНА, А НЕ RMS. Схват это команда +-1;
+    # средняя квадратичная ошибка по нему говорит не то, что доля позиций, где
+    # знак команды разошёлся, а исполняется именно знак.
+    aa = np.asarray(a, np.float64)[:, :horizon, 6]
+    bb = np.asarray(b, np.float64)[:, :horizon, 6]
+    out["grip_mismatch"] = float((np.sign(aa) != np.sign(bb)).mean())
     out["per_row"] = np.sqrt((d ** 2).mean((1, 2)))
     for k_, v_ in out.items():
         if not finite(v_):
@@ -117,73 +123,155 @@ def recovery(e0, e1, e_lim, eps=1e-12):
     return (float(e0) - float(e1)) / gap
 
 
+def _blk_ok(part, names, blocks=("rms", "rms_trans", "rms_rot", "rms_grip")):
+    return all(finite(part[n][b]) for n in names for b in blocks
+               if n in part)
+
+
 def gate(res, log=print):
-    """ДВА НЕЗАВИСИМЫХ РЕШЕНИЯ, а не одно. Пороги из плана K-14, Gate 2.
+    """ТРИ НЕЗАВИСИМЫХ РЕШЕНИЯ. Пороги из плана K-14, Gate 2.
 
-    `codec_refinement_possible` — умеют ли оставшиеся книги исправить
-    ошибочный q0. Это условие продолжать K-14 вообще.
+    `latent_capacity_ok` — умеют ли книги восстановить ПОТОЛОК КОДЕКА после
+    подмены q0. Мишени от z_q, опора decode(z_q). Узкий вопрос о ёмкости.
 
-    `dynamic_relabeling_supported` — даёт ли условная переразметка что-то
-    сверх статической цели K-8. Если нет, продолжать можно, но приписывать
-    эффект conditional relabeling уже нельзя: механизм не подтверждён.
-    Сводить два вопроса в один флаг значило бы получить «гейт пройден» там,
-    где подтверждена только половина утверждения.
+    `action_oracle_ok` — становится ли лучше НАСТОЯЩЕЕ действие. Мишени от
+    непрерывного z_e, опора — действие из кэша K-9a. Именно это решает, имеет
+    ли смысл писать тренер: первый вопрос может пройти при ухудшении
+    настоящих действий, потому что там ошибка кодека тождественно нулевая и из
+    анализа исчезает.
 
-    NaN ПРОВЕРЯЕТСЯ ДО СРАВНЕНИЙ. Иначе каждое «больше порога» вернёт False,
-    и полностью разрушенный счёт объявит гейт пройденным.
+    `dynamic_q1_relabeling_supported` — даёт ли условная переразметка q1
+    что-то сверх статической цели K-8. Названо с q1 в имени: статическое
+    сравнение для q2 считается отдельно и в это решение не входит.
+
+    Обучение разумно только при первых двух вместе.
+
+    NaN ПРОВЕРЯЕТСЯ ДО СРАВНЕНИЙ: иначе каждое «больше порога» вернёт False, и
+    полностью разрушенный счёт объявит гейт пройденным.
     """
     c, sel = res["val_confirm"], res["val_sel"]
-    bad, note = [], []
-    need = []
-    for part in (c, sel):
-        for nm in ("A0", "A01", "A012", "A01_static", "Acodec"):
-            for blk in ("rms", "rms_trans", "rms_rot", "rms_grip"):
-                need.append(part[nm][blk])
-        need += [part["A0_full16"]["rms"], part["A01_full16"]["rms"]]
-    if not all(finite(x) for x in need):
-        bad.append("среди метрик есть nan или inf: сравнивать нечего")
-        return False, False, bad, note
+    bad_cap, bad_act, note = [], [], []
+    names = ("A0", "A01", "A012", "A01_static", "Acodec")
+    if not (_blk_ok(c, names) and _blk_ok(sel, names)):
+        bad_cap.append("среди метрик есть nan или inf: сравнивать нечего")
+        return False, False, False, bad_cap, bad_act, note
+
+    # --- РЕШЕНИЕ 1: ёмкость книг (z_q -> потолок кодека) ------------------
     if not finite(c["recovery_012"]):
-        bad.append(f"совокупное восстановление {c['recovery_012']}: не число "
-                   f"или разрыва нет")
+        bad_cap.append(f"совокупное восстановление {c['recovery_012']}: не "
+                       f"число или разрыва нет")
     if not c["A01"]["rms"] < c["A0"]["rms"]:
-        bad.append(f"A01* не улучшает RMS-8: {c['A01']['rms']:.5f} против "
-                   f"{c['A0']['rms']:.5f}")
+        bad_cap.append(f"A01* не улучшает RMS-8: {c['A01']['rms']:.5f} против "
+                       f"{c['A0']['rms']:.5f}")
     if not sel["A01"]["rms"] < sel["A0"]["rms"]:
-        bad.append("A01* не улучшает RMS-8 на отборочной половине")
+        bad_cap.append("A01* не улучшает RMS-8 на отборочной половине")
     for blk in ("rms_trans", "rms_rot", "rms_grip"):
         if c["A012"][blk] > c["A01"][blk] * 1.005:
-            bad.append(f"A012* хуже A01* по {blk} более чем на 0.5%: "
-                       f"{c['A012'][blk]:.5f} против {c['A01'][blk]:.5f}")
+            bad_cap.append(f"A012* хуже A01* по {blk} более чем на 0.5%: "
+                           f"{c['A012'][blk]:.5f} против {c['A01'][blk]:.5f}")
     r = c["recovery_012"]
     if finite(r) and r < 0.25:
-        bad.append(f"совокупное восстановление {r:.3f}: меньше 25% разрыва")
+        bad_cap.append(f"совокупное восстановление {r:.3f}: меньше 25% "
+                       f"разрыва")
     g8 = c["A0"]["rms"] - c["A01"]["rms"]
     g16 = c["A0_full16"]["rms"] - c["A01_full16"]["rms"]
     if g8 <= 0 < g16:
-        bad.append("улучшение есть только на всех 16 позициях, а на "
-                   "исполняемых восьми его нет")
-    for b in bad:
-        log(f"    ОТКАЗ: {b}")
+        bad_cap.append("улучшение есть только на всех 16 позициях, а на "
+                       "исполняемых восьми его нет")
 
-    # --- второе решение: динамическая цель против статической -------------
-    dyn = c["A01"]["rms"]
-    sta = c["A01_static"]["rms"]
+    # --- РЕШЕНИЕ 2: настоящее действие, мишени от z_e ---------------------
+    av = lambda part, nm: part.get("vs_action." + nm)
+    need2 = [av(c, n) for n in ("A0", "A01_ze", "A012_ze", "Acodec")]
+    if any(x is None for x in need2) or not all(
+            finite(x["rms"]) for x in need2):
+        bad_act.append("таблица против настоящего действия не посчитана или "
+                       "нечисловая")
+    else:
+        if not av(c, "A01_ze")["rms"] < av(c, "A0")["rms"]:
+            bad_act.append(
+                f"мишени от z_e не улучшают настоящее действие: "
+                f"{av(c, 'A01_ze')['rms']:.5f} против "
+                f"{av(c, 'A0')['rms']:.5f}")
+        if not av(sel, "A01_ze")["rms"] < av(sel, "A0")["rms"]:
+            bad_act.append("на отборочной половине улучшения настоящего "
+                           "действия нет")
+        ra = c.get("recovery_012_ze_vs_action")
+        if not finite(ra):
+            bad_act.append(f"восстановление против действия {ra}: не число "
+                           f"или разрыва нет")
+        elif ra < 0.25:
+            bad_act.append(f"восстановление против действия {ra:.3f}: меньше "
+                           f"25% разрыва до предела кодека")
+        if av(c, "A012_ze")["grip_mismatch"] > \
+                av(c, "A0")["grip_mismatch"] + 0.005:
+            bad_act.append(
+                f"расхождение схвата выросло: "
+                f"{av(c, 'A012_ze')['grip_mismatch']:.4f} против "
+                f"{av(c, 'A0')['grip_mismatch']:.4f}")
+
+    for b in bad_cap:
+        log(f"    ЁМКОСТЬ, ОТКАЗ: {b}")
+    for b in bad_act:
+        log(f"    ДЕЙСТВИЕ, ОТКАЗ: {b}")
+
+    # --- РЕШЕНИЕ 3: динамическая цель q1 против статической ---------------
+    dyn, sta = c["A01"]["rms"], c["A01_static"]["rms"]
     if not (finite(dyn) and finite(sta)):
         note.append("статическая цель не посчитана")
         dynamic_ok = False
     elif sta <= dyn * 1.005:
         note.append(f"статическая цель K-8 даёт то же ({sta:.5f} против "
-                    f"{dyn:.5f}): условная переразметка не подтверждена как "
+                    f"{dyn:.5f}): условная переразметка q1 не подтверждена как "
                     f"механизм, приписывать ей эффект нельзя")
         dynamic_ok = False
     else:
-        note.append(f"условная цель лучше статической: {dyn:.5f} против "
+        note.append(f"условная цель q1 лучше статической: {dyn:.5f} против "
                     f"{sta:.5f} ({100 * (sta - dyn) / sta:.1f}%)")
         dynamic_ok = True
     for x in note:
         log(f"    {x}")
-    return (not bad), bool(dynamic_ok), bad, note
+    return (not bad_cap), (not bad_act), bool(dynamic_ok), bad_cap, bad_act, note
+
+
+def build_parts(idx, epi, sel_frac, seed, n_rows, rng, split_episodes):
+    """train / val_sel / val_confirm из разбиения кэша. ЧИСТАЯ ФУНКЦИЯ.
+
+    ВЫНЕСЕНО ПОСЛЕ РЕАЛЬНОГО ПАДЕНИЯ. Здесь стояло `idx["dev"]`, а
+    `load_split` отдаёт `train/val/test`: KeyError на настоящем кэше при
+    зелёной самопроверке, потому что самопроверка это место не исполняла.
+    Теперь исполняет, с настоящими именами ключей.
+
+    ПОДВЫБОРКА ТОЛЬКО У train. K-13b считал на ЦЕЛЫХ val_sel и val_confirm;
+    случайная часть сделала бы слова «та же подтверждающая половина» неверными.
+    """
+    miss = [k for k in ("train", "val") if k not in idx]
+    if miss:
+        raise SystemExit(f"в разбиении нет частей {miss}: ожидались "
+                         f"train/val/test, получено {sorted(idx)}")
+    val_idx = idx["val"]
+    sel_eps, cnf_eps = split_episodes(np.asarray(epi[val_idx]), sel_frac,
+                                      seed=61)
+    e_val = np.asarray(epi[val_idx])
+    parts = {"train": np.asarray(idx["train"]),
+             "val_sel": val_idx[np.isin(e_val, list(sel_eps))],
+             "val_confirm": val_idx[np.isin(e_val, list(cnf_eps))]}
+    avail = {k: int(len(v)) for k, v in parts.items()}
+    if n_rows:
+        parts["train"] = np.sort(rng.choice(
+            parts["train"], size=min(int(n_rows), len(parts["train"])),
+            replace=False))
+    meta = {}
+    for k, v in parts.items():
+        if len(v) == 0:
+            raise SystemExit(f"часть {k} пуста")
+        meta[k] = dict(
+            n_available=avail[k], n_used=int(len(v)),
+            rows_sha1=hashlib.sha1(np.ascontiguousarray(
+                np.asarray(v, np.int64)).tobytes()).hexdigest()[:12],
+            episodes_sha1=hashlib.sha1(np.ascontiguousarray(
+                np.unique(epi[v]).astype(np.int64)).tobytes()).hexdigest()[:12],
+            n_episodes=int(len(np.unique(epi[v]))))
+    return parts, meta
 
 
 def selftest():
@@ -231,38 +319,97 @@ def selftest():
     assert recovery(1.0, 0.5, 2.0) is None
     assert recovery(1.0, 1.5, 0.0) < 0
 
-    def mk(a0, a01, a012, rec, a0f=None, a01f=None, static=None):
-        blk = lambda r: dict(rms=r, rms_trans=r, rms_rot=r, rms_grip=r)
-        part = lambda: dict(A0=blk(a0), A01=blk(a01), A012=blk(a012),
-                            A01_static=blk(a01 * 1.5 if static is None
-                                           else static),
-                            Acodec=blk(0.0), recovery_012=rec,
-                            A0_full16=blk(a0 if a0f is None else a0f),
-                            A01_full16=blk(a01 if a01f is None else a01f))
+    def mk(a0, a01, a012, rec, a0f=None, a01f=None, static=None,
+           act_a0=1.0, act_a01=0.5, act_a012=0.4, act_floor=0.0,
+           act_rec=0.6, grip0=0.05, grip012=0.05):
+        blk = lambda r, gm=0.0: dict(rms=r, rms_trans=r, rms_rot=r,
+                                     rms_grip=r, grip_mismatch=gm)
+
+        def part():
+            d = dict(A0=blk(a0), A01=blk(a01), A012=blk(a012),
+                     A01_static=blk(a01 * 1.5 if static is None else static),
+                     Acodec=blk(0.0), recovery_012=rec,
+                     A0_full16=blk(a0 if a0f is None else a0f),
+                     A01_full16=blk(a01 if a01f is None else a01f),
+                     recovery_012_ze_vs_action=act_rec)
+            d["vs_action.A0"] = blk(act_a0, grip0)
+            d["vs_action.A01_ze"] = blk(act_a01, grip0)
+            d["vs_action.A012_ze"] = blk(act_a012, grip012)
+            d["vs_action.Acodec"] = blk(act_floor, grip0)
+            return d
         return dict(val_sel=part(), val_confirm=part())
 
-    ok, dyn, _, _ = gate(mk(1.0, 0.5, 0.4, 0.6), log=lambda *_: None)
-    assert ok and dyn
+    cap, act, dyn, bc, ba, _ = gate(mk(1.0, 0.5, 0.4, 0.6),
+                                    log=lambda *_: None)
+    assert cap and act and dyn, (bc, ba)
     for args_, why in (((1.0, 1.2, 1.1, 0.6), "не улучшает"),
                        ((1.0, 0.5, 0.9, 0.6), "хуже A01"),
                        ((1.0, 0.5, 0.4, 0.1), "меньше 25%"),
                        ((1.0, 0.5, 0.4, None), "не число")):
-        ok, _dyn, bad, _ = gate(mk(*args_), log=lambda *_: None)
-        assert not ok and any(why in x for x in bad), (why, bad)
-    ok, _dyn, bad, _ = gate(mk(1.0, 1.0, 0.9, 0.6, a0f=1.0, a01f=0.5),
-                            log=lambda *_: None)
-    assert not ok and any("исполняемых восьми" in x for x in bad), bad
+        cap, act, _d, bc, ba, _ = gate(mk(*args_), log=lambda *_: None)
+        assert not cap and any(why in x for x in bc), (why, bc)
+    cap, act, _d, bc, _ba, _ = gate(mk(1.0, 1.0, 0.9, 0.6, a0f=1.0, a01f=0.5),
+                                    log=lambda *_: None)
+    assert not cap and any("исполняемых восьми" in x for x in bc), bc
 
-    # --- NaN В МЕТРИКАХ ГЕЙТА: раньше проходил как «пройден» --------------
+    # --- РЕШЕНИЕ 2 НЕЗАВИСИМО: ёмкость есть, настоящее действие хуже ------
+    # Главный случай из разбора: гейт по потолку кодека проходит, а действия
+    # портятся. Раньше такая комбинация давала «гейт пройден».
+    cap, act, _d, _bc, ba, _ = gate(mk(1.0, 0.5, 0.4, 0.6, act_a01=1.2),
+                                    log=lambda *_: None)
+    assert cap and not act and any("не улучшают настоящее" in x for x in ba), ba
+    cap, act, _d, _bc, ba, _ = gate(mk(1.0, 0.5, 0.4, 0.6, act_rec=0.1),
+                                    log=lambda *_: None)
+    assert cap and not act and any("меньше" in x for x in ba), ba
+    cap, act, _d, _bc, ba, _ = gate(mk(1.0, 0.5, 0.4, 0.6, grip012=0.20),
+                                    log=lambda *_: None)
+    assert cap and not act and any("схват" in x for x in ba), ba
+
     nan_res = mk(1.0, 0.5, float("nan"), float("nan"))
-    ok, dyn, bad, _ = gate(nan_res, log=lambda *_: None)
-    assert not ok and any("nan" in x for x in bad), bad
+    cap, act, _d, bc, _ba, _ = gate(nan_res, log=lambda *_: None)
+    assert not cap and any("nan" in x for x in bc), bc
 
-    # --- ВТОРОЕ РЕШЕНИЕ НЕЗАВИСИМО ОТ ПЕРВОГО ----------------------------
-    ok, dyn, _, note = gate(mk(1.0, 0.5, 0.4, 0.6, static=0.5),
-                            log=lambda *_: None)
-    assert ok and not dyn, note
+    cap, act, dyn, _bc, _ba, note = gate(mk(1.0, 0.5, 0.4, 0.6, static=0.5),
+                                         log=lambda *_: None)
+    assert cap and act and not dyn, note
     assert any("статическая цель" in x for x in note), note
+
+    # --- ПОСТРОЕНИЕ ЧАСТЕЙ НА НАСТОЯЩИХ КЛЮЧАХ РАЗБИЕНИЯ ------------------
+    # Регрессия на реальное падение: тут стояло idx["dev"], а load_split даёт
+    # train/val/test. Самопроверка это место не исполняла и была зелёной.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from k11c_train_d1 import split_episodes as _se
+    # эпизодов в val должно хватать на обе половины при min_each=8
+    n_ep, per_ep = 60, 6
+    epi_t = np.repeat(np.arange(n_ep), per_ep)
+    sp = np.array(["train"] * (20 * per_ep) + ["val"] * (30 * per_ep)
+                  + ["test"] * (10 * per_ep))
+    idx_t = {k: np.flatnonzero(sp == k) for k in ("train", "val", "test")}
+    rng_t = np.random.default_rng(0)
+    parts_t, meta_t = build_parts(idx_t, epi_t, 0.4, 61, 0, rng_t, _se)
+    assert set(parts_t) == {"train", "val_sel", "val_confirm"}
+    # ЦЕЛЫЕ ПОЛОВИНЫ: без подвыборки объединение val_sel и val_confirm равно val
+    assert (len(parts_t["val_sel"]) + len(parts_t["val_confirm"])
+            == len(idx_t["val"]))
+    e_sel = set(epi_t[parts_t["val_sel"]].tolist())
+    e_cnf = set(epi_t[parts_t["val_confirm"]].tolist())
+    assert not (e_sel & e_cnf), "эпизод попал в обе половины"
+    # ПОДВЫБОРКА ТОЛЬКО У train
+    parts_s, meta_s = build_parts(idx_t, epi_t, 0.4, 61, 30,
+                                  np.random.default_rng(0), _se)
+    assert len(parts_s["train"]) == 30
+    assert len(parts_s["val_confirm"]) == len(parts_t["val_confirm"])
+    assert meta_s["train"]["n_available"] == len(idx_t["train"])
+    assert meta_s["val_confirm"]["rows_sha1"] == \
+        meta_t["val_confirm"]["rows_sha1"]
+    # ОТСУТСТВИЕ ЧАСТИ — ОТКАЗ, А НЕ KeyError
+    try:
+        build_parts({"train": idx_t["train"]}, epi_t, 0.4, 61, 0, rng_t, _se)
+    except SystemExit as e_:
+        assert "val" in str(e_), e_
+    else:
+        raise AssertionError("отсутствующая часть разбиения пропущена")
+
     print("самопроверка k14a_oracle_cache пройдена")
 
 
@@ -412,32 +559,9 @@ def main():
     # должна оставаться той же самой во всех работах, иначе «подтверждение»
     # каждый раз считается на новых данных.
     rng = np.random.default_rng(a.seed)
-    dev_idx = idx["dev"]
-    sel_eps, cnf_eps = split_episodes(np.asarray(epi[dev_idx]), a.sel_frac,
-                                      seed=61)
-    e_dev = np.asarray(epi[dev_idx])
-    parts = {
-        "train": idx["train"],
-        "val_sel": dev_idx[np.isin(e_dev, list(sel_eps))],
-        "val_confirm": dev_idx[np.isin(e_dev, list(cnf_eps))],
-    }
-    # ПОДВЫБОРКА ТОЛЬКО У train. K-13b считал на ЦЕЛЫХ val_sel и val_confirm;
-    # если и здесь брать случайную часть, «та же подтверждающая половина»
-    # перестанет быть той же, и слова о совпадении разметки будут неверны.
-    avail = {k: int(len(v)) for k, v in parts.items()}
-    if a.n_rows:
-        parts["train"] = np.sort(rng.choice(
-            parts["train"], size=min(a.n_rows, len(parts["train"])),
-            replace=False))
-    sample_meta = {}
-    for k, v in parts.items():
-        sample_meta[k] = dict(
-            n_available=avail[k], n_used=int(len(v)),
-            rows_sha1=hashlib.sha1(np.ascontiguousarray(
-                np.asarray(v, np.int64)).tobytes()).hexdigest()[:12],
-            episodes_sha1=hashlib.sha1(np.ascontiguousarray(
-                np.unique(epi[v]).astype(np.int64)).tobytes()).hexdigest()[:12],
-            n_episodes=int(len(np.unique(epi[v]))))
+    parts, sample_meta = build_parts(idx, epi, a.sel_frac, 61, a.n_rows, rng,
+                                     split_episodes)
+    avail = {k: v["n_available"] for k, v in sample_meta.items()}
     print("  части: " + ", ".join(
         f"{k} {len(v)} из {avail[k]}" for k, v in parts.items())
         + ". Подвыборка только у train; финальная выборка не читается")
@@ -448,13 +572,39 @@ def main():
     # Поэтому вторая таблица считается против действия из кэша K-9a — того же,
     # на котором будут строиться мишени обучения.
     src_npz = np.load(src, allow_pickle=True)
-    if "action" not in src_npz:
-        raise SystemExit(f"в {src} нет массива action: вторую опору взять "
-                         f"неоткуда")
+    for nm in ("action", "episode", "step", "K_true", "split"):
+        if nm not in src_npz:
+            raise SystemExit(f"в {src} нет массива {nm}: замкнуть провенанс "
+                             f"исходного кэша нечем")
     ACT = src_npz["action"]
-    if ACT.shape[0] < N:
+    # ИСХОДНЫЙ КЭШ СВЕРЯЕТСЯ, А НЕ ПРОСТО ЗАПИСЫВАЕТСЯ. Раньше его sha попадал
+    # в артефакт и ни с чем не сравнивался — то есть был отчётом, а не
+    # проверкой: подменённый файл прошёл бы.
+    if ACT.shape[0] != N:
         raise SystemExit(f"в исходном кэше {ACT.shape[0]} действий при "
                          f"n_obs {N}")
+    keys_now = hashlib.sha1(np.ascontiguousarray(np.stack(
+        [np.asarray(src_npz["episode"]),
+         np.asarray(src_npz["step"])])).tobytes()).hexdigest()[:12]
+    if meta.get("keys_sha1") and keys_now != meta["keys_sha1"]:
+        raise SystemExit(f"(episode, step) исходного кэша дают {keys_now}, а "
+                         f"K-11a собран на {meta['keys_sha1']}: это другой "
+                         f"набор наблюдений")
+    kt_src = np.asarray(src_npz["K_true"])[:N].astype(np.int64)
+    if kt_src.shape != tuple(ktrue.shape):
+        raise SystemExit(f"K_true исходного кэша формы {kt_src.shape} против "
+                         f"{tuple(ktrue.shape)}")
+    if not np.array_equal(kt_src, np.asarray(ktrue).astype(np.int64)):
+        n_d = int((kt_src != np.asarray(ktrue)).sum())
+        raise SystemExit(f"K_true исходного кэша расходится с заверенным в "
+                         f"{n_d} позициях: истинные коды не те")
+    sp_src = np.asarray(src_npz["split"])[:N].astype(str)
+    sp_cache = np.load(f"{a.cache}.split.npy", allow_pickle=True).astype(str)
+    if not np.array_equal(sp_src, sp_cache):
+        raise SystemExit("split исходного кэша расходится с заверенным: "
+                         "части считались бы на других наблюдениях")
+    print(f"  исходный кэш K-9a замкнут: ключи {keys_now}, K_true и split "
+          f"совпали с заверенными, {N} действий")
 
     from depth_rvq_joint12 import code_contribution, nearest_code
 
@@ -466,25 +616,51 @@ def main():
                 out.append(x[..., :7].float().cpu().numpy())
         return np.concatenate(out)
 
+    def encode(x, batch=256):
+        """Непрерывный латент действий — тот самый z_e из плана."""
+        out = []
+        with torch.no_grad():
+            for i in range(0, len(x), batch):
+                out.append(codec._encode(x[i:i + batch].float(),
+                                         embodiment_ids=0).float())
+        return torch.cat(out)
+
     res, extra = {}, {}
     for name, rows in parts.items():
         k = torch.from_numpy(np.asarray(ktrue[rows]).astype(np.int64)).to(dev)
         q0 = torch.from_numpy(np.asarray(q0hat[rows]).astype(np.int64)).to(dev)
+        act = torch.from_numpy(np.asarray(ACT[rows], np.float32)).to(dev)
         with torch.no_grad():
             z_q = sum(code_contribution(qs[l], k[:, l, :]) for l in range(3))
+            # Z_E — ОСНОВНАЯ МИШЕНЬ ПЛАНА. z_q оставлен как отдельный вопрос о
+            # ёмкости книг; решение об обучении принимается по z_e, потому что
+            # именно от него будут строиться мишени тренера и именно он
+            # сравним с настоящим действием.
+            z_e = encode(act)
+            if tuple(z_e.shape) != tuple(z_q.shape):
+                raise SystemExit(f"z_e формы {tuple(z_e.shape)}, z_q "
+                                 f"{tuple(z_q.shape)}")
             e0 = code_contribution(qs[0], q0)
-            q1s = nearest_code(z_q - e0, qs[1])
-            e1 = code_contribution(qs[1], q1s)
-            q2s = nearest_code(z_q - e0 - e1, qs[2])
-            e2 = code_contribution(qs[2], q2s)
+            tgt = {}
+            for tag, zt in (("zq", z_q), ("ze", z_e)):
+                q1s = nearest_code(zt - e0, qs[1])
+                e1 = code_contribution(qs[1], q1s)
+                q2s = nearest_code(zt - e0 - e1, qs[2])
+                e2 = code_contribution(qs[2], q2s)
+                tgt[tag] = (q1s, e1, q2s, e2)
+        q1s, e1, q2s, e2 = tgt["zq"]
+        q1e, e1e, q2e, e2e = tgt["ze"]
         A = dict(A0=decode(e0), A01=decode(e0 + e1), A012=decode(e0 + e1 + e2),
-                 Acodec=decode(z_q))
+                 Acodec=decode(z_q),
+                 A01_ze=decode(e0 + e1e), A012_ze=decode(e0 + e1e + e2e))
         # СТАТИЧЕСКАЯ ЦЕЛЬ K-8 ДЛЯ СРАВНЕНИЯ: q1 берётся истинный, без учёта
         # того, что q0 предсказан с ошибкой. Если разницы нет, вся идея
         # условной переразметки не нужна, и это надо знать до обучения.
         with torch.no_grad():
             e1_static = code_contribution(qs[1], k[:, 1, :])
+            e2_static = code_contribution(qs[2], k[:, 2, :])
         A["A01_static"] = decode(e0 + e1_static)
+        A["A012_static"] = decode(e0 + e1_static + e2_static)
         check_finite("декодированные действия", *A.values())
         atrue = A["Acodec"]
         # НАСТОЯЩЕЕ ДЕЙСТВИЕ ИЗ КЭША K-9a — вторая опора. Первые семь каналов
@@ -514,6 +690,12 @@ def main():
             r["vs_action.A0"]["rms"], r["vs_action.A012"]["rms"],
             r["vs_action.Acodec"]["rms"])
         r["codec_floor_vs_action"] = r["vs_action.Acodec"]["rms"]
+        r["recovery_01_ze_vs_action"] = recovery(
+            r["vs_action.A0"]["rms"], r["vs_action.A01_ze"]["rms"],
+            r["vs_action.Acodec"]["rms"])
+        r["recovery_012_ze_vs_action"] = recovery(
+            r["vs_action.A0"]["rms"], r["vs_action.A012_ze"]["rms"],
+            r["vs_action.Acodec"]["rms"])
         r["frac_A01_better"] = float(
             (r["A01"]["per_row"] < r["A0"]["per_row"]).mean())
         r["frac_A012_better"] = float(
@@ -526,6 +708,9 @@ def main():
                 r[f"rms_A01_{tag}"] = float(r["A01"]["per_row"][m].mean())
         r["dynamic_vs_static_q1_disagree"] = float(
             (q1s != k[:, 1, :]).float().mean())
+        r["dynamic_vs_static_q2_disagree"] = float(
+            (q2s != k[:, 2, :]).float().mean())
+        r["ze_vs_zq_q1_disagree"] = float((q1e != q1s).float().mean())
         r["n_rows"] = int(len(rows))
         for nm in list(r):
             if isinstance(r[nm], dict) and "per_row" in r[nm]:
@@ -539,13 +724,17 @@ def main():
                   f"(перемещение {r[nm]['rms_trans']:.5f}, поворот "
                   f"{r[nm]['rms_rot']:.5f}, схват {r[nm]['rms_grip']:.5f})")
         print("    опора 2 — настоящее действие из кэша K-9a:")
-        for nm in ("A0", "A01", "A012", "A01_static", "Acodec"):
+        for nm in ("A0", "A01", "A012", "A01_ze", "A012_ze", "A01_static",
+                   "Acodec"):
             k_ = "vs_action." + nm
-            print(f"      {nm:11s} RMS-8 {r[k_]['rms']:.5f}")
-        print(f"      восстановление против действия: q0->q01 "
-              f"{r['recovery_01_vs_action']}, q0->q012 "
-              f"{r['recovery_012_vs_action']}; пол кодека "
+            print(f"      {nm:11s} RMS-8 {r[k_]['rms']:.5f}  "
+                  f"схват расходится {100*r[k_]['grip_mismatch']:.2f}%")
+        print(f"      восстановление против действия, мишени z_e: q0->q01 "
+              f"{r['recovery_01_ze_vs_action']}, q0->q012 "
+              f"{r['recovery_012_ze_vs_action']}; пол кодека "
               f"{r['codec_floor_vs_action']:.5f}")
+        print(f"      мишени z_e и z_q расходятся по q1 у "
+              f"{100*r['ze_vs_zq_q1_disagree']:.1f}% позиций")
         print(f"    восстановление: q0->q01 {r['recovery_01']}, "
               f"q0->q012 {r['recovery_012']}")
         print(f"    доля улучшившихся: A01 лучше A0 у "
@@ -555,19 +744,27 @@ def main():
               f"{100 * r['dynamic_vs_static_q1_disagree']:.1f}% позиций")
 
     print("\n  ГЕЙТ 2 (на подтверждающей половине, ЦЕЛИКОМ):")
-    ok, dyn_ok, bad, note = gate(res)
-    print(f"\n  РЕШЕНИЕ 1, codec_refinement_possible: "
-          f"{'ДА — книги умеют исправлять ошибочный q0' if ok else 'НЕТ'}")
-    print(f"  РЕШЕНИЕ 2, dynamic_relabeling_supported: "
-          f"{'ДА' if dyn_ok else 'НЕТ — статическая цель даёт то же'}")
-    if ok and not dyn_ok:
-        print("  Продолжать K-14 можно, но приписывать эффект условной "
-              "переразметке нельзя: механизм не подтверждён")
+    cap_ok, act_ok, dyn_ok, bad_cap, bad_act, note = gate(res)
+    print(f"\n  РЕШЕНИЕ 1, latent_capacity_ok:              "
+          f"{'ДА' if cap_ok else 'НЕТ'}  (книги против потолка кодека)")
+    print(f"  РЕШЕНИЕ 2, action_oracle_ok:                "
+          f"{'ДА' if act_ok else 'НЕТ'}  (мишени z_e против настоящего "
+          f"действия)")
+    print(f"  РЕШЕНИЕ 3, dynamic_q1_relabeling_supported: "
+          f"{'ДА' if dyn_ok else 'НЕТ'}")
+    go = bool(cap_ok and act_ok)
+    print(f"\n  ОБУЧАТЬ ГОЛОВЫ: {'ДА' if go else 'НЕТ'} — требуются оба "
+          f"первых решения")
+    if go and not dyn_ok:
+        print("  Но приписывать эффект условной переразметке нельзя: "
+              "механизм не подтверждён, статическая цель даёт то же")
 
     out = dict(parts=res, sampling=sample_meta,
-               codec_refinement_possible=bool(ok),
-               dynamic_relabeling_supported=bool(dyn_ok),
-               gate_failures=bad, gate_notes=note, sample_seed=int(a.seed),
+               latent_capacity_ok=bool(cap_ok), action_oracle_ok=bool(act_ok),
+               dynamic_q1_relabeling_supported=bool(dyn_ok),
+               train_heads=bool(go),
+               gate_failures_capacity=bad_cap, gate_failures_action=bad_act,
+               gate_notes=note, sample_seed=int(a.seed),
                source_cache=src, source_cache_sha1=sha12(src),
                stamp_k11b=dict(script_sha1=stamp.get("script_sha1"),
                                identity_ok=stamp.get("identity_ok"),
@@ -588,7 +785,7 @@ def main():
     json.dump(out, open(tmp, "w"), ensure_ascii=False, indent=1, default=str)
     os.replace(tmp, a.out)
     print(f"  сохранено: {a.out}")
-    return 0 if ok else 4
+    return 0 if go else 4
 
 
 if __name__ == "__main__":
