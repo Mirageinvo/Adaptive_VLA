@@ -21,10 +21,15 @@
     A012*  = decode(... + E2[q2*])
     Acodec = decode(z_q)                   предел, достижимый тремя уровнями
 
-ПОЧЕМУ z_q, А НЕ НЕПРЕРЫВНЫЙ z_e. План допускает оба. z_q чище для этого
-вопроса: непрерывный латент содержит и ту часть, которую RVQ не представляет
-НИ ПРИ КАКОМ префиксе, и она лишь размывала бы знаменатель `recovery`. Здесь
-знаменатель — ровно разрыв от A0 до предела трёх уровней.
+ДВЕ МИШЕНИ, И ОСНОВНАЯ — z_e. Условные цели считаются и от непрерывного
+z_e = codec._encode(action), и от трёхуровневой реконструкции z_q. Решение об
+обучении принимается по z_e и по ошибке относительно НАСТОЯЩЕГО действия:
+именно от z_e тренер будет строить мишени, и именно настоящее действие
+исполняет робот. z_q оставлен как отдельный, более узкий вопрос о ЁМКОСТИ
+книг: там знаменатель `recovery` — ровно разрыв от A0 до предела трёх уровней,
+без той части непрерывного латента, которую RVQ не представляет ни при каком
+префиксе. Пройденный вопрос о ёмкости при ухудшении настоящих действий
+обучение не разрешает.
 
 ЭТО ОРАКУЛ, А НЕ РЕЗУЛЬТАТ. q1* и q2* вычислены с доступом к истине. Мера
 говорит, ЕСТЬ ЛИ что исправлять, и не говорит, сможет ли голова это
@@ -181,9 +186,13 @@ def gate(res, log=print):
 
     # --- РЕШЕНИЕ 2: настоящее действие, мишени от z_e ---------------------
     av = lambda part, nm: part.get("vs_action." + nm)
-    need2 = [av(c, n) for n in ("A0", "A01_ze", "A012_ze", "Acodec")]
+    need2 = [av(c, n) for n in ("A0", "A01_ze", "A012_ze", "A01_static",
+                                "Acodec")]
+    need2 += [av(sel, n) for n in ("A0", "A01_ze")]
     if any(x is None for x in need2) or not all(
-            finite(x["rms"]) for x in need2):
+            finite(x["rms"]) and finite(x["rms_trans"])
+            and finite(x["rms_rot"]) and finite(x["rms_grip"])
+            and finite(x["grip_mismatch"]) for x in need2):
         bad_act.append("таблица против настоящего действия не посчитана или "
                        "нечисловая")
     else:
@@ -202,12 +211,22 @@ def gate(res, log=print):
         elif ra < 0.25:
             bad_act.append(f"восстановление против действия {ra:.3f}: меньше "
                            f"25% разрыва до предела кодека")
+        # ТРЕТИЙ УРОВЕНЬ НЕ ДОЛЖЕН ПОРТИТЬ БЛОКИ. Совокупный RMS может
+        # улучшиться при том, что поворот стал вчетверо хуже: агрегат
+        # усредняет блоки с разными масштабами. Требование относится к
+        # переходу A01 -> A012, а не к сравнению с A0.
+        for blk in ("rms_trans", "rms_rot", "rms_grip"):
+            if av(c, "A012_ze")[blk] > av(c, "A01_ze")[blk] * 1.005:
+                bad_act.append(
+                    f"A012 (z_e) хуже A01 (z_e) по {blk} более чем на 0.5%: "
+                    f"{av(c, 'A012_ze')[blk]:.5f} против "
+                    f"{av(c, 'A01_ze')[blk]:.5f}")
         if av(c, "A012_ze")["grip_mismatch"] > \
-                av(c, "A0")["grip_mismatch"] + 0.005:
+                av(c, "A01_ze")["grip_mismatch"] + 0.005:
             bad_act.append(
-                f"расхождение схвата выросло: "
+                f"расхождение схвата выросло на переходе A01 -> A012: "
                 f"{av(c, 'A012_ze')['grip_mismatch']:.4f} против "
-                f"{av(c, 'A0')['grip_mismatch']:.4f}")
+                f"{av(c, 'A01_ze')['grip_mismatch']:.4f}")
 
     for b in bad_cap:
         log(f"    ЁМКОСТЬ, ОТКАЗ: {b}")
@@ -215,7 +234,12 @@ def gate(res, log=print):
         log(f"    ДЕЙСТВИЕ, ОТКАЗ: {b}")
 
     # --- РЕШЕНИЕ 3: динамическая цель q1 против статической ---------------
-    dyn, sta = c["A01"]["rms"], c["A01_static"]["rms"]
+    # СРАВНИВАЕТСЯ ТА ВЕТВЬ, КОТОРУЮ БУДЕТ УЧИТЬ ТРЕНЕР: мишени от z_e и
+    # ошибка относительно НАСТОЯЩЕГО действия. Сравнение в координатах z_q
+    # против потолка кодека могло дать «динамика лучше» там, где в
+    # исполняемом пространстве лучше статика.
+    dyn = (av(c, "A01_ze") or {}).get("rms")
+    sta = (av(c, "A01_static") or {}).get("rms")
     if not (finite(dyn) and finite(sta)):
         note.append("статическая цель не посчитана")
         dynamic_ok = False
@@ -250,7 +274,7 @@ def build_parts(idx, epi, sel_frac, seed, n_rows, rng, split_episodes):
                          f"train/val/test, получено {sorted(idx)}")
     val_idx = idx["val"]
     sel_eps, cnf_eps = split_episodes(np.asarray(epi[val_idx]), sel_frac,
-                                      seed=61)
+                                      seed=int(seed))
     e_val = np.asarray(epi[val_idx])
     parts = {"train": np.asarray(idx["train"]),
              "val_sel": val_idx[np.isin(e_val, list(sel_eps))],
@@ -321,7 +345,7 @@ def selftest():
 
     def mk(a0, a01, a012, rec, a0f=None, a01f=None, static=None,
            act_a0=1.0, act_a01=0.5, act_a012=0.4, act_floor=0.0,
-           act_rec=0.6, grip0=0.05, grip012=0.05):
+           act_rec=0.6, grip0=0.05, grip012=0.05, static_act=None):
         blk = lambda r, gm=0.0: dict(rms=r, rms_trans=r, rms_rot=r,
                                      rms_grip=r, grip_mismatch=gm)
 
@@ -336,6 +360,8 @@ def selftest():
             d["vs_action.A01_ze"] = blk(act_a01, grip0)
             d["vs_action.A012_ze"] = blk(act_a012, grip012)
             d["vs_action.Acodec"] = blk(act_floor, grip0)
+            d["vs_action.A01_static"] = blk(
+                act_a01 * 1.5 if static_act is None else static_act, grip0)
             return d
         return dict(val_sel=part(), val_confirm=part())
 
@@ -369,10 +395,33 @@ def selftest():
     cap, act, _d, bc, _ba, _ = gate(nan_res, log=lambda *_: None)
     assert not cap and any("nan" in x for x in bc), bc
 
+    # --- КОНТРПРИМЕР 1: поворот у A012_ze вчетверо хуже A01_ze -----------
+    # Совокупный RMS улучшается, блок портится. Раньше гейт это пропускал.
+    res_rot = mk(1.0, 0.5, 0.4, 0.6)
+    for part in res_rot.values():
+        part["vs_action.A012_ze"] = dict(part["vs_action.A012_ze"])
+        part["vs_action.A012_ze"]["rms_rot"] = \
+            part["vs_action.A01_ze"]["rms_rot"] * 4.0
+    cap, act, _d, _bc, ba, _ = gate(res_rot, log=lambda *_: None)
+    assert cap and not act and any("rms_rot" in x for x in ba), ba
+
+    # --- КОНТРПРИМЕР 2: статическая q1 лучше динамической от z_e ---------
+    res_st = mk(1.0, 0.5, 0.4, 0.6, act_a01=0.8, static_act=0.7)
+    cap, act, dyn, _bc, _ba, note = gate(res_st, log=lambda *_: None)
+    assert not dyn, note
+    assert any("статическая цель" in x for x in note), note
+
+    # --- схват портится именно на переходе A01 -> A012 --------------------
+    res_gr = mk(1.0, 0.5, 0.4, 0.6, grip0=0.05, grip012=0.20)
+    for part in res_gr.values():
+        part["vs_action.A01_ze"] = dict(part["vs_action.A01_ze"])
+        part["vs_action.A01_ze"]["grip_mismatch"] = 0.05
+    cap, act, _d, _bc, ba, _ = gate(res_gr, log=lambda *_: None)
+    assert cap and not act and any("A01 -> A012" in x for x in ba), ba
+
     cap, act, dyn, _bc, _ba, note = gate(mk(1.0, 0.5, 0.4, 0.6, static=0.5),
                                          log=lambda *_: None)
-    assert cap and act and not dyn, note
-    assert any("статическая цель" in x for x in note), note
+    assert cap and act and dyn, note
 
     # --- ПОСТРОЕНИЕ ЧАСТЕЙ НА НАСТОЯЩИХ КЛЮЧАХ РАЗБИЕНИЯ ------------------
     # Регрессия на реальное падение: тут стояло idx["dev"], а load_split даёт
@@ -424,6 +473,11 @@ def main():
                     help="сколько строк каждой части брать; 0 — все")
     ap.add_argument("--horizon", type=int, default=8)
     ap.add_argument("--sel-frac", type=float, default=0.4)
+    ap.add_argument("--probe-rows", type=int, default=256,
+                    help="сколько строк кодировать заново для сверки с K_true")
+    ap.add_argument("--probe-tol", type=float, default=0.0,
+                    help="допустимая доля расходящихся кодов; ноль означает "
+                         "требование точного совпадения")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="data/k14a/oracle_cache.json")
@@ -586,7 +640,12 @@ def main():
     keys_now = hashlib.sha1(np.ascontiguousarray(np.stack(
         [np.asarray(src_npz["episode"]),
          np.asarray(src_npz["step"])])).tobytes()).hexdigest()[:12]
-    if meta.get("keys_sha1") and keys_now != meta["keys_sha1"]:
+    if not meta.get("keys_sha1"):
+        raise SystemExit(
+            "в meta кэша нет keys_sha1: сверить, что это тот же набор "
+            "наблюдений, нечем. Условие «если поле есть» было fail-open — "
+            "кэш без поля проходил бы")
+    if keys_now != meta["keys_sha1"]:
         raise SystemExit(f"(episode, step) исходного кэша дают {keys_now}, а "
                          f"K-11a собран на {meta['keys_sha1']}: это другой "
                          f"набор наблюдений")
@@ -624,6 +683,34 @@ def main():
                 out.append(codec._encode(x[i:i + batch].float(),
                                          embodiment_ids=0).float())
         return torch.cat(out)
+
+    # ДЕЙСТВИЯ СВЕРЯЮТСЯ С ЗАВЕРЕННЫМИ КОДАМИ. K_true, split и ключи уже
+    # сверены, но сам массив `action` теперь определяет z_e, а значит и всю
+    # вторую таблицу. Переставленные или изменённые действия оставили бы
+    # остальные заверенные массивы нетронутыми и молча сдвинули бы оракул.
+    probe_rows = np.sort(np.random.default_rng(20260917).choice(
+        N, size=min(int(a.probe_rows), N), replace=False))
+    with torch.no_grad():
+        z_probe = codec._encode(
+            torch.from_numpy(np.asarray(ACT[probe_rows], np.float32)).to(dev),
+            embodiment_ids=0).float()
+        k_probe = []
+        resid = z_probe.clone()
+        for l in range(3):
+            c_ = nearest_code(resid, qs[l])
+            k_probe.append(c_)
+            resid = resid - code_contribution(qs[l], c_)
+        k_probe = torch.stack(k_probe, 1).cpu().numpy()
+    k_ref = np.asarray(ktrue[probe_rows]).astype(np.int64)
+    dis = float((k_probe != k_ref).mean())
+    if dis > float(a.probe_tol):
+        raise SystemExit(
+            f"проба кодирования: {100 * dis:.3f}% кодов расходятся с "
+            f"заверенным K_true при допуске {100 * float(a.probe_tol):.3f}%. "
+            f"Действия в исходном кэше не те, на которых собран K-11a")
+    print(f"  проба кодирования на {len(probe_rows)} строках: расхождение "
+          f"кодов {100 * dis:.4f}% при допуске "
+          f"{100 * float(a.probe_tol):.3f}%")
 
     res, extra = {}, {}
     for name, rows in parts.items():
@@ -706,10 +793,16 @@ def main():
             if m.sum() >= 8:
                 r[f"rms_A0_{tag}"] = float(r["A0"]["per_row"][m].mean())
                 r[f"rms_A01_{tag}"] = float(r["A01"]["per_row"][m].mean())
-        r["dynamic_vs_static_q1_disagree"] = float(
+        # РАСХОЖДЕНИЯ РАЗДЕЛЕНЫ ПО МИШЕНИ. Основная — от z_e: именно её
+        # будет учить тренер. Цифра от z_q оставлена как диагностика.
+        r["dynamic_zq_vs_static_q1_disagree"] = float(
             (q1s != k[:, 1, :]).float().mean())
-        r["dynamic_vs_static_q2_disagree"] = float(
+        r["dynamic_ze_vs_static_q1_disagree"] = float(
+            (q1e != k[:, 1, :]).float().mean())
+        r["dynamic_zq_vs_static_q2_disagree"] = float(
             (q2s != k[:, 2, :]).float().mean())
+        r["dynamic_ze_vs_static_q2_disagree"] = float(
+            (q2e != k[:, 2, :]).float().mean())
         r["ze_vs_zq_q1_disagree"] = float((q1e != q1s).float().mean())
         r["n_rows"] = int(len(rows))
         for nm in list(r):
@@ -740,8 +833,9 @@ def main():
         print(f"    доля улучшившихся: A01 лучше A0 у "
               f"{100 * r['frac_A01_better']:.1f}%, A012 лучше A01 у "
               f"{100 * r['frac_A012_better']:.1f}%")
-        print(f"    динамическая цель q1 отличается от истинной у "
-              f"{100 * r['dynamic_vs_static_q1_disagree']:.1f}% позиций")
+        print(f"    динамическая цель q1 отличается от истинной: от z_e у "
+              f"{100 * r['dynamic_ze_vs_static_q1_disagree']:.1f}%, от z_q у "
+              f"{100 * r['dynamic_zq_vs_static_q1_disagree']:.1f}% позиций")
 
     print("\n  ГЕЙТ 2 (на подтверждающей половине, ЦЕЛИКОМ):")
     cap_ok, act_ok, dyn_ok, bad_cap, bad_act, note = gate(res)
@@ -772,7 +866,16 @@ def main():
                joint12=src_meta,
                horizon=int(a.horizon), cache=a.cache, ckpt=a.ckpt,
                split_seed=61, sel_frac=float(a.sel_frac),
-               target_latent="z_q = sum E_l[k_l] (трёхуровневая опора кодека)",
+               target_latents=dict(
+                   primary="z_e = codec._encode(action) — мишени тренера",
+                   secondary="z_q = sum E_l[k_l] — вопрос о ёмкости книг",
+                   references=["decode(z_q) — потолок кодека",
+                               "action из кэша K-9a — настоящее действие"]),
+               device=str(dev), dtype="float32",
+               torch_version=str(torch.__version__),
+               cuda_version=str(getattr(torch.version, "cuda", None)),
+               probe_rows=int(a.probe_rows), probe_tol=float(a.probe_tol),
+               probe_code_disagree=float(dis),
                codebooks_sha1=meta.get("codebooks_sha1"),
                decoder_probe=meta.get("decoder_probe"),
                codec_state_sha1=meta.get("codec_state_sha1"),
