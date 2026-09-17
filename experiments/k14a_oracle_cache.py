@@ -475,6 +475,9 @@ def main():
     ap.add_argument("--sel-frac", type=float, default=0.4)
     ap.add_argument("--probe-rows", type=int, default=256,
                     help="сколько строк кодировать заново для сверки с K_true")
+    ap.add_argument("--allow-probe-device-drift", action="store_true",
+                    help="продолжить, если веса кодека совпали, а его "
+                         "поведение отличается из-за другого устройства")
     ap.add_argument("--probe-tol", type=float, default=0.0,
                     help="допустимая доля расходящихся кодов; ноль означает "
                          "требование точного совпадения")
@@ -600,13 +603,42 @@ def main():
     dmax = float((Ecur.cpu() - torch.from_numpy(E)).abs().max())
     if dmax > 1e-5:
         raise SystemExit(f"книги разошлись с кэшем на {dmax:.3e}")
-    k11a.check_fingerprints(meta, dict(
-        codebooks_sha1=hashlib.sha1(np.ascontiguousarray(
-            E.astype(np.float32)).tobytes()).hexdigest()[:12],
-        decoder_probe=k11a.decoder_probe(codec, Ecur.to(dev), dev),
-        codec_state_sha1=k11a.state_sha1(codec)))
-    print(f"  кодек сверен с кэшем: книги max|Δ| = {dmax:.3e}, проба и веса "
-          f"совпали; уровней {len(qs)}")
+    # ВЕСА И ПОВЕДЕНИЕ СВЕРЯЮТСЯ ПОРОЗНЬ, И ЭТО НЕ ПОСЛАБЛЕНИЕ.
+    # `codebooks_sha1` и `codec_state_sha1` — отпечатки ВЕСОВ, они не зависят
+    # от устройства. `decoder_probe` — отпечаток ВЫХОДА на фиксированном
+    # латенте, и он зависит: тот же декодер на CPU и на GPU даёт другие числа
+    # на уровне пятого знака. Общая проверка в этом случае говорит «декодер не
+    # тот», хотя декодер тот же, а другой — режим вычислений. Различать их
+    # обязательно: иначе настоящая подмена и смена устройства выглядят
+    # одинаково.
+    got_w = dict(codebooks_sha1=hashlib.sha1(np.ascontiguousarray(
+        E.astype(np.float32)).tobytes()).hexdigest()[:12],
+        codec_state_sha1=k11a.state_sha1(codec))
+    bad_w = [(k_, meta.get(k_), v_) for k_, v_ in got_w.items()
+             if meta.get(k_) != v_]
+    if bad_w:
+        raise SystemExit("веса кодека не те, которыми собран кэш: "
+                         + "; ".join(f"{k_}: в кэше {a_}, сейчас {b_}"
+                                     for k_, a_, b_ in bad_w))
+    probe_now = k11a.decoder_probe(codec, Ecur.to(dev), dev)
+    probe_same = (meta.get("decoder_probe") == probe_now)
+    if not probe_same:
+        msg = (f"поведение декодера отличается от записанного при сборке "
+               f"кэша: проба в кэше {meta.get('decoder_probe')}, сейчас "
+               f"{probe_now}. ВЕСА ПРИ ЭТОМ СОВПАЛИ, значит декодер тот же, а "
+               f"различается режим вычислений (устройство {dev}). Кэш собран "
+               f"на другом устройстве")
+        if not a.allow_probe_device_drift:
+            raise SystemExit(
+                msg + ". Считать оракул в одном режиме, а обучать в другом "
+                "нельзя без измерения (§39). Если расхождение нужно именно "
+                "ИЗМЕРИТЬ, запустите с --allow-probe-device-drift: флаг "
+                "попадёт в артефакт, и результат нельзя будет предъявить как "
+                "полученный в том же режиме")
+        print(f"  ВНИМАНИЕ: {msg}. Продолжаю по --allow-probe-device-drift")
+    print(f"  кодек: веса совпали с кэшем (книги max|Δ| = {dmax:.3e}), "
+          f"поведение {'совпало' if probe_same else 'РАЗОШЛОСЬ'}; "
+          f"уровней {len(qs)}")
 
     # --- части: train и val, разделённый ПО ЭПИЗОДАМ ------------------------
     # ТА ЖЕ разметка, что в K-11c и K-13b (сид 61): подтверждающая половина
@@ -875,6 +907,9 @@ def main():
                torch_version=str(torch.__version__),
                cuda_version=str(getattr(torch.version, "cuda", None)),
                probe_rows=int(a.probe_rows), probe_tol=float(a.probe_tol),
+               decoder_probe_matches_cache=bool(probe_same),
+               decoder_probe_now=probe_now,
+               allow_probe_device_drift=bool(a.allow_probe_device_drift),
                probe_code_disagree=float(dis),
                codebooks_sha1=meta.get("codebooks_sha1"),
                decoder_probe=meta.get("decoder_probe"),

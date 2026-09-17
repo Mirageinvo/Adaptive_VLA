@@ -30,8 +30,14 @@ for DEV in cuda:0 cpu; do
     OUT="data/k14a/oracle_cache_${TAG}.json"
     LOG="logs/k14a/oracle_${TAG}.log"
     echo "[$(ts)] оракул на $DEV -> $OUT"
+    # НА CPU КЭШ СОБРАН НЕ БЫЛ: отпечаток ПОВЕДЕНИЯ декодера зависит от
+    # устройства, и без флага прогон остановится. Флаг попадает в артефакт,
+    # поэтому CPU-результат нельзя будет выдать за полученный в том же режиме.
+    EXTRA=()
+    [ "$DEV" = "cpu" ] && EXTRA=(--allow-probe-device-drift)
     "${ENVP[@]}" "$PY" experiments/k14a_oracle_cache.py \
-        --device "$DEV" --n-rows "$N_ROWS" --out "$OUT" > "$LOG" 2>&1
+        --device "$DEV" --n-rows "$N_ROWS" --out "$OUT" \
+        ${EXTRA[@]+"${EXTRA[@]}"} > "$LOG" 2>&1
     RC[$DEV]=$?
     echo "[$(ts)] $DEV: код возврата ${RC[$DEV]}"
     # 0 — обучать головы, 4 — гейт не пройден. Остальное это сбой.
