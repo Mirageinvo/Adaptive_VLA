@@ -210,6 +210,7 @@ def make_joint_depth_rvq_class(base_cls):
             exits: Iterable[int] = DEFAULT_EXITS,
             head_dtype: torch.dtype = torch.float32,
             feedback: bool = True,
+            verbose_init: bool = True,
         ):
             exits = tuple(int(x) for x in exits)
             n_layers = len(self.action_expert.layers)
@@ -278,40 +279,101 @@ def make_joint_depth_rvq_class(base_cls):
                     dtype=head_dtype).to(dev)
                 for _ in range(2)
             ])
-            self.configure_joint_depth_rvq(verbose=False)
+            # ПОСЛЕ СБОРКИ НИЧЕГО НЕ ОБУЧАЕТСЯ. Прежде init сам вызывал
+            # configure и оставлял обучаемыми ВСЕ поздние веса: забыть указать
+            # этап было невозможно, потому что этапа не существовало. Теперь
+            # модель выходит из init полностью замороженной, и тренер обязан
+            # назвать этап явно.
+            for p in self.parameters():
+                p.requires_grad_(False)
+            if verbose_init:
+                print(f"  depth-RVQ собран: все веса заморожены, этап не "
+                      f"выбран. Вызовите configure_joint_depth_rvq("
+                      f"stage=..., variant=...)")
             return self
 
-        def joint_depth_rvq_trainable_prefixes(self) -> tuple[str, ...]:
-            return (
-                "depth_rvq_norms.",
-                "depth_rvq_heads.",
-                "depth_rvq_feedback.",
-            )
+        def joint_depth_rvq_trainable_prefixes(
+                self, stage: str, variant: str) -> tuple[str, ...]:
+            """Точные префиксы обучаемых весов ДЛЯ КОНКРЕТНОГО ЭТАПА.
 
-        def configure_joint_depth_rvq(self, *, verbose: bool = True) -> int:
-            """Заморозить всё кроме поздних норм, голов и feedback."""
-            pref = self.joint_depth_rvq_trainable_prefixes()
+            РЕЖИМА ПО УМОЛЧАНИЮ НЕТ. Прежняя версия возвращала общий список
+            `depth_rvq_norms.`, `depth_rvq_heads.`, `depth_rvq_feedback.` — он
+            размораживает ОБА поздних уровня сразу. Тогда обучение q1 молча
+            учило бы и q2-ветвь, а обучение q2 переучивало бы выбранную голову
+            q1, и выбранный чекпойнт переставал бы быть тем, что выбрали.
+            Этап и вариант обязаны называться явно.
+
+            Соответствие уровней: индекс 0 — q1 (выход 18), индекс 1 — q2
+            (выход 24); нулевой уровень q0 принадлежит Joint12 и не обучается
+            никогда.
+            """
+            table = {
+                ("q1", "main"): ("depth_rvq_norms.0.", "depth_rvq_heads.0.",
+                                 "depth_rvq_feedback.0."),
+                ("q1", "static"): ("depth_rvq_norms.0.", "depth_rvq_heads.0.",
+                                   "depth_rvq_feedback.0."),
+                ("q1", "no_feedback"): ("depth_rvq_norms.0.",
+                                        "depth_rvq_heads.0."),
+                ("q2", "main"): ("depth_rvq_norms.1.", "depth_rvq_heads.1.",
+                                 "depth_rvq_feedback.1."),
+            }
+            key = (str(stage), str(variant))
+            if key not in table:
+                raise ValueError(
+                    f"неизвестная пара этап/вариант {key}; допустимы "
+                    f"{sorted(table)}. Умолчания здесь нет намеренно: молча "
+                    f"выбранный набор обучаемых весов — это молча другой "
+                    f"эксперимент")
+            return table[key]
+
+        def configure_joint_depth_rvq(self, *, stage: str, variant: str,
+                                      verbose: bool = True) -> dict:
+            """Разморозить РОВНО веса этого этапа, всё прочее заморозить.
+
+            Возвращает точный состав: имена, число тензоров и параметров. Он
+            же кладётся в чекпойнт и сверяется при продолжении — «сколько
+            получилось» не ответ, отвечает «что именно».
+            """
+            pref = self.joint_depth_rvq_trainable_prefixes(stage, variant)
             for p in self.parameters():
                 p.requires_grad_(False)
             for name, p in self.named_parameters():
-                if any(name.startswith(x) for x in pref):
+                if name.startswith(pref):
                     p.requires_grad_(True)
-            trainable = {n: p for n, p in self.named_parameters() if p.requires_grad}
-            stray = [n for n in trainable if not any(n.startswith(x) for x in pref)]
-            if stray:
-                raise RuntimeError(f"обучаемое вне whitelist: {stray[:5]}")
-            missing_groups = [x for x in pref if not any(n.startswith(x) for n in trainable)]
-            if missing_groups:
-                raise RuntimeError(f"пустые группы обучаемых весов: {missing_groups}")
+            names = sorted(n for n, p in self.named_parameters()
+                           if p.requires_grad)
+            want = sorted(n for n, _ in self.named_parameters()
+                          if n.startswith(pref))
+            if names != want:
+                raise RuntimeError(
+                    f"состав обучаемых весов не совпал: лишние "
+                    f"{sorted(set(names) - set(want))[:5]}, нет "
+                    f"{sorted(set(want) - set(names))[:5]}")
+            for x in pref:
+                if not any(n.startswith(x) for n in names):
+                    raise RuntimeError(f"пустая группа обучаемых весов: {x}")
+            # ЧУЖОЙ УРОВЕНЬ ОБЯЗАН БЫТЬ ЗАМОРОЖЕН ЦЕЛИКОМ. Проверяется явно, а
+            # не подразумевается из префиксов: при обучении q2 разморозка q1
+            # означала бы, что выбранная голова меняется под собственной целью.
+            other = "1." if str(stage) == "q1" else "0."
+            leaked = [n for n in names
+                      if any(n.startswith(f"depth_rvq_{g}.{other}")
+                             for g in ("norms", "heads", "feedback"))]
+            if leaked:
+                raise RuntimeError(f"разморожен чужой уровень: {leaked[:5]}")
             if isinstance(self.depth_rvq_books, nn.Parameter):
                 raise RuntimeError("кодовые книги стали параметром")
-            n = sum(p.numel() for p in trainable.values())
+            n_par = sum(p.numel() for n, p in self.named_parameters()
+                        if n in set(names))
+            info = dict(stage=str(stage), variant=str(variant),
+                        prefixes=list(pref), names=names,
+                        n_tensors=len(names), n_params=int(n_par))
             if verbose:
-                print(
-                    f"  depth-RVQ V2: {len(trainable)} обучаемых тензоров, "
-                    f"{n / 1e6:.3f} млн параметров; Joint12 и backbone "
-                    f"заморожены")
-            return n
+                print(f"  depth-RVQ, этап {stage}/{variant}: "
+                      f"{len(names)} обучаемых тензоров, "
+                      f"{n_par / 1e6:.3f} млн параметров; Joint12, backbone и "
+                      f"уровень {'q2' if stage == 'q1' else 'q1'} заморожены")
+            return info
 
         def _joint_depth_logits(self, action_hidden: torch.Tensor, level: int):
             if level == 0:
@@ -581,14 +643,48 @@ def selftest() -> None:
     assert torch.equal(moved["pred_codes"][0], q0_before)
     assert not torch.equal(moved["logits"][1], nofb["logits"][1])
 
-    # Whitelist точный: q0, backbone, bos и посторонний параметр заморожены.
-    n = m.configure_joint_depth_rvq(verbose=False)
-    tr = {name for name, p in m.named_parameters() if p.requires_grad}
-    assert n > 0 and tr
-    assert all(name.startswith(m.joint_depth_rvq_trainable_prefixes()) for name in tr)
-    for name in ("fast_head.weight", "bos_embedding", "unrelated",
-                 "action_expert.layers.0.weight"):
-        assert not dict(m.named_parameters())[name].requires_grad, name
+    # ПОСЛЕ СБОРКИ НИЧЕГО НЕ ОБУЧАЕТСЯ: этап обязан быть назван явно.
+    assert not any(p.requires_grad for p in m.parameters()), \
+        "init оставил обучаемые веса: этап не выбран, а градиент уже течёт"
+    try:
+        m.configure_joint_depth_rvq(stage="q3", variant="main", verbose=False)
+    except ValueError as e:
+        assert "неизвестная пара" in str(e), e
+    else:
+        raise AssertionError("несуществующий этап принят")
+
+    # ТРИ ЭТАПА ДАЮТ ТРИ РАЗНЫХ ТОЧНЫХ МНОЖЕСТВА -------------------------
+    seen = {}
+    for stage_, var_, groups in (("q1", "main", ("norms.0.", "heads.0.",
+                                                 "feedback.0.")),
+                                 ("q1", "no_feedback", ("norms.0.",
+                                                        "heads.0.")),
+                                 ("q2", "main", ("norms.1.", "heads.1.",
+                                                 "feedback.1."))):
+        info = m.configure_joint_depth_rvq(stage=stage_, variant=var_,
+                                           verbose=False)
+        tr = {name for name, p in m.named_parameters() if p.requires_grad}
+        assert tr == set(info["names"]), (stage_, var_)
+        assert info["n_tensors"] == len(tr) and info["n_params"] > 0
+        for g in groups:
+            assert any(f"depth_rvq_{g}" in n_ for n_ in tr), (stage_, g)
+        # ЧУЖОЙ УРОВЕНЬ ЗАМОРОЖЕН ЦЕЛИКОМ
+        other = "1." if stage_ == "q1" else "0."
+        assert not any(n_.startswith(f"depth_rvq_{gg}.{other}")
+                       for n_ in tr
+                       for gg in ("norms", "heads", "feedback")), (stage_, tr)
+        for name in ("fast_head.weight", "bos_embedding", "unrelated",
+                     "action_expert.layers.0.weight"):
+            assert not dict(m.named_parameters())[name].requires_grad, name
+        seen[(stage_, var_)] = tr
+    # БЕЗ FEEDBACK — СТРОГО МЕНЬШЕ, ЧЕМ MAIN, И РОВНО НА FEEDBACK
+    a_, b_ = seen[("q1", "main")], seen[("q1", "no_feedback")]
+    assert b_ < a_ and all("feedback" in n_ for n_ in a_ - b_), a_ - b_
+    assert not (seen[("q1", "main")] & seen[("q2", "main")]), "этапы пересеклись"
+    # СОСТАВ ВОССТАНАВЛИВАЕТСЯ ПОСЛЕ ЛЮБОГО ЭТАПА
+    m.configure_joint_depth_rvq(stage="q1", variant="main", verbose=False)
+    n = sum(p.numel() for p in m.parameters() if p.requires_grad)
+    assert n > 0
 
     # Все разрешённые тензоры участвуют в настоящем полном пути.
     m.zero_grad(set_to_none=True)
