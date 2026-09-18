@@ -390,6 +390,7 @@ def main():
     import k11a_build_hicora_cache as k11a
     import k12b_protocol as kb
     import k14_common as kc
+    import k11b_hicora_identity as k11b
     from depth_rvq_joint12 import (make_joint_depth_rvq_class,
                                    code_contribution)
     from depth_rvq_vla import straight_through
@@ -533,7 +534,11 @@ def main():
     # СОСТОЯНИЯ — через общий строгий загрузчик. Он один для K-14a, K-14b,
     # K-14c и K-14d: три предыдущих раза одна и та же проверка писалась
     # заново и каждый раз оказывалась fail-open по какому-нибудь полю.
-    st_n, sm, st_shas = kc.load_states(src, N, cmeta, keys_sha,
+    # ПРОИСХОЖДЕНИЕ ДАННЫХ — из meta кэша K-11a через вычитыватель K-11b:
+    # в meta исходного npz этих полей нет по построению, там лежит только путь
+    # к манифесту разбиения.
+    ds_repo, ds_rev = k11b.dataset_source(meta)
+    st_n, sm, st_shas = kc.load_states(src, N, ds_repo, ds_rev, keys_sha,
                                        STATE_Q01, STATE_Q99)
     print(f"  данные: {N} наблюдений, кадры {IMG.shape[1:]}, состояния "
           f"{st_n.shape[1]}-мерные (ключи {sm.get('keys_sha1')}, "

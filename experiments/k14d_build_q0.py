@@ -229,6 +229,7 @@ def main():
     import k12b_protocol as kb
     import k13a_build_trajectory_basis as k13a
     import k14a_oracle_cache as k14a
+    import k11b_hicora_identity as k11b
     from k11c_train_d1 import split_episodes
     from joint12_vla import make_joint12_class
     import actioncodec  # noqa: F401
@@ -259,7 +260,11 @@ def main():
     IMG = np.load(img_p, mmap_mode="r")
     if IMG.shape[0] < N or IMG.dtype != np.uint8:
         raise SystemExit(f"кадры {IMG.shape} {IMG.dtype}")
-    st_n, sm, st_shas = kc.load_states(src, N, cmeta, keys_sha,
+    # ПРОИСХОЖДЕНИЕ ДАННЫХ — из meta кэша K-11a через вычитыватель K-11b:
+    # в meta исходного npz этих полей нет по построению, там лежит только путь
+    # к манифесту разбиения.
+    ds_repo, ds_rev = k11b.dataset_source(meta)
+    st_n, sm, st_shas = kc.load_states(src, N, ds_repo, ds_rev, keys_sha,
                                        STATE_Q01, STATE_Q99)
 
     # ЧАСТИ ИЗ РАЗБИЕНИЯ, А НЕ ИЗ КЭША ЦЕЛЕЙ: иначе q0 зависел бы от файла,

@@ -168,13 +168,28 @@ def check_gate_r(path, *, expect_plan_sha1=None, expect_batch=CANONICAL_BATCH,
                 run_ids=r.get("run_ids"))
 
 
-def load_states(src, n_obs, cmeta, keys_sha, state_q01, state_q99):
+def load_states(src, n_obs, dataset_repo, dataset_revision, keys_sha,
+                state_q01, state_q99):
     """Состояния наблюдений. ВСЕ поля меты обязательны и сверяются точно.
 
     Состояния входят в промпт, то есть определяют вход целиком. Собранные из
     другой ревизии датасета или для других ключей, они дали бы другую модельную
     выдачу при совпадающих отпечатках всего остального.
+
+    ОТКУДА БЕРУТСЯ ОЖИДАЕМЫЕ РЕПОЗИТОРИЙ И РЕВИЗИЯ. Не из `meta` исходного
+    npz: K-9a туда их не пишет — он записывает лишь ПУТЬ к манифесту
+    разбиения, а сами поля лежат в манифесте. Оттуда их переносит K-11a в
+    `meta["manifest"]`, и вынимать их положено `k11b.dataset_source`, которая
+    заодно ловит противоречие между вложенной и верхнеуровневой ревизией.
+    Прежняя версия сверялась с `meta` исходного кэша и потому не могла пройти
+    никогда: она требовала поля, которых там нет по построению. Проверка,
+    которая не выполняется ни на каких данных, не строже отсутствующей — она
+    просто заменяет собой настоящую.
     """
+    if not dataset_repo or not dataset_revision:
+        raise SystemExit(
+            "не заданы ожидаемые репозиторий и ревизия данных: их берут из "
+            "meta кэша K-11a через k11b.dataset_source, а не угадывают")
     st_p, stm_p = src + ".state.npy", src + ".state.json"
     if not (os.path.exists(st_p) and os.path.exists(stm_p)):
         raise SystemExit(
@@ -190,11 +205,10 @@ def load_states(src, n_obs, cmeta, keys_sha, state_q01, state_q99):
         bad.append(f"ключи {sm['keys_sha1']} против {keys_sha}")
     if int(sm["n_obs"]) != int(n_obs):
         bad.append(f"наблюдений {sm['n_obs']}, ожидалось ровно {n_obs}")
-    for k in ("dataset_repo", "dataset_revision"):
-        if cmeta.get(k) is None:
-            bad.append(f"в мете исходного кэша нет {k}")
-        elif str(sm[k]) != str(cmeta[k]):
-            bad.append(f"{k}: состояния {sm[k]}, кэш {cmeta[k]}")
+    for k, want in (("dataset_repo", dataset_repo),
+                    ("dataset_revision", dataset_revision)):
+        if str(sm[k]) != str(want):
+            bad.append(f"{k}: состояния {sm[k]}, кэш собран на {want}")
     if bad:
         raise SystemExit("состояния не от тех наблюдений: " + "; ".join(bad))
     raw = np.load(st_p)
@@ -445,6 +459,60 @@ def selftest():
             pass
         else:
             raise AssertionError("q0 принят без Gate R")
+
+    # --- СОСТОЯНИЯ: ПОЛОЖИТЕЛЬНЫЙ ПУТЬ ОБЯЗАТЕЛЕН -------------------------
+    # Первая версия этой проверки сверялась не с тем источником и не могла
+    # пройти НИ НА КАКИХ данных. Отрицательные случаи её пропускали: они все
+    # ожидали отказа, а она отказывала всегда. Ловится это только тем, что
+    # корректный вход обязан приниматься.
+    with tempfile.TemporaryDirectory() as td:
+        q01 = np.array([0.0, -1.0, 0.0], np.float64)
+        q99 = np.array([2.0, 1.0, 4.0], np.float64)
+        src = os.path.join(td, "cache.npz")
+        raw = np.array([[1.0, 0.0, 2.0], [0.0, -1.0, 0.0],
+                        [2.0, 1.0, 4.0], [1.0, 0.5, 1.0]])
+        np.save(src + ".state.npy", raw)
+        def wsm(**kw):
+            m = dict(keys_sha1="KS", n_obs=4, dataset_repo="repo/x",
+                     dataset_revision="v2.0", dim=3)
+            m.update(kw)
+            json.dump(m, open(src + ".state.json", "w"))
+        wsm()
+        norm, sm_, shas = load_states(src, 4, "repo/x", "v2.0", "KS", q01, q99)
+        assert norm.shape == (4, 3)
+        assert abs(float(norm[1].min()) + 1.0) < 1e-12 and \
+            abs(float(norm[2].max()) - 1.0) < 1e-12, norm
+        assert shas["state_npy"] and shas["state_json"]
+        for kw, args_, why in (
+                ({"keys_sha1": "OTHER"}, ("repo/x", "v2.0", "KS"), "ключи"),
+                ({"n_obs": 5}, ("repo/x", "v2.0", "KS"), "ровно"),
+                ({"dim": 4}, ("repo/x", "v2.0", "KS"), "размерность"),
+                ({}, ("repo/y", "v2.0", "KS"), "dataset_repo"),
+                ({}, ("repo/x", "v1.0", "KS"), "dataset_revision"),
+                ({"dataset_repo": None}, ("repo/x", "v2.0", "KS"),
+                 "нет полей")):
+            wsm(**kw)
+            try:
+                load_states(src, 4, args_[0], args_[1], args_[2], q01, q99)
+            except SystemExit as e:
+                assert why in str(e), (why, e)
+            else:
+                raise AssertionError(f"состояния приняты при {kw} {args_}")
+        wsm()
+        for bad in (("", "v2.0"), ("repo/x", "")):
+            try:
+                load_states(src, 4, bad[0], bad[1], "KS", q01, q99)
+            except SystemExit as e:
+                assert "не заданы" in str(e), e
+            else:
+                raise AssertionError("принято пустое происхождение данных")
+        # число наблюдений сверяется ТОЧНО, а не «не меньше»
+        try:
+            load_states(src, 3, "repo/x", "v2.0", "KS", q01, q99)
+        except SystemExit as e:
+            assert "формы" in str(e) or "ровно" in str(e), e
+        else:
+            raise AssertionError("принят другой размер набора")
 
     print("самопроверка k14_common пройдена")
 
