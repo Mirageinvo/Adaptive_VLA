@@ -459,19 +459,32 @@ def main():
     IMG = np.load(img_p, mmap_mode="r")
     if IMG.shape[0] < N or IMG.dtype != np.uint8:
         raise SystemExit(f"кадры {IMG.shape} {IMG.dtype}: не те")
-    st_p = a.cache + ".state.npy"
-    stm_p = a.cache + ".state.json"
+    # СОСТОЯНИЯ ЛЕЖАТ РЯДОМ С ИСХОДНЫМ КЭШЕМ, А НЕ С ПРОИЗВОДНЫМ. У K-11a
+    # аргумент `--cache` означает исходный npz K-9a, и состояния привязаны к
+    # наблюдениям, а не к таблице отводов: `<src>.state.npy`.
+    st_p = src + ".state.npy"
+    stm_p = src + ".state.json"
     if not (os.path.exists(st_p) and os.path.exists(stm_p)):
-        raise SystemExit(f"нет {st_p}: состояния собираются K-11a, "
-                         f"пересобирать их здесь нельзя — получился бы другой "
-                         f"вход")
+        raise SystemExit(
+            f"нет {st_p}: состояния собираются K-11a рядом с ИСХОДНЫМ кэшем "
+            f"{src}. Пересобирать их здесь нельзя — собранные другим кодом "
+            f"или из другой ревизии дали бы другой промпт, то есть другой "
+            f"вход, чем тот, на котором построены q0hat и цели")
     sm = json.load(open(stm_p))
     if sm.get("keys_sha1") != keys_sha:
-        raise SystemExit(f"состояния собраны для ключей {sm.get('keys_sha1')}")
+        raise SystemExit(f"состояния собраны для ключей {sm.get('keys_sha1')}, "
+                         f"а наблюдения дают {keys_sha}: это другой набор")
+    if sm.get("dataset_revision") and cmeta.get("dataset_revision") and \
+            sm["dataset_revision"] != cmeta["dataset_revision"]:
+        raise SystemExit(f"состояния собраны на ревизии датасета "
+                         f"{sm['dataset_revision']}, кэш на "
+                         f"{cmeta['dataset_revision']}")
+    if int(sm.get("n_obs", -1)) < N:
+        raise SystemExit(f"состояний {sm.get('n_obs')} при {N} наблюдениях")
     st_n = ((np.load(st_p)[:N] - STATE_Q01) / (STATE_Q99 - STATE_Q01)
             * 2.0 - 1.0)
     print(f"  данные: {N} наблюдений, кадры {IMG.shape[1:]}, состояния "
-          f"{st_n.shape[1]}-мерные")
+          f"{st_n.shape[1]}-мерные из {st_p} (ключи {sm.get('keys_sha1')})")
 
     # --- модель -------------------------------------------------------------
     cfg = get_cfg(os.path.join(root, a.cfg_path))
