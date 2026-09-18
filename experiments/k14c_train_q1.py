@@ -413,11 +413,41 @@ def main():
     check_cache_manifest(man, oracle_sha1=sha12(a.oracle), cache=a.cache,
                          ckpt=a.ckpt, expect_sha1=sha12(npz_p))
     with np.load(npz_p, allow_pickle=True) as z:
-        rows_all = np.asarray(z["rows"], np.int64)
-        q1_all = np.asarray(z["q1"], np.int64)
-        part_all = np.asarray(z["part"]).astype(str)
-    if arr_sha(q1_all.astype(np.int32)) != man["q1_sha1"]:
-        raise SystemExit("массив целей не совпал с отпечатком манифеста")
+        if sorted(z.files) != ["part", "q1", "rows"]:
+            raise SystemExit(f"в кэше целей массивы {sorted(z.files)}")
+        q1_raw, rows_raw, part_all = z["q1"], z["rows"], z["part"].astype(str)
+    # ПРОВЕРКИ ДО ПРИВЕДЕНИЯ ТИПА. `np.asarray(x, np.int64)` молча примет и
+    # числа с плавающей точкой, и отрицательные, и чужие формы — а дальше это
+    # будет выглядеть исправными метками.
+    if q1_raw.dtype.kind != "i" or rows_raw.dtype.kind != "i":
+        raise SystemExit(f"типы массивов: q1 {q1_raw.dtype}, rows "
+                         f"{rows_raw.dtype}; оба обязаны быть целыми")
+    if arr_sha(q1_raw) != man["q1_sha1"]:
+        raise SystemExit(f"массив целей имеет sha {arr_sha(q1_raw)}, в "
+                         f"манифесте {man['q1_sha1']}")
+    if arr_sha(rows_raw.astype(np.int64)) != man["rows_sha1"]:
+        raise SystemExit("массив строк не совпал с отпечатком манифеста")
+    if q1_raw.ndim != 2 or q1_raw.shape[0] != rows_raw.shape[0] \
+            or q1_raw.shape[0] != len(part_all):
+        raise SystemExit(f"формы: q1 {q1_raw.shape}, rows {rows_raw.shape}, "
+                         f"part {part_all.shape}")
+    if int(man["n_rows"]) != int(q1_raw.shape[0]):
+        raise SystemExit(f"строк {q1_raw.shape[0]}, в манифесте "
+                         f"{man['n_rows']}")
+    rows_all = np.asarray(rows_raw, np.int64)
+    q1_all = np.asarray(q1_raw, np.int64)
+    if len(np.unique(rows_all)) != len(rows_all):
+        raise SystemExit("номера строк в кэше целей повторяются")
+    if rows_all.min() < 0:
+        raise SystemExit(f"отрицательный номер строки {rows_all.min()}")
+    if set(np.unique(part_all)) != {"train", "val_sel", "val_confirm"}:
+        raise SystemExit(f"части кэша целей: {sorted(set(part_all))}")
+    for nm_ in ("train", "val_sel", "val_confirm"):
+        want_n = int(((man.get("parts") or {}).get(nm_) or {}).get("n_rows", -1))
+        got_n = int((part_all == nm_).sum())
+        if want_n >= 0 and got_n != want_n:
+            raise SystemExit(f"часть {nm_}: {got_n} строк, в манифесте "
+                             f"{want_n}")
     orc = json.load(open(a.oracle))
     # ВХОДНЫЕ МАССИВЫ СВЕРЯЮТСЯ С ТЕМИ, НА КОТОРЫХ ПОСТРОЕН КЭШ ЦЕЛЕЙ.
     # Отпечатка одного .npz мало: `ktrue` определяет цели варианта `static`,
@@ -479,18 +509,38 @@ def main():
             f"или из другой ревизии дали бы другой промпт, то есть другой "
             f"вход, чем тот, на котором построены q0hat и цели")
     sm = json.load(open(stm_p))
-    if sm.get("keys_sha1") != keys_sha:
-        raise SystemExit(f"состояния собраны для ключей {sm.get('keys_sha1')}, "
-                         f"а наблюдения дают {keys_sha}: это другой набор")
-    if sm.get("dataset_revision") and cmeta.get("dataset_revision") and \
-            sm["dataset_revision"] != cmeta["dataset_revision"]:
-        raise SystemExit(f"состояния собраны на ревизии датасета "
-                         f"{sm['dataset_revision']}, кэш на "
-                         f"{cmeta['dataset_revision']}")
-    if int(sm.get("n_obs", -1)) < N:
-        raise SystemExit(f"состояний {sm.get('n_obs')} при {N} наблюдениях")
-    st_n = ((np.load(st_p)[:N] - STATE_Q01) / (STATE_Q99 - STATE_Q01)
-            * 2.0 - 1.0)
+    # ВСЕ ПОЛЯ ОБЯЗАТЕЛЬНЫ. Условие «сверить, если поле есть» здесь означало
+    # бы, что состояния из другой ревизии датасета принимаются молча — а они
+    # входят в промпт, то есть меняют вход целиком.
+    need_sm = ("keys_sha1", "n_obs", "dataset_repo", "dataset_revision",
+               "dim")
+    miss_sm = [k for k in need_sm if sm.get(k) is None]
+    if miss_sm:
+        raise SystemExit(f"в {stm_p} нет полей {miss_sm}: происхождение "
+                         f"состояний подтвердить нечем")
+    bad_sm = []
+    if sm["keys_sha1"] != keys_sha:
+        bad_sm.append(f"ключи {sm['keys_sha1']} против {keys_sha}")
+    if int(sm["n_obs"]) < N:
+        bad_sm.append(f"наблюдений {sm['n_obs']} при {N}")
+    for k_ in ("dataset_repo", "dataset_revision"):
+        if cmeta.get(k_) is None:
+            bad_sm.append(f"в мете исходного кэша нет {k_}")
+        elif str(sm[k_]) != str(cmeta[k_]):
+            bad_sm.append(f"{k_}: состояния {sm[k_]}, кэш {cmeta[k_]}")
+    if bad_sm:
+        raise SystemExit("состояния не от тех наблюдений: "
+                         + "; ".join(bad_sm))
+    ST_raw = np.load(st_p)
+    if ST_raw.ndim != 2 or ST_raw.shape[0] < N:
+        raise SystemExit(f"состояния формы {ST_raw.shape} при {N} наблюдениях")
+    if int(sm["dim"]) != int(ST_raw.shape[1]) or \
+            ST_raw.shape[1] != len(STATE_Q01):
+        raise SystemExit(f"размерность состояний {ST_raw.shape[1]}, в мете "
+                         f"{sm['dim']}, нормировка ждёт {len(STATE_Q01)}")
+    if not np.isfinite(ST_raw[:N]).all():
+        raise SystemExit("в состояниях есть nan или inf")
+    st_n = ((ST_raw[:N] - STATE_Q01) / (STATE_Q99 - STATE_Q01) * 2.0 - 1.0)
     print(f"  данные: {N} наблюдений, кадры {IMG.shape[1:]}, состояния "
           f"{st_n.shape[1]}-мерные из {st_p} (ключи {sm.get('keys_sha1')})")
 
@@ -627,6 +677,10 @@ def main():
         cq0 = torch.from_numpy(
             np.asarray(q0hat_c[sel]).astype(np.int64)).to(dev)
         d_q0 = int((q0 != cq0).sum())
+        # ЗНАМЕНАТЕЛЬ СЧИТАЕТСЯ ВСЕГДА. Прежде он увеличивался внутри ветки
+        # расхождения, то есть был числом позиций в «плохих» батчах, и доля
+        # завышалась во столько раз, во сколько батчей без расхождений больше.
+        q0_tot[0] += int(q0.numel())
         if d_q0:
             # ЗАПАС МЕЖДУ ПЕРВЫМ И ВТОРЫМ ЛОГИТОМ В РАСХОДЯЩИХСЯ ПОЗИЦИЯХ.
             # Он отличает грань от настоящего расхождения путей: при запасе
@@ -642,7 +696,6 @@ def main():
                 q0_margins_ok.append(float(marg[~m].median())
                                      if int((~m).sum()) else float("nan"))
             q0_bad[0] += d_q0
-            q0_tot[0] += int(q0.numel())
             frac = q0_bad[0] / max(q0_tot[0], 1)
             if frac > float(a.q0_tol):
                 raise SystemExit(
