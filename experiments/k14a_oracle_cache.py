@@ -530,6 +530,12 @@ def main():
                          "требование точного совпадения")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--q0", default="",
+                    help="канонический черновик K-14d (.npz)")
+    ap.add_argument("--gate-r", default="reports/k14d/gate_r.json")
+    ap.add_argument("--legacy-q0hat", action="store_true",
+                    help="взять q0 из сентябрьского кэша K-11a; результат "
+                         "помечается неканоническим")
     ap.add_argument("--out", default="data/k14a/oracle_cache.json")
     ap.add_argument("--run-id", default="",
                     help="номер запуска; сверяется бегунком, чтобы сравнение "
@@ -549,6 +555,7 @@ def main():
     import k11a_build_hicora_cache as k11a
     import k12b_protocol as kb
     import k13a_build_trajectory_basis as k13a
+    import k14_common as kc
     from k11c_train_d1 import split_episodes
     import actioncodec  # noqa: F401
     from utils import ACTION_Q01, ACTION_Q99, VisionLanguageActionProcessor
@@ -747,6 +754,39 @@ def main():
     print(f"  исходный кэш K-9a замкнут: ключи {keys_now}, K_true и split "
           f"совпали с заверенными, {N} действий")
 
+    # --- ИСТОЧНИК ЧЕРНОВИКА -------------------------------------------------
+    # Весь гейт считается ОТ ПРЕДСКАЗАННОГО q0: и A0, и цель q1*, и предел
+    # оракула. Значит, q0 входит в определение задачи. Сентябрьский q0hat
+    # сегодня побитово не повторяется, поэтому канонический путь — артефакт
+    # K-14d с доказательством Gate R.
+    if a.q0 and a.legacy_q0hat:
+        raise SystemExit("--q0 и --legacy-q0hat одновременно")
+    q0_prov = dict(q0_source="k11a_legacy", q0_canonical=False)
+    q0_defined = np.ones(N, bool)
+    if a.q0:
+        q0_arr, q0_defined, _q0man, q0_prov = kc.load_canonical_q0(
+            a.q0, gate_r_path=a.gate_r, n_obs=N, keys_sha=keys_now,
+            cache_meta_sha1=k11a.file_sha1(f"{a.cache}.meta.json"))
+        q0_prov["q0_canonical"] = True
+        q0_prov["diff_vs_k11a_positions"] = int(
+            (np.asarray(q0hat).astype(np.int64) != q0_arr).sum())
+        lo = int(q0_arr[q0_defined].min()) if q0_defined.any() else 0
+        hi = int(q0_arr[q0_defined].max()) if q0_defined.any() else 0
+        if lo < 0 or hi >= V:
+            raise SystemExit(f"канонический q0: коды в [{lo}, {hi}] при "
+                             f"словаре {V}")
+        q0hat = q0_arr
+        print(f"  черновик: канонический K-14d, план {q0_prov['plan_sha1']}, "
+              f"Gate R {q0_prov['gate_r_sha1']}, расхождение с кэшем K-11a "
+              f"{q0_prov['diff_vs_k11a_positions']} позиций")
+    elif a.legacy_q0hat:
+        print("  черновик: сентябрьский q0hat K-11a. Результат будет помечен "
+              "НЕКАНОНИЧЕСКИМ")
+    else:
+        raise SystemExit(
+            "не указан источник черновика. Гейт целиком считается от q0: "
+            "укажите --q0 <артефакт K-14d> или явно --legacy-q0hat")
+
     from depth_rvq_joint12 import code_contribution, nearest_code
 
     def decode(z, batch=256):
@@ -800,6 +840,10 @@ def main():
 
     res, extra, labels = {}, {}, {}
     for name, rows in parts.items():
+        if not q0_defined[np.asarray(rows, np.int64)].all():
+            raise SystemExit(
+                f"часть {name}: план K-14d не покрывает все её строки, "
+                f"черновик там не посчитан")
         k = torch.from_numpy(np.asarray(ktrue[rows]).astype(np.int64)).to(dev)
         q0 = torch.from_numpy(np.asarray(q0hat[rows]).astype(np.int64)).to(dev)
         act = torch.from_numpy(np.asarray(ACT[rows], np.float32)).to(dev)
@@ -977,7 +1021,7 @@ def main():
                train_heads=bool(go),
                gate_failures_capacity=bad_cap, gate_failures_action=bad_act,
                gate_notes=note, sample_seed=int(a.seed),
-               source_cache=src, source_cache_sha1=sha12(src),
+               source_cache=src, source_cache_sha1=sha12(src), **q0_prov,
                stamp_k11b=dict(script_sha1=stamp.get("script_sha1"),
                                identity_ok=stamp.get("identity_ok"),
                                arrays=stamp.get("arrays")),

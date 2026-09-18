@@ -157,10 +157,19 @@ def check_cache_manifest(man, *, oracle_sha1, cache, ckpt, expect_sha1):
             "oracle_sha1", "cache", "ckpt", "n_rows", "parts",
             "q0hat_sha1", "ktrue_sha1", "split_sha1", "cache_meta_sha1",
             "source_cache_sha1", "keys_sha1", "codebooks_sha1",
-            "codec_state_sha1", "decoder_probe")
+            "codec_state_sha1", "decoder_probe",
+            # ПРОИСХОЖДЕНИЕ ЧЕРНОВИКА. Цели равны Q1(z_e - E0[q0]), поэтому
+            # кэш целей без указания, какой это был q0, не определён.
+            "q0_source", "q0_canonical", "plan_sha1", "gate_r_sha1")
     miss = [k for k in need if man.get(k) is None]
     if miss:
         raise SystemExit(f"в манифесте кэша нет полей {miss}")
+    if man.get("q0_canonical") is not True:
+        raise SystemExit(
+            f"кэш целей построен от черновика {man.get('q0_source')}, а не от "
+            f"канонического q0 K-14d. Сентябрьский q0hat сегодня побитово не "
+            f"повторяется: обучаться на целях от него значит обучаться на "
+            f"мишени, которую нельзя пересчитать")
     if man["kind"] != "canonical_q1_targets":
         raise SystemExit(f"манифест описывает {man['kind']}, а нужен "
                          f"canonical_q1_targets")
@@ -251,17 +260,23 @@ def selftest():
     # --- МАНИФЕСТ КЭША ----------------------------------------------------
     man = dict(kind="canonical_q1_targets", labels_sha1="L", q1_sha1="Q",
                rows_sha1="R", device="cuda:0", oracle_sha1="O",
-               cache="data/c", ckpt="CK", n_rows=10, parts={},
+               cache="data/c", ckpt="CK", n_rows=10,
+               parts={nm: dict(n_rows=1) for nm in
+                      ("train", "val_sel", "val_confirm")},
                q0hat_sha1="A", ktrue_sha1="B", split_sha1="S",
                cache_meta_sha1="M", source_cache_sha1="SC", keys_sha1="K",
                codebooks_sha1="CB", codec_state_sha1="CS",
-               decoder_probe="DP")
+               decoder_probe="DP", q0_source="k14d_plan", q0_canonical=True,
+               plan_sha1="P", gate_r_sha1="GR")
     mk = dict(oracle_sha1="O", cache="data/c", ckpt="CK", expect_sha1="L")
     check_cache_manifest(man, **mk)
     for patch, why in ((dict(kind="other"), "canonical_q1_targets"),
                        (dict(labels_sha1="Z"), "labels_sha1"),
                        (dict(oracle_sha1="Z"), "артефакту гейта"),
-                       (dict(cache="d"), "cache")):
+                       (dict(cache="d"), "cache"),
+                       # ЦЕЛИ ОТ НЕВОСПРОИЗВОДИМОГО ЧЕРНОВИКА НЕ ПРИНИМАЮТСЯ
+                       (dict(q0_canonical=False, q0_source="k11a_legacy"),
+                        "канонического q0")):
         try:
             check_cache_manifest(dict(man, **patch), **mk)
         except SystemExit as e:
@@ -302,6 +317,9 @@ def main():
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--q1-cache", default="data/k14b/q1_cache")
     ap.add_argument("--oracle", default="reports/k14a/oracle_cache_cuda0.json")
+    ap.add_argument("--gate-r", default="reports/k14d/gate_r.json",
+                    help="доказательство воспроизводимости плана батчей; без "
+                         "него цели не определены однозначно")
     ap.add_argument("--cache", default="data/k11a_joint12")
     ap.add_argument("--joint-ckpt", default="data/k9d_ep3.pt")
     ap.add_argument("--ckpt",
@@ -371,6 +389,7 @@ def main():
     import hicora_vla as hv
     import k11a_build_hicora_cache as k11a
     import k12b_protocol as kb
+    import k14_common as kc
     from depth_rvq_joint12 import (make_joint_depth_rvq_class,
                                    code_contribution)
     from depth_rvq_vla import straight_through
@@ -443,11 +462,25 @@ def main():
     if set(np.unique(part_all)) != {"train", "val_sel", "val_confirm"}:
         raise SystemExit(f"части кэша целей: {sorted(set(part_all))}")
     for nm_ in ("train", "val_sel", "val_confirm"):
-        want_n = int(((man.get("parts") or {}).get(nm_) or {}).get("n_rows", -1))
-        got_n = int((part_all == nm_).sum())
-        if want_n >= 0 and got_n != want_n:
+        # ЧИСЛО СТРОК В МАНИФЕСТЕ ОБЯЗАТЕЛЬНО. Прежнее «сверить, если поле
+        # есть» означало «согласиться, если поля нет»: манифест без разбивки
+        # по частям проходил бы молча, и обучение шло бы на другом составе.
+        pm_ = ((man.get("parts") or {}).get(nm_) or {})
+        if pm_.get("n_rows") is None:
+            raise SystemExit(f"в манифесте кэша нет числа строк части {nm_}")
+        want_n, got_n = int(pm_["n_rows"]), int((part_all == nm_).sum())
+        if got_n != want_n:
             raise SystemExit(f"часть {nm_}: {got_n} строк, в манифесте "
                              f"{want_n}")
+    # АРТЕФАКТ GATE R ПЕРЕПРОВЕРЯЕТСЯ ЗДЕСЬ, а не принимается по отметке в
+    # манифесте кэша: отметка говорит лишь, что при сборке кэша он был.
+    gr_info = kc.check_gate_r(a.gate_r, expect_plan_sha1=man["plan_sha1"])
+    if gr_info["gate_r_sha1"] != man["gate_r_sha1"]:
+        raise SystemExit(f"Gate R {gr_info['gate_r_sha1']}, кэш целей "
+                         f"построен при {man['gate_r_sha1']}")
+    print(f"  Gate R: {a.gate_r}, план {gr_info['plan_sha1']}, порядки "
+          f"{gr_info['exec_order_seeds']}")
+
     orc = json.load(open(a.oracle))
     # ВХОДНЫЕ МАССИВЫ СВЕРЯЮТСЯ С ТЕМИ, НА КОТОРЫХ ПОСТРОЕН КЭШ ЦЕЛЕЙ.
     # Отпечатка одного .npz мало: `ktrue` определяет цели варианта `static`,
@@ -497,52 +530,14 @@ def main():
     IMG = np.load(img_p, mmap_mode="r")
     if IMG.shape[0] < N or IMG.dtype != np.uint8:
         raise SystemExit(f"кадры {IMG.shape} {IMG.dtype}: не те")
-    # СОСТОЯНИЯ ЛЕЖАТ РЯДОМ С ИСХОДНЫМ КЭШЕМ, А НЕ С ПРОИЗВОДНЫМ. У K-11a
-    # аргумент `--cache` означает исходный npz K-9a, и состояния привязаны к
-    # наблюдениям, а не к таблице отводов: `<src>.state.npy`.
-    st_p = src + ".state.npy"
-    stm_p = src + ".state.json"
-    if not (os.path.exists(st_p) and os.path.exists(stm_p)):
-        raise SystemExit(
-            f"нет {st_p}: состояния собираются K-11a рядом с ИСХОДНЫМ кэшем "
-            f"{src}. Пересобирать их здесь нельзя — собранные другим кодом "
-            f"или из другой ревизии дали бы другой промпт, то есть другой "
-            f"вход, чем тот, на котором построены q0hat и цели")
-    sm = json.load(open(stm_p))
-    # ВСЕ ПОЛЯ ОБЯЗАТЕЛЬНЫ. Условие «сверить, если поле есть» здесь означало
-    # бы, что состояния из другой ревизии датасета принимаются молча — а они
-    # входят в промпт, то есть меняют вход целиком.
-    need_sm = ("keys_sha1", "n_obs", "dataset_repo", "dataset_revision",
-               "dim")
-    miss_sm = [k for k in need_sm if sm.get(k) is None]
-    if miss_sm:
-        raise SystemExit(f"в {stm_p} нет полей {miss_sm}: происхождение "
-                         f"состояний подтвердить нечем")
-    bad_sm = []
-    if sm["keys_sha1"] != keys_sha:
-        bad_sm.append(f"ключи {sm['keys_sha1']} против {keys_sha}")
-    if int(sm["n_obs"]) < N:
-        bad_sm.append(f"наблюдений {sm['n_obs']} при {N}")
-    for k_ in ("dataset_repo", "dataset_revision"):
-        if cmeta.get(k_) is None:
-            bad_sm.append(f"в мете исходного кэша нет {k_}")
-        elif str(sm[k_]) != str(cmeta[k_]):
-            bad_sm.append(f"{k_}: состояния {sm[k_]}, кэш {cmeta[k_]}")
-    if bad_sm:
-        raise SystemExit("состояния не от тех наблюдений: "
-                         + "; ".join(bad_sm))
-    ST_raw = np.load(st_p)
-    if ST_raw.ndim != 2 or ST_raw.shape[0] < N:
-        raise SystemExit(f"состояния формы {ST_raw.shape} при {N} наблюдениях")
-    if int(sm["dim"]) != int(ST_raw.shape[1]) or \
-            ST_raw.shape[1] != len(STATE_Q01):
-        raise SystemExit(f"размерность состояний {ST_raw.shape[1]}, в мете "
-                         f"{sm['dim']}, нормировка ждёт {len(STATE_Q01)}")
-    if not np.isfinite(ST_raw[:N]).all():
-        raise SystemExit("в состояниях есть nan или inf")
-    st_n = ((ST_raw[:N] - STATE_Q01) / (STATE_Q99 - STATE_Q01) * 2.0 - 1.0)
+    # СОСТОЯНИЯ — через общий строгий загрузчик. Он один для K-14a, K-14b,
+    # K-14c и K-14d: три предыдущих раза одна и та же проверка писалась
+    # заново и каждый раз оказывалась fail-open по какому-нибудь полю.
+    st_n, sm, st_shas = kc.load_states(src, N, cmeta, keys_sha,
+                                       STATE_Q01, STATE_Q99)
     print(f"  данные: {N} наблюдений, кадры {IMG.shape[1:]}, состояния "
-          f"{st_n.shape[1]}-мерные из {st_p} (ключи {sm.get('keys_sha1')})")
+          f"{st_n.shape[1]}-мерные (ключи {sm.get('keys_sha1')}, "
+          f"sha {st_shas['state_npy']})")
 
     # --- модель -------------------------------------------------------------
     cfg = get_cfg(os.path.join(root, a.cfg_path))
