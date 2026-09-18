@@ -142,11 +142,17 @@ def check_stamp_match(stamp, orc, got_w, probe_now):
             bad.append(f"{nm}: в артефакте гейта нет отпечатка")
         elif cur != gat:
             bad.append(f"{nm}: сейчас {cur}, на гейте {gat}")
+    # ОТСУТСТВИЕ ПОЛЯ — ОТКАЗ, А НЕ СОГЛАСИЕ. Условие «сверить, если поле
+    # есть» проходит на артефакте, который этих отпечатков не несёт, и тогда
+    # кодек не сверяется вовсе. Это тот же fail-open, что уже ловился в
+    # сводке K-13c и в проверке keys_sha1.
     for nm, cur in (("codebooks_sha1", got_w.get("codebooks_sha1")),
                     ("codec_state_sha1", got_w.get("codec_state_sha1")),
                     ("decoder_probe_now", probe_now)):
         gat = orc.get(nm)
-        if gat is not None and str(cur) != str(gat):
+        if gat is None:
+            bad.append(f"{nm}: в артефакте гейта нет поля, сверить нечем")
+        elif str(cur) != str(gat):
             bad.append(f"{nm}: сейчас {cur}, на гейте {gat}")
     if bad:
         raise SystemExit("данные или кодек не те, на которых пройден Gate 2: "
@@ -261,6 +267,15 @@ def selftest():
         assert "нет отпечатков" in str(e), e
     else:
         raise AssertionError("артефакт без отпечатков массивов принят")
+    # ОТСУТСТВИЕ КАЖДОГО ИЗ ТРЁХ ОТПЕЧАТКОВ КОДЕКА — ОТКАЗ
+    for nm_ in ("codebooks_sha1", "codec_state_sha1", "decoder_probe_now"):
+        orc_miss = {k_: v_ for k_, v_ in orc_ok.items() if k_ != nm_}
+        try:
+            check_stamp_match(stamp_ok, orc_miss, gw, "PR")
+        except SystemExit as e:
+            assert f"{nm_}: в артефакте гейта нет поля" in str(e), (nm_, str(e))
+        else:
+            raise AssertionError(f"артефакт без {nm_} принят")
 
     print("самопроверка k14b_build_q1_cache пройдена")
 
@@ -299,6 +314,11 @@ def main():
     # что написано. Состояние записывается в манифест в любом случае.
     dirty = os.popen("git status --porcelain 2>/dev/null").read().strip()
     git_head = os.popen("git rev-parse HEAD 2>/dev/null").read().strip()
+    if not git_head:
+        raise SystemExit(
+            "не удалось определить git HEAD: канонический кэш обязан ссылаться "
+            "на коммит, которым построен, иначе поле git_head в манифесте "
+            "будет пустым и артефакт перестанет быть воспроизводимым")
     if dirty and not a.allow_dirty:
         raise SystemExit(
             f"рабочее дерево не чисто ({len(dirty.splitlines())} файлов). "
