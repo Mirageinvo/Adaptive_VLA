@@ -1,0 +1,21 @@
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+[robosuite WARNING] No private macro file found! (macros.py:53)
+[robosuite WARNING] It is recommended to use a private macro file (macros.py:54)
+[robosuite WARNING] To setup, run: python /home/docker_user/.local/lib/python3.11/site-packages/robosuite/scripts/setup_macros.py (macros.py:55)
+  привязка к Gate 2: reports/k14a/oracle_cache_cuda0.json, запуск 20260918T125631-140092, режим cuda:0
+Fetching 21 files:   0%|          | 0/21 [00:00<?, ?it/s]Fetching 21 files: 100%|██████████| 21/21 [00:00<00:00, 135717.08it/s]
+Vocabulary expanded. New size: 51328
+Note: Remember to resize model embeddings after loading, e.g., model.resize_token_embeddings(len(processor.tokenizer))
+  происхождение сверено с артефактом гейта: массивы K-11b, книги, веса кодека и проба декодера совпали; режим cuda:0
+  части: train 121100, val_sel 5795, val_confirm 8698. Подвыборки нет; финальная выборка не читается
+    train: 121100 строк, sha меток 88354bac0f0d, совпадает с истинной q1 у 68.4% позиций
+    val_sel: 5795 строк, sha меток 198bf2ec68ea, совпадает с истинной q1 у 40.3% позиций
+    val_confirm: 8698 строк, sha меток aee1a3844f40, совпадает с истинной q1 у 40.2% позиций
+    train: метки совпали с оракулом побитово на 4096 строках (sha ac993bf9901a, int32)
+    val_sel: метки совпали с оракулом побитово на 5795 строках (sha 198bf2ec68ea, int32)
+    val_confirm: метки совпали с оракулом побитово на 8698 строках (sha aee1a3844f40, int32)
+
+  кэш: data/k14b/q1_cache.npz (sha 9061f0da0dd3), манифест: data/k14b/q1_cache.manifest.json
+  всего 135593 строк, метки int32, канонический режим cuda:0

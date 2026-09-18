@@ -1,0 +1,121 @@
+{
+ "kind": "canonical_q1_targets",
+ "target_latent": "z_e = codec._encode(action)",
+ "device": "cuda:0",
+ "dtype": "int32",
+ "n_rows": 135593,
+ "parts": {
+  "train": {
+   "vocab": 2048,
+   "lo": 0,
+   "hi": 2047,
+   "frac_equal_static": 0.6842568125516102,
+   "n_rows": 121100,
+   "q1_sha1": "88354bac0f0d",
+   "rows_sha1": "5704fde7bfef"
+  },
+  "val_sel": {
+   "vocab": 2048,
+   "lo": 0,
+   "hi": 2047,
+   "frac_equal_static": 0.40250215703192405,
+   "n_rows": 5795,
+   "q1_sha1": "198bf2ec68ea",
+   "rows_sha1": "6a2a55971a47"
+  },
+  "val_confirm": {
+   "vocab": 2048,
+   "lo": 0,
+   "hi": 2046,
+   "frac_equal_static": 0.40171591170383997,
+   "n_rows": 8698,
+   "q1_sha1": "aee1a3844f40",
+   "rows_sha1": "6b9124490f6d"
+  }
+ },
+ "sampling": {
+  "train": {
+   "n_available": 121100,
+   "n_used": 121100,
+   "rows_sha1": "5704fde7bfef",
+   "episodes_sha1": "7931fa60c88b",
+   "n_episodes": 1293
+  },
+  "val_sel": {
+   "n_available": 5795,
+   "n_used": 5795,
+   "rows_sha1": "6a2a55971a47",
+   "episodes_sha1": "a7e0152816ae",
+   "n_episodes": 62
+  },
+  "val_confirm": {
+   "n_available": 8698,
+   "n_used": 8698,
+   "rows_sha1": "6b9124490f6d",
+   "episodes_sha1": "897e2bab3b70",
+   "n_episodes": 92
+  }
+ },
+ "split_seed": 61,
+ "sel_frac": 0.4,
+ "cache": "data/k11a_joint12",
+ "cache_meta_sha1": "403d355fd939",
+ "source_cache": "/home/malinin_aa/Adaptive_VLA/data/k9_teacher_150k.npz",
+ "source_cache_sha1": "3a4c6ef00fe8",
+ "keys_sha1": "d251ec1e0d9a",
+ "q0hat_sha1": "c4f5df34c1ed",
+ "ktrue_sha1": "9d3ad4062470",
+ "split_sha1": "9ea63363ba80",
+ "ckpt": "ZibinDong/SmolVLM2-2.2B-ActionCodec-BAR-LIBERO",
+ "vocab": 2048,
+ "codebooks_sha1": "fdb64717158e",
+ "codec_state_sha1": "f3f1b602491d",
+ "decoder_probe": "1dbcbe579a75",
+ "labels_npz": "q1_cache.npz",
+ "labels_sha1": "9061f0da0dd3",
+ "rows_sha1": "e1b046a9210c",
+ "q1_sha1": "af31382e8087",
+ "note": "только q1. Цели q2 строятся позже и отдельно для каждой обученной головы, от её ФАКТИЧЕСКОГО q1, а не от оракульного",
+ "oracle_artifact": "reports/k14a/oracle_cache_cuda0.json",
+ "oracle_sha1": "69491ccb8aa6",
+ "oracle_run_id": "20260918T125631-140092",
+ "checked_against_oracle": {
+  "train": {
+   "rows_sha1": "88272cc404e8",
+   "q1_sha1": "ac993bf9901a",
+   "dtype": "int32",
+   "n": 4096
+  },
+  "val_sel": {
+   "rows_sha1": "6a2a55971a47",
+   "q1_sha1": "198bf2ec68ea",
+   "dtype": "int32",
+   "n": 5795
+  },
+  "val_confirm": {
+   "rows_sha1": "6b9124490f6d",
+   "q1_sha1": "aee1a3844f40",
+   "dtype": "int32",
+   "n": 8698
+  }
+ },
+ "torch_version": "2.4.1+cu124",
+ "cuda_version": "12.4",
+ "gpu": "Tesla V100-SXM2-32GB",
+ "tf32_matmul": false,
+ "tf32_cudnn": true,
+ "code_version": {
+  "k14b_build_q1_cache.py": "436541485e67",
+  "depth_rvq_joint12.py": "59c8d4814674",
+  "k14a_oracle_cache.py": "f26ec96de87b",
+  "k11a_build_hicora_cache.py": "f372e6d2e7f7",
+  "k11c_train_d1.py": "4e64cd64bcd1",
+  "k12b_protocol.py": "1d62bcdfe76c",
+  "k13a_build_trajectory_basis.py": "c284215ac0de"
+ },
+ "actioncodec_sha1": "4406ebab946d",
+ "git_head": "182c63e7079fc84c6e60d4e30ce36476da267362",
+ "git_dirty": false,
+ "git_dirty_files": 0,
+ "script_sha1": "97abcf5298c1"
+}
