@@ -130,6 +130,26 @@ def main():
     import k12b_protocol as kb
     from k14a_oracle_cache import err_blocks
     from depth_rvq_joint12 import code_contribution, _project_fp32
+    # LIBERO НУЖЕН ДАЖЕ ЗДЕСЬ. `utils` из actioncodec тянет `libero.libero` на
+    # уровне импорта модуля, хотя этот скрипт симулятор не запускает. Обычно
+    # путь задаётся снаружи через PYTHONPATH; здесь он подставляется сам, но с
+    # явным сообщением — прятать требование окружения нельзя, о нём надо
+    # знать. Editable-установка в этом окружении не работает, поэтому именно
+    # путь, а не пакет.
+    try:
+        import libero  # noqa: F401
+    except ModuleNotFoundError:
+        lp = os.environ.get("LIBERO_PATH") or os.path.expanduser("~/LIBERO")
+        if not os.path.isdir(lp):
+            raise SystemExit(
+                f"нет модуля libero и нет каталога {lp}: задайте PYTHONPATH "
+                f"или LIBERO_PATH. Он нужен потому, что utils из actioncodec "
+                f"импортирует libero.libero, а не потому, что здесь "
+                f"запускается симулятор")
+        sys.path.insert(0, lp)
+        os.environ.setdefault("MUJOCO_GL", "egl")
+        print(f"  LIBERO подставлен из {lp} (utils импортирует его на уровне "
+              f"модуля)")
     import actioncodec  # noqa: F401
     from utils import ACTION_Q01, ACTION_Q99, VisionLanguageActionProcessor
 
