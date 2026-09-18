@@ -76,6 +76,84 @@ def check_manifest(man, want):
     return True
 
 
+def check_outputs_absent(paths, overwrite):
+    """Канонический кэш неизменяем. ПРОВЕРЯЕТСЯ ДО СЧЁТА, а не после.
+
+    Проверка в конце стоила бы получаса работы, чтобы затем отказать: все
+    135 593 строки были бы закодированы впустую.
+    """
+    ex = [p for p in paths if os.path.exists(p)]
+    if ex and not overwrite:
+        raise SystemExit(
+            f"уже существует: {ex}. Канонический кэш не перезаписывается — "
+            f"обученные головы ссылаются на его sha, и молчаливая перезапись "
+            f"поменяла бы задачу под ними. Укажите --overwrite явно или "
+            f"другое имя --out")
+    return True
+
+
+def check_oracle(orc, *, device, ckpt, cache, split_seed, sel_frac):
+    """Артефакт пройденного Gate 2: состав и режим.
+
+    RUN_ID ОБЯЗАТЕЛЕН. Артефакт без него снят версией до введения номера
+    запуска, и связать его с конкретным прогоном нельзя — а именно на эту
+    связь опирается вся привязка кэша.
+    """
+    bad = []
+    if not orc.get("run_id"):
+        bad.append("нет run_id: артефакт снят версией до его введения и с "
+                   "конкретным прогоном не связан")
+    for k in ("latent_capacity_ok", "action_oracle_ok",
+              "dynamic_q1_relabeling_supported"):
+        if not orc.get(k):
+            bad.append(f"{k} = {orc.get(k)}")
+    if str(orc.get("device")) != str(device):
+        bad.append(f"гейт пройден на {orc.get('device')}, кэш строится на "
+                   f"{device}")
+    if float(orc.get("probe_code_disagree", 1.0)) != 0.0:
+        bad.append(f"проба кодирования {orc.get('probe_code_disagree')}")
+    if not orc.get("decoder_probe_matches_cache", False):
+        bad.append("поведение декодера не совпадало с кэшем")
+    for k, want in (("ckpt", ckpt), ("cache", cache),
+                    ("split_seed", split_seed), ("sel_frac", sel_frac)):
+        if str(orc.get(k)) != str(want):
+            bad.append(f"{k}: {orc.get(k)} против {want}")
+    if bad:
+        raise SystemExit("артефакт Gate 2 непригоден: " + "; ".join(bad))
+    return True
+
+
+def check_stamp_match(stamp, orc, got_w, probe_now):
+    """Те ли САМЫЕ массивы и тот ли кодек, на которых пройден гейт.
+
+    Совпадения с текущим заверением K-11b мало: заверение могло быть
+    переснято на других массивах. Сверять надо с отпечатками, записанными В
+    АРТЕФАКТЕ ГЕЙТА. Иначе q0hat, изменённый вне контрольных строк, прошёл бы
+    и побитовую сверку меток, и заверение, а полный train получил бы другие
+    цели.
+    """
+    go = (orc.get("stamp_k11b") or {}).get("arrays") or {}
+    if not go:
+        raise SystemExit("в артефакте гейта нет отпечатков массивов K-11b")
+    bad = []
+    for nm in ("q0hat", "ktrue", "split", "codebooks"):
+        cur, gat = (stamp.get("arrays") or {}).get(nm), go.get(nm)
+        if not gat:
+            bad.append(f"{nm}: в артефакте гейта нет отпечатка")
+        elif cur != gat:
+            bad.append(f"{nm}: сейчас {cur}, на гейте {gat}")
+    for nm, cur in (("codebooks_sha1", got_w.get("codebooks_sha1")),
+                    ("codec_state_sha1", got_w.get("codec_state_sha1")),
+                    ("decoder_probe_now", probe_now)):
+        gat = orc.get(nm)
+        if gat is not None and str(cur) != str(gat):
+            bad.append(f"{nm}: сейчас {cur}, на гейте {gat}")
+    if bad:
+        raise SystemExit("данные или кодек не те, на которых пройден Gate 2: "
+                         + "; ".join(bad))
+    return True
+
+
 def selftest():
     q0 = np.zeros((5, 16), np.int64)
     kt = np.zeros((5, 16), np.int64)
@@ -107,6 +185,83 @@ def selftest():
         assert "нет полей" in str(e), e
     else:
         raise AssertionError("отсутствующее поле пропущено")
+    # --- НЕИЗМЕНЯЕМОСТЬ ВЫХОДА: отказ ДО счёта ---------------------------
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as _td:
+        p1 = os.path.join(_td, "q1_cache.npz")
+        p2 = os.path.join(_td, "q1_cache.manifest.json")
+        check_outputs_absent((p1, p2), False)
+        open(p1, "wb").close()
+        try:
+            check_outputs_absent((p1, p2), False)
+        except SystemExit as e:
+            assert "не перезаписывается" in str(e), e
+        else:
+            raise AssertionError("существующий кэш не отвергнут")
+        check_outputs_absent((p1, p2), True)
+        open(p2, "w").close()
+        try:
+            check_outputs_absent((p1, p2), False)
+        except SystemExit as e:
+            assert "q1_cache.npz" in str(e) and "manifest" in str(e), e
+        else:
+            raise AssertionError("существующий манифест не отвергнут")
+
+    # --- АРТЕФАКТ ГЕЙТА: состав и режим ----------------------------------
+    good = dict(run_id="R1", latent_capacity_ok=True, action_oracle_ok=True,
+                dynamic_q1_relabeling_supported=True, device="cuda:0",
+                probe_code_disagree=0.0, decoder_probe_matches_cache=True,
+                ckpt="CK", cache="data/c", split_seed=61, sel_frac=0.4)
+    kw = dict(device="cuda:0", ckpt="CK", cache="data/c", split_seed=61,
+              sel_frac=0.4)
+    check_oracle(good, **kw)
+    for patch, why in (({"run_id": None}, "нет run_id"),
+                       ({"action_oracle_ok": False}, "action_oracle_ok"),
+                       ({"device": "cpu"}, "гейт пройден на cpu"),
+                       ({"probe_code_disagree": 0.01}, "проба кодирования"),
+                       ({"decoder_probe_matches_cache": False},
+                        "не совпадало"),
+                       ({"cache": "data/other"}, "cache"),
+                       ({"sel_frac": 0.5}, "sel_frac")):
+        try:
+            check_oracle(dict(good, **patch), **kw)
+        except SystemExit as e:
+            assert why in str(e), (why, str(e))
+        else:
+            raise AssertionError(f"артефакт гейта принят при: {why}")
+
+    # --- ТЕ ЖЕ МАССИВЫ И ТОТ ЖЕ КОДЕК, ЧТО НА ГЕЙТЕ ----------------------
+    arrs = {"q0hat": "A", "ktrue": "B", "split": "C", "codebooks": "D"}
+    stamp_ok = dict(arrays=dict(arrs))
+    orc_ok = dict(stamp_k11b=dict(arrays=dict(arrs)),
+                  codebooks_sha1="CB", codec_state_sha1="CS",
+                  decoder_probe_now="PR")
+    gw = dict(codebooks_sha1="CB", codec_state_sha1="CS")
+    check_stamp_match(stamp_ok, orc_ok, gw, "PR")
+    # q0hat изменён ВНЕ контрольных строк: побитовая сверка меток его не
+    # поймает, а эта проверка обязана.
+    try:
+        check_stamp_match(dict(arrays=dict(arrs, q0hat="X")), orc_ok, gw, "PR")
+    except SystemExit as e:
+        assert "q0hat" in str(e), e
+    else:
+        raise AssertionError("подменённый q0hat принят")
+    for gw_, pr_, why in ((dict(gw, codebooks_sha1="Z"), "PR", "codebooks"),
+                          (dict(gw, codec_state_sha1="Z"), "PR", "codec_state"),
+                          (gw, "ZZ", "decoder_probe_now")):
+        try:
+            check_stamp_match(stamp_ok, orc_ok, gw_, pr_)
+        except SystemExit as e:
+            assert why in str(e), (why, str(e))
+        else:
+            raise AssertionError(f"принято расхождение по {why}")
+    try:
+        check_stamp_match(stamp_ok, {}, gw, "PR")
+    except SystemExit as e:
+        assert "нет отпечатков" in str(e), e
+    else:
+        raise AssertionError("артефакт без отпечатков массивов принят")
+
     print("самопроверка k14b_build_q1_cache пройдена")
 
 
@@ -125,6 +280,9 @@ def main():
     ap.add_argument("--oracle", default="reports/k14a/oracle_cache_cuda0.json",
                     help="артефакт пройденного Gate 2: кэш меток обязан "
                          "строиться на тех же данных и в том же режиме")
+    ap.add_argument("--allow-dirty", action="store_true",
+                    help="строить канонический кэш при незакоммиченных "
+                         "изменениях (по умолчанию отказ)")
     ap.add_argument("--overwrite", action="store_true",
                     help="перезаписать существующий канонический кэш")
     ap.add_argument("--out", default="data/k14b/q1_cache")
@@ -132,6 +290,21 @@ def main():
     if a.selftest:
         selftest()
         return 0
+
+    npz_p, man_p = a.out + ".npz", a.out + ".manifest.json"
+    check_outputs_absent((npz_p, man_p), a.overwrite)
+
+    # ЧИСТОЕ ДЕРЕВО ДЛЯ КАНОНИЧЕСКОГО АРТЕФАКТА. Кэш будет жить дольше этой
+    # рабочей копии, и «построен таким-то коммитом» должно означать ровно то,
+    # что написано. Состояние записывается в манифест в любом случае.
+    dirty = os.popen("git status --porcelain 2>/dev/null").read().strip()
+    git_head = os.popen("git rev-parse HEAD 2>/dev/null").read().strip()
+    if dirty and not a.allow_dirty:
+        raise SystemExit(
+            f"рабочее дерево не чисто ({len(dirty.splitlines())} файлов). "
+            f"Канонический кэш ссылался бы на коммит {git_head or '?'}, не "
+            f"соответствующий тому, чем он построен. Закоммитьте изменения "
+            f"или укажите --allow-dirty осознанно:\n{dirty[:400]}")
 
     here = os.path.dirname(os.path.abspath(__file__))
     root = os.path.abspath(a.root)
@@ -183,27 +356,8 @@ def main():
             f"нет {a.oracle}: кэш меток обязан ссылаться на артефакт "
             f"пройденного Gate 2, иначе он ни к чему не привязан")
     orc = json.load(open(a.oracle))
-    for k_ in ("latent_capacity_ok", "action_oracle_ok",
-               "dynamic_q1_relabeling_supported"):
-        if not orc.get(k_):
-            raise SystemExit(f"{a.oracle}: {k_} = {orc.get(k_)}. Кэш меток "
-                             f"строится только после пройденного Gate 2")
-    if str(orc.get("device")) != str(dev):
-        raise SystemExit(
-            f"Gate 2 пройден на {orc.get('device')}, а кэш строится на {dev}. "
-            f"Канонический режим — тот, в котором пройден гейт")
-    if float(orc.get("probe_code_disagree", 1.0)) != 0.0:
-        raise SystemExit(f"{a.oracle}: проба кодирования дала "
-                         f"{orc.get('probe_code_disagree')}, а не ноль")
-    if not orc.get("decoder_probe_matches_cache", False):
-        raise SystemExit(f"{a.oracle}: поведение декодера не совпадало с "
-                         f"кэшем — этот артефакт не канонический")
-    for k_ in ("ckpt", "cache", "split_seed", "sel_frac"):
-        want_ = {"ckpt": a.ckpt, "cache": a.cache,
-                 "split_seed": a.split_seed, "sel_frac": a.sel_frac}[k_]
-        if str(orc.get(k_)) != str(want_):
-            raise SystemExit(f"{a.oracle}: {k_} = {orc.get(k_)}, здесь "
-                             f"{want_}")
+    check_oracle(orc, device=dev, ckpt=a.ckpt, cache=a.cache,
+                 split_seed=a.split_seed, sel_frac=a.sel_frac)
     print(f"  привязка к Gate 2: {a.oracle}, запуск {orc.get('run_id')}, "
           f"режим {orc.get('device')}")
 
@@ -267,8 +421,9 @@ def main():
             f"(в кэше {meta.get('decoder_probe')}, сейчас {probe_now}). Кэш "
             f"меток обязан строиться в ТОМ ЖЕ режиме, в каком пройден гейт "
             f"K-14a: устройство {dev}")
-    print(f"  происхождение сверено: кэш {a.cache}, кодек {got_w}, "
-          f"канонический режим {dev}")
+    check_stamp_match(stamp, orc, got_w, probe_now)
+    print(f"  происхождение сверено с артефактом гейта: массивы K-11b, книги, "
+          f"веса кодека и проба декодера совпали; режим {dev}")
 
     # --- части: те же, что в K-14a -----------------------------------------
     parts, sample_meta = k14a.build_parts(
@@ -361,15 +516,7 @@ def main():
         raise SystemExit("строки повторяются между частями")
 
     os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
-    npz = a.out + ".npz"
-    # КАНОНИЧЕСКИЙ КЭШ НЕИЗМЕНЯЕМ. Перезаписать его молча значит поменять
-    # задачу под уже обученными головами: их чекпойнты ссылаются на sha,
-    # которого больше нет.
-    if os.path.exists(npz) and not a.overwrite:
-        raise SystemExit(
-            f"{npz} уже существует. Канонический кэш не перезаписывается: "
-            f"обученные головы ссылаются на его sha. Если он действительно "
-            f"устарел, укажите --overwrite явно или другое имя --out")
+    npz = npz_p
     tmp = npz + f".tmp.{os.getpid()}"
     with open(tmp, "wb") as fh:
         np.savez_compressed(fh, rows=rows_all, q1=q1_all, part=part_all)
@@ -425,10 +572,11 @@ def main():
             os.path.join(here, "k13a_build_trajectory_basis.py")]),
         actioncodec_sha1=sha12(os.path.join(
             root, "actioncodec", "rvq.py")),
-        git_head=os.popen("git rev-parse HEAD 2>/dev/null").read().strip()
-        or None,
+        git_head=git_head or None,
+        git_dirty=bool(dirty),
+        git_dirty_files=len(dirty.splitlines()) if dirty else 0,
         script_sha1=sha12(os.path.abspath(__file__)))
-    mp = a.out + ".manifest.json"
+    mp = man_p
     tmpm = mp + f".tmp.{os.getpid()}"
     json.dump(man, open(tmpm, "w"), ensure_ascii=False, indent=1, default=str)
     os.replace(tmpm, mp)
