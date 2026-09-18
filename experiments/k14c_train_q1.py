@@ -149,8 +149,15 @@ def restore(named, snap):
 
 def check_cache_manifest(man, *, oracle_sha1, cache, ckpt, expect_sha1):
     """Кэш целей обязан быть тем, что построен на данных пройденного гейта."""
+    # ВСЕ ОТПЕЧАТКИ ОБЯЗАТЕЛЬНЫ. Условие «сверить, если поле есть» означает
+    # «согласиться, если отпечатка нет», и это уже четвёртый случай того же
+    # шаблона в проекте. Поля перечислены здесь, а не проверяются по месту,
+    # чтобы забыть одно было невозможно.
     need = ("kind", "labels_sha1", "q1_sha1", "rows_sha1", "device",
-            "oracle_sha1", "cache", "ckpt", "n_rows", "parts")
+            "oracle_sha1", "cache", "ckpt", "n_rows", "parts",
+            "q0hat_sha1", "ktrue_sha1", "split_sha1", "cache_meta_sha1",
+            "source_cache_sha1", "keys_sha1", "codebooks_sha1",
+            "codec_state_sha1", "decoder_probe")
     miss = [k for k in need if man.get(k) is None]
     if miss:
         raise SystemExit(f"в манифесте кэша нет полей {miss}")
@@ -244,7 +251,11 @@ def selftest():
     # --- МАНИФЕСТ КЭША ----------------------------------------------------
     man = dict(kind="canonical_q1_targets", labels_sha1="L", q1_sha1="Q",
                rows_sha1="R", device="cuda:0", oracle_sha1="O",
-               cache="data/c", ckpt="CK", n_rows=10, parts={})
+               cache="data/c", ckpt="CK", n_rows=10, parts={},
+               q0hat_sha1="A", ktrue_sha1="B", split_sha1="S",
+               cache_meta_sha1="M", source_cache_sha1="SC", keys_sha1="K",
+               codebooks_sha1="CB", codec_state_sha1="CS",
+               decoder_probe="DP")
     mk = dict(oracle_sha1="O", cache="data/c", ckpt="CK", expect_sha1="L")
     check_cache_manifest(man, **mk)
     for patch, why in ((dict(kind="other"), "canonical_q1_targets"),
@@ -257,13 +268,17 @@ def selftest():
             assert why in str(e), (why, str(e))
         else:
             raise AssertionError(f"манифест принят при: {why}")
-    try:
-        check_cache_manifest({k: v for k, v in man.items()
-                              if k != "labels_sha1"}, **mk)
-    except SystemExit as e:
-        assert "нет полей" in str(e), e
-    else:
-        raise AssertionError("манифест без labels_sha1 принят")
+    # ОТСУТСТВИЕ ЛЮБОГО ОБЯЗАТЕЛЬНОГО ПОЛЯ — ОТКАЗ. Перечислять их по одному
+    # значит проверить, что список в схеме действительно работает, а не
+    # выглядит работающим.
+    for key in sorted(man):
+        try:
+            check_cache_manifest({k: v for k, v in man.items() if k != key},
+                                 **mk)
+        except SystemExit as e:
+            assert "нет полей" in str(e) and key in str(e), (key, str(e))
+        else:
+            raise AssertionError(f"манифест без {key} принят")
     print("самопроверка k14c_train_q1 пройдена")
 
 
@@ -360,8 +375,14 @@ def main():
 
     dev = torch.device(a.device)
     dt = getattr(torch, a.dtype)
-    torch.manual_seed(a.seed)
-    np.random.seed(a.seed)
+    # СИД ЗАПУСКА НЕ ДОЛЖЕН ДОХОДИТЬ ДО ИНИЦИАЛИЗАЦИИ. Поздние головы и так
+    # собираются детерминированно, но глобальный `manual_seed(a.seed)`
+    # оставлял канал, по которому два прогона могли бы разойтись не только
+    # порядком данных. Глобальные генераторы фиксируются постоянным значением,
+    # а сид запуска применяется РОВНО в одном месте — к порядку батчей.
+    INIT_SEED = 0
+    torch.manual_seed(INIT_SEED)
+    np.random.seed(INIT_SEED)
     max_act_q = np.maximum(np.abs(ACTION_Q01), np.abs(ACTION_Q99))
     H_EXEC = 8
 
@@ -385,12 +406,13 @@ def main():
     for nm, key in (("q0hat", "q0hat_sha1"), ("ktrue", "ktrue_sha1"),
                     ("split", "split_sha1")):
         got_ = k11a.file_sha1(f"{a.cache}.{nm}.npy")
-        if man.get(key) and got_ != man[key]:
+        if got_ != man[key]:
             raise SystemExit(f"{nm}.npy имеет sha {got_}, кэш целей построен "
                              f"на {man[key]}")
-    if man.get("cache_meta_sha1") and \
-            k11a.file_sha1(f"{a.cache}.meta.json") != man["cache_meta_sha1"]:
-        raise SystemExit("meta.json кэша изменился после построения целей")
+    mm_ = k11a.file_sha1(f"{a.cache}.meta.json")
+    if mm_ != man["cache_meta_sha1"]:
+        raise SystemExit(f"meta.json кэша имеет sha {mm_}, цели построены на "
+                         f"{man['cache_meta_sha1']}")
     print(f"  цели: {npz_p}, sha {man['labels_sha1']}, построены в режиме "
           f"{man['device']} по гейту {man['oracle_sha1']}")
 
@@ -407,10 +429,13 @@ def main():
         raise SystemExit(f"ключи наблюдений {keys_sha} против "
                          f"{meta.get('keys_sha1')}")
     src_sha = sha12(src)
-    if man.get("source_cache_sha1") and src_sha != man["source_cache_sha1"]:
+    if src_sha != man["source_cache_sha1"]:
         raise SystemExit(f"исходный кэш K-9a {src_sha}, цели построены на "
                          f"{man['source_cache_sha1']}: массив действий "
                          f"определяет и цели, и потерю действия")
+    if keys_sha != man["keys_sha1"]:
+        raise SystemExit(f"ключи наблюдений {keys_sha}, цели построены на "
+                         f"{man['keys_sha1']}")
     ACT = np.asarray(d["action"])[:N]
     offs = np.asarray(d["pos_offset"])[:N].astype(np.int64)
     tsk = np.asarray(d["task"])[:N]
@@ -486,12 +511,14 @@ def main():
         raise SystemExit("книги кодека разошлись с кэшем")
     cs_now = k11a.state_sha1(codec)
     dp_now = k11a.decoder_probe(codec, Ecur.to(dev), dev)
-    for nm, cur, want in (("codec_state_sha1", cs_now,
-                           man.get("codec_state_sha1")),
-                          ("decoder_probe", dp_now, man.get("decoder_probe"))):
-        if want and cur != want:
+    cb_now = arr_sha(np.asarray(E, np.float32))
+    for nm, cur, want in (("codebooks_sha1", cb_now, man["codebooks_sha1"]),
+                          ("codec_state_sha1", cs_now,
+                           man["codec_state_sha1"]),
+                          ("decoder_probe", dp_now, man["decoder_probe"])):
+        if cur != want:
             raise SystemExit(f"{nm}: сейчас {cur}, цели построены при {want}")
-    print(f"  кодек сверен: веса {cs_now}, проба {dp_now}")
+    print(f"  кодек сверен: книги {cb_now}, веса {cs_now}, проба {dp_now}")
 
     # ПРОДОЛЖЕНИЯ НЕТ НАМЕРЕННО. Оно требовало бы переносить состояние Adam,
     # порядок данных, историю и факт уже открытой подтверждающей половины;
@@ -682,11 +709,13 @@ def main():
           f"восстановлены и сверены, sha {sel_sha}")
 
     if a.smoke:
-        # ПОДТВЕРЖДАЮЩАЯ ПОЛОВИНА В ЭТОМ РЕЖИМЕ НЕ ЧИТАЕТСЯ ВОВСЕ. Её нет
-        # даже в наборах: проверка связности не имеет права расходовать
-        # единственное открытие.
-        print("  РЕЖИМ SMOKE: подтверждающая половина не читалась, Gate 4 не "
-              "считался, эта голова для эксперимента непригодна")
+        # СТРОКИ ПОДТВЕРЖДАЮЩЕЙ ПОЛОВИНЫ НЕ ОБРАЗУЮТ НАБОРА И НЕ ПРОХОДЯТ
+        # ЧЕРЕЗ МОДЕЛЬ; метрика по ним не вычисляется. Сам файл целей и
+        # артефакт гейта, разумеется, читаются целиком — но ни одно
+        # наблюдение этой половины моделью не обработано.
+        print("  РЕЖИМ SMOKE: строки подтверждающей половины через модель не "
+              "проходили, метрика по ним не считалась, Gate 4 не вычислялся; "
+              "эта голова для эксперимента непригодна")
         if a.out:
             torch.save(dict(kind="smoke", stage="q1", variant=a.variant,
                             seed=int(a.seed), history=hist,
@@ -723,7 +752,7 @@ def main():
         q1_manifest_sha1=sha12(man_p), source_cache_sha1=src_sha,
         q0hat_sha1=k11a.file_sha1(f"{a.cache}.q0hat.npy"),
         ktrue_sha1=k11a.file_sha1(f"{a.cache}.ktrue.npy"),
-        codebooks_sha1=man.get("codebooks_sha1"),
+        codebooks_sha1=cb_now,
         codec_state_sha1=cs_now, decoder_probe=dp_now,
         initial_trainable_state_sha1=init_sha,
         selected_state_sha1=sel_sha,
@@ -732,10 +761,23 @@ def main():
         lr=a.lr, wd=a.wd, batch=int(a.batch),
         lambda_action=a.lambda_action, lambda_fb=a.lambda_fb,
         grip_weight=a.grip_weight, device=str(dev), dtype=a.dtype,
+        git_head=(os.popen("git rev-parse HEAD 2>/dev/null").read().strip()
+                  or None),
+        git_dirty=bool(os.popen("git status --porcelain 2>/dev/null")
+                       .read().strip()),
+        # В ВЕРСИЮ КОДА ВХОДИТ ВСЁ, ЧТО ВЛИЯЕТ НА ОБУЧЕНИЕ. Прежде сюда не
+        # попадали joint12_vla.py (ранний выход и его норма), depth_rvq_vla.py
+        # (straight_through и CodeFeedback) и bar.py (сегментированный проход),
+        # хотя изменение любого из них меняет обученную голову.
         code_version=kb.code_version([
             os.path.abspath(__file__),
             os.path.join(here, "depth_rvq_joint12.py"),
+            os.path.join(here, "depth_rvq_vla.py"),
+            os.path.join(here, "joint12_vla.py"),
             os.path.join(here, "k14b_build_q1_cache.py")]),
+        bar_sha1=sha12(os.path.join(root, "src", "smolvla", "bar.py"))
+        if os.path.exists(os.path.join(root, "src", "smolvla", "bar.py"))
+        else None,
         script_sha1=sha12(os.path.abspath(__file__)))
     tmp = out_p + f".tmp.{os.getpid()}"
     torch.save(ck, tmp)
