@@ -160,7 +160,8 @@ def check_cache_manifest(man, *, oracle_sha1, cache, ckpt, expect_sha1):
             "codec_state_sha1", "decoder_probe",
             # ПРОИСХОЖДЕНИЕ ЧЕРНОВИКА. Цели равны Q1(z_e - E0[q0]), поэтому
             # кэш целей без указания, какой это был q0, не определён.
-            "q0_source", "q0_canonical", "plan_sha1", "gate_r_sha1")
+            "q0_source", "q0_canonical", "plan_sha1", "plan_batch",
+            "gate_r_sha1", "q0_manifest_sha1", "q0_npz_sha1", "q0_run_id")
     miss = [k for k in need if man.get(k) is None]
     if miss:
         raise SystemExit(f"в манифесте кэша нет полей {miss}")
@@ -267,7 +268,8 @@ def selftest():
                cache_meta_sha1="M", source_cache_sha1="SC", keys_sha1="K",
                codebooks_sha1="CB", codec_state_sha1="CS",
                decoder_probe="DP", q0_source="k14d_plan", q0_canonical=True,
-               plan_sha1="P", gate_r_sha1="GR")
+               plan_sha1="P", plan_batch=8, gate_r_sha1="GR",
+               q0_manifest_sha1="QM", q0_npz_sha1="QN", q0_run_id="QR")
     mk = dict(oracle_sha1="O", cache="data/c", ckpt="CK", expect_sha1="L")
     check_cache_manifest(man, **mk)
     for patch, why in ((dict(kind="other"), "canonical_q1_targets"),
@@ -295,21 +297,6 @@ def selftest():
         else:
             raise AssertionError(f"манифест без {key} принят")
     print("самопроверка k14c_train_q1 пройдена")
-
-
-def group_by_offset(rows, offs, batch):
-    """Батчи из строк с ОДИНАКОВЫМ смещением позиций.
-
-    `build_inputs` принимает одно `position_offset` на батч, поэтому смешивать
-    строки разных задач в одном батче нельзя: часть получила бы чужое
-    смещение и читала бы вход не с той позиции.
-    """
-    out = []
-    for po in sorted(set(int(x) for x in offs[rows])):
-        sel = rows[offs[rows] == po]
-        for i in range(0, len(sel), batch):
-            out.append((po, sel[i:i + batch]))
-    return out
 
 
 def main():
@@ -343,10 +330,9 @@ def main():
     ap.add_argument("--grip-weight", type=float, default=1.0,
                     help="вес канала схвата в потере действия; фиксируется "
                          "до первого запуска")
-    ap.add_argument("--q0-tol", type=float, default=0.0,
-                    help="допустимая доля позиций, где q0 модели расходится "
-                         "с кэшем. Ноль по умолчанию: допуск меняет "
-                         "протокол и должен быть зарегистрирован до прогона")
+    ap.add_argument("--q0", default="data/k14d/q0_b8_e0.npz",
+                    help="канонический черновик K-14d: ТОТ ЖЕ массив, от "
+                         "которого построены цели и посчитан Gate 2")
     ap.add_argument("--q0-audit", action="store_true",
                     help="только измерить расхождение q0 и запас логитов, "
                          "не обучая")
@@ -355,7 +341,11 @@ def main():
                          "подтверждающая половина НЕ ЧИТАЕТСЯ вовсе, Gate 4 "
                          "не считается, результат не годится как голова")
     ap.add_argument("--limit", type=int, default=0,
-                    help="ограничить train и val_sel (только со --smoke)")
+                    help="ограничить smoke ЦЕЛЫМИ каноническими батчами "
+                         "(число батчей на часть, только со --smoke). "
+                         "Урезание по строкам с последующей перенарезкой "
+                         "дало бы неполные батчи, которых нет в плане, а "
+                         "значит другой q0")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--dtype", default="float16")
     ap.add_argument("--out", default="")
@@ -479,8 +469,18 @@ def main():
     if gr_info["gate_r_sha1"] != man["gate_r_sha1"]:
         raise SystemExit(f"Gate R {gr_info['gate_r_sha1']}, кэш целей "
                          f"построен при {man['gate_r_sha1']}")
+    # РАЗМЕР МИКРОБАТЧА ОБЯЗАН СОВПАСТЬ С ТЕМ, ПРИ КОТОРОМ ПОСТРОЕН q0.
+    # Промпты дополняются слева до самого длинного в батче, поэтому состав
+    # батча входит в вычисление. При другом размере тренер считал бы свой q0,
+    # не равный кэшу, и сверка с A0 сравнивала бы разные величины.
+    if int(a.batch) != int(gr_info["batch"]):
+        raise SystemExit(
+            f"--batch {a.batch}, а q0 построен при {gr_info['batch']}. Размер "
+            f"прямого микробатча — часть определения задачи (решение 5.1), а "
+            f"не настройка скорости: копите градиент, но считайте по "
+            f"{gr_info['batch']}")
     print(f"  Gate R: {a.gate_r}, план {gr_info['plan_sha1']}, порядки "
-          f"{gr_info['exec_order_seeds']}")
+          f"{gr_info['exec_order_seeds']}, микробатч {gr_info['batch']}")
 
     orc = json.load(open(a.oracle))
     # ВХОДНЫЕ МАССИВЫ СВЕРЯЮТСЯ С ТЕМИ, НА КОТОРЫХ ПОСТРОЕН КЭШ ЦЕЛЕЙ.
@@ -524,8 +524,39 @@ def main():
     offs = np.asarray(d["pos_offset"])[:N].astype(np.int64)
     tsk = np.asarray(d["task"])[:N]
     ktrue = np.load(f"{a.cache}.ktrue.npy", mmap_mode="r")
-    q0hat_c = np.load(f"{a.cache}.q0hat.npy", mmap_mode="r")
     E = np.load(f"{a.cache}.codebooks.npy")
+
+    # --- КАНОНИЧЕСКИЙ ЧЕРНОВИК И СОХРАНЁННЫЙ ПЛАН ---------------------------
+    # Сентябрьский q0hat K-11a здесь больше не участвует ни в сверке, ни в
+    # аудите: он побитово не воспроизводится, и расхождение с ним измерено
+    # (0.17-0.24% позиций). Тренер стоит на том же массиве, от которого
+    # построены цели и посчитан Gate 2.
+    q0_can, q0_defined, q0_man, q0_prov = kc.load_canonical_q0(
+        a.q0, gate_r_path=a.gate_r, n_obs=N, keys_sha=keys_sha,
+        cache_meta_sha1=k11a.file_sha1(f"{a.cache}.meta.json"))
+    bad_q0 = [k_ for k_ in ("q0_manifest_sha1", "q0_npz_sha1", "q0_run_id",
+                            "plan_sha1", "plan_batch", "gate_r_sha1")
+              if str(man.get(k_)) != str(q0_prov.get(k_))]
+    if bad_q0:
+        raise SystemExit(
+            f"кэш целей построен на другом черновике: расходятся {bad_q0}. "
+            f"Цели равны Q1(z_e - E0[q0]); от другого q0 это другие цели")
+    plan_all = kc.load_plan(a.q0, q0_man)
+    # СМЕЩЕНИЕ, ЗАПИСАННОЕ В ПЛАНЕ, ОБЯЗАНО СОВПАСТЬ СО СМЕЩЕНИЕМ ДАННЫХ.
+    # `build_inputs` принимает одно position_offset на батч; если план говорит
+    # одно, а кэш — другое, вход читается не с той позиции, и расхождение
+    # выглядело бы как ошибка модели.
+    for nm_, po_, sel_ in plan_all:
+        if not bool((offs[sel_] == po_).all()):
+            raise SystemExit(
+                f"батч части {nm_} заявлен со смещением {po_}, а строки "
+                f"{sel_[:3]} имеют {sorted(set(int(x) for x in offs[sel_]))}")
+    if int(a.batch) != int(q0_man["batch"]):
+        raise SystemExit(f"--batch {a.batch}, план построен при "
+                         f"{q0_man['batch']}")
+    print(f"  черновик: {q0_prov['q0_npz']} ({q0_prov['q0_npz_sha1']}), "
+          f"план {q0_prov['plan_sha1']}, {len(plan_all)} батчей, "
+          f"Gate R {q0_prov['gate_r_sha1']}")
 
     img_p = os.path.join(os.path.dirname(src), cmeta["images_file"])
     IMG = np.load(img_p, mmap_mode="r")
@@ -616,6 +647,15 @@ def main():
     # --- батчи --------------------------------------------------------------
     keep = ("train", "val_sel") if a.smoke else ("train", "val_sel",
                                                  "val_confirm")
+    # БАТЧИ БЕРУТСЯ ИЗ ПЛАНА, А НЕ НАРЕЗАЮТСЯ ЗАНОВО. Состав батча входит в
+    # вычисление (дополнение слева до самого длинного промпта), поэтому
+    # собственная нарезка совпадала бы с канонической лишь случайно — и
+    # заведомо расходилась бы на укороченном smoke.
+    batches = {nm: [(po, sel) for n_, po, sel in plan_all if n_ == nm]
+               for nm in keep}
+    empty = [nm for nm in keep if not batches[nm]]
+    if empty:
+        raise SystemExit(f"в плане нет батчей частей {empty}")
     sets = {nm: rows_all[part_all == nm] for nm in keep}
     # ЦЕЛИ РАСКЛАДЫВАЮТСЯ ПО НОМЕРАМ СТРОК КЭША K-11a: батчи формируются по
     # смещению позиций, а не по порядку в кэше целей, и брать цель по позиции
@@ -623,9 +663,21 @@ def main():
     q1_of_pos = np.full((N, q1_all.shape[1]), -1, np.int64)
     q1_of_pos[rows_all] = q1_all
     if a.limit:
-        for nm in sets:
-            sets[nm] = sets[nm][:a.limit]
-    print("  части: " + ", ".join(f"{k} {len(v)}" for k, v in sets.items()))
+        # ЦЕЛЫЕ КАНОНИЧЕСКИЕ БАТЧИ. Урезание по строкам с перенарезкой давало
+        # бы неполный хвостовой батч по каждому смещению — батч, которого в
+        # плане нет, а значит другой вход и другой q0.
+        for nm in batches:
+            batches[nm] = batches[nm][:a.limit]
+    for nm in keep:
+        rows_nm = np.concatenate([sel for _po, sel in batches[nm]])
+        if not a.limit and not np.array_equal(np.sort(rows_nm),
+                                              np.sort(sets[nm])):
+            raise SystemExit(
+                f"часть {nm}: строки плана не совпадают со строками кэша "
+                f"целей — цели и черновик построены на разных наборах")
+        sets[nm] = rows_nm
+    print("  части: " + ", ".join(
+        f"{k} {len(sets[k])} строк в {len(batches[k])} батчах" for k in keep))
 
     def build(po, sel):
         image = torch.from_numpy(np.asarray(IMG[sel]))
@@ -672,10 +724,14 @@ def main():
                 position_ids=p_, mode="medium")
         lg = out["logits"][1].float()
         q0 = out["pred_codes"][0]
-        # Q0 ОБЯЗАН СОВПАСТЬ С КЭШЕМ: цели построены от q0hat кэша, и если
-        # модель выдаёт другой черновик, они относятся к другому остатку.
+        # Q0 ОБЯЗАН СОВПАСТЬ С КАНОНИЧЕСКИМ: цели построены как
+        # Q1(z_e - E0[q0]) от артефакта K-14d, и если модель выдаёт другой
+        # черновик, они относятся к другому остатку. Сравнение идёт с
+        # заверенным Gate R массивом, а НЕ с сентябрьским q0hat K-11a:
+        # последний сегодня побитово не воспроизводится, и сверка с ним
+        # заведомо расходилась бы на измеренных 0.17-0.24% позиций.
         cq0 = torch.from_numpy(
-            np.asarray(q0hat_c[sel]).astype(np.int64)).to(dev)
+            np.asarray(q0_can[sel]).astype(np.int64)).to(dev)
         d_q0 = int((q0 != cq0).sum())
         # ЗНАМЕНАТЕЛЬ СЧИТАЕТСЯ ВСЕГДА. Прежде он увеличивался внутри ветки
         # расхождения, то есть был числом позиций в «плохих» батчах, и доля
@@ -697,13 +753,17 @@ def main():
                                      if int((~m).sum()) else float("nan"))
             q0_bad[0] += d_q0
             frac = q0_bad[0] / max(q0_tot[0], 1)
-            if frac > float(a.q0_tol):
-                raise SystemExit(
-                    f"q0 модели разошёлся с кэшем: {q0_bad[0]} из "
-                    f"{q0_tot[0]} позиций ({100 * frac:.4f}%) при допуске "
-                    f"{100 * float(a.q0_tol):.4f}%. Запас логитов в этих "
-                    f"позициях: {sorted(q0_margins)[:5]}. Цели построены от "
-                    f"q0hat кэша и относятся к другому остатку")
+            # ДОПУСКА НЕТ. Он был временной мерой, пока канонический q0 не
+            # существовал и сравнение шло с невоспроизводимым кэшем. Теперь
+            # черновик заверен Gate R, и любое расхождение означает, что
+            # исполняется не тот план или не та арифметика, а не «почти то же».
+            raise SystemExit(
+                f"q0 модели разошёлся с каноническим: {q0_bad[0]} из "
+                f"{q0_tot[0]} позиций ({100 * frac:.4f}%). Запас логитов в "
+                f"этих позициях: {sorted(q0_margins)[:5]}. Цели построены от "
+                f"{q0_prov['q0_npz']} (план {q0_prov['plan_sha1']}, "
+                f"Gate R {q0_prov['gate_r_sha1']}) и относятся к другому "
+                f"остатку")
         tg = targets(sel)
         ce = F.cross_entropy(lg.reshape(-1, lg.shape[-1]), tg.reshape(-1))
         # E0 СТРОИТСЯ ОТ ФАКТИЧЕСКОГО q0 МОДЕЛИ. Они только что сверены с
@@ -732,12 +792,12 @@ def main():
                 f"{float(act_loss)}, регуляризатор {float(fb_reg)}")
         return loss, ce, act_loss, a_hat.detach(), a_true, d_q0
 
-    def evaluate(rows):
+    def evaluate(bs):
         """RMS первых восьми действий в единицах робота, argmax без ST."""
         se, n = 0.0, 0
         model.eval()
         with torch.no_grad():
-            for po, sel in group_by_offset(rows, offs, a.batch):
+            for po, sel in bs:
                 _l, _c, _al, a_hat, a_true, _d = run_batch(po, sel, False)
                 q = torch.as_tensor(max_act_q[:7], device=dev,
                                     dtype=torch.float32).clone()
@@ -750,9 +810,9 @@ def main():
     if a.q0_audit:
         # ИЗМЕРЕНИЕ, А НЕ ОБУЧЕНИЕ. Отвечает на один вопрос: расхождение q0 —
         # это грань между почти равными логитами или разные пути вычисления.
-        rows_a = np.concatenate([sets[k] for k in sorted(sets)])
+        bs_a = [b_ for k in sorted(batches) for b_ in batches[k]]
         with torch.no_grad():
-            for po, sel in group_by_offset(rows_a, offs, a.batch):
+            for po, sel in bs_a:
                 run_batch(po, sel, False)
         # ЛОКАЛИЗАЦИЯ ПРИЧИНЫ. Кэш строился `forward_taps` с отводом на 12-м
         # слое; тренер берёт q0 сегментированным проходом depth-RVQ. Это
@@ -762,10 +822,10 @@ def main():
         cmp = dict(seg_vs_cache=0, fast_vs_cache=0, taps_vs_cache=0,
                    seg_vs_fast=0, seg_vs_taps=0, n=0)
         with torch.no_grad():
-            for po, sel in group_by_offset(rows_a, offs, a.batch)[:16]:
+            for po, sel in bs_a[:16]:
                 b = build(po, sel)
                 cq = torch.from_numpy(
-                    np.asarray(q0hat_c[sel]).astype(np.int64)).to(dev)
+                    np.asarray(q0_can[sel]).astype(np.int64)).to(dev)
                 with ac16:
                     v_, p_ = model.build_inputs(position_offset=po, **b)
                     seg = model.forward_joint_depth_rvq(
@@ -836,14 +896,14 @@ def main():
     rng = np.random.default_rng(a.seed)
     hist = []
     t0 = time.time()
-    e0_val = evaluate(sets["val_sel"])
+    e0_val = evaluate(batches["val_sel"])
     hist.append(dict(epoch=0, train=None, val_sel=e0_val))
     # СНИМОК ЭПОХИ 0 — ПОЛНОЦЕННЫЙ КАНДИДАТ. Если начальное состояние головы
     # окажется лучшим, оно и будет восстановлено.
     best = dict(epoch=0, val_sel=e0_val, state=snapshot(named_tr))
     print(f"  эпоха 0 (без обучения): val_sel RMS-8 {e0_val:.6f}")
     for ep in range(1, int(a.epochs) + 1):
-        order = group_by_offset(sets["train"], offs, a.batch)
+        order = list(batches["train"])
         rng.shuffle(order)
         run, nb, dq = 0.0, 0, 0
         for po, sel in order:
@@ -870,7 +930,7 @@ def main():
                           f"{len(params)} обучаемых тензоров")
             opt.step()
             run += float(loss.detach()); nb += 1; dq += d_q0
-        v = evaluate(sets["val_sel"])
+        v = evaluate(batches["val_sel"])
         hist.append(dict(epoch=ep, train=run / max(nb, 1), val_sel=v))
         mark = ""
         if v < best["val_sel"]:          # СТРОГОЕ улучшение, иначе ранняя
@@ -889,7 +949,7 @@ def main():
     # подтверждающая половина считалась на весах ПОСЛЕДНЕЙ эпохи, а в отчёт
     # шёл номер выбранной — Gate 4 относился бы не к той модели.
     restore(named_tr, best["state"])
-    re_val = evaluate(sets["val_sel"])
+    re_val = evaluate(batches["val_sel"])
     if abs(re_val - best_val) > 1e-9:
         raise SystemExit(
             f"после восстановления val_sel {re_val:.8f} против {best_val:.8f}: "
@@ -911,8 +971,8 @@ def main():
             torch.save(dict(kind="smoke", stage="q1", variant=a.variant,
                             seed=int(a.seed), history=hist,
                             initial_trainable_state_sha1=init_sha,
-        q0_mismatch=int(q0_bad[0]), q0_positions=int(q0_tot[0]),
-        q0_tol=float(a.q0_tol),
+                            q0_mismatch=int(q0_bad[0]),
+                            q0_positions=int(q0_tot[0]), q0_prov=q0_prov,
                             selected_state_sha1=sel_sha,
                             note="проверка связности; как источник весов "
                                  "для канонического прогона непригодна"),
@@ -920,7 +980,7 @@ def main():
             print(f"  сохранено: {a.out}")
         return 0
 
-    e_conf = evaluate(sets["val_confirm"])
+    e_conf = evaluate(batches["val_confirm"])
     po_ = (orc.get("parts") or {}).get("val_confirm") or {}
     e_a0 = (po_.get("vs_action.A0") or {}).get("rms")
     e_or = (po_.get("vs_action.A01_ze") or {}).get("rms")
@@ -949,7 +1009,7 @@ def main():
         codec_state_sha1=cs_now, decoder_probe=dp_now,
         initial_trainable_state_sha1=init_sha,
         q0_mismatch=int(q0_bad[0]), q0_positions=int(q0_tot[0]),
-        q0_tol=float(a.q0_tol),
+        q0_prov=q0_prov,
         selected_state_sha1=sel_sha,
         selected_epoch=best_ep, val_sel=best_val, val_confirm=e_conf,
         gate4=g4, history=hist, epochs_run=int(a.epochs),

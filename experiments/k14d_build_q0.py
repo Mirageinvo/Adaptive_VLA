@@ -39,21 +39,45 @@ def sha12(path, chunk=1 << 22):
     return h.hexdigest()[:12]
 
 
-def gate_r(ma, mb):
+# ПОЛЯ, ОБЯЗАННЫЕ СОВПАСТЬ У ДВУХ ИСПОЛНЕНИЙ. Список один и перечислен
+# здесь, а не по месту: раньше часть полей писалась в манифест, но в сравнении
+# не участвовала, и подмена конфига, карты, версии Torch или флагов TF32
+# проходила как «повторяемость». Самопроверка перебирает КАЖДОЕ поле этого
+# списка и требует отказа — забыть одно теперь нельзя.
+GATE_R_SAME = (
+    # тождество задачи
+    "schema", "plan_sha1", "batch", "declared_parts", "n_batches",
+    "split_seed", "sel_frac",
+    # входные данные
+    "cache", "cache_meta_sha1", "source_cache_sha1", "keys_sha1",
+    "images_sha1", "state_npy_sha1", "state_json_sha1", "split_sha1",
+    "q0hat_k11a_sha1",
+    # модель и её конфигурация
+    "ckpt", "joint_sha1", "bar_sha1", "cfg_sha1",
+    # код
+    "code_version", "script_sha1", "git_head",
+    # арифметика: тип, устройство и всё, что меняет численный результат при
+    # неизменном коде
+    "q0_dtype", "compute_dtype", "device", "gpu", "gpu_uuid",
+    "torch_version", "cuda_version", "tf32_matmul", "tf32_cudnn",
+    "cudnn_deterministic", "cudnn_benchmark",
+)
+
+
+def gate_r(ma, mb, sha_a="", sha_b=""):
     """Машинная проверка повторяемости. Расхождение любого поля — отказ.
 
     ОТЛИЧАТЬСЯ РАЗРЕШЕНО ТОЛЬКО ПОРЯДКУ ИСПОЛНЕНИЯ и тому, что от него
     зависит: имени файла, времени, номеру запуска. Всё остальное обязано
     совпасть, иначе сравниваются два разных вычисления, а не два исполнения
     одного.
+
+    ОТПЕЧАТКИ ДВУХ МАНИФЕСТОВ ВХОДЯТ В АРТЕФАКТ. Без них заверение
+    относилось бы к ПЛАНУ, а не к двум конкретным массивам: третий q0 с тем
+    же планом проходил бы под чужим Gate R.
     """
     bad = []
-    for k in ("plan_sha1", "batch", "declared_parts", "n_batches",
-              "cache", "source_cache_sha1", "keys_sha1", "ckpt",
-              "joint_sha1", "bar_sha1", "code_version", "script_sha1",
-              "q0_dtype", "compute_dtype", "device", "images_sha1",
-              "state_npy_sha1", "state_json_sha1", "split_sha1",
-              "git_head"):
+    for k in GATE_R_SAME:
         va, vb = ma.get(k), mb.get(k)
         if va is None or vb is None:
             bad.append(f"{k}: нет поля ({va} / {vb})")
@@ -85,7 +109,19 @@ def gate_r(ma, mb):
                           ("n_rows", "rows_sha1", "q0_sha1")}, same=bool(same))
         if not same:
             bad.append(f"часть {nm}: q0 или строки различаются")
+    wit = []
+    for m, sh in ((ma, sha_a), (mb, sha_b)):
+        if not sh:
+            bad.append("не передан отпечаток манифеста: заверение оказалось "
+                       "бы привязано к плану, а не к конкретному q0")
+        wit.append(dict(manifest_sha1=sh, run_id=m.get("run_id"),
+                        exec_order_seed=m.get("exec_order_seed"),
+                        parts={k: v.get("q0_sha1") for k, v in
+                               (m.get("parts") or {}).items()}))
+    if sha_a and sha_b and sha_a == sha_b:
+        bad.append(f"оба манифеста имеют отпечаток {sha_a}: это один файл")
     return dict(kind="k14_gate_r", passed=not bad, failures=bad, parts=per,
+                witnesses=wit,
                 batch=ma.get("batch") if ma.get("batch") == mb.get("batch")
                 else None,
                 declared_parts=ma.get("declared_parts"),
@@ -97,51 +133,70 @@ def gate_r(ma, mb):
 
 def selftest():
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import tempfile
     import k14_common as kc
     kc.selftest()
 
-    base = dict(plan_sha1="P", batch=8, declared_parts=list(kc.CANONICAL_PARTS),
-                n_batches=10, cache="c", source_cache_sha1="s",
-                keys_sha1="k", ckpt="ck", joint_sha1="j", bar_sha1="b",
-                code_version={"x": "1"}, script_sha1="sc", q0_dtype="int32",
-                compute_dtype="float16", device="cuda:0", images_sha1="im",
-                state_npy_sha1="sn", state_json_sha1="sj", split_sha1="sp",
-                git_head="HEAD", git_dirty=False, limit=0,
+    # База заполняется ПО СПИСКУ GATE_R_SAME, а не вручную: иначе добавленное
+    # в список поле осталось бы непроверенным, а это ровно тот дефект, из-за
+    # которого подмена конфига и карты проходила незамеченной.
+    base = dict(git_dirty=False, limit=0,
                 parts={p: dict(n_rows=1, rows_sha1="r" + p, q0_sha1="q" + p,
                                dtype="int32") for p in kc.CANONICAL_PARTS})
+    for k in GATE_R_SAME:
+        base[k] = {"declared_parts": list(kc.CANONICAL_PARTS),
+                   "batch": kc.CANONICAL_BATCH, "n_batches": 10,
+                   "sel_frac": 0.4, "split_seed": 61,
+                   "code_version": {"x": "1"},
+                   "tf32_matmul": False, "tf32_cudnn": False,
+                   "cudnn_deterministic": False,
+                   "cudnn_benchmark": False}.get(k, f"<{k}>")
     A = dict(base, exec_order_seed=0, run_id="A")
     B = dict(base, exec_order_seed=7, run_id="B")
-    r = gate_r(A, B)
+    r = gate_r(A, B, "SHA_A", "SHA_B")
     assert r["passed"], r["failures"]
+    assert [w["manifest_sha1"] for w in r["witnesses"]] == ["SHA_A", "SHA_B"]
+    assert [w["run_id"] for w in r["witnesses"]] == ["A", "B"]
 
-    for patch, why in (
-            ({"plan_sha1": "Q"}, "plan_sha1"),
-            ({"batch": 16}, "batch"),
-            ({"joint_sha1": "z"}, "joint_sha1"),
-            ({"git_dirty": True}, "незакоммиченных"),
-            ({"limit": 2048}, "--limit"),
-            ({"images_sha1": None}, "нет поля")):
-        r2 = gate_r(dict(A), dict(B, **patch))
+    # КАЖДОЕ поле списка проверяется отдельно: и на расхождение, и на пропуск.
+    for k in GATE_R_SAME:
+        other = "ДРУГОЕ" if not isinstance(base[k], (bool, int, float)) \
+            else (not base[k] if isinstance(base[k], bool) else base[k] + 1)
+        r2 = gate_r(dict(A), dict(B, **{k: other}), "SHA_A", "SHA_B")
+        assert not r2["passed"] and any(x.startswith(k + ":")
+                                        for x in r2["failures"]), \
+            f"расхождение поля {k} не замечено: {r2['failures']}"
+        r3 = gate_r(dict(A), dict(B, **{k: None}), "SHA_A", "SHA_B")
+        assert not r3["passed"] and any(f"{k}: нет поля" in x
+                                        for x in r3["failures"]), \
+            f"отсутствие поля {k} не замечено"
+
+    for patch, why in (({"git_dirty": True}, "незакоммиченных"),
+                       ({"limit": 2048}, "--limit")):
+        r2 = gate_r(dict(A), dict(B, **patch), "SHA_A", "SHA_B")
         assert not r2["passed"] and any(why in x for x in r2["failures"]), \
             (why, r2["failures"])
     # одинаковый порядок исполнения — это повтор, а не проверка
-    r3 = gate_r(dict(A), dict(B, exec_order_seed=0))
+    r3 = gate_r(dict(A), dict(B, exec_order_seed=0), "SHA_A", "SHA_B")
     assert not r3["passed"] and any("порядок исполнения одинаков" in x
                                     for x in r3["failures"])
+    # без отпечатков манифестов заверение не привязано ни к чему
+    for sa, sb in (("", "SHA_B"), ("SHA_A", ""), ("SHA_A", "SHA_A")):
+        r5 = gate_r(dict(A), dict(B), sa, sb)
+        assert not r5["passed"], (sa, sb)
     # различие q0 в одной части
     bad_parts = {p: dict(base["parts"][p]) for p in kc.CANONICAL_PARTS}
     bad_parts["val_sel"] = dict(bad_parts["val_sel"], q0_sha1="OTHER")
-    r4 = gate_r(dict(A), dict(B, parts=bad_parts))
+    r4 = gate_r(dict(A), dict(B, parts=bad_parts), "SHA_A", "SHA_B")
     assert not r4["passed"] and any("val_sel" in x for x in r4["failures"])
     assert r4["parts"]["train"]["same"] and not r4["parts"]["val_sel"]["same"]
-    import tempfile
+
     with tempfile.TemporaryDirectory() as td:
         q = os.path.join(td, "gate_r.json")
-        json.dump(gate_r(A, B), open(q, "w"))
-        kc.check_gate_r(q, expect_plan_sha1="P")
-    # тот же артефакт, но с расхождением — потребители обязаны отказать
-    with tempfile.TemporaryDirectory() as td:
-        q = os.path.join(td, "gate_r.json")
+        json.dump(gate_r(A, B, "SHA_A", "SHA_B"), open(q, "w"))
+        info = kc.check_gate_r(q, expect_plan_sha1="<plan_sha1>")
+        assert info["witness_sha1"] == ["SHA_A", "SHA_B"], info
+        # тот же артефакт, но с расхождением — потребители обязаны отказать
         json.dump(r4, open(q, "w"))
         try:
             kc.check_gate_r(q)
@@ -185,9 +240,10 @@ def main():
 
     if a.gate_r:
         ma, mb = (json.load(open(p)) for p in a.gate_r)
-        r = gate_r(ma, mb)
+        sa, sb = (sha12(p) for p in a.gate_r)
+        r = gate_r(ma, mb, sa, sb)
         r["manifests"] = list(a.gate_r)
-        r["manifest_sha1"] = [sha12(p) for p in a.gate_r]
+        r["manifest_sha1"] = [sa, sb]
         print(f"\n  GATE R по плану {r['plan_sha1']}, порядки "
               f"{r['exec_order_seeds']}:")
         for nm, d in sorted(r["parts"].items()):
@@ -238,6 +294,31 @@ def main():
                        dict_apply, get_cfg, prompt_template)
 
     dev, dt = torch.device(a.device), getattr(torch, a.dtype)
+
+    def gpu_uuid(d):
+        """Физический идентификатор карты, а не строка «cuda:1».
+
+        Номер устройства — свойство процесса, а не железа: тот же «cuda:1» в
+        другом запуске может оказаться другой картой. Заверять повторяемость
+        по номеру значило бы не заверять её вовсе.
+        """
+        if d.type != "cuda":
+            return "cpu"
+        try:
+            u = torch.cuda.get_device_properties(d).uuid
+            if u:
+                return str(u)
+        except Exception:
+            pass
+        idx = d.index if d.index is not None else torch.cuda.current_device()
+        out = os.popen(f"nvidia-smi --query-gpu=uuid --format=csv,noheader "
+                       f"-i {int(idx)} 2>/dev/null").read().strip()
+        if not out:
+            raise SystemExit(
+                "не удалось определить физический идентификатор карты: ни "
+                "torch, ни nvidia-smi его не дали. Без него Gate R заверял бы "
+                "повторяемость по номеру устройства в процессе")
+        return out.splitlines()[0].strip()
     torch.manual_seed(0)
     np.random.seed(0)
 
@@ -349,14 +430,17 @@ def main():
         print(f"    {nm}: q0 sha {res[nm]['q0_sha1']}, расхождение с K-11a "
               f"{nb} из {q.size} ({100 * nb / max(q.size, 1):.4f}%)")
 
+    # NPZ СНАЧАЛА ПИШЕТСЯ ВО ВРЕМЕННЫЙ ФАЙЛ И ПУБЛИКУЕТСЯ ТОЛЬКО ПОСЛЕ ВСЕХ
+    # ПРОВЕРОК. Прежний порядок публиковал массив до финальной проверки
+    # чистоты дерева: отказ на ней оставлял .npz без манифеста, то есть
+    # артефакт, про который нельзя сказать, чем он посчитан.
     os.makedirs(os.path.dirname(os.path.abspath(out_p)) or ".", exist_ok=True)
     npz = out_p + ".npz"
     arrs = dict(q0=q0_out, **kc.plan_arrays(plan))
     tmp = npz + f".tmp.{os.getpid()}"
     with open(tmp, "wb") as fh:
         np.savez_compressed(fh, **arrs)
-    os.replace(tmp, npz)
-    with np.load(npz, allow_pickle=True) as z:
+    with np.load(tmp, allow_pickle=True) as z:
         if sorted(z.files) != sorted(arrs):
             raise SystemExit(f"{npz}: массивы {sorted(z.files)}")
         for k_, v_ in arrs.items():
@@ -382,7 +466,7 @@ def main():
         dataset_repo=sm.get("dataset_repo"),
         dataset_revision=sm.get("dataset_revision"),
         ckpt=a.ckpt, joint_ckpt=a.joint_ckpt, joint_sha1=j_sha,
-        limit=int(a.limit), npz_sha1=sha12(npz),
+        limit=int(a.limit), npz_sha1=sha12(tmp),
         bar_sha1=sha12(inspect.getfile(SmolVLABlockwiseAR)),
         cfg_sha1=sha12(os.path.join(root, a.cfg_path)),
         tf32_matmul=bool(torch.backends.cuda.matmul.allow_tf32),
@@ -391,7 +475,9 @@ def main():
         cudnn_benchmark=bool(torch.backends.cudnn.benchmark),
         torch_version=str(torch.__version__),
         cuda_version=str(getattr(torch.version, "cuda", None)),
-        gpu=(torch.cuda.get_device_name(dev) if dev.type == "cuda" else None),
+        gpu=(torch.cuda.get_device_name(dev) if dev.type == "cuda"
+             else "cpu"),
+        gpu_uuid=gpu_uuid(dev),
         git_head=git_head, git_dirty=bool(dirty or dirty2),
         git_dirty_files=len((dirty2 or dirty).splitlines()),
         minutes=float((time.time() - t0) / 60),
@@ -401,15 +487,25 @@ def main():
             os.path.join(here, "joint12_vla.py")]),
         script_sha1=sha12(os.path.abspath(__file__)))
     if dirty2 and not dirty and not a.allow_dirty:
+        os.unlink(tmp)
         raise SystemExit("дерево стало грязным ВО ВРЕМЯ построения: отпечатки "
                          "кода в начале и в конце не совпадают")
+    # МАНИФЕСТ ОБЯЗАН СОДЕРЖАТЬ ВСЁ, ЧТО СРАВНИВАЕТ GATE R. Иначе построитель
+    # молча производит артефакт, который заверение потом отвергнет за
+    # отсутствие поля — а обнаружилось бы это после двух часов счёта.
+    miss_gr = [k for k in GATE_R_SAME if man.get(k) is None]
+    if miss_gr:
+        os.unlink(tmp)
+        raise SystemExit(f"в манифесте нет полей {miss_gr}, которые сравнивает "
+                         f"Gate R")
+    os.replace(tmp, npz)
     mp = out_p + ".manifest.json"
     tmpm = mp + f".tmp.{os.getpid()}"
     json.dump(man, open(tmpm, "w"), ensure_ascii=False, indent=1, default=str)
     os.replace(tmpm, mp)
     print(f"\n  сохранено: {npz} и {mp}")
-    print(f"  ДЛЯ GATE R: повторите с другим --exec-order-seed, затем "
-          f"--gate-r A.manifest.json B.manifest.json")
+    print("  ДЛЯ GATE R: повторите с другим --exec-order-seed, затем "
+          "--gate-r A.manifest.json B.manifest.json")
     return 0
 
 

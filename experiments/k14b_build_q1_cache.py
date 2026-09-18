@@ -92,14 +92,31 @@ def check_outputs_absent(paths, overwrite):
     return True
 
 
-def check_oracle(orc, *, device, ckpt, cache, split_seed, sel_frac):
-    """Артефакт пройденного Gate 2: состав и режим.
+def check_oracle(orc, *, device, ckpt, cache, split_seed, sel_frac,
+                 q0_prov=None):
+    """Артефакт пройденного Gate 2: состав, режим и ТОТ ЖЕ черновик.
 
     RUN_ID ОБЯЗАТЕЛЕН. Артефакт без него снят версией до введения номера
     запуска, и связать его с конкретным прогоном нельзя — а именно на эту
     связь опирается вся привязка кэша.
+
+    ЧЕРНОВИК ОБЯЗАН БЫТЬ ТОТ ЖЕ. Gate 2 измеряет, сколько восстанавливает
+    оракул ОТ ПРЕДСКАЗАННОГО q0; цели кэша считаются как Q1(z_e - E0[q0]).
+    Если это разные q0, порог Gate 4 и мишень обучения относятся к разным
+    задачам, и расхождение выглядело бы как свойство модели.
     """
     bad = []
+    if q0_prov is not None:
+        if orc.get("q0_canonical") is not True:
+            bad.append(f"гейт пройден на черновике {orc.get('q0_source')}, "
+                       f"а кэш строится на каноническом")
+        for k in ("q0_manifest_sha1", "q0_npz_sha1", "q0_run_id", "plan_sha1",
+                  "plan_batch", "gate_r_sha1"):
+            if orc.get(k) is None:
+                bad.append(f"в артефакте гейта нет {k}")
+            elif str(orc[k]) != str(q0_prov.get(k)):
+                bad.append(f"{k}: гейт {orc[k]}, черновик кэша "
+                           f"{q0_prov.get(k)}")
     if not orc.get("run_id"):
         bad.append("нет run_id: артефакт снят версией до его введения и с "
                    "конкретным прогоном не связан")
@@ -270,6 +287,35 @@ def selftest():
             assert why in str(e), (why, str(e))
         else:
             raise AssertionError(f"артефакт гейта принят при: {why}")
+
+    # ТОТ ЖЕ ЧЕРНОВИК. Гейт и кэш обязаны стоять на одном q0, иначе порог
+    # Gate 4 и мишень обучения относятся к разным задачам.
+    q0p = dict(q0_canonical=True, q0_manifest_sha1="QM", q0_npz_sha1="QN",
+               q0_run_id="QR", plan_sha1="PL", plan_batch=8, gate_r_sha1="GR")
+    good_q0 = dict(good, **q0p)
+    check_oracle(good_q0, **kw, q0_prov=q0p)
+    for patch, why in (({"q0_canonical": False}, "на каноническом"),
+                       ({"q0_manifest_sha1": "ДРУГОЕ"}, "q0_manifest_sha1"),
+                       ({"q0_npz_sha1": "ДРУГОЕ"}, "q0_npz_sha1"),
+                       ({"q0_run_id": "ДРУГОЕ"}, "q0_run_id"),
+                       ({"plan_sha1": "ДРУГОЕ"}, "plan_sha1"),
+                       ({"plan_batch": 16}, "plan_batch"),
+                       ({"gate_r_sha1": "ДРУГОЕ"}, "gate_r_sha1")):
+        try:
+            check_oracle(dict(good_q0, **patch), **kw, q0_prov=q0p)
+        except SystemExit as e:
+            assert why in str(e), (why, str(e))
+        else:
+            raise AssertionError(f"гейт с чужим черновиком принят: {why}")
+    # артефакт гейта старого образца, без полей черновика вовсе
+    for k_ in ("q0_manifest_sha1", "plan_sha1", "gate_r_sha1"):
+        try:
+            check_oracle({k: v for k, v in good_q0.items() if k != k_},
+                         **kw, q0_prov=q0p)
+        except SystemExit as e:
+            assert f"нет {k_}" in str(e), (k_, str(e))
+        else:
+            raise AssertionError(f"гейт без {k_} принят")
 
     # --- ТЕ ЖЕ МАССИВЫ И ТОТ ЖЕ КОДЕК, ЧТО НА ГЕЙТЕ ----------------------
     arrs = {"q0hat": "A", "ktrue": "B", "split": "C", "codebooks": "D"}
@@ -455,21 +501,6 @@ def main():
             raise SystemExit(f"{nm}.npy имеет sha {got}, K-11b заверила "
                              f"{(stamp.get('arrays') or {}).get(nm)}")
 
-    # --- ПРИВЯЗКА К ПРОЙДЕННОМУ GATE 2 --------------------------------------
-    # Без неё кэш меток «канонический» только на словах: изменённый массив
-    # действий с прежними ключами (episode, step) прошёл бы все проверки выше
-    # и дал бы ДРУГИЕ q1*. K-14a этот случай закрывает пробой кодирования и
-    # сверкой K_true; здесь тот же разрыв закрывается ссылкой на его артефакт.
-    if not os.path.exists(a.oracle):
-        raise SystemExit(
-            f"нет {a.oracle}: кэш меток обязан ссылаться на артефакт "
-            f"пройденного Gate 2, иначе он ни к чему не привязан")
-    orc = json.load(open(a.oracle))
-    check_oracle(orc, device=dev, ckpt=a.ckpt, cache=a.cache,
-                 split_seed=a.split_seed, sel_frac=a.sel_frac)
-    check_oracle_schema(orc)
-    print(f"  привязка к Gate 2: {a.oracle}, запуск {orc.get('run_id')}, "
-          f"режим {orc.get('device')}")
 
     q0hat_legacy = np.load(f"{a.cache}.q0hat.npy", mmap_mode="r")
     q0hat = q0hat_legacy
@@ -520,6 +551,23 @@ def main():
             "не указан источник черновика. Цели считаются от остатка "
             "z_e - E0[q0], поэтому q0 входит в определение целей: укажите "
             "--q0 <артефакт K-14d> или явно --legacy-q0hat")
+
+    # --- ПРИВЯЗКА К ПРОЙДЕННОМУ GATE 2 --------------------------------------
+    # Без неё кэш меток «канонический» только на словах: изменённый массив
+    # действий с прежними ключами (episode, step) прошёл бы все проверки выше
+    # и дал бы ДРУГИЕ q1*. K-14a этот случай закрывает пробой кодирования и
+    # сверкой K_true; здесь тот же разрыв закрывается ссылкой на его артефакт.
+    if not os.path.exists(a.oracle):
+        raise SystemExit(
+            f"нет {a.oracle}: кэш меток обязан ссылаться на артефакт "
+            f"пройденного Gate 2, иначе он ни к чему не привязан")
+    orc = json.load(open(a.oracle))
+    check_oracle(orc, device=dev, ckpt=a.ckpt, cache=a.cache,
+                 split_seed=a.split_seed, sel_frac=a.sel_frac,
+                 q0_prov=(q0_prov if q0_prov.get("q0_canonical") else None))
+    check_oracle_schema(orc)
+    print(f"  привязка к Gate 2: {a.oracle}, запуск {orc.get('run_id')}, "
+          f"режим {orc.get('device')}")
 
     ACT = src_npz["action"]
     if ACT.shape[0] != N:

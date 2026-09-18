@@ -108,6 +108,47 @@ def plan_arrays(plan):
                 batch_offset=np.array([o for _n, o, _r in plan], np.int64))
 
 
+def load_plan(path, man):
+    """Прочитать СОХРАНЁННЫЙ план и убедиться, что это тот самый план.
+
+    ЗАЧЕМ ЧИТАТЬ, А НЕ ПЕРЕСОБИРАТЬ. Потребитель, который заново нарезает
+    батчи из строк, исполняет СВОЙ план, совпадающий с каноническим лишь
+    случайно — и расходящийся с ним, как только состав строк урезан (smoke) или
+    порядок иной. Тогда его q0 отличается от кэша, а сверка списывает это на
+    модель. План — часть артефакта, и читается он оттуда же, откуда q0.
+    """
+    npz_p = path if path.endswith(".npz") else path + ".npz"
+    with np.load(npz_p, allow_pickle=True) as z:
+        need = ("plan_rows", "batch_ptr", "batch_part", "batch_offset")
+        miss = [k for k in need if k not in z.files]
+        if miss:
+            raise SystemExit(f"в {npz_p} нет границ плана {miss}: артефакт "
+                             f"старого образца, состав батчей не восстановим")
+        rows = np.asarray(z["plan_rows"], np.int64)
+        ptr = np.asarray(z["batch_ptr"], np.int64)
+        part = np.asarray(z["batch_part"]).astype(str)
+        off = np.asarray(z["batch_offset"], np.int64)
+    if len(ptr) != len(part) + 1 or len(off) != len(part):
+        raise SystemExit(f"границы плана несогласованы: ptr {len(ptr)}, "
+                         f"part {len(part)}, offset {len(off)}")
+    if int(ptr[0]) != 0 or int(ptr[-1]) != len(rows):
+        raise SystemExit(f"границы плана не покрывают строки: {ptr[0]}..."
+                         f"{ptr[-1]} при {len(rows)}")
+    plan = [(str(part[i]), int(off[i]), rows[ptr[i]:ptr[i + 1]])
+            for i in range(len(part))]
+    if any(len(r) == 0 for _n, _o, r in plan):
+        raise SystemExit("в плане есть пустой батч")
+    got = plan_identity(plan, int(man["batch"]),
+                        tuple(man.get("declared_parts") or CANONICAL_PARTS))
+    if got != man["plan_sha1"]:
+        raise SystemExit(f"восстановленный план имеет отпечаток {got}, в "
+                         f"манифесте {man['plan_sha1']}")
+    if len(plan) != int(man.get("n_batches", -1)):
+        raise SystemExit(f"батчей {len(plan)}, в манифесте "
+                         f"{man.get('n_batches')}")
+    return plan
+
+
 def plan_stats(plan):
     out = {}
     for name, _po, rows in plan:
@@ -160,11 +201,28 @@ def check_gate_r(path, *, expect_plan_sha1=None, expect_batch=CANONICAL_BATCH,
     if len(seeds) != 2 or seeds[0] == seeds[1]:
         raise SystemExit(f"Gate R по порядкам {seeds}: это не два разных "
                          f"исполнения")
+    # СВИДЕТЕЛИ. Заверение относится к ДВУМ КОНКРЕТНЫМ массивам, а не к плану.
+    # Без отпечатков манифестов третий q0 с тем же планом проходил бы под
+    # чужим Gate R — а он мог быть посчитан другой картой, другим кодом или
+    # вовсе не посчитан, а собран.
+    wit = r.get("witnesses") or []
+    if len(wit) != 2:
+        raise SystemExit(f"в Gate R {len(wit)} свидетелей вместо двух: "
+                         f"артефакт старого образца, заверение не привязано "
+                         f"к конкретным q0")
+    w_sha = [w.get("manifest_sha1") for w in wit]
+    w_run = [w.get("run_id") for w in wit]
+    if not all(w_sha) or w_sha[0] == w_sha[1]:
+        raise SystemExit(f"отпечатки манифестов свидетелей {w_sha}")
+    if not all(w_run) or w_run[0] == w_run[1]:
+        raise SystemExit(f"номера запусков свидетелей {w_run}")
     if expect_plan_sha1 and r.get("plan_sha1") != expect_plan_sha1:
         raise SystemExit(f"Gate R проведён по плану {r.get('plan_sha1')}, а "
                          f"данные построены по {expect_plan_sha1}")
     return dict(gate_r_path=path, gate_r_sha1=file_sha(path),
-                plan_sha1=r.get("plan_sha1"), exec_order_seeds=seeds,
+                plan_sha1=r.get("plan_sha1"), batch=int(r["batch"]),
+                exec_order_seeds=seeds, witness_sha1=w_sha,
+                witness_run_id=w_run, witnesses=wit,
                 run_ids=r.get("run_ids"))
 
 
@@ -252,6 +310,28 @@ def load_canonical_q0(path, *, gate_r_path, n_obs, keys_sha,
         raise SystemExit(f"в {man_p} нет полей {miss}")
     gr = check_gate_r(gate_r_path, expect_plan_sha1=man["plan_sha1"],
                       expect_batch=int(man["batch"]))
+    # ЭТОТ ИМЕННО МАССИВ ОБЯЗАН БЫТЬ ОДНИМ ИЗ ДВУХ ЗАВЕРЕННЫХ. Совпадения
+    # плана мало: план — свойство задачи, а Gate R утверждает про исполнения.
+    man_sha = file_sha(man_p)
+    if man_sha not in gr["witness_sha1"]:
+        raise SystemExit(
+            f"манифест {man_p} имеет отпечаток {man_sha}, а Gate R заверил "
+            f"{gr['witness_sha1']}. Это третий артефакт с тем же планом: "
+            f"про него не доказано ничего")
+    w = gr["witnesses"][gr["witness_sha1"].index(man_sha)]
+    if str(w.get("run_id")) != str(man["run_id"]):
+        raise SystemExit(f"свидетель {man_sha} имеет run_id {w.get('run_id')}, "
+                         f"в манифесте {man['run_id']}")
+    if int(w.get("exec_order_seed", -1)) != int(man.get("exec_order_seed", -2)):
+        raise SystemExit(
+            f"свидетель {man_sha} заверен при порядке "
+            f"{w.get('exec_order_seed')}, манифест говорит "
+            f"{man.get('exec_order_seed')}")
+    for nm, sha_ in (w.get("parts") or {}).items():
+        got_ = ((man.get("parts") or {}).get(nm) or {}).get("q0_sha1")
+        if sha_ != got_:
+            raise SystemExit(f"часть {nm}: Gate R заверил q0 {sha_}, в "
+                             f"манифесте {got_}")
     if man["limit"]:
         raise SystemExit(f"q0 построен с ограничением --limit {man['limit']}: "
                          f"это не полный канонический план")
@@ -281,12 +361,15 @@ def load_canonical_q0(path, *, gate_r_path, n_obs, keys_sha,
         if int(pm.get("n_rows", -1)) < 0:
             raise SystemExit(f"в манифесте нет числа строк части {nm}")
     prov = dict(q0_source="k14d_plan", q0_npz=npz_p, q0_npz_sha1=got,
-                q0_manifest_sha1=file_sha(man_p), plan_sha1=man["plan_sha1"],
+                q0_manifest_sha1=man_sha, plan_sha1=man["plan_sha1"],
                 plan_batch=int(man["batch"]), q0_run_id=man["run_id"],
                 q0_git_head=man["git_head"],
                 q0_parts={k: v.get("q0_sha1") for k, v in
                           man["parts"].items()},
-                **{k: v for k, v in gr.items() if k != "plan_sha1"})
+                # имена из заверения переносятся с префиксом: без него
+                # «batch» столкнулся бы с одноимённым полем потребителя
+                **{("gate_r_" + k if k in ("batch", "run_ids", "witnesses")
+                    else k): v for k, v in gr.items() if k != "plan_sha1"})
     return q0.astype(np.int64), defined, man, prov
 
 
@@ -372,31 +455,55 @@ def selftest():
         assert list(ar["plan_rows"][a_:b_]) == list(rows)
         assert ar["batch_part"][i] == nm and ar["batch_offset"][i] == po
     import tempfile
-    ok = dict(kind="k14_gate_r", passed=True, failures=[], batch=CANONICAL_BATCH,
-              exec_order_seeds=[0, 7], plan_sha1="P", run_ids=["A", "B"],
-              parts={p: dict(same=True) for p in CANONICAL_PARTS})
+
+    def mk_gate(**over):
+        g = dict(kind="k14_gate_r", passed=True, failures=[],
+                 batch=CANONICAL_BATCH, exec_order_seeds=[0, 7],
+                 plan_sha1="P", run_ids=["A", "B"],
+                 parts={p_: dict(same=True) for p_ in CANONICAL_PARTS},
+                 witnesses=[dict(manifest_sha1="SHA_A", run_id="A",
+                                 exec_order_seed=0,
+                                 parts={p_: "s" + p_
+                                        for p_ in CANONICAL_PARTS}),
+                            dict(manifest_sha1="SHA_B", run_id="B",
+                                 exec_order_seed=7,
+                                 parts={p_: "s" + p_
+                                        for p_ in CANONICAL_PARTS})])
+        g.update(over)
+        return g
+
     with tempfile.TemporaryDirectory() as td:
         def w(obj, nm="g.json"):
             q = os.path.join(td, nm)
             json.dump(obj, open(q, "w"))
             return q
-        assert check_gate_r(w(ok), expect_plan_sha1="P")["plan_sha1"] == "P"
+        assert check_gate_r(w(mk_gate()), expect_plan_sha1="P")["plan_sha1"] \
+            == "P"
+        assert check_gate_r(w(mk_gate()))["witness_sha1"] == ["SHA_A", "SHA_B"]
         for patch, why in (
                 ({"passed": False}, "не пройден"),
                 ({"failures": ["x"]}, "противоречив"),
                 ({"batch": 16}, "batch"),
                 ({"exec_order_seeds": [0, 0]}, "не два разных"),
                 ({"kind": "other"}, "нужен"),
-                ({"parts": {p: dict(same=True) for p in CANONICAL_PARTS[:2]}},
-                 "не покрывает")):
+                ({"parts": {p_: dict(same=True) for p_ in CANONICAL_PARTS[:2]}},
+                 "не покрывает"),
+                # АРТЕФАКТ СТАРОГО ОБРАЗЦА, заверяющий план, а не два массива
+                ({"witnesses": []}, "свидетелей вместо двух"),
+                ({"witnesses": [dict(manifest_sha1="S", run_id="A"),
+                                dict(manifest_sha1="S", run_id="B")]},
+                 "отпечатки манифестов"),
+                ({"witnesses": [dict(manifest_sha1="S1", run_id="A"),
+                                dict(manifest_sha1="S2", run_id="A")]},
+                 "номера запусков")):
             try:
-                check_gate_r(w(dict(ok, **patch)))
+                check_gate_r(w(mk_gate(**patch)))
             except SystemExit as e:
                 assert why in str(e), (why, e)
             else:
                 raise AssertionError(f"Gate R принят при {patch}")
         try:
-            check_gate_r(w(ok), expect_plan_sha1="Q")
+            check_gate_r(w(mk_gate()), expect_plan_sha1="Q")
         except SystemExit as e:
             assert "по плану" in str(e)
         else:
@@ -410,51 +517,127 @@ def selftest():
                 raise AssertionError("принято отсутствие Gate R")
 
         # --- канонический q0 ------------------------------------------------
-        grp = w(ok)
         q0 = np.full((7, 16), 3, np.int32)
         q0[5:] = -1                       # строки вне частей не считались
         base = os.path.join(td, "q0")
         np.savez_compressed(open(base + ".npz", "wb"), q0=q0)
+
         def wm(**kw):
+            """Записать манифест и вернуть путь к npz и отпечаток манифеста."""
             m = dict(kind="k14_q0_by_plan", plan_sha1="P",
                      batch=CANONICAL_BATCH, npz_sha1=file_sha(base + ".npz"),
                      keys_sha1="KS", limit=0, git_dirty=False, git_head="H",
-                     run_id="R", q0_dtype="int32", cache_meta_sha1="CM",
+                     run_id="A", exec_order_seed=0, q0_dtype="int32",
+                     cache_meta_sha1="CM",
                      parts={p_: dict(n_rows=2, q0_sha1="s" + p_)
                             for p_ in CANONICAL_PARTS})
             m.update(kw)
             json.dump(m, open(base + ".manifest.json", "w"))
-            return base + ".npz"
+            return base + ".npz", file_sha(base + ".manifest.json")
+
+        def gate_for(man_sha, **over):
+            """Gate R, заверяющий ИМЕННО этот манифест как первого свидетеля."""
+            g = mk_gate()
+            g["witnesses"][0]["manifest_sha1"] = man_sha
+            for k_, v_ in over.items():
+                if k_.startswith("w0_"):
+                    g["witnesses"][0][k_[3:]] = v_
+                else:
+                    g[k_] = v_
+            return w(g)
+
+        # --- ЧТЕНИЕ СОХРАНЁННОГО ПЛАНА --------------------------------
+        pl = make_plan(dict(train=np.array([0, 1, 2, 5]),
+                            val_sel=np.array([3, 4]),
+                            val_confirm=np.array([6, 7])), offs, 2)
+        pa = plan_arrays(pl)
+        pbase = os.path.join(td, "plan")
+        np.savez_compressed(open(pbase + ".npz", "wb"), q0=np.zeros((1, 1)),
+                            **pa)
+        pman = dict(batch=2, declared_parts=list(CANONICAL_PARTS),
+                    plan_sha1=plan_identity(pl, 2), n_batches=len(pl))
+        back = load_plan(pbase + ".npz", pman)
+        assert [(n, o, list(r)) for n, o, r in back] == \
+            [(n, o, list(r)) for n, o, r in pl], "план восстановлен иначе"
+        for over, why in ((dict(plan_sha1="ДРУГОЕ"), "отпечаток"),
+                          (dict(n_batches=99), "батчей"),
+                          (dict(batch=8), "отпечаток")):
+            try:
+                load_plan(pbase + ".npz", dict(pman, **over))
+            except SystemExit as e:
+                assert why in str(e), (why, e)
+            else:
+                raise AssertionError(f"план принят при {over}")
+        np.savez_compressed(open(pbase + ".npz", "wb"), q0=np.zeros((1, 1)))
+        try:
+            load_plan(pbase + ".npz", pman)
+        except SystemExit as e:
+            assert "нет границ плана" in str(e), e
+        else:
+            raise AssertionError("принят артефакт без границ плана")
+
+        npz_p, ms = wm()
         got_q0, defined, man_, prov = load_canonical_q0(
-            wm(), gate_r_path=grp, n_obs=7, keys_sha="KS",
+            npz_p, gate_r_path=gate_for(ms), n_obs=7, keys_sha="KS",
             cache_meta_sha1="CM")
         assert got_q0.dtype == np.int64 and got_q0.shape == (7, 16)
         assert defined.sum() == 5, defined.sum()
         assert prov["plan_sha1"] == "P" and prov["gate_r_sha1"]
+        assert prov["q0_manifest_sha1"] == ms
+
         for kw, why in (({"keys_sha1": "OTHER"}, "по ключам"),
                         ({"limit": 99}, "--limit"),
                         ({"git_dirty": True}, "незакоммиченных"),
                         ({"npz_sha1": "beef"}, "в манифесте"),
-                        ({"plan_sha1": "Q"}, "по плану"),
                         ({"cache_meta_sha1": "XX"}, "по мете"),
                         ({"q0_dtype": "int64"}, "типа"),
                         ({"kind": "other"}, "описывает")):
+            np_, ms_ = wm(**kw)
             try:
-                load_canonical_q0(wm(**kw), gate_r_path=grp, n_obs=7,
+                load_canonical_q0(np_, gate_r_path=gate_for(ms_), n_obs=7,
                                   keys_sha="KS", cache_meta_sha1="CM")
             except SystemExit as e:
                 assert why in str(e), (why, e)
             else:
                 raise AssertionError(f"q0 принят при {kw}")
+
+        # ТРЕТИЙ АРТЕФАКТ С ТЕМ ЖЕ ПЛАНОМ. Именно этот случай проходил раньше:
+        # Gate R заверял A и B, а грузился C, про который не доказано ничего.
+        _np1, sha_ab = wm()
+        _np2, _sha_c = wm(run_id="C", exec_order_seed=3)
         try:
-            load_canonical_q0(wm(), gate_r_path=grp, n_obs=9, keys_sha="KS")
+            load_canonical_q0(_np2, gate_r_path=gate_for(sha_ab), n_obs=7,
+                              keys_sha="KS")
+        except SystemExit as e:
+            assert "третий артефакт" in str(e), e
+        else:
+            raise AssertionError("принят q0, не заверённый Gate R")
+
+        npz_p, ms = wm()
+        for over, why in (({"w0_run_id": "ДРУГОЙ"}, "run_id"),
+                          ({"w0_exec_order_seed": 5}, "при порядке"),
+                          ({"w0_parts": {p_: "ДРУГОЕ"
+                                         for p_ in CANONICAL_PARTS}},
+                           "заверил q0"),
+                          ({"plan_sha1": "Q"}, "по плану")):
+            try:
+                load_canonical_q0(npz_p, gate_r_path=gate_for(ms, **over),
+                                  n_obs=7, keys_sha="KS")
+            except SystemExit as e:
+                assert why in str(e), (why, e)
+            else:
+                raise AssertionError(f"q0 принят при {over}")
+
+        try:
+            load_canonical_q0(npz_p, gate_r_path=gate_for(ms), n_obs=9,
+                              keys_sha="KS")
         except SystemExit as e:
             assert "формы" in str(e), e
         else:
             raise AssertionError("q0 чужого размера принят")
         # без доказательства Gate R q0 не грузится вовсе
         try:
-            load_canonical_q0(wm(), gate_r_path="", n_obs=7, keys_sha="KS")
+            load_canonical_q0(npz_p, gate_r_path="", n_obs=7, keys_sha="KS")
         except SystemExit:
             pass
         else:
