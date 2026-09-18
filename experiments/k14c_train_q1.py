@@ -488,6 +488,11 @@ def main():
 
     # --- модель -------------------------------------------------------------
     cfg = get_cfg(os.path.join(root, a.cfg_path))
+    # ПУТЬ К БАЗОВОЙ МОДЕЛИ ПЕРЕОПРЕДЕЛЯЕТСЯ, КАК В K-11a И K-12d. В конфиге
+    # авторов зашит абсолютный путь с их машины; без подмены `from_pretrained`
+    # пытается трактовать его как имя репозитория на HuggingFace.
+    cfg.TRAINING.ckpt_dir = a.ckpt
+    cfg.MODEL.vlm.kwargs.pretrained_model_name_or_path = a.ckpt
     Base = make_joint12_class(SmolVLABlockwiseAR)
     model = Base.from_pretrained(**cfg.MODEL.vlm.kwargs).to(dev, dt).eval()
     proc = VisionLanguageActionProcessor.from_pretrained(
