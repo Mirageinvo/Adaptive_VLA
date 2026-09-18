@@ -368,6 +368,7 @@ def main():
             sys.path.insert(0, p)
     import torch
     import torch.nn.functional as F
+    import hicora_vla as hv
     import k11a_build_hicora_cache as k11a
     import k12b_protocol as kb
     from depth_rvq_joint12 import (make_joint_depth_rvq_class,
@@ -723,11 +724,25 @@ def main():
                         attention_mask=b.get("attention_mask"),
                         position_ids=p_)
                     fast = jf["pred_codes"] if "pred_codes" in jf else jf[1]
-                    tp = model.forward_taps(
-                        vlm_inputs_embeds=v_,
-                        attention_mask=b.get("attention_mask"),
-                        position_ids=p_)
-                    _lg, taps_q0 = model.q0_from(tp[model.fast_depth])
+                    # `forward_taps` живёт в классе HiCoRA, и у модели
+                    # тренера его нет. На время аудита класс расширяется
+                    # примесью и возвращается обратно: иначе сравнить с тем
+                    # вызовом, которым построен кэш, невозможно. Ни один вес
+                    # при этом не меняется — метод только читает отводы.
+                    base_cls = type(model)
+                    model.__class__ = hv.make_hicora_class(base_cls)
+                    model.taps = tuple(sorted(set(
+                        list(model.depth_rvq_exits) + [model.fast_depth])))
+                    model.q0_depth = int(model.fast_depth)
+                    model.n_layers_total = len(model.action_expert.layers)
+                    try:
+                        tp = model.forward_taps(
+                            vlm_inputs_embeds=v_,
+                            attention_mask=b.get("attention_mask"),
+                            position_ids=p_)
+                        _lg, taps_q0 = model.q0_from(tp[model.fast_depth])
+                    finally:
+                        model.__class__ = base_cls
                 cmp["seg_vs_cache"] += int((seg != cq).sum())
                 cmp["fast_vs_cache"] += int((fast != cq).sum())
                 cmp["taps_vs_cache"] += int((taps_q0 != cq).sum())
