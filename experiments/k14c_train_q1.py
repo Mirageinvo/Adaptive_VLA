@@ -369,9 +369,21 @@ def main():
     from joint12_vla import make_joint12_class
     import actioncodec  # noqa: F401
     from smolvla.bar import SmolVLABlockwiseAR
+    import inspect
     from utils import (ACTION_Q01, ACTION_Q99, STATE_Q01, STATE_Q99,
                        VisionLanguageActionProcessor, dict_apply, get_cfg,
                        prompt_template)
+
+    # ОТПЕЧАТОК bar.py БЕРЁТСЯ ОТ ФАКТИЧЕСКИ ИМПОРТИРОВАННОГО КЛАССА.
+    # Собранный вручную путь был неверен (`src/smolvla/bar.py` вместо
+    # `smolvla/bar.py`), и поле молча становилось None — то есть провенанс
+    # сегментированного прохода отсутствовал, а выглядел записанным.
+    bar_p = inspect.getfile(SmolVLABlockwiseAR)
+    if not bar_p or not os.path.exists(bar_p):
+        raise SystemExit(f"не удалось определить файл SmolVLABlockwiseAR "
+                         f"({bar_p}): без его отпечатка провенанс прохода "
+                         f"неполон")
+    bar_sha = sha12(bar_p)
 
     dev = torch.device(a.device)
     dt = getattr(torch, a.dtype)
@@ -677,6 +689,12 @@ def main():
                 if nog or nf:
                     raise SystemExit(f"градиенты: нет у {nog[:3]}, "
                                      f"нечисловые у {nf[:3]}")
+                if ep == 1:
+                    # ПОЛОЖИТЕЛЬНАЯ СТРОКА, А НЕ ТОЛЬКО ОТСУТСТВИЕ ОТКАЗА.
+                    # По логу должно быть видно, что проверка исполнялась.
+                    print(f"    первый шаг: q0 совпал с кэшем, потеря "
+                          f"конечна, градиент есть у всех "
+                          f"{len(params)} обучаемых тензоров")
             opt.step()
             run += float(loss.detach()); nb += 1; dq += d_q0
         v = evaluate(sets["val_sel"])
@@ -761,6 +779,7 @@ def main():
         lr=a.lr, wd=a.wd, batch=int(a.batch),
         lambda_action=a.lambda_action, lambda_fb=a.lambda_fb,
         grip_weight=a.grip_weight, device=str(dev), dtype=a.dtype,
+        bar_path=bar_p,
         git_head=(os.popen("git rev-parse HEAD 2>/dev/null").read().strip()
                   or None),
         git_dirty=bool(os.popen("git status --porcelain 2>/dev/null")
@@ -775,9 +794,7 @@ def main():
             os.path.join(here, "depth_rvq_vla.py"),
             os.path.join(here, "joint12_vla.py"),
             os.path.join(here, "k14b_build_q1_cache.py")]),
-        bar_sha1=sha12(os.path.join(root, "src", "smolvla", "bar.py"))
-        if os.path.exists(os.path.join(root, "src", "smolvla", "bar.py"))
-        else None,
+        bar_sha1=bar_sha,
         script_sha1=sha12(os.path.abspath(__file__)))
     tmp = out_p + f".tmp.{os.getpid()}"
     torch.save(ck, tmp)
