@@ -700,6 +700,45 @@ def main():
         with torch.no_grad():
             for po, sel in group_by_offset(rows_a, offs, a.batch):
                 run_batch(po, sel, False)
+        # ЛОКАЛИЗАЦИЯ ПРИЧИНЫ. Кэш строился `forward_taps` с отводом на 12-м
+        # слое; тренер берёт q0 сегментированным проходом depth-RVQ. Это
+        # разные вызовы, и надо знать, какой из них расходится с кэшем: от
+        # этого зависит, грань это или разные пути.
+        print("\n  СРАВНЕНИЕ ТРЁХ ПУТЕЙ на первых батчах:")
+        cmp = dict(seg_vs_cache=0, fast_vs_cache=0, taps_vs_cache=0,
+                   seg_vs_fast=0, seg_vs_taps=0, n=0)
+        with torch.no_grad():
+            for po, sel in group_by_offset(rows_a, offs, a.batch)[:16]:
+                b = build(po, sel)
+                cq = torch.from_numpy(
+                    np.asarray(q0hat_c[sel]).astype(np.int64)).to(dev)
+                with ac16:
+                    v_, p_ = model.build_inputs(position_offset=po, **b)
+                    seg = model.forward_joint_depth_rvq(
+                        vlm_inputs_embeds=v_,
+                        attention_mask=b.get("attention_mask"),
+                        position_ids=p_, mode="fast")["pred_codes"][0]
+                    jf = model.forward_joint_fast(
+                        vlm_inputs_embeds=v_,
+                        attention_mask=b.get("attention_mask"),
+                        position_ids=p_)
+                    fast = jf["pred_codes"] if "pred_codes" in jf else jf[1]
+                    tp = model.forward_taps(
+                        vlm_inputs_embeds=v_,
+                        attention_mask=b.get("attention_mask"),
+                        position_ids=p_)
+                    _lg, taps_q0 = model.q0_from(tp[model.fast_depth])
+                cmp["seg_vs_cache"] += int((seg != cq).sum())
+                cmp["fast_vs_cache"] += int((fast != cq).sum())
+                cmp["taps_vs_cache"] += int((taps_q0 != cq).sum())
+                cmp["seg_vs_fast"] += int((seg != fast).sum())
+                cmp["seg_vs_taps"] += int((seg != taps_q0).sum())
+                cmp["n"] += int(cq.numel())
+        for k_ in ("seg_vs_cache", "fast_vs_cache", "taps_vs_cache",
+                   "seg_vs_fast", "seg_vs_taps"):
+            print(f"    {k_:16s} {cmp[k_]:5d} из {cmp['n']} "
+                  f"({100 * cmp[k_] / max(cmp['n'], 1):.4f}%)")
+
         n_b, n_t = q0_bad[0], q0_tot[0]
         print(f"\n  АУДИТ q0: расхождений {n_b} из {n_t} позиций "
               f"({100 * n_b / max(n_t, 1):.4f}%)")
