@@ -251,7 +251,15 @@ def make_joint_depth_rvq_class(base_cls):
             d_model = int(self.fast_head.in_features)
             vocab = int(self.fast_head.out_features)
             self.depth_rvq_exits = exits
-            self.depth_rvq_use_feedback = bool(feedback)
+            # МАСКА ИСПОЛНЕНИЯ FEEDBACK — ПОУРОВНЕВАЯ И НЕ ЗАДАНА ДО ВЫБОРА
+            # ЭТАПА. Глобальный флаг был fail-open: вариант `no_feedback`
+            # исключал веса feedback из обучаемых, но forward всё равно их
+            # применял. На свежей инициализации это случайно эквивалентно —
+            # проекция нулевая; после загрузки main-чекпойнта feedback был бы
+            # заморожен и продолжал бы влиять, а вариант назывался бы
+            # `no_feedback`.
+            self.depth_rvq_feedback_built = bool(feedback)
+            self.depth_rvq_feedback_mask = None
             self.register_buffer("depth_rvq_books", b.to(dev))
 
             # Норма Joint12 обучена читать h12. Её применение к h18/h24 было
@@ -326,7 +334,16 @@ def make_joint_depth_rvq_class(base_cls):
                     f"эксперимент")
             return table[key]
 
+        # МАСКА ИСПОЛНЕНИЯ ПО ЭТАПАМ. Индекс 0 — внедрение E0(q0) после слоя
+        # 12 (самообусловливание ветви q1), индекс 1 — внедрение E1(q1) после
+        # слоя 18. Для q2 маска нулевого уровня НАСЛЕДУЕТСЯ от той головы q1,
+        # поверх которой он учится, и обязана быть названа явно.
+        FEEDBACK_MASK = {("q1", "main"): (True, True),
+                         ("q1", "static"): (True, True),
+                         ("q1", "no_feedback"): (False, True)}
+
         def configure_joint_depth_rvq(self, *, stage: str, variant: str,
+                                      parent_feedback: bool = None,
                                       verbose: bool = True) -> dict:
             """Разморозить РОВНО веса этого этапа, всё прочее заморозить.
 
@@ -335,6 +352,24 @@ def make_joint_depth_rvq_class(base_cls):
             получилось» не ответ, отвечает «что именно».
             """
             pref = self.joint_depth_rvq_trainable_prefixes(stage, variant)
+            key = (str(stage), str(variant))
+            if key in self.FEEDBACK_MASK:
+                if parent_feedback is not None:
+                    raise ValueError(
+                        f"parent_feedback задан для этапа {key}: он имеет "
+                        f"смысл только для q2, где маска нулевого уровня "
+                        f"наследуется от обученной головы q1")
+                mask = self.FEEDBACK_MASK[key]
+            else:                                   # q2
+                if parent_feedback is None:
+                    raise ValueError(
+                        "для этапа q2 нужен parent_feedback: маска нулевого "
+                        "уровня наследуется от головы q1, поверх которой он "
+                        "учится. Умолчания нет — оно означало бы, что q2 "
+                        "учится при другом самообусловливании, чем его "
+                        "родитель")
+                mask = (bool(parent_feedback), True)
+            self.depth_rvq_feedback_mask = mask
             for p in self.parameters():
                 p.requires_grad_(False)
             for name, p in self.named_parameters():
@@ -367,12 +402,17 @@ def make_joint_depth_rvq_class(base_cls):
                         if n in set(names))
             info = dict(stage=str(stage), variant=str(variant),
                         prefixes=list(pref), names=names,
-                        n_tensors=len(names), n_params=int(n_par))
+                        n_tensors=len(names), n_params=int(n_par),
+                        feedback_mask=list(mask),
+                        feedback_built=bool(self.depth_rvq_feedback_built),
+                        parent_feedback=(None if parent_feedback is None
+                                         else bool(parent_feedback)))
             if verbose:
                 print(f"  depth-RVQ, этап {stage}/{variant}: "
                       f"{len(names)} обучаемых тензоров, "
-                      f"{n_par / 1e6:.3f} млн параметров; Joint12, backbone и "
-                      f"уровень {'q2' if stage == 'q1' else 'q1'} заморожены")
+                      f"{n_par / 1e6:.3f} млн параметров; маска feedback "
+                      f"{mask}; Joint12, backbone и уровень "
+                      f"{'q2' if stage == 'q1' else 'q1'} заморожены")
             return info
 
         def _joint_depth_logits(self, action_hidden: torch.Tensor, level: int):
@@ -479,8 +519,16 @@ def make_joint_depth_rvq_class(base_cls):
                     emb = hard if g == 0 else emb + (hard - emb).detach()
                 injected.append(inj_idx)
                 embs.append(emb)
-                if self.depth_rvq_use_feedback:
-                    action_hidden = self.depth_rvq_feedback[g](action_hidden, emb)
+                if self.depth_rvq_feedback_mask is None:
+                    raise RuntimeError(
+                        "маска feedback не задана: вызовите "
+                        "configure_joint_depth_rvq(stage=..., variant=...) "
+                        "до прохода. Умолчания нет намеренно — оно уже один "
+                        "раз сделало `no_feedback` действующим")
+                if self.depth_rvq_feedback_built \
+                        and self.depth_rvq_feedback_mask[g]:
+                    action_hidden = self.depth_rvq_feedback[g](action_hidden,
+                                                               emb)
 
             if layers_run != self.depth_rvq_exits[stop_level]:
                 raise RuntimeError(
@@ -601,6 +649,10 @@ def selftest() -> None:
     late_norm = copy.deepcopy(m.action_expert.norm)
     books = torch.randn(3, V, Z)
     m.init_joint_depth_rvq(refine_norm=late_norm, books=books)
+    # ПОСЛЕ СБОРКИ НИЧЕГО НЕ ОБУЧАЕТСЯ: этап обязан быть назван явно.
+    assert not any(p.requires_grad for p in m.parameters()), \
+        "init оставил обучаемые веса: этап не выбран, а градиент уже течёт"
+    assert m.depth_rvq_feedback_mask is None, "init задал маску feedback"
     x = torch.randn(2, 5, D)
 
     # Эталон fast вручную: та же непрерывная раскладка bos и те же 12 слоёв.
@@ -619,13 +671,25 @@ def selftest() -> None:
     assert out_fast["layers_run"] == 12
     assert torch.equal(out_fast["logits"][0], ref)
 
+    # БЕЗ ВЫБРАННОГО ЭТАПА ПРОХОД НЕВОЗМОЖЕН: маска feedback не задана.
+    try:
+        m.forward_joint_depth_rvq(
+            vlm_inputs_embeds=x, attention_mask=None, position_ids=None,
+            mode="full")
+    except RuntimeError as e:
+        assert "маска feedback не задана" in str(e), e
+    else:
+        raise AssertionError("проход без выбранного этапа выполнился")
+    m.configure_joint_depth_rvq(stage="q1", variant="main", verbose=False)
+
     out0 = m.forward_joint_depth_rvq(
         vlm_inputs_embeds=x, attention_mask=None, position_ids=None,
         mode="full")
     assert out0["layers_run"] == 24 and len(out0["logits"]) == 3
     q0_before = out0["pred_codes"][0].clone()
     # Нулевая feedback-проекция обязана быть точным тождеством.
-    m.depth_rvq_use_feedback = False
+    m.configure_joint_depth_rvq(stage="q1", variant="no_feedback",
+                                verbose=False)
     nofb = m.forward_joint_depth_rvq(
         vlm_inputs_embeds=x, attention_mask=None, position_ids=None,
         mode="full")
@@ -633,7 +697,7 @@ def selftest() -> None:
         assert torch.equal(a, b)
 
     # После ненулевого feedback меняются только поздние уровни, q0 остаётся.
-    m.depth_rvq_use_feedback = True
+    m.configure_joint_depth_rvq(stage="q1", variant="main", verbose=False)
     for fb in m.depth_rvq_feedback:
         nn.init.normal_(fb.proj.weight, std=0.1)
         nn.init.normal_(fb.proj.bias, std=0.1)
@@ -643,9 +707,6 @@ def selftest() -> None:
     assert torch.equal(moved["pred_codes"][0], q0_before)
     assert not torch.equal(moved["logits"][1], nofb["logits"][1])
 
-    # ПОСЛЕ СБОРКИ НИЧЕГО НЕ ОБУЧАЕТСЯ: этап обязан быть назван явно.
-    assert not any(p.requires_grad for p in m.parameters()), \
-        "init оставил обучаемые веса: этап не выбран, а градиент уже течёт"
     try:
         m.configure_joint_depth_rvq(stage="q3", variant="main", verbose=False)
     except ValueError as e:
@@ -654,14 +715,14 @@ def selftest() -> None:
         raise AssertionError("несуществующий этап принят")
 
     # ТРИ ЭТАПА ДАЮТ ТРИ РАЗНЫХ ТОЧНЫХ МНОЖЕСТВА -------------------------
-    seen = {}
-    for stage_, var_, groups in (("q1", "main", ("norms.0.", "heads.0.",
-                                                 "feedback.0.")),
-                                 ("q1", "no_feedback", ("norms.0.",
-                                                        "heads.0.")),
-                                 ("q2", "main", ("norms.1.", "heads.1.",
-                                                 "feedback.1."))):
+    seen, masks = {}, {}
+    for stage_, var_, groups, pf_ in (
+            ("q1", "main", ("norms.0.", "heads.0.", "feedback.0."), None),
+            ("q1", "static", ("norms.0.", "heads.0.", "feedback.0."), None),
+            ("q1", "no_feedback", ("norms.0.", "heads.0."), None),
+            ("q2", "main", ("norms.1.", "heads.1.", "feedback.1."), True)):
         info = m.configure_joint_depth_rvq(stage=stage_, variant=var_,
+                                           parent_feedback=pf_,
                                            verbose=False)
         tr = {name for name, p in m.named_parameters() if p.requires_grad}
         assert tr == set(info["names"]), (stage_, var_)
@@ -677,10 +738,58 @@ def selftest() -> None:
                      "action_expert.layers.0.weight"):
             assert not dict(m.named_parameters())[name].requires_grad, name
         seen[(stage_, var_)] = tr
+        masks[(stage_, var_)] = tuple(info["feedback_mask"])
     # БЕЗ FEEDBACK — СТРОГО МЕНЬШЕ, ЧЕМ MAIN, И РОВНО НА FEEDBACK
     a_, b_ = seen[("q1", "main")], seen[("q1", "no_feedback")]
     assert b_ < a_ and all("feedback" in n_ for n_ in a_ - b_), a_ - b_
     assert not (seen[("q1", "main")] & seen[("q2", "main")]), "этапы пересеклись"
+    # STATIC ОТЛИЧАЕТСЯ ОТ MAIN ТОЛЬКО ИСТОЧНИКОМ ЦЕЛЕЙ: обучаемые веса и
+    # маска исполнения обязаны совпадать. Иначе сравнение динамических и
+    # статических целей сравнивало бы заодно и архитектуру.
+    assert seen[("q1", "static")] == seen[("q1", "main")], "static != main"
+    assert masks[("q1", "static")] == masks[("q1", "main")], "маски различны"
+    assert masks[("q1", "no_feedback")][0] is False
+    assert masks[("q1", "main")][0] is True
+
+    # --- q2 НАСЛЕДУЕТ МАСКУ РОДИТЕЛЬСКОЙ ГОЛОВЫ q1 -----------------------
+    try:
+        m.configure_joint_depth_rvq(stage="q2", variant="main", verbose=False)
+    except ValueError as e:
+        assert "parent_feedback" in str(e), e
+    else:
+        raise AssertionError("q2 без parent_feedback принят")
+    try:
+        m.configure_joint_depth_rvq(stage="q1", variant="main",
+                                    parent_feedback=True, verbose=False)
+    except ValueError as e:
+        assert "parent_feedback задан" in str(e), e
+    else:
+        raise AssertionError("parent_feedback принят для q1")
+    i2 = m.configure_joint_depth_rvq(stage="q2", variant="main",
+                                     parent_feedback=False, verbose=False)
+    assert tuple(i2["feedback_mask"]) == (False, True), i2["feedback_mask"]
+
+    # --- NO_FEEDBACK ДЕЙСТВИТЕЛЬНО ОБХОДИТ МОДУЛЬ ------------------------
+    # Главная проверка: при НЕНУЛЕВОМ feedback варианты обязаны РАЗОЙТИСЬ.
+    # Прежде `no_feedback` лишь исключал веса из обучаемых, а forward их
+    # применял, и на свежей инициализации разницы не было видно.
+    for fb_ in m.depth_rvq_feedback:
+        nn.init.normal_(fb_.proj.weight, std=0.1)
+        nn.init.normal_(fb_.proj.bias, std=0.1)
+    m.configure_joint_depth_rvq(stage="q1", variant="main", verbose=False)
+    with_fb = m.forward_joint_depth_rvq(
+        vlm_inputs_embeds=x, attention_mask=None, position_ids=None,
+        mode="medium")
+    m.configure_joint_depth_rvq(stage="q1", variant="no_feedback",
+                                verbose=False)
+    without_fb = m.forward_joint_depth_rvq(
+        vlm_inputs_embeds=x, attention_mask=None, position_ids=None,
+        mode="medium")
+    assert torch.equal(with_fb["pred_codes"][0], without_fb["pred_codes"][0]), \
+        "q0 изменился от маски feedback: он обязан быть от неё независим"
+    assert not torch.equal(with_fb["logits"][1], without_fb["logits"][1]), \
+        ("no_feedback не обошёл модуль: при ненулевой проекции логиты q1 "
+         "обязаны отличаться от main")
     # СОСТАВ ВОССТАНАВЛИВАЕТСЯ ПОСЛЕ ЛЮБОГО ЭТАПА
     m.configure_joint_depth_rvq(stage="q1", variant="main", verbose=False)
     n = sum(p.numel() for p in m.parameters() if p.requires_grad)

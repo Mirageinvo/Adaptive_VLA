@@ -123,6 +123,41 @@ def check_oracle(orc, *, device, ckpt, cache, split_seed, sel_frac):
     return True
 
 
+INT_DTYPES = ("int16", "int32", "int64")
+
+
+def check_oracle_schema(orc, parts=("train", "val_sel", "val_confirm")):
+    """Поля артефакта гейта, без которых сверка меток становится видимостью.
+
+    ОТСУТСТВИЕ ПОЛЯ — ОТКАЗ. Условия вида «сверить, если поле есть» уже трижды
+    за проект превращали проверку в согласие: в сводке K-13c, в keys_sha1 и в
+    отпечатках кодека. Здесь то же самое: без rows_sha1 контрольные строки не
+    сверяются, без n_used они не восстанавливаются, без dtype метки приводятся
+    неизвестно к чему.
+    """
+    bad = []
+    if orc.get("sample_seed") is None:
+        bad.append("sample_seed")
+    for nm in parts:
+        smp = (orc.get("sampling") or {}).get(nm) or {}
+        po = (orc.get("parts") or {}).get(nm) or {}
+        for k in ("n_used", "rows_sha1"):
+            if smp.get(k) in (None, ""):
+                bad.append(f"sampling.{nm}.{k}")
+        for k in ("q1_ze_sha1", "q1_ze_dtype"):
+            if po.get(k) in (None, ""):
+                bad.append(f"parts.{nm}.{k}")
+        dt = po.get("q1_ze_dtype")
+        if dt is not None and str(dt) not in INT_DTYPES:
+            bad.append(f"parts.{nm}.q1_ze_dtype = {dt}: метки обязаны быть "
+                       f"целыми, допустимы {INT_DTYPES}")
+    if bad:
+        raise SystemExit(
+            "в артефакте гейта нет обязательных полей или они неверны: "
+            + ", ".join(bad) + ". Без них сверка меток была бы видимостью")
+    return True
+
+
 def check_stamp_match(stamp, orc, got_w, probe_now):
     """Те ли САМЫЕ массивы и тот ли кодек, на которых пройден гейт.
 
@@ -277,6 +312,50 @@ def selftest():
         else:
             raise AssertionError(f"артефакт без {nm_} принят")
 
+    # --- СХЕМА АРТЕФАКТА ГЕЙТА: ОТСУТСТВИЕ ПОЛЯ — ОТКАЗ ------------------
+    def _orc(**patch):
+        base = dict(sample_seed=0,
+                    sampling={p: dict(n_used=10, rows_sha1="R" + p)
+                              for p in ("train", "val_sel", "val_confirm")},
+                    parts={p: dict(q1_ze_sha1="S" + p, q1_ze_dtype="int32")
+                           for p in ("train", "val_sel", "val_confirm")})
+        base.update(patch)
+        return base
+
+    check_oracle_schema(_orc())
+    for patch, why in (
+            ({"sample_seed": None}, "sample_seed"),
+            ({"sampling": {}}, "sampling.train.n_used"),
+            ({"parts": {}}, "parts.train.q1_ze_sha1")):
+        try:
+            check_oracle_schema(_orc(**patch))
+        except SystemExit as e:
+            assert why in str(e), (why, str(e))
+        else:
+            raise AssertionError(f"схема принята без {why}")
+    # по одному отсутствующему полю на часть
+    for part_ in ("train", "val_sel", "val_confirm"):
+        for grp, key in (("sampling", "n_used"), ("sampling", "rows_sha1"),
+                         ("parts", "q1_ze_sha1"), ("parts", "q1_ze_dtype")):
+            o = _orc()
+            o[grp][part_] = {k: v for k, v in o[grp][part_].items()
+                             if k != key}
+            try:
+                check_oracle_schema(o)
+            except SystemExit as e:
+                assert f"{grp}.{part_}.{key}" in str(e), (part_, key, str(e))
+            else:
+                raise AssertionError(f"принято без {grp}.{part_}.{key}")
+    # нецелый тип меток
+    o = _orc()
+    o["parts"]["train"]["q1_ze_dtype"] = "float32"
+    try:
+        check_oracle_schema(o)
+    except SystemExit as e:
+        assert "обязаны быть целыми" in str(e), e
+    else:
+        raise AssertionError("нецелый тип меток принят")
+
     print("самопроверка k14b_build_q1_cache пройдена")
 
 
@@ -378,6 +457,7 @@ def main():
     orc = json.load(open(a.oracle))
     check_oracle(orc, device=dev, ckpt=a.ckpt, cache=a.cache,
                  split_seed=a.split_seed, sel_frac=a.sel_frac)
+    check_oracle_schema(orc)
     print(f"  привязка к Gate 2: {a.oracle}, запуск {orc.get('run_id')}, "
           f"режим {orc.get('device')}")
 
@@ -491,8 +571,8 @@ def main():
     # генератором, и сверка идёт на них.
     ctl_parts, ctl_meta = k14a.build_parts(
         idx, epi, a.sel_frac, a.split_seed,
-        int(orc.get("sampling", {}).get("train", {}).get("n_used", 0)),
-        np.random.default_rng(int(orc.get("sample_seed", 0))),
+        int(orc["sampling"]["train"]["n_used"]),
+        np.random.default_rng(int(orc["sample_seed"])),
         split_episodes)
     q1_by_part = {nm: arr for nm, arr in zip(
         ("train", "val_sel", "val_confirm"), out_q1)}
@@ -501,17 +581,18 @@ def main():
     checked = {}
     for name in ("train", "val_sel", "val_confirm"):
         po = (orc.get("parts") or {}).get(name) or {}
-        want_sha, want_dt = po.get("q1_ze_sha1"), po.get("q1_ze_dtype")
-        if not want_sha:
-            raise SystemExit(f"в {a.oracle} нет q1_ze_sha1 для {name}")
+        want_sha, want_dt = po["q1_ze_sha1"], po["q1_ze_dtype"]
         ctl = np.asarray(ctl_parts[name], np.int64)
+        smp = orc["sampling"][name]
+        if len(ctl) != int(smp["n_used"]):
+            raise SystemExit(
+                f"{name}: восстановлено {len(ctl)} контрольных строк, в "
+                f"артефакте заявлено {smp['n_used']}")
         got_rows_sha = arr_sha(ctl)
-        want_rows_sha = (orc.get("sampling", {}).get(name, {})
-                         .get("rows_sha1"))
-        if want_rows_sha and got_rows_sha != want_rows_sha:
+        if got_rows_sha != smp["rows_sha1"]:
             raise SystemExit(
                 f"{name}: контрольные строки дают sha {got_rows_sha}, у "
-                f"оракула {want_rows_sha} — восстановлен другой набор")
+                f"оракула {smp['rows_sha1']} — восстановлен другой набор")
         pos = np.searchsorted(rows_by_part[name], ctl)
         if pos.max() >= len(rows_by_part[name]) or \
                 not np.array_equal(rows_by_part[name][pos], ctl):
