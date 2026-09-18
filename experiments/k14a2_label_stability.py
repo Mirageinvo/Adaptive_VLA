@@ -51,6 +51,30 @@ def flip_stats(xa, xb):
                 frac_rows=float(d.any(-1).mean()))
 
 
+def top2_margin(residual, quantizer, torch, _project, chunk_rows=4096):
+    """Разрыв между первым и вторым ближайшими кодами, по токенам.
+
+    СЧИТАЕТСЯ ТАМ, ГДЕ КОДЕК И МЕРЯЕТ — после `in_project`. Разрыв в исходном
+    пространстве относился бы к другой метрике, и вывод о близости кодов был бы
+    о ней, а не о той, по которой код выбирается.
+
+    Разбито по строкам: матрица (все токены, размер словаря) для целой части
+    заняла бы больше гигабайта без всякой нужды.
+    """
+    enc = _project(quantizer.in_project, residual, "in_project")
+    book = quantizer.codebook.float().to(enc.device)
+    flat = enc.reshape(-1, enc.shape[-1])
+    b2 = book.square().sum(-1).unsqueeze(0)
+    out = []
+    with torch.no_grad():
+        for i in range(0, flat.shape[0], chunk_rows):
+            x = flat[i:i + chunk_rows]
+            d = x.square().sum(-1, keepdim=True) - 2.0 * x @ book.T + b2
+            two = torch.topk(d, 2, dim=-1, largest=False).values
+            out.append((two[:, 1] - two[:, 0]).float().cpu())
+    return torch.cat(out).numpy().reshape(enc.shape[:-1])
+
+
 def margin_summary(margins, mask, log=print):
     """Запас до второго ближайшего кода: у перевернувшихся и у остальных.
 
@@ -154,15 +178,53 @@ def main():
     from utils import ACTION_Q01, ACTION_Q99, VisionLanguageActionProcessor
 
     oa, ob = json.load(open(a.a)), json.load(open(a.b))
-    for nm, o in ((a.a, oa), (a.b, ob)):
-        if not o.get("labels_path") or not os.path.exists(o["labels_path"]):
-            raise SystemExit(f"{nm}: нет сохранённых меток")
-        if o.get("labels_sha1") and sha12(o["labels_path"]) != o["labels_sha1"]:
-            raise SystemExit(f"{nm}: файл меток изменился после записи")
-    la = dict(np.load(oa["labels_path"]))
-    lb = dict(np.load(ob["labels_path"]))
-    print(f"  метки: {a.label_a} {oa['labels_path']}\n"
-          f"         {a.label_b} {ob['labels_path']}")
+
+    def labels_of(json_path, o):
+        """Путь к меткам, ПЕРЕНОСИМЫЙ между машинами.
+
+        В артефакте лежит абсолютный путь вычислительного узла. После
+        копирования JSON в reports/ он не откроется у того, кто проверяет
+        результат. Поэтому рядом с JSON ищется файл с тем же именем, и в
+        обоих случаях СВЕРЯЕТСЯ sha: подставить чужой файл нельзя.
+        """
+        lp = o.get("labels_path")
+        if not lp:
+            raise SystemExit(f"{json_path}: в артефакте нет labels_path")
+        if not os.path.exists(lp):
+            alt = os.path.join(os.path.dirname(os.path.abspath(json_path)),
+                               os.path.basename(lp))
+            if not os.path.exists(alt):
+                raise SystemExit(f"{json_path}: нет файла меток ни по {lp}, "
+                                 f"ни рядом с артефактом")
+            print(f"  метки взяты рядом с артефактом: {alt}")
+            lp = alt
+        want = o.get("labels_sha1")
+        if not want:
+            raise SystemExit(f"{json_path}: в артефакте нет labels_sha1, "
+                             f"подтвердить подлинность меток нечем")
+        got = sha12(lp)
+        if got != want:
+            raise SystemExit(f"{lp}: sha {got}, в артефакте {want}")
+        return lp
+
+    # --- ДВА АРТЕФАКТА ОБЯЗАНЫ БЫТЬ ОТ ОДНОГО ЗАПУСКА И ОДНИХ ДАННЫХ ------
+    # Иначе сравнивались бы не режимы вычислений, а разные эксперименты.
+    for k in ("run_id", "source_cache_sha1", "codebooks_sha1",
+              "codec_state_sha1", "ckpt", "horizon", "sample_seed",
+              "n_rows", "split_seed", "sel_frac"):
+        va, vb = oa.get(k), ob.get(k)
+        if str(va) != str(vb):
+            raise SystemExit(f"артефакты различаются по {k}: {va} против "
+                             f"{vb} — это разные эксперименты, а не два "
+                             f"режима одного")
+    if not oa.get("run_id"):
+        raise SystemExit("в артефактах нет run_id: подтвердить, что они от "
+                         "одного запуска, нечем")
+    lpa, lpb = labels_of(a.a, oa), labels_of(a.b, ob)
+    la, lb = dict(np.load(lpa)), dict(np.load(lpb))
+    print(f"  метки: {a.label_a} {lpa}\n         {a.label_b} {lpb}")
+    print(f"  общий запуск {oa['run_id']}, кэш {oa.get('source_cache_sha1')}, "
+          f"кодек {oa.get('codec_state_sha1')}")
 
     dev = torch.device(a.canon)
     max_act_q = np.maximum(np.abs(ACTION_Q01), np.abs(ACTION_Q99))
@@ -179,6 +241,12 @@ def main():
     codec = (ac if hasattr(ac, "vq") else getattr(ac, "codec", None))
     codec = codec.to(dev).eval()
     qs = list(codec.vq.quantizers)
+    import k11a_build_hicora_cache as k11a
+    st_now = k11a.state_sha1(codec)
+    if oa.get("codec_state_sha1") and st_now != oa["codec_state_sha1"]:
+        raise SystemExit(f"веса кодека сейчас {st_now}, в артефактах "
+                         f"{oa['codec_state_sha1']}: декодируется не тем "
+                         f"кодеком, которым считались метки")
 
     def decode(z, batch=256):
         out = []
@@ -208,6 +276,15 @@ def main():
                   f"{st['n_rows_flip']} из {st['n_rows']}{mark}")
 
         # --- дальше только для уровня, который разошёлся -------------------
+        # ВАРИАНТ A БЕРЁТСЯ ОБЩЕЙ БАЗОЙ ДЛЯ ОБОИХ, поэтому q1 обязан совпасть.
+        # Сейчас он совпадает, но если когда-нибудь разойдётся, сравнение q2
+        # пойдёт от разных префиксов и потеряет смысл — молча.
+        k1 = f"{part}.q1_ze"
+        if flip_stats(la[k1], lb[k1])["n_flip"] != 0:
+            raise SystemExit(
+                f"{part}: метки q1_ze различаются между режимами. Сравнивать "
+                f"q2 от общего q1 нельзя: префиксы разные, и разность q2 "
+                f"означала бы не то")
         k2 = f"{part}.q2_ze"
         if flip_stats(la[k2], lb[k2])["n_flip"] == 0:
             continue
@@ -224,6 +301,28 @@ def main():
             kb_ = torch.from_numpy(lb[k2]).long().to(dev)
             A = decode(base + code_contribution(qs[2], ka))
             B = decode(base + code_contribution(qs[2], kb_))
+            # ЗАПАС ДО ВТОРОГО БЛИЖАЙШЕГО КОДА на остатке второго уровня.
+            # Без него утверждение «коды почти равноудалены» остаётся
+            # гипотезой, а не измерением.
+            act_t = torch.from_numpy(
+                np.asarray(ACT[rows], np.float32)).to(dev)
+            z_e = torch.cat([codec._encode(act_t[i:i + 256].float(),
+                                           embodiment_ids=0).float()
+                             for i in range(0, len(act_t), 256)])
+            marg = top2_margin(z_e - base, qs[2], torch, _project_fp32)
+        flip_mask = (la[k2] != lb[k2])
+        print(f"    запас до второго ближайшего кода (в пространстве "
+              f"in_project):")
+        pr["top2_margin"] = margin_summary(marg, flip_mask,
+                                           log=lambda m: print("  " + m))
+        _f = pr["top2_margin"].get("flipped")
+        _s = pr["top2_margin"].get("stable")
+        if _f and _s and _s["median"] > 0:
+            pr["margin_ratio_flipped_to_stable"] = (
+                _f["median"] / _s["median"])
+            print(f"      медиана у перевернувшихся меньше медианы "
+                  f"устойчивых в "
+                  f"{_s['median'] / max(_f['median'], 1e-30):.3g} раз")
         pr["decoded_diff_rms_all"] = err_blocks(A, B, max_act_q,
                                                 a.horizon)["rms"]
         # НА ЗАТРОНУТЫХ СТРОКАХ ОТДЕЛЬНО. Один перевёрнутый токен на сотню
@@ -252,10 +351,15 @@ def main():
               f"{pr['decoded_diff_rms_all']:.3e}")
 
     out = dict(parts=res, canon=str(dev), horizon=int(a.horizon),
+               run_id=oa.get("run_id"),
                a=dict(path=a.a, label=a.label_a, device=oa.get("device"),
+                      json_sha1=sha12(a.a), labels_path=lpa,
                       labels_sha1=oa.get("labels_sha1")),
                b=dict(path=a.b, label=a.label_b, device=ob.get("device"),
+                      json_sha1=sha12(a.b), labels_path=lpb,
                       labels_sha1=ob.get("labels_sha1")),
+               codec_state_sha1=st_now,
+               source_cache_sha1=oa.get("source_cache_sha1"),
                code_version=kb.code_version([os.path.abspath(__file__)]),
                script_sha1=sha12(os.path.abspath(__file__)))
     os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)

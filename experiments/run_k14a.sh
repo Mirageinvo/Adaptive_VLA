@@ -89,6 +89,17 @@ for p, o in ((pa, a), (pb, b)):
     if not lp or not os.path.exists(lp):
         print(f"  ОТКАЗ: в {p} нет сохранённых меток ({lp})")
         sys.exit(10)
+    # SHA ПЕРЕСЧИТЫВАЕТСЯ, А НЕ ЧИТАЕТСЯ. Наличие файла не значит, что это тот
+    # файл: бегунок, объявляющий себя машинным гейтом, обязан это проверить.
+    import hashlib as _h
+    _d = _h.sha1()
+    with open(lp, "rb") as _f:
+        for _b in iter(lambda: _f.read(1 << 22), b""):
+            _d.update(_b)
+    if _d.hexdigest()[:12] != str(o.get("labels_sha1")):
+        print(f"  ОТКАЗ: {lp} имеет sha {_d.hexdigest()[:12]}, в артефакте "
+              f"{o.get('labels_sha1')}")
+        sys.exit(11)
 bad = []
 for k in ("latent_capacity_ok", "action_oracle_ok",
           "dynamic_q1_relabeling_supported", "train_heads"):
