@@ -9,6 +9,8 @@
 # ОСТАНОВ НА ПЕРВОМ ОТКАЗЕ. Если первый прогон упал, второй не запускается:
 # полтора часа карты не тратятся на половину пары.
 #
+# Путь к LIBERO берётся из $LIBERO_PATH, иначе $HOME/LIBERO.
+#
 #   bash experiments/k14d_run_pair.sh            # порядки 0 и 7
 #   bash experiments/k14d_run_pair.sh cuda:0 1 9 # карта и оба порядка
 set -u
@@ -17,8 +19,11 @@ S1="${2:-0}"
 S2="${3:-7}"
 BATCH="${4:-8}"
 
-cd "$HOME/Adaptive_VLA" || exit 1
-export PYTHONPATH="$HOME/LIBERO"
+# КОРЕНЬ БЕРЁТСЯ ИЗ ПУТИ САМОГО СКРИПТА, а не из $HOME: в контейнере
+# домашний каталог пользователя и каталог репозитория разные.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT" || exit 1
+export PYTHONPATH="${LIBERO_PATH:-$HOME/LIBERO}"
 export MUJOCO_GL=egl
 mkdir -p logs data/k14d
 exec >> logs/k14d_pair.log 2>&1
