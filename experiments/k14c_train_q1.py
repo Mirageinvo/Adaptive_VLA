@@ -110,28 +110,40 @@ def select_epoch(history):
     return int(best["epoch"]), float(best["val_sel"])
 
 
-def check_resume(prev, *, stage, variant, q1_cache_sha1, trainable_names,
-                 feedback_mask, joint_sha1):
-    """Продолжение обязано совпасть по всему, что определяет задачу."""
-    bad = []
-    if prev.get("stage") != stage:
-        bad.append(f"этап {prev.get('stage')} против {stage}")
-    if prev.get("variant") != variant:
-        bad.append(f"вариант {prev.get('variant')} против {variant}")
-    if prev.get("q1_cache_sha1") != q1_cache_sha1:
-        bad.append(f"кэш целей {prev.get('q1_cache_sha1')} против "
-                   f"{q1_cache_sha1}")
-    if prev.get("joint_sha1") != joint_sha1:
-        bad.append(f"Joint12 {prev.get('joint_sha1')} против {joint_sha1}")
-    if list(prev.get("feedback_mask") or []) != list(feedback_mask):
-        bad.append(f"маска feedback {prev.get('feedback_mask')} против "
-                   f"{list(feedback_mask)}")
-    pn = sorted(prev.get("trainable_names") or [])
-    if pn != sorted(trainable_names):
-        bad.append(f"набор обучаемых весов: нет {sorted(set(trainable_names) - set(pn))[:3]}, "
-                   f"лишние {sorted(set(pn) - set(trainable_names))[:3]}")
-    if bad:
-        raise SystemExit("продолжение не сходится: " + "; ".join(bad))
+def state_sha(named):
+    """Отпечаток набора именованных тензоров, в фиксированном порядке."""
+    h = hashlib.sha1()
+    for k in sorted(named):
+        v = named[k]
+        h.update(k.encode())
+        h.update(np.ascontiguousarray(
+            np.asarray(v, dtype=np.float64)).tobytes())
+    return h.hexdigest()[:12]
+
+
+def snapshot(named):
+    """Копия обучаемых весов. ИМЕННО КОПИЯ.
+
+    Без клонирования снимок указывал бы на те же тензоры, что продолжают
+    меняться, и «восстановление лучшей эпохи» вернуло бы последнюю.
+    """
+    return {k: v.detach().clone() for k, v in named.items()}
+
+
+def restore(named, snap):
+    """Вернуть веса снимка И ПРОВЕРИТЬ, что вернулись именно они."""
+    import torch
+    miss = sorted(set(snap) - set(named))
+    extra = sorted(set(named) - set(snap))
+    if miss or extra:
+        raise SystemExit(f"снимок не соответствует модели: нет {miss[:3]}, "
+                         f"лишние {extra[:3]}")
+    with torch.no_grad():
+        for k, v in snap.items():
+            named[k].data.copy_(v)
+    for k, v in snap.items():
+        if not torch.equal(named[k].detach().cpu(), v.detach().cpu()):
+            raise SystemExit(f"восстановление неточно по {k}")
     return True
 
 
@@ -206,24 +218,28 @@ def selftest():
         else:
             raise AssertionError(f"отбор принял: {why}")
 
-    # --- ПРОДОЛЖЕНИЕ ------------------------------------------------------
-    base = dict(stage="q1", variant="main", q1_cache_sha1="C",
-                joint_sha1="J", feedback_mask=[True, True],
-                trainable_names=["a", "b"])
-    kw = dict(stage="q1", variant="main", q1_cache_sha1="C", joint_sha1="J",
-              feedback_mask=(True, True), trainable_names=["b", "a"])
-    check_resume(dict(base), **kw)
-    for patch, why in ((dict(variant="no_feedback"), "вариант"),
-                       (dict(q1_cache_sha1="X"), "кэш целей"),
-                       (dict(joint_sha1="X"), "Joint12"),
-                       (dict(feedback_mask=[False, True]), "маска feedback"),
-                       (dict(trainable_names=["a"]), "набор обучаемых")):
-        try:
-            check_resume(dict(base, **patch), **kw)
-        except SystemExit as e:
-            assert why in str(e), (why, str(e))
-        else:
-            raise AssertionError(f"продолжение принято при: {why}")
+    # --- СНИМОК И ВОССТАНОВЛЕНИЕ ЛУЧШЕЙ ЭПОХИ ----------------------------
+    # Регрессия на главный блокер: эпоха выбиралась, а веса оставались от
+    # последней, и Gate 4 считался не на той модели.
+    import torch as _t
+    par = {"w": _t.nn.Parameter(_t.zeros(3)),
+           "b": _t.nn.Parameter(_t.ones(2))}
+    snap0 = snapshot(par)
+    sha0 = state_sha({k: v.detach().numpy() for k, v in par.items()})
+    with _t.no_grad():
+        par["w"] += 5.0
+    assert state_sha({k: v.detach().numpy()
+                      for k, v in par.items()}) != sha0
+    assert float(snap0["w"].abs().max()) == 0.0, "снимок изменился вместе с весами"
+    restore(par, snap0)
+    assert state_sha({k: v.detach().numpy()
+                      for k, v in par.items()}) == sha0
+    try:
+        restore({"w": par["w"]}, snap0)
+    except SystemExit as e:
+        assert "не соответствует" in str(e), e
+    else:
+        raise AssertionError("снимок чужой формы принят")
 
     # --- МАНИФЕСТ КЭША ----------------------------------------------------
     man = dict(kind="canonical_q1_targets", labels_sha1="L", q1_sha1="Q",
@@ -294,12 +310,15 @@ def main():
     ap.add_argument("--grip-weight", type=float, default=1.0,
                     help="вес канала схвата в потере действия; фиксируется "
                          "до первого запуска")
+    ap.add_argument("--smoke", action="store_true",
+                    help="проверка связности: train и val_sel урезаются, "
+                         "подтверждающая половина НЕ ЧИТАЕТСЯ вовсе, Gate 4 "
+                         "не считается, результат не годится как голова")
     ap.add_argument("--limit", type=int, default=0,
-                    help="ограничить train для проверки связности")
+                    help="ограничить train и val_sel (только со --smoke)")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--dtype", default="float16")
     ap.add_argument("--out", default="")
-    ap.add_argument("--resume", default="")
     a = ap.parse_args()
     if a.selftest:
         selftest()
@@ -309,10 +328,15 @@ def main():
     if miss:
         raise SystemExit(f"нужны {miss}: вариант и training-сид задаются "
                          f"явно, умолчаний у них нет")
-    out_p = a.out or f"data/k14c/q1_{a.variant}_s{a.seed}.pt"
-    if os.path.exists(out_p) and not a.resume:
-        raise SystemExit(f"{out_p} уже существует: обученная голова не "
-                         f"перезаписывается молча")
+    if a.limit and not a.smoke:
+        raise SystemExit("--limit допустим только вместе со --smoke: "
+                         "укороченный train в каноническом прогоне дал бы "
+                         "голову, обученную не на том наборе")
+    out_p = a.out or (f"data/k14c/smoke_{a.variant}_s{a.seed}.pt" if a.smoke
+                      else f"data/k14c/q1_{a.variant}_s{a.seed}.pt")
+    if os.path.exists(out_p):
+        raise SystemExit(f"{out_p} уже существует: голова не перезаписывается "
+                         f"молча")
 
     here = os.path.dirname(os.path.abspath(__file__))
     root = os.path.abspath(a.root)
@@ -354,6 +378,19 @@ def main():
     if arr_sha(q1_all.astype(np.int32)) != man["q1_sha1"]:
         raise SystemExit("массив целей не совпал с отпечатком манифеста")
     orc = json.load(open(a.oracle))
+    # ВХОДНЫЕ МАССИВЫ СВЕРЯЮТСЯ С ТЕМИ, НА КОТОРЫХ ПОСТРОЕН КЭШ ЦЕЛЕЙ.
+    # Отпечатка одного .npz мало: `ktrue` определяет цели варианта `static`,
+    # `q0hat` — остаток, от которого цели считались, `codebooks` — и цели, и
+    # потерю действия. Подмена любого из них меняет эксперимент молча.
+    for nm, key in (("q0hat", "q0hat_sha1"), ("ktrue", "ktrue_sha1"),
+                    ("split", "split_sha1")):
+        got_ = k11a.file_sha1(f"{a.cache}.{nm}.npy")
+        if man.get(key) and got_ != man[key]:
+            raise SystemExit(f"{nm}.npy имеет sha {got_}, кэш целей построен "
+                             f"на {man[key]}")
+    if man.get("cache_meta_sha1") and \
+            k11a.file_sha1(f"{a.cache}.meta.json") != man["cache_meta_sha1"]:
+        raise SystemExit("meta.json кэша изменился после построения целей")
     print(f"  цели: {npz_p}, sha {man['labels_sha1']}, построены в режиме "
           f"{man['device']} по гейту {man['oracle_sha1']}")
 
@@ -369,6 +406,11 @@ def main():
     if keys_sha != meta.get("keys_sha1"):
         raise SystemExit(f"ключи наблюдений {keys_sha} против "
                          f"{meta.get('keys_sha1')}")
+    src_sha = sha12(src)
+    if man.get("source_cache_sha1") and src_sha != man["source_cache_sha1"]:
+        raise SystemExit(f"исходный кэш K-9a {src_sha}, цели построены на "
+                         f"{man['source_cache_sha1']}: массив действий "
+                         f"определяет и цели, и потерю действия")
     ACT = np.asarray(d["action"])[:N]
     offs = np.asarray(d["pos_offset"])[:N].astype(np.int64)
     tsk = np.asarray(d["task"])[:N]
@@ -433,30 +475,41 @@ def main():
     codec = (codec if hasattr(codec, "vq") else codec.codec).to(dev).eval()
     for p_ in codec.parameters():
         p_.requires_grad_(False)
+    # КОДЕК СВЕРЯЕТСЯ ПО ВЕСАМ И ПОВЕДЕНИЮ. Имя чекпойнта на HuggingFace не
+    # гарантирует содержимого: изменившийся артефакт под тем же именем
+    # сдвинул бы потерю действия и Gate 4.
+    with torch.no_grad():
+        ii = torch.arange(int(codec.vocab_size), device=dev).unsqueeze(0)
+        Ecur = torch.stack([q.out_project(q.decode_code(ii))[0]
+                            for q in codec.vq.quantizers]).float()
+    if float((Ecur.cpu() - torch.from_numpy(E)).abs().max()) > 1e-5:
+        raise SystemExit("книги кодека разошлись с кэшем")
+    cs_now = k11a.state_sha1(codec)
+    dp_now = k11a.decoder_probe(codec, Ecur.to(dev), dev)
+    for nm, cur, want in (("codec_state_sha1", cs_now,
+                           man.get("codec_state_sha1")),
+                          ("decoder_probe", dp_now, man.get("decoder_probe"))):
+        if want and cur != want:
+            raise SystemExit(f"{nm}: сейчас {cur}, цели построены при {want}")
+    print(f"  кодек сверен: веса {cs_now}, проба {dp_now}")
 
-    if a.resume:
-        prev = torch.load(a.resume, map_location="cpu", weights_only=False)
-        check_resume(prev, stage="q1", variant=a.variant,
-                     q1_cache_sha1=man["labels_sha1"],
-                     trainable_names=info["names"],
-                     feedback_mask=info["feedback_mask"], joint_sha1=j_sha)
-        with torch.no_grad():
-            for k, v in prev["state"].items():
-                dict(model.named_parameters())[k].data = v.to(dev,
-                                                              torch.float32)
-        print(f"  продолжение от {a.resume}, эпох пройдено "
-              f"{prev.get('epochs_run')}")
+    # ПРОДОЛЖЕНИЯ НЕТ НАМЕРЕННО. Оно требовало бы переносить состояние Adam,
+    # порядок данных, историю и факт уже открытой подтверждающей половины;
+    # без этого `--resume` был бы тёплым стартом под видом продолжения, а
+    # `val_confirm` открывалась бы повторно. Прогон идёт целиком или не идёт.
 
     # --- батчи --------------------------------------------------------------
-    sets = {nm: rows_all[part_all == nm] for nm in ("train", "val_sel",
-                                                    "val_confirm")}
+    keep = ("train", "val_sel") if a.smoke else ("train", "val_sel",
+                                                 "val_confirm")
+    sets = {nm: rows_all[part_all == nm] for nm in keep}
     # ЦЕЛИ РАСКЛАДЫВАЮТСЯ ПО НОМЕРАМ СТРОК КЭША K-11a: батчи формируются по
     # смещению позиций, а не по порядку в кэше целей, и брать цель по позиции
     # в массиве было бы сопоставлением не тех строк.
     q1_of_pos = np.full((N, q1_all.shape[1]), -1, np.int64)
     q1_of_pos[rows_all] = q1_all
     if a.limit:
-        sets["train"] = sets["train"][:a.limit]
+        for nm in sets:
+            sets[nm] = sets[nm][:a.limit]
     print("  части: " + ", ".join(f"{k} {len(v)}" for k, v in sets.items()))
 
     def build(po, sel):
@@ -508,9 +561,20 @@ def main():
         cq0 = torch.from_numpy(
             np.asarray(q0hat_c[sel]).astype(np.int64)).to(dev)
         d_q0 = int((q0 != cq0).sum())
+        if d_q0:
+            # ОТКАЗ СРАЗУ, А НЕ В КОНЦЕ ЭПОХИ. Накопленное расхождение
+            # означало бы, что часть шагов уже сделана по целям от чужого
+            # остатка, и эти шаги не отменить.
+            raise SystemExit(
+                f"q0 модели разошёлся с кэшем в {d_q0} позициях на батче со "
+                f"смещением {po}: цели построены от q0hat кэша и относятся к "
+                f"другому остатку")
         tg = targets(sel)
         ce = F.cross_entropy(lg.reshape(-1, lg.shape[-1]), tg.reshape(-1))
-        e0 = books[0][cq0.long()].float()
+        # E0 СТРОИТСЯ ОТ ФАКТИЧЕСКОГО q0 МОДЕЛИ. Они только что сверены с
+        # кэшем, так что значения те же, но брать надо то, что модель выдала:
+        # иначе оценивался бы гибрид, которого модель не производила.
+        e0 = books[0][q0.long()].float()
         if train:
             emb, _, _ = straight_through(lg, books[1].float(), tau=1.0)
         else:
@@ -527,6 +591,10 @@ def main():
             for p_ in model.depth_rvq_feedback[0].parameters():
                 fb_reg = fb_reg + (p_.float() ** 2).sum()
         loss = ce + a.lambda_action * act_loss + a.lambda_fb * fb_reg
+        if not torch.isfinite(loss):
+            raise SystemExit(
+                f"потеря не число: CE {float(ce)}, действие "
+                f"{float(act_loss)}, регуляризатор {float(fb_reg)}")
         return loss, ce, act_loss, a_hat.detach(), a_true, d_q0
 
     def evaluate(rows):
@@ -544,16 +612,25 @@ def main():
                 n += dd.numel()
         return float(np.sqrt(se / max(n, 1)))
 
-    params = [p for n_, p in model.named_parameters() if n_ in set(info["names"])]
+    named_tr = {n_: p_ for n_, p_ in model.named_parameters()
+                if n_ in set(info["names"])}
+    params = [named_tr[n_] for n_ in info["names"]]
+    init_sha = state_sha({k: v.detach().float().cpu().numpy()
+                          for k, v in named_tr.items()})
+    print(f"  начальное состояние обучаемых весов: sha {init_sha}. Оно "
+          f"детерминировано и НЕ зависит от --seed: сид задаёт только порядок "
+          f"данных")
     opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=a.wd)
     rng = np.random.default_rng(a.seed)
     hist = []
     t0 = time.time()
     e0_val = evaluate(sets["val_sel"])
     hist.append(dict(epoch=0, train=None, val_sel=e0_val))
+    # СНИМОК ЭПОХИ 0 — ПОЛНОЦЕННЫЙ КАНДИДАТ. Если начальное состояние головы
+    # окажется лучшим, оно и будет восстановлено.
+    best = dict(epoch=0, val_sel=e0_val, state=snapshot(named_tr))
     print(f"  эпоха 0 (без обучения): val_sel RMS-8 {e0_val:.6f}")
     for ep in range(1, int(a.epochs) + 1):
-        model.train()
         order = group_by_offset(sets["train"], offs, a.batch)
         rng.shuffle(order)
         run, nb, dq = 0.0, 0, 0
@@ -561,19 +638,66 @@ def main():
             opt.zero_grad(set_to_none=True)
             loss, ce, al, _ah, _at, d_q0 = run_batch(po, sel, True)
             loss.backward()
+            # ГРАДИЕНТ ОБЯЗАН ДОЙТИ ДО КАЖДОГО РАЗРЕШЁННОГО ВЕСА И БЫТЬ
+            # КОНЕЧНЫМ. Отсутствующий градиент означает, что часть головы не
+            # участвует в потере, и обучается не то, что заявлено.
+            if nb == 0:
+                nog = [n_ for n_, p_ in zip(info["names"], params)
+                       if p_.grad is None]
+                nf = [n_ for n_, p_ in zip(info["names"], params)
+                      if p_.grad is not None
+                      and not torch.isfinite(p_.grad).all()]
+                if nog or nf:
+                    raise SystemExit(f"градиенты: нет у {nog[:3]}, "
+                                     f"нечисловые у {nf[:3]}")
             opt.step()
             run += float(loss.detach()); nb += 1; dq += d_q0
-        if dq:
-            raise SystemExit(f"эпоха {ep}: q0 модели разошёлся с кэшем в {dq} "
-                             f"позициях — цели относятся к другому остатку")
         v = evaluate(sets["val_sel"])
         hist.append(dict(epoch=ep, train=run / max(nb, 1), val_sel=v))
+        mark = ""
+        if v < best["val_sel"]:          # СТРОГОЕ улучшение, иначе ранняя
+            best = dict(epoch=ep, val_sel=v, state=snapshot(named_tr))
+            mark = "  <- лучшая"
         print(f"  эпоха {ep}: потеря {run / max(nb, 1):.5f}, val_sel RMS-8 "
-              f"{v:.6f} ({(time.time() - t0) / 60:.1f} мин)")
+              f"{v:.6f} ({(time.time() - t0) / 60:.1f} мин){mark}")
 
     best_ep, best_val = select_epoch(hist)
-    print(f"\n  выбрана эпоха {best_ep} по val_sel "
-          f"({best_val:.6f})")
+    if best_ep != best["epoch"] or abs(best_val - best["val_sel"]) > 1e-12:
+        raise SystemExit(
+            f"отбор дал эпоху {best_ep} ({best_val}), а снимок хранит "
+            f"{best['epoch']} ({best['val_sel']}): выбор и сохранённые веса "
+            f"разошлись")
+    # ВЕСА ВЫБРАННОЙ ЭПОХИ ВОССТАНАВЛИВАЮТСЯ ДО ВСЯКОЙ ОЦЕНКИ. Прежде
+    # подтверждающая половина считалась на весах ПОСЛЕДНЕЙ эпохи, а в отчёт
+    # шёл номер выбранной — Gate 4 относился бы не к той модели.
+    restore(named_tr, best["state"])
+    re_val = evaluate(sets["val_sel"])
+    if abs(re_val - best_val) > 1e-9:
+        raise SystemExit(
+            f"после восстановления val_sel {re_val:.8f} против {best_val:.8f}: "
+            f"восстановлены не те веса")
+    sel_sha = state_sha({k: v.detach().float().cpu().numpy()
+                         for k, v in named_tr.items()})
+    print(f"\n  выбрана эпоха {best_ep} по val_sel ({best_val:.6f}); веса "
+          f"восстановлены и сверены, sha {sel_sha}")
+
+    if a.smoke:
+        # ПОДТВЕРЖДАЮЩАЯ ПОЛОВИНА В ЭТОМ РЕЖИМЕ НЕ ЧИТАЕТСЯ ВОВСЕ. Её нет
+        # даже в наборах: проверка связности не имеет права расходовать
+        # единственное открытие.
+        print("  РЕЖИМ SMOKE: подтверждающая половина не читалась, Gate 4 не "
+              "считался, эта голова для эксперимента непригодна")
+        if a.out:
+            torch.save(dict(kind="smoke", stage="q1", variant=a.variant,
+                            seed=int(a.seed), history=hist,
+                            initial_trainable_state_sha1=init_sha,
+                            selected_state_sha1=sel_sha,
+                            note="проверка связности; как источник весов "
+                                 "для канонического прогона непригодна"),
+                       a.out)
+            print(f"  сохранено: {a.out}")
+        return 0
+
     e_conf = evaluate(sets["val_confirm"])
     po_ = (orc.get("parts") or {}).get("val_confirm") or {}
     e_a0 = (po_.get("vs_action.A0") or {}).get("rms")
@@ -596,6 +720,13 @@ def main():
         q1_cache=a.q1_cache, q1_cache_sha1=man["labels_sha1"],
         oracle=a.oracle, oracle_sha1=sha12(a.oracle),
         joint_ckpt=a.joint_ckpt, joint_sha1=j_sha, cache=a.cache, ckpt=a.ckpt,
+        q1_manifest_sha1=sha12(man_p), source_cache_sha1=src_sha,
+        q0hat_sha1=k11a.file_sha1(f"{a.cache}.q0hat.npy"),
+        ktrue_sha1=k11a.file_sha1(f"{a.cache}.ktrue.npy"),
+        codebooks_sha1=man.get("codebooks_sha1"),
+        codec_state_sha1=cs_now, decoder_probe=dp_now,
+        initial_trainable_state_sha1=init_sha,
+        selected_state_sha1=sel_sha,
         selected_epoch=best_ep, val_sel=best_val, val_confirm=e_conf,
         gate4=g4, history=hist, epochs_run=int(a.epochs),
         lr=a.lr, wd=a.wd, batch=int(a.batch),
