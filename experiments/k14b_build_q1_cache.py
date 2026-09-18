@@ -2,6 +2,10 @@
 # -*- coding: utf-8 -*-
 """K-14b: канонический кэш условных меток q1*. Один режим, один файл, один sha.
 
+КАНОНИЧЕСКИЙ РЕЖИМ ОГРАНИЧИВАЕТ ПОСТРОЕНИЕ МЕТОК, А НЕ ОБУЧЕНИЕ. Метки
+строятся один раз в одном режиме и кладутся целыми числами; дальше тренер
+читает готовые числа, и на каком устройстве он учится — безразлично.
+
 ЗАЧЕМ КАНОНИЧЕСКИЙ КЭШ, А НЕ ПЕРЕСЧЁТ В ТРЕНЕРЕ. Метка q1* выбирается как
 ближайший код к остатку z_e - E0[q0hat], и у части позиций два кода почти
 равноудалены: измеренный разрыв там порядка 5e-08 при величинах 1e-02, то есть
@@ -118,6 +122,11 @@ def main():
     ap.add_argument("--sel-frac", type=float, default=0.4)
     ap.add_argument("--split-seed", type=int, default=61)
     ap.add_argument("--batch", type=int, default=256)
+    ap.add_argument("--oracle", default="reports/k14a/oracle_cache_cuda0.json",
+                    help="артефакт пройденного Gate 2: кэш меток обязан "
+                         "строиться на тех же данных и в том же режиме")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="перезаписать существующий канонический кэш")
     ap.add_argument("--out", default="data/k14b/q1_cache")
     a = ap.parse_args()
     if a.selftest:
@@ -164,11 +173,48 @@ def main():
             raise SystemExit(f"{nm}.npy имеет sha {got}, K-11b заверила "
                              f"{(stamp.get('arrays') or {}).get(nm)}")
 
+    # --- ПРИВЯЗКА К ПРОЙДЕННОМУ GATE 2 --------------------------------------
+    # Без неё кэш меток «канонический» только на словах: изменённый массив
+    # действий с прежними ключами (episode, step) прошёл бы все проверки выше
+    # и дал бы ДРУГИЕ q1*. K-14a этот случай закрывает пробой кодирования и
+    # сверкой K_true; здесь тот же разрыв закрывается ссылкой на его артефакт.
+    if not os.path.exists(a.oracle):
+        raise SystemExit(
+            f"нет {a.oracle}: кэш меток обязан ссылаться на артефакт "
+            f"пройденного Gate 2, иначе он ни к чему не привязан")
+    orc = json.load(open(a.oracle))
+    for k_ in ("latent_capacity_ok", "action_oracle_ok",
+               "dynamic_q1_relabeling_supported"):
+        if not orc.get(k_):
+            raise SystemExit(f"{a.oracle}: {k_} = {orc.get(k_)}. Кэш меток "
+                             f"строится только после пройденного Gate 2")
+    if str(orc.get("device")) != str(dev):
+        raise SystemExit(
+            f"Gate 2 пройден на {orc.get('device')}, а кэш строится на {dev}. "
+            f"Канонический режим — тот, в котором пройден гейт")
+    if float(orc.get("probe_code_disagree", 1.0)) != 0.0:
+        raise SystemExit(f"{a.oracle}: проба кодирования дала "
+                         f"{orc.get('probe_code_disagree')}, а не ноль")
+    if not orc.get("decoder_probe_matches_cache", False):
+        raise SystemExit(f"{a.oracle}: поведение декодера не совпадало с "
+                         f"кэшем — этот артефакт не канонический")
+    for k_ in ("ckpt", "cache", "split_seed", "sel_frac"):
+        want_ = {"ckpt": a.ckpt, "cache": a.cache,
+                 "split_seed": a.split_seed, "sel_frac": a.sel_frac}[k_]
+        if str(orc.get(k_)) != str(want_):
+            raise SystemExit(f"{a.oracle}: {k_} = {orc.get(k_)}, здесь "
+                             f"{want_}")
+    print(f"  привязка к Gate 2: {a.oracle}, запуск {orc.get('run_id')}, "
+          f"режим {orc.get('device')}")
+
     q0hat = np.load(f"{a.cache}.q0hat.npy", mmap_mode="r")
     ktrue = np.load(f"{a.cache}.ktrue.npy", mmap_mode="r")
     E = np.load(f"{a.cache}.codebooks.npy")
     N = int(meta["n_obs"])
     idx, _ = k13a.load_split(f"{a.cache}.split.npy", N)
+    if tuple(q0hat.shape) != (N, 16) or tuple(ktrue.shape) != (N, 3, 16):
+        raise SystemExit(f"формы q0hat {tuple(q0hat.shape)} и ktrue "
+                         f"{tuple(ktrue.shape)} не те при n_obs {N}")
 
     src = meta.get("cache")
     if not src or not os.path.exists(src):
@@ -183,6 +229,15 @@ def main():
     ACT = src_npz["action"]
     if ACT.shape[0] != N:
         raise SystemExit(f"в исходном кэше {ACT.shape[0]} действий при {N}")
+    src_sha = sha12(src)
+    if str(orc.get("source_cache_sha1")) != src_sha:
+        raise SystemExit(
+            f"исходный кэш K-9a имеет sha {src_sha}, а Gate 2 пройден на "
+            f"{orc.get('source_cache_sha1')}: массив действий определяет z_e "
+            f"и, значит, сами метки")
+    kt_src = np.asarray(src_npz["K_true"])[:N].astype(np.int64)
+    if not np.array_equal(kt_src, np.asarray(ktrue).astype(np.int64)):
+        raise SystemExit("K_true исходного кэша расходится с заверенным")
     epi = np.asarray(src_npz["episode"]).astype(np.int64)[:N]
 
     # --- кодек --------------------------------------------------------------
@@ -192,6 +247,8 @@ def main():
     codec = (ac if hasattr(ac, "vq") else getattr(ac, "codec", None))
     codec = codec.to(dev).eval()
     qs = list(codec.vq.quantizers)
+    if len(qs) != 3:
+        raise SystemExit(f"уровней RVQ {len(qs)}, ожидалось 3")
     with torch.no_grad():
         ii = torch.arange(int(codec.vocab_size), device=dev).unsqueeze(0)
         Ecur = torch.stack([q.out_project(q.decode_code(ii))[0]
@@ -251,6 +308,52 @@ def main():
               f"{stats[name]['q1_sha1']}, совпадает с истинной q1 у "
               f"{100 * stats[name]['frac_equal_static']:.1f}% позиций")
 
+    # --- ПОБИТОВАЯ СВЕРКА С МЕТКАМИ ОРАКУЛА ---------------------------------
+    # Один и тот же вычислительный путь обязан дать те же метки. Это
+    # одновременно проверяет данные, устройство, разбиение на партии и
+    # реализацию поиска ближайшего кода. Для train у оракула была
+    # КОНТРОЛЬНАЯ подвыборка, поэтому её строки восстанавливаются тем же
+    # генератором, и сверка идёт на них.
+    ctl_parts, ctl_meta = k14a.build_parts(
+        idx, epi, a.sel_frac, a.split_seed,
+        int(orc.get("sampling", {}).get("train", {}).get("n_used", 0)),
+        np.random.default_rng(int(orc.get("sample_seed", 0))),
+        split_episodes)
+    q1_by_part = {nm: arr for nm, arr in zip(
+        ("train", "val_sel", "val_confirm"), out_q1)}
+    rows_by_part = {nm: np.asarray(r, np.int64) for nm, r in zip(
+        ("train", "val_sel", "val_confirm"), out_rows)}
+    checked = {}
+    for name in ("train", "val_sel", "val_confirm"):
+        po = (orc.get("parts") or {}).get(name) or {}
+        want_sha, want_dt = po.get("q1_ze_sha1"), po.get("q1_ze_dtype")
+        if not want_sha:
+            raise SystemExit(f"в {a.oracle} нет q1_ze_sha1 для {name}")
+        ctl = np.asarray(ctl_parts[name], np.int64)
+        got_rows_sha = arr_sha(ctl)
+        want_rows_sha = (orc.get("sampling", {}).get(name, {})
+                         .get("rows_sha1"))
+        if want_rows_sha and got_rows_sha != want_rows_sha:
+            raise SystemExit(
+                f"{name}: контрольные строки дают sha {got_rows_sha}, у "
+                f"оракула {want_rows_sha} — восстановлен другой набор")
+        pos = np.searchsorted(rows_by_part[name], ctl)
+        if pos.max() >= len(rows_by_part[name]) or \
+                not np.array_equal(rows_by_part[name][pos], ctl):
+            raise SystemExit(f"{name}: контрольные строки не лежат в кэше")
+        sub = q1_by_part[name][pos].astype(np.dtype(want_dt))
+        got = arr_sha(sub)
+        if got != want_sha:
+            n_d = "неизвестно"
+            raise SystemExit(
+                f"{name}: метки q1 не совпали с оракулом — sha {got} против "
+                f"{want_sha} ({n_d} расхождений). Кэш строится не тем путём, "
+                f"которым пройден Gate 2")
+        checked[name] = dict(rows_sha1=got_rows_sha, q1_sha1=got,
+                             dtype=str(want_dt), n=int(len(ctl)))
+        print(f"    {name}: метки совпали с оракулом побитово на "
+              f"{len(ctl)} строках (sha {got}, {want_dt})")
+
     rows_all = np.concatenate(out_rows)
     q1_all = np.concatenate(out_q1)
     part_all = np.concatenate(out_part).astype(str)
@@ -259,14 +362,30 @@ def main():
 
     os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
     npz = a.out + ".npz"
+    # КАНОНИЧЕСКИЙ КЭШ НЕИЗМЕНЯЕМ. Перезаписать его молча значит поменять
+    # задачу под уже обученными головами: их чекпойнты ссылаются на sha,
+    # которого больше нет.
+    if os.path.exists(npz) and not a.overwrite:
+        raise SystemExit(
+            f"{npz} уже существует. Канонический кэш не перезаписывается: "
+            f"обученные головы ссылаются на его sha. Если он действительно "
+            f"устарел, укажите --overwrite явно или другое имя --out")
     tmp = npz + f".tmp.{os.getpid()}"
     with open(tmp, "wb") as fh:
         np.savez_compressed(fh, rows=rows_all, q1=q1_all, part=part_all)
     os.replace(tmp, npz)
     with np.load(npz, allow_pickle=True) as z:
-        if not (np.array_equal(z["q1"], q1_all)
-                and np.array_equal(z["rows"], rows_all)):
-            raise SystemExit(f"{npz}: прочиталось не то, что записано")
+        if sorted(z.files) != ["part", "q1", "rows"]:
+            raise SystemExit(f"{npz}: набор массивов {sorted(z.files)}")
+        for nm_, ref_ in (("rows", rows_all), ("q1", q1_all),
+                          ("part", part_all)):
+            got_ = z[nm_]
+            if got_.shape != ref_.shape or str(got_.dtype) != str(ref_.dtype):
+                raise SystemExit(f"{npz}: {nm_} формы {got_.shape} "
+                                 f"{got_.dtype}, записывалось {ref_.shape} "
+                                 f"{ref_.dtype}")
+            if not np.array_equal(got_, ref_):
+                raise SystemExit(f"{npz}: {nm_} прочитался иначе, чем записан")
 
     man = dict(
         kind="canonical_q1_targets", target_latent="z_e = codec._encode(action)",
@@ -286,10 +405,28 @@ def main():
         rows_sha1=arr_sha(rows_all), q1_sha1=arr_sha(q1_all),
         note="только q1. Цели q2 строятся позже и отдельно для каждой "
              "обученной головы, от её ФАКТИЧЕСКОГО q1, а не от оракульного",
+        oracle_artifact=a.oracle, oracle_sha1=sha12(a.oracle),
+        oracle_run_id=orc.get("run_id"),
+        checked_against_oracle=checked,
+        torch_version=str(torch.__version__),
+        cuda_version=str(getattr(torch.version, "cuda", None)),
+        gpu=(torch.cuda.get_device_name(dev)
+             if dev.type == "cuda" else None),
+        tf32_matmul=bool(getattr(torch.backends.cuda, "matmul", None)
+                         and torch.backends.cuda.matmul.allow_tf32),
+        tf32_cudnn=bool(torch.backends.cudnn.allow_tf32),
         code_version=kb.code_version([
             os.path.abspath(__file__),
             os.path.join(here, "depth_rvq_joint12.py"),
-            os.path.join(here, "k14a_oracle_cache.py")]),
+            os.path.join(here, "k14a_oracle_cache.py"),
+            os.path.join(here, "k11a_build_hicora_cache.py"),
+            os.path.join(here, "k11c_train_d1.py"),
+            os.path.join(here, "k12b_protocol.py"),
+            os.path.join(here, "k13a_build_trajectory_basis.py")]),
+        actioncodec_sha1=sha12(os.path.join(
+            root, "actioncodec", "rvq.py")),
+        git_head=os.popen("git rev-parse HEAD 2>/dev/null").read().strip()
+        or None,
         script_sha1=sha12(os.path.abspath(__file__)))
     mp = a.out + ".manifest.json"
     tmpm = mp + f".tmp.{os.getpid()}"
