@@ -325,6 +325,13 @@ def main():
     ap.add_argument("--grip-weight", type=float, default=1.0,
                     help="вес канала схвата в потере действия; фиксируется "
                          "до первого запуска")
+    ap.add_argument("--q0-tol", type=float, default=0.0,
+                    help="допустимая доля позиций, где q0 модели расходится "
+                         "с кэшем. Ноль по умолчанию: допуск меняет "
+                         "протокол и должен быть зарегистрирован до прогона")
+    ap.add_argument("--q0-audit", action="store_true",
+                    help="только измерить расхождение q0 и запас логитов, "
+                         "не обучая")
     ap.add_argument("--smoke", action="store_true",
                     help="проверка связности: train и val_sel урезаются, "
                          "подтверждающая половина НЕ ЧИТАЕТСЯ вовсе, Gate 4 "
@@ -589,6 +596,7 @@ def main():
 
     books = model.depth_rvq_books
     ac16 = torch.autocast(device_type=dev.type, dtype=dt)
+    q0_bad, q0_tot, q0_margins, q0_margins_ok = [0], [0], [], []
 
     def targets(sel):
         if a.variant == "static":
@@ -619,13 +627,29 @@ def main():
             np.asarray(q0hat_c[sel]).astype(np.int64)).to(dev)
         d_q0 = int((q0 != cq0).sum())
         if d_q0:
-            # ОТКАЗ СРАЗУ, А НЕ В КОНЦЕ ЭПОХИ. Накопленное расхождение
-            # означало бы, что часть шагов уже сделана по целям от чужого
-            # остатка, и эти шаги не отменить.
-            raise SystemExit(
-                f"q0 модели разошёлся с кэшем в {d_q0} позициях на батче со "
-                f"смещением {po}: цели построены от q0hat кэша и относятся к "
-                f"другому остатку")
+            # ЗАПАС МЕЖДУ ПЕРВЫМ И ВТОРЫМ ЛОГИТОМ В РАСХОДЯЩИХСЯ ПОЗИЦИЯХ.
+            # Он отличает грань от настоящего расхождения путей: при запасе
+            # порядка единицы последнего разряда речь о почти равных
+            # кандидатах, при большом — о разных вычислениях.
+            with torch.no_grad():
+                l0 = out["logits"][0].float()
+                two = torch.topk(l0, 2, dim=-1).values
+                marg = (two[..., 0] - two[..., 1])
+                m = (q0 != cq0)
+                q0_margins.extend(
+                    [float(x) for x in marg[m].detach().cpu().numpy()])
+                q0_margins_ok.append(float(marg[~m].median())
+                                     if int((~m).sum()) else float("nan"))
+            q0_bad[0] += d_q0
+            q0_tot[0] += int(q0.numel())
+            frac = q0_bad[0] / max(q0_tot[0], 1)
+            if frac > float(a.q0_tol):
+                raise SystemExit(
+                    f"q0 модели разошёлся с кэшем: {q0_bad[0]} из "
+                    f"{q0_tot[0]} позиций ({100 * frac:.4f}%) при допуске "
+                    f"{100 * float(a.q0_tol):.4f}%. Запас логитов в этих "
+                    f"позициях: {sorted(q0_margins)[:5]}. Цели построены от "
+                    f"q0hat кэша и относятся к другому остатку")
         tg = targets(sel)
         ce = F.cross_entropy(lg.reshape(-1, lg.shape[-1]), tg.reshape(-1))
         # E0 СТРОИТСЯ ОТ ФАКТИЧЕСКОГО q0 МОДЕЛИ. Они только что сверены с
@@ -668,6 +692,30 @@ def main():
                 se += float((dd ** 2).sum())
                 n += dd.numel()
         return float(np.sqrt(se / max(n, 1)))
+
+    if a.q0_audit:
+        # ИЗМЕРЕНИЕ, А НЕ ОБУЧЕНИЕ. Отвечает на один вопрос: расхождение q0 —
+        # это грань между почти равными логитами или разные пути вычисления.
+        rows_a = np.concatenate([sets[k] for k in sorted(sets)])
+        with torch.no_grad():
+            for po, sel in group_by_offset(rows_a, offs, a.batch):
+                run_batch(po, sel, False)
+        n_b, n_t = q0_bad[0], q0_tot[0]
+        print(f"\n  АУДИТ q0: расхождений {n_b} из {n_t} позиций "
+              f"({100 * n_b / max(n_t, 1):.4f}%)")
+        if q0_margins:
+            mm = np.asarray(q0_margins)
+            ok = np.asarray([x for x in q0_margins_ok if np.isfinite(x)])
+            print(f"    запас логитов в расходящихся: медиана "
+                  f"{np.median(mm):.3e}, максимум {mm.max():.3e}")
+            if ok.size:
+                print(f"    запас в совпадающих (медиана по батчам): "
+                      f"{np.median(ok):.3e}")
+                print(f"    отношение медиан: "
+                      f"{np.median(ok) / max(np.median(mm), 1e-30):.3g}")
+        else:
+            print("    расхождений нет")
+        return 0
 
     named_tr = {n_: p_ for n_, p_ in model.named_parameters()
                 if n_ in set(info["names"])}
@@ -756,6 +804,8 @@ def main():
             torch.save(dict(kind="smoke", stage="q1", variant=a.variant,
                             seed=int(a.seed), history=hist,
                             initial_trainable_state_sha1=init_sha,
+        q0_mismatch=int(q0_bad[0]), q0_positions=int(q0_tot[0]),
+        q0_tol=float(a.q0_tol),
                             selected_state_sha1=sel_sha,
                             note="проверка связности; как источник весов "
                                  "для канонического прогона непригодна"),
@@ -791,6 +841,8 @@ def main():
         codebooks_sha1=cb_now,
         codec_state_sha1=cs_now, decoder_probe=dp_now,
         initial_trainable_state_sha1=init_sha,
+        q0_mismatch=int(q0_bad[0]), q0_positions=int(q0_tot[0]),
+        q0_tol=float(a.q0_tol),
         selected_state_sha1=sel_sha,
         selected_epoch=best_ep, val_sel=best_val, val_confirm=e_conf,
         gate4=g4, history=hist, epochs_run=int(a.epochs),
