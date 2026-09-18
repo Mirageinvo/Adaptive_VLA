@@ -1,0 +1,184 @@
+{
+ "parts": {
+  "train": {
+   "n_rows": 4096,
+   "q1_ze": {
+    "n_tokens": 65536,
+    "n_flip": 0,
+    "frac_tokens": 0.0,
+    "n_rows": 4096,
+    "n_rows_flip": 0,
+    "frac_rows": 0.0
+   },
+   "q2_ze": {
+    "n_tokens": 65536,
+    "n_flip": 1,
+    "frac_tokens": 1.52587890625e-05,
+    "n_rows": 4096,
+    "n_rows_flip": 1,
+    "frac_rows": 0.000244140625
+   },
+   "q1_zq": {
+    "n_tokens": 65536,
+    "n_flip": 0,
+    "frac_tokens": 0.0,
+    "n_rows": 4096,
+    "n_rows_flip": 0,
+    "frac_rows": 0.0
+   },
+   "q2_zq": {
+    "n_tokens": 65536,
+    "n_flip": 0,
+    "frac_tokens": 0.0,
+    "n_rows": 4096,
+    "n_rows_flip": 0,
+    "frac_rows": 0.0
+   },
+   "top2_margin": {
+    "flipped": {
+     "n": 1,
+     "mean": 7.450580596923828e-08,
+     "median": 7.450580596923828e-08,
+     "q10": 7.450580596923828e-08,
+     "q90": 7.450580596923828e-08
+    },
+    "stable": {
+     "n": 65535,
+     "mean": 0.019236108288168907,
+     "median": 0.0058779120445251465,
+     "q10": 0.000718685972969979,
+     "q90": 0.04103745520114899
+    }
+   },
+   "margin_ratio_flipped_to_stable": 1.267555645692846e-05,
+   "decoded_diff_rms_all": 1.4264899804931881e-05,
+   "n_rows_flipped": 1,
+   "decoded_diff_rms_flipped_rows": 0.0009129535875156404,
+   "err_vs_action_flipped_rows": {
+    "cuda0": 0.012061453265716397,
+    "cpu": 0.012063187346125938
+   },
+   "better_on_flipped_rows": "cuda0"
+  },
+  "val_sel": {
+   "n_rows": 5795,
+   "q1_ze": {
+    "n_tokens": 92720,
+    "n_flip": 0,
+    "frac_tokens": 0.0,
+    "n_rows": 5795,
+    "n_rows_flip": 0,
+    "frac_rows": 0.0
+   },
+   "q2_ze": {
+    "n_tokens": 92720,
+    "n_flip": 0,
+    "frac_tokens": 0.0,
+    "n_rows": 5795,
+    "n_rows_flip": 0,
+    "frac_rows": 0.0
+   },
+   "q1_zq": {
+    "n_tokens": 92720,
+    "n_flip": 0,
+    "frac_tokens": 0.0,
+    "n_rows": 5795,
+    "n_rows_flip": 0,
+    "frac_rows": 0.0
+   },
+   "q2_zq": {
+    "n_tokens": 92720,
+    "n_flip": 0,
+    "frac_tokens": 0.0,
+    "n_rows": 5795,
+    "n_rows_flip": 0,
+    "frac_rows": 0.0
+   }
+  },
+  "val_confirm": {
+   "n_rows": 8698,
+   "q1_ze": {
+    "n_tokens": 139168,
+    "n_flip": 0,
+    "frac_tokens": 0.0,
+    "n_rows": 8698,
+    "n_rows_flip": 0,
+    "frac_rows": 0.0
+   },
+   "q2_ze": {
+    "n_tokens": 139168,
+    "n_flip": 1,
+    "frac_tokens": 7.185559898827317e-06,
+    "n_rows": 8698,
+    "n_rows_flip": 1,
+    "frac_rows": 0.00011496895838123707
+   },
+   "q1_zq": {
+    "n_tokens": 139168,
+    "n_flip": 0,
+    "frac_tokens": 0.0,
+    "n_rows": 8698,
+    "n_rows_flip": 0,
+    "frac_rows": 0.0
+   },
+   "q2_zq": {
+    "n_tokens": 139168,
+    "n_flip": 0,
+    "frac_tokens": 0.0,
+    "n_rows": 8698,
+    "n_rows_flip": 0,
+    "frac_rows": 0.0
+   },
+   "top2_margin": {
+    "flipped": {
+     "n": 1,
+     "mean": 4.470348358154297e-08,
+     "median": 4.470348358154297e-08,
+     "q10": 4.470348358154297e-08,
+     "q90": 4.470348358154297e-08
+    },
+    "stable": {
+     "n": 139167,
+     "mean": 0.023512819781899452,
+     "median": 0.0074066221714019775,
+     "q10": 0.0008350318530574441,
+     "q90": 0.05162090063095093
+    }
+   },
+   "margin_ratio_flipped_to_stable": 6.035610099587567e-06,
+   "decoded_diff_rms_all": 8.260281151227571e-06,
+   "n_rows_flipped": 1,
+   "decoded_diff_rms_flipped_rows": 0.0007703791692259968,
+   "err_vs_action_flipped_rows": {
+    "cuda0": 0.027518950060309376,
+    "cpu": 0.02770960701089832
+   },
+   "better_on_flipped_rows": "cuda0"
+  }
+ },
+ "canon": "cuda:0",
+ "horizon": 8,
+ "run_id": "20260918T125631-140092",
+ "a": {
+  "path": "data/k14a/oracle_cache_cuda0.json",
+  "label": "cuda0",
+  "device": "cuda:0",
+  "json_sha1": "69491ccb8aa6",
+  "labels_path": "/home/malinin_aa/Adaptive_VLA/data/k14a/oracle_cache_cuda0.json.labels.npz",
+  "labels_sha1": "c47e41c94e74"
+ },
+ "b": {
+  "path": "data/k14a/oracle_cache_cpu.json",
+  "label": "cpu",
+  "device": "cpu",
+  "json_sha1": "ea9556f6e4d9",
+  "labels_path": "/home/malinin_aa/Adaptive_VLA/data/k14a/oracle_cache_cpu.json.labels.npz",
+  "labels_sha1": "4a3787c72fab"
+ },
+ "codec_state_sha1": "f3f1b602491d",
+ "source_cache_sha1": "3a4c6ef00fe8",
+ "code_version": {
+  "k14a2_label_stability.py": "16fbab5c3715"
+ },
+ "script_sha1": "9ff65d5a4f24"
+}

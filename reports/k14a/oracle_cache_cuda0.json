@@ -738,26 +738,26 @@
     4096,
     16
    ],
-   "q1_ze_dtype": "int64",
-   "q1_ze_sha1": "b51bdd2ac5fe",
+   "q1_ze_dtype": "int32",
+   "q1_ze_sha1": "ac993bf9901a",
    "q2_ze_shape": [
     4096,
     16
    ],
-   "q2_ze_dtype": "int64",
-   "q2_ze_sha1": "cf62211a45d1",
+   "q2_ze_dtype": "int32",
+   "q2_ze_sha1": "00ca1b1b256d",
    "q1_zq_shape": [
     4096,
     16
    ],
-   "q1_zq_dtype": "int64",
-   "q1_zq_sha1": "0b6f0b56ae26",
+   "q1_zq_dtype": "int32",
+   "q1_zq_sha1": "dbe00736b870",
    "q2_zq_shape": [
     4096,
     16
    ],
-   "q2_zq_dtype": "int64",
-   "q2_zq_sha1": "314af2b7c9f4",
+   "q2_zq_dtype": "int32",
+   "q2_zq_sha1": "0b3704d43443",
    "n_rows": 4096
   },
   "val_sel": {
@@ -1496,26 +1496,26 @@
     5795,
     16
    ],
-   "q1_ze_dtype": "int64",
-   "q1_ze_sha1": "b64d221af4ef",
+   "q1_ze_dtype": "int32",
+   "q1_ze_sha1": "198bf2ec68ea",
    "q2_ze_shape": [
     5795,
     16
    ],
-   "q2_ze_dtype": "int64",
-   "q2_ze_sha1": "3e9367990bdc",
+   "q2_ze_dtype": "int32",
+   "q2_ze_sha1": "e7478169a8e7",
    "q1_zq_shape": [
     5795,
     16
    ],
-   "q1_zq_dtype": "int64",
-   "q1_zq_sha1": "52a844a258de",
+   "q1_zq_dtype": "int32",
+   "q1_zq_sha1": "fbc9354d4f76",
    "q2_zq_shape": [
     5795,
     16
    ],
-   "q2_zq_dtype": "int64",
-   "q2_zq_sha1": "8bad0ecaf0f0",
+   "q2_zq_dtype": "int32",
+   "q2_zq_sha1": "82d99f7af217",
    "n_rows": 5795
   },
   "val_confirm": {
@@ -2254,26 +2254,26 @@
     8698,
     16
    ],
-   "q1_ze_dtype": "int64",
-   "q1_ze_sha1": "fe5469754abf",
+   "q1_ze_dtype": "int32",
+   "q1_ze_sha1": "aee1a3844f40",
    "q2_ze_shape": [
     8698,
     16
    ],
-   "q2_ze_dtype": "int64",
-   "q2_ze_sha1": "3ae3e6fce9ff",
+   "q2_ze_dtype": "int32",
+   "q2_ze_sha1": "3ce1ccefdc19",
    "q1_zq_shape": [
     8698,
     16
    ],
-   "q1_zq_dtype": "int64",
-   "q1_zq_sha1": "e2ed37584a54",
+   "q1_zq_dtype": "int32",
+   "q1_zq_sha1": "551778e3f3be",
    "q2_zq_shape": [
     8698,
     16
    ],
-   "q2_zq_dtype": "int64",
-   "q2_zq_sha1": "34040e817826",
+   "q2_zq_dtype": "int32",
+   "q2_zq_sha1": "9ee0a5f91ab4",
    "n_rows": 8698
   }
  },
@@ -2353,6 +2353,7 @@
  "dtype": "float32",
  "torch_version": "2.4.1+cu124",
  "cuda_version": "12.4",
+ "run_id": "20260918T125631-140092",
  "probe_rows": 256,
  "probe_tol": 0.0,
  "decoder_probe_matches_cache": true,
@@ -2363,8 +2364,10 @@
  "decoder_probe": "1dbcbe579a75",
  "codec_state_sha1": "f3f1b602491d",
  "code_version": {
-  "k14a_oracle_cache.py": "e96deda6f046",
+  "k14a_oracle_cache.py": "f26ec96de87b",
   "depth_rvq_joint12.py": "59c8d4814674"
  },
- "script_sha1": "9d7b1cab94da"
+ "script_sha1": "cd572d733efe",
+ "labels_path": "/home/malinin_aa/Adaptive_VLA/data/k14a/oracle_cache_cuda0.json.labels.npz",
+ "labels_sha1": "c47e41c94e74"
 }
