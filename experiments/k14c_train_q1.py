@@ -333,9 +333,7 @@ def main():
     ap.add_argument("--q0", default="data/k14d/q0_b8_e0.npz",
                     help="канонический черновик K-14d: ТОТ ЖЕ массив, от "
                          "которого построены цели и посчитан Gate 2")
-    ap.add_argument("--q0-audit", action="store_true",
-                    help="только измерить расхождение q0 и запас логитов, "
-                         "не обучая")
+
     ap.add_argument("--smoke", action="store_true",
                     help="проверка связности: train и val_sel урезаются, "
                          "подтверждающая половина НЕ ЧИТАЕТСЯ вовсе, Gate 4 "
@@ -346,6 +344,15 @@ def main():
                          "Урезание по строкам с последующей перенарезкой "
                          "дало бы неполные батчи, которых нет в плане, а "
                          "значит другой q0")
+    ap.add_argument("--allow-dirty", action="store_true",
+                    help="разрешить прогон на незакоммиченном коде; "
+                         "канонический результат так получать нельзя")
+    ap.add_argument("--allow-device-drift", action="store_true",
+                    help="разрешить карту, отличную от той, на которой "
+                         "построен q0. ТОЛЬКО со --smoke: это диагностика "
+                         "переносимости, а не канонический прогон")
+    ap.add_argument("--summary", default="",
+                    help="куда записать машинную сводку прогона (json)")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--dtype", default="float16")
     ap.add_argument("--out", default="")
@@ -358,6 +365,8 @@ def main():
     if miss:
         raise SystemExit(f"нужны {miss}: вариант и training-сид задаются "
                          f"явно, умолчаний у них нет")
+    if a.allow_device_drift and not a.smoke:
+        raise SystemExit("--allow-device-drift допустим только со --smoke")
     if a.limit and not a.smoke:
         raise SystemExit("--limit допустим только вместе со --smoke: "
                          "укороченный train в каноническом прогоне дал бы "
@@ -374,12 +383,59 @@ def main():
               os.path.abspath("experiments")):
         if p not in sys.path:
             sys.path.insert(0, p)
+    import k14_common as kc
+    import k12b_protocol as kb
+
+    def code_state():
+        """Коммит и отпечатки всего, что влияет на обучение.
+
+        СНИМАЕТСЯ НА СТАРТЕ И ПЕРЕПРОВЕРЯЕТСЯ ПЕРЕД ПОДТВЕРЖДЕНИЕМ. Семь
+        часов — достаточный срок, чтобы файл успели поправить; результат,
+        полученный наполовину одним кодом и наполовину другим, не относится
+        ни к одному из них.
+        """
+        head, dirty, _arte = kc.check_code_clean(a.allow_dirty)
+        return head, kb.code_version([
+            os.path.abspath(__file__),
+            os.path.join(here, "k14_common.py"),
+            os.path.join(here, "depth_rvq_joint12.py"),
+            os.path.join(here, "depth_rvq_vla.py"),
+            os.path.join(here, "joint12_vla.py"),
+            os.path.join(here, "k14b_build_q1_cache.py")]), bool(dirty)
+
+    # FAIL-FAST ДО ЗАГРУЗКИ МОДЕЛИ. Прежде чистота кода только записывалась в
+    # чекпойнт полем git_dirty, то есть семичасовой канонический прогон на
+    # незакоммиченном коде доводился до конца и принимался.
+    git_head0, code_v0, dirty0 = code_state()
+
+    def write_summary(**kw):
+        """Машинная сводка прогона. НЕ бинарная: её можно положить в git.
+
+        Чекпойнт весит сотни мегабайт и в репозиторий не кладётся, а без
+        какой-либо машинной записи результат существует только в тексте
+        отчёта и проверке не поддаётся.
+        """
+        if not a.summary:
+            return
+        d_ = dict(kind="k14c_run", variant=a.variant, seed=int(a.seed),
+                  smoke=bool(a.smoke), limit=int(a.limit),
+                  epochs=int(a.epochs), batch=int(a.batch),
+                  git_head=git_head0, git_dirty=bool(dirty0),
+                  code_version=code_v0,
+                  script_sha1=sha12(os.path.abspath(__file__)), **kw)
+        os.makedirs(os.path.dirname(os.path.abspath(a.summary)) or ".",
+                    exist_ok=True)
+        t_ = a.summary + f".tmp.{os.getpid()}"
+        json.dump(d_, open(t_, "w"), ensure_ascii=False, indent=1,
+                  default=str)
+        os.replace(t_, a.summary)
+        print(f"  сводка: {a.summary}")
+    print(f"  код: коммит {git_head0}, "
+          f"{len(code_v0)} файлов в версии"
+          + ("  (--allow-dirty)" if dirty0 else ""))
     import torch
     import torch.nn.functional as F
-    import hicora_vla as hv
     import k11a_build_hicora_cache as k11a
-    import k12b_protocol as kb
-    import k14_common as kc
     import k11b_hicora_identity as k11b
     from depth_rvq_joint12 import (make_joint_depth_rvq_class,
                                    code_contribution)
@@ -542,6 +598,30 @@ def main():
             f"кэш целей построен на другом черновике: расходятся {bad_q0}. "
             f"Цели равны Q1(z_e - E0[q0]); от другого q0 это другие цели")
     plan_all = kc.load_plan(a.q0, q0_man)
+    # КАРТА И РЕЖИМ ВЫЧИСЛЕНИЙ. Побитового совпадения q0 недостаточно, чтобы
+    # считать задачу той же: q0 — это argmax, он грубее скрытых состояний.
+    # Два устройства могут дать одинаковые коды и при этом слегка разные h12,
+    # из которых обучается q1. Пока переносимость не измерена, канонический
+    # прогон обязан идти на той же карте и в том же режиме.
+    rt_now = dict(device=str(dev), gpu_uuid=kc.gpu_uuid(dev, torch),
+                  compute_dtype=a.dtype, torch_version=str(torch.__version__),
+                  cuda_version=str(getattr(torch.version, "cuda", None)),
+                  tf32_matmul=bool(torch.backends.cuda.matmul.allow_tf32),
+                  tf32_cudnn=bool(torch.backends.cudnn.allow_tf32),
+                  cudnn_deterministic=bool(torch.backends.cudnn.deterministic),
+                  cudnn_benchmark=bool(torch.backends.cudnn.benchmark))
+    drift = [k_ for k_, v_ in rt_now.items()
+             if str(q0_man.get(k_)) != str(v_)]
+    if drift:
+        msg = ("прогон идёт в другом режиме, чем построен q0: "
+               + "; ".join(f"{k_}: сейчас {rt_now[k_]}, у q0 "
+                           f"{q0_man.get(k_)}" for k_ in drift))
+        if not (a.allow_device_drift and a.smoke):
+            raise SystemExit(
+                msg + ". Для диагностики переносимости: --smoke вместе с "
+                      "--allow-device-drift; канонический прогон так вести "
+                      "нельзя")
+        print(f"  ДИАГНОСТИКА ПЕРЕНОСИМОСТИ: {msg}")
     # СМЕЩЕНИЕ, ЗАПИСАННОЕ В ПЛАНЕ, ОБЯЗАНО СОВПАСТЬ СО СМЕЩЕНИЕМ ДАННЫХ.
     # `build_inputs` принимает одно position_offset на батч; если план говорит
     # одно, а кэш — другое, вход читается не с той позиции, и расхождение
@@ -807,83 +887,6 @@ def main():
                 n += dd.numel()
         return float(np.sqrt(se / max(n, 1)))
 
-    if a.q0_audit:
-        # ИЗМЕРЕНИЕ, А НЕ ОБУЧЕНИЕ. Отвечает на один вопрос: расхождение q0 —
-        # это грань между почти равными логитами или разные пути вычисления.
-        bs_a = [b_ for k in sorted(batches) for b_ in batches[k]]
-        with torch.no_grad():
-            for po, sel in bs_a:
-                run_batch(po, sel, False)
-        # ЛОКАЛИЗАЦИЯ ПРИЧИНЫ. Кэш строился `forward_taps` с отводом на 12-м
-        # слое; тренер берёт q0 сегментированным проходом depth-RVQ. Это
-        # разные вызовы, и надо знать, какой из них расходится с кэшем: от
-        # этого зависит, грань это или разные пути.
-        print("\n  СРАВНЕНИЕ ТРЁХ ПУТЕЙ на первых батчах:")
-        cmp = dict(seg_vs_cache=0, fast_vs_cache=0, taps_vs_cache=0,
-                   seg_vs_fast=0, seg_vs_taps=0, n=0)
-        with torch.no_grad():
-            for po, sel in bs_a[:16]:
-                b = build(po, sel)
-                cq = torch.from_numpy(
-                    np.asarray(q0_can[sel]).astype(np.int64)).to(dev)
-                with ac16:
-                    v_, p_ = model.build_inputs(position_offset=po, **b)
-                    seg = model.forward_joint_depth_rvq(
-                        vlm_inputs_embeds=v_,
-                        attention_mask=b.get("attention_mask"),
-                        position_ids=p_, mode="fast")["pred_codes"][0]
-                    jf = model.forward_joint_fast(
-                        vlm_inputs_embeds=v_,
-                        attention_mask=b.get("attention_mask"),
-                        position_ids=p_)
-                    fast = jf["pred_codes"] if "pred_codes" in jf else jf[1]
-                    # `forward_taps` живёт в классе HiCoRA, и у модели
-                    # тренера его нет. На время аудита класс расширяется
-                    # примесью и возвращается обратно: иначе сравнить с тем
-                    # вызовом, которым построен кэш, невозможно. Ни один вес
-                    # при этом не меняется — метод только читает отводы.
-                    base_cls = type(model)
-                    model.__class__ = hv.make_hicora_class(base_cls)
-                    model.taps = tuple(sorted(set(
-                        list(model.depth_rvq_exits) + [model.fast_depth])))
-                    model.q0_depth = int(model.fast_depth)
-                    model.n_layers_total = len(model.action_expert.layers)
-                    try:
-                        tp = model.forward_taps(
-                            vlm_inputs_embeds=v_,
-                            attention_mask=b.get("attention_mask"),
-                            position_ids=p_)
-                        _lg, taps_q0 = model.q0_from(tp[model.fast_depth])
-                    finally:
-                        model.__class__ = base_cls
-                cmp["seg_vs_cache"] += int((seg != cq).sum())
-                cmp["fast_vs_cache"] += int((fast != cq).sum())
-                cmp["taps_vs_cache"] += int((taps_q0 != cq).sum())
-                cmp["seg_vs_fast"] += int((seg != fast).sum())
-                cmp["seg_vs_taps"] += int((seg != taps_q0).sum())
-                cmp["n"] += int(cq.numel())
-        for k_ in ("seg_vs_cache", "fast_vs_cache", "taps_vs_cache",
-                   "seg_vs_fast", "seg_vs_taps"):
-            print(f"    {k_:16s} {cmp[k_]:5d} из {cmp['n']} "
-                  f"({100 * cmp[k_] / max(cmp['n'], 1):.4f}%)")
-
-        n_b, n_t = q0_bad[0], q0_tot[0]
-        print(f"\n  АУДИТ q0: расхождений {n_b} из {n_t} позиций "
-              f"({100 * n_b / max(n_t, 1):.4f}%)")
-        if q0_margins:
-            mm = np.asarray(q0_margins)
-            ok = np.asarray([x for x in q0_margins_ok if np.isfinite(x)])
-            print(f"    запас логитов в расходящихся: медиана "
-                  f"{np.median(mm):.3e}, максимум {mm.max():.3e}")
-            if ok.size:
-                print(f"    запас в совпадающих (медиана по батчам): "
-                      f"{np.median(ok):.3e}")
-                print(f"    отношение медиан: "
-                      f"{np.median(ok) / max(np.median(mm), 1e-30):.3g}")
-        else:
-            print("    расхождений нет")
-        return 0
-
     named_tr = {n_: p_ for n_, p_ in model.named_parameters()
                 if n_ in set(info["names"])}
     params = [named_tr[n_] for n_ in info["names"]]
@@ -967,6 +970,15 @@ def main():
         print("  РЕЖИМ SMOKE: строки подтверждающей половины через модель не "
               "проходили, метрика по ним не считалась, Gate 4 не вычислялся; "
               "эта голова для эксперимента непригодна")
+        write_summary(outcome="smoke", history=hist, runtime=rt_now,
+                      q0_prov=q0_prov, q0_mismatch=int(q0_bad[0]),
+                      q0_positions=int(q0_tot[0]),
+                      initial_trainable_state_sha1=init_sha,
+                      selected_state_sha1=sel_sha, selected_epoch=best_ep,
+                      val_sel=best_val,
+                      parts={k_: dict(rows=int(len(sets[k_])),
+                                      batches=len(batches[k_]))
+                             for k_ in sets})
         if a.out:
             torch.save(dict(kind="smoke", stage="q1", variant=a.variant,
                             seed=int(a.seed), history=hist,
@@ -979,6 +991,18 @@ def main():
                        a.out)
             print(f"  сохранено: {a.out}")
         return 0
+
+    # ПЕРЕД ОТКРЫТИЕМ ПОДТВЕРЖДАЮЩЕЙ ПОЛОВИНЫ КОД СВЕРЯЕТСЯ ЗАНОВО. Она
+    # открывается один раз, и открывать её результатом, полученным частично
+    # другим кодом, значит потратить её впустую.
+    git_head1, code_v1, _d1 = code_state()
+    if git_head1 != git_head0 or code_v1 != code_v0:
+        raise SystemExit(
+            f"код изменился во время обучения: коммит {git_head0} -> "
+            f"{git_head1}, версия "
+            f"{[k for k in code_v0 if code_v0[k] != code_v1.get(k)]}. "
+            f"Подтверждающая половина не открывается: результат не относится "
+            f"ни к одной из версий целиком")
 
     e_conf = evaluate(batches["val_confirm"])
     po_ = (orc.get("parts") or {}).get("val_confirm") or {}
@@ -1017,25 +1041,34 @@ def main():
         lambda_action=a.lambda_action, lambda_fb=a.lambda_fb,
         grip_weight=a.grip_weight, device=str(dev), dtype=a.dtype,
         bar_path=bar_p,
-        git_head=(os.popen("git rev-parse HEAD 2>/dev/null").read().strip()
-                  or None),
-        git_dirty=bool(kc.check_code_clean(True)[1]),
+        git_dirty=bool(dirty0),
         # В ВЕРСИЮ КОДА ВХОДИТ ВСЁ, ЧТО ВЛИЯЕТ НА ОБУЧЕНИЕ. Прежде сюда не
         # попадали joint12_vla.py (ранний выход и его норма), depth_rvq_vla.py
         # (straight_through и CodeFeedback) и bar.py (сегментированный проход),
         # хотя изменение любого из них меняет обученную голову.
-        code_version=kb.code_version([
-            os.path.abspath(__file__),
-            os.path.join(here, "depth_rvq_joint12.py"),
-            os.path.join(here, "depth_rvq_vla.py"),
-            os.path.join(here, "joint12_vla.py"),
-            os.path.join(here, "k14b_build_q1_cache.py")]),
+        code_version=code_v0, git_head=git_head0, runtime=rt_now,
         bar_sha1=bar_sha,
         script_sha1=sha12(os.path.abspath(__file__)))
     tmp = out_p + f".tmp.{os.getpid()}"
     torch.save(ck, tmp)
     os.replace(tmp, out_p)
     print(f"  сохранено: {out_p}")
+    write_summary(outcome=("gate4_passed" if g4["passed"]
+                           else "gate4_not_passed"),
+                  history=hist, runtime=rt_now, q0_prov=q0_prov,
+                  q0_mismatch=int(q0_bad[0]), q0_positions=int(q0_tot[0]),
+                  initial_trainable_state_sha1=init_sha,
+                  selected_state_sha1=sel_sha, selected_epoch=best_ep,
+                  val_sel=best_val, val_confirm=e_conf, gate4=g4,
+                  e_a0=e_a0, e_oracle=e_or, checkpoint=out_p,
+                  q1_cache=a.q1_cache, oracle=a.oracle, gate_r=a.gate_r,
+                  parts={k_: dict(rows=int(len(sets[k_])),
+                                  batches=len(batches[k_])) for k_ in sets})
+    # КОД 4 — ЭТО ЗАВЕРШЁННЫЙ ПРОГОН С НЕПРОЙДЕННЫМ GATE 4, А НЕ ОТКАЗ.
+    # Отличать обязательно: иначе бегунок, увидев отрицательный, но валидный
+    # результат первой реплики, не запустит вторую — и зарегистрированный
+    # дизайн с двумя порядками данных превратится в остановку после
+    # просмотра результата.
     return 0 if g4["passed"] else 4
 
 

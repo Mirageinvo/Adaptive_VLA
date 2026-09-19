@@ -213,6 +213,8 @@ def main():
     ap.add_argument("--gate-r", nargs=2, metavar=("A", "B"),
                     help="сравнить два манифеста и записать gate_r.json")
     ap.add_argument("--gate-r-out", default="reports/k14d/gate_r.json")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="перезаписать существующее заверение Gate R")
     ap.add_argument("--cache", default="data/k11a_joint12")
     ap.add_argument("--joint-ckpt", default="data/k9d_ep3.pt")
     ap.add_argument("--ckpt",
@@ -239,6 +241,15 @@ def main():
     import k14_common as kc
 
     if a.gate_r:
+        # ЗАВЕРЕНИЕ НЕ ПЕРЕЗАПИСЫВАЕТСЯ МОЛЧА. Иначе повторный запуск с
+        # другой парой заменил бы пройденное заверение непройденным, а
+        # ссылки на него уже проставлены в кэше целей и чекпойнтах.
+        if os.path.exists(a.gate_r_out) and not a.overwrite:
+            raise SystemExit(
+                f"{a.gate_r_out} уже существует. На это заверение ссылаются "
+                f"кэш целей и тренер: замена его задним числом меняет "
+                f"основание всей цепочки. Укажите другой --gate-r-out или "
+                f"явный --overwrite")
         ma, mb = (json.load(open(p)) for p in a.gate_r)
         sa, sb = (sha12(p) for p in a.gate_r)
         r = gate_r(ma, mb, sa, sb)
@@ -263,7 +274,9 @@ def main():
     out_p = a.out or f"data/k14d/q0_b{a.batch}_e{a.exec_order_seed}"
     for suf in (".npz", ".manifest.json"):
         if os.path.exists(out_p + suf):
-            raise SystemExit(f"{out_p}{suf} уже существует")
+            raise SystemExit(
+                f"{out_p}{suf} уже существует. Если это .npz без манифеста — "
+                f"остаток убитого процесса: удалите его и запустите заново")
     git_head, dirty_code, new_arte = kc.check_code_clean(a.allow_dirty)
     dirty = "\n".join(dirty_code)
     if new_arte:
@@ -290,31 +303,6 @@ def main():
                        dict_apply, get_cfg, prompt_template)
 
     dev, dt = torch.device(a.device), getattr(torch, a.dtype)
-
-    def gpu_uuid(d):
-        """Физический идентификатор карты, а не строка «cuda:1».
-
-        Номер устройства — свойство процесса, а не железа: тот же «cuda:1» в
-        другом запуске может оказаться другой картой. Заверять повторяемость
-        по номеру значило бы не заверять её вовсе.
-        """
-        if d.type != "cuda":
-            return "cpu"
-        try:
-            u = torch.cuda.get_device_properties(d).uuid
-            if u:
-                return str(u)
-        except Exception:
-            pass
-        idx = d.index if d.index is not None else torch.cuda.current_device()
-        out = os.popen(f"nvidia-smi --query-gpu=uuid --format=csv,noheader "
-                       f"-i {int(idx)} 2>/dev/null").read().strip()
-        if not out:
-            raise SystemExit(
-                "не удалось определить физический идентификатор карты: ни "
-                "torch, ни nvidia-smi его не дали. Без него Gate R заверял бы "
-                "повторяемость по номеру устройства в процессе")
-        return out.splitlines()[0].strip()
     torch.manual_seed(0)
     np.random.seed(0)
 
@@ -430,6 +418,12 @@ def main():
     # ПРОВЕРОК. Прежний порядок публиковал массив до финальной проверки
     # чистоты дерева: отказ на ней оставлял .npz без манифеста, то есть
     # артефакт, про который нельзя сказать, чем он посчитан.
+    #
+    # ЭТО НЕ ПОЛНАЯ АТОМАРНОСТЬ. Между публикацией npz и публикацией манифеста
+    # остаётся окно: процесс, убитый ровно там, оставит массив без манифеста.
+    # Утверждение здесь у́же: при ШТАТНЫХ отказах неполной пары не возникает.
+    # Осиротевший npz безвреден — каждый потребитель требует манифест и
+    # откажется, — но повторный запуск на то же имя упрётся в проверку выше.
     os.makedirs(os.path.dirname(os.path.abspath(out_p)) or ".", exist_ok=True)
     npz = out_p + ".npz"
     arrs = dict(q0=q0_out, **kc.plan_arrays(plan))
@@ -473,7 +467,7 @@ def main():
         cuda_version=str(getattr(torch.version, "cuda", None)),
         gpu=(torch.cuda.get_device_name(dev) if dev.type == "cuda"
              else "cpu"),
-        gpu_uuid=gpu_uuid(dev),
+        gpu_uuid=kc.gpu_uuid(dev, torch),
         git_head=git_head, git_dirty=bool(dirty or dirty2),
         git_dirty_files=len((dirty2 or dirty).splitlines()),
         minutes=float((time.time() - t0) / 60),

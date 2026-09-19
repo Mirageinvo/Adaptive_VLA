@@ -23,7 +23,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 1
 export PYTHONPATH="${LIBERO_PATH:-$HOME/LIBERO}"
 export MUJOCO_GL=egl
-mkdir -p logs data/k14c
+mkdir -p logs data/k14c reports/k14c
 exec >> logs/k14_train.log 2>&1
 
 Q0="data/k14d/q0_b8_e0.npz"
@@ -34,19 +34,34 @@ CACHE="data/k14b/q1_canonical"
 echo "=== СТАРТ $(date) === вариант $VARIANT, карта $DEV, сиды ${SEEDS[*]}"
 echo "    коммит $(git rev-parse --short HEAD 2>/dev/null)"
 
+# КОДЫ ВОЗВРАТА K-14c РАЗЛИЧАЮТСЯ ПО СМЫСЛУ:
+#   0 — прогон завершён, Gate 4 пройден;
+#   4 — прогон завершён, чекпойнт сохранён, Gate 4 НЕ пройден;
+#   иное — технический отказ.
+# Код 4 — научный результат, а не сбой. Останавливать на нём цепочку значило
+# бы не запустить вторую реплику, увидев отрицательный результат первой, то
+# есть превратить зарегистрированный дизайн с двумя порядками данных в
+# остановку после просмотра. Обе реплики выполняются всегда.
+FAILED4=0
 for S in "${SEEDS[@]}"; do
   LOG="logs/k14c_${VARIANT}_s${S}.log"
+  SUM="reports/k14c/${VARIANT}_s${S}.json"
   echo "--- $VARIANT сид $S $(date) ---"
   python experiments/k14c_train_q1.py --variant "$VARIANT" --seed "$S" \
     --device "$DEV" --q1-cache "$CACHE" --q0 "$Q0" --gate-r "$GR" \
-    --oracle "$ORC" > "$LOG" 2>&1
+    --oracle "$ORC" --summary "$SUM" > "$LOG" 2>&1
   rc=$?
   echo "    код $rc $(date)"
-  if [ $rc -ne 0 ]; then
-    echo "ОСТАНОВ: сид $S не дошёл, остальные не запускаю"
-    tail -15 "$LOG"
-    exit 1
-  fi
-  grep -E "ПОДТВЕРЖДЕНИЕ|Gate 4|выбрана эпоха|q0 совпал" "$LOG"
+  case $rc in
+    0) echo "    Gate 4 ПРОЙДЕН" ;;
+    4) echo "    Gate 4 НЕ пройден — результат сохранён, продолжаю"
+       FAILED4=1 ;;
+    *) echo "ОСТАНОВ: технический отказ на сиде $S, остальные не запускаю"
+       tail -15 "$LOG"
+       exit $rc ;;
+  esac
+  grep -E "ПОДТВЕРЖДЕНИЕ|Gate 4:|выбрана эпоха|q0 совпал" "$LOG"
 done
 echo "=== КОНЕЦ $(date) ==="
+# Наружу 4, если хотя бы одна реплика не прошла гейт, но обе выполнены.
+exit $([ "$FAILED4" = "1" ] && echo 4 || echo 0)

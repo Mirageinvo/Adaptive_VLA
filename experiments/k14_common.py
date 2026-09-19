@@ -233,6 +233,32 @@ CODE_SUFFIXES = (".py", ".sh", ".yaml", ".yml", ".cfg", ".json.py")
 ARTIFACT_DIRS = ("reports/", "data/", "logs/")
 
 
+def gpu_uuid(dev, torch):
+    """Физический идентификатор карты, а не строка «cuda:1».
+
+    Номер устройства — свойство процесса, а не железа: тот же «cuda:1» в
+    другом запуске может оказаться другой картой. Заверять повторяемость по
+    номеру значило бы не заверять её вовсе.
+    """
+    if dev.type != "cuda":
+        return "cpu"
+    try:
+        u = torch.cuda.get_device_properties(dev).uuid
+        if u:
+            return str(u)
+    except Exception:
+        pass
+    idx = dev.index if dev.index is not None else torch.cuda.current_device()
+    out = os.popen(f"nvidia-smi --query-gpu=uuid --format=csv,noheader "
+                   f"-i {int(idx)} 2>/dev/null").read().strip()
+    if not out:
+        raise SystemExit(
+            "не удалось определить физический идентификатор карты: ни torch, "
+            "ни nvidia-smi его не дали. Без него заверение относилось бы к "
+            "номеру устройства в процессе, а не к железу")
+    return out.splitlines()[0].strip()
+
+
 def check_code_clean(allow_dirty=False):
     """Код обязан соответствовать коммиту. РЕЗУЛЬТАТЫ — не обязаны.
 

@@ -51,6 +51,10 @@ run "$S2" "$B" logs/k14d_e${S2}.log || {
 echo "--- GATE R $(date) ---"
 python experiments/k14d_build_q0.py \
   --gate-r "$A.manifest.json" "$B.manifest.json" > logs/k14d_gate_r.log 2>&1
-echo "    код $?"
+grc=$?
+echo "    код $grc"
 cat logs/k14d_gate_r.log
 echo "=== КОНЕЦ $(date) ==="
+# КОД ОТКАЗА ПРОБРАСЫВАЕТСЯ НАРУЖУ. Прежде после echo и cat скрипт завершался
+# нулём, и непройденный Gate R выглядел снаружи как успешная пара.
+exit $grc

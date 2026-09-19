@@ -35,8 +35,13 @@ echo "    коммит $(git rev-parse --short HEAD 2>/dev/null)"
 
 if [ "$ONLY_B" = "0" ]; then
   echo "--- K-14a, Gate 2 $(date) ---"
+  # БЕЗ --overwrite. Артефакт гейта неизменяем: на него уже ссылаются кэш
+  # целей и чекпойнты. Прежняя версия перезаписывала его при каждом запуске,
+  # а K-14b следом отказывался из-за существующего кэша — и старый кэш
+  # оставался привязан к уничтоженной версии гейта. Для пересчёта — новое имя
+  # через третий аргумент.
   python experiments/k14a_oracle_cache.py --device "$DEV" --q0 "$Q0" \
-    --gate-r "$GR" --overwrite --run-id "canon-$(date +%Y%m%dT%H%M%S)" \
+    --gate-r "$GR" --run-id "canon-$(date +%Y%m%dT%H%M%S)" \
     --out "$ORC" > logs/k14a_canonical.log 2>&1
   rc=$?
   echo "    код $rc $(date)"
