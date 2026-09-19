@@ -537,11 +537,19 @@ def main():
             cache_meta_sha1=k11a.file_sha1(f"{a.cache}.meta.json"))
         q0_prov["q0_canonical"] = True
         q0hat = q0_arr
-        d_leg = int((np.asarray(q0hat_legacy).astype(np.int64) != q0_arr).sum())
+        # ТОЛЬКО ПО ПОСЧИТАННЫМ СТРОКАМ: строки вне плана помечены -1, и
+        # считать их расхождением значит выдавать непокрытие за различие.
+        d_msk = np.asarray(q0_defined)
+        d_leg = int((np.asarray(q0hat_legacy)[d_msk].astype(np.int64)
+                     != q0_arr[d_msk]).sum())
         q0_prov["diff_vs_k11a_positions"] = d_leg
+        q0_prov["diff_vs_k11a_compared"] = int(d_msk.sum()) * 16
+        q0_prov["rows_not_in_plan"] = int((~d_msk).sum())
         print(f"  черновик: канонический K-14d, план "
               f"{q0_prov['plan_sha1']}, Gate R {q0_prov['gate_r_sha1']}, "
-              f"расхождение с кэшем K-11a {d_leg} позиций")
+              f"расхождение с кэшем K-11a {d_leg} из "
+              f"{q0_prov['diff_vs_k11a_compared']} позиций; вне плана "
+              f"{q0_prov['rows_not_in_plan']} строк")
     elif a.legacy_q0hat:
         q0_defined = np.ones(N, bool)
         print("  черновик: сентябрьский q0hat K-11a. Кэш целей будет помечен "

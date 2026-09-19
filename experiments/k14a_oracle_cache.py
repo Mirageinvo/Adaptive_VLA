@@ -537,10 +537,18 @@ def main():
                     help="взять q0 из сентябрьского кэша K-11a; результат "
                          "помечается неканоническим")
     ap.add_argument("--out", default="data/k14a/oracle_cache.json")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="перезаписать существующий артефакт гейта")
     ap.add_argument("--run-id", default="",
                     help="номер запуска; сверяется бегунком, чтобы сравнение "
                          "не взяло артефакт от предыдущего прогона")
     a = ap.parse_args()
+    if not a.selftest and os.path.exists(a.out) and not a.overwrite:
+        raise SystemExit(
+            f"{a.out} уже существует. Артефакт пройденного гейта — запись, на "
+            f"которую ссылаются кэш целей и тренер; молча перезаписать его "
+            f"значит подменить основание задним числом. Нужен другой --out "
+            f"или явный --overwrite")
     if a.selftest:
         selftest()
         return 0
@@ -768,17 +776,28 @@ def main():
             a.q0, gate_r_path=a.gate_r, n_obs=N, keys_sha=keys_now,
             cache_meta_sha1=k11a.file_sha1(f"{a.cache}.meta.json"))
         q0_prov["q0_canonical"] = True
+        # СЧИТАЕТСЯ ТОЛЬКО ПО ПОСЧИТАННЫМ СТРОКАМ. План покрывает три
+        # канонические части, остальные строки помечены -1; включать их
+        # значило бы выдавать непокрытие за расхождение и получать
+        # десятикратно завышенное число.
+        d_msk = np.asarray(q0_defined)
         q0_prov["diff_vs_k11a_positions"] = int(
-            (np.asarray(q0hat).astype(np.int64) != q0_arr).sum())
+            (np.asarray(q0hat)[d_msk].astype(np.int64)
+             != q0_arr[d_msk]).sum())
+        q0_prov["diff_vs_k11a_compared"] = int(d_msk.sum()) * 16
+        q0_prov["rows_not_in_plan"] = int((~d_msk).sum())
         lo = int(q0_arr[q0_defined].min()) if q0_defined.any() else 0
         hi = int(q0_arr[q0_defined].max()) if q0_defined.any() else 0
         if lo < 0 or hi >= V:
             raise SystemExit(f"канонический q0: коды в [{lo}, {hi}] при "
                              f"словаре {V}")
         q0hat = q0_arr
+        d_n, d_of = (q0_prov["diff_vs_k11a_positions"],
+                     q0_prov["diff_vs_k11a_compared"])
         print(f"  черновик: канонический K-14d, план {q0_prov['plan_sha1']}, "
               f"Gate R {q0_prov['gate_r_sha1']}, расхождение с кэшем K-11a "
-              f"{q0_prov['diff_vs_k11a_positions']} позиций")
+              f"{d_n} из {d_of} позиций ({100 * d_n / max(d_of, 1):.4f}%); "
+              f"вне плана {q0_prov['rows_not_in_plan']} строк")
     elif a.legacy_q0hat:
         print("  черновик: сентябрьский q0hat K-11a. Результат будет помечен "
               "НЕКАНОНИЧЕСКИМ")
