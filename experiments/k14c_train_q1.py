@@ -1019,8 +1019,7 @@ def main():
         bar_path=bar_p,
         git_head=(os.popen("git rev-parse HEAD 2>/dev/null").read().strip()
                   or None),
-        git_dirty=bool(os.popen("git status --porcelain 2>/dev/null")
-                       .read().strip()),
+        git_dirty=bool(kc.check_code_clean(True)[1]),
         # В ВЕРСИЮ КОДА ВХОДИТ ВСЁ, ЧТО ВЛИЯЕТ НА ОБУЧЕНИЕ. Прежде сюда не
         # попадали joint12_vla.py (ранний выход и его норма), depth_rvq_vla.py
         # (straight_through и CodeFeedback) и bar.py (сегментированный проход),

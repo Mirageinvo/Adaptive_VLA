@@ -15,6 +15,10 @@ set -u
 DEV="${1:-cuda:1}"
 Q0="${2:-data/k14d/q0_b8_e0.npz}"
 GR="${3:-reports/k14d/gate_r.json}"
+[ "$GR" = "--only-b" ] && GR="reports/k14d/gate_r.json"
+
+ONLY_B=0
+for arg in "$@"; do [ "$arg" = "--only-b" ] && ONLY_B=1; done
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 1
@@ -29,14 +33,19 @@ OUT="data/k14b/q1_canonical"
 echo "=== СТАРТ $(date) === карта $DEV, черновик $Q0"
 echo "    коммит $(git rev-parse --short HEAD 2>/dev/null)"
 
-echo "--- K-14a, Gate 2 $(date) ---"
-python experiments/k14a_oracle_cache.py --device "$DEV" --q0 "$Q0" \
-  --gate-r "$GR" --overwrite --run-id "canon-$(date +%Y%m%dT%H%M%S)" \
-  --out "$ORC" > logs/k14a_canonical.log 2>&1
-rc=$?
-echo "    код $rc $(date)"
-[ $rc -ne 0 ] && { echo "ОСТАНОВ: гейт не пройден, кэш целей не строю"; exit 1; }
-grep -E "ГЕЙТ 2|РЕШЕНИЕ|ОБУЧАТЬ|черновик:" logs/k14a_canonical.log
+if [ "$ONLY_B" = "0" ]; then
+  echo "--- K-14a, Gate 2 $(date) ---"
+  python experiments/k14a_oracle_cache.py --device "$DEV" --q0 "$Q0" \
+    --gate-r "$GR" --overwrite --run-id "canon-$(date +%Y%m%dT%H%M%S)" \
+    --out "$ORC" > logs/k14a_canonical.log 2>&1
+  rc=$?
+  echo "    код $rc $(date)"
+  [ $rc -ne 0 ] && { echo "ОСТАНОВ: гейт не пройден, кэш целей не строю"; \
+    exit 1; }
+  grep -E "ГЕЙТ 2|РЕШЕНИЕ|ОБУЧАТЬ|черновик:" logs/k14a_canonical.log
+else
+  echo "--- K-14a пропущен, гейт берётся готовый: $ORC ---"
+fi
 
 echo "--- K-14b, кэш целей $(date) ---"
 python experiments/k14b_build_q1_cache.py --device "$DEV" --q0 "$Q0" \

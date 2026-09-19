@@ -446,31 +446,22 @@ def main():
     # ЧИСТОЕ ДЕРЕВО ДЛЯ КАНОНИЧЕСКОГО АРТЕФАКТА. Кэш будет жить дольше этой
     # рабочей копии, и «построен таким-то коммитом» должно означать ровно то,
     # что написано. Состояние записывается в манифест в любом случае.
-    dirty = os.popen("git status --porcelain 2>/dev/null").read().strip()
-    git_head = os.popen("git rev-parse HEAD 2>/dev/null").read().strip()
-    if not git_head:
-        raise SystemExit(
-            "не удалось определить git HEAD: канонический кэш обязан ссылаться "
-            "на коммит, которым построен, иначе поле git_head в манифесте "
-            "будет пустым и артефакт перестанет быть воспроизводимым")
-    if dirty and not a.allow_dirty:
-        raise SystemExit(
-            f"рабочее дерево не чисто ({len(dirty.splitlines())} файлов). "
-            f"Канонический кэш ссылался бы на коммит {git_head or '?'}, не "
-            f"соответствующий тому, чем он построен. Закоммитьте изменения "
-            f"или укажите --allow-dirty осознанно:\n{dirty[:400]}")
-
     here = os.path.dirname(os.path.abspath(__file__))
     root = os.path.abspath(a.root)
     for p in (root, os.path.join(root, "src"), here,
               os.path.abspath("experiments")):
         if p not in sys.path:
             sys.path.insert(0, p)
+    import k14_common as kc
+    git_head, dirty_code, new_arte = kc.check_code_clean(a.allow_dirty)
+    dirty = "\n".join(dirty_code)
+    if new_arte:
+        print(f"  незакоммиченных результатов рядом: {len(new_arte)} "
+              f"(на код не влияют, в манифест записаны)")
     import torch
     import k11a_build_hicora_cache as k11a
     import k12b_protocol as kb
     import k13a_build_trajectory_basis as k13a
-    import k14_common as kc
     import k14a_oracle_cache as k14a
     from k11c_train_d1 import split_episodes
     from depth_rvq_joint12 import code_contribution, nearest_code

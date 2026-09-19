@@ -226,6 +226,51 @@ def check_gate_r(path, *, expect_plan_sha1=None, expect_batch=CANONICAL_BATCH,
                 run_ids=r.get("run_ids"))
 
 
+# Расширения, изменение которых меняет ВЫЧИСЛЕНИЕ, и каталоги, где лежат
+# только РЕЗУЛЬТАТЫ. Отличать одно от другого обязательно: иначе проверка
+# происхождения срабатывает на файле, который сама же цепочка и произвела.
+CODE_SUFFIXES = (".py", ".sh", ".yaml", ".yml", ".cfg", ".json.py")
+ARTIFACT_DIRS = ("reports/", "data/", "logs/")
+
+
+def check_code_clean(allow_dirty=False):
+    """Код обязан соответствовать коммиту. РЕЗУЛЬТАТЫ — не обязаны.
+
+    Утверждение, которое защищает эта проверка, ровно одно: «артефакт построен
+    кодом коммита X». Незакоммиченный .py его опровергает; незакоммиченный
+    отчёт в reports/ — нет, он и есть выход предыдущего шага той же цепочки.
+    Прежняя версия не различала их и падала на файле, который цепочка только
+    что сама создала: проверка мешала работе, ничего не доказывая.
+
+    Возвращает (git_head, строки про код, строки про результаты).
+    """
+    # -uall ОБЯЗАТЕЛЕН. Без него git сворачивает новый каталог в одну строку
+    # «?? reports/k14d/», и по ней нельзя сказать, лежит ли внутри отчёт или
+    # новый .py. Свёрнутый каталог прошёл бы как результат вместе с кодом.
+    out = os.popen("git status --porcelain -uall 2>/dev/null").read().strip()
+    head = os.popen("git rev-parse HEAD 2>/dev/null").read().strip()
+    if not head:
+        raise SystemExit(
+            "не удалось определить git HEAD: артефакт обязан ссылаться на "
+            "коммит, которым построен")
+    code, arte = [], []
+    for ln in (out.splitlines() if out else []):
+        path = ln[3:].strip().strip('"')
+        is_new = ln[:2].strip() == "??"
+        in_arte = any(path.startswith(d) for d in ARTIFACT_DIRS)
+        if is_new and in_arte and not path.endswith(CODE_SUFFIXES):
+            arte.append(ln)
+        else:
+            code.append(ln)
+    if code and not allow_dirty:
+        raise SystemExit(
+            f"изменён код, не вошедший в коммит {head} ({len(code)} файлов). "
+            f"Артефакт ссылался бы на коммит, не соответствующий тому, чем он "
+            f"построен. Закоммитьте или укажите --allow-dirty осознанно:\n"
+            + "\n".join(code[:20]))
+    return head, code, arte
+
+
 def load_states(src, n_obs, dataset_repo, dataset_revision, keys_sha,
                 state_q01, state_q99):
     """Состояния наблюдений. ВСЕ поля меты обязательны и сверяются точно.
@@ -696,6 +741,52 @@ def selftest():
             assert "формы" in str(e) or "ровно" in str(e), e
         else:
             raise AssertionError("принят другой размер набора")
+
+    # --- чистота КОДА, а не выходного каталога ----------------------------
+    import subprocess
+    with tempfile.TemporaryDirectory() as td:
+        def git(*args):
+            return subprocess.run(("git",) + args, cwd=td,
+                                  capture_output=True, text=True)
+        git("init", "-q")
+        git("config", "user.email", "t@t")
+        git("config", "user.name", "t")
+        os.makedirs(os.path.join(td, "experiments"))
+        open(os.path.join(td, "experiments", "a.py"), "w").write("x = 1\n")
+        git("add", "-A")
+        git("commit", "-qm", "init")
+        cwd = os.getcwd()
+        try:
+            os.chdir(td)
+            head, code, arte = check_code_clean()
+            assert head and not code and not arte, (head, code, arte)
+            # результат цепочки — не повод отказывать
+            os.makedirs("reports/k14d", exist_ok=True)
+            open("reports/k14d/gate_r.json", "w").write("{}")
+            os.makedirs("data/k14d", exist_ok=True)
+            open("data/k14d/q0.manifest.json", "w").write("{}")
+            head, code, arte = check_code_clean()
+            assert not code and len(arte) == 2, (code, arte)
+            # изменённый код — повод
+            open("experiments/a.py", "w").write("x = 2\n")
+            try:
+                check_code_clean()
+            except SystemExit as e:
+                assert "изменён код" in str(e), e
+            else:
+                raise AssertionError("изменённый код принят")
+            assert check_code_clean(allow_dirty=True)[1], "--allow-dirty"
+            # новый .py в каталоге результатов — это код, а не результат
+            open("experiments/a.py", "w").write("x = 1\n")
+            open("reports/helper.py", "w").write("y = 1\n")
+            try:
+                check_code_clean()
+            except SystemExit as e:
+                assert "изменён код" in str(e), e
+            else:
+                raise AssertionError("новый .py в reports/ принят как результат")
+        finally:
+            os.chdir(cwd)
 
     print("самопроверка k14_common пройдена")
 

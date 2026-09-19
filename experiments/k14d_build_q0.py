@@ -264,15 +264,11 @@ def main():
     for suf in (".npz", ".manifest.json"):
         if os.path.exists(out_p + suf):
             raise SystemExit(f"{out_p}{suf} уже существует")
-    dirty = os.popen("git status --porcelain 2>/dev/null").read().strip()
-    git_head = os.popen("git rev-parse HEAD 2>/dev/null").read().strip()
-    if not git_head:
-        raise SystemExit("не удалось определить git HEAD")
-    if dirty and not a.allow_dirty:
-        raise SystemExit(
-            f"рабочее дерево не чисто ({len(dirty.splitlines())} файлов). "
-            f"Канонический q0 обязан ссылаться на коммит, которым построен:\n"
-            f"{dirty[:400]}")
+    git_head, dirty_code, new_arte = kc.check_code_clean(a.allow_dirty)
+    dirty = "\n".join(dirty_code)
+    if new_arte:
+        print(f"  незакоммиченных результатов рядом: {len(new_arte)} "
+              f"(на код не влияют, в манифест записаны)")
     run_id = f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}"
 
     root = os.path.abspath(a.root)
@@ -447,7 +443,7 @@ def main():
             if not np.array_equal(z[k_], v_):
                 raise SystemExit(f"{npz}: {k_} прочитался иначе")
 
-    dirty2 = os.popen("git status --porcelain 2>/dev/null").read().strip()
+    dirty2 = "\n".join(kc.check_code_clean(True)[1])
     man = dict(
         kind="k14_q0_by_plan", run_id=run_id, batch=int(a.batch),
         declared_parts=list(kc.CANONICAL_PARTS), schema=kc.SCHEMA_VERSION,
