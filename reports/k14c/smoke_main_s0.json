@@ -1,0 +1,121 @@
+{
+ "kind": "k14c_run",
+ "variant": "main",
+ "seed": 0,
+ "smoke": true,
+ "limit": 40,
+ "epochs": 2,
+ "batch": 8,
+ "git_head": "81ddb7ed3628a95b19ecc9f6b9f3e5bf50396e1c",
+ "git_dirty": false,
+ "code_version": {
+  "k14c_train_q1.py": "05af65c51748",
+  "k14_common.py": "10a504aacd85",
+  "depth_rvq_joint12.py": "e497ae43e8be",
+  "depth_rvq_vla.py": "21c8b98190fb",
+  "joint12_vla.py": "9ec8d96770f9",
+  "k14b_build_q1_cache.py": "7db2b6ed12f3"
+ },
+ "script_sha1": "e85400fe13b3",
+ "outcome": "smoke",
+ "history": [
+  {
+   "epoch": 0,
+   "train": null,
+   "val_sel": 0.3696075633420701
+  },
+  {
+   "epoch": 1,
+   "train": 13.547565841674805,
+   "val_sel": 0.3343591981726797
+  },
+  {
+   "epoch": 2,
+   "train": 10.192615485191345,
+   "val_sel": 0.31118824607547735
+  }
+ ],
+ "runtime": {
+  "device": "cuda:1",
+  "gpu_uuid": "GPU-f00eac7f-5fe6-25c9-5e42-65bc575a0738",
+  "compute_dtype": "float16",
+  "torch_version": "2.4.1+cu124",
+  "cuda_version": "12.4",
+  "tf32_matmul": false,
+  "tf32_cudnn": true,
+  "cudnn_deterministic": false,
+  "cudnn_benchmark": false
+ },
+ "q0_prov": {
+  "q0_source": "k14d_plan",
+  "q0_npz": "data/k14d/q0_b8_e0.npz",
+  "q0_npz_sha1": "ccd7964392ff",
+  "q0_manifest_sha1": "d3d42b57387e",
+  "plan_sha1": "847aa52de729",
+  "plan_batch": 8,
+  "q0_run_id": "20260918T212308-141785",
+  "q0_git_head": "e6f797005480a005eed30258e747c1c1192cd646",
+  "q0_parts": {
+   "train": "a69b5d7b7dfc",
+   "val_sel": "98772cfebc82",
+   "val_confirm": "0218f83b386e"
+  },
+  "gate_r_path": "reports/k14d/gate_r.json",
+  "gate_r_sha1": "cfcd92939062",
+  "gate_r_batch": 8,
+  "exec_order_seeds": [
+   0,
+   7
+  ],
+  "witness_sha1": [
+   "d3d42b57387e",
+   "cf017e6817ac"
+  ],
+  "witness_run_id": [
+   "20260918T212308-141785",
+   "20260918T230022-141864"
+  ],
+  "gate_r_witnesses": [
+   {
+    "manifest_sha1": "d3d42b57387e",
+    "run_id": "20260918T212308-141785",
+    "exec_order_seed": 0,
+    "parts": {
+     "train": "a69b5d7b7dfc",
+     "val_sel": "98772cfebc82",
+     "val_confirm": "0218f83b386e"
+    }
+   },
+   {
+    "manifest_sha1": "cf017e6817ac",
+    "run_id": "20260918T230022-141864",
+    "exec_order_seed": 7,
+    "parts": {
+     "train": "a69b5d7b7dfc",
+     "val_sel": "98772cfebc82",
+     "val_confirm": "0218f83b386e"
+    }
+   }
+  ],
+  "gate_r_run_ids": [
+   "20260918T212308-141785",
+   "20260918T230022-141864"
+  ]
+ },
+ "q0_mismatch": 0,
+ "q0_positions": 30720,
+ "initial_trainable_state_sha1": "a6401bb27b25",
+ "selected_state_sha1": "f6c102b8d841",
+ "selected_epoch": 2,
+ "val_sel": 0.31118824607547735,
+ "parts": {
+  "train": {
+   "rows": 320,
+   "batches": 40
+  },
+  "val_sel": {
+   "rows": 320,
+   "batches": 40
+  }
+ }
+}
