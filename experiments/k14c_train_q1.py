@@ -349,8 +349,15 @@ def main():
                          "канонический результат так получать нельзя")
     ap.add_argument("--allow-device-drift", action="store_true",
                     help="разрешить карту, отличную от той, на которой "
-                         "построен q0. ТОЛЬКО со --smoke: это диагностика "
-                         "переносимости, а не канонический прогон")
+                         "построен q0. ТОЛЬКО со --smoke или "
+                         "--eval-checkpoint: это диагностика переносимости, "
+                         "а не канонический прогон. Побочно она её и меряет: "
+                         "сверка q0 внутри прогона побитовая, и если на "
+                         "другой карте она проходит, переносимость есть")
+    ap.add_argument("--eval-checkpoint", default="",
+                    help="измерить сохранённую голову на val_sel (CE, top-1 "
+                         "по кодам, RMS) и выйти; подтверждающая половина не "
+                         "открывается")
     ap.add_argument("--summary", default="",
                     help="куда записать машинную сводку прогона (json)")
     ap.add_argument("--device", default="cuda:0")
@@ -365,8 +372,10 @@ def main():
     if miss:
         raise SystemExit(f"нужны {miss}: вариант и training-сид задаются "
                          f"явно, умолчаний у них нет")
-    if a.allow_device_drift and not a.smoke:
-        raise SystemExit("--allow-device-drift допустим только со --smoke")
+    if a.allow_device_drift and not (a.smoke or a.eval_checkpoint):
+        raise SystemExit(
+            "--allow-device-drift допустим только со --smoke или "
+            "--eval-checkpoint: это диагностика, а не канонический прогон")
     if a.limit and not a.smoke:
         raise SystemExit("--limit допустим только вместе со --smoke: "
                          "укороченный train в каноническом прогоне дал бы "
@@ -616,7 +625,7 @@ def main():
         msg = ("прогон идёт в другом режиме, чем построен q0: "
                + "; ".join(f"{k_}: сейчас {rt_now[k_]}, у q0 "
                            f"{q0_man.get(k_)}" for k_ in drift))
-        if not (a.allow_device_drift and a.smoke):
+        if not (a.allow_device_drift and (a.smoke or a.eval_checkpoint)):
             raise SystemExit(
                 msg + ". Для диагностики переносимости: --smoke вместе с "
                       "--allow-device-drift; канонический прогон так вести "
@@ -870,22 +879,108 @@ def main():
             raise SystemExit(
                 f"потеря не число: CE {float(ce)}, действие "
                 f"{float(act_loss)}, регуляризатор {float(fb_reg)}")
-        return loss, ce, act_loss, a_hat.detach(), a_true, d_q0
+        with torch.no_grad():
+            top1 = float((lg.argmax(-1) == tg).float().mean())
+        return loss, ce, act_loss, a_hat.detach(), a_true, d_q0, top1
+
+    ev_extra = {}
 
     def evaluate(bs):
-        """RMS первых восьми действий в единицах робота, argmax без ST."""
+        """RMS первых восьми действий в единицах робота, argmax без ST.
+
+        ПОБОЧНО СОБИРАЕТ CE И TOP-1 ПО КОДАМ. Печаталась только суммарная
+        обучающая функция ce + L_action + L_fb, и по ней нельзя сказать,
+        улучшается ли предсказание кодов: три слагаемых могли двигаться
+        по-разному. Утверждение «коды точнее, действие нет» требует
+        раздельного измерения, иначе это домысел.
+        """
         se, n = 0.0, 0
+        ce_s, t1_s, nb_ = 0.0, 0.0, 0
         model.eval()
         with torch.no_grad():
             for po, sel in bs:
-                _l, _c, _al, a_hat, a_true, _d = run_batch(po, sel, False)
+                _l, _c, _al, a_hat, a_true, _d, t1 = run_batch(po, sel, False)
+                ce_s += float(_c); t1_s += t1; nb_ += 1
                 q = torch.as_tensor(max_act_q[:7], device=dev,
                                     dtype=torch.float32).clone()
                 q[-1] = 1.0
                 dd = (a_hat[:, :H_EXEC] - a_true[:, :H_EXEC]) * q
                 se += float((dd ** 2).sum())
                 n += dd.numel()
+        ev_extra.clear()
+        ev_extra.update(ce=ce_s / max(nb_, 1), top1=t1_s / max(nb_, 1),
+                        batches=nb_)
         return float(np.sqrt(se / max(n, 1)))
+
+    if a.eval_checkpoint:
+        # Снимок НАЧАЛЬНОГО состояния тех же весов — опора сравнения: без неё
+        # непонятно, что именно дало обучение, а что было с самого начала.
+        snap0_eval = snapshot({n_: p_ for n_, p_ in model.named_parameters()
+                               if n_ in set(info["names"])})
+        # ТОЛЬКО ИЗМЕРЕНИЕ, БЕЗ ОБУЧЕНИЯ И БЕЗ ПОДТВЕРЖДАЮЩЕЙ ПОЛОВИНЫ.
+        # Отвечает на один вопрос: расходятся ли точность по кодам и ошибка
+        # действия. Подтверждение здесь не открывается ни при каких условиях:
+        # оно одноразовое и тратится только в каноническом прогоне.
+        ck_ = torch.load(a.eval_checkpoint, map_location="cpu",
+                         weights_only=False)
+        st_ = ck_.get("state") or {}
+        own_ = dict(model.named_parameters())
+        miss_ = [k for k in st_ if k not in own_]
+        if miss_:
+            raise SystemExit(f"в модели нет ключей чекпойнта {miss_[:5]}")
+        with torch.no_grad():
+            for k_, v_ in st_.items():
+                if tuple(own_[k_].shape) != tuple(v_.shape):
+                    raise SystemExit(f"форма {k_}: {tuple(v_.shape)} против "
+                                     f"{tuple(own_[k_].shape)}")
+                own_[k_].data.copy_(v_.to(own_[k_].device, own_[k_].dtype))
+        print(f"  загружен чекпойнт {a.eval_checkpoint}: {len(st_)} тензоров, "
+              f"вариант {ck_.get('variant')}, сид {ck_.get('seed')}, "
+              f"эпоха {ck_.get('selected_epoch')}")
+        # СРЕЗ TRAIN РАВНОГО РАЗМЕРА. Обучающая и валидационная метрики
+        # должны быть ОДНОЙ величиной на наборах одного размера, иначе
+        # «обучающая падает, валидационная стоит» нечем проверить. Именно
+        # этот признак отличает нехватку данных (train сильно лучше val) от
+        # недоученности (обе плохи и примерно равны).
+        n_v = len(batches["val_sel"])
+        ev_sets = {"val_sel": batches["val_sel"],
+                   "train (срез)": batches["train"][:n_v]}
+        rows_ = {}
+        for tag, st0 in (("обученная", True), ("до обучения", False)):
+            if not st0:
+                with torch.no_grad():
+                    for k_, v_ in snap0_eval.items():
+                        own_[k_].data.copy_(v_.to(own_[k_].device,
+                                                  own_[k_].dtype))
+            for nm_, bs_ in ev_sets.items():
+                r_ = evaluate(bs_)
+                rows_[f"{tag} / {nm_}"] = dict(rms=r_, n_batches=len(bs_),
+                                               **dict(ev_extra))
+                print(f"    {tag:12s} {nm_:14s} RMS-8 {r_:.6f}  "
+                      f"CE {ev_extra['ce']:.5f}  "
+                      f"top-1 {100 * ev_extra['top1']:.2f}%")
+        a0_ = (((orc.get("parts") or {}).get("val_sel") or {})
+               .get("vs_action.A0") or {}).get("rms")
+        or_ = (((orc.get("parts") or {}).get("val_sel") or {})
+               .get("vs_action.A01_ze") or {}).get("rms")
+        if a0_ and or_:
+            for tag, d_ in rows_.items():
+                if tag.endswith("val_sel"):
+                    print(f"    {tag:28s} захват C = "
+                          f"{(a0_ - d_['rms']) / (a0_ - or_):+.4f}")
+        tr_, vl_ = rows_.get("обученная / train (срез)"), \
+            rows_.get("обученная / val_sel")
+        if tr_ and vl_:
+            print(f"\n  РАЗРЫВ ОБУЧЕНИЕ/ВАЛИДАЦИЯ: CE {tr_['ce']:.5f} против "
+                  f"{vl_['ce']:.5f}, top-1 {100 * tr_['top1']:.2f}% против "
+                  f"{100 * vl_['top1']:.2f}%")
+            print("  Большой разрыв -> упёрлись в данные. Малый разрыв при "
+                  "низком top-1 на обоих -> упёрлись в бюджет или ёмкость.")
+        write_summary(outcome="eval_only", eval_val_sel=rows_,
+                      checkpoint=a.eval_checkpoint, runtime=rt_now,
+                      q0_prov=q0_prov, e_a0_val_sel=a0_,
+                      e_oracle_val_sel=or_)
+        return 0
 
     named_tr = {n_: p_ for n_, p_ in model.named_parameters()
                 if n_ in set(info["names"])}
@@ -907,11 +1002,12 @@ def main():
     print(f"  эпоха 0 (без обучения): val_sel RMS-8 {e0_val:.6f}")
     for ep in range(1, int(a.epochs) + 1):
         order = list(batches["train"])
+        t_ep = time.time()
         rng.shuffle(order)
         run, nb, dq = 0.0, 0, 0
         for po, sel in order:
             opt.zero_grad(set_to_none=True)
-            loss, ce, al, _ah, _at, d_q0 = run_batch(po, sel, True)
+            loss, ce, al, _ah, _at, d_q0, _t1 = run_batch(po, sel, True)
             loss.backward()
             # ГРАДИЕНТ ОБЯЗАН ДОЙТИ ДО КАЖДОГО РАЗРЕШЁННОГО ВЕСА И БЫТЬ
             # КОНЕЧНЫМ. Отсутствующий градиент означает, что часть головы не
@@ -933,6 +1029,17 @@ def main():
                           f"{len(params)} обучаемых тензоров")
             opt.step()
             run += float(loss.detach()); nb += 1; dq += d_q0
+            # ПРОГРЕСС ВНУТРИ ЭПОХИ, С ЯВНЫМ СБРОСОМ БУФЕРА. Эпоха идёт часы;
+            # без этого лог молчит, и работающий прогон неотличим от
+            # зависшего. flush обязателен: при перенаправлении в файл stdout
+            # буферизуется блоками, и строки эпох (десятки байт) не дошли бы
+            # до файла до самого выхода процесса.
+            if nb % 250 == 0:
+                el = (time.time() - t_ep) / 60
+                print(f"    эпоха {ep}: батч {nb}/{len(order)}, потеря "
+                      f"{run / nb:.5f}, {el:.1f} мин, осталось "
+                      f"{el * (len(order) - nb) / max(nb, 1):.0f} мин",
+                      flush=True)
         v = evaluate(batches["val_sel"])
         hist.append(dict(epoch=ep, train=run / max(nb, 1), val_sel=v))
         mark = ""
@@ -997,12 +1104,43 @@ def main():
     # другим кодом, значит потратить её впустую.
     git_head1, code_v1, _d1 = code_state()
     if git_head1 != git_head0 or code_v1 != code_v0:
-        raise SystemExit(
-            f"код изменился во время обучения: коммит {git_head0} -> "
-            f"{git_head1}, версия "
-            f"{[k for k in code_v0 if code_v0[k] != code_v1.get(k)]}. "
-            f"Подтверждающая половина не открывается: результат не относится "
-            f"ни к одной из версий целиком")
+        # ВЕСА СОХРАНЯЮТСЯ, ПОДТВЕРЖДЕНИЕ НЕ ОТКРЫВАЕТСЯ. Отказ обязан стоить
+        # ровно того, что он защищает. Защищается одноразовая подтверждающая
+        # половина, а не семь часов обучения: выбрасывать обученную голову
+        # из-за того, что рядом сменился коммит, значит наказывать за
+        # постороннее. Голова помечается непригодной для гейта и сохраняется.
+        changed = [k for k in code_v0 if code_v0[k] != code_v1.get(k)]
+        print(f"  КОД ИЗМЕНИЛСЯ ВО ВРЕМЯ ОБУЧЕНИЯ: коммит {git_head0} -> "
+              f"{git_head1}, файлы {changed or 'те же'}. Подтверждающая "
+              f"половина НЕ открывается: результат не относится ни к одной "
+              f"из версий целиком. Веса сохраняются, для Gate 4 они "
+              f"непригодны")
+        tmp = out_p + f".tmp.{os.getpid()}"
+        torch.save(dict(kind="q1_head_unconfirmed", stage="q1",
+                        variant=a.variant, seed=int(a.seed),
+                        state={k: v.detach().cpu()
+                               for k, v in model.state_dict().items()
+                               if k in set(info["names"])},
+                        history=hist, selected_epoch=best_ep,
+                        val_sel=best_val,
+                        initial_trainable_state_sha1=init_sha,
+                        selected_state_sha1=sel_sha, q0_prov=q0_prov,
+                        git_head_start=git_head0, git_head_end=git_head1,
+                        code_version_start=code_v0, code_version_end=code_v1,
+                        runtime=rt_now,
+                        note="подтверждающая половина не открывалась: код "
+                             "изменился во время обучения"), tmp)
+        os.replace(tmp, out_p)
+        print(f"  сохранено: {out_p}")
+        write_summary(outcome="code_changed_during_run", history=hist,
+                      runtime=rt_now, q0_prov=q0_prov, val_sel=best_val,
+                      selected_epoch=best_ep, selected_state_sha1=sel_sha,
+                      git_head_end=git_head1, code_version_end=code_v1,
+                      checkpoint=out_p)
+        # КОД 5 — НЕ 4 И НЕ 0: прогон не завершён по протоколу, и бегунок
+        # обязан остановить цепочку, а не считать это отрицательным
+        # результатом.
+        return 5
 
     e_conf = evaluate(batches["val_confirm"])
     po_ = (orc.get("parts") or {}).get("val_confirm") or {}

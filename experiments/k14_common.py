@@ -15,6 +15,7 @@ forward-размер батча 8 входит в идентичность, на
 import hashlib
 import json
 import os
+import re
 
 import numpy as np
 
@@ -250,13 +251,22 @@ def gpu_uuid(dev, torch):
         pass
     idx = dev.index if dev.index is not None else torch.cuda.current_device()
     out = os.popen(f"nvidia-smi --query-gpu=uuid --format=csv,noheader "
-                   f"-i {int(idx)} 2>/dev/null").read().strip()
-    if not out:
+                   f"-i {int(idx)} 2>&1").read().strip()
+    got = out.splitlines()[0].strip() if out else ""
+    # ВЫВОД ПРОВЕРЯЕТСЯ НА ФОРМУ, А НЕ НА НЕПУСТОТУ. `nvidia-smi` при
+    # отвалившемся NVML печатает «Failed to initialize NVML: Unknown Error» и
+    # это непустая строка: прежняя версия принимала её за идентификатор карты
+    # и сравнивала с настоящим UUID. Отказ получался верный, но причина в
+    # сообщении была подменена — вместо «GPU недоступен» читалось «не та
+    # карта», а это разные поломки с разным лечением.
+    if not re.fullmatch(r"GPU-[0-9a-fA-F-]{32,40}", got):
         raise SystemExit(
-            "не удалось определить физический идентификатор карты: ни torch, "
-            "ни nvidia-smi его не дали. Без него заверение относилось бы к "
-            "номеру устройства в процессе, а не к железу")
-    return out.splitlines()[0].strip()
+            f"не удалось определить физический идентификатор карты: torch не "
+            f"дал uuid, а nvidia-smi ответил {out[:120]!r}. Если это "
+            f"«Failed to initialize NVML» — контейнер потерял GPU при живом "
+            f"драйвере; лечится перезапуском докера с хоста, а не правкой "
+            f"кода")
+    return got
 
 
 def check_code_clean(allow_dirty=False):
