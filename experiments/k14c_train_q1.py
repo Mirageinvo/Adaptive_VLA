@@ -807,7 +807,14 @@ def main():
         x, _ = codec._decode(z.float(), embodiment_ids=0)
         return x[..., :7].float()
 
-    def run_batch(po, sel, train):
+    def run_batch(po, sel, train, no_q1=False):
+        """`no_q1` — ОПОРА A0: действие декодируется из одного E0[q0].
+
+        Без неё нельзя сказать, помогает ли голова ВООБЩЕ. Числа оракула
+        сняты на других строках (train там подвыбирался), и сравнивать с ними
+        срез значит сравнивать разные наборы. Опора должна считаться на тех
+        же строках тем же кодом.
+        """
         b = build(po, sel)
         with ac16:
             v_, p_ = model.build_inputs(position_offset=po, **b)
@@ -866,7 +873,7 @@ def main():
             emb, _, _ = straight_through(lg, books[1].float(), tau=1.0)
         else:
             emb = books[1][lg.argmax(-1)].float()
-        a_hat = decode_actions(e0 + emb)
+        a_hat = decode_actions(e0 if no_q1 else e0 + emb)
         a_true = torch.from_numpy(
             np.asarray(ACT[sel], np.float32)).to(dev)[..., :7]
         w = torch.ones(7, device=dev, dtype=torch.float32)
@@ -888,7 +895,7 @@ def main():
 
     ev_extra = {}
 
-    def evaluate(bs):
+    def evaluate(bs, no_q1=False):
         """RMS первых восьми действий в единицах робота, argmax без ST.
 
         ПОБОЧНО СОБИРАЕТ CE И TOP-1 ПО КОДАМ. Печаталась только суммарная
@@ -902,7 +909,8 @@ def main():
         model.eval()
         with torch.no_grad():
             for po, sel in bs:
-                _l, _c, _al, a_hat, a_true, _d, t1 = run_batch(po, sel, False)
+                _l, _c, _al, a_hat, a_true, _d, t1 = run_batch(
+                    po, sel, False, no_q1=no_q1)
                 ce_s += float(_c); t1_s += t1; nb_ += 1
                 q = torch.as_tensor(max_act_q[:7], device=dev,
                                     dtype=torch.float32).clone()
@@ -949,6 +957,12 @@ def main():
         ev_sets = {"val_sel": batches["val_sel"],
                    "train (срез)": batches["train"][:n_v]}
         rows_ = {}
+        # ОПОРА A0 НА ТЕХ ЖЕ СТРОКАХ. Считается один раз: она не зависит от
+        # весов головы — q1 просто не применяется.
+        for nm_, bs_ in ev_sets.items():
+            r_ = evaluate(bs_, no_q1=True)
+            rows_[f"опора A0 / {nm_}"] = dict(rms=r_, n_batches=len(bs_))
+            print(f"    {'опора A0':12s} {nm_:14s} RMS-8 {r_:.6f}")
         for tag, st0 in (("обученная", True), ("до обучения", False)):
             if not st0:
                 with torch.no_grad():
@@ -971,6 +985,15 @@ def main():
                 if tag.endswith("val_sel"):
                     print(f"    {tag:28s} захват C = "
                           f"{(a0_ - d_['rms']) / (a0_ - or_):+.4f}")
+        # ПОМОГАЕТ ЛИ ГОЛОВА ВООБЩЕ — на каждом наборе отдельно.
+        for nm_ in ev_sets:
+            b_ = rows_.get(f"опора A0 / {nm_}")
+            h_ = rows_.get(f"обученная / {nm_}")
+            if b_ and h_:
+                d_ = b_["rms"] - h_["rms"]
+                print(f"    {nm_:14s} голова против опоры A0: "
+                      f"{h_['rms']:.6f} против {b_['rms']:.6f} "
+                      f"({'лучше' if d_ > 0 else 'ХУЖЕ'} на {abs(d_):.6f})")
         tr_, vl_ = rows_.get("обученная / train (срез)"), \
             rows_.get("обученная / val_sel")
         if tr_ and vl_:
