@@ -876,10 +876,32 @@ def main():
         a_hat = decode_actions(e0 if no_q1 else e0 + emb)
         a_true = torch.from_numpy(
             np.asarray(ACT[sel], np.float32)).to(dev)[..., :7]
+        # ВЕСА ОБУЧЕНИЯ И ВЕСА ГЕЙТА — РАЗНЫЕ, И ЭТО ИЗМЕРЯЕТСЯ.
+        # В потере все каналы равны (кроме схвата), в метрике Gate 4 они
+        # взвешены физическим масштабом max_act_q. При равных сырых ошибках
+        # вращательные каналы получают в потере в 6-21 раз больший вес, чем
+        # в метрике, по которой судят. Раньше в истории лежала только сумма,
+        # и разойтись этим двум величинам было нечем помешать и нечем
+        # заметить.
         w = torch.ones(7, device=dev, dtype=torch.float32)
         w[6] = float(a.grip_weight)
-        dd = (a_hat[:, :H_EXEC] - a_true[:, :H_EXEC]) * w
+        raw = a_hat[:, :H_EXEC] - a_true[:, :H_EXEC]
+        dd = raw * w
         act_loss = (dd ** 2).mean()
+        with torch.no_grad():
+            wg = torch.as_tensor(max_act_q[:7], device=dev,
+                                 dtype=torch.float32).clone()
+            wg[-1] = 1.0
+            ch_sq = ((raw * wg) ** 2).sum(dim=(0, 1))     # по каналам, гейт
+            ch_sq_raw = (raw ** 2).sum(dim=(0, 1))        # по каналам, сырые
+            n_el = int(raw.shape[0] * raw.shape[1])
+            stat = dict(n_tok=int(lg.shape[0] * lg.shape[1]),
+                        correct=float((lg.argmax(-1) == tg).sum()),
+                        ce_sum=float(ce) * int(lg.shape[0] * lg.shape[1]),
+                        act_train=float(act_loss) * int(dd.numel()),
+                        act_gate=float(ch_sq.sum()), n_el=n_el,
+                        ch_gate=ch_sq.detach().cpu().numpy(),
+                        ch_raw=ch_sq_raw.detach().cpu().numpy())
         fb_reg = torch.zeros((), device=dev)
         if a.variant != "no_feedback":
             for p_ in model.depth_rvq_feedback[0].parameters():
@@ -889,9 +911,7 @@ def main():
             raise SystemExit(
                 f"потеря не число: CE {float(ce)}, действие "
                 f"{float(act_loss)}, регуляризатор {float(fb_reg)}")
-        with torch.no_grad():
-            top1 = float((lg.argmax(-1) == tg).float().mean())
-        return loss, ce, act_loss, a_hat.detach(), a_true, d_q0, top1
+        return loss, ce, act_loss, a_hat.detach(), a_true, d_q0, stat
 
     ev_extra = {}
 
@@ -905,22 +925,41 @@ def main():
         раздельного измерения, иначе это домысел.
         """
         se, n = 0.0, 0
-        ce_s, t1_s, nb_ = 0.0, 0.0, 0
+        # СУММЫ, А НЕ СРЕДНЕЕ СРЕДНИХ. Хвостовой батч короче полного, и
+        # равный вес дал бы ему завышенное влияние — знакомая проекту ошибка.
+        acc = dict(ce_sum=0.0, correct=0.0, n_tok=0, act_train=0.0,
+                   act_gate=0.0, n_el=0, rows=0, batches=0)
+        ch_g, ch_r = np.zeros(7), np.zeros(7)
         model.eval()
         with torch.no_grad():
             for po, sel in bs:
-                _l, _c, _al, a_hat, a_true, _d, t1 = run_batch(
+                _l, _c, _al, a_hat, a_true, _d, st_ = run_batch(
                     po, sel, False, no_q1=no_q1)
-                ce_s += float(_c); t1_s += t1; nb_ += 1
+                for k_ in ("ce_sum", "correct", "n_tok", "act_train",
+                           "act_gate", "n_el"):
+                    acc[k_] += st_[k_]
+                ch_g += st_["ch_gate"]; ch_r += st_["ch_raw"]
+                acc["rows"] += int(len(sel)); acc["batches"] += 1
                 q = torch.as_tensor(max_act_q[:7], device=dev,
                                     dtype=torch.float32).clone()
                 q[-1] = 1.0
                 dd = (a_hat[:, :H_EXEC] - a_true[:, :H_EXEC]) * q
                 se += float((dd ** 2).sum())
                 n += dd.numel()
+        nt = max(acc["n_tok"], 1)          # токенов кода q1
+        ne = max(acc["n_el"], 1)           # строк x H_EXEC
+        nel7 = ne * 7                      # то же по всем семи каналам
         ev_extra.clear()
-        ev_extra.update(ce=ce_s / max(nb_, 1), top1=t1_s / max(nb_, 1),
-                        batches=nb_)
+        ev_extra.update(
+            ce=acc["ce_sum"] / nt, top1=acc["correct"] / nt,
+            n_tok=acc["n_tok"], rows=acc["rows"], batches=acc["batches"],
+            # СКВ в весах ОБУЧЕНИЯ и в весах ГЕЙТА — на одних и тех же
+            # строках. Если они расходятся, оптимизатор честно снижал свою
+            # величину, не двигаясь в сторону той, по которой судят.
+            rms_train_w=float(np.sqrt(acc["act_train"] / nel7)),
+            rms_gate_w=float(np.sqrt(acc["act_gate"] / nel7)),
+            ch_rms_gate=[float(x) for x in np.sqrt(ch_g / ne)],
+            ch_rms_raw=[float(x) for x in np.sqrt(ch_r / ne)])
         return float(np.sqrt(se / max(n, 1)))
 
     if a.eval_checkpoint:
@@ -932,37 +971,84 @@ def main():
         # Отвечает на один вопрос: расходятся ли точность по кодам и ошибка
         # действия. Подтверждение здесь не открывается ни при каких условиях:
         # оно одноразовое и тратится только в каноническом прогоне.
+        # ЗАГРУЗКА СТРОГАЯ. Прежде сверялись только неизвестные ключи и
+        # формы: пустой или неполный state прошёл бы молча, и измерение
+        # относилось бы к голове, которую никто не обучал. Множество ключей
+        # обязано совпасть ТОЧНО с белым списком этапа, а отпечаток весов
+        # после загрузки — с записанным в чекпойнте.
         ck_ = torch.load(a.eval_checkpoint, map_location="cpu",
                          weights_only=False)
-        st_ = ck_.get("state") or {}
+        need_ck = ("kind", "variant", "seed", "state",
+                   "selected_state_sha1", "q0_prov")
+        miss_f = [k for k in need_ck if ck_.get(k) is None]
+        if miss_f:
+            raise SystemExit(f"в чекпойнте нет полей {miss_f}")
+        if str(ck_["variant"]) != str(a.variant):
+            raise SystemExit(f"чекпойнт варианта {ck_['variant']}, запрошен "
+                             f"{a.variant}: это другая голова")
+        st_ = ck_["state"]
+        want_ = set(info["names"])
+        if set(st_) != want_:
+            raise SystemExit(
+                f"ключи чекпойнта не совпадают с белым списком этапа: "
+                f"лишние {sorted(set(st_) - want_)[:5]}, "
+                f"нет {sorted(want_ - set(st_))[:5]}")
         own_ = dict(model.named_parameters())
-        miss_ = [k for k in st_ if k not in own_]
-        if miss_:
-            raise SystemExit(f"в модели нет ключей чекпойнта {miss_[:5]}")
         with torch.no_grad():
             for k_, v_ in st_.items():
                 if tuple(own_[k_].shape) != tuple(v_.shape):
                     raise SystemExit(f"форма {k_}: {tuple(v_.shape)} против "
                                      f"{tuple(own_[k_].shape)}")
+                if not torch.isfinite(v_).all():
+                    raise SystemExit(f"в {k_} есть nan или inf")
                 own_[k_].data.copy_(v_.to(own_[k_].device, own_[k_].dtype))
+        got_sha = state_sha({k_: own_[k_].detach().float().cpu().numpy()
+                             for k_ in want_})
+        if got_sha != ck_["selected_state_sha1"]:
+            raise SystemExit(
+                f"после загрузки веса имеют отпечаток {got_sha}, в чекпойнте "
+                f"{ck_['selected_state_sha1']}: загрузилось не то состояние")
+        # ПРОИСХОЖДЕНИЕ ЧЕРНОВИКА У ЧЕКПОЙНТА И У ТЕКУЩЕГО ПРОГОНА — ОДНО.
+        bad_p = [k_ for k_ in ("q0_manifest_sha1", "q0_npz_sha1", "plan_sha1",
+                               "gate_r_sha1")
+                 if str((ck_["q0_prov"] or {}).get(k_))
+                 != str(q0_prov.get(k_))]
+        if bad_p:
+            raise SystemExit(f"чекпойнт обучен на другом черновике: {bad_p}")
         print(f"  загружен чекпойнт {a.eval_checkpoint}: {len(st_)} тензоров, "
               f"вариант {ck_.get('variant')}, сид {ck_.get('seed')}, "
-              f"эпоха {ck_.get('selected_epoch')}")
+              f"эпоха {ck_.get('selected_epoch')}, отпечаток весов "
+              f"{got_sha} совпал")
         # СРЕЗ TRAIN РАВНОГО РАЗМЕРА. Обучающая и валидационная метрики
         # должны быть ОДНОЙ величиной на наборах одного размера, иначе
         # «обучающая падает, валидационная стоит» нечем проверить. Именно
         # этот признак отличает нехватку данных (train сильно лучше val) от
         # недоученности (обе плохи и примерно равны).
+        # СРЕЗ TRAIN БЕРЁТСЯ РАВНОМЕРНО ПО ВСЕМУ ПЛАНУ, А НЕ С НАЧАЛА.
+        # План упорядочен по смещению позиций, поэтому первые N батчей — это
+        # строки одного-двух смещений, то есть другой состав задач, а не
+        # случайная часть train. Равномерная выборка индексов детерминирована
+        # и покрывает все смещения пропорционально их доле.
         n_v = len(batches["val_sel"])
+        tr_all = batches["train"]
+        take = np.unique(np.linspace(0, len(tr_all) - 1,
+                                     min(n_v, len(tr_all))).astype(int))
         ev_sets = {"val_sel": batches["val_sel"],
-                   "train (срез)": batches["train"][:n_v]}
+                   "train (срез)": [tr_all[i] for i in take]}
+        print(f"    срез train: {len(take)} батчей из {len(tr_all)}, "
+              f"смещений {len(set(int(tr_all[i][0]) for i in take))} из "
+              f"{len(set(int(b[0]) for b in tr_all))}")
         rows_ = {}
         # ОПОРА A0 НА ТЕХ ЖЕ СТРОКАХ. Считается один раз: она не зависит от
         # весов головы — q1 просто не применяется.
         for nm_, bs_ in ev_sets.items():
             r_ = evaluate(bs_, no_q1=True)
-            rows_[f"опора A0 / {nm_}"] = dict(rms=r_, n_batches=len(bs_))
-            print(f"    {'опора A0':12s} {nm_:14s} RMS-8 {r_:.6f}")
+            rows_[f"опора A0 / {nm_}"] = dict(rms=r_, n_batches=len(bs_),
+                                              **dict(ev_extra))
+            print(f"    {'опора A0':12s} {nm_:14s} RMS-8 {r_:.6f}  "
+                  f"({ev_extra['rows']} строк)")
+            print("                 по каналам (веса гейта): "
+                  + " ".join(f"{x:.4f}" for x in ev_extra["ch_rms_gate"]))
         for tag, st0 in (("обученная", True), ("до обучения", False)):
             if not st0:
                 with torch.no_grad():
@@ -975,7 +1061,15 @@ def main():
                                                **dict(ev_extra))
                 print(f"    {tag:12s} {nm_:14s} RMS-8 {r_:.6f}  "
                       f"CE {ev_extra['ce']:.5f}  "
-                      f"top-1 {100 * ev_extra['top1']:.2f}%")
+                      f"top-1 {100 * ev_extra['top1']:.2f}%  "
+                      f"({ev_extra['rows']} строк, {ev_extra['n_tok']} "
+                      f"токенов)")
+                print(f"                 {'':14s} СКВ в весах обучения "
+                      f"{ev_extra['rms_train_w']:.6f}, в весах гейта "
+                      f"{ev_extra['rms_gate_w']:.6f}")
+                print("                 по каналам (веса гейта): "
+                      + " ".join(f"{x:.4f}"
+                                 for x in ev_extra["ch_rms_gate"]))
         a0_ = (((orc.get("parts") or {}).get("val_sel") or {})
                .get("vs_action.A0") or {}).get("rms")
         or_ = (((orc.get("parts") or {}).get("val_sel") or {})
@@ -1033,7 +1127,7 @@ def main():
         run, nb, dq = 0.0, 0, 0
         for po, sel in order:
             opt.zero_grad(set_to_none=True)
-            loss, ce, al, _ah, _at, d_q0, _t1 = run_batch(po, sel, True)
+            loss, ce, al, _ah, _at, d_q0, _st = run_batch(po, sel, True)
             loss.backward()
             # ГРАДИЕНТ ОБЯЗАН ДОЙТИ ДО КАЖДОГО РАЗРЕШЁННОГО ВЕСА И БЫТЬ
             # КОНЕЧНЫМ. Отсутствующий градиент означает, что часть головы не
