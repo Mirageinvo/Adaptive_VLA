@@ -382,7 +382,10 @@ def main():
                          "голову, обученную не на том наборе")
     out_p = a.out or (f"data/k14c/smoke_{a.variant}_s{a.seed}.pt" if a.smoke
                       else f"data/k14c/q1_{a.variant}_s{a.seed}.pt")
-    if os.path.exists(out_p):
+    # В РЕЖИМЕ ОЦЕНКИ ГОЛОВА НЕ ПИШЕТСЯ ВОВСЕ, и проверка на существование
+    # выходного файла запрещала измерять ровно тот чекпойнт, ради которого
+    # режим и заведён: его путь совпадает с тем, который прогон записал бы.
+    if os.path.exists(out_p) and not a.eval_checkpoint:
         raise SystemExit(f"{out_p} уже существует: голова не перезаписывается "
                          f"молча")
 
