@@ -978,16 +978,26 @@ def main():
         # после загрузки — с записанным в чекпойнте.
         ck_ = torch.load(a.eval_checkpoint, map_location="cpu",
                          weights_only=False)
-        need_ck = ("kind", "variant", "seed", "state",
+        # Поля перечислены по тому, что канонический прогон ДЕЙСТВИТЕЛЬНО
+        # пишет: у него `stage`, а не `kind`. Требовать несуществующее поле
+        # — это отказ на ровном месте, а не строгость.
+        need_ck = ("stage", "variant", "seed", "state", "trainable_names",
                    "selected_state_sha1", "q0_prov")
         miss_f = [k for k in need_ck if ck_.get(k) is None]
         if miss_f:
             raise SystemExit(f"в чекпойнте нет полей {miss_f}")
+        if str(ck_["stage"]) != "q1":
+            raise SystemExit(f"чекпойнт этапа {ck_['stage']}, ожидался q1")
         if str(ck_["variant"]) != str(a.variant):
             raise SystemExit(f"чекпойнт варианта {ck_['variant']}, запрошен "
                              f"{a.variant}: это другая голова")
         st_ = ck_["state"]
         want_ = set(info["names"])
+        if set(ck_["trainable_names"]) != want_:
+            raise SystemExit(
+                f"белый список чекпойнта не совпадает с белым списком этапа: "
+                f"лишние {sorted(set(ck_['trainable_names']) - want_)[:5]}, "
+                f"нет {sorted(want_ - set(ck_['trainable_names']))[:5]}")
         if set(st_) != want_:
             raise SystemExit(
                 f"ключи чекпойнта не совпадают с белым списком этапа: "
@@ -1274,6 +1284,7 @@ def main():
 
     os.makedirs(os.path.dirname(os.path.abspath(out_p)) or ".", exist_ok=True)
     ck = dict(
+        kind="q1_head",
         state={k: v.detach().cpu() for k, v in model.state_dict().items()
                if k in set(info["names"])},
         stage="q1", variant=a.variant, seed=int(a.seed),
