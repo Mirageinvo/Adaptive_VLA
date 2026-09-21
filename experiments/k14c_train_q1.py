@@ -807,7 +807,7 @@ def main():
         x, _ = codec._decode(z.float(), embodiment_ids=0)
         return x[..., :7].float()
 
-    def run_batch(po, sel, train, no_q1=False):
+    def run_batch(po, sel, train, no_q1=False, mix_ps=None, mix_rng=None):
         """`no_q1` — ОПОРА A0: действие декодируется из одного E0[q0].
 
         Без неё нельзя сказать, помогает ли голова ВООБЩЕ. Числа оракула
@@ -911,6 +911,24 @@ def main():
             raise SystemExit(
                 f"потеря не число: CE {float(ce)}, действие "
                 f"{float(act_loss)}, регуляризатор {float(fb_reg)}")
+        if mix_ps is not None:
+            # СКОЛЬКО ТОЧНОСТИ НУЖНО. Доля `p` предсказанных кодов
+            # заменяется оракульной меткой; p=0 — сама голова, p=1 — оракул.
+            # Кривая RMS(p) отвечает, достижим ли порог в принципе и при
+            # какой точности, а не «выучится ли голова ещё немного».
+            # Всё считается ОДНИМ прямым проходом: дорог только он, декодер
+            # дёшев.
+            with torch.no_grad():
+                pred = lg.argmax(-1)
+                mix = {}
+                for pp in mix_ps:
+                    m_ = torch.from_numpy(
+                        mix_rng.random(tuple(pred.shape)) < float(pp)).to(dev)
+                    q1m = torch.where(m_, tg, pred)
+                    am = decode_actions(e0 + books[1][q1m].float())
+                    dm = (am[:, :H_EXEC] - a_true[:, :H_EXEC]) * wg
+                    mix[float(pp)] = (float((dm ** 2).sum()), int(dm.numel()))
+                stat["mix"] = mix
         return loss, ce, act_loss, a_hat.detach(), a_true, d_q0, stat
 
     ev_extra = {}
@@ -1106,7 +1124,30 @@ def main():
                   f"{100 * vl_['top1']:.2f}%")
             print("  Большой разрыв -> упёрлись в данные. Малый разрыв при "
                   "низком top-1 на обоих -> упёрлись в бюджет или ёмкость.")
+        # --- сколько точности нужно для порога -----------------------------
+        ps_ = [0.0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0]
+        mix_rng = np.random.default_rng(0)
+        acc_m = {float(x): [0.0, 0] for x in ps_}
+        with torch.no_grad():
+            for po, sel in batches["val_sel"]:
+                _l, _c, _a, _ah, _at, _d, st_ = run_batch(
+                    po, sel, False, mix_ps=ps_, mix_rng=mix_rng)
+                for k_, (s_, n_) in st_["mix"].items():
+                    acc_m[k_][0] += s_; acc_m[k_][1] += n_
+        print("\n  RMS-8 на val_sel при подмене доли кодов оракульными:")
+        curve = {}
+        for k_ in ps_:
+            s_, n_ = acc_m[float(k_)]
+            r_ = float(np.sqrt(s_ / max(n_, 1)))
+            c_ = (a0_ - r_) / (a0_ - or_) if (a0_ and or_) else float("nan")
+            curve[float(k_)] = dict(rms=r_, capture=c_)
+            mark = "  <- порог" if c_ >= 0.20 else ""
+            print(f"    доля оракула {100 * k_:5.1f}%   RMS {r_:.6f}   "
+                  f"C = {c_:+.4f}{mark}")
+        print("    (p=0 обязан совпасть с обученной головой, p=1 — с "
+              "оракулом A01_ze)")
         write_summary(outcome="eval_only", eval_val_sel=rows_,
+                      accuracy_curve=curve,
                       checkpoint=a.eval_checkpoint, runtime=rt_now,
                       q0_prov=q0_prov, e_a0_val_sel=a0_,
                       e_oracle_val_sel=or_)
