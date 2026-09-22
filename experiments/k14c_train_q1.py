@@ -147,6 +147,59 @@ def restore(named, snap):
     return True
 
 
+def signed_share(vals):
+    """Доли вклада С СОХРАНЕНИЕМ ЗНАКА; None, если сумма близка к нулю.
+
+    Делить на `max(sum, 1e-12)` нельзя: у головы, которая в сумме ХУЖЕ опоры,
+    знаменатель отрицателен, `max` подменяет его на 1e-12, и печатаются
+    гигантские бессмысленные проценты. Знак здесь содержателен: канал может
+    вносить отрицательный вклад в положительный итог и наоборот.
+    """
+    v = np.asarray(vals, float)
+    den = float(v.sum())
+    if abs(den) < 1e-12:
+        return None
+    return [100.0 * float(x) / den for x in v]
+
+
+def cluster_boot(per_row, eps, n_el_row, n=1000, seed=7, qs=(5, 95)):
+    """Кластерный бутстрап ПО ЭПИЗОДАМ, парный по всем поданным величинам.
+
+    `per_row` — словарь {имя: массив сумм квадратов по строкам}. В каждой
+    реплике пересэмплируются ОДНИ И ТЕ ЖЕ эпизоды для всех величин, и только
+    после этого считается производная величина (захват). Иначе интервал для
+    C строился бы при фиксированных A0 и оракуле, то есть не был бы
+    доверительным интервалом для C.
+
+    Строки одного эпизода сильно зависимы: бутстрап по строкам занижал бы
+    интервал, поэтому единица пересэмплирования — эпизод.
+    """
+    eps = np.asarray(eps)
+    uniq, inv = np.unique(eps, return_inverse=True)
+    names = sorted(per_row)
+    # СУММЫ ПО ЭПИЗОДАМ СЧИТАЮТСЯ ОДИН РАЗ. Пересэмплирование эпизодов — это
+    # выбор их сумм и их длин, а не сбор индексов строк: последнее давало бы
+    # те же числа на порядок медленнее.
+    ep_sum = {k: np.bincount(inv, weights=np.asarray(per_row[k], float),
+                             minlength=len(uniq)) for k in names}
+    ep_cnt = np.bincount(inv, minlength=len(uniq)).astype(float)
+    rg = np.random.default_rng(seed)
+    pick = rg.integers(0, len(uniq), size=(n, len(uniq)))
+    m = ep_cnt[pick].sum(axis=1) * n_el_row
+    out = {k: np.sqrt(ep_sum[k][pick].sum(axis=1) / m) for k in names}
+    if {"a0", "p", "oracle"} <= set(names):
+        d = out["a0"] - out["oracle"]
+        cap = np.where(np.abs(d) > 1e-12,
+                       (out["a0"] - out["p"]) / np.where(d == 0, 1, d),
+                       np.nan)
+    else:
+        cap = np.full(n, np.nan)
+    res = {k: [float(np.percentile(out[k], q)) for q in qs] for k in names}
+    if np.isfinite(cap).any():
+        res["capture"] = [float(np.nanpercentile(cap, q)) for q in qs]
+    return res
+
+
 def check_cache_manifest(man, *, oracle_sha1, cache, ckpt, expect_sha1):
     """Кэш целей обязан быть тем, что построен на данных пройденного гейта."""
     # ВСЕ ОТПЕЧАТКИ ОБЯЗАТЕЛЬНЫ. Условие «сверить, если поле есть» означает
@@ -296,6 +349,55 @@ def selftest():
             assert "нет полей" in str(e) and key in str(e), (key, str(e))
         else:
             raise AssertionError(f"манифест без {key} принят")
+    # --- ДОЛИ СО ЗНАКОМ ---------------------------------------------------
+    assert signed_share([1.0, 3.0]) == [25.0, 75.0]
+    neg = signed_share([-4.0, 1.0])          # сумма -3, знак сохраняется
+    assert abs(neg[0] - 133.3333333) < 1e-4 and abs(neg[1] + 33.3333333) < 1e-4
+    assert signed_share([1.0, -1.0]) is None, "нулевая сумма не поймана"
+    # ГОЛОВА ХУЖЕ ОПОРЫ: раньше здесь печатались проценты порядка 1e14
+    bad = signed_share([-0.5, -0.5])
+    assert bad == [50.0, 50.0], bad
+
+    # --- КЛАСТЕРНЫЙ БУТСТРАП ----------------------------------------------
+    rng_t = np.random.default_rng(0)
+    eps_t = np.repeat(np.arange(40), 5)       # 40 эпизодов по 5 строк
+    n_el = 56
+    a0_t = rng_t.random(200) * 2 + 4
+    or_t = a0_t * 0.3
+    p_t = a0_t * 0.9
+    r = cluster_boot(dict(a0=a0_t, p=p_t, oracle=or_t), eps_t, n_el, n=200)
+    for k in ("a0", "p", "oracle", "capture"):
+        assert k in r, k
+        assert r[k][0] <= r[k][1], (k, r[k])
+    # точечный захват обязан лежать внутри интервала
+    def _rms(v):
+        return float(np.sqrt(v.sum() / (len(v) * n_el)))
+    cpt = (_rms(a0_t) - _rms(p_t)) / (_rms(a0_t) - _rms(or_t))
+    assert r["capture"][0] <= cpt <= r["capture"][1], (r["capture"], cpt)
+    # ПАРНОСТЬ: при p == a0 захват строго нулевой в КАЖДОЙ реплике
+    r0 = cluster_boot(dict(a0=a0_t, p=a0_t.copy(), oracle=or_t), eps_t, n_el,
+                      n=100)
+    assert abs(r0["capture"][0]) < 1e-9 and abs(r0["capture"][1]) < 1e-9, \
+        "интервал захвата не парный: при p == a0 он обязан схлопнуться"
+    # при p == oracle захват строго единичный
+    r1 = cluster_boot(dict(a0=a0_t, p=or_t.copy(), oracle=or_t), eps_t, n_el,
+                      n=100)
+    assert abs(r1["capture"][0] - 1) < 1e-9 and abs(r1["capture"][1] - 1) < 1e-9
+    # без трёх обязательных имён захват не считается
+    r2 = cluster_boot(dict(p=p_t), eps_t, n_el, n=50)
+    assert "capture" not in r2
+    # ЗАВИСИМОСТЬ ВНУТРИ ЭПИЗОДА — РОВНО ТО, РАДИ ЧЕГО КЛАСТЕРНЫЙ БУТСТРАП.
+    # При независимых строках он интервал не расширяет (и не должен). Здесь
+    # к каждому эпизоду добавлен общий сдвиг: тогда единиц информации 40, а
+    # не 200, и бутстрап по строкам занижает интервал.
+    dep = (rng_t.random(200) * 0.2
+           + np.repeat(rng_t.random(40) * 8.0, 5))
+    one = cluster_boot(dict(p=dep), np.arange(200), n_el, n=400)["p"]
+    many = cluster_boot(dict(p=dep), eps_t, n_el, n=400)["p"]
+    assert (many[1] - many[0]) > 1.5 * (one[1] - one[0]), \
+        (f"кластерный бутстрап обязан давать заметно более широкий интервал: "
+         f"{many} против {one}")
+
     print("самопроверка k14c_train_q1 пройдена")
 
 
@@ -808,6 +910,8 @@ def main():
         x, _ = codec._decode(z.float(), embodiment_ids=0)
         return x[..., :7].float()
 
+    geom_rng = np.random.default_rng(20260923)
+
     def run_batch(po, sel, train, no_q1=False, mix_ps=None, mix_rng=None):
         """`no_q1` — ОПОРА A0: действие декодируется из одного E0[q0].
 
@@ -928,6 +1032,16 @@ def main():
                 pred = lg.argmax(-1)
                 ok_ = (pred == tg)
                 mix = {}
+                # ОПОРА A0 ПО СТРОКАМ, В ТОМ ЖЕ ПРОХОДЕ. Нужна для ПАРНОГО
+                # бутстрапа: интервал для C обязан строиться на одних и тех
+                # же пересэмплированных эпизодах для A0, для p и для оракула.
+                a0m = decode_actions(e0)
+                d0_ = (a0m[:, :H_EXEC] - a_true[:, :H_EXEC]) * wg
+                mix[("a0", -1)] = dict(
+                    sq=float((d0_ ** 2).sum()), n=int(d0_.numel()),
+                    correct=0.0, n_tok=int(tg.numel()),
+                    ch=(d0_ ** 2).sum(dim=(0, 1)).detach().cpu().numpy(),
+                    per_row=(d0_ ** 2).sum(dim=(1, 2)).detach().cpu().numpy())
                 for sd_lbl, sd_ in mix_rng:   # несколько независимых сидов
                     u_ = torch.from_numpy(
                         sd_.random(tuple(pred.shape))).to(dev)
@@ -952,20 +1066,43 @@ def main():
                 stat["mix"] = mix
                 # --- ГЕОМЕТРИЯ ОШИБКИ -------------------------------------
                 # Перплексия говорит о концентрации распределения, а НЕ о
-                # том, близок ли выбранный код к правильному в книге и
-                # дёшева ли ошибка. Это разные вещи, и меряются они прямо.
-                ep_, et_ = books[1][pred].float(), books[1][tg].float()
-                dist = torch.linalg.norm(ep_ - et_, dim=-1)
-                rnd_ = books[1][torch.randint(
-                    0, books.shape[1], tg.shape, device=dev)].float()
-                dist_r = torch.linalg.norm(rnd_ - et_, dim=-1)
+                # том, близок ли выбранный код к правильному в книге.
+                #
+                # ВСЕ ТРИ ВЕЛИЧИНЫ СЧИТАЮТСЯ НА ОДНОЙ МАСКЕ — на позициях,
+                # где голова ошиблась. Прежде расстояние до предсказанного
+                # бралось на ошибках, а опора и масштаб цели — на ВСЕХ
+                # позициях: если у ошибочных позиций другие целевые коды,
+                # сравнение смещено.
+                wrong = ~ok_
+                nw_ = int(wrong.sum())
+                V_ = int(books.shape[1])
+                et_ = books[1][tg].float()
+                if nw_:
+                    tgw = tg[wrong]
+                    dw = torch.linalg.norm(
+                        books[1][pred[wrong]].float()
+                        - books[1][tgw].float(), dim=-1)
+                    # СЛУЧАЙНЫЙ КОД ГАРАНТИРОВАННО ОТЛИЧЕН ОТ ЦЕЛИ: сдвиг на
+                    # 1..V-1 по модулю V. Иначе опора включала бы попадания
+                    # в цель и занижалась.
+                    shift = torch.from_numpy(
+                        geom_rng.integers(1, V_, size=(nw_,))).to(dev)
+                    rq = (tgw + shift) % V_
+                    dr = torch.linalg.norm(
+                        books[1][rq].float() - books[1][tgw].float(), dim=-1)
+                    nt = torch.linalg.norm(books[1][tgw].float(), dim=-1)
+                    g_w, g_r, g_t = (float(dw.sum()), float(dr.sum()),
+                                     float(nt.sum()))
+                else:
+                    g_w = g_r = g_t = 0.0
                 stat["geom"] = dict(
-                    n_wrong=int((~ok_).sum()), n_tok=int(tg.numel()),
-                    d_wrong=float(dist[~ok_].sum()) if int((~ok_).sum()) else 0.0,
-                    d_rand=float(dist_r.sum()), n_rand=int(dist_r.numel()),
-                    norm_tg=float(torch.linalg.norm(et_, dim=-1).sum()),
-                    # ранг правильного кода в логитах
-                    rank=float((lg > lg.gather(
+                    n_wrong=nw_, n_tok=int(tg.numel()),
+                    d_wrong=g_w, d_rand=g_r, norm_tg_wrong=g_t,
+                    norm_tg_all=float(torch.linalg.norm(et_, dim=-1).sum()),
+                    # ЧИСЛО КОДОВ С БОЛЬШИМ ЛОГИТОМ, чем у правильного:
+                    # у верно угаданного оно равно нулю, поэтому называть
+                    # это «рангом» (где первое место — 1) было неверно.
+                    n_above=float((lg > lg.gather(
                         -1, tg.unsqueeze(-1))).sum(-1).float().sum()))
         return loss, ce, act_loss, a_hat.detach(), a_true, d_q0, stat
 
@@ -1101,8 +1238,33 @@ def main():
         if bad_pr:
             raise SystemExit("голова обучена в другой обстановке: "
                              + "; ".join(bad_pr))
-        print("  происхождение головы сверено полностью: кэш целей, "
-              "манифест, оракул, Joint12, кодек и проба декодера совпали")
+        if int(ck_["seed"]) != int(a.seed):
+            raise SystemExit(f"чекпойнт сида {ck_['seed']}, запрошен "
+                             f"{a.seed}")
+        if str(ck_.get("bar_sha1")) != str(bar_sha):
+            raise SystemExit(
+                f"bar.py в чекпойнте {ck_.get('bar_sha1')}, сейчас "
+                f"{bar_sha}: сегментированный проход изменился, значит h18 "
+                f"другой, и оценивалась бы другая голова")
+        # АРХИТЕКТУРНЫЕ ФАЙЛЫ СВЕРЯЮТСЯ, САМ ТРЕНЕР — НЕТ. Он изменился ради
+        # этой диагностики, и требовать его равенства значило бы запретить
+        # измерять что-либо после любой правки измерителя. Всё, что влияет
+        # на ВЫЧИСЛЕНИЕ головы, при этом обязано совпасть.
+        arch_ = ("depth_rvq_joint12.py", "depth_rvq_vla.py",
+                 "joint12_vla.py", "k14_common.py",
+                 "k14b_build_q1_cache.py")
+        cv_ck, cv_now = ck_.get("code_version") or {}, code_v0
+        miss_cv = [k_ for k_ in arch_ if cv_ck.get(k_) is None]
+        if miss_cv:
+            raise SystemExit(f"в code_version чекпойнта нет {miss_cv}")
+        bad_cv = [f"{k_}: чекпойнт {cv_ck[k_]}, сейчас {cv_now.get(k_)}"
+                  for k_ in arch_ if str(cv_ck[k_]) != str(cv_now.get(k_))]
+        if bad_cv:
+            raise SystemExit("архитектурный код изменился с момента "
+                             "обучения: " + "; ".join(bad_cv))
+        print("  происхождение головы сверено: кэш целей, манифест, оракул, "
+              "Joint12, кодек, проба декодера, bar.py и пять архитектурных "
+              "файлов совпали; сверка тренера намеренно не требуется")
         print(f"  загружен чекпойнт {a.eval_checkpoint}: {len(st_)} тензоров, "
               f"вариант {ck_.get('variant')}, сид {ck_.get('seed')}, "
               f"эпоха {ck_.get('selected_epoch')}, отпечаток весов "
@@ -1157,7 +1319,7 @@ def main():
             acc = {}
             rows_seen, per_row = [], {}
             geom = dict(n_wrong=0, n_tok=0, d_wrong=0.0, d_rand=0.0,
-                        n_rand=0, norm_tg=0.0, rank=0.0)
+                        norm_tg_wrong=0.0, norm_tg_all=0.0, n_above=0.0)
             with torch.no_grad():
                 for po, sel in batches["val_sel"]:
                     _l, _c, _a, _ah, _at, _d, st_m = run_batch(
@@ -1176,52 +1338,54 @@ def main():
 
             rows_seen = np.concatenate(rows_seen)
             eps_ = epi_all[rows_seen]
-            uniq_ep = np.unique(eps_)
             n_el_row = int(H_EXEC * 7)
+            n_ep = int(len(np.unique(eps_)))
 
-            def boot(vals, n=1000, seed=7):
-                """Кластерный бутстрап по эпизодам; возвращает 5% и 95%."""
-                rg = np.random.default_rng(seed)
-                idx_by_ep = [np.where(eps_ == e)[0] for e in uniq_ep]
-                out = np.empty(n)
-                for i in range(n):
-                    pick = rg.integers(0, len(idx_by_ep), len(idx_by_ep))
-                    ii = np.concatenate([idx_by_ep[j] for j in pick])
-                    out[i] = np.sqrt(vals[ii].sum() / (len(ii) * n_el_row))
-                return float(np.percentile(out, 5)), float(
-                    np.percentile(out, 95))
+            def rows_of(key):
+                return np.concatenate(per_row[key])
+
+            pr_a0 = rows_of(("a0", -1))
+            pr_or = np.mean([rows_of((1.0, i)) for i, _ in sds_], axis=0)
 
             print(f"\n  RMS-8 на val_sel, коды {tag} с подменой доли "
-                  f"оракульными ({len(uniq_ep)} эпизодов, {len(sds_)} сидов):")
+                  f"оракульными ({n_ep} эпизодов, {len(sds_)} масок):")
+            print("    интервалы — кластерный бутстрап по эпизодам, 1000 "
+                  "реплик, 5 и 95 процентили; захват пересчитывается внутри "
+                  "каждой реплики")
             cur = {}
             for pp in ps_:
-                rr, aa = [], []
-                for _, sd_ in sds_:
-                    d_ = acc[(float(pp), int(_))]
-                    rr.append(float(np.sqrt(d_["sq"] / max(d_["n"], 1))))
-                    aa.append(d_["correct"] / max(d_["n_tok"], 1))
-                v0 = np.concatenate(per_row[(float(pp), 0)])
-                lo, hi = boot(v0)
-                r_ = float(np.mean(rr)); acc_f = float(np.mean(aa))
+                # ТОЧКА И ИНТЕРВАЛ — ОТ ОДНОЙ ВЕЛИЧИНЫ. Прежде точка была
+                # средним по трём маскам, а интервал строился по одной: они
+                # описывали разные вещи. Теперь усредняются суммы ПО СТРОКАМ,
+                # и бутстрап идёт по ним же.
+                pr_p = np.mean([rows_of((float(pp), i)) for i, _ in sds_],
+                               axis=0)
+                rr = [float(np.sqrt(rows_of((float(pp), i)).sum()
+                                    / (len(rows_seen) * n_el_row)))
+                      for i, _ in sds_]
+                aa = [acc[(float(pp), i)]["correct"]
+                      / max(acc[(float(pp), i)]["n_tok"], 1) for i, _ in sds_]
+                r_ = float(np.sqrt(pr_p.sum() / (len(rows_seen) * n_el_row)))
+                ci = cluster_boot(dict(a0=pr_a0, p=pr_p, oracle=pr_or),
+                                  eps_, n_el_row, n=1000)
                 c_ = ((a0_ - r_) / (a0_ - or_) if (a0_ and or_)
                       else float("nan"))
+                ch_ = np.mean([acc[(float(pp), i)]["ch"] for i, _ in sds_],
+                              axis=0)
                 cur[float(pp)] = dict(
-                    rms=r_, rms_by_seed=rr, capture=c_, top1=acc_f,
-                    ci90=[lo, hi],
-                    capture_ci90=[(a0_ - hi) / (a0_ - or_),
-                                  (a0_ - lo) / (a0_ - or_)],
+                    rms=r_, rms_by_mask=rr, rms_ci90=ci["p"],
+                    capture=c_, capture_ci90=ci.get("capture"),
+                    top1=float(np.mean(aa)), top1_by_mask=aa,
                     ch_rms=[float(x) for x in
-                            np.sqrt(acc[(float(pp), 0)]["ch"]
-                                    / max(acc[(float(pp), 0)]["n"] / 7, 1))])
-                print(f"    p={100 * pp:5.1f}%  top-1 факт {100 * acc_f:5.2f}%"
-                      f"   RMS {r_:.6f} [{lo:.6f}, {hi:.6f}]   "
-                      f"C = {c_:+.4f} [{(a0_ - hi) / (a0_ - or_):+.4f}, "
-                      f"{(a0_ - lo) / (a0_ - or_):+.4f}]")
+                            np.sqrt(ch_ / max(len(rows_seen) * H_EXEC, 1))])
+                cc = ci.get("capture") or [float("nan")] * 2
+                print(f"    p={100 * pp:5.1f}%  top-1 факт "
+                      f"{100 * np.mean(aa):5.2f}%   RMS {r_:.6f} "
+                      f"[{ci['p'][0]:.6f}, {ci['p'][1]:.6f}]   "
+                      f"C = {c_:+.4f} [{cc[0]:+.4f}, {cc[1]:+.4f}]   "
+                      f"разброс масок {max(rr) - min(rr):.2e}")
 
             # --- НАСТОЯЩИЕ СВЕРКИ, А НЕ ПЕЧАТЬ ----------------------------
-            # Прежде в комментарии было написано «обязан совпасть», а в коде
-            # значение только печаталось. Одна такая сверка уже поймала
-            # измерение на чужих весах — но поймала глазами, а не отказом.
             if abs(cur[0.0]["rms"] - ref_rms) > 1e-6:
                 raise SystemExit(
                     f"развёртка при p=0 дала {cur[0.0]['rms']:.6f}, а голова "
@@ -1230,6 +1394,12 @@ def main():
                 raise SystemExit(
                     f"развёртка при p=1 дала {cur[1.0]['rms']:.6f}, а оракул "
                     f"A01_ze — {or_:.6f}: подменяются не оракульные метки")
+            rms_a0 = float(np.sqrt(pr_a0.sum()
+                                   / (len(rows_seen) * n_el_row)))
+            if a0_ and abs(rms_a0 - a0_) > 1e-4:
+                raise SystemExit(
+                    f"опора A0 в развёртке {rms_a0:.6f}, в артефакте гейта "
+                    f"{a0_:.6f}: считаются разные вещи")
 
             # --- ПОКАНАЛЬНОЕ РАЗЛОЖЕНИЕ ВЫИГРЫША --------------------------
             # Утверждать «гейт в основном про схват» по одной лишь доле
@@ -1243,15 +1413,20 @@ def main():
                 avail = ch_a0 ** 2 - ch_or ** 2
                 got = ch_a0 ** 2 - ch_hd ** 2
                 nmv = ["x", "y", "z", "rx", "ry", "rz", "схват"]
+                sh_a, sh_g = signed_share(avail), signed_share(got)
                 print("    разложение по каналам (квадраты ошибки):")
+                print(f"      суммарно: доступно {avail.sum():+.6f}, "
+                      f"получено {got.sum():+.6f}")
+                if sh_g is None:
+                    print("      доли полученного не печатаются: суммарное "
+                          "улучшение близко к нулю")
                 print("      канал   доступно оракулу   получено головой   "
-                      "доля доступного   доля полученного")
+                      "доля(±)   доля(±)")
                 for i_, n_ in enumerate(nmv):
+                    sa = f"{sh_a[i_]:7.1f}%" if sh_a else "      —"
+                    sg = f"{sh_g[i_]:7.1f}%" if sh_g else "      —"
                     print(f"      {n_:6s}   {avail[i_]:+.6f}        "
-                          f"{got[i_]:+.6f}       "
-                          f"{100 * avail[i_] / max(avail.sum(), 1e-12):6.1f}%"
-                          f"           "
-                          f"{100 * got[i_] / max(got.sum(), 1e-12):6.1f}%")
+                          f"{got[i_]:+.6f}     {sa}  {sg}")
                 curves.setdefault("_channels", {})[tag] = dict(
                     a0=[float(x) for x in ch_a0],
                     oracle=[float(x) for x in ch_or],
@@ -1261,22 +1436,26 @@ def main():
 
             # --- ГЕОМЕТРИЯ ОШИБКИ -----------------------------------------
             nw = max(geom["n_wrong"], 1)
-            print(f"    геометрия ошибки: доля неверных "
-                  f"{100 * geom['n_wrong'] / max(geom['n_tok'], 1):.2f}%; "
-                  f"среднее ||E1[пред] − E1[цель]|| на неверных "
-                  f"{geom['d_wrong'] / nw:.4f}; у случайного кода "
-                  f"{geom['d_rand'] / max(geom['n_rand'], 1):.4f}; "
-                  f"||E1[цель]|| {geom['norm_tg'] / max(geom['n_tok'], 1):.4f}")
-            print(f"    средний ранг правильного кода в логитах: "
-                  f"{geom['rank'] / max(geom['n_tok'], 1):.1f} из "
+            print(f"    геометрия ошибки (ВСЁ на позициях, где голова "
+                  f"ошиблась — их "
+                  f"{100 * geom['n_wrong'] / max(geom['n_tok'], 1):.2f}%):")
+            print(f"      ||E1[предсказ] − E1[цель]||   "
+                  f"{geom['d_wrong'] / nw:.4f}")
+            print(f"      ||E1[случайный ≠ цель] − E1[цель]||  "
+                  f"{geom['d_rand'] / nw:.4f}   <- опора")
+            print(f"      ||E1[цель]|| на тех же позициях  "
+                  f"{geom['norm_tg_wrong'] / nw:.4f}   (на всех "
+                  f"{geom['norm_tg_all'] / max(geom['n_tok'], 1):.4f})")
+            print(f"      кодов с большим логитом, чем у правильного: "
+                  f"{geom['n_above'] / max(geom['n_tok'], 1):.1f} из "
                   f"{int(books.shape[1])}")
             curves[tag] = dict(curve=cur, geometry=dict(
                 frac_wrong=geom["n_wrong"] / max(geom["n_tok"], 1),
-                d_wrong=geom["d_wrong"] / nw,
-                d_random=geom["d_rand"] / max(geom["n_rand"], 1),
-                norm_target=geom["norm_tg"] / max(geom["n_tok"], 1),
-                mean_rank=geom["rank"] / max(geom["n_tok"], 1),
-                vocab=int(books.shape[1])), n_episodes=int(len(uniq_ep)))
+                d_wrong=geom["d_wrong"] / nw, d_random=geom["d_rand"] / nw,
+                norm_target_wrong=geom["norm_tg_wrong"] / nw,
+                norm_target_all=geom["norm_tg_all"] / max(geom["n_tok"], 1),
+                mean_n_above=geom["n_above"] / max(geom["n_tok"], 1),
+                vocab=int(books.shape[1])), n_episodes=n_ep)
             return cur
 
         rows_ = {}
