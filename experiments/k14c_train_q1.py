@@ -1346,6 +1346,16 @@ def main():
 
             pr_a0 = rows_of(("a0", -1))
             pr_or = np.mean([rows_of((1.0, i)) for i, _ in sds_], axis=0)
+            # ТОЧКА И ИНТЕРВАЛ ОПРЕДЕЛЯЮТСЯ ОДНИМИ И ТЕМИ ЖЕ ВЕЛИЧИНАМИ.
+            # Прежде точечный C брал A0 и оракула из артефакта гейта, а
+            # бутстрап пересчитывал их из строк: различие микроскопическое,
+            # но это ровно тот класс несогласованности, который здесь и
+            # исправляется. Числа из артефакта остаются ВНЕШНИМ эталоном для
+            # отказа, а не входом формулы.
+            n_all = len(rows_seen) * n_el_row
+            rms_a0 = float(np.sqrt(pr_a0.sum() / n_all))
+            rms_or = float(np.sqrt(pr_or.sum() / n_all))
+            den_ = rms_a0 - rms_or
 
             print(f"\n  RMS-8 на val_sel, коды {tag} с подменой доли "
                   f"оракульными ({n_ep} эпизодов, {len(sds_)} масок):")
@@ -1365,11 +1375,10 @@ def main():
                       for i, _ in sds_]
                 aa = [acc[(float(pp), i)]["correct"]
                       / max(acc[(float(pp), i)]["n_tok"], 1) for i, _ in sds_]
-                r_ = float(np.sqrt(pr_p.sum() / (len(rows_seen) * n_el_row)))
+                r_ = float(np.sqrt(pr_p.sum() / n_all))
                 ci = cluster_boot(dict(a0=pr_a0, p=pr_p, oracle=pr_or),
                                   eps_, n_el_row, n=1000)
-                c_ = ((a0_ - r_) / (a0_ - or_) if (a0_ and or_)
-                      else float("nan"))
+                c_ = (rms_a0 - r_) / den_ if abs(den_) > 1e-12 else float("nan")
                 ch_ = np.mean([acc[(float(pp), i)]["ch"] for i, _ in sds_],
                               axis=0)
                 cur[float(pp)] = dict(
@@ -1394,8 +1403,11 @@ def main():
                 raise SystemExit(
                     f"развёртка при p=1 дала {cur[1.0]['rms']:.6f}, а оракул "
                     f"A01_ze — {or_:.6f}: подменяются не оракульные метки")
-            rms_a0 = float(np.sqrt(pr_a0.sum()
-                                   / (len(rows_seen) * n_el_row)))
+            if abs(cur[1.0]["capture"] - 1.0) > 1e-9:
+                raise SystemExit(
+                    f"при p=1 точечный захват {cur[1.0]['capture']:.9f}, а "
+                    f"обязан быть ровно 1: точка и интервал считаются от "
+                    f"разных величин")
             if a0_ and abs(rms_a0 - a0_) > 1e-4:
                 raise SystemExit(
                     f"опора A0 в развёртке {rms_a0:.6f}, в артефакте гейта "
