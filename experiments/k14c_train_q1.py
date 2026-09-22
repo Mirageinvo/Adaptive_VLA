@@ -1066,6 +1066,33 @@ def main():
                             # бутстрапа по эпизодам
                             per_row=((dm ** 2).sum(dim=(1, 2))
                                      .detach().cpu().numpy()))
+                # --- МЯГКОЕ ДЕКОДИРОВАНИЕ ---------------------------------
+                # Декодер принимает ВЕКТОР, а не индекс кода. `argmax`
+                # выбрасывает всё распределение, хотя правильный код обычно
+                # в первых десятках из 2048, а промахи вчетверо ближе
+                # случайных. Ожидаемое вложение Σ p_k E1[k] использует эту
+                # информацию и НЕ требует ни переобучения, ни изменения
+                # архитектуры — это другое правило вывода на той же голове.
+                #
+                # top-k с перенормировкой — промежуточные варианты: k=1 это
+                # в точности argmax и служит сверкой.
+                soft = {}
+                pr_ = torch.softmax(lg.float(), dim=-1)
+                B1 = books[1].float()
+                for kk in (1, 5, 20, 50, 0):        # 0 — всё распределение
+                    if kk:
+                        v_, i_ = torch.topk(pr_, kk, dim=-1)
+                        w_ = v_ / v_.sum(-1, keepdim=True)
+                        emb_s = (w_.unsqueeze(-1) * B1[i_]).sum(-2)
+                    else:
+                        emb_s = pr_ @ B1
+                    as_ = decode_actions(e0 + emb_s)
+                    ds_ = (as_[:, :H_EXEC] - a_true[:, :H_EXEC]) * wg
+                    soft[kk] = dict(
+                        sq=float((ds_ ** 2).sum()), n=int(ds_.numel()),
+                        per_row=(ds_ ** 2).sum(dim=(1, 2))
+                        .detach().cpu().numpy())
+                stat["soft"] = soft
                 stat["mix"] = mix
                 # --- ГЕОМЕТРИЯ ОШИБКИ -------------------------------------
                 # Перплексия говорит о концентрации распределения, а НЕ о
@@ -1343,6 +1370,7 @@ def main():
             rows_seen, per_row = [], {}
             geom = dict(n_wrong=0, n_tok=0, d_wrong=0.0, d_rand=0.0,
                         norm_tg_wrong=0.0, norm_tg_all=0.0, n_above=0.0)
+            soft_rows = {}
             with torch.no_grad():
                 for po, sel in batches["val_sel"]:
                     _l, _c, _a, _ah, _at, _d, st_m = run_batch(
@@ -1358,6 +1386,8 @@ def main():
                         per_row.setdefault(k_, []).append(v_["per_row"])
                     for g_ in geom:
                         geom[g_] += st_m["geom"][g_]
+                    for k_, v_ in st_m["soft"].items():
+                        soft_rows.setdefault(k_, []).append(v_["per_row"])
 
             rows_seen = np.concatenate(rows_seen)
             eps_ = epi_all[rows_seen]
@@ -1435,6 +1465,32 @@ def main():
                 raise SystemExit(
                     f"опора A0 в развёртке {rms_a0:.6f}, в артефакте гейта "
                     f"{a0_:.6f}: считаются разные вещи")
+
+            # --- МЯГКОЕ ДЕКОДИРОВАНИЕ ПРОТИВ argmax -----------------------
+            print(f"\n    декодирование ожидаемым вложением вместо argmax "
+                  f"({tag}):")
+            soft_res = {}
+            for kk in sorted(soft_rows, key=lambda x: (x == 0, x)):
+                pr_k = np.concatenate(soft_rows[kk])
+                r_k = float(np.sqrt(pr_k.sum() / n_all))
+                ci_k = cluster_boot(dict(a0=pr_a0, p=pr_k, oracle=pr_or),
+                                    eps_, n_el_row, n=1000)
+                c_k = ((rms_a0 - r_k) / den_ if abs(den_) > 1e-12
+                       else float("nan"))
+                cck = ci_k.get("capture") or [float("nan")] * 2
+                nm_k = "всё распределение" if kk == 0 else f"top-{kk}"
+                soft_res[str(kk)] = dict(rms=r_k, capture=c_k,
+                                         capture_ci90=cck)
+                print(f"      {nm_k:18s} RMS {r_k:.6f}   C = {c_k:+.4f} "
+                      f"[{cck[0]:+.4f}, {cck[1]:+.4f}]")
+            # top-1 с перенормировкой — это в точности argmax; расхождение
+            # означало бы ошибку в самом измерении.
+            if abs(soft_res["1"]["rms"] - cur[0.0]["rms"]) > 1e-6:
+                raise SystemExit(
+                    f"top-1 мягкого декодирования {soft_res['1']['rms']:.6f} "
+                    f"против argmax {cur[0.0]['rms']:.6f}: это обязано быть "
+                    f"одно и то же")
+            curves.setdefault("_soft", {})[tag] = soft_res
 
             # --- ПОКАНАЛЬНОЕ РАЗЛОЖЕНИЕ ВЫИГРЫША --------------------------
             # Утверждать «гейт в основном про схват» по одной лишь доле
