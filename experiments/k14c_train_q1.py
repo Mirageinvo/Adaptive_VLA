@@ -1066,6 +1066,49 @@ def main():
         print(f"    срез train: {len(take)} батчей из {len(tr_all)}, "
               f"смещений {len(set(int(tr_all[i][0]) for i in take))} из "
               f"{len(set(int(b[0]) for b in tr_all))}")
+        a0_ = (((orc.get("parts") or {}).get("val_sel") or {})
+               .get("vs_action.A0") or {}).get("rms")
+        or_ = (((orc.get("parts") or {}).get("val_sel") or {})
+               .get("vs_action.A01_ze") or {}).get("rms")
+        curves = {}
+
+        def mix_sweep(tag):
+            """RMS на val_sel при подмене доли кодов оракульными.
+
+            СЧИТАЕТСЯ ДЛЯ КАЖДОГО СОСТОЯНИЯ ВЕСОВ ОТДЕЛЬНО. Первая версия
+            стояла после цикла, который последним восстанавливает начальные
+            веса, и потому мерила НЕОБУЧЕННУЮ голову. Поймала это встроенная
+            сверка «p=0 обязан совпасть с обученной головой» — поэтому она и
+            печатается рядом с кривой, а не проверяется мысленно.
+
+            Смысл величины: при доле p позиций код берётся оракульный, на
+            остальных — тот, что выдала голова. Кривая отвечает, какая
+            точность нужна для порога, и насколько дорого обходится ошибка.
+            """
+            ps_ = [0.0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0]
+            rng_m = np.random.default_rng(0)
+            acc_m = {float(x): [0.0, 0] for x in ps_}
+            with torch.no_grad():
+                for po, sel in batches["val_sel"]:
+                    _l, _c, _a, _ah, _at, _d, st_m = run_batch(
+                        po, sel, False, mix_ps=ps_, mix_rng=rng_m)
+                    for k_, (sq_, n_) in st_m["mix"].items():
+                        acc_m[k_][0] += sq_; acc_m[k_][1] += n_
+            print(f"\n  RMS-8 на val_sel, коды {tag} с подменой доли "
+                  f"оракульными:")
+            cur = {}
+            for k_ in ps_:
+                sq_, n_ = acc_m[float(k_)]
+                r_ = float(np.sqrt(sq_ / max(n_, 1)))
+                c_ = ((a0_ - r_) / (a0_ - or_) if (a0_ and or_)
+                      else float("nan"))
+                cur[float(k_)] = dict(rms=r_, capture=c_)
+                mark = "  <- порог" if c_ >= 0.20 else ""
+                print(f"    доля оракула {100 * k_:5.1f}%   RMS {r_:.6f}   "
+                      f"C = {c_:+.4f}{mark}")
+            curves[tag] = cur
+            return cur
+
         rows_ = {}
         # ОПОРА A0 НА ТЕХ ЖЕ СТРОКАХ. Считается один раз: она не зависит от
         # весов головы — q1 просто не применяется.
@@ -1098,10 +1141,7 @@ def main():
                 print("                 по каналам (веса гейта): "
                       + " ".join(f"{x:.4f}"
                                  for x in ev_extra["ch_rms_gate"]))
-        a0_ = (((orc.get("parts") or {}).get("val_sel") or {})
-               .get("vs_action.A0") or {}).get("rms")
-        or_ = (((orc.get("parts") or {}).get("val_sel") or {})
-               .get("vs_action.A01_ze") or {}).get("rms")
+            mix_sweep(tag)
         if a0_ and or_:
             for tag, d_ in rows_.items():
                 if tag.endswith("val_sel"):
@@ -1124,30 +1164,8 @@ def main():
                   f"{100 * vl_['top1']:.2f}%")
             print("  Большой разрыв -> упёрлись в данные. Малый разрыв при "
                   "низком top-1 на обоих -> упёрлись в бюджет или ёмкость.")
-        # --- сколько точности нужно для порога -----------------------------
-        ps_ = [0.0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0]
-        mix_rng = np.random.default_rng(0)
-        acc_m = {float(x): [0.0, 0] for x in ps_}
-        with torch.no_grad():
-            for po, sel in batches["val_sel"]:
-                _l, _c, _a, _ah, _at, _d, st_ = run_batch(
-                    po, sel, False, mix_ps=ps_, mix_rng=mix_rng)
-                for k_, (s_, n_) in st_["mix"].items():
-                    acc_m[k_][0] += s_; acc_m[k_][1] += n_
-        print("\n  RMS-8 на val_sel при подмене доли кодов оракульными:")
-        curve = {}
-        for k_ in ps_:
-            s_, n_ = acc_m[float(k_)]
-            r_ = float(np.sqrt(s_ / max(n_, 1)))
-            c_ = (a0_ - r_) / (a0_ - or_) if (a0_ and or_) else float("nan")
-            curve[float(k_)] = dict(rms=r_, capture=c_)
-            mark = "  <- порог" if c_ >= 0.20 else ""
-            print(f"    доля оракула {100 * k_:5.1f}%   RMS {r_:.6f}   "
-                  f"C = {c_:+.4f}{mark}")
-        print("    (p=0 обязан совпасть с обученной головой, p=1 — с "
-              "оракулом A01_ze)")
         write_summary(outcome="eval_only", eval_val_sel=rows_,
-                      accuracy_curve=curve,
+                      accuracy_curves=curves,
                       checkpoint=a.eval_checkpoint, runtime=rt_now,
                       q0_prov=q0_prov, e_a0_val_sel=a0_,
                       e_oracle_val_sel=or_)
