@@ -162,7 +162,8 @@ def signed_share(vals):
     return [100.0 * float(x) / den for x in v]
 
 
-def cluster_boot(per_row, eps, n_el_row, n=1000, seed=7, qs=(5, 95)):
+def cluster_boot(per_row, eps, n_el_row, n=1000, seed=7, qs=(5, 95),
+                 deltas=()):
     """Кластерный бутстрап ПО ЭПИЗОДАМ, парный по всем поданным величинам.
 
     `per_row` — словарь {имя: массив сумм квадратов по строкам}. В каждой
@@ -187,16 +188,31 @@ def cluster_boot(per_row, eps, n_el_row, n=1000, seed=7, qs=(5, 95)):
     pick = rg.integers(0, len(uniq), size=(n, len(uniq)))
     m = ep_cnt[pick].sum(axis=1) * n_el_row
     out = {k: np.sqrt(ep_sum[k][pick].sum(axis=1) / m) for k in names}
-    if {"a0", "p", "oracle"} <= set(names):
-        d = out["a0"] - out["oracle"]
-        cap = np.where(np.abs(d) > 1e-12,
-                       (out["a0"] - out["p"]) / np.where(d == 0, 1, d),
-                       np.nan)
-    else:
-        cap = np.full(n, np.nan)
     res = {k: [float(np.percentile(out[k], q)) for q in qs] for k in names}
-    if np.isfinite(cap).any():
-        res["capture"] = [float(np.nanpercentile(cap, q)) for q in qs]
+    cap = {}
+    if {"a0", "oracle"} <= set(names):
+        d = out["a0"] - out["oracle"]
+        sd = np.where(np.abs(d) > 1e-12, np.where(d == 0, 1, d), np.nan)
+        for k in names:
+            if k in ("a0", "oracle"):
+                continue
+            cap[k] = (out["a0"] - out[k]) / sd
+            res[f"capture:{k}"] = [float(np.nanpercentile(cap[k], q))
+                                   for q in qs]
+        if "p" in cap:
+            res["capture"] = res["capture:p"]
+    # ПАРНЫЕ РАЗНОСТИ СЧИТАЮТСЯ ВНУТРИ РЕПЛИКИ. Непересечение двух отдельных
+    # интервалов не является проверкой того, что одна величина больше другой:
+    # их ошибки сильно коррелированы, потому что считаются на одних строках.
+    # Интервал для РАЗНОСТИ поэтому заметно у́же и отвечает на нужный вопрос.
+    for a_, b_ in deltas:
+        if a_ not in names or b_ not in names:
+            raise ValueError(f"нет величин {a_}/{b_} для парной разности")
+        res[f"d_rms:{a_}-{b_}"] = [
+            float(np.percentile(out[a_] - out[b_], q)) for q in qs]
+        if a_ in cap and b_ in cap:
+            res[f"d_capture:{b_}-{a_}"] = [
+                float(np.nanpercentile(cap[b_] - cap[a_], q)) for q in qs]
     return res
 
 
@@ -386,6 +402,39 @@ def selftest():
     # без трёх обязательных имён захват не считается
     r2 = cluster_boot(dict(p=p_t), eps_t, n_el, n=50)
     assert "capture" not in r2
+
+    # --- ПАРНАЯ РАЗНОСТЬ ---------------------------------------------------
+    # Две величины отличаются на малую, но ПОСТОЯННУЮ долю. Их собственные
+    # интервалы широки и перекрываются, а интервал разности обязан быть
+    # узким и не содержать нуля: ровно ради этого разность и считается
+    # внутри реплики.
+    hard_t = a0_t * 0.95
+    soft_t = a0_t * 0.94
+    rp = cluster_boot(dict(a0=a0_t, oracle=or_t, hard=hard_t, soft=soft_t),
+                      eps_t, n_el, n=500, deltas=[("hard", "soft")])
+    dh = rp["d_rms:hard-soft"]
+    assert dh[0] > 0, f"парная разность обязана исключать ноль: {dh}"
+    wide_h, wide_s = rp["hard"], rp["soft"]
+    assert (wide_h[1] - wide_h[0]) > 10 * (dh[1] - dh[0]), \
+        (f"интервал разности обязан быть много у́же собственных: "
+         f"{dh} против {wide_h}")
+    assert wide_h[0] < wide_s[1] and wide_s[0] < wide_h[1], \
+        "собственные интервалы обязаны перекрываться — в этом и смысл теста"
+    assert rp["d_capture:soft-hard"][0] > 0
+    assert "capture:hard" in rp and "capture:soft" in rp
+    # одинаковые величины: разность строго нулевая в каждой реплике
+    rq = cluster_boot(dict(a0=a0_t, oracle=or_t, hard=hard_t,
+                           soft=hard_t.copy()), eps_t, n_el, n=100,
+                      deltas=[("hard", "soft")])
+    assert abs(rq["d_rms:hard-soft"][0]) < 1e-12 and \
+        abs(rq["d_rms:hard-soft"][1]) < 1e-12
+    try:
+        cluster_boot(dict(a0=a0_t, oracle=or_t), eps_t, n_el, n=10,
+                     deltas=[("hard", "soft")])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("парная разность по отсутствующим величинам")
     # ЗАВИСИМОСТЬ ВНУТРИ ЭПИЗОДА — РОВНО ТО, РАДИ ЧЕГО КЛАСТЕРНЫЙ БУТСТРАП.
     # При независимых строках он интервал не расширяет (и не должен). Здесь
     # к каждому эпизоду добавлен общий сдвиг: тогда единиц информации 40, а
@@ -1132,8 +1181,14 @@ def main():
                     # ЧИСЛО КОДОВ С БОЛЬШИМ ЛОГИТОМ, чем у правильного:
                     # у верно угаданного оно равно нулю, поэтому называть
                     # это «рангом» (где первое место — 1) было неверно.
-                    n_above=float((lg > lg.gather(
-                        -1, tg.unsqueeze(-1))).sum(-1).float().sum()))
+                    # ТОЛЬКО НА ОШИБОЧНЫХ ПОЗИЦИЯХ. На верно угаданных эта
+                    # величина тождественно нулевая, и среднее по всем
+                    # позициям занижало бы её ровно во столько раз, какова
+                    # доля верных — то есть описывало бы не то, что заявлено
+                    # рядом в той же строке отчёта.
+                    n_above=float(((lg > lg.gather(-1, tg.unsqueeze(-1)))
+                                   .sum(-1).float())[wrong].sum())
+                    if nw_ else 0.0)
         return loss, ce, act_loss, a_hat.detach(), a_true, d_q0, stat
 
     ev_extra = {}
@@ -1470,19 +1525,30 @@ def main():
             print(f"\n    декодирование ожидаемым вложением вместо argmax "
                   f"({tag}):")
             soft_res = {}
+            pr_hard = np.mean([rows_of((0.0, i)) for i, _ in sds_], axis=0)
+            print("      ΔRMS — ПАРНАЯ разность hard − soft, считается внутри"
+                  " каждой бутстрап-реплики; положительная значит soft лучше")
             for kk in sorted(soft_rows, key=lambda x: (x == 0, x)):
                 pr_k = np.concatenate(soft_rows[kk])
                 r_k = float(np.sqrt(pr_k.sum() / n_all))
-                ci_k = cluster_boot(dict(a0=pr_a0, p=pr_k, oracle=pr_or),
-                                    eps_, n_el_row, n=1000)
+                ci_k = cluster_boot(
+                    dict(a0=pr_a0, oracle=pr_or, hard=pr_hard, soft=pr_k),
+                    eps_, n_el_row, n=1000, deltas=[("hard", "soft")])
                 c_k = ((rms_a0 - r_k) / den_ if abs(den_) > 1e-12
                        else float("nan"))
-                cck = ci_k.get("capture") or [float("nan")] * 2
+                cck = ci_k.get("capture:soft") or [float("nan")] * 2
+                dd_ = ci_k["d_rms:hard-soft"]
+                dc_ = ci_k.get("d_capture:soft-hard") or [float("nan")] * 2
                 nm_k = "всё распределение" if kk == 0 else f"top-{kk}"
-                soft_res[str(kk)] = dict(rms=r_k, capture=c_k,
-                                         capture_ci90=cck)
-                print(f"      {nm_k:18s} RMS {r_k:.6f}   C = {c_k:+.4f} "
-                      f"[{cck[0]:+.4f}, {cck[1]:+.4f}]")
+                soft_res[str(kk)] = dict(
+                    rms=r_k, capture=c_k, capture_ci90=cck,
+                    d_rms_vs_hard=float(cur[0.0]["rms"] - r_k),
+                    d_rms_ci90=dd_, d_capture_ci90=dc_)
+                print(f"      {nm_k:18s} RMS {r_k:.6f}   "
+                      f"C_hard = {c_k:+.4f} [{cck[0]:+.4f}, {cck[1]:+.4f}]")
+                print(f"      {'':18s} ΔRMS {cur[0.0]['rms'] - r_k:+.6f} "
+                      f"[{dd_[0]:+.6f}, {dd_[1]:+.6f}]   "
+                      f"ΔC [{dc_[0]:+.4f}, {dc_[1]:+.4f}]")
             # top-1 с перенормировкой — это в точности argmax; расхождение
             # означало бы ошибку в самом измерении.
             if abs(soft_res["1"]["rms"] - cur[0.0]["rms"]) > 1e-6:
@@ -1538,14 +1604,14 @@ def main():
                   f"{geom['norm_tg_wrong'] / nw:.4f}   (на всех "
                   f"{geom['norm_tg_all'] / max(geom['n_tok'], 1):.4f})")
             print(f"      кодов с большим логитом, чем у правильного: "
-                  f"{geom['n_above'] / max(geom['n_tok'], 1):.1f} из "
-                  f"{int(books.shape[1])}")
+                  f"{geom['n_above'] / nw:.1f} из {int(books.shape[1])} "
+                  f"(на ошибочных позициях)")
             curves[tag] = dict(curve=cur, geometry=dict(
                 frac_wrong=geom["n_wrong"] / max(geom["n_tok"], 1),
                 d_wrong=geom["d_wrong"] / nw, d_random=geom["d_rand"] / nw,
                 norm_target_wrong=geom["norm_tg_wrong"] / nw,
                 norm_target_all=geom["norm_tg_all"] / max(geom["n_tok"], 1),
-                mean_n_above=geom["n_above"] / max(geom["n_tok"], 1),
+                mean_n_above_on_wrong=geom["n_above"] / nw,
                 vocab=int(books.shape[1])), n_episodes=n_ep)
             return cur
 
