@@ -20,6 +20,10 @@ set -euo pipefail
 DEV="${1:-cuda:1}"
 SEED="${2:-0}"
 TAG="${3:-v2}"
+# Четвёртым аргументом — поимённый список архитектурных файлов, расхождение
+# которых с чекпойнтом допускается. Пусто по умолчанию: любое расхождение
+# останавливает измерение.
+DRIFT="${4:-}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -48,5 +52,6 @@ python experiments/k14c_train_q1.py \
   --gate-r reports/k14d/gate_r.json \
   --oracle reports/k14a/oracle_canonical_cuda1.json \
   --summary "$SUM" \
+  --allow-code-drift "$DRIFT" \
   > "$LOG" 2>&1 < /dev/null &
 echo "запущено, pid $!; лог $LOG, сводка $SUM"

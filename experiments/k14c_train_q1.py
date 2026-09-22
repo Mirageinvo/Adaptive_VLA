@@ -456,6 +456,9 @@ def main():
                          "а не канонический прогон. Побочно она её и меряет: "
                          "сверка q0 внутри прогона побитовая, и если на "
                          "другой карте она проходит, переносимость есть")
+    ap.add_argument("--allow-code-drift", default="",
+                    help="через запятую: архитектурные файлы, расхождение "
+                         "которых с чекпойнтом допустимо. Попадает в сводку")
     ap.add_argument("--eval-checkpoint", default="",
                     help="измерить сохранённую голову на val_sel (CE, top-1 "
                          "по кодам, RMS) и выйти; подтверждающая половина не "
@@ -1257,11 +1260,31 @@ def main():
         miss_cv = [k_ for k_ in arch_ if cv_ck.get(k_) is None]
         if miss_cv:
             raise SystemExit(f"в code_version чекпойнта нет {miss_cv}")
-        bad_cv = [f"{k_}: чекпойнт {cv_ck[k_]}, сейчас {cv_now.get(k_)}"
-                  for k_ in arch_ if str(cv_ck[k_]) != str(cv_now.get(k_))]
-        if bad_cv:
-            raise SystemExit("архитектурный код изменился с момента "
-                             "обучения: " + "; ".join(bad_cv))
+        drift_ok = set(x.strip() for x in a.allow_code_drift.split(",")
+                       if x.strip())
+        unknown_ = drift_ok - set(arch_)
+        if unknown_:
+            raise SystemExit(f"--allow-code-drift называет файлы вне "
+                             f"архитектурного списка: {sorted(unknown_)}")
+        drifted = {k_: dict(checkpoint=cv_ck[k_], now=cv_now.get(k_))
+                   for k_ in arch_ if str(cv_ck[k_]) != str(cv_now.get(k_))}
+        # ПОСЛАБЛЕНИЕ ЯВНОЕ И ЗАПИСЫВАЕМОЕ. Отказ по изменившемуся файлу
+        # может быть ложным: например, правка коснулась функции, которая при
+        # оценке не исполняется. Но решать это должен человек, поимённо, и
+        # след решения обязан остаться в артефакте — иначе послабление
+        # превращается в тихое ослабление проверки.
+        hard_ = {k_: v for k_, v in drifted.items() if k_ not in drift_ok}
+        if hard_:
+            raise SystemExit(
+                "архитектурный код изменился с момента обучения: "
+                + "; ".join(f"{k_}: чекпойнт {v['checkpoint']}, сейчас "
+                            f"{v['now']}" for k_, v in hard_.items())
+                + ". Если изменение не влияет на вычисление головы, назовите "
+                  "файл в --allow-code-drift — это будет записано в сводку")
+        for k_, v in drifted.items():
+            print(f"  ДОПУЩЕНО РАСХОЖДЕНИЕ КОДА: {k_} — чекпойнт "
+                  f"{v['checkpoint']}, сейчас {v['now']} "
+                  f"(разрешено --allow-code-drift)")
         print("  происхождение головы сверено: кэш целей, манифест, оракул, "
               "Joint12, кодек, проба декодера, bar.py и пять архитектурных "
               "файлов совпали; сверка тренера намеренно не требуется")
@@ -1526,7 +1549,9 @@ def main():
             print("  Большой разрыв -> упёрлись в данные. Малый разрыв при "
                   "низком top-1 на обоих -> упёрлись в бюджет или ёмкость.")
         write_summary(outcome="eval_only", eval_val_sel=rows_,
-                      accuracy_curves=curves,
+                      accuracy_curves=curves, code_drift=drifted,
+                      code_drift_allowed=sorted(drift_ok),
+                      checkpoint_code_version=cv_ck,
                       checkpoint=a.eval_checkpoint, runtime=rt_now,
                       q0_prov=q0_prov, e_a0_val_sel=a0_,
                       e_oracle_val_sel=or_)
