@@ -591,6 +591,7 @@ def main():
     ACT = np.asarray(d["action"])[:N]
     offs = np.asarray(d["pos_offset"])[:N].astype(np.int64)
     tsk = np.asarray(d["task"])[:N]
+    epi_all = np.asarray(d["episode"])[:N].astype(np.int64)
     ktrue = np.load(f"{a.cache}.ktrue.npy", mmap_mode="r")
     E = np.load(f"{a.cache}.codebooks.npy")
 
@@ -912,6 +913,11 @@ def main():
                 f"потеря не число: CE {float(ce)}, действие "
                 f"{float(act_loss)}, регуляризатор {float(fb_reg)}")
         if mix_ps is not None:
+            # ВЛОЖЕННЫЕ МАСКИ ИЗ ОДНОГО МАССИВА u. Независимые маски на
+            # каждое p делали кривую немонотонной по построению: множества
+            # исправленных позиций при p=0.2 и p=0.3 не были вложены, и
+            # разность двух точек содержала не только новые исправления.
+            pass
             # СКОЛЬКО ТОЧНОСТИ НУЖНО. Доля `p` предсказанных кодов
             # заменяется оракульной меткой; p=0 — сама голова, p=1 — оракул.
             # Кривая RMS(p) отвечает, достижим ли порог в принципе и при
@@ -920,15 +926,47 @@ def main():
             # дёшев.
             with torch.no_grad():
                 pred = lg.argmax(-1)
+                ok_ = (pred == tg)
                 mix = {}
-                for pp in mix_ps:
-                    m_ = torch.from_numpy(
-                        mix_rng.random(tuple(pred.shape)) < float(pp)).to(dev)
-                    q1m = torch.where(m_, tg, pred)
-                    am = decode_actions(e0 + books[1][q1m].float())
-                    dm = (am[:, :H_EXEC] - a_true[:, :H_EXEC]) * wg
-                    mix[float(pp)] = (float((dm ** 2).sum()), int(dm.numel()))
+                for sd_lbl, sd_ in mix_rng:   # несколько независимых сидов
+                    u_ = torch.from_numpy(
+                        sd_.random(tuple(pred.shape))).to(dev)
+                    for pp in mix_ps:
+                        m_ = u_ < float(pp)
+                        q1m = torch.where(m_, tg, pred)
+                        am = decode_actions(e0 + books[1][q1m].float())
+                        dm = (am[:, :H_EXEC] - a_true[:, :H_EXEC]) * wg
+                        key = (float(pp), int(sd_lbl))
+                        mix[key] = dict(
+                            sq=float((dm ** 2).sum()), n=int(dm.numel()),
+                            # ФАКТИЧЕСКАЯ точность после подмены, а не её
+                            # математическое ожидание.
+                            correct=float((q1m == tg).sum()),
+                            n_tok=int(q1m.numel()),
+                            ch=((dm ** 2).sum(dim=(0, 1))
+                                .detach().cpu().numpy()),
+                            # суммы квадратов ПО СТРОКАМ — для кластерного
+                            # бутстрапа по эпизодам
+                            per_row=((dm ** 2).sum(dim=(1, 2))
+                                     .detach().cpu().numpy()))
                 stat["mix"] = mix
+                # --- ГЕОМЕТРИЯ ОШИБКИ -------------------------------------
+                # Перплексия говорит о концентрации распределения, а НЕ о
+                # том, близок ли выбранный код к правильному в книге и
+                # дёшева ли ошибка. Это разные вещи, и меряются они прямо.
+                ep_, et_ = books[1][pred].float(), books[1][tg].float()
+                dist = torch.linalg.norm(ep_ - et_, dim=-1)
+                rnd_ = books[1][torch.randint(
+                    0, books.shape[1], tg.shape, device=dev)].float()
+                dist_r = torch.linalg.norm(rnd_ - et_, dim=-1)
+                stat["geom"] = dict(
+                    n_wrong=int((~ok_).sum()), n_tok=int(tg.numel()),
+                    d_wrong=float(dist[~ok_].sum()) if int((~ok_).sum()) else 0.0,
+                    d_rand=float(dist_r.sum()), n_rand=int(dist_r.numel()),
+                    norm_tg=float(torch.linalg.norm(et_, dim=-1).sum()),
+                    # ранг правильного кода в логитах
+                    rank=float((lg > lg.gather(
+                        -1, tg.unsqueeze(-1))).sum(-1).float().sum()))
         return loss, ce, act_loss, a_hat.detach(), a_true, d_q0, stat
 
     ev_extra = {}
@@ -1036,13 +1074,35 @@ def main():
             raise SystemExit(
                 f"после загрузки веса имеют отпечаток {got_sha}, в чекпойнте "
                 f"{ck_['selected_state_sha1']}: загрузилось не то состояние")
-        # ПРОИСХОЖДЕНИЕ ЧЕРНОВИКА У ЧЕКПОЙНТА И У ТЕКУЩЕГО ПРОГОНА — ОДНО.
+        # ПРОИСХОЖДЕНИЕ СВЕРЯЕТСЯ ЦЕЛИКОМ, А НЕ ТОЛЬКО ПО ЧЕРНОВИКУ.
+        # Весов правильной формы, обученных на ДРУГОМ кэше целей, другом
+        # артефакте гейта или другой версии Joint12, прежняя проверка не
+        # отличала: сверялись четыре поля q0, а чекпойнт хранит ещё
+        # отпечатки кэша, манифеста, оракула, Joint12, кодека и версию кода.
         bad_p = [k_ for k_ in ("q0_manifest_sha1", "q0_npz_sha1", "plan_sha1",
-                               "gate_r_sha1")
+                               "gate_r_sha1", "q0_run_id", "plan_batch")
                  if str((ck_["q0_prov"] or {}).get(k_))
                  != str(q0_prov.get(k_))]
         if bad_p:
             raise SystemExit(f"чекпойнт обучен на другом черновике: {bad_p}")
+        now_ = dict(q1_cache_sha1=man["labels_sha1"],
+                    q1_manifest_sha1=sha12(man_p),
+                    oracle_sha1=sha12(a.oracle), joint_sha1=j_sha,
+                    codebooks_sha1=cb_now, codec_state_sha1=cs_now,
+                    decoder_probe=dp_now, cache=a.cache, ckpt=a.ckpt)
+        miss_pr = [k_ for k_ in now_ if ck_.get(k_) is None]
+        if miss_pr:
+            raise SystemExit(
+                f"в чекпойнте нет полей происхождения {miss_pr}: он снят "
+                f"версией до их введения, и сверить, на чём обучена голова, "
+                f"нечем")
+        bad_pr = [f"{k_}: чекпойнт {ck_[k_]}, сейчас {v_}"
+                  for k_, v_ in now_.items() if str(ck_[k_]) != str(v_)]
+        if bad_pr:
+            raise SystemExit("голова обучена в другой обстановке: "
+                             + "; ".join(bad_pr))
+        print("  происхождение головы сверено полностью: кэш целей, "
+              "манифест, оракул, Joint12, кодек и проба декодера совпали")
         print(f"  загружен чекпойнт {a.eval_checkpoint}: {len(st_)} тензоров, "
               f"вариант {ck_.get('variant')}, сид {ck_.get('seed')}, "
               f"эпоха {ck_.get('selected_epoch')}, отпечаток весов "
@@ -1072,41 +1132,151 @@ def main():
                .get("vs_action.A01_ze") or {}).get("rms")
         curves = {}
 
-        def mix_sweep(tag):
+        def mix_sweep(tag, ref_rms):
             """RMS на val_sel при подмене доли кодов оракульными.
 
-            СЧИТАЕТСЯ ДЛЯ КАЖДОГО СОСТОЯНИЯ ВЕСОВ ОТДЕЛЬНО. Первая версия
-            стояла после цикла, который последним восстанавливает начальные
-            веса, и потому мерила НЕОБУЧЕННУЮ голову. Поймала это встроенная
-            сверка «p=0 обязан совпасть с обученной головой» — поэтому она и
-            печатается рядом с кривой, а не проверяется мысленно.
+            ЧТО ЭТО ЗА ВЕЛИЧИНА И ЧТО ЕЮ НЕЛЬЗЯ ДОКАЗАТЬ. Это анализ
+            чувствительности ОДНОЙ обученной головы к случайному исправлению
+            части её ошибок. Он НЕ устанавливает закона «захват зависит
+            только от точности»: собственный контроль этой же развёртки его
+            и опровергает — при почти равной эффективной точности 75-78%
+            обученная и необученная головы дают C = +0.72 и C = −0.16.
+            Значит важно не только сколько ошибок, но и какие коды выбраны.
 
-            Смысл величины: при доле p позиций код берётся оракульный, на
-            остальных — тот, что выдала голова. Кривая отвечает, какая
-            точность нужна для порога, и насколько дорого обходится ошибка.
+            МАСКИ ВЛОЖЕНЫ. Один массив u на батч и сид, маски u < p: при
+            росте p множество исправленных позиций только расширяется.
+            Независимые маски давали бы разность двух точек, в которой
+            намешаны и новые исправления, и отменённые старые.
+
+            СИДОВ НЕСКОЛЬКО, и по строкам считается кластерный бутстрап по
+            эпизодам: строки одного эпизода сильно зависимы, и бутстрап по
+            строкам занижал бы интервал.
             """
             ps_ = [0.0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0]
-            rng_m = np.random.default_rng(0)
-            acc_m = {float(x): [0.0, 0] for x in ps_}
+            sds_ = [(i, np.random.default_rng(1000 + i)) for i in range(3)]
+            acc = {}
+            rows_seen, per_row = [], {}
+            geom = dict(n_wrong=0, n_tok=0, d_wrong=0.0, d_rand=0.0,
+                        n_rand=0, norm_tg=0.0, rank=0.0)
             with torch.no_grad():
                 for po, sel in batches["val_sel"]:
                     _l, _c, _a, _ah, _at, _d, st_m = run_batch(
-                        po, sel, False, mix_ps=ps_, mix_rng=rng_m)
-                    for k_, (sq_, n_) in st_m["mix"].items():
-                        acc_m[k_][0] += sq_; acc_m[k_][1] += n_
+                        po, sel, False, mix_ps=ps_, mix_rng=sds_)
+                    rows_seen.append(np.asarray(sel, np.int64))
+                    for k_, v_ in st_m["mix"].items():
+                        d_ = acc.setdefault(k_, dict(
+                            sq=0.0, n=0, correct=0.0, n_tok=0,
+                            ch=np.zeros(7)))
+                        d_["sq"] += v_["sq"]; d_["n"] += v_["n"]
+                        d_["correct"] += v_["correct"]
+                        d_["n_tok"] += v_["n_tok"]; d_["ch"] += v_["ch"]
+                        per_row.setdefault(k_, []).append(v_["per_row"])
+                    for g_ in geom:
+                        geom[g_] += st_m["geom"][g_]
+
+            rows_seen = np.concatenate(rows_seen)
+            eps_ = epi_all[rows_seen]
+            uniq_ep = np.unique(eps_)
+            n_el_row = int(H_EXEC * 7)
+
+            def boot(vals, n=1000, seed=7):
+                """Кластерный бутстрап по эпизодам; возвращает 5% и 95%."""
+                rg = np.random.default_rng(seed)
+                idx_by_ep = [np.where(eps_ == e)[0] for e in uniq_ep]
+                out = np.empty(n)
+                for i in range(n):
+                    pick = rg.integers(0, len(idx_by_ep), len(idx_by_ep))
+                    ii = np.concatenate([idx_by_ep[j] for j in pick])
+                    out[i] = np.sqrt(vals[ii].sum() / (len(ii) * n_el_row))
+                return float(np.percentile(out, 5)), float(
+                    np.percentile(out, 95))
+
             print(f"\n  RMS-8 на val_sel, коды {tag} с подменой доли "
-                  f"оракульными:")
+                  f"оракульными ({len(uniq_ep)} эпизодов, {len(sds_)} сидов):")
             cur = {}
-            for k_ in ps_:
-                sq_, n_ = acc_m[float(k_)]
-                r_ = float(np.sqrt(sq_ / max(n_, 1)))
+            for pp in ps_:
+                rr, aa = [], []
+                for _, sd_ in sds_:
+                    d_ = acc[(float(pp), int(_))]
+                    rr.append(float(np.sqrt(d_["sq"] / max(d_["n"], 1))))
+                    aa.append(d_["correct"] / max(d_["n_tok"], 1))
+                v0 = np.concatenate(per_row[(float(pp), 0)])
+                lo, hi = boot(v0)
+                r_ = float(np.mean(rr)); acc_f = float(np.mean(aa))
                 c_ = ((a0_ - r_) / (a0_ - or_) if (a0_ and or_)
                       else float("nan"))
-                cur[float(k_)] = dict(rms=r_, capture=c_)
-                mark = "  <- порог" if c_ >= 0.20 else ""
-                print(f"    доля оракула {100 * k_:5.1f}%   RMS {r_:.6f}   "
-                      f"C = {c_:+.4f}{mark}")
-            curves[tag] = cur
+                cur[float(pp)] = dict(
+                    rms=r_, rms_by_seed=rr, capture=c_, top1=acc_f,
+                    ci90=[lo, hi],
+                    capture_ci90=[(a0_ - hi) / (a0_ - or_),
+                                  (a0_ - lo) / (a0_ - or_)],
+                    ch_rms=[float(x) for x in
+                            np.sqrt(acc[(float(pp), 0)]["ch"]
+                                    / max(acc[(float(pp), 0)]["n"] / 7, 1))])
+                print(f"    p={100 * pp:5.1f}%  top-1 факт {100 * acc_f:5.2f}%"
+                      f"   RMS {r_:.6f} [{lo:.6f}, {hi:.6f}]   "
+                      f"C = {c_:+.4f} [{(a0_ - hi) / (a0_ - or_):+.4f}, "
+                      f"{(a0_ - lo) / (a0_ - or_):+.4f}]")
+
+            # --- НАСТОЯЩИЕ СВЕРКИ, А НЕ ПЕЧАТЬ ----------------------------
+            # Прежде в комментарии было написано «обязан совпасть», а в коде
+            # значение только печаталось. Одна такая сверка уже поймала
+            # измерение на чужих весах — но поймала глазами, а не отказом.
+            if abs(cur[0.0]["rms"] - ref_rms) > 1e-6:
+                raise SystemExit(
+                    f"развёртка при p=0 дала {cur[0.0]['rms']:.6f}, а голова "
+                    f"{tag} — {ref_rms:.6f}: измеряются разные веса")
+            if or_ and abs(cur[1.0]["rms"] - or_) > 1e-4:
+                raise SystemExit(
+                    f"развёртка при p=1 дала {cur[1.0]['rms']:.6f}, а оракул "
+                    f"A01_ze — {or_:.6f}: подменяются не оракульные метки")
+
+            # --- ПОКАНАЛЬНОЕ РАЗЛОЖЕНИЕ ВЫИГРЫША --------------------------
+            # Утверждать «гейт в основном про схват» по одной лишь доле
+            # ошибки опоры нельзя: Gate 4 меряет ДОЛЮ ЗАХВАЧЕННОГО разрыва
+            # A0 -> оракул. Раскладывать надо и доступный выигрыш, и
+            # фактический, и делать это по тем же строкам.
+            if "опора A0 / val_sel" in rows_:
+                ch_a0 = np.asarray(rows_["опора A0 / val_sel"]["ch_rms_gate"])
+                ch_or = np.asarray(cur[1.0]["ch_rms"])
+                ch_hd = np.asarray(cur[0.0]["ch_rms"])
+                avail = ch_a0 ** 2 - ch_or ** 2
+                got = ch_a0 ** 2 - ch_hd ** 2
+                nmv = ["x", "y", "z", "rx", "ry", "rz", "схват"]
+                print("    разложение по каналам (квадраты ошибки):")
+                print("      канал   доступно оракулу   получено головой   "
+                      "доля доступного   доля полученного")
+                for i_, n_ in enumerate(nmv):
+                    print(f"      {n_:6s}   {avail[i_]:+.6f}        "
+                          f"{got[i_]:+.6f}       "
+                          f"{100 * avail[i_] / max(avail.sum(), 1e-12):6.1f}%"
+                          f"           "
+                          f"{100 * got[i_] / max(got.sum(), 1e-12):6.1f}%")
+                curves.setdefault("_channels", {})[tag] = dict(
+                    a0=[float(x) for x in ch_a0],
+                    oracle=[float(x) for x in ch_or],
+                    head=[float(x) for x in ch_hd],
+                    available=[float(x) for x in avail],
+                    obtained=[float(x) for x in got])
+
+            # --- ГЕОМЕТРИЯ ОШИБКИ -----------------------------------------
+            nw = max(geom["n_wrong"], 1)
+            print(f"    геометрия ошибки: доля неверных "
+                  f"{100 * geom['n_wrong'] / max(geom['n_tok'], 1):.2f}%; "
+                  f"среднее ||E1[пред] − E1[цель]|| на неверных "
+                  f"{geom['d_wrong'] / nw:.4f}; у случайного кода "
+                  f"{geom['d_rand'] / max(geom['n_rand'], 1):.4f}; "
+                  f"||E1[цель]|| {geom['norm_tg'] / max(geom['n_tok'], 1):.4f}")
+            print(f"    средний ранг правильного кода в логитах: "
+                  f"{geom['rank'] / max(geom['n_tok'], 1):.1f} из "
+                  f"{int(books.shape[1])}")
+            curves[tag] = dict(curve=cur, geometry=dict(
+                frac_wrong=geom["n_wrong"] / max(geom["n_tok"], 1),
+                d_wrong=geom["d_wrong"] / nw,
+                d_random=geom["d_rand"] / max(geom["n_rand"], 1),
+                norm_target=geom["norm_tg"] / max(geom["n_tok"], 1),
+                mean_rank=geom["rank"] / max(geom["n_tok"], 1),
+                vocab=int(books.shape[1])), n_episodes=int(len(uniq_ep)))
             return cur
 
         rows_ = {}
@@ -1141,7 +1311,7 @@ def main():
                 print("                 по каналам (веса гейта): "
                       + " ".join(f"{x:.4f}"
                                  for x in ev_extra["ch_rms_gate"]))
-            mix_sweep(tag)
+            mix_sweep(tag, rows_[f'{tag} / val_sel']['rms'])
         if a0_ and or_:
             for tag, d_ in rows_.items():
                 if tag.endswith("val_sel"):
