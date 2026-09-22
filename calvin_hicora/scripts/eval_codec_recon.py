@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from codec_common import ActionCodec, load_json, seed_everything, sha1_file
@@ -75,6 +76,7 @@ class MetricAccumulator:
         self.target_sq_sum = np.zeros(7, dtype=np.float64)
         self.gripper_correct = 0
         self.gripper_count = 0
+        self.gripper_bce_sum = 0.0
         self.start_sse = np.zeros(7, dtype=np.float64)
         self.end_sse = np.zeros(7, dtype=np.float64)
         self.boundary_count = 0
@@ -107,9 +109,25 @@ class MetricAccumulator:
             ((predicted_sign == target_sign) & gripper_valid).sum().item()
         )
         self.gripper_count += int(gripper_valid.sum().item())
+        gripper_target = (target[..., 6] + 1.0) * 0.5
+        gripper_bce = F.binary_cross_entropy_with_logits(
+            prediction[..., 6], gripper_target, reduction="none"
+        )
+        self.gripper_bce_sum += float(
+            torch.where(gripper_valid, gripper_bce, torch.zeros_like(gripper_bce))
+            .sum()
+            .item()
+        )
 
+        valid_lengths = mask.sum(dim=1)
+        if bool((valid_lengths <= 0).any()):
+            raise ValueError("Every reconstruction chunk must contain a valid timestep")
+        if not bool(mask[:, 0].all()):
+            raise ValueError("Padding masks must be left-aligned")
+        batch_indices = torch.arange(error.shape[0], device=error.device)
+        last_valid = error[batch_indices, valid_lengths - 1]
         self.start_sse += error[:, 0].square().sum(0).double().cpu().numpy()
-        self.end_sse += error[:, -1].square().sum(0).double().cpu().numpy()
+        self.end_sse += last_valid.square().sum(0).double().cpu().numpy()
         self.boundary_count += target.shape[0]
         delta_valid = mask[:, 1:] & mask[:, :-1]
         delta_error = (prediction[:, 1:] - prediction[:, :-1]) - (
@@ -165,6 +183,7 @@ class MetricAccumulator:
             "rotation_r2": 1
             - group_sse["rotation"] / max(group_sst["rotation"], np.finfo(float).eps),
             "gripper_sign_accuracy": self.gripper_correct / max(self.gripper_count, 1),
+            "gripper_bce": self.gripper_bce_sum / max(self.gripper_count, 1),
             "start_mse_per_channel": (
                 self.start_sse / max(self.boundary_count, 1)
             ).tolist(),
@@ -342,7 +361,8 @@ def main() -> int:
             # ActionCodec._decode accepts (z_q, embodiment_ids, durations);
             # its decoder derives the reconstruction mask from embodiment IDs.
             prediction, recon_mask = model._decode(z_from_codes, ids)
-            accumulators[name].update(prediction[..., :7], action, recon_mask)
+            valid_mask = padding_mask & recon_mask.bool()
+            accumulators[name].update(prediction[..., :7], action, valid_mask)
         batches += 1
 
     if batches == 0:

@@ -55,7 +55,7 @@ def _consume(loader: DataLoader, max_batches: int = 8) -> dict[str, object]:
 def main() -> int:
     data_root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("data/calvin_converted/debug")
     manifest = validate_converted_dataset(data_root)
-    assert int(manifest["format_version"]) == 2
+    assert int(manifest["format_version"]) in (2, 3)
 
     dataset = CalvinActionChunkDataset(data_root, split="train", cache_indices=True)
     printed = repr(dataset)

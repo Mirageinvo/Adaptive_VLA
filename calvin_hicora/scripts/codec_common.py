@@ -12,6 +12,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -126,7 +127,10 @@ def assert_residual_codebooks_initialized(model: ActionCodec) -> dict[str, Any]:
 
 @torch.no_grad()
 def warm_residual_codebook_init(
-    model: ActionCodec, actions: torch.Tensor, embodiment_id: int
+    model: ActionCodec,
+    actions: torch.Tensor,
+    embodiment_id: int,
+    padding_mask: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Run one quantize pass so residual books k-means-init on real actions."""
     ensure_single_process_codebook_ops()
@@ -140,7 +144,7 @@ def warm_residual_codebook_init(
     ids = torch.full(
         (actions.shape[0],), embodiment_id, dtype=torch.long, device=actions.device
     )
-    z_e = model._encode(actions, ids)
+    z_e = model._encode(actions, ids, padding_mask)
     _ = model.vq(z_e)
     used_randn_fallback = False
     for quantizer in model.vq.quantizers[1:]:
@@ -187,6 +191,21 @@ def assert_dataset_matches_protocol(
             representation["flip_gripper_sign"],
         ),
     ]
+    if int(manifest.get("format_version", 0)) >= 3:
+        checks.extend(
+            [
+                (
+                    "short_episode_padding",
+                    manifest.get("short_episode_padding"),
+                    geometry["short_episode_padding"],
+                ),
+                (
+                    "padding_mask_semantics",
+                    manifest.get("padding_mask_semantics"),
+                    geometry["padding_mask_semantics"],
+                ),
+            ]
+        )
     mismatches = [
         f"{name}: manifest={actual!r} protocol={expected!r}"
         for name, actual, expected in checks
@@ -409,7 +428,12 @@ def enforce_rvq_frozen_primary(model: ActionCodec) -> None:
         freeze_primary_codebook(primary)
     else:
         primary.eval()
-        if not torch.equal(primary.codebook, primary._calvin_frozen_codebook):
+        # model.to(device) moves codebook but not the non-Parameter freeze snapshot
+        frozen = primary._calvin_frozen_codebook.to(
+            device=primary.codebook.device, dtype=primary.codebook.dtype
+        )
+        primary._calvin_frozen_codebook = frozen
+        if not torch.equal(primary.codebook, frozen):
             raise RuntimeError(
                 "Primary codebook mutated under Appendix C freeze contract"
             )
@@ -515,15 +539,49 @@ def grouped_reconstruction_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
     mask: torch.Tensor,
+    *,
+    gripper_bce_weight: float,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """CALVIN reconstruction loss: continuous MSE plus binary gripper BCE.
+
+    The decoder's seventh output is treated as a logit. CALVIN gripper targets
+    are mapped from {-1, +1} to {0, 1}; padded timesteps do not contribute.
+    """
+    if prediction.shape != target.shape or prediction.ndim != 3:
+        raise ValueError(
+            f"prediction and target must share shape (B,T,D), got "
+            f"{prediction.shape} and {target.shape}"
+        )
+    if prediction.shape[-1] != 7:
+        raise ValueError(f"CALVIN actions must have 7 channels, got {prediction.shape[-1]}")
+    if mask.shape != prediction.shape[:2]:
+        raise ValueError(f"mask shape {mask.shape} != {prediction.shape[:2]}")
+    if gripper_bce_weight < 0:
+        raise ValueError("gripper_bce_weight must be non-negative")
+
     valid = mask.to(dtype=prediction.dtype).unsqueeze(-1)
     denom_steps = valid.sum().clamp_min(1)
     squared = (prediction - target).square() * valid
     position = squared[..., :3].sum() / (denom_steps * 3)
     rotation = squared[..., 3:6].sum() / (denom_steps * 3)
-    gripper = squared[..., 6].sum() / denom_steps
-    total = (position * 3 + rotation * 3 + gripper) / 7
-    return total, {"position": position, "rotation": rotation, "gripper": gripper}
+    continuous_mse = squared[..., :6].sum() / (denom_steps * 6)
+
+    gripper_target = (target[..., 6] + 1.0) * 0.5
+    if not bool(((gripper_target == 0) | (gripper_target == 1)).all()):
+        raise ValueError("CALVIN gripper targets must be exactly -1 or +1")
+    gripper_bce_unreduced = F.binary_cross_entropy_with_logits(
+        prediction[..., 6], gripper_target, reduction="none"
+    )
+    gripper_bce = (
+        gripper_bce_unreduced * mask.to(dtype=prediction.dtype)
+    ).sum() / denom_steps
+    total = continuous_mse + float(gripper_bce_weight) * gripper_bce
+    return total, {
+        "position": position,
+        "rotation": rotation,
+        "continuous_mse": continuous_mse,
+        "gripper_bce": gripper_bce,
+    }
 
 
 def cosine_with_warmup_factor(

@@ -1,0 +1,30 @@
+{
+  "protocol_version": 1,
+  "status": "draft_open_until_hicora_closed_loop; vla_hardware_gate fields freeze for Stage-3",
+  "source": {
+    "calvin_spec": "HiCoRA_CALVIN_SPEC.md",
+    "actioncodec_paper": "arXiv:2602.15397",
+    "baseline_protocol": "calvin_hicora/protocols/baseline_protocol.json"
+  },
+  "vla_hardware_gate": {
+    "require_exclusive_gpus": true,
+    "max_foreign_vram_mib_per_gpu": 2000,
+    "backbone": "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
+    "precision": "fp16_mixed",
+    "attention": "sdpa",
+    "fsdp": "full_shard",
+    "sharded_grad_scaler": true,
+    "action_only_supervision": true,
+    "action_only_gate_step": 0,
+    "action_token_budget": 48,
+    "action_vocab_size": 2048,
+    "rolling_checkpoints": ["latest", "latest_backup", "best"],
+    "best_monitor": "val/l1_dist",
+    "best_mode": "min",
+    "forbid_unbounded_step_trees": true
+  },
+  "hicora_closed_loop": {
+    "status": "open",
+    "note": "Numeric non-inferiority margin and power targets freeze before HiCoRA outcomes; not invented here."
+  }
+}

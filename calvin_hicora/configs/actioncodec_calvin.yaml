@@ -28,11 +28,21 @@ data:
   action_key: rel_actions
   chunk_length: 30
   execution_horizon: 12
+  short_episode_padding: repeat_last_action
+  padding_mask_semantics: true_is_valid_false_is_padding
   clip_actions: [-1.0, 1.0]
   additional_normalization: false
   flip_gripper_sign: false
 
 training:
+  reconstruction_loss:
+    continuous: mse
+    continuous_channels: [0, 1, 2, 3, 4, 5]
+    gripper: binary_cross_entropy_with_logits
+    gripper_channel: 6
+    gripper_target_mapping: "(-1,+1)_to_(0,1)"
+    gripper_bce_weight: 0.1
+    status: calvin_primary_deviation_frozen_before_scientific_run
   seeds: [0, 1]
   global_batch_size: 8192
   micro_batch_size_candidate_for_benchmark: 2048
@@ -41,13 +51,13 @@ training:
   precision: fp32
   gradient_clip_norm: 1.0
   validation_interval: 1000
-  checkpoint_interval: 5000
+  checkpoint_interval: 1000
   early_stopping_validation_patience: 5
   optimizer:
     name: AdamW
-    betas_status: not_disclosed
+    betas_status: frozen_implementation_candidate_before_scientific_run
     betas_implementation_candidate: [0.9, 0.95]
-    weight_decay_status: not_disclosed
+    weight_decay_status: frozen_implementation_candidate_before_scientific_run
     weight_decay_implementation_candidate: 0.01
     eps: 1.0e-8
   base_vq:
@@ -64,11 +74,11 @@ training:
     freeze_primary_codebook: true
     train_decoder: true
     train_residual_codebooks: true
-    learning_rate:
-    learning_rate_status: not_disclosed_in_ActionCodec_Appendix_C_do_not_invent
-    learning_rate_implementation_candidate: 2.0e-4
-    max_steps:
-    max_steps_status: not_disclosed_in_ActionCodec_Appendix_C_do_not_invent
+    learning_rate: 1.0e-4
+    learning_rate_status: frozen_implementation_candidate_before_scientific_run
+    learning_rate_implementation_candidate: 1.0e-4
+    max_steps: 50000
+    max_steps_status: frozen_implementation_candidate_before_scientific_run
 
 secondary_ablation:
   pretrained_transfer:

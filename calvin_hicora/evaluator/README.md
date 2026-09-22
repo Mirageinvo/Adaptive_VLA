@@ -21,14 +21,29 @@ success, SR1…SR5, AvgLen) with:
 | HULC / `calvin_env` install lock | TODO |
 | Official chain set binding | TODO |
 | Success oracle parity check | TODO |
-| Rollout harness for BAR / HiCoRA arms | TODO |
+| Generic 30 Hz receding-horizon core | Implemented + contract-tested |
+| HULC adapter for BAR / HiCoRA arms | TODO |
+
+`receding_horizon.py` enforces the offline/online contract:
+
+- every policy call returns exactly `(30, 7)` native-scale actions;
+- exactly the first 12 actions are executed, the remaining 18 are discarded;
+- the next plan observes the state after action 12;
+- the supplied simulator timestep must equal `1/30` seconds;
+- there is no overlap averaging;
+- termination/truncation stops execution immediately.
+
+The timestep assertion checks the simulator's configured control timestep, not
+wall-clock latency. A simulator may run faster or slower than real time while
+still representing 30 Hz physics correctly.
 
 ## Next concrete steps
 
 1. Lock `calvin` / `calvin_env` / MuJoCo versions in `calvin_hicora/env/`.
 2. Run the official HULC or CALVIN baseline evaluation once and archive raw
    chain outcomes plus SR1…SR5.
-3. Only then wire HiCoRA / BAR policies into the same harness.
+3. Bind the policy and environment APIs to `receding_horizon.py`; do not
+   duplicate horizon logic in each policy arm.
 
 Do not invent numeric success thresholds here; register them after the
 reproduction and power analysis required by the SPEC.

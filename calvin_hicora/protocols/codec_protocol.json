@@ -1,6 +1,6 @@
 {
   "protocol_version": 1,
-  "status": "frozen_except_measured_budgets_and_undisclosed_rvq_posttrain_step_count",
+  "status": "frozen_except_measured_vla_budget_rvq_posttrain_sensitivity_frozen",
   "freeze_policy": {
     "all_scientific_fields_frozen": true,
     "pending_fields": [
@@ -38,6 +38,8 @@
     "duration_seconds": 1,
     "chunk_length": 30,
     "execution_horizon": 12,
+    "short_episode_padding": "repeat_last_action",
+    "padding_mask_semantics": "true_is_valid_false_is_padding",
     "latent_positions": 16,
     "latent_dim": 512,
     "rvq_levels": 3,
@@ -117,6 +119,15 @@
   },
   "training": {
     "codec": {
+      "reconstruction_loss": {
+        "continuous": "mse",
+        "continuous_channels": [0, 1, 2, 3, 4, 5],
+        "gripper": "binary_cross_entropy_with_logits",
+        "gripper_channel": 6,
+        "gripper_target_mapping": "(-1,+1)_to_(0,1)",
+        "gripper_bce_weight": 0.1,
+        "status": "calvin_primary_deviation_frozen_before_scientific_run"
+      },
       "global_batch_size": 8192,
       "micro_batch_size_candidate_for_benchmark": 2048,
       "gradient_accumulation_steps_candidate_for_benchmark": 4,
@@ -124,17 +135,23 @@
       "num_workers": 8,
       "precision": "fp32",
       "optimizer": "AdamW",
-      "betas_status": "not_disclosed_in_ActionCodec_paper_or_released_training_code",
+      "betas_status": "frozen_implementation_candidate_before_scientific_run",
       "betas_implementation_candidate": [
         0.9,
         0.95
       ],
-      "weight_decay_status": "not_disclosed_in_ActionCodec_paper_or_released_training_code",
+      "weight_decay_status": "frozen_implementation_candidate_before_scientific_run",
       "weight_decay_implementation_candidate": 0.01,
       "eps": 1e-08,
       "gradient_clip_norm": 1.0,
       "validation_interval": 1000,
-      "checkpoint_interval": 5000,
+      "checkpoint_interval": 1000,
+      "checkpoint_policy": {
+        "mode": "rolling_latest",
+        "slots": ["best", "latest", "latest_backup"],
+        "forbids_unbounded_step_dirs": true,
+        "note": "Every checkpoint_interval: rotate latest→latest_backup, write latest, then delete backup. best/ only on val improvement. Max progress loss ≈1h at ~0.26 steps/s."
+      },
       "early_stopping_validation_patience": 5,
       "selection_split": "dev",
       "selection_split_note": "episode-disjoint carve from official training/; official validation/ is evaluation-domain only",
@@ -160,11 +177,13 @@
           "reconstruction",
           "rvq_objectives"
         ],
-        "learning_rate": null,
-        "learning_rate_status": "not_disclosed_in_ActionCodec_Appendix_C_do_not_invent",
-        "learning_rate_implementation_candidate": 0.0002,
-        "max_steps": null,
-        "max_steps_status": "not_disclosed_in_ActionCodec_Appendix_C_do_not_invent"
+        "learning_rate": 0.0001,
+        "learning_rate_status": "frozen_implementation_candidate_before_scientific_run",
+        "learning_rate_implementation_candidate": 0.0001,
+        "learning_rate_note": "ActionCodec Appendix C does not disclose RVQ post-train lr; frozen sensitivity candidate 1e-4 (half of base_vq 2e-4) before Stage-2 scientific runs",
+        "max_steps": 50000,
+        "max_steps_status": "frozen_implementation_candidate_before_scientific_run",
+        "max_steps_note": "ActionCodec Appendix C does not disclose RVQ post-train step count; frozen sensitivity candidate 50000 before Stage-2 scientific runs"
       },
       "microbatch_selection_note": "Chosen after V100 probes: batch256~3.5GiB, batch2048~24.9GiB fits; 4096/8192 not probed for VRAM on debug because drop-last needs >=batch chunks (debug train has 2742). Linear estimate suggests 4096 would OOM. 2048*4=8192 preserves registered global batch."
     },
@@ -264,7 +283,7 @@
       "name": "loss_weighting",
       "allowed_values": [
         "position_rotation_gripper_weights",
-        "separate_gripper_bce_head"
+        "gripper_bce_weight_sensitivity"
       ]
     }
   ],
@@ -289,13 +308,13 @@
     }
   },
   "open_decisions_before_scientific_codec_training": {
-    "tokenizer_optimizer_betas": "not disclosed",
-    "tokenizer_weight_decay": "not disclosed",
-    "rvq_posttrain_learning_rate": "not disclosed",
-    "rvq_posttrain_max_steps": "not disclosed",
+    "tokenizer_optimizer_betas": "frozen_implementation_candidate: [0.9, 0.95] (not in paper; labelled assumption)",
+    "tokenizer_weight_decay": "frozen_implementation_candidate: 0.01 (not in paper; labelled assumption)",
+    "rvq_posttrain_learning_rate": "frozen_implementation_candidate: 1e-4 (not disclosed in paper)",
+    "rvq_posttrain_max_steps": "frozen_implementation_candidate: 50000 (not disclosed in paper)",
     "development_split_for_codec_selection": "registered: episode-disjoint 5% carve from training/, seed 0, stratified by scene",
     "micro_batch_and_accumulation": "registered: micro 2048, accum 4, global 8192 (V100 probe)",
-    "codec_gpu_budget": "base_vq ~120.8 GPU-h/seed at 2048x4; RVQ post-train pending step count",
+    "codec_gpu_budget": "base_vq ~120.8 GPU-h/seed at 2048x4; RVQ post-train 50k@1e-4 (live GPU-h TBD)",
     "full_2b_fallback_cluster": "TBD; 256M is not an allowed scientific substitute"
   },
   "forbidden_adaptations": [

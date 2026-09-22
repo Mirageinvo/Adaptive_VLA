@@ -25,11 +25,12 @@ CHUNK_DTYPE = np.dtype(
         ("source_start", "<i8"),
         ("split_id", "i1"),
         ("scene_id", "i1"),
+        ("valid_length", "<i2"),
     ]
 )
 SPLIT_CODES = {"train": 0, "val": 1, "dev": 2}
 SCENE_CODES = {"A": 0, "B": 1, "C": 2, "D": 3}
-CONVERTED_FORMAT_VERSION = 2
+CONVERTED_FORMAT_VERSION = 3
 DEFAULT_DEV_FRACTION = 0.05
 DEFAULT_DEV_SEED = 0
 
@@ -123,8 +124,11 @@ def load_episode_bounds(split_dir: Path) -> np.ndarray:
         raise ValueError(f"{path} must have shape (episodes, 2), got {bounds.shape}")
     if np.any(bounds[:, 1] < bounds[:, 0]):
         raise ValueError(f"Invalid episode bounds in {path}")
+    # Official CALVIN ep_start_end_ids.npy is not guaranteed to be pre-sorted.
+    order = np.argsort(bounds[:, 0], kind="mergesort")
+    bounds = bounds[order]
     if len(bounds) > 1 and np.any(bounds[1:, 0] <= bounds[:-1, 1]):
-        raise ValueError(f"Episode ranges overlap or are unsorted in {path}")
+        raise ValueError(f"Episode ranges overlap after sorting in {path}")
     return bounds
 
 
@@ -146,6 +150,15 @@ def load_scene_ranges(split_dir: Path) -> list[tuple[str, int, int]]:
             raise ValueError(f"Unrecognized CALVIN scene name {key!r} in {path}")
         ranges.append((scene, start, end))
     return sorted(ranges, key=lambda row: row[1])
+
+
+def default_scene_ranges_for_directory(split_dir: Path) -> list[tuple[str, int, int]]:
+    text = str(split_dir).lower()
+    if "task_d_d" in text or "calvin_debug_dataset" in text:
+        return [("D", 0, 2**63 - 1)]
+    raise FileNotFoundError(
+        f"Missing required scene_info.npy in {split_dir} and cannot infer scene"
+    )
 
 
 def scene_for_episode(
@@ -200,7 +213,7 @@ def build_episode_records(splits: list[SourceSplit]) -> list[dict[str, Any]]:
         scenes = load_scene_ranges(split.path)
         languages = load_language_ranges(split.path)
         if not scenes:
-            raise FileNotFoundError(f"Missing required scene_info.npy in {split.path}")
+            scenes = default_scene_ranges_for_directory(split.path)
         for source_start, source_end in bounds:
             source_start, source_end = int(source_start), int(source_end)
             n_frames = source_end - source_start + 1
@@ -316,7 +329,22 @@ def build_chunks(
 ) -> np.ndarray:
     rows = []
     for record in records:
+        episode_length = int(record["n_frames"])
+        if episode_length <= 0:
+            raise ValueError(f"Episode {record['episode_id']} has no actions")
         last_start = record["action_end_exclusive"] - chunk_length
+        if episode_length < chunk_length:
+            rows.append(
+                (
+                    record["action_start"],
+                    record["episode_id"],
+                    record["source_start"],
+                    SPLIT_CODES[record["split"]],
+                    SCENE_CODES[record["scene"]],
+                    episode_length,
+                )
+            )
+            continue
         for action_start in range(record["action_start"], last_start + 1, stride):
             source_start = record["source_start"] + action_start - record["action_start"]
             rows.append(
@@ -326,14 +354,20 @@ def build_chunks(
                     source_start,
                     SPLIT_CODES[record["split"]],
                     SCENE_CODES[record["scene"]],
+                    chunk_length,
                 )
             )
     chunks = np.asarray(rows, dtype=CHUNK_DTYPE)
     for chunk in chunks:
         record = records[int(chunk["episode_id"])]
         start = int(chunk["action_start"])
+        valid_length = int(chunk["valid_length"])
         assert record["action_start"] <= start
-        assert start + chunk_length <= record["action_end_exclusive"]
+        assert 0 < valid_length <= chunk_length
+        assert start + valid_length <= record["action_end_exclusive"]
+        if valid_length < chunk_length:
+            assert start == record["action_start"]
+            assert valid_length == record["n_frames"]
         assert int(chunk["split_id"]) == SPLIT_CODES[record["split"]]
         assert int(chunk["scene_id"]) == SCENE_CODES[record["scene"]]
     return chunks
@@ -468,11 +502,14 @@ def main() -> int:
         "chunk_length": args.chunk_length,
         "execution_horizon": args.execution_horizon,
         "stride": args.stride,
+        "short_episode_padding": "repeat_last_action",
+        "padding_mask_semantics": "true_is_valid_false_is_padding",
         "development_split": development_split,
         "num_frames": int(actions.shape[0]),
         "clipped_frames": clipped_frames,
         "num_episodes": len(records),
         "num_chunks": len(chunks),
+        "num_padded_chunks": int((chunks["valid_length"] < args.chunk_length).sum()),
         "split_counts": {
             name: sum(1 for record in records if record["split"] == name)
             for name in SPLIT_CODES

@@ -1,0 +1,81 @@
+# BAR reliability gate on aicenter: FSDP + fp16, real CALVIN RGB cache.
+strategy: bar
+
+DATASET:
+  root: /datasets/askhabaliev_gs/calvin_full/task_D_D
+  chunk_length: 30
+
+MODEL:
+  model_name: HuggingFaceTB/SmolVLM2-256M-Video-Instruct
+  answer_start_token: "Assistant:"
+
+  action_processor:
+    vocab_size: 2048
+    token_len: 48
+    _target_: transformers.AutoModel
+    kwargs:
+      pretrained_model_name_or_path: /home/askhabaliev_gs/Adaptive_VLA-1/checkpoints/codec/rvq_posttrain_s1/best/model
+      trust_remote_code: true
+
+  vl_processor:
+    _target_: transformers.AutoProcessor
+    kwargs:
+      pretrained_model_name_or_path: ${MODEL.model_name}
+      trust_remote_code: true
+
+  vla_processor:
+    kwargs:
+      mode: "discrete"
+      vocab_shift: 0
+
+  vlm:
+    _target_: smolvla.bar.SmolVLABlockwiseAR
+    kwargs:
+      pretrained_model_name_or_path: ${MODEL.model_name}
+      trust_remote_code: true
+      # Keep weights in fp32; FSDP + 16-mixed (ShardedGradScaler) casts compute.
+      # Loading VLM as float16 leaves action_expert in float32 and FSDP refuses
+      # to flatten mixed dtypes.
+      torch_dtype: float32
+      token_budget: ${MODEL.action_processor.token_len}
+      num_blocks: 3
+      action_vocab_size: ${MODEL.action_processor.vocab_size}
+      _attn_implementation: sdpa
+
+TRAINING:
+  ckpt_dir: /home/askhabaliev_gs/Adaptive_VLA-1/checkpoints/vla_debug_overfit
+  training_steps: 50
+  warmup_steps: 0
+  batch_size: 1
+  num_workers: 0
+  val_check_interval: 1000
+
+  use_lora: false
+  lora_kwargs:
+    lora_alpha: 32
+    r: 16
+    task_type: "CAUSAL_LM"
+    target_modules:
+      - "q_proj"
+      - "k_proj"
+      - "v_proj"
+      - "o_proj"
+      - "up_proj"
+      - "down_proj"
+      - "gate_proj"
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    kwargs:
+      lr: 2e-4
+      weight_decay: 1e-10
+      eps: 1e-8
+      betas: [0.9, 0.999]
+
+  trainer:
+    devices: [0, 1]
+    accumulate_grad_batches: 1
+    precision: 16-mixed
+    gradient_clip_val: 1.0
+    log_every_n_steps: 1
+    strategy: fsdp

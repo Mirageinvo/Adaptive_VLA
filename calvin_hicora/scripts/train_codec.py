@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -106,10 +107,16 @@ def validate(
     embodiment_id: int,
     device: torch.device,
     max_batches: int,
+    gripper_bce_weight: float,
 ) -> dict[str, float]:
     model.eval()
     totals = {"loss": 0.0, "reconstruction": 0.0, "quantization": 0.0}
-    groups = {"position": 0.0, "rotation": 0.0, "gripper": 0.0}
+    groups = {
+        "position": 0.0,
+        "rotation": 0.0,
+        "continuous_mse": 0.0,
+        "gripper_bce": 0.0,
+    }
     count = 0
     for batch_index, batch in enumerate(loader):
         if batch_index >= max_batches:
@@ -119,8 +126,12 @@ def validate(
         prediction, recon_mask, _, quantization_loss = encode_quantize_decode(
             model, action, embodiment_id, padding_mask
         )
+        valid_mask = padding_mask & recon_mask.bool()
         reconstruction_loss, grouped = grouped_reconstruction_loss(
-            prediction, action, recon_mask
+            prediction,
+            action,
+            valid_mask,
+            gripper_bce_weight=gripper_bce_weight,
         )
         total_loss = reconstruction_loss + quantization_loss
         totals["loss"] += float(total_loss)
@@ -162,11 +173,62 @@ def save_checkpoint(
     )
 
 
+def save_rolling_latest(
+    output_dir: Path,
+    model: ActionCodec,
+    optimizer: AdamW,
+    scheduler: LambdaLR,
+    step: int,
+    best_val: float,
+    metadata: dict[str, Any],
+    bad_validations: int,
+) -> Path:
+    """Atomic latest ↔ latest_backup rotation (no unbounded step_XXXXXXXX dirs).
+
+    During the write window the previous good checkpoint lives in
+    ``latest_backup/``. After a successful write the backup is removed so the
+    disk footprint stays at most ``best/`` + ``latest/`` (+ transient backup).
+    Resume with ``--resume …/latest`` (or ``…/latest_backup`` if a crash left
+    only the backup).
+    """
+    latest = output_dir / "latest"
+    backup = output_dir / "latest_backup"
+    if backup.exists():
+        shutil.rmtree(backup)
+    if latest.exists():
+        latest.rename(backup)
+    try:
+        save_checkpoint(
+            latest,
+            model,
+            optimizer,
+            scheduler,
+            step,
+            best_val,
+            metadata,
+            bad_validations,
+        )
+    except Exception:
+        # Leave backup intact for --resume if the new write failed mid-flight.
+        if latest.exists():
+            shutil.rmtree(latest, ignore_errors=True)
+        raise
+    if backup.exists():
+        shutil.rmtree(backup)
+    return latest
+
+
 def main() -> int:
     args = parse_args()
     protocol = load_json(args.protocol)
     registered = protocol["training"]["codec"]
     stage_config = registered[args.stage]
+    loss_config = registered["reconstruction_loss"]
+    if loss_config.get("continuous") != "mse":
+        raise RuntimeError("This trainer implements the registered continuous MSE path only")
+    if loss_config.get("gripper") != "binary_cross_entropy_with_logits":
+        raise RuntimeError("This trainer requires registered BCEWithLogits for CALVIN gripper")
+    gripper_bce_weight = float(loss_config["gripper_bce_weight"])
     if sum(bool(flag) for flag in (args.smoke, args.benchmark, args.memory_smoke)) > 1:
         raise ValueError("--smoke, --benchmark, and --memory-smoke are mutually exclusive")
     if (
@@ -326,9 +388,12 @@ def main() -> int:
     model, embodiment_id, expansion_report = build_model(args, protocol, device)
     residual_init_report = None
     if args.stage == "rvq_posttrain" and args.resume is None:
-        warm_batch = next(iter(train_loader))["action"].to(device)
+        warm_batch = next(iter(train_loader))
         residual_init_report = warm_residual_codebook_init(
-            model, warm_batch, embodiment_id
+            model,
+            warm_batch["action"].to(device),
+            embodiment_id,
+            warm_batch["padding_mask"].to(device),
         )
     model.train()
     enforce_rvq_frozen_primary(model)
@@ -347,6 +412,33 @@ def main() -> int:
     )
     scheduler = LambdaLR(optimizer, lambda _step: 1.0)
     start_step, best_val, bad_validations = 0, float("inf"), 0
+    if args.stage == "rvq_posttrain":
+        encoder_trainable = sum(
+            parameter.numel()
+            for parameter in model.encoder.parameters()
+            if parameter.requires_grad
+        )
+        primary_trainable = sum(
+            parameter.numel()
+            for parameter in model.vq.quantizers[0].parameters()
+            if parameter.requires_grad
+        )
+        optimizer_trainable = sum(
+            parameter.numel() for group in optimizer.param_groups for parameter in group["params"]
+        )
+        print(
+            f"[freeze] encoder_trainable={encoder_trainable} "
+            f"quantizers0_trainable={primary_trainable} "
+            f"optimizer_trainable={optimizer_trainable} "
+            f"warm_start={args.resume is None}",
+            flush=True,
+        )
+        if encoder_trainable != 0 or primary_trainable != 0:
+            raise RuntimeError(
+                "RVQ freeze contract violated before training: "
+                f"encoder_trainable={encoder_trainable} "
+                f"quantizers0_trainable={primary_trainable}"
+            )
     if args.resume:
         state = torch.load(args.resume / "trainer_state.pt", map_location="cpu")
         if state.get("stage", args.stage) != args.stage:
@@ -367,7 +459,9 @@ def main() -> int:
         "data_manifest": {
             "generated_sha256": train_dataset.manifest["generated_sha256"],
             "is_pipeline_validation": train_dataset.manifest["is_pipeline_validation"],
-            "dataset_root": train_dataset.manifest["dataset_root"],
+            "dataset_root": train_dataset.manifest.get(
+                "dataset_root", str(args.data_root.resolve())
+            ),
             "num_frames": train_dataset.manifest["num_frames"],
             "num_chunks": train_dataset.manifest["num_chunks"],
         },
@@ -390,6 +484,7 @@ def main() -> int:
         "learning_rate": float(learning_rate),
         "scheduler": "constant",
         "scheduler_status": "paper reports peak lr only; constant schedule is an implementation assumption",
+        "reconstruction_loss": loss_config,
     }
     (args.output_dir / "run_metadata.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n"
@@ -409,7 +504,8 @@ def main() -> int:
             "quantization": 0.0,
             "position": 0.0,
             "rotation": 0.0,
-            "gripper": 0.0,
+            "continuous_mse": 0.0,
+            "gripper_bce": 0.0,
         }
         for _micro_step in range(accumulation_steps):
             try:
@@ -423,8 +519,12 @@ def main() -> int:
             prediction, recon_mask, _, quantization_loss = encode_quantize_decode(
                 model, action, embodiment_id, padding_mask
             )
+            valid_mask = padding_mask & recon_mask.bool()
             reconstruction_loss, grouped = grouped_reconstruction_loss(
-                prediction, action, recon_mask
+                prediction,
+                action,
+                valid_mask,
+                gripper_bce_weight=gripper_bce_weight,
             )
             loss = reconstruction_loss + quantization_loss
             if not torch.isfinite(loss):
@@ -453,13 +553,19 @@ def main() -> int:
             "train_quantization": aggregate["quantization"],
             "train_position_mse": aggregate["position"],
             "train_rotation_mse": aggregate["rotation"],
-            "train_gripper_mse": aggregate["gripper"],
+            "train_continuous_mse": aggregate["continuous_mse"],
+            "train_gripper_bce": aggregate["gripper_bce"],
             "gradient_norm": float(gradient_norm),
             "learning_rate": optimizer.param_groups[0]["lr"],
         }
         if step % validation_interval == 0 or step == max_steps:
             record["validation"] = validate(
-                model, val_loader, embodiment_id, device, args.validation_batches
+                model,
+                val_loader,
+                embodiment_id,
+                device,
+                args.validation_batches,
+                gripper_bce_weight,
             )
             val_loss = record["validation"]["reconstruction"]
             if val_loss < best_val:
@@ -487,10 +593,15 @@ def main() -> int:
                 stopped_early = True
         with history_path.open("a") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
-        if step % 10 == 0 or step == max_steps or stopped_early:
+        if step % 10 == 0 or step == max_steps or stopped_early or step == 50:
             elapsed = time.perf_counter() - timing_start
             print(
                 f"step={step}/{max_steps} loss={record['train_loss']:.6f} "
+                f"recon={record['train_reconstruction']:.6f} "
+                f"mse={record['train_continuous_mse']:.6f} "
+                f"grip_bce={record['train_gripper_bce']:.6f} "
+                f"grip_term={0.1 * record['train_gripper_bce']:.6f} "
+                f"quant={record['train_quantization']:.6f} "
                 f"lr={record['learning_rate']:.3e} steps/s={(step-start_step)/elapsed:.3f}"
                 + (
                     f" early_stop={bad_validations}/{early_stopping_patience}"
@@ -500,8 +611,8 @@ def main() -> int:
                 flush=True,
             )
         if step % checkpoint_interval == 0 or step == max_steps or stopped_early:
-            save_checkpoint(
-                args.output_dir / f"step_{step:08d}",
+            save_rolling_latest(
+                args.output_dir,
                 model,
                 optimizer,
                 scheduler,
@@ -510,6 +621,12 @@ def main() -> int:
                 metadata,
                 bad_validations,
             )
+            if step % checkpoint_interval == 0 or step == max_steps:
+                print(
+                    f"[ckpt] rolling latest @ step={step} "
+                    f"(interval={checkpoint_interval})",
+                    flush=True,
+                )
         if stopped_early:
             break
 

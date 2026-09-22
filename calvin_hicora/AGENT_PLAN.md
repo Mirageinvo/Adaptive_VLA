@@ -51,7 +51,7 @@
 | Запрещено | bf16, FlashAttention-2 (Volta) |
 | Codec GPU | 1× V100 |
 | VLA GPU | 2× V100 exclusive |
-| Диск | полный `task_D_D` требует ~500 GiB free |
+| Диск | variant B (stream zip, actions-only): ≥~180 GiB free for `task_D_D.zip` + cache; full unzip (~500 GiB) больше не требуется |
 
 Обе V100 часто заняты чужим ресерчем — согласовывать exclusive access. Если 2.2B не влезает / слишком медленный на этом хосте → перенос 2.2B на другой кластер. **Не откат на 256M как scientific baseline.**
 
@@ -76,6 +76,7 @@ calvin_hicora/
 ├── evaluator/README.md           ← HULC scaffold (closed-loop only)
 ├── scripts/
 │   ├── convert_calvin.py
+│   ├── convert_from_zip_actions_only.py
 │   ├── codec_common.py
 │   ├── codec_data.py
 │   ├── train_codec.py
@@ -105,7 +106,8 @@ calvin_hicora/
 10. **Dev-split зарегистрирован и реализован:**
     - episode-disjoint carve из official `training/`;
     - **fraction = 0.05**, seed = 0, scene-stratified (см. `codec_protocol.json` → `data.development_split`);
-    - `split_codes`: `train|dev|val`, converted `format_version = 2`;
+    - `split_codes`: `train|dev|val`; scientific conversion uses
+      `format_version = 3` with `valid_length` and honest padding masks;
     - `selection_split: "dev"` в protocol; early stopping на `dev`;
     - official `validation/` → evaluation-domain only;
     - debug с 1 train-эпизодом: carve disabled, smoke может падать на `val` (pipeline only).
@@ -171,8 +173,12 @@ Smoke / 200-step benchmark **разрешены** с `*_implementation_candidate
 
 1. Засинкать `calvin_hicora/` на кластер (SSH-ключ у пользователя).
 2. Убедиться, что GPU 0 свободен для codec; для VLA — обе exclusive.
-3. Debug data: `data/calvin_converted/debug` (`format_version: 2`).
-4. Полный `task_D_D` — только при ≥500 GiB free: `scripts/fetch_data.sh`, затем `convert_calvin.py` **без** `--no-dev-split`.
+3. Legacy debug data: `data/calvin_converted/debug` (`format_version: 2`);
+   regenerate as v3 before the next GPU smoke.
+4. Полный `task_D_D` — только при ≥~180 GiB free (variant B): скачать zip,
+   затем `scripts/convert_from_zip_actions_only.py` **без** `--no-dev-split`
+   (полный unzip / старый 500 GiB budget не нужны). Directory converter
+   `convert_calvin.py` остаётся для уже распакованных деревьев.
 
 Команды проверки локально:
 

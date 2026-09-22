@@ -14,7 +14,7 @@ from torch.utils.data import Dataset
 
 Split = Literal["train", "val", "dev", "all"]
 Normalization = Literal["native", "quantile"]
-SUPPORTED_FORMAT_VERSIONS = {2}
+SUPPORTED_FORMAT_VERSIONS = {2, 3}
 
 
 def sha256_file(path: Path, block_size: int = 8 * 1024 * 1024) -> str:
@@ -53,6 +53,11 @@ def validate_converted_dataset(root: Path, verify_hashes: bool = False) -> dict[
         raise ValueError(
             "Scientific converted datasets must carve an enabled development split "
             "from official training/"
+        )
+    if not manifest.get("is_pipeline_validation") and int(manifest["format_version"]) < 3:
+        raise ValueError(
+            "Scientific converted datasets must use format_version >= 3 with honest "
+            "short-episode padding masks"
         )
     if verify_hashes:
         for name, expected in manifest["generated_sha256"].items():
@@ -184,19 +189,33 @@ class CalvinActionChunkDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         chunk = self.all_chunks[int(self.indices[index])]
         start = int(chunk["action_start"])
-        stop = start + self.chunk_length
-        action = np.array(self.actions[start:stop], dtype=np.float32, copy=True)
-        if len(action) != self.chunk_length:
-            raise IndexError(f"Short chunk at {start}: {len(action)}")
+        valid_length = (
+            int(chunk["valid_length"])
+            if "valid_length" in (self.all_chunks.dtype.names or ())
+            else self.chunk_length
+        )
+        if not 0 < valid_length <= self.chunk_length:
+            raise ValueError(f"Invalid valid_length={valid_length} at chunk {index}")
+        stop = start + valid_length
+        valid_actions = np.array(self.actions[start:stop], dtype=np.float32, copy=True)
+        if len(valid_actions) != valid_length:
+            raise IndexError(f"Short chunk at {start}: {len(valid_actions)} != {valid_length}")
+        if valid_length < self.chunk_length:
+            padding = np.repeat(
+                valid_actions[-1:, :], self.chunk_length - valid_length, axis=0
+            )
+            action = np.concatenate((valid_actions, padding), axis=0)
+        else:
+            action = valid_actions
         action /= self.scale
         action = np.clip(action, -1.0, 1.0)
+        padding_mask = torch.zeros(self.chunk_length, dtype=torch.bool)
+        padding_mask[:valid_length] = True
         episode_id = int(chunk["episode_id"])
         episode = self.episodes_by_id[episode_id]
         return {
             "action": torch.from_numpy(action),
-            # Always True for CALVIN: every registered chunk is fully valid and
-            # never zero-padded. Kept for ActionCodec encode/decode API parity.
-            "padding_mask": torch.ones(self.chunk_length, dtype=torch.bool),
+            "padding_mask": padding_mask,
             "episode_id": torch.tensor(episode_id, dtype=torch.long),
             "source_start": torch.tensor(int(chunk["source_start"]), dtype=torch.long),
             "scene_id": torch.tensor(int(chunk["scene_id"]), dtype=torch.long),
