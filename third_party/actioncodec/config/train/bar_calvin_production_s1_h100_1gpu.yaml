@@ -1,0 +1,83 @@
+# Stage-3 production BAR on aicenter4: SmolVLM2-2.2B, single H100 GPU0.
+# Global batch 128 = microbatch 1 × 1 GPU × accumulate 128.
+# FSDP still enabled (1-rank) so ShardedGradScaler / FSDPPrecision path matches protocol.
+strategy: bar
+
+DATASET:
+  root: /datasets/askhabaliev_g/calvin_full/task_D_D
+  chunk_length: 30
+
+MODEL:
+  model_name: HuggingFaceTB/SmolVLM2-2.2B-Instruct
+  answer_start_token: "Assistant:"
+
+  action_processor:
+    vocab_size: 2048
+    token_len: 48
+    _target_: transformers.AutoModel
+    kwargs:
+      pretrained_model_name_or_path: /datasets/askhabaliev_g/checkpoints/codec/rvq_posttrain_s1/best/model
+      trust_remote_code: true
+
+  vl_processor:
+    _target_: transformers.AutoProcessor
+    kwargs:
+      pretrained_model_name_or_path: ${MODEL.model_name}
+      trust_remote_code: true
+
+  vla_processor:
+    kwargs:
+      mode: "discrete"
+      vocab_shift: 0
+
+  vlm:
+    _target_: smolvla.bar.SmolVLABlockwiseAR
+    kwargs:
+      pretrained_model_name_or_path: ${MODEL.model_name}
+      trust_remote_code: true
+      torch_dtype: float32
+      token_budget: ${MODEL.action_processor.token_len}
+      num_blocks: 3
+      action_vocab_size: ${MODEL.action_processor.vocab_size}
+      _attn_implementation: sdpa
+
+TRAINING:
+  ckpt_dir: /datasets/askhabaliev_g/checkpoints/vla/production_s1
+  training_steps: 30000
+  warmup_steps: 1000
+  batch_size: 1
+  num_workers: 4
+  val_check_interval: 1000
+  checkpoint_interval: 1000
+  checkpoint_monitor: val/l1_dist
+  checkpoint_mode: min
+
+  use_lora: false
+  lora_kwargs:
+    lora_alpha: 32
+    r: 16
+    task_type: "CAUSAL_LM"
+    target_modules:
+      - "q_proj"
+      - "k_proj"
+      - "v_proj"
+      - "o_proj"
+      - "up_proj"
+      - "down_proj"
+      - "gate_proj"
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    kwargs:
+      lr: 1e-4
+      weight_decay: 1e-10
+      eps: 1e-8
+      betas: [0.9, 0.999]
+
+  trainer:
+    devices: [0]
+    accumulate_grad_batches: 128
+    precision: 16-mixed
+    gradient_clip_val: 1.0
+    log_every_n_steps: 10
+    strategy: fsdp
