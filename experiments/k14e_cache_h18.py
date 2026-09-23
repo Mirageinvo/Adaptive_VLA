@@ -466,15 +466,24 @@ def main():
             # на котором обучалась голова. Проверяется побитово И по кодам.
             h16 = h.to(store_t)
             n_lossy += int((h16.to(h.dtype) != h).sum())
-            lg16 = model.depth_rvq_heads[0](
-                model.depth_rvq_norms[0](h16.float()))
+            # ПЕРЕСЧЁТ ИДЁТ В ТОМ ЖЕ autocast, ЧТО И ЖИВОЙ ПРОХОД. Первая
+            # версия считала его снаружи: голова там работала в fp32, а живая
+            # — в fp16, и разошедшийся код списывался на округление при
+            # хранении, хотя хранение было ни при чём. Сравнивать надо
+            # хранение с хранением, а не арифметику с арифметикой.
+            with ac16:
+                lg16 = model.depth_rvq_heads[0](
+                    model.depth_rvq_norms[0](h16.to(h.dtype)))
             q1_live = out["logits"][1].argmax(-1)
             n_flip = int((lg16.argmax(-1) != q1_live).sum())
             if n_flip:
                 raise SystemExit(
-                    f"хранение в fp16 меняет {n_flip} кодов q1 на батче "
-                    f"{k_} части {nm_}: кэш был бы не тем состоянием. "
-                    f"Пересоберите с --dtype-store float32")
+                    f"хранение в {a.dtype_store} меняет {n_flip} кодов q1 на "
+                    f"батче {k_} части {nm_}: кэш был бы не тем состоянием."
+                    + (" Пересоберите с --dtype-store float32"
+                       if a.dtype_store == "float16" else
+                       " При float32 округления нет вовсе, значит расходится "
+                       "сам пересчёт — это ошибка измерителя, а не данных"))
             q1_sum.update(q1_live.cpu().numpy().astype(np.int32).tobytes())
             ii = np.array([pos[int(r)] for r in sel_])
             H[ii] = h16.cpu().numpy()
