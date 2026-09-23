@@ -245,6 +245,24 @@ def main():
 
     h_handle = model.depth_rvq_norms[0].register_forward_pre_hook(pre_hook)
 
+    # КЛАСС И eps НОРМЫ ЗАПИСЫВАЮТСЯ В МАНИФЕСТ. Проба обучает норму заново
+    # и потому обязана воспроизвести её ровно, не загружая VLM: без eps
+    # совпадение чисел было бы случайным.
+    nrm0 = model.depth_rvq_norms[0]
+    norm_eps = None
+    for at in ("eps", "variance_epsilon"):
+        if hasattr(nrm0, at):
+            norm_eps = float(getattr(nrm0, at))
+            break
+    if norm_eps is None:
+        raise SystemExit(f"у нормы {type(nrm0).__name__} не найдено eps: "
+                         f"проба не сможет воспроизвести её точно")
+    norm_class = type(nrm0).__name__
+    norm_shapes = {k: list(v.shape)
+                   for k, v in nrm0.state_dict().items()}
+    print(f"  норма уровня q1: {norm_class}, eps {norm_eps}, "
+          f"параметры {norm_shapes}")
+
     d_model = int(model.fast_head.in_features)
     n_pos = int(model.block_size)
     print(f"  d_model {d_model}, позиций {n_pos}; кэш будет "
@@ -330,6 +348,7 @@ def main():
 
     man = dict(
         kind="k14_h18_cache", parts=list(parts_want),
+        norm_class=norm_class, norm_eps=norm_eps, norm_shapes=norm_shapes,
         n_rows=int(len(rows_all)), n_pos=n_pos, d_model=d_model,
         dtype="float16", rows_sha1=arr_sha(rows_all),
         h18_sha1=sha12(a.out + ".h18.npy"), meta_sha1=sha12(mp),
