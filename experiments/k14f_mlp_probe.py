@@ -321,7 +321,10 @@ def main():
 
     man = json.load(open(a.h18 + ".manifest.json"))
     q1_man = json.load(open(a.q1_cache + ".manifest.json"))
-    need_parts = ("train", "val_sel") if a.verify_only else \
+    # СВЕРКЕ НУЖНА ТОЛЬКО val_sel. Требовать при ней train значило бы
+    # запретить дешёвый смоук: кэш одной части строится за минуты и
+    # проверяет ровно ту же цепочку, что полный.
+    need_parts = ("val_sel",) if a.verify_only else \
         ("train", "val_sel", "val_confirm")
     check_manifest(man, q1_man=q1_man, need_parts=need_parts)
     if sha12(a.h18 + ".h18.npy") != man["h18_sha1"]:
