@@ -364,6 +364,57 @@ def load_states(src, n_obs, dataset_repo, dataset_revision, keys_sha,
                           state_json=file_sha(stm_p))
 
 
+def load_q1_targets(q1_cache, man, expect_parts=CANONICAL_PARTS):
+    """Канонические цели q1 из кэша K-14b. ВСЁ сверяется по содержимому.
+
+    ОТПЕЧАТКИ СЧИТАЮТСЯ ОТ СЫРОГО МАССИВА, а не от приведённого к int64.
+    K-14b хеширует то, что записал, — int32; `astype(np.int64)` меняет байты,
+    и сверка отвергала бы правильный кэш всегда. Приведение типа делается
+    ПОСЛЕ сверки и только для `cross_entropy`, которая требует long.
+
+    Третья по счёту реализация этой схемы и стала источником ошибки, поэтому
+    она здесь одна на всех потребителей.
+    """
+    npz_p = q1_cache if q1_cache.endswith(".npz") else q1_cache + ".npz"
+    need = ("labels_sha1", "rows_sha1", "q1_sha1", "dtype", "n_rows", "parts")
+    miss = [k for k in need if man.get(k) is None]
+    if miss:
+        raise SystemExit(f"в манифесте кэша целей нет полей {miss}")
+    if file_sha(npz_p) != man["labels_sha1"]:
+        raise SystemExit(f"{npz_p} не совпал с labels_sha1 манифеста")
+    with np.load(npz_p, allow_pickle=True) as z:
+        rows_raw, q1_raw = np.asarray(z["rows"]), np.asarray(z["q1"])
+        part = z["part"].astype(str)
+    if arr_sha(rows_raw.astype(np.int64)) != man["rows_sha1"]:
+        raise SystemExit("строки кэша целей не совпали с rows_sha1")
+    if arr_sha(q1_raw) != man["q1_sha1"]:
+        raise SystemExit(f"цели не совпали с q1_sha1: {arr_sha(q1_raw)} "
+                         f"против {man['q1_sha1']}")
+    if str(q1_raw.dtype) != str(man["dtype"]):
+        raise SystemExit(f"цели типа {q1_raw.dtype}, в манифесте "
+                         f"{man['dtype']}")
+    if q1_raw.ndim != 2 or q1_raw.shape[0] != rows_raw.shape[0]:
+        raise SystemExit(f"формы целей {q1_raw.shape} и строк "
+                         f"{rows_raw.shape}")
+    if int(man["n_rows"]) != int(rows_raw.shape[0]):
+        raise SystemExit(f"строк {rows_raw.shape[0]}, в манифесте "
+                         f"{man['n_rows']}")
+    if len(np.unique(rows_raw)) != len(rows_raw):
+        raise SystemExit("номера строк в кэше целей повторяются")
+    if set(np.unique(part)) != set(expect_parts):
+        raise SystemExit(f"части кэша целей {sorted(set(np.unique(part)))}")
+    for nm in expect_parts:
+        pm = (man["parts"] or {}).get(nm) or {}
+        if pm.get("n_rows") is None:
+            raise SystemExit(f"в манифесте нет числа строк части {nm}")
+        got = int((part == nm).sum())
+        if got != int(pm["n_rows"]):
+            raise SystemExit(f"часть {nm}: {got} строк, в манифесте "
+                             f"{pm['n_rows']}")
+    return (rows_raw.astype(np.int64), q1_raw.astype(np.int64), part,
+            dict(q1_raw_dtype=str(q1_raw.dtype), n_rows=int(len(rows_raw))))
+
+
 def load_canonical_q0(path, *, gate_r_path, n_obs, keys_sha,
                       cache_meta_sha1=None):
     """Черновик q0 как АРТЕФАКТ K-14d, а не как файл сентябрьского кэша.
@@ -823,6 +874,53 @@ def selftest():
                 raise AssertionError("новый .py в reports/ принят как результат")
         finally:
             os.chdir(cwd)
+
+    # --- ЦЕЛИ q1 ----------------------------------------------------------
+    with tempfile.TemporaryDirectory() as td:
+        base = os.path.join(td, "q1")
+        rows_q = np.array([0, 2, 5, 7, 9, 11], np.int64)
+        q1_q = (np.arange(6 * 16).reshape(6, 16) % 2048).astype(np.int32)
+        part_q = np.array(["train"] * 2 + ["val_sel"] * 2
+                          + ["val_confirm"] * 2)
+        np.savez_compressed(open(base + ".npz", "wb"), rows=rows_q, q1=q1_q,
+                            part=part_q)
+        def mq(**kw):
+            m = dict(labels_sha1=file_sha(base + ".npz"),
+                     rows_sha1=arr_sha(rows_q), q1_sha1=arr_sha(q1_q),
+                     dtype="int32", n_rows=6,
+                     parts={p_: dict(n_rows=2) for p_ in CANONICAL_PARTS})
+            m.update(kw)
+            return m
+        r_, q_, p_, i_ = load_q1_targets(base, mq())
+        assert q_.dtype == np.int64 and i_["q1_raw_dtype"] == "int32"
+        assert list(r_) == list(rows_q) and list(p_) == list(part_q)
+        # ОТПЕЧАТОК ОТ ПРИВЕДЁННОГО МАССИВА ОТВЕРГАЛ БЫ ПРАВИЛЬНЫЙ КЭШ
+        assert arr_sha(q1_q.astype(np.int64)) != arr_sha(q1_q), \
+            "int32 и int64 обязаны давать разные отпечатки"
+        for kw, why in ((dict(q1_sha1=arr_sha(q1_q.astype(np.int64))),
+                         "не совпали с q1_sha1"),
+                        (dict(rows_sha1="Z"), "rows_sha1"),
+                        (dict(dtype="int64"), "типа"),
+                        (dict(labels_sha1="Z"), "labels_sha1"),
+                        (dict(n_rows=5), "строк"),
+                        (dict(parts={p2: dict(n_rows=3)
+                                     for p2 in CANONICAL_PARTS}),
+                         "в манифесте")):
+            try:
+                load_q1_targets(base, mq(**kw))
+            except SystemExit as e:
+                assert why in str(e), (why, e)
+            else:
+                raise AssertionError(f"цели приняты при {kw}")
+        for k_ in ("labels_sha1", "rows_sha1", "q1_sha1", "dtype", "n_rows",
+                   "parts"):
+            try:
+                load_q1_targets(base, {x: v for x, v in mq().items()
+                                       if x != k_})
+            except SystemExit as e:
+                assert "нет полей" in str(e), (k_, e)
+            else:
+                raise AssertionError(f"манифест целей без {k_} принят")
 
     print("самопроверка k14_common пройдена")
 

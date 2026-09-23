@@ -135,14 +135,20 @@ def main():
     ap.add_argument("--root", default="third_party/actioncodec")
     ap.add_argument("--cfg-path", default="config/eval/bar.yaml")
     ap.add_argument("--variant", default="main")
+    ap.add_argument("--expect-seed", type=int, default=0,
+                    help="§46 зарегистрирован для main/seed0")
     ap.add_argument("--parts", default="train,val_sel,val_confirm")
     ap.add_argument("--device", default="cuda:1")
     ap.add_argument("--dtype", default="float16")
-    ap.add_argument("--dtype-store", default="float16",
+    ap.add_argument("--dtype-store", default="float32",
                     choices=("float16", "float32"),
-                    help="тип хранения h18; float16 допустим только если "
-                         "он не переворачивает ни одного кода q1, и это "
-                         "проверяется на каждом батче")
+                    help="тип хранения h18. КАНОНИЧЕСКИЙ float32: "
+                         "захваченное состояние имеет именно его, а "
+                         "округление до float16 доказуемо сохраняет argmax "
+                         "СТАРОЙ головы, но не гарантирует сохранности "
+                         "слабых признаков, которые могла бы извлечь новая. "
+                         "float16 вдвое компактнее и допустим только для "
+                         "вопроса «что читается из квантованного h18»")
     ap.add_argument("--allow-code-drift", default="")
     ap.add_argument("--allow-dirty", action="store_true")
     ap.add_argument("--out", default="data/k14e/h18")
@@ -277,6 +283,9 @@ def main():
     if str(ck["variant"]) != str(a.variant):
         raise SystemExit(f"чекпойнт варианта {ck['variant']}, запрошен "
                          f"{a.variant}")
+    if int(ck["seed"]) != int(a.expect_seed):
+        raise SystemExit(f"чекпойнт сида {ck['seed']}, а §46 зарегистрирован "
+                         f"для сида {a.expect_seed}")
     st = ck["state"]
     want_ = set(info["names"])
     if set(st) != want_ or set(ck["trainable_names"]) != want_:
@@ -308,7 +317,17 @@ def main():
                 joint_sha1=j_sha,
                 codebooks_sha1=arr_sha(np.asarray(E, np.float32)),
                 cache=a.cache, ckpt=a.ckpt,
-                bar_sha1=sha12(inspect.getfile(SmolVLABlockwiseAR)))
+                bar_sha1=sha12(inspect.getfile(SmolVLABlockwiseAR)),
+                # ТРИ ПОЛЯ СВЕРЯЮТСЯ С МАНИФЕСТОМ ЦЕЛЕЙ, а не только на
+                # наличие: кэш целей и голова обязаны стоять на одном
+                # артефакте гейта и одном кодеке.
+                oracle_sha1=q1_man.get("oracle_sha1"),
+                codec_state_sha1=q1_man.get("codec_state_sha1"),
+                decoder_probe=q1_man.get("decoder_probe"))
+    miss_q1 = [k for k in ("oracle_sha1", "codec_state_sha1",
+                           "decoder_probe") if now_[k] is None]
+    if miss_q1:
+        raise SystemExit(f"в манифесте кэша целей нет полей {miss_q1}")
     bad_pr = [f"{k}: чекпойнт {ck[k]}, сейчас {v}"
               for k, v in now_.items() if str(ck[k]) != str(v)]
     if bad_pr:
@@ -336,10 +355,11 @@ def main():
                         for k, v in hard_.items())
             + ". Назовите файл в --allow-code-drift, если изменение не "
               "влияет на вычисление")
-    for k in arch_:
-        if str(cv_ck[k]) != str(code_v.get(k)):
-            print(f"  ДОПУЩЕНО РАСХОЖДЕНИЕ КОДА: {k} — чекпойнт {cv_ck[k]}, "
-                  f"сейчас {code_v.get(k)}")
+    drifted = {k: dict(checkpoint=cv_ck[k], now=code_v.get(k))
+               for k in arch_ if str(cv_ck[k]) != str(code_v.get(k))}
+    for k, v in drifted.items():
+        print(f"  ДОПУЩЕНО РАСХОЖДЕНИЕ КОДА: {k} — чекпойнт {v['checkpoint']}, "
+              f"сейчас {v['now']}")
     for p_ in model.parameters():
         p_.requires_grad_(False)
     print(f"  обратная связь взята из {a.head_ckpt} (эпоха "
@@ -513,6 +533,8 @@ def main():
         cudnn_deterministic=bool(torch.backends.cudnn.deterministic),
         cudnn_benchmark=bool(torch.backends.cudnn.benchmark),
         git_head=git_head, git_dirty=bool(dirty), code_version=code_v,
+        code_drift=drifted, code_drift_allowed=sorted(drift_ok),
+        checkpoint_code_version=cv_ck,
         script_sha1=sha12(os.path.abspath(__file__)),
         minutes=float((time.time() - t0) / 60), **q0_prov)
     tmpj = a.out + ".manifest.json" + f".tmp.{os.getpid()}"

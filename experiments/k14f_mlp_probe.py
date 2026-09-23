@@ -271,14 +271,24 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--wd", type=float, default=0.0)
     ap.add_argument("--lambda-action", type=float, default=1.0)
+    ap.add_argument("--allow-dirty", action="store_true",
+                    help="разрешить прогон на незакоммиченном коде")
     ap.add_argument("--device", default="cuda:1")
     ap.add_argument("--out", default="reports/k14f/mlp_probe.json")
     a = ap.parse_args()
     if a.selftest:
         selftest()
         return 0
-    if os.path.exists(a.out) and not a.verify_only:
-        raise SystemExit(f"{a.out} уже существует")
+    ck_out = (a.out[:-5] + ".pt") if a.out.endswith(".json") else a.out + ".pt"
+    if not a.verify_only:
+        # КАТАЛОГ И ОТСУТСТВИЕ ОБОИХ ВЫХОДОВ ПРОВЕРЯЮТСЯ ДО ОБУЧЕНИЯ.
+        # Прежде `.pt` сохранялся раньше `makedirs`, и девять прогонов
+        # падали бы в самом конце; существующий `.pt` перезаписывался молча.
+        os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".",
+                    exist_ok=True)
+        for q in (a.out, ck_out):
+            if os.path.exists(q):
+                raise SystemExit(f"{q} уже существует")
 
     here = os.path.dirname(os.path.abspath(__file__))
     root = os.path.abspath(a.root)
@@ -295,7 +305,16 @@ def main():
     from utils import ACTION_Q01, ACTION_Q99, VisionLanguageActionProcessor
 
     H_EXEC = 8
-    git_head, dirty, _ = kc.check_code_clean(True)
+    def code_state():
+        h_, d_, _a = kc.check_code_clean(a.allow_dirty)
+        return h_, kb.code_version([
+            os.path.abspath(__file__),
+            os.path.join(here, "k14_common.py"),
+            os.path.join(here, "depth_rvq_vla.py")]), bool(d_)
+
+    # FAIL-CLOSED. Прежде здесь стояло check_code_clean(True), то есть любой
+    # незакоммиченный код молча принимался.
+    git_head, code_v0, dirty = code_state()
     dev = torch.device(a.device)
 
     man = json.load(open(a.h18 + ".manifest.json"))
@@ -324,34 +343,11 @@ def main():
     q0_c = np.asarray(mt["q0"], np.int64)
     ACT = np.asarray(mt["action"], np.float32)
 
-    # --- (6) КЭШ ЦЕЛЕЙ СВЕРЯЕТСЯ ПО СОДЕРЖИМОМУ ---------------------------
-    # Читать из него `rows` и `q1`, не проверив отпечатков, — тот же
-    # fail-open, что уже трижды правился в этой линии.
-    npz_p = a.q1_cache + ".npz"
-    if sha12(npz_p) != q1_man["labels_sha1"]:
-        raise SystemExit(f"{npz_p} не совпал с labels_sha1 манифеста целей")
-    with np.load(npz_p, allow_pickle=True) as z:
-        t_rows_raw, t_q1_raw = np.asarray(z["rows"]), np.asarray(z["q1"])
-        t_part = z["part"].astype(str)
-    if arr_sha(t_rows_raw.astype(np.int64)) != q1_man["rows_sha1"]:
-        raise SystemExit("строки кэша целей не совпали с rows_sha1")
-    if arr_sha(t_q1_raw.astype(np.int64)) != q1_man["q1_sha1"]:
-        raise SystemExit("цели не совпали с q1_sha1")
-    if str(t_q1_raw.dtype) != str(q1_man["dtype"]):
-        raise SystemExit(f"цели типа {t_q1_raw.dtype}, в манифесте "
-                         f"{q1_man['dtype']}")
-    if t_q1_raw.ndim != 2 or t_q1_raw.shape[0] != t_rows_raw.shape[0]:
-        raise SystemExit(f"формы целей {t_q1_raw.shape} и строк "
-                         f"{t_rows_raw.shape}")
-    for nm_, pm_ in (q1_man.get("parts") or {}).items():
-        got_n = int((t_part == nm_).sum())
-        if int(pm_["n_rows"]) != got_n:
-            raise SystemExit(f"часть {nm_}: {got_n} строк, в манифесте "
-                             f"{pm_['n_rows']}")
-    t_rows = t_rows_raw.astype(np.int64)
-    # ЦЕЛИ ПРИВОДЯТСЯ К int64 ЯВНО: кэш хранит int32, а cross_entropy
-    # требует long, и без этого падала бы уже сверка.
-    t_q1 = t_q1_raw.astype(np.int64)
+    # ЦЕЛИ ЗАГРУЖАЮТСЯ ОБЩИМ СТРОГИМ ЗАГРУЗЧИКОМ. Своя реализация здесь и
+    # дала ошибку: отпечаток считался от приведённого к int64 массива, а
+    # K-14b хеширует то, что записал, — int32. Правильный кэш отвергался бы
+    # всегда. Загрузчик теперь один на всех потребителей.
+    t_rows, t_q1, t_part, t_info = kc.load_q1_targets(a.q1_cache, q1_man)
     pos_of = {int(r): i for i, r in enumerate(t_rows)}
     miss = [int(r) for r in rows if int(r) not in pos_of]
     if miss:
@@ -440,6 +436,19 @@ def main():
     # --- ОБЯЗАТЕЛЬНАЯ СВЕРКА: ЛИНЕЙНАЯ ГОЛОВА НА КЭШЕ -----------------------
     ck = torch.load(man["head_ckpt"], map_location="cpu", weights_only=False)
     st = ck["state"]
+    # ОТПЕЧАТОК БАЗОВОЙ ГОЛОВЫ ПЕРЕСЧИТЫВАЕТСЯ И СВЕРЯЕТСЯ С КЭШЕМ h18:
+    # именно её обратная связь вшита в кэш, и подмена чекпойнта означала бы,
+    # что читается состояние, произведённое другой головой.
+    base_sha = state_sha_np({k: v.detach().float().cpu().numpy()
+                             for k, v in st.items()})
+    if base_sha != str(man["head_state_sha1"]):
+        raise SystemExit(
+            f"базовая голова {man['head_ckpt']} имеет отпечаток {base_sha}, "
+            f"а кэш h18 снят при {man['head_state_sha1']}")
+    if str(ck.get("selected_state_sha1")) != base_sha:
+        raise SystemExit(f"в чекпойнте записан отпечаток "
+                         f"{ck.get('selected_state_sha1')}, фактический "
+                         f"{base_sha}")
     lin = make_head(torch, d_model, V, 0, float(man["norm_eps"])).to(dev)
     with torch.no_grad():
         lin.norm.weight.copy_(st["depth_rvq_norms.0.weight"].float())
@@ -478,6 +487,11 @@ def main():
     tr_slice = tr[np.linspace(0, len(tr) - 1, len(vs)).astype(int)]
     tr_slice = np.unique(tr_slice)
     print(f"  срез train для сравнения: {len(tr_slice)} строк из {len(tr)}")
+    lin_tr = evaluate(lin, tr_slice)
+    print(f"  ЛИНЕЙНАЯ ОПОРА на этом срезе: RMS-8 {lin_tr['rms']:.6f}, "
+          f"top-1 {100 * lin_tr['top1']:.2f}%, CE {lin_tr['ce']:.5f}")
+    print(f"  ЛИНЕЙНАЯ ОПОРА на val_sel:    RMS-8 {got['rms']:.6f}, "
+          f"top-1 {100 * got['top1']:.2f}%")
     results, hist_all = [], {}
     t0 = time.time()
     for hid in hiddens:
@@ -562,6 +576,25 @@ def main():
     print(f"\n  ВЫБРАНО по val_sel: h={pick['hidden']}, сид {pick['seed']}, "
           f"эпоха {pick['epoch']}, val_sel RMS {pick['val_sel']:.6f}, "
           f"top-1 {100 * pick['top1']:.2f}%")
+    # ТРИ ЗАРЕГИСТРИРОВАННЫХ ИСХОДА РАЗЛИЧАЮТСЯ ТОЛЬКО ПАРОЙ СРАВНЕНИЙ.
+    ts = pick["train_slice"]
+    d_tr = lin_tr["top1"] - ts["top1"]
+    d_va = got["top1"] - pick["top1"]
+    print(f"  top-1: train {100 * lin_tr['top1']:.2f}% -> "
+          f"{100 * ts['top1']:.2f}% ({-100 * d_tr:+.2f} п.п.), "
+          f"val_sel {100 * got['top1']:.2f}% -> {100 * pick['top1']:.2f}% "
+          f"({-100 * d_va:+.2f} п.п.)")
+    print(f"  RMS-8: train {lin_tr['rms']:.6f} -> {ts['rms']:.6f}, "
+          f"val_sel {got['rms']:.6f} -> {pick['val_sel']:.6f}")
+
+    # ПЕРЕД ОТКРЫТИЕМ val_confirm КОД СВЕРЯЕТСЯ ЗАНОВО. Прогон идёт часы, и
+    # правка файла посреди него осталась бы незамеченной.
+    git_head1, code_v1, _d1 = code_state()
+    if git_head1 != git_head or code_v1 != code_v0:
+        raise SystemExit(
+            f"код изменился во время прогона: коммит {git_head} -> "
+            f"{git_head1}, файлы "
+            f"{[k for k in code_v0 if code_v0[k] != code_v1.get(k)]}")
 
     head = make_head(torch, d_model, V, pick["hidden"],
                      float(man["norm_eps"])).to(dev)
@@ -581,7 +614,6 @@ def main():
     # а самой головы — нет, и повторить её было бы нечем.
     sel_sha = state_sha_np({k: v.detach().float().cpu().numpy()
                             for k, v in head.state_dict().items()})
-    ck_out = a.out[:-5] + ".pt" if a.out.endswith(".json") else a.out + ".pt"
     ck_d = dict(kind="k14f_head", stage="q1", variant="probe_mlp",
                 state={k: v.detach().cpu()
                        for k, v in head.state_dict().items()},
@@ -614,16 +646,14 @@ def main():
                history=hist_all, verify_linear_on_cache=got,
                expect_rms=a.expect_rms, expect_top1=a.expect_top1,
                confirm_mlp=conf_mlp, confirm_linear=conf_lin,
+               linear_train_slice=lin_tr, linear_val_sel=got,
+               train_slice_rows=int(len(tr_slice)),
                h18_manifest_sha1=sha12(a.h18 + ".manifest.json"),
                h18_sha1=man["h18_sha1"], q1_cache=a.q1_cache,
                epochs=a.epochs, batch=a.batch, lr=a.lr, wd=a.wd,
                lambda_action=a.lambda_action, device=str(dev),
                gpu_uuid=kc.gpu_uuid(dev, torch), git_head=git_head,
-               git_dirty=bool(dirty),
-               code_version=kb.code_version([
-                   os.path.abspath(__file__),
-                   os.path.join(here, "k14_common.py"),
-                   os.path.join(here, "depth_rvq_vla.py")]),
+               git_dirty=bool(dirty), code_version=code_v0,
                script_sha1=sha12(os.path.abspath(__file__)),
                minutes=float((time.time() - t0) / 60))
     os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
