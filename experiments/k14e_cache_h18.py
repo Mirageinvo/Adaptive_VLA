@@ -47,6 +47,20 @@ def sha12(path, chunk=1 << 22):
     return h.hexdigest()[:12]
 
 
+def state_sha(named):
+    """Отпечаток набора именованных тензоров, в фиксированном порядке.
+
+    Та же функция, что в K-14c: отпечаток чекпойнта считается ею, и считать
+    его здесь иначе значило бы сравнивать разные величины.
+    """
+    h = hashlib.sha1()
+    for k in sorted(named):
+        h.update(k.encode())
+        h.update(np.ascontiguousarray(
+            np.asarray(named[k], dtype=np.float64)).tobytes())
+    return h.hexdigest()[:12]
+
+
 def arr_sha(a):
     return hashlib.sha1(
         np.ascontiguousarray(a).tobytes()).hexdigest()[:12]
@@ -93,6 +107,15 @@ def selftest():
     rows = np.concatenate([r for _n, _o, r in plan_of(plan, {"train"})])
     order = np.argsort(rows)
     assert list(rows[order]) == sorted(rows)
+    import importlib.util
+    sp = importlib.util.spec_from_file_location(
+        "_k14c", os.path.join(here, "k14c_train_q1.py"))
+    m = importlib.util.module_from_spec(sp)
+    sp.loader.exec_module(m)
+    ref = dict(a=np.arange(6, dtype=np.float32).reshape(2, 3),
+               b=np.linspace(-1, 1, 4, dtype=np.float32))
+    assert state_sha(ref) == m.state_sha(ref), \
+        "отпечаток весов считается иначе, чем в K-14c"
     print("самопроверка k14e_cache_h18 пройдена")
 
 
@@ -115,6 +138,11 @@ def main():
     ap.add_argument("--parts", default="train,val_sel,val_confirm")
     ap.add_argument("--device", default="cuda:1")
     ap.add_argument("--dtype", default="float16")
+    ap.add_argument("--dtype-store", default="float16",
+                    choices=("float16", "float32"),
+                    help="тип хранения h18; float16 допустим только если "
+                         "он не переворачивает ни одного кода q1, и это "
+                         "проверяется на каждом батче")
     ap.add_argument("--allow-code-drift", default="")
     ap.add_argument("--allow-dirty", action="store_true")
     ap.add_argument("--out", default="data/k14e/h18")
@@ -181,6 +209,22 @@ def main():
         a.q0, gate_r_path=a.gate_r, n_obs=N, keys_sha=keys_sha,
         cache_meta_sha1=k11a.file_sha1(f"{a.cache}.meta.json"))
     plan_all = kc.load_plan(a.q0, q0_man)
+    # РЕЖИМ ВЫЧИСЛЕНИЙ СВЕРЯЕТСЯ С ТЕМ, В КОТОРОМ ПОСТРОЕН q0. Совпадения q0
+    # недостаточно: он argmax и грубее скрытого состояния, ради которого всё
+    # и затевается. Одинаковые коды при слегка разных h18 — ровно тот случай,
+    # который кэш обязан исключить.
+    rt_now = dict(device=str(dev), gpu_uuid=kc.gpu_uuid(dev, torch),
+                  compute_dtype=a.dtype, torch_version=str(torch.__version__),
+                  cuda_version=str(getattr(torch.version, "cuda", None)),
+                  tf32_matmul=bool(torch.backends.cuda.matmul.allow_tf32),
+                  tf32_cudnn=bool(torch.backends.cudnn.allow_tf32),
+                  cudnn_deterministic=bool(torch.backends.cudnn.deterministic),
+                  cudnn_benchmark=bool(torch.backends.cudnn.benchmark))
+    drift = [f"{k}: сейчас {v}, у q0 {q0_man.get(k)}"
+             for k, v in rt_now.items() if str(q0_man.get(k)) != str(v)]
+    if drift:
+        raise SystemExit("кэш h18 строился бы в другом режиме, чем q0: "
+                         + "; ".join(drift))
     plan = plan_of(plan_all, set(parts_want))
     rows_all = np.sort(np.concatenate([r for _n, _o, r in plan]))
     if len(np.unique(rows_all)) != len(rows_all):
@@ -220,18 +264,82 @@ def main():
 
     # --- ОБРАТНАЯ СВЯЗЬ ИЗ ЧЕКПОЙНТА: она входит в h18 -----------------------
     ck = torch.load(a.head_ckpt, map_location="cpu", weights_only=False)
+    need_ck = ("stage", "variant", "seed", "state", "trainable_names",
+               "selected_state_sha1", "q0_prov", "code_version", "bar_sha1",
+               "q1_cache_sha1", "q1_manifest_sha1", "oracle_sha1",
+               "joint_sha1", "codebooks_sha1", "codec_state_sha1",
+               "decoder_probe", "cache", "ckpt")
+    miss_ck = [k for k in need_ck if ck.get(k) is None]
+    if miss_ck:
+        raise SystemExit(f"в чекпойнте нет полей {miss_ck}")
+    if str(ck["stage"]) != "q1":
+        raise SystemExit(f"чекпойнт этапа {ck['stage']}")
+    if str(ck["variant"]) != str(a.variant):
+        raise SystemExit(f"чекпойнт варианта {ck['variant']}, запрошен "
+                         f"{a.variant}")
     st = ck["state"]
-    if set(st) != set(info["names"]):
-        raise SystemExit("белый список чекпойнта не совпадает с этапом")
+    want_ = set(info["names"])
+    if set(st) != want_ or set(ck["trainable_names"]) != want_:
+        raise SystemExit(
+            f"белый список чекпойнта не совпадает с этапом: лишние "
+            f"{sorted(set(st) - want_)[:5]}, нет {sorted(want_ - set(st))[:5]}")
     own = dict(model.named_parameters())
     with torch.no_grad():
         for k, v in st.items():
+            if tuple(own[k].shape) != tuple(v.shape):
+                raise SystemExit(f"форма {k}: {tuple(v.shape)} против "
+                                 f"{tuple(own[k].shape)}")
+            if not torch.isfinite(v).all():
+                raise SystemExit(f"в {k} есть nan или inf")
             own[k].data.copy_(v.to(own[k].device, own[k].dtype))
+    got_sha = state_sha({k: own[k].detach().float().cpu().numpy()
+                              for k in want_})
+    if got_sha != ck["selected_state_sha1"]:
+        raise SystemExit(f"после загрузки веса имеют отпечаток {got_sha}, в "
+                         f"чекпойнте {ck['selected_state_sha1']}")
     bad_p = [k for k in ("q0_manifest_sha1", "q0_npz_sha1", "plan_sha1",
-                         "gate_r_sha1")
+                         "gate_r_sha1", "q0_run_id", "plan_batch")
              if str((ck.get("q0_prov") or {}).get(k)) != str(q0_prov.get(k))]
     if bad_p:
         raise SystemExit(f"чекпойнт обучен на другом черновике: {bad_p}")
+    q1_man = json.load(open(a.q1_cache + ".manifest.json"))
+    now_ = dict(q1_cache_sha1=q1_man["labels_sha1"],
+                q1_manifest_sha1=sha12(a.q1_cache + ".manifest.json"),
+                joint_sha1=j_sha,
+                codebooks_sha1=arr_sha(np.asarray(E, np.float32)),
+                cache=a.cache, ckpt=a.ckpt,
+                bar_sha1=sha12(inspect.getfile(SmolVLABlockwiseAR)))
+    bad_pr = [f"{k}: чекпойнт {ck[k]}, сейчас {v}"
+              for k, v in now_.items() if str(ck[k]) != str(v)]
+    if bad_pr:
+        raise SystemExit("голова обучена в другой обстановке: "
+                         + "; ".join(bad_pr))
+    # ДРЕЙФ АРХИТЕКТУРНОГО КОДА. Аргумент был объявлен и не использовался,
+    # то есть проверки дрейфа фактически не было вовсе.
+    drift_ok = set(x.strip() for x in a.allow_code_drift.split(",")
+                   if x.strip())
+    arch_ = ("depth_rvq_joint12.py", "depth_rvq_vla.py", "joint12_vla.py",
+             "k14_common.py")
+    unknown_ = drift_ok - set(arch_)
+    if unknown_:
+        raise SystemExit(f"--allow-code-drift вне списка: {sorted(unknown_)}")
+    cv_ck = ck["code_version"]
+    miss_cv = [k for k in arch_ if cv_ck.get(k) is None]
+    if miss_cv:
+        raise SystemExit(f"в code_version чекпойнта нет {miss_cv}")
+    hard_ = {k: (cv_ck[k], code_v.get(k)) for k in arch_
+             if str(cv_ck[k]) != str(code_v.get(k)) and k not in drift_ok}
+    if hard_:
+        raise SystemExit(
+            "архитектурный код изменился с момента обучения головы: "
+            + "; ".join(f"{k}: чекпойнт {v[0]}, сейчас {v[1]}"
+                        for k, v in hard_.items())
+            + ". Назовите файл в --allow-code-drift, если изменение не "
+              "влияет на вычисление")
+    for k in arch_:
+        if str(cv_ck[k]) != str(code_v.get(k)):
+            print(f"  ДОПУЩЕНО РАСХОЖДЕНИЕ КОДА: {k} — чекпойнт {cv_ck[k]}, "
+                  f"сейчас {code_v.get(k)}")
     for p_ in model.parameters():
         p_.requires_grad_(False)
     print(f"  обратная связь взята из {a.head_ckpt} (эпоха "
@@ -266,12 +374,22 @@ def main():
     d_model = int(model.fast_head.in_features)
     n_pos = int(model.block_size)
     print(f"  d_model {d_model}, позиций {n_pos}; кэш будет "
-          f"{len(rows_all) * n_pos * d_model * 2 / 2 ** 30:.1f} ГиБ")
+          f"{len(rows_all) * n_pos * d_model * (2 if a.dtype_store == 'float16' else 4) / 2 ** 30:.1f}"
+          f" ГиБ ({a.dtype_store})")
 
     pos = {int(r): i for i, r in enumerate(rows_all)}
     tmp = a.out + f".h18.npy.tmp.{os.getpid()}"
     os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
-    H = np.lib.format.open_memmap(tmp, mode="w+", dtype=np.float16,
+    need_b = len(rows_all) * n_pos * d_model * (
+        2 if a.dtype_store == "float16" else 4)
+    free_b = __import__("shutil").disk_usage(
+        os.path.dirname(os.path.abspath(a.out)) or ".").free
+    if free_b < need_b * 1.15:
+        raise SystemExit(f"нужно {need_b / 2 ** 30:.1f} ГиБ, свободно "
+                         f"{free_b / 2 ** 30:.1f}")
+    store_np = np.float16 if a.dtype_store == "float16" else np.float32
+    store_t = torch.float16 if a.dtype_store == "float16" else torch.float32
+    H = np.lib.format.open_memmap(tmp, mode="w+", dtype=store_np,
                                   shape=(len(rows_all), n_pos, d_model))
     filled = np.zeros(len(rows_all), bool)
 
@@ -296,6 +414,8 @@ def main():
     ac16 = torch.autocast(device_type=dev.type, dtype=dt)
     t0 = time.time()
     q0_bad = 0
+    n_lossy = 0
+    q1_sum = hashlib.sha1()
     with torch.no_grad():
         for k_, (nm_, po_, sel_) in enumerate(plan):
             b = build(po_, sel_)
@@ -316,8 +436,28 @@ def main():
             h = grabbed.pop("h")
             if tuple(h.shape) != (len(sel_), n_pos, d_model):
                 raise SystemExit(f"h имеет форму {tuple(h.shape)}")
+            if not torch.isfinite(h).all():
+                raise SystemExit(f"в h18 батча {k_} есть nan или inf")
+            # --- ХРАНЕНИЕ В fp16 ДОКАЗЫВАЕТСЯ, А НЕ ПРЕДПОЛАГАЕТСЯ ---------
+            # Хук стоит ПОСЛЕ приведения к типу нормы, то есть h здесь fp32.
+            # Прямой проход идёт в fp16, поэтому округление скорее всего
+            # ничего не теряет — но «скорее всего» тут недостаточно: если
+            # оно меняет хотя бы один код, кэш окажется не тем состоянием,
+            # на котором обучалась голова. Проверяется побитово И по кодам.
+            h16 = h.to(store_t)
+            n_lossy += int((h16.to(h.dtype) != h).sum())
+            lg16 = model.depth_rvq_heads[0](
+                model.depth_rvq_norms[0](h16.float()))
+            q1_live = out["logits"][1].argmax(-1)
+            n_flip = int((lg16.argmax(-1) != q1_live).sum())
+            if n_flip:
+                raise SystemExit(
+                    f"хранение в fp16 меняет {n_flip} кодов q1 на батче "
+                    f"{k_} части {nm_}: кэш был бы не тем состоянием. "
+                    f"Пересоберите с --dtype-store float32")
+            q1_sum.update(q1_live.cpu().numpy().astype(np.int32).tobytes())
             ii = np.array([pos[int(r)] for r in sel_])
-            H[ii] = h.to(torch.float16).cpu().numpy()
+            H[ii] = h16.cpu().numpy()
             filled[ii] = True
             if k_ % 1000 == 0:
                 el = (time.time() - t0) / 60
@@ -330,7 +470,10 @@ def main():
         raise SystemExit("в начале кэша есть nan или inf")
     H.flush()
     del H
-    os.replace(tmp, a.out + ".h18.npy")
+    print(f"  {a.dtype_store}: неточных значений {n_lossy} из "
+          f"{len(rows_all) * n_pos * d_model}, перевёрнутых кодов q1 — 0")
+    print(f"  отпечаток предсказанных q1 живого прохода: "
+          f"{q1_sum.hexdigest()[:12]}")
 
     part_of = np.empty(len(rows_all), object)
     for nm_, _po, sel_ in plan:
@@ -344,14 +487,13 @@ def main():
                             action=ACT[rows_all].astype(np.float32),
                             pos_offset=offs[rows_all].astype(np.int64),
                             episode=epi[rows_all].astype(np.int64))
-    os.replace(tmpm, mp)
-
     man = dict(
         kind="k14_h18_cache", parts=list(parts_want),
         norm_class=norm_class, norm_eps=norm_eps, norm_shapes=norm_shapes,
         n_rows=int(len(rows_all)), n_pos=n_pos, d_model=d_model,
-        dtype="float16", rows_sha1=arr_sha(rows_all),
-        h18_sha1=sha12(a.out + ".h18.npy"), meta_sha1=sha12(mp),
+        dtype=a.dtype_store, rows_sha1=arr_sha(rows_all),
+        h18_sha1=sha12(tmp), meta_sha1=sha12(tmpm),
+        q1_live_sha1=q1_sum.hexdigest()[:12], fp16_lossy_values=int(n_lossy),
         head_ckpt=a.head_ckpt, head_state_sha1=ck.get("selected_state_sha1"),
         head_epoch=ck.get("selected_epoch"), variant=a.variant,
         feedback_baked_in=True, trainable_names=list(info["names"]),
@@ -375,7 +517,16 @@ def main():
         minutes=float((time.time() - t0) / 60), **q0_prov)
     tmpj = a.out + ".manifest.json" + f".tmp.{os.getpid()}"
     json.dump(man, open(tmpj, "w"), ensure_ascii=False, indent=1, default=str)
-    os.replace(tmpj, a.out + ".manifest.json")
+    # ВСЕ ТРИ ФАЙЛА ПУБЛИКУЮТСЯ ТОЛЬКО ЗДЕСЬ. Прежний порядок выкладывал
+    # массив до манифеста: падение между ними оставляло неполную пару, а
+    # повторный запуск упирался в проверку существования и требовал ручной
+    # уборки после полутора часов счёта.
+    for src_, dst_ in ((tmp, a.out + ".h18.npy"), (tmpm, mp),
+                       (tmpj, a.out + ".manifest.json")):
+        os.replace(src_, dst_)
+    if sha12(a.out + ".h18.npy") != man["h18_sha1"] \
+            or sha12(mp) != man["meta_sha1"]:
+        raise SystemExit("после публикации отпечатки разошлись")
     print(f"\n  сохранено: {a.out}.h18.npy, {mp}, {a.out}.manifest.json")
     print(f"  q0 совпал с каноническим на всех {len(rows_all)} строках")
     print(f"  {(time.time() - t0) / 60:.1f} мин")

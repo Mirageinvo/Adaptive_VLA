@@ -47,6 +47,16 @@ def arr_sha(a):
     return hashlib.sha1(np.ascontiguousarray(a).tobytes()).hexdigest()[:12]
 
 
+def state_sha_np(named):
+    """Отпечаток именованных тензоров — та же функция, что в K-14c и K-14e."""
+    h = hashlib.sha1()
+    for k in sorted(named):
+        h.update(k.encode())
+        h.update(np.ascontiguousarray(
+            np.asarray(named[k], dtype=np.float64)).tobytes())
+    return h.hexdigest()[:12]
+
+
 def make_rms_norm(torch):
     """RMSNorm, воспроизведённая явно; правильность доказывается сверкой.
 
@@ -137,7 +147,7 @@ def check_manifest(man, *, q1_man, need_parts):
     if absent:
         raise SystemExit(f"в кэше нет частей {absent}")
     bad = [k for k in ("codebooks_sha1", "keys_sha1", "plan_sha1",
-                       "q0_npz_sha1", "gate_r_sha1")
+                       "q0_npz_sha1", "gate_r_sha1", "q0_manifest_sha1")
            if str(man[k]) != str(q1_man.get(k))]
     if bad:
         raise SystemExit(f"кэш h18 и кэш целей расходятся по {bad}")
@@ -192,12 +202,12 @@ def selftest():
 
     # --- СВЕРКА МАНИФЕСТОВ -------------------------------------------------
     q1m = dict(codebooks_sha1="CB", keys_sha1="KS", plan_sha1="PL",
-               q0_npz_sha1="QN", gate_r_sha1="GR")
+               q0_npz_sha1="QN", gate_r_sha1="GR", q0_manifest_sha1="QM")
     man = dict(kind="k14_h18_cache", parts=["train", "val_sel"], n_rows=10,
                n_pos=16, d_model=8, dtype="float16", rows_sha1="R",
                h18_sha1="H", meta_sha1="M", norm_class="RMSNorm",
                norm_eps=1e-5, head_ckpt="c.pt", head_state_sha1="S",
-               feedback_baked_in=True, q0_manifest_sha1="QM", **q1m)
+               feedback_baked_in=True, **q1m)
     assert check_manifest(man, q1_man=q1m, need_parts=("train", "val_sel"))
     for patch, why in (({"kind": "x"}, "описывает"),
                        ({"feedback_baked_in": False}, "вшитой"),
@@ -226,6 +236,16 @@ def selftest():
                 or "вшитой" in str(e), (k, e)
         else:
             raise AssertionError(f"манифест без {k} принят")
+    import importlib.util, os as _os
+    _h = _os.path.dirname(_os.path.abspath(__file__))
+    sp = importlib.util.spec_from_file_location(
+        "_k14c", _os.path.join(_h, "k14c_train_q1.py"))
+    m = importlib.util.module_from_spec(sp)
+    sp.loader.exec_module(m)
+    ref = dict(a=np.arange(6, dtype=np.float32).reshape(2, 3),
+               b=np.linspace(-1, 1, 4, dtype=np.float32))
+    assert state_sha_np(ref) == m.state_sha(ref), \
+        "отпечаток весов считается иначе, чем в K-14c"
     print("самопроверка k14f_mlp_probe пройдена")
 
 
@@ -304,14 +324,40 @@ def main():
     q0_c = np.asarray(mt["q0"], np.int64)
     ACT = np.asarray(mt["action"], np.float32)
 
-    with np.load(a.q1_cache + ".npz", allow_pickle=True) as z:
-        t_rows = np.asarray(z["rows"], np.int64)
-        t_q1 = np.asarray(z["q1"], np.int64)
+    # --- (6) КЭШ ЦЕЛЕЙ СВЕРЯЕТСЯ ПО СОДЕРЖИМОМУ ---------------------------
+    # Читать из него `rows` и `q1`, не проверив отпечатков, — тот же
+    # fail-open, что уже трижды правился в этой линии.
+    npz_p = a.q1_cache + ".npz"
+    if sha12(npz_p) != q1_man["labels_sha1"]:
+        raise SystemExit(f"{npz_p} не совпал с labels_sha1 манифеста целей")
+    with np.load(npz_p, allow_pickle=True) as z:
+        t_rows_raw, t_q1_raw = np.asarray(z["rows"]), np.asarray(z["q1"])
+        t_part = z["part"].astype(str)
+    if arr_sha(t_rows_raw.astype(np.int64)) != q1_man["rows_sha1"]:
+        raise SystemExit("строки кэша целей не совпали с rows_sha1")
+    if arr_sha(t_q1_raw.astype(np.int64)) != q1_man["q1_sha1"]:
+        raise SystemExit("цели не совпали с q1_sha1")
+    if str(t_q1_raw.dtype) != str(q1_man["dtype"]):
+        raise SystemExit(f"цели типа {t_q1_raw.dtype}, в манифесте "
+                         f"{q1_man['dtype']}")
+    if t_q1_raw.ndim != 2 or t_q1_raw.shape[0] != t_rows_raw.shape[0]:
+        raise SystemExit(f"формы целей {t_q1_raw.shape} и строк "
+                         f"{t_rows_raw.shape}")
+    for nm_, pm_ in (q1_man.get("parts") or {}).items():
+        got_n = int((t_part == nm_).sum())
+        if int(pm_["n_rows"]) != got_n:
+            raise SystemExit(f"часть {nm_}: {got_n} строк, в манифесте "
+                             f"{pm_['n_rows']}")
+    t_rows = t_rows_raw.astype(np.int64)
+    # ЦЕЛИ ПРИВОДЯТСЯ К int64 ЯВНО: кэш хранит int32, а cross_entropy
+    # требует long, и без этого падала бы уже сверка.
+    t_q1 = t_q1_raw.astype(np.int64)
     pos_of = {int(r): i for i, r in enumerate(t_rows)}
     miss = [int(r) for r in rows if int(r) not in pos_of]
     if miss:
         raise SystemExit(f"{len(miss)} строк кэша нет в кэше целей")
-    TG = t_q1[[pos_of[int(r)] for r in rows]]
+    TG = np.ascontiguousarray(t_q1[[pos_of[int(r)] for r in rows]],
+                              dtype=np.int64)
 
     E = np.load(f"{a.cache}.codebooks.npy")
     if arr_sha(np.asarray(E, np.float32)) != man["codebooks_sha1"]:
@@ -319,11 +365,35 @@ def main():
     books = torch.from_numpy(np.asarray(E, np.float32)).to(dev)
     V = int(books.shape[1])
 
+    if int(TG.min()) < 0 or int(TG.max()) >= V:
+        raise SystemExit(f"коды целей в диапазоне [{TG.min()}, {TG.max()}] "
+                         f"при словаре {V}")
+    if int(q0_c.min()) < 0 or int(q0_c.max()) >= V:
+        raise SystemExit("коды q0 вне словаря")
+
     proc = VisionLanguageActionProcessor.from_pretrained(
         a.ckpt, trust_remote_code=True, mode="discrete")
     codec = proc.action_processor.to(dev).eval()
     for p_ in codec.parameters():
         p_.requires_grad_(False)
+    # ЧЕРЕЗ ДЕКОДЕР ИДЁТ ПОТЕРЯ ДЕЙСТВИЯ И ЕЁ ГРАДИЕНТ. Совпадения итогового
+    # RMS недостаточно: разные локальные ошибки дают почти одинаковое
+    # среднее. Сверяются состояние кодека и проба декодера — те же величины,
+    # что заверены в кэше целей.
+    import k11a_build_hicora_cache as k11a
+    cs_now = k11a.state_sha1(codec)
+    dp_now = k11a.decoder_probe(codec, books.float(), dev)
+    bad_c = []
+    if str(cs_now) != str(q1_man.get("codec_state_sha1")):
+        bad_c.append(f"состояние кодека {cs_now} против "
+                     f"{q1_man.get('codec_state_sha1')}")
+    if str(dp_now) != str(q1_man.get("decoder_probe")):
+        bad_c.append(f"проба декодера {dp_now} против "
+                     f"{q1_man.get('decoder_probe')}")
+    if bad_c:
+        raise SystemExit("декодер не тот, на котором построены цели: "
+                         + "; ".join(bad_c))
+    print(f"  декодер заверен: состояние {cs_now}, проба {dp_now}")
     max_act_q = np.maximum(np.abs(ACTION_Q01), np.abs(ACTION_Q99))
     wq = torch.as_tensor(max_act_q[:7], device=dev,
                          dtype=torch.float32).clone()
@@ -402,6 +472,12 @@ def main():
     hiddens = [int(x) for x in a.hidden.split(",") if x.strip()]
     seeds = [int(x) for x in a.seeds.split(",") if x.strip()]
     tr, vc = idx_of["train"], idx_of["val_confirm"]
+    # СРЕЗ train РАВНОМЕРНЫЙ ПО ВСЕМУ НАБОРУ, а не первые N строк: строки
+    # упорядочены по глобальному индексу, то есть по эпизодам, и первые
+    # 5795 были бы другим набором задач, а не случайной частью.
+    tr_slice = tr[np.linspace(0, len(tr) - 1, len(vs)).astype(int)]
+    tr_slice = np.unique(tr_slice)
+    print(f"  срез train для сравнения: {len(tr_slice)} строк из {len(tr)}")
     results, hist_all = [], {}
     t0 = time.time()
     for hid in hiddens:
@@ -438,6 +514,21 @@ def main():
                         raise SystemExit(f"потеря не число на эпохе {ep}")
                     opt.zero_grad(set_to_none=True)
                     loss.backward()
+                    if ep == 1 and nb == 0:
+                        # ГРАДИЕНТ ОБЯЗАН ДОЙТИ ДО КАЖДОГО ПАРАМЕТРА И БЫТЬ
+                        # КОНЕЧНЫМ. Отсутствующий означает, что часть головы
+                        # в потере не участвует, и обучается не то, что
+                        # заявлено.
+                        nog = [n_ for n_, p2 in head.named_parameters()
+                               if p2.grad is None]
+                        nf = [n_ for n_, p2 in head.named_parameters()
+                              if p2.grad is not None
+                              and not torch.isfinite(p2.grad).all()]
+                        if nog or nf:
+                            raise SystemExit(f"градиенты: нет у {nog[:3]}, "
+                                             f"нечисловые у {nf[:3]}")
+                        print(f"    h={hid} сид {sd}: градиент есть у всех "
+                              f"{len(list(head.parameters()))} тензоров")
                     opt.step()
                     run += float(loss.detach()); nb += 1
                 ev = evaluate(head, vs)
@@ -452,8 +543,18 @@ def main():
                       f"{run / max(nb, 1):.5f}, val_sel RMS {ev['rms']:.6f}, "
                       f"top-1 {100 * ev['top1']:.2f}% "
                       f"({(time.time() - t0) / 60:.1f} мин)", flush=True)
-            tr_ev = evaluate(head, tr[:len(vs)])
-            best["train_slice"] = tr_ev
+            # ВЕСА ВОЗВРАЩАЮТСЯ К ВЫБРАННОЙ ЭПОХЕ ДО ЛЮБЫХ ИЗМЕРЕНИЙ.
+            # После цикла в голове лежит последняя эпоха, а выбрана могла
+            # быть ранняя: тогда «вырос ли train» относилось бы не к той
+            # модели, которую выбрали.
+            head.load_state_dict(best["state"])
+            re_val = evaluate(head, vs)
+            if abs(re_val["rms"] - best["val_sel"]) > 1e-9:
+                raise SystemExit(
+                    f"после восстановления эпохи {best['epoch']} val_sel "
+                    f"{re_val['rms']:.9f} против сохранённого "
+                    f"{best['val_sel']:.9f}")
+            best["train_slice"] = evaluate(head, tr_slice)
             hist_all[f"h{hid}_s{sd}"] = hist
             results.append(best)
 
@@ -475,7 +576,37 @@ def main():
     print(f"    разность {conf_lin['rms'] - conf_mlp['rms']:+.6f} "
           f"(положительная — MLP лучше)")
 
-    out = dict(kind="k14f_mlp_probe", note="post-hoc проверка на повторно "
+    # --- ВЕСА ВЫБРАННОЙ ГОЛОВЫ СОХРАНЯЮТСЯ -------------------------------
+    # Иначе при хорошем результате от него остались бы только числа в json,
+    # а самой головы — нет, и повторить её было бы нечем.
+    sel_sha = state_sha_np({k: v.detach().float().cpu().numpy()
+                            for k, v in head.state_dict().items()})
+    ck_out = a.out[:-5] + ".pt" if a.out.endswith(".json") else a.out + ".pt"
+    ck_d = dict(kind="k14f_head", stage="q1", variant="probe_mlp",
+                state={k: v.detach().cpu()
+                       for k, v in head.state_dict().items()},
+                hidden=pick["hidden"], seed=pick["seed"], epoch=pick["epoch"],
+                n_params=pick["n_params"], selected_state_sha1=sel_sha,
+                norm_eps=float(man["norm_eps"]), d_model=d_model, vocab=V,
+                val_sel=pick["val_sel"], val_confirm=conf_mlp["rms"],
+                confirm_linear=conf_lin["rms"],
+                h18_sha1=man["h18_sha1"],
+                h18_manifest_sha1=sha12(a.h18 + ".manifest.json"),
+                q1_cache=a.q1_cache, q1_cache_sha1=q1_man["labels_sha1"],
+                base_head_ckpt=man["head_ckpt"],
+                base_head_state_sha1=man["head_state_sha1"],
+                epochs=a.epochs, batch=a.batch, lr=a.lr, wd=a.wd,
+                lambda_action=a.lambda_action,
+                note="post-hoc; val_confirm повторно использована",
+                git_head=git_head, script_sha1=sha12(os.path.abspath(__file__)))
+    tmp_ck = ck_out + f".tmp.{os.getpid()}"
+    torch.save(ck_d, tmp_ck)
+    os.replace(tmp_ck, ck_out)
+    print(f"  веса выбранной головы: {ck_out} (отпечаток {sel_sha})")
+
+    out = dict(kind="k14f_mlp_probe", selected_head=ck_out,
+               selected_state_sha1=sel_sha,
+               note="post-hoc проверка на повторно "
                "использованной val_confirm, не независимое подтверждение",
                results=[{k: v for k, v in r.items() if k != "state"}
                         for r in results],
