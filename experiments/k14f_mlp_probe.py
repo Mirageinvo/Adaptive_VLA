@@ -134,7 +134,8 @@ def check_manifest(man, *, q1_man, need_parts):
             "rows_sha1", "h18_sha1", "meta_sha1", "norm_class", "norm_eps",
             "head_ckpt", "head_state_sha1", "feedback_baked_in",
             "codebooks_sha1", "keys_sha1", "q0_npz_sha1", "plan_sha1",
-            "gate_r_sha1", "q0_manifest_sha1")
+            "gate_r_sha1", "q0_manifest_sha1", "q1_cache_sha1",
+            "q1_manifest_sha1")
     miss = [k for k in need if man.get(k) is None]
     if miss:
         raise SystemExit(f"в манифесте кэша h18 нет полей {miss}")
@@ -207,7 +208,8 @@ def selftest():
                n_pos=16, d_model=8, dtype="float16", rows_sha1="R",
                h18_sha1="H", meta_sha1="M", norm_class="RMSNorm",
                norm_eps=1e-5, head_ckpt="c.pt", head_state_sha1="S",
-               feedback_baked_in=True, **q1m)
+               feedback_baked_in=True, q1_cache_sha1="L",
+               q1_manifest_sha1="QMAN", **q1m)
     assert check_manifest(man, q1_man=q1m, need_parts=("train", "val_sel"))
     for patch, why in (({"kind": "x"}, "описывает"),
                        ({"feedback_baked_in": False}, "вшитой"),
@@ -449,6 +451,22 @@ def main():
         raise SystemExit(f"в чекпойнте записан отпечаток "
                          f"{ck.get('selected_state_sha1')}, фактический "
                          f"{base_sha}")
+    # КЭШ ЦЕЛЕЙ СВЕРЯЕТСЯ С ТЕМ, НА КОТОРОМ ОБУЧЕНА БАЗОВАЯ ГОЛОВА И СНЯТ
+    # КЭШ СОСТОЯНИЙ. Без этого пару npz+манифест можно было бы подменить
+    # между K-14e и пробой, сохранив тот же q0, план и книги: голова читала
+    # бы состояния от одной разметки, а целилась бы в другую.
+    q1_man_sha = sha12(a.q1_cache + ".manifest.json")
+    for who, d_ in (("базовая голова", ck), ("кэш h18", man)):
+        for k_, v_ in (("q1_cache_sha1", q1_man["labels_sha1"]),
+                       ("q1_manifest_sha1", q1_man_sha)):
+            if d_.get(k_) is None:
+                raise SystemExit(f"в {who} нет поля {k_}")
+            if str(d_[k_]) != str(v_):
+                raise SystemExit(
+                    f"{who}: {k_} = {d_[k_]}, а поданный кэш целей даёт "
+                    f"{v_}. Это другая разметка")
+    print(f"  кэш целей сверен с базовой головой и кэшем h18: "
+          f"{q1_man['labels_sha1']}, манифест {q1_man_sha}")
     lin = make_head(torch, d_model, V, 0, float(man["norm_eps"])).to(dev)
     with torch.no_grad():
         lin.norm.weight.copy_(st["depth_rvq_norms.0.weight"].float())

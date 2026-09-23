@@ -518,6 +518,12 @@ def main():
         head_epoch=ck.get("selected_epoch"), variant=a.variant,
         feedback_baked_in=True, trainable_names=list(info["names"]),
         cache=a.cache, cache_meta_sha1=k11a.file_sha1(f"{a.cache}.meta.json"),
+        # КЭШ ЦЕЛЕЙ ЗАПИСЫВАЕТСЯ В МАНИФЕСТ, а не только проверяется здесь:
+        # иначе пару npz+манифест можно было бы подменить между сборкой кэша
+        # состояний и пробой, сохранив тот же q0, план и книги.
+        q1_cache_sha1=now_["q1_cache_sha1"],
+        q1_manifest_sha1=now_["q1_manifest_sha1"],
+        oracle_sha1=now_["oracle_sha1"],
         codebooks_sha1=arr_sha(np.asarray(E, np.float32)),
         source_cache=src, source_cache_sha1=sha12(src), keys_sha1=keys_sha,
         images_sha1=sha12(img_p), state_npy_sha1=st_shas["state_npy"],
