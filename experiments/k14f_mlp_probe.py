@@ -307,16 +307,24 @@ def main():
     from utils import ACTION_Q01, ACTION_Q99, VisionLanguageActionProcessor
 
     H_EXEC = 8
-    def code_state():
-        h_, d_, _a = kc.check_code_clean(a.allow_dirty)
-        return h_, kb.code_version([
-            os.path.abspath(__file__),
-            os.path.join(here, "k14_common.py"),
-            os.path.join(here, "depth_rvq_vla.py")]), bool(d_)
+    CODE_FILES = [os.path.abspath(__file__),
+                  os.path.join(here, "k14_common.py"),
+                  os.path.join(here, "depth_rvq_vla.py")]
 
-    # FAIL-CLOSED. Прежде здесь стояло check_code_clean(True), то есть любой
-    # незакоммиченный код молча принимался.
-    git_head, code_v0, dirty = code_state()
+    def code_state(strict):
+        """Снимок кода. `strict` отказывает при грязном дереве, иначе нет.
+
+        В НАЧАЛЕ СТРОГО, В КОНЦЕ НЕТ — и это не послабление, а условие того,
+        чтобы отказ вообще случился. Прежде снимок в конце тоже отказывал при
+        грязном дереве, то есть падал ДО сравнения версий и до сохранения
+        результатов: любой новый файл рядом стоил бы всех часов счёта, ради
+        защиты которых сохранение и заводилось.
+        """
+        h_, d_, _a = kc.check_code_clean(a.allow_dirty if strict else True)
+        return h_, kb.code_version(CODE_FILES), bool(d_)
+
+    git_head, code_v0, dirty = code_state(True)
+    script_sha_0 = sha12(os.path.abspath(__file__))
     dev = torch.device(a.device)
 
     man = json.load(open(a.h18 + ".manifest.json"))
@@ -509,7 +517,7 @@ def main():
                  history=hist_all, verify_linear_on_cache=got,
                  linear_train_slice=lin_tr, linear_val_sel=got,
                  h18_sha1=man["h18_sha1"], git_head=git_head,
-                 script_sha1=sha12(os.path.abspath(__file__)), **extra)
+                 script_sha1=script_sha_0, **extra)
         os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".",
                     exist_ok=True)
         t_ = a.out + f".tmp.{os.getpid()}"
@@ -518,9 +526,16 @@ def main():
         print(f"  сохранено (без подтверждения): {a.out}")
         if sel is not None and "state" in sel:
             t2 = ck_out + f".tmp.{os.getpid()}"
+            sha_ = state_sha_np({k: v.detach().float().cpu().numpy()
+                                 for k, v in sel["state"].items()})
             torch.save(dict(kind="k14f_head_unconfirmed", state=sel["state"],
                             hidden=sel["hidden"], seed=sel["seed"],
                             epoch=sel["epoch"], val_sel=sel["val_sel"],
+                            selected_state_sha1=sha_,
+                            n_params=sel.get("n_params"),
+                            d_model=d_model, vocab=V,
+                            norm_eps=float(man["norm_eps"]),
+                            h18_sha1=man["h18_sha1"],
                             outcome=outcome, **extra), t2)
             os.replace(t2, ck_out)
             print(f"  веса сохранены как неподтверждённые: {ck_out}")
@@ -637,8 +652,11 @@ def main():
 
     # ПЕРЕД ОТКРЫТИЕМ val_confirm КОД СВЕРЯЕТСЯ ЗАНОВО. Прогон идёт часы, и
     # правка файла посреди него осталась бы незамеченной.
-    git_head1, code_v1, _d1 = code_state()
-    changed = [k for k in code_v0 if code_v0[k] != code_v1.get(k)]
+    git_head1, code_v1, _d1 = code_state(False)
+    # СИММЕТРИЧНО ПО КЛЮЧАМ: появившийся или исчезнувший файл — тоже
+    # изменение, а односторонний перебор его бы не заметил.
+    changed = sorted(k for k in set(code_v0) | set(code_v1)
+                     if code_v0.get(k) != code_v1.get(k))
     if changed:
         # ОТКАЗ СТОИТ РОВНО ТОГО, ЧТО ЗАЩИЩАЕТ. Защищается одноразовая
         # подтверждающая половина, а не часы обучения: выбранные веса и все
@@ -648,7 +666,10 @@ def main():
               f"сохраняются как неподтверждённые")
         save_partial(results, pick, "code_changed_during_run",
                      dict(git_head_start=git_head, git_head_end=git_head1,
-                          code_version_end=code_v1, changed=changed))
+                          code_version_start=code_v0,
+                          code_version_end=code_v1, changed=changed,
+                          script_sha1_start=script_sha_0,
+                          script_sha1_end=sha12(os.path.abspath(__file__))))
         return 5
     if git_head1 != git_head:
         # СМЕНА КОММИТА БЕЗ СМЕНЫ ФАЙЛОВ — НЕ ПОВОД ОТКАЗЫВАТЬ. Проверка
@@ -718,8 +739,9 @@ def main():
                lambda_action=a.lambda_action, device=str(dev),
                gpu_uuid=kc.gpu_uuid(dev, torch), git_head=git_head,
                git_dirty=bool(dirty), code_version=code_v0,
-               git_head_end=git_head1,
-               script_sha1=sha12(os.path.abspath(__file__)),
+               code_version_end=code_v1, git_head_end=git_head1,
+               script_sha1_end=sha12(os.path.abspath(__file__)),
+               script_sha1=script_sha_0,
                minutes=float((time.time() - t0) / 60))
     os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
     tmp = a.out + f".tmp.{os.getpid()}"
