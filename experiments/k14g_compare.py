@@ -62,9 +62,14 @@ def verdict(ci, eq=EQ):
     """Два НЕЗАВИСИМЫХ вердикта по интервалу разности.
 
     Направление отвечает на «различаются ли», практическая величина — на
-    «имеет ли различие значение». Прежняя формулировка их смешивала: интервал
-    [-0.0005, 0.0005] попадал сразу под «пересекает ноль» и под «целиком
-    внутри зоны», и правило противоречило само себе.
+    «имеет ли различие значение». Они не исключают друг друга: интервал
+    [0.0003, 0.0010] означает одновременно «лучше» и «практически
+    эквивалентно», и это два ответа на разные вопросы.
+
+    У ПРАКТИЧЕСКОЙ ВЕЛИЧИНЫ ТРИ СОСТОЯНИЯ, А НЕ ДВА. Прежняя версия называла
+    «значимым» всё, что не помещалось в зону целиком, — в том числе интервал
+    [-0.004, +0.009], который не доказывает ни эквивалентности, ни значимого
+    различия. Неопределённость обязана иметь своё имя.
     """
     lo, hi = float(ci[0]), float(ci[1])
     if lo > 0:
@@ -73,8 +78,46 @@ def verdict(ci, eq=EQ):
         d = "хуже"
     else:
         d = "неопределённо"
-    e = "эквивалентно" if (lo >= -eq and hi <= eq) else "различие значимо"
+    if lo >= -eq and hi <= eq:
+        e = "практически эквивалентно"
+    elif lo > eq or hi < -eq:
+        e = "практически различаются"
+    else:
+        e = "величина неопределённа"
     return d, e
+
+
+def check_alignment(rows_h, part_h, rows_t, part_t):
+    """Кэш состояний и кэш целей описывают ОДНИ И ТЕ ЖЕ строки.
+
+    Прежде в основном пути стояло `match_rows(rows, rows)` — массив,
+    сравнённый сам с собой, то есть проверка, которая не может не пройти.
+    Отрицательный тест при этом существовал и создавал видимость покрытия.
+
+    Порядок здесь НЕ требуется одинаковым: цели сопоставляются по номеру
+    строки. Требуется совпадение СОСТАВА, отсутствие дублей и совпадение
+    части у каждой строки — иначе голова читала бы состояние строки из
+    одной части, а целилась бы в метку из другой.
+    """
+    rh, rt = np.asarray(rows_h, np.int64), np.asarray(rows_t, np.int64)
+    if len(np.unique(rh)) != len(rh):
+        raise SystemExit("номера строк кэша состояний повторяются")
+    if len(np.unique(rt)) != len(rt):
+        raise SystemExit("номера строк кэша целей повторяются")
+    miss = np.setdiff1d(rh, rt)
+    if len(miss):
+        raise SystemExit(f"{len(miss)} строк кэша состояний нет в кэше "
+                         f"целей: {list(miss[:5])}")
+    pos = {int(r): i for i, r in enumerate(rt)}
+    idx = np.array([pos[int(r)] for r in rh])
+    bad = np.where(np.asarray(part_t)[idx] != np.asarray(part_h))[0]
+    if len(bad):
+        i0 = int(bad[0])
+        raise SystemExit(
+            f"у {len(bad)} строк часть в кэше состояний и в кэше целей "
+            f"различается, например строка {int(rh[i0])}: "
+            f"{part_h[i0]} против {np.asarray(part_t)[idx][i0]}")
+    return idx
 
 
 def match_rows(rows_cache, rows_need):
@@ -98,7 +141,7 @@ def match_rows(rows_cache, rows_need):
 
 
 def load_heads(spec, torch, make_head, d_model, vocab, norm_eps, dev,
-               base_state, h18_sha1, state_sha_np):
+               base_state, h18_sha1, state_sha_np, allow_unconfirmed=False):
     """Головы для сравнения: историческая линейная плюс сохранённые пробы.
 
     КАЖДЫЙ ЧЕКПОЙНТ СВЕРЯЕТСЯ: вид, отпечаток весов после загрузки, кэш h18,
@@ -119,8 +162,14 @@ def load_heads(spec, torch, make_head, d_model, vocab, norm_eps, dev,
 
     for p in spec:
         ck = torch.load(p, map_location="cpu", weights_only=False)
-        if str(ck.get("kind")) not in ("k14f_head", "k14f_head_unconfirmed"):
-            raise SystemExit(f"{p} описывает {ck.get('kind')}")
+        kind_ = str(ck.get("kind"))
+        if kind_ not in ("k14f_head", "k14f_head_unconfirmed"):
+            raise SystemExit(f"{p} описывает {kind_}")
+        if kind_ == "k14f_head_unconfirmed" and not allow_unconfirmed:
+            raise SystemExit(
+                f"{p} — голова, для которой подтверждающая половина НЕ "
+                f"открывалась. Анализ по ней открыл бы её незаметно; нужен "
+                f"явный --allow-unconfirmed")
         for k in ("state", "hidden", "selected_state_sha1", "h18_sha1"):
             if ck.get(k) is None:
                 raise SystemExit(f"в {p} нет поля {k}")
@@ -151,14 +200,50 @@ def selftest():
     k14c = importlib.util.module_from_spec(sp)
     sp.loader.exec_module(k14c)
 
-    # --- ВЕРДИКТЫ НЕЗАВИСИМЫ ----------------------------------------------
-    assert verdict([0.0003, 0.0010]) == ("лучше", "эквивалентно"), \
-        "интервал внутри зоны и выше нуля — оба вердикта сразу"
-    assert verdict([0.004, 0.009]) == ("лучше", "различие значимо")
-    assert verdict([-0.009, -0.004]) == ("хуже", "различие значимо")
-    assert verdict([-0.0005, 0.0005]) == ("неопределённо", "эквивалентно")
-    assert verdict([-0.004, 0.009]) == ("неопределённо", "различие значимо")
-    assert verdict([0.0, 0.002]) == ("неопределённо", "различие значимо")
+    # --- ВЕРДИКТЫ НЕЗАВИСИМЫ, У ВЕЛИЧИНЫ ТРИ СОСТОЯНИЯ ---------------------
+    assert verdict([0.0003, 0.0010]) == ("лучше", "практически эквивалентно")
+    assert verdict([0.004, 0.009]) == ("лучше", "практически различаются")
+    assert verdict([-0.009, -0.004]) == ("хуже", "практически различаются")
+    assert verdict([-0.0005, 0.0005]) == ("неопределённо",
+                                          "практически эквивалентно")
+    # НЕ ДОКАЗЫВАЕТ НИ ТОГО, НИ ДРУГОГО — и обязан называться так
+    assert verdict([-0.004, 0.009]) == ("неопределённо",
+                                        "величина неопределённа")
+    assert verdict([0.0, 0.002]) == ("неопределённо", "величина неопределённа")
+    assert verdict([0.0019, 0.0019]) == ("лучше", "практически эквивалентно")
+    assert verdict([0.00191, 0.004])[1] == "практически различаются"
+
+    # --- СООТВЕТСТВИЕ СТРОК ДВУХ КЭШЕЙ ------------------------------------
+    rh = np.array([5, 1, 9], np.int64)
+    ph = np.array(["train", "val_sel", "train"])
+    rt = np.array([1, 5, 9, 12], np.int64)
+    pt = np.array(["val_sel", "train", "train", "val_confirm"])
+    idx = check_alignment(rh, ph, rt, pt)
+    assert list(idx) == [1, 0, 2], idx
+    # лишняя строка в целях допустима, недостающая — нет
+    try:
+        check_alignment(np.array([5, 77], np.int64), np.array(["train"] * 2),
+                        rt, pt)
+    except SystemExit as e:
+        assert "нет в кэше целей" in str(e), e
+    else:
+        raise AssertionError("принята строка, которой нет в целях")
+    # часть обязана совпасть
+    try:
+        check_alignment(rh, np.array(["train", "train", "train"]), rt, pt)
+    except SystemExit as e:
+        assert "часть" in str(e), e
+    else:
+        raise AssertionError("принято расхождение частей")
+    for bad_h, bad_t, why in ((np.array([5, 5], np.int64), rt, "состояний"),
+                              (rh, np.array([1, 5, 9, 9], np.int64), "целей")):
+        try:
+            check_alignment(bad_h, np.array(["train"] * len(bad_h)), bad_t,
+                            np.array(["train"] * len(bad_t)))
+        except SystemExit as e:
+            assert "повторяются" in str(e) and why in str(e), (why, e)
+        else:
+            raise AssertionError(f"приняты дубли в {why}")
 
     # --- СТРОКИ: ПЕРЕСТАНОВКА ОТВЕРГАЕТСЯ ---------------------------------
     r = np.array([3, 1, 4, 1, 5], np.int64)
@@ -195,13 +280,21 @@ def selftest():
     d0 = r0["d_rms:x-y"]
     assert abs(d0[0]) < 1e-12 and abs(d0[1]) < 1e-12, \
         f"одинаковые головы обязаны дать строго нулевую разность: {d0}"
-    assert verdict(d0) == ("неопределённо", "эквивалентно")
+    assert verdict(d0) == ("неопределённо", "практически эквивалентно")
+    # ЗНАК. `y` заведомо лучше (меньшая ошибка). По конвенции main для пары
+    # (первая=y, вторая=x) берётся d_rms:x-y = RMS(x) − RMS(y) > 0, и это
+    # читается как «первая, то есть y, лучше».
     r1 = k14c.cluster_boot(dict(a0=base * 1.2, oracle=base * 0.5, x=base,
                                 y=better), eps, n_el, n=300,
                            deltas=[("x", "y")])
     d1 = r1["d_rms:x-y"]
-    assert d1[0] > 0, f"заведомо лучшая голова: интервал {d1} обязан быть >0"
-    assert verdict(d1)[0] == "лучше"
+    assert d1[0] > 0, f"интервал {d1} обязан быть выше нуля"
+    assert verdict(d1)[0] == "лучше", "y меньше по ошибке, значит лучше"
+    # обратная пара обязана дать зеркальный вердикт
+    r2 = k14c.cluster_boot(dict(a0=base * 1.2, oracle=base * 0.5, x=base,
+                                y=better), eps, n_el, n=300,
+                           deltas=[("y", "x")])
+    assert verdict(r2["d_rms:y-x"])[0] == "хуже"
     assert "capture:x" in r1 and "capture:y" in r1
     print("самопроверка k14g_compare пройдена")
 
@@ -221,6 +314,12 @@ def main():
     ap.add_argument("--rms-tol", type=float, default=2e-5,
                     help="допуск воспроизведения сохранённого RMS")
     ap.add_argument("--boot", type=int, default=1000)
+    ap.add_argument("--allow-dirty", action="store_true",
+                    help="разрешить анализ при незакоммиченном коде")
+    ap.add_argument("--allow-unconfirmed", action="store_true",
+                    help="принимать головы k14f_head_unconfirmed — те, для "
+                         "которых подтверждающая половина НЕ открывалась. "
+                         "Без флага такой анализ незаметно открыл бы её")
     ap.add_argument("--device", default="cuda:1")
     ap.add_argument("--out", default="reports/k14g/compare.json")
     a = ap.parse_args()
@@ -255,7 +354,7 @@ def main():
 
     H_EXEC = 8
     dev = torch.device(a.device)
-    git_head, dirty, _ = kc.check_code_clean(True)
+    git_head, dirty, _ = kc.check_code_clean(a.allow_dirty)
 
     man = json.load(open(a.h18 + ".manifest.json"))
     q1_man = json.load(open(a.q1_cache + ".manifest.json"))
@@ -270,16 +369,15 @@ def main():
     Hm = np.load(a.h18 + ".h18.npy", mmap_mode="r")
     mt = np.load(a.h18 + ".meta.npz", allow_pickle=True)
     rows, part = np.asarray(mt["rows"], np.int64), mt["part"].astype(str)
-    match_rows(rows, rows)                      # состав и порядок кэша
     if arr_sha(rows) != man["rows_sha1"]:
         raise SystemExit("номера строк кэша не совпали с отпечатком")
     q0_c, ACT = np.asarray(mt["q0"], np.int64), np.asarray(mt["action"],
                                                            np.float32)
     epi_all = np.asarray(mt["episode"], np.int64)
 
-    t_rows, t_q1, _tp, _ti = kc.load_q1_targets(a.q1_cache, q1_man)
-    pos_of = {int(r): i for i, r in enumerate(t_rows)}
-    TG = np.ascontiguousarray(t_q1[[pos_of[int(r)] for r in rows]], np.int64)
+    t_rows, t_q1, t_part, _ti = kc.load_q1_targets(a.q1_cache, q1_man)
+    idx_t = check_alignment(rows, part, t_rows, t_part)
+    TG = np.ascontiguousarray(t_q1[idx_t], np.int64)
 
     E = np.load(f"{a.cache}.codebooks.npy")
     if arr_sha(np.asarray(E, np.float32)) != man["codebooks_sha1"]:
@@ -306,7 +404,8 @@ def main():
                          weights_only=False)
     heads = load_heads(a.heads, torch, k14f.make_head, d_model, V,
                        float(man["norm_eps"]), dev, base_ck["state"],
-                       man["h18_sha1"], k14f.state_sha_np)
+                       man["h18_sha1"], k14f.state_sha_np,
+                       a.allow_unconfirmed)
     print(f"  голов к сравнению: {len(heads)}")
     for h in heads:
         print(f"    {h['label']}")
@@ -370,14 +469,20 @@ def main():
                         f"чекпойнте записано {float(st):.6f}")
                 mark = "  (совпало с чекпойнтом)"
             print(f"    {h['label']:56s} RMS {r_:.6f}  C {c_:+.4f}{mark}")
+        # ЗНАК: cluster_boot считает RMS(первого) − RMS(второго), а RMS —
+        # это ОШИБКА. Чтобы «положительное» означало «первая голова лучше»,
+        # в пару передаётся обратный порядок: RMS(второй) − RMS(первой).
+        # Прежняя версия печатала подпись «положительная — первая лучше» над
+        # величиной с противоположным смыслом.
         pairs = [(names[i], names[j]) for i in range(len(names))
                  for j in range(i + 1, len(names))]
-        ci = k14c.cluster_boot(pr, eps, n_el_row, n=a.boot, deltas=pairs)
-        print("\n    попарно, 90% интервал разности "
-              "(положительная — первая лучше):")
+        ci = k14c.cluster_boot(pr, eps, n_el_row, n=a.boot,
+                               deltas=[(j_, i_) for i_, j_ in pairs])
+        print("\n    попарно, 90% интервал разности RMS(вторая) − RMS(первая)"
+              "; положительная означает, что ПЕРВАЯ лучше:")
         cmp_out = {}
         for i_, j_ in pairs:
-            d = ci[f"d_rms:{i_}-{j_}"]
+            d = ci[f"d_rms:{j_}-{i_}"]
             dv, ev = verdict(d)
             la = heads[names.index(i_)]["label"]
             lb = heads[names.index(j_)]["label"]
