@@ -149,7 +149,8 @@ def gate_case(architecture, feedback):
     return f"{architecture}/{feedback}"
 
 
-GATE_SAME = ("joint_ckpt", "joint_sha1", "ckpt", "q0_npz", "q0_npz_sha1",
+GATE_SAME = ("heads", "head_dtype",
+             "joint_ckpt", "joint_sha1", "ckpt", "q0_npz", "q0_npz_sha1",
              "q0_manifest_sha1", "plan_sha1", "plan_batch", "gate_r_sha1",
              "device", "gpu_uuid", "compute_dtype", "torch_version",
              "cuda_version", "tf32_matmul", "tf32_cudnn",
@@ -260,6 +261,13 @@ def make_draft_reattn_class(base_cls):
             """
             base_variant = ("no_feedback" if variant == "no_additive_feedback"
                             else variant)
+            # СНАЧАЛА ЗАМОРАЖИВАЕТСЯ ВСЁ, ПОТОМ ПРИМЕНЯЕТСЯ СПИСОК. При
+            # переключении между конфигурациями `requires_grad=True` мог бы
+            # уцелеть от предыдущей — и обучалось бы объединение двух белых
+            # списков, а не заявленный. Проверяется точным сравнением
+            # множеств ниже, но полагаться на проверку вместо сброса нельзя.
+            for p in self.parameters():
+                p.requires_grad_(False)
             info = self.configure_joint_depth_rvq(stage=stage,
                                                   variant=base_variant,
                                                   verbose=False)

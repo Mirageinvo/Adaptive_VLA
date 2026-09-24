@@ -468,6 +468,15 @@ def main():
     # проверки чистых функций нет. Обязательность проверяется ниже, после
     # ветки самопроверки.
     ap.add_argument("--variant", choices=("main", "static", "no_feedback"))
+    # §49: ТРИ ОБЯЗАТЕЛЬНЫХ АРГУМЕНТА БЕЗ УМОЛЧАНИЙ. Умолчание здесь означало
+    # бы, что архитектуру можно обучить, не назвав её, и в чекпойнте осталась
+    # бы догадка вместо факта.
+    ap.add_argument("--architecture",
+                    choices=("baseline", "reattn_draft", "reattn_state"))
+    ap.add_argument("--additive-feedback", choices=("on", "off"))
+    ap.add_argument("--identity-gate", default="",
+                    help="артефакт архитектурного гейта K-14h; без него "
+                         "обучать нельзя")
     ap.add_argument("--seed", type=int, default=None,
                     help="training/data-order seed: поздние головы "
                          "инициализируются детерминированно, различается "
@@ -495,6 +504,8 @@ def main():
                          "Урезание по строкам с последующей перенарезкой "
                          "дало бы неполные батчи, которых нет в плане, а "
                          "значит другой q0")
+    ap.add_argument("--reattn-heads", type=int, default=8,
+                    help="число голов блока §49; сверяется с гейтом")
     ap.add_argument("--allow-dirty", action="store_true",
                     help="разрешить прогон на незакоммиченном коде; "
                          "канонический результат так получать нельзя")
@@ -521,8 +532,20 @@ def main():
     if a.selftest:
         selftest()
         return 0
+    need_arch = not a.eval_checkpoint
     miss = [n for n, v in (("--variant", a.variant), ("--seed", a.seed))
             if v is None]
+    if need_arch:
+        miss += [n for n, v in (("--architecture", a.architecture),
+                                ("--additive-feedback", a.additive_feedback),
+                                ("--identity-gate", a.identity_gate or None))
+                 if v is None]
+    if a.architecture and a.additive_feedback == "off" \
+            and a.variant == "no_feedback":
+        raise SystemExit(
+            "--variant no_feedback и --additive-feedback off задают одно и то "
+            "же двумя способами: при §49 состоянием аддитивной ветви "
+            "управляет только --additive-feedback")
     if miss:
         raise SystemExit(f"нужны {miss}: вариант и training-сид задаются "
                          f"явно, умолчаний у них нет")
@@ -551,6 +574,7 @@ def main():
             sys.path.insert(0, p)
     import k14_common as kc
     import k12b_protocol as kb
+    import k14h_reattn as kh
 
     def code_state():
         """Коммит и отпечатки всего, что влияет на обучение.
@@ -765,6 +789,45 @@ def main():
             f"кэш целей построен на другом черновике: расходятся {bad_q0}. "
             f"Цели равны Q1(z_e - E0[q0]); от другого q0 это другие цели")
     plan_all = kc.load_plan(a.q0, q0_man)
+    # --- §49: АРХИТЕКТУРНЫЙ ГЕЙТ, FAIL-CLOSED --------------------------
+    # Проверяется до модели и до обучения: он утверждает, что до первого шага
+    # новая архитектура ТОЖДЕСТВЕННА прежней, и без этого сравнение двух
+    # архитектур начиналось бы с неучтённого сдвига.
+    id_info, gate_case_info = None, None
+    if need_arch:
+        expect_gate = dict(
+            heads=int(a.reattn_heads), head_dtype="float32",
+            joint_ckpt=a.joint_ckpt,
+            # отпечаток берётся из файла прямо здесь: сам чекпойнт грузится
+            # позже, а гейт проверяется ДО модели
+            joint_sha1=k11a.file_sha1(a.joint_ckpt), ckpt=a.ckpt,
+            q0_npz=q0_prov["q0_npz"], q0_npz_sha1=q0_prov["q0_npz_sha1"],
+            q0_manifest_sha1=q0_prov["q0_manifest_sha1"],
+            plan_sha1=q0_prov["plan_sha1"],
+            plan_batch=q0_prov["plan_batch"],
+            gate_r_sha1=q0_prov["gate_r_sha1"],
+            device=str(dev), gpu_uuid=kc.gpu_uuid(dev, torch),
+            compute_dtype=a.dtype, torch_version=str(torch.__version__),
+            cuda_version=str(getattr(torch.version, "cuda", None)),
+            tf32_matmul=bool(torch.backends.cuda.matmul.allow_tf32),
+            tf32_cudnn=bool(torch.backends.cudnn.allow_tf32),
+            cudnn_deterministic=bool(torch.backends.cudnn.deterministic),
+            cudnn_benchmark=bool(torch.backends.cudnn.benchmark),
+            reattn_sha1=sha12(os.path.join(here, "k14h_reattn.py")),
+            depth_rvq_joint12_sha1=sha12(os.path.join(
+                here, "depth_rvq_joint12.py")),
+            depth_rvq_vla_sha1=sha12(os.path.join(here, "depth_rvq_vla.py")),
+            joint12_vla_sha1=sha12(os.path.join(here, "joint12_vla.py")),
+            bar_sha1=bar_sha)
+        id_info = kh.check_identity_gate(
+            a.identity_gate, architecture=a.architecture,
+            feedback=a.additive_feedback, expect=expect_gate,
+            file_sha=sha12)
+        gate_case_info = (json.load(open(a.identity_gate))["cases"]
+                          [id_info["identity_case"]])
+        print(f"  гейт тождественности: {a.identity_gate}, случай "
+              f"{id_info['identity_case']}, запуск "
+              f"{id_info['identity_gate_run_id']}")
     # КАРТА И РЕЖИМ ВЫЧИСЛЕНИЙ. Побитового совпадения q0 недостаточно, чтобы
     # считать задачу той же: q0 — это argmax, он грубее скрытых состояний.
     # Два устройства могут дать одинаковые коды и при этом слегка разные h12,
@@ -857,11 +920,39 @@ def main():
     print(f"  Joint12 загружен строго: {len(state)} тензоров, sha {j_sha}")
 
     model.__class__ = make_joint_depth_rvq_class(type(model))
+    if need_arch:
+        # КЛАСС ОДИН НА ВСЕ ТРИ АРХИТЕКТУРЫ, различаются только флаги. Тогда
+        # `baseline` — это буквально та же вычислительная ветвь нового кода,
+        # что и доказывает гейт, а не отдельная сборка, которую с ней лишь
+        # сравнили.
+        model.__class__ = kh.make_draft_reattn_class(type(model))
     model.init_joint_depth_rvq(refine_norm=refine_norm,
                                books=torch.from_numpy(E),
                                feedback=(a.variant != "no_feedback"),
                                verbose_init=False)
-    info = model.configure_joint_depth_rvq(stage="q1", variant=a.variant)
+    if need_arch:
+        model.init_draft_reattn(n_heads=a.reattn_heads, use_draft=True,
+                                head_dtype=torch.float32, verbose=True)
+        model.draft_reattn_enabled = (a.architecture != "baseline")
+        model.draft_reattn[0].set_use_draft(a.architecture == "reattn_draft")
+        var = a.variant if a.additive_feedback == "on" \
+            else "no_additive_feedback"
+        info = model.configure_draft_reattn(stage="q1", variant=var)
+        # СПИСОК ОБУЧАЕМЫХ ОБЯЗАН СОВПАСТЬ СО СПИСКОМ ИЗ ГЕЙТА ДЛЯ ЭТОГО ЖЕ
+        # СЛУЧАЯ. Иначе обучается не то, про что доказана тождественность.
+        want_tr = (gate_case_info or {}).get("trainable_new")
+        if want_tr is None:
+            raise SystemExit("в случае гейта нет списка обучаемых")
+        if sorted(info["names"]) != sorted(want_tr):
+            raise SystemExit(
+                f"обучаемые не совпали с гейтом: лишние "
+                f"{sorted(set(info['names']) - set(want_tr))[:5]}, нет "
+                f"{sorted(set(want_tr) - set(info['names']))[:5]}")
+        print(f"  архитектура {a.architecture}, аддитивная ветвь "
+              f"{a.additive_feedback}; список обучаемых совпал с гейтом "
+              f"{id_info['identity_case']}")
+    else:
+        info = model.configure_joint_depth_rvq(stage="q1", variant=a.variant)
     codec = proc.action_processor
     codec = (codec if hasattr(codec, "vq") else codec.codec).to(dev).eval()
     for p_ in codec.parameters():
@@ -1799,6 +1890,24 @@ def main():
     # ПЕРЕД ОТКРЫТИЕМ ПОДТВЕРЖДАЮЩЕЙ ПОЛОВИНЫ КОД СВЕРЯЕТСЯ ЗАНОВО. Она
     # открывается один раз, и открывать её результатом, полученным частично
     # другим кодом, значит потратить её впустую.
+    if need_arch:
+        # ПЕРЕД ПОДТВЕРЖДАЮЩЕЙ ПОЛОВИНОЙ ГЕЙТ И АРХИТЕКТУРНЫЙ КОД СВЕРЯЮТСЯ
+        # ЗАНОВО. Прогон идёт часы; подмена файла блока посреди него означала
+        # бы, что обучалась одна архитектура, а подтверждается другая.
+        for nm_, want_ in (("k14h_reattn.py", expect_gate["reattn_sha1"]),
+                           ("depth_rvq_joint12.py",
+                            expect_gate["depth_rvq_joint12_sha1"]),
+                           ("depth_rvq_vla.py",
+                            expect_gate["depth_rvq_vla_sha1"]),
+                           ("joint12_vla.py",
+                            expect_gate["joint12_vla_sha1"])):
+            got_ = sha12(os.path.join(here, nm_))
+            if got_ != want_:
+                raise SystemExit(f"{nm_} изменился во время прогона: {want_} "
+                                 f"-> {got_}")
+        if sha12(a.identity_gate) != id_info["identity_gate_sha1"]:
+            raise SystemExit("артефакт гейта изменился во время прогона")
+
     git_head1, code_v1, _d1 = code_state()
     if git_head1 != git_head0 or code_v1 != code_v0:
         # ВЕСА СОХРАНЯЮТСЯ, ПОДТВЕРЖДЕНИЕ НЕ ОТКРЫВАЕТСЯ. Отказ обязан стоить
@@ -1883,6 +1992,14 @@ def main():
         # (straight_through и CodeFeedback) и bar.py (сегментированный проход),
         # хотя изменение любого из них меняет обученную голову.
         code_version=code_v0, git_head=git_head0, runtime=rt_now,
+        architecture=a.architecture, additive_feedback=a.additive_feedback,
+        reattn_heads=(int(a.reattn_heads) if need_arch else None),
+        memory_scope=("full_valid_vlm_prefix" if need_arch else None),
+        query_build=("concat[LN(h12), LN(P_D E0[q0])]" if need_arch else None),
+        reattn_order=("parallel_with_additive_feedback" if need_arch
+                      else None),
+        reattn_init=("W_o=0, alpha=1" if need_arch else None),
+        **(id_info or {}),
         bar_sha1=bar_sha,
         script_sha1=sha12(os.path.abspath(__file__)))
     tmp = out_p + f".tmp.{os.getpid()}"
@@ -1896,6 +2013,9 @@ def main():
                   initial_trainable_state_sha1=init_sha,
                   selected_state_sha1=sel_sha, selected_epoch=best_ep,
                   val_sel=best_val, val_confirm=e_conf, gate4=g4,
+                  architecture=a.architecture,
+                  additive_feedback=a.additive_feedback,
+                  **(id_info or {}),
                   e_a0=e_a0, e_oracle=e_or, checkpoint=out_p,
                   q1_cache=a.q1_cache, oracle=a.oracle, gate_r=a.gate_r,
                   parts={k_: dict(rows=int(len(sets[k_])),

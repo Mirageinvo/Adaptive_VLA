@@ -107,13 +107,15 @@ def main():
     ap.add_argument("--device", default="cuda:1")
     ap.add_argument("--dtype", default="float16")
     ap.add_argument("--allow-code-drift", default="")
+    ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--out", default="reports/k14h/identity.json")
     a = ap.parse_args()
     if a.selftest:
         selftest()
         return 0
-    if os.path.exists(a.out):
-        raise SystemExit(f"{a.out} уже существует")
+    if os.path.exists(a.out) and not a.overwrite:
+        raise SystemExit(f"{a.out} уже существует: на этот артефакт будет "
+                         f"ссылаться тренер, и молча заменять его нельзя")
 
     here = os.path.dirname(os.path.abspath(__file__))
     root = os.path.abspath(a.root)
@@ -262,10 +264,16 @@ def main():
         rows_used.astype(np.int64)).tobytes()).hexdigest()[:12]
 
     res = {}
-    cases, names_by_case = {}, {}
-    for arch in ("baseline", "reattn_draft", "reattn_state"):
-        for fb in ("on", "off"):
+
+    def run_cases(seq):
+        """Шесть случаев в заданном порядке. Состояние сбрасывается перед
+        каждым: архитектура, режим запроса и заморозка всех параметров."""
+        got = {}
+        for arch, fb in seq:
             case = kh.gate_case(arch, fb)
+            for mdl in (m_old, m_new):
+                for p_ in mdl.parameters():
+                    p_.requires_grad_(False)
             var_new = "main" if fb == "on" else "no_additive_feedback"
             var_old = "main" if fb == "on" else "no_feedback"
             info_old = m_old.configure_joint_depth_rvq(
@@ -317,21 +325,45 @@ def main():
             new_only = sorted(set(info_new["names"]) - set(info_old["names"]))
             if arch != "baseline" and not new_only:
                 raise SystemExit(f"{case}: блок не попал в обучаемые")
-            cases[case] = dict(
+            got[case] = dict(
                 passed=True, modes=modes, reattn_calls=calls,
                 q0_matches_canonical=bool(q0_ok),
                 trainable_old=info_old["names"],
                 trainable_new=info_new["names"], added=new_only,
                 n_params_old=int(info_old["n_params"]),
                 n_params_new=int(info_new["n_params"]))
-            names_by_case[case] = new_only
             print(f"    пройден; обучаемых {info_old['n_tensors']} -> "
                   f"{info_new['n_tensors']}, добавлено {len(new_only)}")
+        return got
+
+    order = [(arch, fb) for arch in ("baseline", "reattn_draft",
+                                     "reattn_state") for fb in ("on", "off")]
+    # ДВА ПОРЯДКА ОБХОДА. Результат не имеет права зависеть от того, в каком
+    # порядке проверялись случаи: если зависит, значит между ними протекает
+    # состояние — не сброшенный requires_grad, не восстановленный флаг
+    # архитектуры. Сравниваются списки обучаемых и число вызовов блока.
+    by_order = {}
+    for oname, seq in (("прямой", order), ("обратный", order[::-1])):
+        print(f"\n  ОБХОД {oname}")
+        by_order[oname] = run_cases(seq)
+    a_, b_ = by_order["прямой"], by_order["обратный"]
+    if sorted(a_) != sorted(b_):
+        raise SystemExit("наборы случаев в двух обходах различаются")
+    for k_ in a_:
+        for f_ in ("trainable_new", "trainable_old", "reattn_calls", "added"):
+            if a_[k_][f_] != b_[k_][f_]:
+                raise SystemExit(
+                    f"случай {k_}: поле {f_} зависит от порядка обхода — "
+                    f"между случаями протекает состояние")
+    cases = a_
+    print("\n  порядок обхода на результат не влияет")
 
     out = dict(
         kind="k14h_identity_gate", passed=True,
         run_id=f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}",
         cases=cases, comparisons=res, n_batches=len(batches),
+        case_orders=["прямой", "обратный"],
+        head_dtype="float32",
         rows_sha1=rows_sha, heads=int(a.heads), variant=a.variant,
         joint_ckpt=a.joint_ckpt, joint_sha1=k11a.file_sha1(a.joint_ckpt),
         ckpt=a.ckpt, head_ckpt=a.head_ckpt,
