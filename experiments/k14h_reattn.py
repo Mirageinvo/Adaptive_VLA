@@ -30,6 +30,7 @@ vlm_hidden вместе с текстом, и маски позиций изоб
 перезапускаются, q0 не меняется, работа добавляется только в режимах medium
 и full.
 """
+import os
 import sys
 
 try:
@@ -93,6 +94,17 @@ def make_draft_reattn_block():
             b, n, _ = x.shape
             return x.view(b, n, self.n_heads, -1).transpose(1, 2)
 
+        def set_use_draft(self, flag):
+            """Переключение архитектуры БЕЗ пересборки весов.
+
+            Обе архитектуры имеют одну форму запроса и один набор
+            параметров, поэтому различаются только тем, что подаётся во
+            второй слот. Один объект обслуживает оба варианта — это и делает
+            проверку тождественности честной: сравниваются не две разные
+            сборки, а один блок в двух режимах.
+            """
+            self.use_draft = bool(flag)
+
         def forward(self, h, d0, ctx, ctx_mask=None):
             """h: (B,P,D) действия; d0: (B,P,Dc); ctx: (B,S,D) префикс.
 
@@ -123,6 +135,87 @@ def make_draft_reattn_block():
 
 TRAIN_PREFIXES = ("depth_rvq_norms.0.", "depth_rvq_heads.0.",
                   "depth_rvq_feedback.0.", "draft_reattn.0.")
+
+
+ARCHITECTURES = ("baseline", "reattn_draft", "reattn_state")
+FEEDBACK = ("on", "off")
+
+
+def gate_case(architecture, feedback):
+    if architecture not in ARCHITECTURES:
+        raise SystemExit(f"неизвестная архитектура {architecture}")
+    if feedback not in FEEDBACK:
+        raise SystemExit(f"неизвестное состояние feedback {feedback}")
+    return f"{architecture}/{feedback}"
+
+
+GATE_SAME = ("joint_ckpt", "joint_sha1", "ckpt", "q0_npz", "q0_npz_sha1",
+             "q0_manifest_sha1", "plan_sha1", "plan_batch", "gate_r_sha1",
+             "device", "gpu_uuid", "compute_dtype", "torch_version",
+             "cuda_version", "tf32_matmul", "tf32_cudnn",
+             "cudnn_deterministic", "cudnn_benchmark",
+             "reattn_sha1", "depth_rvq_joint12_sha1", "depth_rvq_vla_sha1",
+             "joint12_vla_sha1", "bar_sha1")
+
+
+def check_identity_gate(path, *, architecture, feedback, expect, file_sha):
+    """Требовать пройденный архитектурный гейт ДЛЯ ЭТОЙ КОНФИГУРАЦИИ.
+
+    ОТСУТСТВИЕ ФАЙЛА — ОТКАЗ, как и с Gate R. Но одного `passed` мало:
+    гейт обязан относиться к тому же коду, тем же весам, тому же
+    каноническому черновику, тому же режиму вычислений И к той самой паре
+    «архитектура + аддитивная обратная связь», которая сейчас запускается.
+    Общий флаг «что-то проверялось» проверкой не является.
+
+    `expect` — словарь величин текущего прогона, `file_sha` — функция
+    отпечатка файла: модуль не решает, как их считать.
+    """
+    import json
+    import os
+    if not path:
+        raise SystemExit(
+            "не указан артефакт гейта тождественности. Обучать архитектуру, "
+            "про которую не доказано, что до обучения она совпадает с "
+            "прежней, значит сравнивать её с неизвестно чем")
+    if not os.path.exists(path):
+        raise SystemExit(f"нет {path}: гейт тождественности не проводился")
+    g = json.load(open(path))
+    if g.get("kind") != "k14h_identity_gate":
+        raise SystemExit(f"{path} описывает {g.get('kind')}")
+    if g.get("passed") is not True:
+        raise SystemExit(f"гейт не пройден: {g.get('passed')!r}")
+    if not g.get("run_id"):
+        raise SystemExit("в гейте нет run_id")
+    if g.get("git_dirty"):
+        raise SystemExit("гейт снят при незакоммиченном коде")
+    miss = [k for k in GATE_SAME if g.get(k) is None]
+    if miss:
+        raise SystemExit(f"в гейте нет полей {miss}")
+    bad = [f"{k}: гейт {g[k]}, сейчас {expect.get(k)}"
+           for k in GATE_SAME if str(g[k]) != str(expect.get(k))]
+    if bad:
+        raise SystemExit("гейт снят в другой обстановке: " + "; ".join(bad))
+    case = gate_case(architecture, feedback)
+    cases = g.get("cases") or {}
+    if case not in cases:
+        raise SystemExit(
+            f"в гейте нет случая {case}; есть {sorted(cases)}. Проверялась "
+            f"другая конфигурация, а не запускаемая")
+    c = cases[case]
+    if c.get("passed") is not True:
+        raise SystemExit(f"случай {case} не пройден")
+    for mode, want in (("fast", 0), ("medium", 1), ("full", 1)):
+        if mode not in (c.get("modes") or {}):
+            raise SystemExit(f"случай {case}: режим {mode} не проверялся")
+        got = (c.get("reattn_calls") or {}).get(mode)
+        if int(got if got is not None else -1) != want:
+            raise SystemExit(f"случай {case}, режим {mode}: блок вызван "
+                             f"{got} раз, ожидалось {want}")
+    if c.get("q0_matches_canonical") is not True:
+        raise SystemExit(f"случай {case}: q0 не сверялся с каноническим")
+    return dict(identity_gate=path, identity_gate_sha1=file_sha(path),
+                identity_gate_run_id=g["run_id"], identity_case=case,
+                identity_rows_sha1=g.get("rows_sha1"), identity_passed=True)
 
 
 def make_draft_reattn_class(base_cls):
@@ -392,6 +485,93 @@ def selftest():
         pass
     else:
         raise AssertionError("принято число голов, не делящее d_model")
+    # --- ПРОВЕРКА ГЕЙТА: ОТКАЗ НА КАЖДОМ НЕСОВПАДЕНИИ ---------------------
+    import json as _json
+    import tempfile
+    exp = {k: f"<{k}>" for k in GATE_SAME}
+    good = dict(kind="k14h_identity_gate", passed=True, run_id="R1",
+                git_dirty=False, rows_sha1="RS",
+                cases={"reattn_draft/on": dict(
+                    passed=True, modes={"fast": {}, "medium": {}, "full": {}},
+                    reattn_calls={"fast": 0, "medium": 1, "full": 1},
+                    q0_matches_canonical=True)}, **exp)
+    with tempfile.TemporaryDirectory() as td:
+        def w(obj):
+            q = os.path.join(td, "g.json")
+            _json.dump(obj, open(q, "w"))
+            return q
+        info = check_identity_gate(w(good), architecture="reattn_draft",
+                                   feedback="on", expect=exp,
+                                   file_sha=lambda _p: "SH")
+        assert info["identity_case"] == "reattn_draft/on"
+        assert info["identity_gate_run_id"] == "R1"
+        for patch, why in (
+                ({"passed": False}, "не пройден"),
+                ({"run_id": ""}, "run_id"),
+                ({"git_dirty": True}, "незакоммиченном"),
+                ({"kind": "x"}, "описывает"),
+                ({"bar_sha1": "ДРУГОЕ"}, "в другой обстановке"),
+                ({"gpu_uuid": None}, "нет полей")):
+            try:
+                check_identity_gate(w(dict(good, **patch)),
+                                    architecture="reattn_draft",
+                                    feedback="on", expect=exp,
+                                    file_sha=lambda _p: "SH")
+            except SystemExit as e:
+                assert why in str(e), (why, e)
+            else:
+                raise AssertionError(f"гейт принят при {patch}")
+        # ЧУЖОЙ СЛУЧАЙ НЕ ГОДИТСЯ
+        for arch, fb, why in (("reattn_state", "on", "нет случая"),
+                              ("reattn_draft", "off", "нет случая")):
+            try:
+                check_identity_gate(w(good), architecture=arch, feedback=fb,
+                                    expect=exp, file_sha=lambda _p: "SH")
+            except SystemExit as e:
+                assert why in str(e), (arch, fb, e)
+            else:
+                raise AssertionError(f"принят чужой случай {arch}/{fb}")
+        # ЧИСЛО ВЫЗОВОВ БЛОКА
+        for mode, val, why in (("fast", 1, "fast"), ("medium", 0, "medium"),
+                               ("full", 2, "full")):
+            bad_c = _json.loads(_json.dumps(good))
+            bad_c["cases"]["reattn_draft/on"]["reattn_calls"][mode] = val
+            try:
+                check_identity_gate(w(bad_c), architecture="reattn_draft",
+                                    feedback="on", expect=exp,
+                                    file_sha=lambda _p: "SH")
+            except SystemExit as e:
+                assert why in str(e), (mode, e)
+            else:
+                raise AssertionError(f"принято {val} вызовов в {mode}")
+        no_q0 = _json.loads(_json.dumps(good))
+        no_q0["cases"]["reattn_draft/on"]["q0_matches_canonical"] = False
+        try:
+            check_identity_gate(w(no_q0), architecture="reattn_draft",
+                                feedback="on", expect=exp,
+                                file_sha=lambda _p: "SH")
+        except SystemExit as e:
+            assert "q0 не сверялся" in str(e), e
+        else:
+            raise AssertionError("принят гейт без сверки q0")
+        for bad in ("", os.path.join(td, "нет.json")):
+            try:
+                check_identity_gate(bad, architecture="reattn_draft",
+                                    feedback="on", expect=exp,
+                                    file_sha=lambda _p: "SH")
+            except SystemExit:
+                pass
+            else:
+                raise AssertionError("принято отсутствие гейта")
+    assert gate_case("baseline", "off") == "baseline/off"
+    for bad in (("нет", "on"), ("baseline", "нет")):
+        try:
+            gate_case(*bad)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"принято {bad}")
+
     print("самопроверка k14h_reattn пройдена")
 
 

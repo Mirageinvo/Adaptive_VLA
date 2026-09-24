@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 
 import numpy as np
 
@@ -123,11 +124,13 @@ def main():
     import torch
     import copy
     import k11a_build_hicora_cache as k11a
+    import inspect
     import k11b_hicora_identity as k11b
     import k12b_protocol as kb
     import k14_common as kc
     from joint12_vla import make_joint12_class
     from depth_rvq_joint12 import make_joint_depth_rvq_class
+    import k14h_reattn as kh
     from k14h_reattn import make_draft_reattn_class
     import actioncodec  # noqa: F401
     from smolvla.bar import SmolVLABlockwiseAR
@@ -216,8 +219,13 @@ def main():
             p_.requires_grad_(False)
         return m, info
 
-    m_old, info_old = build_model(False)
-    m_new, info_new = build_model(True)
+    # ДВЕ МОДЕЛИ НА ВСЕ ШЕСТЬ СЛУЧАЕВ. Вариант и архитектура переключаются
+    # на месте: блок обслуживает оба режима запроса одним набором весов, а
+    # `draft_reattn_enabled` выключает его целиком. Пересобирать модель под
+    # каждый случай значило бы сравнивать разные сборки, а не один блок в
+    # разных режимах.
+    m_old, _ = build_model(False)
+    m_new, _ = build_model(True)
 
     blk = m_new.draft_reattn[0]
     if float(blk.w_o.weight.abs().max()) != 0.0:
@@ -247,81 +255,120 @@ def main():
         return dict_apply(lambda x: x.to(dev, dt), b)
 
     ac = torch.autocast(device_type=dev.type, dtype=dt)
-    res, calls = {}, {}
-    with torch.no_grad():
-        for bi, (nm_, po_, sel_) in enumerate(plan):
-            b = build_batch(po_, sel_)
-            am = b.get("attention_mask")
-            for mdl, tag in ((m_old, "старая"), (m_new, "новая")):
-                with ac:
-                    v_, p_ = mdl.build_inputs(position_offset=po_, **b)
-                if am is not None:
-                    if int(am.shape[1]) != int(v_.shape[1]):
-                        raise SystemExit(
-                            f"маска длины {int(am.shape[1])} при префиксе "
-                            f"{int(v_.shape[1])}: внимание пошло бы не туда")
-                    if int(am.sum(dim=1).min()) < 1:
-                        raise SystemExit("в каком-то примере нет ни одного "
-                                         "открытого ключа префикса")
-            for mode in ("fast", "medium", "full"):
-                outs = {}
-                for mdl, tag in ((m_old, "старая"), (m_new, "новая")):
-                    with ac:
-                        v_, p_ = mdl.build_inputs(position_offset=po_, **b)
-                        o = mdl.forward_joint_depth_rvq(
-                            vlm_inputs_embeds=v_, attention_mask=am,
-                            position_ids=p_, mode=mode)
-                    outs[tag] = o
-                got = outs["новая"].get("reattn_calls")
-                want = 0 if mode == "fast" else 1
-                if got != want:
-                    raise SystemExit(f"{mode}: блок вызван {got} раз, "
-                                     f"ожидалось {want}")
-                calls[mode] = got
-                print(f"  батч {bi}, режим {mode} (блок вызван {got} раз):")
-                compare(f"b{bi}.{mode}.logits", outs["старая"]["logits"],
-                        outs["новая"]["logits"], res)
-                compare(f"b{bi}.{mode}.pred_codes",
-                        outs["старая"]["pred_codes"],
-                        outs["новая"]["pred_codes"], res)
-                # И q0 ОБЕИХ МОДЕЛЕЙ ОБЯЗАН СОВПАСТЬ С КАНОНИЧЕСКИМ: иначе
-                # тождественность доказана между двумя одинаково неверными
-                # прохождениями.
-                for tag in ("старая", "новая"):
-                    got_q0 = outs[tag]["pred_codes"][0].cpu().numpy()
-                    bad = int((got_q0 != q0_for_check[sel_]).sum())
-                    if bad:
-                        raise SystemExit(
-                            f"{tag} модель, режим {mode}: q0 разошёлся с "
-                            f"каноническим в {bad} позициях")
+    batches = [(nm_, po_, sel_, build_batch(po_, sel_))
+               for nm_, po_, sel_ in plan]
+    rows_used = np.concatenate([s_ for _n, _p, s_, _b in batches])
+    rows_sha = hashlib.sha1(np.ascontiguousarray(
+        rows_used.astype(np.int64)).tobytes()).hexdigest()[:12]
 
-    out = dict(kind="k14h_identity_gate", passed=True, comparisons=res,
-               reattn_calls=calls, n_batches=len(plan), heads=int(a.heads),
-               variant=a.variant, device=str(dev),
-               gpu_uuid=kc.gpu_uuid(dev, torch), compute_dtype=a.dtype,
-               trainable_old=info_old["names"], trainable_new=info_new["names"],
-               n_params_old=int(info_old["n_params"]),
-               n_params_new=int(info_new["n_params"]),
-               head_ckpt=a.head_ckpt, q0=a.q0, plan_sha1=q0_prov["plan_sha1"],
-               reattn_sha1=sha12(os.path.join(here, "k14h_reattn.py")),
-               git_head=git_head, git_dirty=bool(dirty),
-               code_version=kb.code_version([
-                   os.path.abspath(__file__),
-                   os.path.join(here, "k14h_reattn.py"),
-                   os.path.join(here, "depth_rvq_joint12.py"),
-                   os.path.join(here, "k14_common.py")]),
-               script_sha1=sha12(os.path.abspath(__file__)))
+    res = {}
+    cases, names_by_case = {}, {}
+    for arch in ("baseline", "reattn_draft", "reattn_state"):
+        for fb in ("on", "off"):
+            case = kh.gate_case(arch, fb)
+            var_new = "main" if fb == "on" else "no_additive_feedback"
+            var_old = "main" if fb == "on" else "no_feedback"
+            info_old = m_old.configure_joint_depth_rvq(
+                stage="q1", variant=var_old, verbose=False)
+            info_new = m_new.configure_draft_reattn(
+                stage="q1", variant=var_new, verbose=False)
+            m_new.draft_reattn_enabled = (arch != "baseline")
+            blk.set_use_draft(arch == "reattn_draft")
+            print(f"\n  === случай {case} ===")
+            modes, calls, q0_ok = {}, {}, True
+            for mode in ("fast", "medium", "full"):
+                for bi, (nm_, po_, sel_, b) in enumerate(batches):
+                    am = b.get("attention_mask")
+                    outs = {}
+                    for mdl, tag in ((m_old, "старая"), (m_new, "новая")):
+                        with ac:
+                            v_, p_ = mdl.build_inputs(position_offset=po_, **b)
+                            if am is not None and \
+                                    int(am.shape[1]) != int(v_.shape[1]):
+                                raise SystemExit(
+                                    f"маска длины {int(am.shape[1])} при "
+                                    f"префиксе {int(v_.shape[1])}")
+                            if am is not None and int(am.sum(1).min()) < 1:
+                                raise SystemExit("есть пример без открытых "
+                                                 "ключей префикса")
+                            outs[tag] = mdl.forward_joint_depth_rvq(
+                                vlm_inputs_embeds=v_, attention_mask=am,
+                                position_ids=p_, mode=mode)
+                    got = outs["новая"].get("reattn_calls")
+                    want = 0 if (mode == "fast" or arch == "baseline") else 1
+                    if got != want:
+                        raise SystemExit(f"{case}/{mode}: блок вызван {got} "
+                                         f"раз, ожидалось {want}")
+                    calls[mode] = int(got)
+                    pref = f"{case}.b{bi}.{mode}"
+                    compare(f"{pref}.logits", outs["старая"]["logits"],
+                            outs["новая"]["logits"], res)
+                    compare(f"{pref}.pred_codes", outs["старая"]["pred_codes"],
+                            outs["новая"]["pred_codes"], res)
+                    for tag in ("старая", "новая"):
+                        got_q0 = outs[tag]["pred_codes"][0].cpu().numpy()
+                        bad = int((got_q0 != q0_for_check[sel_]).sum())
+                        if bad:
+                            q0_ok = False
+                            raise SystemExit(
+                                f"{case}, {tag} модель, {mode}: q0 разошёлся "
+                                f"с каноническим в {bad} позициях")
+                modes[mode] = dict(batches=len(batches))
+            new_only = sorted(set(info_new["names"]) - set(info_old["names"]))
+            if arch != "baseline" and not new_only:
+                raise SystemExit(f"{case}: блок не попал в обучаемые")
+            cases[case] = dict(
+                passed=True, modes=modes, reattn_calls=calls,
+                q0_matches_canonical=bool(q0_ok),
+                trainable_old=info_old["names"],
+                trainable_new=info_new["names"], added=new_only,
+                n_params_old=int(info_old["n_params"]),
+                n_params_new=int(info_new["n_params"]))
+            names_by_case[case] = new_only
+            print(f"    пройден; обучаемых {info_old['n_tensors']} -> "
+                  f"{info_new['n_tensors']}, добавлено {len(new_only)}")
+
+    out = dict(
+        kind="k14h_identity_gate", passed=True,
+        run_id=f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}",
+        cases=cases, comparisons=res, n_batches=len(batches),
+        rows_sha1=rows_sha, heads=int(a.heads), variant=a.variant,
+        joint_ckpt=a.joint_ckpt, joint_sha1=k11a.file_sha1(a.joint_ckpt),
+        ckpt=a.ckpt, head_ckpt=a.head_ckpt,
+        q0_npz=q0_prov["q0_npz"], q0_npz_sha1=q0_prov["q0_npz_sha1"],
+        q0_manifest_sha1=q0_prov["q0_manifest_sha1"],
+        plan_sha1=q0_prov["plan_sha1"], plan_batch=q0_prov["plan_batch"],
+        gate_r_sha1=q0_prov["gate_r_sha1"],
+        device=str(dev), gpu_uuid=kc.gpu_uuid(dev, torch),
+        compute_dtype=a.dtype, torch_version=str(torch.__version__),
+        cuda_version=str(getattr(torch.version, "cuda", None)),
+        tf32_matmul=bool(torch.backends.cuda.matmul.allow_tf32),
+        tf32_cudnn=bool(torch.backends.cudnn.allow_tf32),
+        cudnn_deterministic=bool(torch.backends.cudnn.deterministic),
+        cudnn_benchmark=bool(torch.backends.cudnn.benchmark),
+        reattn_sha1=sha12(os.path.join(here, "k14h_reattn.py")),
+        depth_rvq_joint12_sha1=sha12(os.path.join(here,
+                                                  "depth_rvq_joint12.py")),
+        depth_rvq_vla_sha1=sha12(os.path.join(here, "depth_rvq_vla.py")),
+        joint12_vla_sha1=sha12(os.path.join(here, "joint12_vla.py")),
+        bar_sha1=sha12(inspect.getfile(SmolVLABlockwiseAR)),
+        git_head=git_head, git_dirty=bool(dirty),
+        code_version=kb.code_version([
+            os.path.abspath(__file__),
+            os.path.join(here, "k14h_reattn.py"),
+            os.path.join(here, "depth_rvq_joint12.py"),
+            os.path.join(here, "k14_common.py")]),
+        script_sha1=sha12(os.path.abspath(__file__)))
+    if dirty:
+        raise SystemExit("гейт снят при незакоммиченном коде: он быстрый, "
+                         "переснимите после коммита")
     os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
     tmp = a.out + f".tmp.{os.getpid()}"
     json.dump(out, open(tmp, "w"), ensure_ascii=False, indent=1, default=str)
     os.replace(tmp, a.out)
-    new_only = sorted(set(info_new["names"]) - set(info_old["names"]))
-    print(f"\n  ГЕЙТ ПРОЙДЕН: все режимы совпали побитово на {len(plan)} "
-          f"батчах")
-    print(f"  обучаемых было {info_old['n_tensors']} "
-          f"({info_old['n_params'] / 1e6:.3f} млн), стало "
-          f"{info_new['n_tensors']} ({info_new['n_params'] / 1e6:.3f} млн)")
-    print(f"  добавлены только параметры блока: {len(new_only)} тензоров")
+    print(f"\n  ГЕЙТ ПРОЙДЕН: {len(cases)} случаев x 3 режима x "
+          f"{len(batches)} батчей, всё побитово")
+    print(f"  строки сверки: {rows_sha}, запуск {out['run_id']}")
     print(f"  сохранено: {a.out}")
     return 0
 
