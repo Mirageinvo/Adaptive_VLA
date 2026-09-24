@@ -498,6 +498,33 @@ def main():
     if a.verify_only:
         return 0
 
+    def save_partial(res, sel, outcome, extra):
+        """Сохранить измеренное, когда подтверждение открывать нельзя."""
+        d = dict(kind="k14f_mlp_probe", outcome=outcome,
+                 note="подтверждающая половина не открывалась",
+                 results=[{k: v for k, v in r.items() if k != "state"}
+                          for r in res],
+                 selected=({k: v for k, v in sel.items() if k != "state"}
+                           if sel else None),
+                 history=hist_all, verify_linear_on_cache=got,
+                 linear_train_slice=lin_tr, linear_val_sel=got,
+                 h18_sha1=man["h18_sha1"], git_head=git_head,
+                 script_sha1=sha12(os.path.abspath(__file__)), **extra)
+        os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".",
+                    exist_ok=True)
+        t_ = a.out + f".tmp.{os.getpid()}"
+        json.dump(d, open(t_, "w"), ensure_ascii=False, indent=1, default=str)
+        os.replace(t_, a.out)
+        print(f"  сохранено (без подтверждения): {a.out}")
+        if sel is not None and "state" in sel:
+            t2 = ck_out + f".tmp.{os.getpid()}"
+            torch.save(dict(kind="k14f_head_unconfirmed", state=sel["state"],
+                            hidden=sel["hidden"], seed=sel["seed"],
+                            epoch=sel["epoch"], val_sel=sel["val_sel"],
+                            outcome=outcome, **extra), t2)
+            os.replace(t2, ck_out)
+            print(f"  веса сохранены как неподтверждённые: {ck_out}")
+
     # --- ОБУЧЕНИЕ ПРОБЫ -----------------------------------------------------
     hiddens = [int(x) for x in a.hidden.split(",") if x.strip()]
     seeds = [int(x) for x in a.seeds.split(",") if x.strip()]
@@ -611,11 +638,27 @@ def main():
     # ПЕРЕД ОТКРЫТИЕМ val_confirm КОД СВЕРЯЕТСЯ ЗАНОВО. Прогон идёт часы, и
     # правка файла посреди него осталась бы незамеченной.
     git_head1, code_v1, _d1 = code_state()
-    if git_head1 != git_head or code_v1 != code_v0:
-        raise SystemExit(
-            f"код изменился во время прогона: коммит {git_head} -> "
-            f"{git_head1}, файлы "
-            f"{[k for k in code_v0 if code_v0[k] != code_v1.get(k)]}")
+    changed = [k for k in code_v0 if code_v0[k] != code_v1.get(k)]
+    if changed:
+        # ОТКАЗ СТОИТ РОВНО ТОГО, ЧТО ЗАЩИЩАЕТ. Защищается одноразовая
+        # подтверждающая половина, а не часы обучения: выбранные веса и все
+        # измерения сохраняются, не открывается только она.
+        print(f"  КОД ИЗМЕНИЛСЯ ВО ВРЕМЯ ПРОГОНА: файлы {changed}. "
+              f"Подтверждающая половина НЕ открывается; результаты "
+              f"сохраняются как неподтверждённые")
+        save_partial(results, pick, "code_changed_during_run",
+                     dict(git_head_start=git_head, git_head_end=git_head1,
+                          code_version_end=code_v1, changed=changed))
+        return 5
+    if git_head1 != git_head:
+        # СМЕНА КОММИТА БЕЗ СМЕНЫ ФАЙЛОВ — НЕ ПОВОД ОТКАЗЫВАТЬ. Проверка
+        # существует ради того, чтобы результат принадлежал одной версии
+        # вычисляющего кода; если ни один такой файл не тронут, он ей и
+        # принадлежит. Прежняя версия роняла прогон из-за правки FINDINGS и
+        # теряла сто пять минут счёта.
+        print(f"  коммит сменился во время прогона ({git_head} -> "
+              f"{git_head1}), но ни один отслеживаемый файл не изменился; "
+              f"оба коммита записаны в сводку")
 
     head = make_head(torch, d_model, V, pick["hidden"],
                      float(man["norm_eps"])).to(dev)
@@ -675,6 +718,7 @@ def main():
                lambda_action=a.lambda_action, device=str(dev),
                gpu_uuid=kc.gpu_uuid(dev, torch), git_head=git_head,
                git_dirty=bool(dirty), code_version=code_v0,
+               git_head_end=git_head1,
                script_sha1=sha12(os.path.abspath(__file__)),
                minutes=float((time.time() - t0) / 60))
     os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
