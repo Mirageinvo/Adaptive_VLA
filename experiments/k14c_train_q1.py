@@ -504,6 +504,11 @@ def main():
                          "Урезание по строкам с последующей перенарезкой "
                          "дало бы неполные батчи, которых нет в плане, а "
                          "значит другой q0")
+    ap.add_argument("--selection-only", action="store_true",
+                    help="полный train и полный val_sel, голова сохраняется, "
+                         "подтверждающая половина НЕ формируется вовсе. Это "
+                         "НЕ смоук: данные полные, результат пригоден для "
+                         "выбора варианта, но не для Gate 4")
     ap.add_argument("--reattn-heads", type=int, default=8,
                     help="число голов блока §49; сверяется с гейтом")
     ap.add_argument("--allow-dirty", action="store_true",
@@ -540,12 +545,15 @@ def main():
                                 ("--additive-feedback", a.additive_feedback),
                                 ("--identity-gate", a.identity_gate or None))
                  if v is None]
-    if a.architecture and a.additive_feedback == "off" \
-            and a.variant == "no_feedback":
+    if a.architecture and a.variant == "no_feedback":
+        # ЗАПРЕЩЁН ЦЕЛИКОМ, А НЕ ТОЛЬКО В СОЧЕТАНИИ. С `off` это дублирование,
+        # с `on` — прямое противоречие, а при включённом блоке само название
+        # неверно: обратная связь от q0 остаётся через запрос внимания.
         raise SystemExit(
-            "--variant no_feedback и --additive-feedback off задают одно и то "
-            "же двумя способами: при §49 состоянием аддитивной ветви "
-            "управляет только --additive-feedback")
+            "--variant no_feedback несовместим с §49: состоянием аддитивной "
+            "ветви управляет только --additive-feedback. Значение "
+            "no_feedback оставлено для старых диагностических режимов и "
+            "чекпойнтов")
     if miss:
         raise SystemExit(f"нужны {miss}: вариант и training-сид задаются "
                          f"явно, умолчаний у них нет")
@@ -553,12 +561,20 @@ def main():
         raise SystemExit(
             "--allow-device-drift допустим только со --smoke или "
             "--eval-checkpoint: это диагностика, а не канонический прогон")
+    if a.smoke and a.selection_only:
+        raise SystemExit("--smoke и --selection-only взаимоисключающи: первый "
+                         "режет данные, второй нет")
     if a.limit and not a.smoke:
         raise SystemExit("--limit допустим только вместе со --smoke: "
                          "укороченный train в каноническом прогоне дал бы "
                          "голову, обученную не на том наборе")
-    out_p = a.out or (f"data/k14c/smoke_{a.variant}_s{a.seed}.pt" if a.smoke
-                      else f"data/k14c/q1_{a.variant}_s{a.seed}.pt")
+    tag_ = (f"_{a.architecture}_{a.additive_feedback}"
+            if a.architecture else "")
+    out_p = a.out or (
+        f"data/k14c/smoke_{a.variant}{tag_}_s{a.seed}.pt" if a.smoke
+        else f"data/k14c/sel_{a.variant}{tag_}_s{a.seed}.pt"
+        if a.selection_only
+        else f"data/k14c/q1_{a.variant}{tag_}_s{a.seed}.pt")
     # В РЕЖИМЕ ОЦЕНКИ ГОЛОВА НЕ ПИШЕТСЯ ВОВСЕ, и проверка на существование
     # выходного файла запрещала измерять ровно тот чекпойнт, ради которого
     # режим и заведён: его путь совпадает с тем, который прогон записал бы.
@@ -983,7 +999,11 @@ def main():
     # `val_confirm` открывалась бы повторно. Прогон идёт целиком или не идёт.
 
     # --- батчи --------------------------------------------------------------
-    keep = ("train", "val_sel") if a.smoke else ("train", "val_sel",
+    # ПОДТВЕРЖДАЮЩАЯ ПОЛОВИНА НЕ ФОРМИРУЕТСЯ В ОБОИХ РЕЖИМАХ, и по одной и
+    # той же причине: она открывается один раз, и тратить её на выбор
+    # варианта — значит подтверждать тем же набором, которым выбирали.
+    no_conf = bool(a.smoke or a.selection_only)
+    keep = ("train", "val_sel") if no_conf else ("train", "val_sel",
                                                  "val_confirm")
     # БАТЧИ БЕРУТСЯ ИЗ ПЛАНА, А НЕ НАРЕЗАЮТСЯ ЗАНОВО. Состав батча входит в
     # вычисление (дополнение слева до самого длинного промпта), поэтому
@@ -1857,15 +1877,22 @@ def main():
     print(f"\n  выбрана эпоха {best_ep} по val_sel ({best_val:.6f}); веса "
           f"восстановлены и сверены, sha {sel_sha}")
 
-    if a.smoke:
+    if no_conf:
         # СТРОКИ ПОДТВЕРЖДАЮЩЕЙ ПОЛОВИНЫ НЕ ОБРАЗУЮТ НАБОРА И НЕ ПРОХОДЯТ
         # ЧЕРЕЗ МОДЕЛЬ; метрика по ним не вычисляется. Сам файл целей и
         # артефакт гейта, разумеется, читаются целиком — но ни одно
         # наблюдение этой половины моделью не обработано.
-        print("  РЕЖИМ SMOKE: строки подтверждающей половины через модель не "
-              "проходили, метрика по ним не считалась, Gate 4 не вычислялся; "
-              "эта голова для эксперимента непригодна")
-        write_summary(outcome="smoke", history=hist, runtime=rt_now,
+        if a.smoke:
+            print("  РЕЖИМ SMOKE: строки подтверждающей половины через модель "
+                  "не проходили, метрика по ним не считалась, Gate 4 не "
+                  "вычислялся; эта голова для эксперимента непригодна")
+        else:
+            print("  РЕЖИМ ВЫБОРА: полные train и val_sel, подтверждающая "
+                  "половина не формировалась. Голова сохраняется и пригодна "
+                  "для выбора варианта; Gate 4 по ней не вычислен и "
+                  "вычислен быть не может")
+        write_summary(outcome=("smoke" if a.smoke else "selection_only"),
+                      history=hist, runtime=rt_now,
                       q0_prov=q0_prov, q0_mismatch=int(q0_bad[0]),
                       q0_positions=int(q0_tot[0]),
                       initial_trainable_state_sha1=init_sha,
@@ -1874,39 +1901,57 @@ def main():
                       parts={k_: dict(rows=int(len(sets[k_])),
                                       batches=len(batches[k_]))
                              for k_ in sets})
-        if a.out:
-            torch.save(dict(kind="smoke", stage="q1", variant=a.variant,
-                            seed=int(a.seed), history=hist,
-                            initial_trainable_state_sha1=init_sha,
-                            q0_mismatch=int(q0_bad[0]),
-                            q0_positions=int(q0_tot[0]), q0_prov=q0_prov,
-                            selected_state_sha1=sel_sha,
-                            note="проверка связности; как источник весов "
-                                 "для канонического прогона непригодна"),
-                       a.out)
-            print(f"  сохранено: {a.out}")
+        if a.out or a.selection_only:
+            out_sel = a.out or out_p
+            tmp_ = out_sel + f".tmp.{os.getpid()}"
+            torch.save(dict(
+                kind=("smoke" if a.smoke else "q1_head_unconfirmed"),
+                stage="q1", variant=a.variant, seed=int(a.seed),
+                architecture=a.architecture,
+                additive_feedback=a.additive_feedback,
+                state=({k: v.detach().cpu()
+                        for k, v in model.state_dict().items()
+                        if k in set(info["names"])}
+                       if a.selection_only else None),
+                trainable_names=info["names"], history=hist,
+                selected_epoch=best_ep, val_sel=best_val,
+                initial_trainable_state_sha1=init_sha,
+                q0_mismatch=int(q0_bad[0]), q0_positions=int(q0_tot[0]),
+                q0_prov=q0_prov, selected_state_sha1=sel_sha,
+                q1_cache=a.q1_cache, q1_cache_sha1=man["labels_sha1"],
+                joint_sha1=j_sha, bar_sha1=bar_sha,
+                code_version=code_v0, git_head=git_head0,
+                **(id_info or {}),
+                note=("проверка связности; как источник весов непригодна"
+                      if a.smoke else
+                      "подтверждающая половина НЕ открывалась; пригодна для "
+                      "выбора варианта, не для Gate 4")), tmp_)
+            os.replace(tmp_, out_sel)
+            print(f"  сохранено: {out_sel}")
         return 0
 
     # ПЕРЕД ОТКРЫТИЕМ ПОДТВЕРЖДАЮЩЕЙ ПОЛОВИНЫ КОД СВЕРЯЕТСЯ ЗАНОВО. Она
     # открывается один раз, и открывать её результатом, полученным частично
     # другим кодом, значит потратить её впустую.
     if need_arch:
-        # ПЕРЕД ПОДТВЕРЖДАЮЩЕЙ ПОЛОВИНОЙ ГЕЙТ И АРХИТЕКТУРНЫЙ КОД СВЕРЯЮТСЯ
-        # ЗАНОВО. Прогон идёт часы; подмена файла блока посреди него означала
-        # бы, что обучалась одна архитектура, а подтверждается другая.
-        for nm_, want_ in (("k14h_reattn.py", expect_gate["reattn_sha1"]),
-                           ("depth_rvq_joint12.py",
-                            expect_gate["depth_rvq_joint12_sha1"]),
-                           ("depth_rvq_vla.py",
-                            expect_gate["depth_rvq_vla_sha1"]),
-                           ("joint12_vla.py",
-                            expect_gate["joint12_vla_sha1"])):
-            got_ = sha12(os.path.join(here, nm_))
-            if got_ != want_:
-                raise SystemExit(f"{nm_} изменился во время прогона: {want_} "
-                                 f"-> {got_}")
-        if sha12(a.identity_gate) != id_info["identity_gate_sha1"]:
-            raise SystemExit("артефакт гейта изменился во время прогона")
+        # ПЕРЕД ПОДТВЕРЖДАЮЩЕЙ ПОЛОВИНОЙ ГЕЙТ ПРОВЕРЯЕТСЯ ТЕМ ЖЕ ВЫЗОВОМ, что
+        # и на старте, и результат обязан совпасть целиком. Сокращённая
+        # ручная сверка нескольких отпечатков была бы второй, чуть иной
+        # реализацией той же схемы — а именно из таких пар и вырастают
+        # расхождения, которые никто не замечает.
+        expect_now = dict(expect_gate)
+        for k_, f_ in (("reattn_sha1", "k14h_reattn.py"),
+                       ("depth_rvq_joint12_sha1", "depth_rvq_joint12.py"),
+                       ("depth_rvq_vla_sha1", "depth_rvq_vla.py"),
+                       ("joint12_vla_sha1", "joint12_vla.py")):
+            expect_now[k_] = sha12(os.path.join(here, f_))
+        id_now = kh.check_identity_gate(
+            a.identity_gate, architecture=a.architecture,
+            feedback=a.additive_feedback, expect=expect_now, file_sha=sha12)
+        if id_now != id_info:
+            raise SystemExit(
+                f"проверка гейта перед подтверждением дала другой результат: "
+                f"{[k for k in id_info if id_info[k] != id_now.get(k)]}")
 
     git_head1, code_v1, _d1 = code_state()
     if git_head1 != git_head0 or code_v1 != code_v0:

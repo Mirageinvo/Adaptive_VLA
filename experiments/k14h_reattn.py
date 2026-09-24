@@ -205,7 +205,12 @@ def check_identity_gate(path, *, architecture, feedback, expect, file_sha):
     c = cases[case]
     if c.get("passed") is not True:
         raise SystemExit(f"случай {case} не пройден")
-    for mode, want in (("fast", 0), ("medium", 1), ("full", 1)):
+    # ЧИСЛО ВЫЗОВОВ ЗАВИСИТ ОТ АРХИТЕКТУРЫ. У baseline блок выключен
+    # целиком, и правильное ожидание — ноль во всех режимах. Требовать 0/1/1
+    # от любого случая значило бы либо никогда не пропускать baseline, либо
+    # считать вход в оболочку вместо фактического вычисления внимания.
+    on = 0 if architecture == "baseline" else 1
+    for mode, want in (("fast", 0), ("medium", on), ("full", on)):
         if mode not in (c.get("modes") or {}):
             raise SystemExit(f"случай {case}: режим {mode} не проверялся")
         got = (c.get("reattn_calls") or {}).get(mode)
@@ -539,7 +544,28 @@ def selftest():
                 assert why in str(e), (arch, fb, e)
             else:
                 raise AssertionError(f"принят чужой случай {arch}/{fb}")
-        # ЧИСЛО ВЫЗОВОВ БЛОКА
+        # BASELINE: ожидание ноль во всех режимах
+        base_ok = _json.loads(_json.dumps(good))
+        base_ok["cases"] = {"baseline/on": dict(
+            passed=True, modes={"fast": {}, "medium": {}, "full": {}},
+            reattn_calls={"fast": 0, "medium": 0, "full": 0},
+            q0_matches_canonical=True)}
+        assert check_identity_gate(w(base_ok), architecture="baseline",
+                                   feedback="on", expect=exp,
+                                   file_sha=lambda _p: "SH")["identity_case"] \
+            == "baseline/on"
+        bad_b = _json.loads(_json.dumps(base_ok))
+        bad_b["cases"]["baseline/on"]["reattn_calls"]["medium"] = 1
+        try:
+            check_identity_gate(w(bad_b), architecture="baseline",
+                                feedback="on", expect=exp,
+                                file_sha=lambda _p: "SH")
+        except SystemExit as e:
+            assert "medium" in str(e), e
+        else:
+            raise AssertionError("baseline с вызовом блока принят")
+
+        # ЧИСЛО ВЫЗОВОВ БЛОКА У reattn
         for mode, val, why in (("fast", 1, "fast"), ("medium", 0, "medium"),
                                ("full", 2, "full")):
             bad_c = _json.loads(_json.dumps(good))
