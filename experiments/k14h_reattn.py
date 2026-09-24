@@ -70,8 +70,16 @@ def make_draft_reattn_block():
             self.p_d = nn.Linear(d_code, d_model, **kw)
             self.ln_d = nn.LayerNorm(d_model, **kw)
             self.ln_ctx = nn.LayerNorm(d_model, **kw)
-            q_in = 2 * d_model if self.use_draft else d_model
-            self.w_q = nn.Linear(q_in, d_model, **kw)
+            # ФОРМА ЗАПРОСА ОДНА У ОБОИХ ВАРИАНТОВ. Если бы у контроля
+            # W_q была вдвое у́же, он имел бы меньше параметров, и
+            # превосходство варианта с черновиком нельзя было бы приписать
+            # информации q0 — оно объяснялось бы лишней ёмкостью. Поэтому
+            # контроль подаёт во второй слот ФИКСИРОВАННЫЙ нулевой черновик;
+            # через LN и P_D он превращается в константу, одинаковую для всех
+            # позиций, и никакой информации о q0 не несёт.
+            self.w_q = nn.Linear(2 * d_model, d_model, **kw)
+            self.register_buffer("null_draft",
+                                 torch.zeros(1, 1, d_code, dtype=dtype))
             self.w_k = nn.Linear(d_model, d_model, **kw)
             self.w_v = nn.Linear(d_model, d_model, **kw)
             self.w_o = nn.Linear(d_model, d_model, **kw)
@@ -95,11 +103,10 @@ def make_draft_reattn_block():
             """
             dt = self.w_q.weight.dtype
             hq = self.ln_h(h.to(dt))
-            if self.use_draft:
-                q = self.w_q(torch.cat([hq, self.ln_d(self.p_d(d0.to(dt)))],
-                                       dim=-1))
-            else:
-                q = self.w_q(hq)
+            d_in = (d0.to(dt) if self.use_draft
+                    else self.null_draft.to(dt).expand(h.shape[0],
+                                                       h.shape[1], -1))
+            q = self.w_q(torch.cat([hq, self.ln_d(self.p_d(d_in))], dim=-1))
             c = self.ln_ctx(ctx.to(dt))
             k, v = self.w_k(c), self.w_v(c)
             am = None
@@ -152,8 +159,16 @@ def make_draft_reattn_class(base_cls):
 
         def configure_draft_reattn(self, *, stage="q1", variant="main",
                                    verbose=True):
-            """Белый список этапа плюс параметры блока. Точное множество."""
-            info = self.configure_joint_depth_rvq(stage=stage, variant=variant,
+            """Белый список этапа плюс параметры блока. Точное множество.
+
+            `variant="no_additive_feedback"` выключает аддитивную ветвь
+            CodeFeedback; базовый класс знает её под именем `no_feedback`, и
+            имя переводится здесь, а не в вызывающем коде.
+            """
+            base_variant = ("no_feedback" if variant == "no_additive_feedback"
+                            else variant)
+            info = self.configure_joint_depth_rvq(stage=stage,
+                                                  variant=base_variant,
                                                   verbose=False)
             if not hasattr(self, "draft_reattn"):
                 raise RuntimeError("блок не собран")
@@ -164,7 +179,11 @@ def make_draft_reattn_class(base_cls):
                            if p.requires_grad)
             want = sorted(n for n, _ in self.named_parameters()
                           if n.startswith(TRAIN_PREFIXES))
-            if variant == "no_feedback":
+            # ИМЯ ВАРИАНТА ТОЧНОЕ. При включённом блоке q0 продолжает
+            # входить в вычисление через запрос внимания, поэтому «без
+            # обратной связи» было бы неверно: выключается только АДДИТИВНАЯ
+            # ветвь CodeFeedback.
+            if variant in ("no_feedback", "no_additive_feedback"):
                 want = [n for n in want
                         if not n.startswith("depth_rvq_feedback.")]
             if names != want:
@@ -257,15 +276,21 @@ def make_draft_reattn_class(base_cls):
                     emb = hard if g == 0 else emb + (hard - emb).detach()
                 injected.append(inj_idx)
                 embs.append(emb)
+                # ЗАПРОС СТРОИТСЯ ИЗ СОСТОЯНИЯ ДО additive feedback, и обе
+                # добавки ПАРАЛЛЕЛЬНЫ:
+                #     h' = h + F(E0[q0]) + ReAttn(h, E0[q0], H_vlm)
+                # Если бы запрос собирался из состояния ПОСЛЕ feedback,
+                # черновик входил бы дважды — и это была бы другая
+                # архитектура, а сравнение с базовой перестало бы отвечать на
+                # заданный вопрос.
+                h_pre = action_hidden
                 if self.depth_rvq_feedback_built \
                         and self.depth_rvq_feedback_mask[g]:
                     action_hidden = self.depth_rvq_feedback[g](action_hidden,
                                                                emb)
-                # --- НОВОЕ: обращение к префиксу с учётом черновика --------
                 if g == 0 and getattr(self, "draft_reattn_enabled", False):
-                    c = self.draft_reattn[0](
-                        action_hidden, emb, vlm_hidden,
-                        ctx_mask=attention_mask)
+                    c = self.draft_reattn[0](h_pre, emb, vlm_hidden,
+                                             ctx_mask=attention_mask)
                     action_hidden = action_hidden + c.to(action_hidden.dtype)
                     n_reattn += 1
 
@@ -327,21 +352,38 @@ def selftest():
     nod = Block(D, Dc, n_heads=4, use_draft=False)
     with torch.no_grad():
         nod.w_o.weight.normal_(0, 0.5)
-    assert torch.allclose(nod(h, d0, ctx), nod(h, torch.randn(B, P, Dc), ctx),
-                          atol=0), "вариант без черновика от него зависит"
-    assert nod.w_q.in_features == D and blk.w_q.in_features == 2 * D
+    assert torch.equal(nod(h, d0, ctx), nod(h, torch.randn(B, P, Dc), ctx)), \
+        "вариант без черновика от него зависит"
+    # КОНТРОЛЬ УРАВНЕН ПО ПАРАМЕТРАМ: форма запроса одна и та же, во втором
+    # слоте фиксированный нулевой черновик.
+    assert nod.w_q.in_features == 2 * D and blk.w_q.in_features == 2 * D
+    n_blk = sum(p.numel() for p in blk.parameters())
+    n_nod = sum(p.numel() for p in nod.parameters())
+    assert n_blk == n_nod, (f"число параметров различается: {n_blk} против "
+                            f"{n_nod} — превосходство нельзя будет приписать "
+                            f"информации q0")
+    assert float(nod.null_draft.abs().max()) == 0.0
 
-    # --- ГРАДИЕНТ ДОХОДИТ ДО ВСЕХ ПАРАМЕТРОВ ------------------------------
-    blk.zero_grad()
-    blk(h, d0, ctx).sum().backward()
-    nog = [n for n, p in blk.named_parameters() if p.grad is None]
-    assert not nog, f"нет градиента у {nog}"
-    # и при нулевой W_o тоже: alpha не должна обнулять путь к W_o
+    # --- ГРАДИЕНТЫ: ЧТО ОБЯЗАНО БЫТЬ НЕНУЛЕВЫМ И КОГДА --------------------
+    # При ТОЧНОМ W_o = 0 выход не зависит от Q, K, V, норм и alpha, поэтому
+    # их градиенты закономерно нулевые, и требовать обратного значило бы
+    # требовать математически невозможного. Ненулевым обязан быть ровно один
+    # градиент — по самой W_o: иначе блок мёртв и не тронется с места.
     b2 = Block(D, Dc, n_heads=4)
     b2(h, d0, ctx).sum().backward()
     assert b2.w_o.weight.grad is not None \
         and float(b2.w_o.weight.grad.abs().max()) > 0, \
         "при нулевой W_o градиент до неё не доходит — блок мёртв"
+    for nm_ in ("w_q.weight", "w_k.weight", "w_v.weight", "alpha"):
+        g_ = dict(b2.named_parameters())[nm_].grad
+        assert g_ is None or float(g_.abs().max()) == 0.0, \
+            f"при нулевой W_o градиент по {nm_} обязан быть нулевым"
+    # ПОСЛЕ ненулевой W_o он доходит до всех
+    blk.zero_grad()
+    blk(h, d0, ctx).sum().backward()
+    nog = [n for n, p in blk.named_parameters() if p.grad is None
+           or float(p.grad.abs().max()) == 0.0]
+    assert not nog, f"после ненулевой W_o нет градиента у {nog}"
 
     # --- ФОРМА ГОЛОВ -------------------------------------------------------
     try:
