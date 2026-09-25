@@ -121,12 +121,21 @@ def lint_shadowed_subscripts(path):
 
 def selftest():
     import torch
+    torch.manual_seed(0)
     out = {}
     a = torch.randn(3, 4)
     compare("x", a, a.clone(), out)
     assert out["x"]["equal"]
     compare("l", [a, a], [a.clone(), a.clone()], out)
-    b = a.clone(); b[0, 0] += 1e-7
+    # НА ОДИН МЛАДШИЙ РАЗРЯД, А НЕ НА 1e-7. Прибавка фиксированной величины
+    # к случайному числу меняет биты не всегда: при |a| около двух шаг сетки
+    # float32 сам больше 1e-7, и `b` выходил побитово равным `a` — тест
+    # тогда «проходил» сравнение и падал на собственном assert. nextafter
+    # даёт МИНИМАЛЬНОЕ представимое различие, и это ровно то, что проверка
+    # обязана видеть: допуска нет.
+    b = a.clone()
+    b[0, 0] = torch.nextafter(b[0, 0], torch.tensor(float("inf")))
+    assert not torch.equal(a, b), "возмущение не изменило ни одного бита"
     try:
         compare("y", a, b, out)
     except SystemExit as e:
