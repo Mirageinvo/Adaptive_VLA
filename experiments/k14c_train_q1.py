@@ -1956,25 +1956,39 @@ def main():
         os.makedirs(os.path.dirname(os.path.abspath(a.dump_rows)) or ".",
                     exist_ok=True)
         tmp_d = a.dump_rows + f".tmp.{os.getpid()}"
-        np.savez(tmp_d, rows=d_rows, episode=d_epi, se=d_se, n=d_n,
-                 meta=json.dumps(dict(
-                     kind="k14c_rows_val_sel", part="val_sel",
-                     variant=a.variant, seed=int(a.seed),
-                     architecture=a.architecture,
-                     additive_feedback=a.additive_feedback,
-                     selected_epoch=int(best_ep), val_sel=float(best_val),
-                     selected_state_sha1=sel_sha,
-                     initial_trainable_state_sha1=init_sha,
-                     epochs=int(a.epochs), batch=int(a.batch),
-                     smoke=bool(a.smoke), limit=int(a.limit),
-                     selection_only=bool(a.selection_only),
-                     n_episodes=int(len(np.unique(d_epi))),
-                     q0_prov=q0_prov, plan_sha1=q0_prov.get("plan_sha1"),
-                     q1_cache_sha1=man["labels_sha1"],
-                     git_head=git_head0, code_version=code_v0,
-                     identity_gate_run_id=(id_info or {}).get(
-                         "identity_gate_run_id")), ensure_ascii=False,
-                     default=str))
+        # ЧЕРЕЗ ОТКРЫТЫЙ ДЕСКРИПТОР, как в K-14d и K-14e. По ИМЕНИ numpy
+        # дописывает расширение .npz, если его нет, — временный файл
+        # получался с именем ...npz.tmp.PID.npz, а переименовывался
+        # несуществующий ...npz.tmp.PID.
+        meta_d = dict(
+            kind="k14c_rows_val_sel", part="val_sel",
+            variant=a.variant, seed=int(a.seed),
+            architecture=a.architecture,
+            additive_feedback=a.additive_feedback,
+            selected_epoch=int(best_ep), val_sel=float(best_val),
+            selected_state_sha1=sel_sha,
+            initial_trainable_state_sha1=init_sha,
+            epochs=int(a.epochs), batch=int(a.batch),
+            smoke=bool(a.smoke), limit=int(a.limit),
+            selection_only=bool(a.selection_only),
+            n_episodes=int(len(np.unique(d_epi))),
+            q0_prov=q0_prov, plan_sha1=q0_prov.get("plan_sha1"),
+            q1_cache_sha1=man["labels_sha1"],
+            git_head=git_head0, code_version=code_v0,
+            identity_gate_run_id=(id_info or {}).get("identity_gate_run_id"))
+        arrs_d = dict(rows=d_rows, episode=d_epi, se=d_se, n=d_n,
+                      meta=json.dumps(meta_d, ensure_ascii=False,
+                                      default=str))
+        with open(tmp_d, "wb") as fh_d:
+            np.savez_compressed(fh_d, **arrs_d)
+        # ПЕРЕЧИТЫВАНИЕ ДО ПУБЛИКАЦИИ: файл, который не открывается или
+        # потерял массив, лучше обнаружить здесь, чем через двадцать часов
+        # при сравнении.
+        with np.load(tmp_d, allow_pickle=True) as z_:
+            if sorted(z_.files) != sorted(arrs_d):
+                raise SystemExit(f"{a.dump_rows}: массивы {sorted(z_.files)}")
+            if not np.array_equal(z_["rows"], d_rows):
+                raise SystemExit(f"{a.dump_rows}: строки не перечитались")
         os.replace(tmp_d, a.dump_rows)
         print(f"  построчная ошибка val_sel: {a.dump_rows} "
               f"({len(d_rows)} строк, {len(np.unique(d_epi))} эпизодов, "
