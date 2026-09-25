@@ -59,18 +59,28 @@ def make_draft_reattn_block():
         нынешней, и сравнение архитектур начинается с общей точки.
         """
 
-        def __init__(self, d_model, d_code, n_heads=8, use_draft=True,
-                     dtype=torch.float32):
+        def __init__(self, d_model, d_code, d_ctx=None, n_heads=8,
+                     use_draft=True, dtype=torch.float32):
+            """`d_ctx` — ширина ЧИТАЕМОГО префикса, она же ширина башни VLM.
+
+            ОНА НЕ РАВНА `d_model`. Эксперт действий у́же башни (768 против
+            2048), а блок читает из башни и пишет в поток действий. Значение
+            по умолчанию `d_ctx = d_model` оставлено только ради
+            самопроверок на игрушечных размерах; настоящая сборка обязана
+            передавать ширину явно.
+            """
             super().__init__()
             if d_model % n_heads:
                 raise ValueError(f"d_model {d_model} не делится на {n_heads}")
+            d_ctx = int(d_model if d_ctx is None else d_ctx)
             self.d_model, self.n_heads = int(d_model), int(n_heads)
+            self.d_code, self.d_ctx = int(d_code), d_ctx
             self.use_draft = bool(use_draft)
             kw = dict(dtype=dtype)
             self.ln_h = nn.LayerNorm(d_model, **kw)
             self.p_d = nn.Linear(d_code, d_model, **kw)
             self.ln_d = nn.LayerNorm(d_model, **kw)
-            self.ln_ctx = nn.LayerNorm(d_model, **kw)
+            self.ln_ctx = nn.LayerNorm(d_ctx, **kw)
             # ФОРМА ЗАПРОСА ОДНА У ОБОИХ ВАРИАНТОВ. Если бы у контроля
             # W_q была вдвое у́же, он имел бы меньше параметров, и
             # превосходство варианта с черновиком нельзя было бы приписать
@@ -81,8 +91,8 @@ def make_draft_reattn_block():
             self.w_q = nn.Linear(2 * d_model, d_model, **kw)
             self.register_buffer("null_draft",
                                  torch.zeros(1, 1, d_code, dtype=dtype))
-            self.w_k = nn.Linear(d_model, d_model, **kw)
-            self.w_v = nn.Linear(d_model, d_model, **kw)
+            self.w_k = nn.Linear(d_ctx, d_model, **kw)
+            self.w_v = nn.Linear(d_ctx, d_model, **kw)
             self.w_o = nn.Linear(d_model, d_model, **kw)
             self.alpha = nn.Parameter(torch.ones(1, dtype=dtype))
             with torch.no_grad():
@@ -113,6 +123,19 @@ def make_draft_reattn_block():
             позиции, а их число зависит от состава батча — то самое, из-за
             чего q0 когда-то оказался невоспроизводимым.
             """
+            for nm_, got_, want_ in (("h", h.shape[-1], self.d_model),
+                                     ("d0", d0.shape[-1], self.d_code),
+                                     ("ctx", ctx.shape[-1], self.d_ctx)):
+                if int(got_) != int(want_):
+                    raise ValueError(
+                        f"{nm_} шириной {int(got_)}, блок собран под "
+                        f"{int(want_)} (d_model={self.d_model}, "
+                        f"d_code={self.d_code}, d_ctx={self.d_ctx})")
+            if ctx_mask is not None and \
+                    int(ctx_mask.shape[-1]) != int(ctx.shape[1]):
+                raise ValueError(
+                    f"маска длины {int(ctx_mask.shape[-1])} при префиксе "
+                    f"{int(ctx.shape[1])}")
             dt = self.w_q.weight.dtype
             hq = self.ln_h(h.to(dt))
             d_in = (d0.to(dt) if self.use_draft
@@ -240,9 +263,20 @@ def make_draft_reattn_class(base_cls):
                 raise RuntimeError("блок уже собран")
             d_model = int(self.fast_head.in_features)
             d_code = int(self.depth_rvq_books.shape[-1])
+            # ЧИТАЕМЫЙ ПРЕФИКС ШИРЕ ПОТОКА ДЕЙСТВИЙ. Эксперт действий у́же
+            # башни VLM, и блок ходит за информацией именно в башню. Ширина
+            # берётся из конфига, а не приравнивается к d_model; несовпадение
+            # с фактическим тензором отвергается в forward.
+            d_ctx = getattr(self.config.vlm_config.text_config,
+                            "hidden_size", None)
+            if not d_ctx:
+                raise RuntimeError(
+                    "в конфиге нет vlm_config.text_config.hidden_size — "
+                    "ширину префикса взять неоткуда")
+            d_ctx = int(d_ctx)
             dev = self.fast_head.weight.device
             self.draft_reattn = nn.ModuleList(
-                [Block(d_model, d_code, n_heads=n_heads,
+                [Block(d_model, d_code, d_ctx=d_ctx, n_heads=n_heads,
                        use_draft=use_draft, dtype=head_dtype).to(dev)])
             self.draft_reattn_enabled = True
             self.draft_reattn_uses_draft = bool(use_draft)
@@ -254,6 +288,7 @@ def make_draft_reattn_class(base_cls):
                 n = sum(p.numel() for p in self.draft_reattn.parameters())
                 print(f"  re-attention собран: голов {n_heads}, запрос "
                       f"{'с черновиком' if use_draft else 'БЕЗ черновика'}, "
+                      f"действия {d_model}, префикс {d_ctx}, код {d_code}, "
                       f"{n / 1e6:.3f} млн параметров, W_o обнулена")
 
         def configure_draft_reattn(self, *, stage="q1", variant="main",
@@ -395,6 +430,15 @@ def make_draft_reattn_class(base_cls):
                     action_hidden = self.depth_rvq_feedback[g](action_hidden,
                                                                emb)
                 if g == 0 and getattr(self, "draft_reattn_enabled", False):
+                    # БЕЗ МАСКИ БЛОК НЕ РАБОТАЕТ. Внимание разошлось бы и на
+                    # дополненные позиции, а их число зависит от состава
+                    # батча — ровно та причина, по которой q0 когда-то
+                    # оказался невоспроизводимым. Молча брать полный префикс
+                    # нельзя.
+                    if attention_mask is None:
+                        raise RuntimeError(
+                            "re-attention включён, а маски префикса нет: "
+                            "паддинг остался бы открытым")
                     c = self.draft_reattn[0](h_pre, emb, vlm_hidden,
                                              ctx_mask=attention_mask)
                     action_hidden = action_hidden + c.to(action_hidden.dtype)
@@ -421,12 +465,40 @@ def selftest():
     import torch
     torch.manual_seed(0)
     Block = make_draft_reattn_block()
-    B, P, S, D, Dc = 3, 4, 7, 16, 8
+    # ТРИ ШИРИНЫ РАЗНЫЕ, И ЭТО НЕ ПРИДИРКА. Первый прогон гейта упал именно
+    # потому, что самопроверка гоняла блок на ctx той же ширины, что и поток
+    # действий, — и не могла увидеть, что K и V проецируются не из той
+    # размерности. Равные размеры в тесте прячут ровно тот класс ошибки,
+    # ради которого тест написан.
+    B, P, S, D, Dc, Dx = 3, 4, 7, 16, 8, 24
 
-    blk = Block(D, Dc, n_heads=4)
+    blk = Block(D, Dc, d_ctx=Dx, n_heads=4)
     h = torch.randn(B, P, D)
     d0 = torch.randn(B, P, Dc)
-    ctx = torch.randn(B, S, D)
+    ctx = torch.randn(B, S, Dx)
+    assert blk.w_k.in_features == Dx and blk.w_v.in_features == Dx, \
+        "K и V проецируются не из ширины префикса"
+    assert blk.w_k.out_features == D and blk.ln_ctx.normalized_shape == (Dx,)
+
+    # --- НЕСОВПАДЕНИЕ ШИРИН ОТВЕРГАЕТСЯ С ВНЯТНЫМ СООБЩЕНИЕМ -------------
+    for bad_h, bad_d, bad_c, why in (
+            (torch.randn(B, P, D + 1), d0, ctx, "h шириной"),
+            (h, torch.randn(B, P, Dc + 1), ctx, "d0 шириной"),
+            (h, d0, torch.randn(B, S, Dx + 1), "ctx шириной")):
+        try:
+            blk(bad_h, bad_d, bad_c)
+        except ValueError as e:
+            assert why in str(e), (why, e)
+        else:
+            raise AssertionError(f"принят вход неверной ширины: {why}")
+    try:
+        blk(h, d0, ctx, ctx_mask=torch.ones(B, S + 1, dtype=torch.bool))
+    except ValueError as e:
+        assert "маска длины" in str(e), e
+    else:
+        raise AssertionError("принята маска не по длине префикса")
+    assert Block(D, Dc, n_heads=4).d_ctx == D, \
+        "по умолчанию ширина префикса обязана совпадать с d_model"
 
     # --- ПРИ ОБНУЛЁННОЙ W_o ВЫХОД СТРОГО НУЛЕВОЙ -------------------------
     out = blk(h, d0, ctx)
@@ -444,7 +516,7 @@ def selftest():
     m[:, -3:] = False
     o1 = blk(h, d0, ctx, ctx_mask=m)
     ctx2 = ctx.clone()
-    ctx2[:, -3:] = torch.randn(B, 3, D) * 100      # мусор в закрытых позициях
+    ctx2[:, -3:] = torch.randn(B, 3, Dx) * 100      # мусор в закрытых позициях
     o2 = blk(h, d0, ctx2, ctx_mask=m)
     assert torch.allclose(o1, o2, atol=1e-6), \
         "закрытые маской позиции влияют на выход"
@@ -455,7 +527,7 @@ def selftest():
     o3 = blk(h, torch.randn(B, P, Dc), ctx)
     assert not torch.allclose(blk(h, d0, ctx), o3, atol=1e-6), \
         "черновик не влияет на выход, хотя заявлен в запросе"
-    nod = Block(D, Dc, n_heads=4, use_draft=False)
+    nod = Block(D, Dc, d_ctx=Dx, n_heads=4, use_draft=False)
     with torch.no_grad():
         nod.w_o.weight.normal_(0, 0.5)
     assert torch.equal(nod(h, d0, ctx), nod(h, torch.randn(B, P, Dc), ctx)), \
@@ -475,7 +547,7 @@ def selftest():
     # их градиенты закономерно нулевые, и требовать обратного значило бы
     # требовать математически невозможного. Ненулевым обязан быть ровно один
     # градиент — по самой W_o: иначе блок мёртв и не тронется с места.
-    b2 = Block(D, Dc, n_heads=4)
+    b2 = Block(D, Dc, d_ctx=Dx, n_heads=4)
     b2(h, d0, ctx).sum().backward()
     assert b2.w_o.weight.grad is not None \
         and float(b2.w_o.weight.grad.abs().max()) > 0, \
@@ -493,7 +565,7 @@ def selftest():
 
     # --- ФОРМА ГОЛОВ -------------------------------------------------------
     try:
-        Block(D, Dc, n_heads=5)
+        Block(D, Dc, d_ctx=Dx, n_heads=5)
     except ValueError:
         pass
     else:
