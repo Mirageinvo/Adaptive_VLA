@@ -511,6 +511,13 @@ def main():
                          "выбора варианта, но не для Gate 4")
     ap.add_argument("--reattn-heads", type=int, default=8,
                     help="число голов блока §49; сверяется с гейтом")
+    ap.add_argument("--dump-rows", default="",
+                    help="npz с ПОСТРОЧНОЙ ошибкой на val_sel для весов "
+                         "выбранной эпохи: номер строки, эпизод, сумма "
+                         "квадратов и число элементов. Без него парное "
+                         "сравнение архитектур невозможно: сводка хранит "
+                         "только агрегат, а бутстрап по эпизодам требует "
+                         "слагаемых")
     ap.add_argument("--allow-dirty", action="store_true",
                     help="разрешить прогон на незакоммиченном коде; "
                          "канонический результат так получать нельзя")
@@ -1304,7 +1311,7 @@ def main():
 
     ev_extra = {}
 
-    def evaluate(bs, no_q1=False):
+    def evaluate(bs, no_q1=False, dump=None):
         """RMS первых восьми действий в единицах робота, argmax без ST.
 
         ПОБОЧНО СОБИРАЕТ CE И TOP-1 ПО КОДАМ. Печаталась только суммарная
@@ -1335,6 +1342,18 @@ def main():
                 dd = (a_hat[:, :H_EXEC] - a_true[:, :H_EXEC]) * q
                 se += float((dd ** 2).sum())
                 n += dd.numel()
+                if dump is not None:
+                    # ТА ЖЕ ВЕЛИЧИНА, ЧТО И В АГРЕГАТЕ, разложенная по
+                    # строкам: суммы квадратов и число элементов, а не
+                    # готовые RMS. Среднее корней не равно корню среднего, и
+                    # бутстрап по эпизодам обязан складывать слагаемые.
+                    ax = tuple(range(1, dd.dim()))
+                    dump["rows"].append(np.asarray(sel, np.int64))
+                    dump["se"].append(
+                        (dd.double() ** 2).sum(dim=ax).cpu().numpy())
+                    dump["n"].append(np.full(int(dd.shape[0]),
+                                             int(dd.numel() // dd.shape[0]),
+                                             np.int64))
         nt = max(acc["n_tok"], 1)          # токенов кода q1
         ne = max(acc["n_el"], 1)           # строк x H_EXEC
         nel7 = ne * 7                      # то же по всем семи каналам
@@ -1888,7 +1907,11 @@ def main():
     # подтверждающая половина считалась на весах ПОСЛЕДНЕЙ эпохи, а в отчёт
     # шёл номер выбранной — Gate 4 относился бы не к той модели.
     restore(named_tr, best["state"])
-    re_val = evaluate(batches["val_sel"])
+    # ДАМП СНИМАЕТСЯ ИМЕННО ЗДЕСЬ, на уже идущем пересчёте: он относится к
+    # весам выбранной эпохи по построению, а не по обещанию, и его агрегат
+    # сверяется с тем самым числом, по которому шёл отбор.
+    dump = dict(rows=[], se=[], n=[]) if a.dump_rows else None
+    re_val = evaluate(batches["val_sel"], dump=dump)
     if abs(re_val - best_val) > 1e-9:
         raise SystemExit(
             f"после восстановления val_sel {re_val:.8f} против {best_val:.8f}: "
@@ -1897,6 +1920,52 @@ def main():
                          for k, v in named_tr.items()})
     print(f"\n  выбрана эпоха {best_ep} по val_sel ({best_val:.6f}); веса "
           f"восстановлены и сверены, sha {sel_sha}")
+
+    if dump is not None:
+        d_rows = np.concatenate(dump["rows"])
+        d_se = np.concatenate(dump["se"])
+        d_n = np.concatenate(dump["n"])
+        # СВЕРКА ТРЁХ ВЕЩЕЙ, И КАЖДАЯ ЛОВИТ СВОЙ ВИД ПОДМЕНЫ.
+        want_rows = np.asarray(sets["val_sel"], np.int64)
+        if len(d_rows) != len(want_rows) or \
+                not np.array_equal(np.sort(d_rows), np.sort(want_rows)):
+            raise SystemExit(
+                f"дамп покрывает {len(d_rows)} строк, в val_sel "
+                f"{len(want_rows)}: состав не совпал")
+        if len(np.unique(d_rows)) != len(d_rows):
+            raise SystemExit("в дампе повторяются строки")
+        agg = float(np.sqrt(d_se.sum() / max(int(d_n.sum()), 1)))
+        if abs(agg - re_val) > 1e-9:
+            raise SystemExit(
+                f"агрегат дампа {agg:.10f} против val_sel {re_val:.10f}: "
+                f"разложено не то, по чему шёл отбор")
+        d_epi = epi_all[d_rows]
+        os.makedirs(os.path.dirname(os.path.abspath(a.dump_rows)) or ".",
+                    exist_ok=True)
+        tmp_d = a.dump_rows + f".tmp.{os.getpid()}"
+        np.savez(tmp_d, rows=d_rows, episode=d_epi, se=d_se, n=d_n,
+                 meta=json.dumps(dict(
+                     kind="k14c_rows_val_sel", part="val_sel",
+                     variant=a.variant, seed=int(a.seed),
+                     architecture=a.architecture,
+                     additive_feedback=a.additive_feedback,
+                     selected_epoch=int(best_ep), val_sel=float(best_val),
+                     selected_state_sha1=sel_sha,
+                     initial_trainable_state_sha1=init_sha,
+                     epochs=int(a.epochs), batch=int(a.batch),
+                     smoke=bool(a.smoke), limit=int(a.limit),
+                     selection_only=bool(a.selection_only),
+                     n_episodes=int(len(np.unique(d_epi))),
+                     q0_prov=q0_prov, plan_sha1=q0_prov.get("plan_sha1"),
+                     q1_cache_sha1=man["labels_sha1"],
+                     git_head=git_head0, code_version=code_v0,
+                     identity_gate_run_id=(id_info or {}).get(
+                         "identity_gate_run_id")), ensure_ascii=False,
+                     default=str))
+        os.replace(tmp_d, a.dump_rows)
+        print(f"  построчная ошибка val_sel: {a.dump_rows} "
+              f"({len(d_rows)} строк, {len(np.unique(d_epi))} эпизодов, "
+              f"агрегат {agg:.6f})")
 
     if no_conf:
         # СТРОКИ ПОДТВЕРЖДАЮЩЕЙ ПОЛОВИНЫ НЕ ОБРАЗУЮТ НАБОРА И НЕ ПРОХОДЯТ
