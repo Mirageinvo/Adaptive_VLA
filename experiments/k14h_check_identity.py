@@ -363,10 +363,14 @@ def main():
             var_old = "main" if fb == "on" else "no_feedback"
             info_old = m_old.configure_joint_depth_rvq(
                 stage="q1", variant=var_old, verbose=False)
-            info_new = m_new.configure_draft_reattn(
-                stage="q1", variant=var_new, verbose=False)
+            # ФЛАГИ СТАВЯТСЯ ДО НАСТРОЙКИ, а принадлежность блока к
+            # обучаемым передаётся ЯВНО: белый список не должен зависеть от
+            # того, в каком порядке выставлены флаги.
             m_new.draft_reattn_enabled = (arch != "baseline")
             blk.set_use_draft(arch == "reattn_draft")
+            info_new = m_new.configure_draft_reattn(
+                stage="q1", variant=var_new, verbose=False,
+                include_block=(arch != "baseline"))
             print(f"\n  === случай {case} ===")
             modes, calls, q0_ok = {}, {}, True
             for mode in ("fast", "medium", "full"):
@@ -410,6 +414,17 @@ def main():
             new_only = sorted(set(info_new["names"]) - set(info_old["names"]))
             if arch != "baseline" and not new_only:
                 raise SystemExit(f"{case}: блок не попал в обучаемые")
+            # И ОБРАТНОЕ УТВЕРЖДЕНИЕ, положительное: baseline обязан обучать
+            # РОВНО то же, что обучала прежняя модель. Блок у него не
+            # вызывается, и держать его в белом списке значило бы объявить
+            # обучаемым то, до чего не доходит градиент, — а заодно сделать
+            # точку отсчёта не той, с которой сравнивают.
+            if arch == "baseline" and \
+                    sorted(info_new["names"]) != sorted(info_old["names"]):
+                raise SystemExit(
+                    f"{case}: белый список baseline отличается от прежнего: "
+                    f"лишние {new_only[:5]}, нет "
+                    f"{sorted(set(info_old['names']) - set(info_new['names']))[:5]}")
             got[case] = dict(
                 passed=True, modes=modes, reattn_calls=calls,
                 q0_matches_canonical=bool(q0_ok),

@@ -307,12 +307,23 @@ def make_draft_reattn_class(base_cls):
                       f"{n / 1e6:.3f} млн параметров, W_o обнулена")
 
         def configure_draft_reattn(self, *, stage="q1", variant="main",
-                                   verbose=True):
+                                   include_block=None, verbose=True):
             """Белый список этапа плюс параметры блока. Точное множество.
 
             `variant="no_additive_feedback"` выключает аддитивную ветвь
             CodeFeedback; базовый класс знает её под именем `no_feedback`, и
             имя переводится здесь, а не в вызывающем коде.
+
+            `include_block` — входят ли параметры блока в обучаемые. У
+            baseline блок НЕ ВЫЗЫВАЕТСЯ, значит градиента до него не
+            доходит; держать его в белом списке означало бы объявить
+            обучаемым то, что не обучается, и тренер справедливо отказывает
+            на проверке «градиент есть у всех обучаемых». Но главное не
+            техническое: baseline обязан обучать ровно то же, что обучала
+            прежняя модель, иначе это не та точка отсчёта, с которой
+            сравнивают. По умолчанию берётся `draft_reattn_enabled`, но
+            вызывающему лучше сказать явно — тогда результат не зависит от
+            порядка установки флагов.
             """
             base_variant = ("no_feedback" if variant == "no_additive_feedback"
                             else variant)
@@ -328,13 +339,26 @@ def make_draft_reattn_class(base_cls):
                                                   verbose=False)
             if not hasattr(self, "draft_reattn"):
                 raise RuntimeError("блок не собран")
-            for n, p in self.named_parameters():
-                if n.startswith("draft_reattn.0."):
-                    p.requires_grad_(True)
+            if include_block is None:
+                include_block = bool(getattr(self, "draft_reattn_enabled",
+                                             False))
+            include_block = bool(include_block)
+            if include_block and not getattr(self, "draft_reattn_enabled",
+                                             False):
+                raise RuntimeError(
+                    "блок просят обучать, но он выключен: градиент до него "
+                    "не дойдёт")
+            if include_block:
+                for n, p in self.named_parameters():
+                    if n.startswith("draft_reattn.0."):
+                        p.requires_grad_(True)
             names = sorted(n for n, p in self.named_parameters()
                            if p.requires_grad)
+            prefixes = (TRAIN_PREFIXES if include_block
+                        else tuple(x for x in TRAIN_PREFIXES
+                                   if not x.startswith("draft_reattn.")))
             want = sorted(n for n, _ in self.named_parameters()
-                          if n.startswith(TRAIN_PREFIXES))
+                          if n.startswith(prefixes))
             # ИМЯ ВАРИАНТА ТОЧНОЕ. При включённом блоке q0 продолжает
             # входить в вычисление через запрос внимания, поэтому «без
             # обратной связи» было бы неверно: выключается только АДДИТИВНАЯ
@@ -352,9 +376,11 @@ def make_draft_reattn_class(base_cls):
                        n_params=int(sum(p.numel()
                                         for n, p in self.named_parameters()
                                         if n in set(names))),
-                       reattn_uses_draft=bool(self.draft_reattn_uses_draft))
+                       reattn_uses_draft=bool(self.draft_reattn_uses_draft),
+                       reattn_trainable=include_block)
             if verbose:
-                print(f"  этап {stage}/{variant} с re-attention: "
+                print(f"  этап {stage}/{variant}, блок "
+                      f"{'обучается' if include_block else 'ВНЕ обучаемых'}: "
                       f"{out['n_tensors']} тензоров, "
                       f"{out['n_params'] / 1e6:.3f} млн параметров")
             return out
@@ -585,6 +611,83 @@ def selftest():
         pass
     else:
         raise AssertionError("принято число голов, не делящее d_model")
+    # --- БЕЛЫЙ СПИСОК: BASELINE НЕ ОБУЧАЕТ ТО, ЧТО НЕ ВЫЗЫВАЕТСЯ ----------
+    # Эта проверка написана после того, как смоук baseline упал на «градиента
+    # нет у draft_reattn.*»: блок безусловно попадал в обучаемые, хотя при
+    # выключенной архитектуре он не вызывается ни разу. Игрушечная база
+    # нужна именно затем, чтобы логика белого списка проверялась без модели
+    # на 2.2 млрд параметров.
+    import torch.nn as nn
+    from types import SimpleNamespace
+
+    class _Base(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.depth_rvq_norms = nn.ModuleList([nn.Linear(D, D)])
+            self.depth_rvq_heads = nn.ModuleList([nn.Linear(D, D)])
+            self.depth_rvq_feedback = nn.ModuleList([nn.Linear(D, D)])
+            self.deep = nn.Linear(D, D)
+            self.fast_head = nn.Linear(D, 9)
+            self.register_buffer("depth_rvq_books", torch.zeros(3, 5, Dc))
+            self.config = SimpleNamespace(vlm_config=SimpleNamespace(
+                text_config=SimpleNamespace(hidden_size=Dx)))
+
+        def configure_joint_depth_rvq(self, *, stage, variant, verbose=True):
+            for q in self.parameters():
+                q.requires_grad_(False)
+            pref = ["depth_rvq_norms.0.", "depth_rvq_heads.0."]
+            if variant != "no_feedback":
+                pref.append("depth_rvq_feedback.0.")
+            for nm2, q in self.named_parameters():
+                if nm2.startswith(tuple(pref)):
+                    q.requires_grad_(True)
+            nms = sorted(nm2 for nm2, q in self.named_parameters()
+                         if q.requires_grad)
+            return dict(names=nms, n_tensors=len(nms),
+                        n_params=sum(q.numel() for nm2, q
+                                     in self.named_parameters()
+                                     if nm2 in set(nms)))
+
+    Cls = make_draft_reattn_class(_Base)
+    m = Cls()
+    m.init_draft_reattn(n_heads=4, verbose=False)
+    base_names = sorted(_Base.configure_joint_depth_rvq(
+        m, stage="q1", variant="main")["names"])
+
+    m.draft_reattn_enabled = False
+    i_base = m.configure_draft_reattn(stage="q1", variant="main",
+                                      include_block=False, verbose=False)
+    assert sorted(i_base["names"]) == base_names, \
+        "baseline обучает не то же, что прежняя модель"
+    assert not any(n_.startswith("draft_reattn.") for n_ in i_base["names"])
+    assert i_base["reattn_trainable"] is False
+    # умолчание следует флагу, а не наоборот
+    assert sorted(m.configure_draft_reattn(
+        stage="q1", variant="main", verbose=False)["names"]) == base_names
+    try:
+        m.configure_draft_reattn(stage="q1", variant="main",
+                                 include_block=True, verbose=False)
+    except RuntimeError as e:
+        assert "выключен" in str(e), e
+    else:
+        raise AssertionError("блок объявлен обучаемым при выключенной ветви")
+
+    m.draft_reattn_enabled = True
+    i_on = m.configure_draft_reattn(stage="q1", variant="main",
+                                    include_block=True, verbose=False)
+    added = sorted(set(i_on["names"]) - set(base_names))
+    assert added and all(n_.startswith("draft_reattn.0.") for n_ in added)
+    assert len(added) == len([n_ for n_, _ in m.named_parameters()
+                              if n_.startswith("draft_reattn.0.")])
+    assert i_on["reattn_trainable"] is True
+    # ВАРИАНТ БЕЗ АДДИТИВНОЙ ВЕТВИ УБИРАЕТ ТОЛЬКО ЕЁ
+    i_nf = m.configure_draft_reattn(stage="q1",
+                                    variant="no_additive_feedback",
+                                    include_block=True, verbose=False)
+    assert not any(n_.startswith("depth_rvq_feedback.")
+                   for n_ in i_nf["names"])
+    assert any(n_.startswith("draft_reattn.0.") for n_ in i_nf["names"])
+
     # --- ПРОВЕРКА ГЕЙТА: ОТКАЗ НА КАЖДОМ НЕСОВПАДЕНИИ ---------------------
     import json as _json
     import tempfile

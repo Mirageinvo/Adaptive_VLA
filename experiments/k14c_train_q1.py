@@ -960,7 +960,9 @@ def main():
         model.draft_reattn[0].set_use_draft(a.architecture == "reattn_draft")
         var = a.variant if a.additive_feedback == "on" \
             else "no_additive_feedback"
-        info = model.configure_draft_reattn(stage="q1", variant=var)
+        info = model.configure_draft_reattn(
+            stage="q1", variant=var,
+            include_block=(a.architecture != "baseline"))
         # СПИСОК ОБУЧАЕМЫХ ОБЯЗАН СОВПАСТЬ СО СПИСКОМ ИЗ ГЕЙТА ДЛЯ ЭТОГО ЖЕ
         # СЛУЧАЯ. Иначе обучается не то, про что доказана тождественность.
         want_tr = (gate_case_info or {}).get("trainable_new")
