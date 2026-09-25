@@ -269,8 +269,13 @@ def main():
     # определённые эпизоды.
     take = np.linspace(0, len(tr) - a.batch - 1, a.n_batches).astype(int)
     batches = [tr[i:i + a.batch] for i in take]
+    # ОТПЕЧАТОК ВЫБОРА БАТЧЕЙ. Вердикт ветвит весь дальнейший план, и по
+    # артефакту должно быть видно не только «16 батчей», но и какие именно:
+    # иначе повторить измерение можно только на слово.
+    batch_rows = np.concatenate([rows[j] for j in batches]).astype(np.int64)
+    batches_sha = k14f.arr_sha(batch_rows)
     print(f"  батчей {len(batches)} по {a.batch} строк, равномерно по "
-          f"{len(tr)} строкам train")
+          f"{len(tr)} строкам train; отпечаток выбора {batches_sha}")
 
     def decode(z, bs=512):
         out = []
@@ -293,7 +298,11 @@ def main():
                 lin.net.bias.copy_(st["depth_rvq_heads.0.bias"].float())
             elif lin.net.bias is not None:
                 lin.net.bias.zero_()
-        out.append(("линейная (историческая)", lin))
+        out.append(("линейная (историческая)", lin,
+                    dict(checkpoint=man["head_ckpt"],
+                         file_sha1=sha12(man["head_ckpt"]),
+                         selected_state_sha1=ck0.get("selected_state_sha1"),
+                         hidden=0)))
         for p in a.heads:
             ck = torch.load(p, map_location="cpu", weights_only=False)
             if str(ck.get("h18_sha1")) != str(man["h18_sha1"]):
@@ -306,11 +315,15 @@ def main():
                                      for k, v in h.state_dict().items()})
             if got != str(ck["selected_state_sha1"]):
                 raise SystemExit(f"{p}: отпечаток после загрузки {got}")
-            out.append((os.path.basename(p)[:-3], h))
+            out.append((os.path.basename(p)[:-3], h,
+                        dict(checkpoint=p, file_sha1=sha12(p),
+                             selected_state_sha1=ck["selected_state_sha1"],
+                             hidden=int(ck["hidden"]),
+                             seed=ck.get("seed"), epoch=ck.get("epoch"))))
         return out
 
     res = {}
-    for label, head in make_heads():
+    for label, head, prov in make_heads():
         for p_ in head.parameters():
             p_.requires_grad_(True)
         named = list(head.named_parameters())
@@ -382,7 +395,8 @@ def main():
         v = verdict(s, cos_sum=cos_sum)
         res[label] = dict(summary=s, per_batch=rows_out, verdict=v["text"],
                           supports_hypothesis=bool(v["supports"]),
-                          decision=v, groups=sorted(groups))
+                          decision=v, groups=sorted(groups), provenance=prov,
+                          n_params=int(sum(p_.numel() for p_ in par)))
         txt = v["text"]
         print(f"\\n  === {label} ===")
         print(f"    ||g_CE||           медиана {s['n_ce']['median']:.5f}  "
@@ -410,6 +424,12 @@ def main():
 
     out = dict(kind="k14i_grad_audit", heads=res, batch=int(a.batch),
                n_batches=int(a.n_batches), lambda_action=a.lambda_action,
+               batches_sha1=batches_sha,
+               batch_row_ids=[[int(x) for x in rows[j]] for j in batches],
+               thresholds=dict(cos_conflict=COS_CONFLICT,
+                               cos_orthogonal=COS_ORTH,
+                               ratio_dominates=RATIO_DOMINATES,
+                               main_statistic="median"),
                h18_sha1=man["h18_sha1"], q1_cache_sha1=q1_man["labels_sha1"],
                device=str(dev), gpu_uuid=kc.gpu_uuid(dev, torch),
                git_head=git_head, git_dirty=bool(dirty),
