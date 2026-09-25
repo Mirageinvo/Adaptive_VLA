@@ -60,6 +60,65 @@ def compare(name, a, b, out):
     print(f"    {name:34s} совпало побитово")
 
 
+def lint_shadowed_subscripts(path):
+    """Ловит класс ошибки, из-за которого гейт упал на первом же прогоне:
+    имя заводится как пустой накопитель, потом в теле цикла переприсваивается
+    чем-то другим, а ниже к нему снова обращаются по ключу. Признак — все три
+    вместе: инициализация пустым контейнером, голое переприсваивание не
+    контейнером, запись по индексу. Ни одна пара из трёх сама по себе не
+    подозрительна, поэтому ищется именно тройка."""
+    import ast
+    with open(path, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read(), str(path))
+
+    def kind(node):
+        if isinstance(node, (ast.Dict, ast.List, ast.Set)):
+            empty = not (node.keys if isinstance(node, ast.Dict) else node.elts)
+            return "пустой" if empty else "контейнер"
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in ("dict", "list", "set")):
+            return "пустой" if not (node.args or node.keywords) else "контейнер"
+        if isinstance(node, ast.DictComp) or isinstance(node, ast.ListComp):
+            return "контейнер"
+        return "прочее"
+
+    bad = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        nested = {n for f in ast.walk(fn)
+                  if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and f is not fn for n in ast.walk(f)}
+        init, rebind, subs = {}, {}, {}
+        for node in ast.walk(fn):
+            if node in nested or not isinstance(node, ast.Assign):
+                continue
+            pairs = []
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Tuple) and \
+                        isinstance(node.value, ast.Tuple) and \
+                        len(tgt.elts) == len(node.value.elts):
+                    pairs += list(zip(tgt.elts, node.value.elts))
+                else:
+                    pairs.append((tgt, node.value))
+            for tgt, val in pairs:
+                if isinstance(tgt, ast.Subscript) and \
+                        isinstance(tgt.value, ast.Name):
+                    subs.setdefault(tgt.value.id, node.lineno)
+                elif isinstance(tgt, ast.Name):
+                    k = kind(val)
+                    if k == "пустой":
+                        init.setdefault(tgt.id, node.lineno)
+                    elif k == "прочее":
+                        rebind.setdefault(tgt.id, node.lineno)
+        for name in sorted(set(init) & set(rebind) & set(subs)):
+            bad.append(f"{fn.name}: {name!r} заведено пустым в строке "
+                       f"{init[name]}, переприсвоено в строке {rebind[name]}, "
+                       f"используется по ключу в строке {subs[name]}")
+    if bad:
+        raise AssertionError("затенение накопителя:\n  " + "\n  ".join(bad))
+
+
 def selftest():
     import torch
     out = {}
@@ -86,6 +145,23 @@ def selftest():
         pass
     else:
         raise AssertionError("разные длины приняты")
+    lint_shadowed_subscripts(__file__)
+    for probe, must in ((
+            "def f():\n d = {}\n for i in (1,):\n  d = i\n  d[i] = 1\n",
+            True), ("def f():\n d = {}\n for i in (1,):\n  d[i] = 1\n",
+                    False)):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".py",
+                                         delete=False) as fh:
+            fh.write(probe)
+        try:
+            lint_shadowed_subscripts(fh.name)
+        except AssertionError:
+            assert must, "линтер ругается на здоровый код"
+        else:
+            assert not must, "линтер не видит затенение накопителя"
+        finally:
+            os.unlink(fh.name)
     print("самопроверка k14h_check_identity пройдена")
 
 
@@ -302,12 +378,12 @@ def main():
                             outs[tag] = mdl.forward_joint_depth_rvq(
                                 vlm_inputs_embeds=v_, attention_mask=am,
                                 position_ids=p_, mode=mode)
-                    got = outs["новая"].get("reattn_calls")
+                    ncalls = outs["новая"].get("reattn_calls")
                     want = 0 if (mode == "fast" or arch == "baseline") else 1
-                    if got != want:
-                        raise SystemExit(f"{case}/{mode}: блок вызван {got} "
-                                         f"раз, ожидалось {want}")
-                    calls[mode] = int(got)
+                    if ncalls != want:
+                        raise SystemExit(f"{case}/{mode}: блок вызван "
+                                         f"{ncalls} раз, ожидалось {want}")
+                    calls[mode] = int(ncalls)
                     pref = f"{case}.b{bi}.{mode}"
                     compare(f"{pref}.logits", outs["старая"]["logits"],
                             outs["новая"]["logits"], res)
