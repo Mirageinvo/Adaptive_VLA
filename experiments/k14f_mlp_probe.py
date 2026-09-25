@@ -273,6 +273,15 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--wd", type=float, default=0.0)
     ap.add_argument("--lambda-action", type=float, default=1.0)
+    ap.add_argument("--objective", default="ce_action",
+                    choices=("ce_action", "action_only", "action_only_gate"),
+                    help="что оптимизируется. ce_action — как в каноническом "
+                         "прогоне: CE + lambda * ошибка действия в весах "
+                         "обучения. action_only — только ошибка действия в "
+                         "тех же весах, CE убрана. action_only_gate — только "
+                         "ошибка действия в ВЕСАХ GATE 4. CE и top-1 "
+                         "считаются всегда, но на шаг влияют только в "
+                         "ce_action")
     ap.add_argument("--allow-dirty", action="store_true",
                     help="разрешить прогон на незакоммиченном коде")
     ap.add_argument("--device", default="cuda:1")
@@ -550,6 +559,9 @@ def main():
     tr_slice = tr[np.linspace(0, len(tr) - 1, len(vs)).astype(int)]
     tr_slice = np.unique(tr_slice)
     print(f"  срез train для сравнения: {len(tr_slice)} строк из {len(tr)}")
+    print(f"  цель обучения: {a.objective}"
+          + ("" if a.objective == "ce_action" else
+             "; CE считается, но на шаг НЕ влияет"))
     lin_tr = evaluate(lin, tr_slice)
     print(f"  ЛИНЕЙНАЯ ОПОРА на этом срезе: RMS-8 {lin_tr['rms']:.6f}, "
           f"top-1 {100 * lin_tr['top1']:.2f}%, CE {lin_tr['ce']:.5f}")
@@ -586,7 +598,18 @@ def main():
                     at = torch.from_numpy(ACT[j]).to(dev)[..., :7]
                     dd = (ah[:, :H_EXEC] - at[:, :H_EXEC])
                     al = (dd ** 2).mean()
-                    loss = ce + a.lambda_action * al
+                    # ЦЕЛЬ ВЫБИРАЕТСЯ ЯВНО. Аудит §48 показал, что при
+                    # ce_action градиент от CE в 68-90 раз больше градиента
+                    # от ошибки действия, а направления почти ортогональны:
+                    # второе слагаемое вносит около полутора процентов нормы
+                    # шага. Варианты ниже убирают CE, чтобы проверить, в ней
+                    # ли дело.
+                    if a.objective == "ce_action":
+                        loss = ce + a.lambda_action * al
+                    elif a.objective == "action_only":
+                        loss = al
+                    else:
+                        loss = ((dd * wq) ** 2).mean()
                     if not torch.isfinite(loss):
                         raise SystemExit(f"потеря не число на эпохе {ep}")
                     opt.zero_grad(set_to_none=True)
@@ -713,7 +736,7 @@ def main():
                 base_head_ckpt=man["head_ckpt"],
                 base_head_state_sha1=man["head_state_sha1"],
                 epochs=a.epochs, batch=a.batch, lr=a.lr, wd=a.wd,
-                lambda_action=a.lambda_action,
+                lambda_action=a.lambda_action, objective=a.objective,
                 note="post-hoc; val_confirm повторно использована",
                 git_head=git_head, script_sha1=sha12(os.path.abspath(__file__)))
     tmp_ck = ck_out + f".tmp.{os.getpid()}"
@@ -736,7 +759,8 @@ def main():
                h18_manifest_sha1=sha12(a.h18 + ".manifest.json"),
                h18_sha1=man["h18_sha1"], q1_cache=a.q1_cache,
                epochs=a.epochs, batch=a.batch, lr=a.lr, wd=a.wd,
-               lambda_action=a.lambda_action, device=str(dev),
+               lambda_action=a.lambda_action, objective=a.objective,
+               device=str(dev),
                gpu_uuid=kc.gpu_uuid(dev, torch), git_head=git_head,
                git_dirty=bool(dirty), code_version=code_v0,
                code_version_end=code_v1, git_head_end=git_head1,
