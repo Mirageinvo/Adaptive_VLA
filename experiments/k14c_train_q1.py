@@ -1799,6 +1799,27 @@ def main():
           f"детерминировано и НЕ зависит от --seed: сид задаёт только порядок "
           f"данных")
     opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=a.wd)
+    # ПОДПИСЬ БЮДЖЕТА. Утверждение «этот прогон идёт при том же бюджете, что
+    # и такой-то» должно проверяться машинно, а не сверкой глазами по логам:
+    # совпасть обязаны число шагов, число предъявленных примеров, отсутствие
+    # накопления градиента, оптимизатор с его параметрами, роль сида и
+    # правило выбора эпохи вместе с тем, входит ли в него нулевая.
+    budget = dict(
+        batch=int(a.batch), epochs=int(a.epochs),
+        steps_per_epoch=int(len(batches["train"])),
+        total_steps=int(len(batches["train"]) * a.epochs),
+        rows_train=int(len(sets["train"])),
+        examples=int(len(sets["train"]) * a.epochs),
+        grad_accumulation=False, optimizer="AdamW", lr=float(a.lr),
+        wd=float(a.wd), lambda_action=float(a.lambda_action),
+        lambda_fb=float(a.lambda_fb), grip_weight=float(a.grip_weight),
+        seed_role="порядок данных; инициализация от сида не зависит",
+        seed=int(a.seed),
+        epoch_selection="минимум RMS-8 на val_sel, эпоха 0 участвует",
+        includes_epoch0=True)
+    print("  подпись бюджета: " + ", ".join(
+        f"{k}={budget[k]}" for k in ("batch", "epochs", "steps_per_epoch",
+                                     "total_steps", "examples", "lr", "wd")))
     rng = np.random.default_rng(a.seed)
     hist = []
     t0 = time.time()
@@ -1894,7 +1915,7 @@ def main():
         write_summary(outcome=("smoke" if a.smoke else "selection_only"),
                       history=hist, runtime=rt_now,
                       q0_prov=q0_prov, q0_mismatch=int(q0_bad[0]),
-                      q0_positions=int(q0_tot[0]),
+                      q0_positions=int(q0_tot[0]), budget=budget,
                       initial_trainable_state_sha1=init_sha,
                       selected_state_sha1=sel_sha, selected_epoch=best_ep,
                       val_sel=best_val,
@@ -2037,7 +2058,7 @@ def main():
         # (straight_through и CodeFeedback) и bar.py (сегментированный проход),
         # хотя изменение любого из них меняет обученную голову.
         code_version=code_v0, git_head=git_head0, runtime=rt_now,
-        architecture=a.architecture, additive_feedback=a.additive_feedback,
+        budget=budget, architecture=a.architecture, additive_feedback=a.additive_feedback,
         reattn_heads=(int(a.reattn_heads) if need_arch else None),
         memory_scope=("full_valid_vlm_prefix" if need_arch else None),
         query_build=("concat[LN(h12), LN(P_D E0[q0])]" if need_arch else None),
@@ -2058,7 +2079,7 @@ def main():
                   initial_trainable_state_sha1=init_sha,
                   selected_state_sha1=sel_sha, selected_epoch=best_ep,
                   val_sel=best_val, val_confirm=e_conf, gate4=g4,
-                  architecture=a.architecture,
+                  budget=budget, architecture=a.architecture,
                   additive_feedback=a.additive_feedback,
                   **(id_info or {}),
                   e_a0=e_a0, e_oracle=e_or, checkpoint=out_p,

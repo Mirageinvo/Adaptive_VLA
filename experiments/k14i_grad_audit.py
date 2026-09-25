@@ -63,11 +63,14 @@ def flat_cos(a, b):
 
 
 def summarize(rows, keys):
-    """Среднее, минимум и максимум по батчам. Разброс печатается всегда.
+    """МЕДИАНА как основная точка, плюс диапазон и число батчей.
 
-    Одно усреднённое число скрыло бы случай, когда на половине батчей
-    слагаемые согласны, а на половине конфликтуют, — а это совсем другой
-    вывод, чем «в среднем слабо согласны».
+    Какая именно сводная величина решает — определено ДО прогона (§48).
+    Иначе после результата можно было бы выбрать среднее, медиану или
+    агрегированный градиент в зависимости от того, что удобнее. Медиана
+    устойчива к одному выбросу, а диапазон и число батчей печатаются рядом
+    всегда: одно число скрыло бы случай, когда на половине батчей слагаемые
+    согласны, а на половине конфликтуют.
     """
     out = {}
     for k in keys:
@@ -76,27 +79,47 @@ def summarize(rows, keys):
         if not len(v):
             out[k] = None
             continue
-        out[k] = dict(mean=float(v.mean()), min=float(v.min()),
-                      max=float(v.max()), n=int(len(v)))
+        out[k] = dict(median=float(np.median(v)), mean=float(v.mean()),
+                      min=float(v.min()), max=float(v.max()), n=int(len(v)),
+                      n_negative=int((v < 0).sum()))
     return out
 
 
-def verdict(cos_mean, ratio_mean, cos_min):
-    """Что из чисел следует. Три исхода, названные заранее (§48)."""
+COS_CONFLICT, COS_ORTH, RATIO_DOMINATES = 0.0, 0.2, 10.0
+
+
+def verdict(s, cos_sum=None):
+    """Что из чисел следует. Пороги и сводные величины названы до прогона.
+
+    ВСЕ ПОРОГИ ОТНОСЯТСЯ К МЕДИАНЕ по батчам, и отношение норм берётся тем
+    же способом — смешивать медиану косинусов со средним отношением нельзя,
+    это дало бы свободу выбрать удобную пару.
+
+    Косинус СУММАРНЫХ по батчам градиентов приводится отдельно: он отвечает
+    на другой вопрос — про направление накопленного шага, а не про типичный
+    батч, — и в пороги не входит.
+    """
+    c, r = s["cos_ce_act"], s["ratio_ce_over_act"]
+    cm, rm = c["median"], r["median"]
     reasons = []
-    if cos_mean < 0.0:
-        reasons.append(f"слагаемые в среднем КОНФЛИКТУЮТ (cos {cos_mean:+.3f})")
-    elif cos_mean < 0.2:
-        reasons.append(f"слагаемые почти ортогональны (cos {cos_mean:+.3f})")
-    if ratio_mean > 10.0:
-        reasons.append(f"градиент CE больше на порядок (отношение "
-                       f"{ratio_mean:.1f})")
-    if cos_min < 0.0 <= cos_mean:
-        reasons.append(f"на части батчей конфликт (минимум {cos_min:+.3f})")
-    if not reasons:
-        return ("гипотеза §48 не поддержана: слагаемые согласованы по "
-                "направлению и сопоставимы по величине", False)
-    return ("; ".join(reasons), True)
+    if cm < COS_CONFLICT:
+        reasons.append(f"медианный косинус отрицателен ({cm:+.3f}): "
+                       f"слагаемые конфликтуют")
+    elif cm < COS_ORTH:
+        reasons.append(f"медианный косинус {cm:+.3f} ниже {COS_ORTH}: "
+                       f"слагаемые почти ортогональны")
+    if rm > RATIO_DOMINATES:
+        reasons.append(f"медианное отношение норм {rm:.1f} больше "
+                       f"{RATIO_DOMINATES}: CE доминирует в шаге")
+    if c["n_negative"] and cm >= COS_CONFLICT:
+        reasons.append(f"конфликт на {c['n_negative']} батчах из {c['n']} "
+                       f"при неотрицательной медиане")
+    txt = ("; ".join(reasons) if reasons else
+           "гипотеза §48 не поддержана: по медиане слагаемые согласованы по "
+           "направлению и сопоставимы по величине")
+    return dict(text=txt, supports=bool(reasons), cos_median=cm,
+                ratio_median=rm, n_negative=c["n_negative"], n=c["n"],
+                cos_of_summed=cos_sum)
 
 
 def selftest():
@@ -126,14 +149,31 @@ def selftest():
     assert s["cos"]["n"] == 2 and abs(s["cos"]["min"] + 0.1) < 1e-12
     assert s["r"]["n"] == 3 and s["r"]["max"] == 3.0
 
-    t, flag = verdict(-0.3, 2.0, -0.4)
-    assert flag and "КОНФЛИКТУЮТ" in t
-    t, flag = verdict(0.8, 30.0, 0.5)
-    assert flag and "на порядок" in t
-    t, flag = verdict(0.7, 2.0, -0.2)
-    assert flag and "части батчей" in t
-    t, flag = verdict(0.8, 2.0, 0.4)
-    assert not flag and "не поддержана" in t
+    def mk(cos_vals, ratio_vals):
+        rr = [dict(cos_ce_act=c, ratio_ce_over_act=r)
+              for c, r in zip(cos_vals, ratio_vals)]
+        return summarize(rr, ("cos_ce_act", "ratio_ce_over_act"))
+
+    # ПОРОГИ ОТНОСЯТСЯ К МЕДИАНЕ, и это проверяется прямо: набор, у которого
+    # среднее и медиана указывают в разные стороны, обязан читаться по
+    # медиане.
+    v = verdict(mk([-0.3] * 9 + [0.9] * 7, [2.0] * 16))
+    assert v["supports"] and "медианный косинус отрицателен" in v["text"]
+    v = verdict(mk([0.8] * 16, [30.0] * 16))
+    assert v["supports"] and "доминирует" in v["text"]
+    v = verdict(mk([0.7] * 14 + [-0.2] * 2, [2.0] * 16))
+    assert v["supports"] and "конфликт на 2 батчах" in v["text"]
+    v = verdict(mk([0.8] * 16, [2.0] * 16))
+    assert not v["supports"] and "не поддержана" in v["text"]
+    # СРЕДНЕЕ СКАЗАЛО БЫ ДРУГОЕ: медиана 0.5, среднее отрицательно
+    ss = mk([0.5] * 9 + [-9.0] * 7, [2.0] * 16)
+    assert ss["cos_ce_act"]["mean"] < 0 < ss["cos_ce_act"]["median"]
+    v = verdict(ss)
+    assert "медианный косинус отрицателен" not in v["text"]
+    assert v["cos_median"] == 0.5 and v["n_negative"] == 7
+    v = verdict(mk([0.8] * 16, [2.0] * 16), cos_sum=-0.4)
+    assert v["cos_of_summed"] == -0.4 and not v["supports"], \
+        "косинус суммарных градиентов в пороги входить не должен"
     print("самопроверка k14i_grad_audit пройдена")
 
 
@@ -273,7 +313,20 @@ def main():
     for label, head in make_heads():
         for p_ in head.parameters():
             p_.requires_grad_(True)
-        par = [p_ for p_ in head.parameters()]
+        named = list(head.named_parameters())
+        par = [p_ for _n, p_ in named]
+        # ГРУППЫ ПАРАМЕТРОВ. Общий косинус может скрыть согласие в одной
+        # части головы и конфликт в другой; для головы на кэше групп две —
+        # норма и сама голова. Ветви обратной связи здесь НЕТ: она вшита в
+        # кэш h18 и не обучается, и это ограничение самой постановки, а не
+        # недосмотр.
+        groups = {"norm": [i for i, (n_, _) in enumerate(named)
+                           if n_.startswith("norm.")],
+                  "head": [i for i, (n_, _) in enumerate(named)
+                           if n_.startswith("net.")]}
+        groups = {k: v for k, v in groups.items() if v}
+        acc_ce = [torch.zeros_like(p_) for p_ in par]
+        acc_ac = [torch.zeros_like(p_) for p_ in par]
         rows_out = []
         for j in batches:
             h = torch.from_numpy(np.asarray(Hm[j])).to(dev).float()
@@ -296,7 +349,18 @@ def main():
             c_ce_tr, n_ce, n_tr = flat_cos(g_ce, g_tr)
             c_ce_gt, _, n_gt = flat_cos(g_ce, g_gt)
             c_tr_gt, _, _ = flat_cos(g_tr, g_gt)
+            for i_, (x_, y_) in enumerate(zip(g_ce, g_tr)):
+                acc_ce[i_] += x_.detach()
+                acc_ac[i_] += y_.detach()
+            by_grp = {}
+            for gname, idxs in groups.items():
+                cg, ng_ce, ng_ac = flat_cos([g_ce[i] for i in idxs],
+                                            [g_tr[i] for i in idxs])
+                by_grp[gname] = dict(cos=cg, n_ce=ng_ce, n_act=ng_ac)
             rows_out.append(dict(
+                **{f"cos_{k}": v["cos"] for k, v in by_grp.items()},
+                **{f"n_ce_{k}": v["n_ce"] for k, v in by_grp.items()},
+                **{f"n_act_{k}": v["n_act"] for k, v in by_grp.items()},
                 ce=float(ce), act_train=float(al_tr), act_gate=float(al_gt),
                 n_ce=n_ce, n_act_train=n_tr, n_act_gate=n_gt,
                 # ВКЛАД В ШАГ, а не значение слагаемого: потеря действия
@@ -305,27 +369,43 @@ def main():
                                    if n_tr > 0 else float("nan")),
                 cos_ce_act=c_ce_tr, cos_ce_act_gate=c_ce_gt,
                 cos_act_train_gate=c_tr_gt))
-        keys = ("ce", "act_train", "act_gate", "n_ce", "n_act_train",
-                "n_act_gate", "ratio_ce_over_act", "cos_ce_act",
-                "cos_ce_act_gate", "cos_act_train_gate")
+        keys = (["ce", "act_train", "act_gate", "n_ce", "n_act_train",
+                 "n_act_gate", "ratio_ce_over_act", "cos_ce_act",
+                 "cos_ce_act_gate", "cos_act_train_gate"]
+                + [f"cos_{k}" for k in groups]
+                + [f"n_ce_{k}" for k in groups]
+                + [f"n_act_{k}" for k in groups])
         s = summarize(rows_out, keys)
-        txt, flag = verdict(s["cos_ce_act"]["mean"],
-                            s["ratio_ce_over_act"]["mean"],
-                            s["cos_ce_act"]["min"])
-        res[label] = dict(summary=s, per_batch=rows_out, verdict=txt,
-                          supports_hypothesis=bool(flag))
+        # КОСИНУС СУММАРНЫХ ГРАДИЕНТОВ: направление накопленного шага, а не
+        # типичного батча. В пороги не входит, приводится рядом.
+        cos_sum, _, _ = flat_cos(acc_ce, acc_ac)
+        v = verdict(s, cos_sum=cos_sum)
+        res[label] = dict(summary=s, per_batch=rows_out, verdict=v["text"],
+                          supports_hypothesis=bool(v["supports"]),
+                          decision=v, groups=sorted(groups))
+        txt = v["text"]
         print(f"\\n  === {label} ===")
-        print(f"    ||g_CE||           {s['n_ce']['mean']:.5f}  "
+        print(f"    ||g_CE||           медиана {s['n_ce']['median']:.5f}  "
               f"[{s['n_ce']['min']:.5f}, {s['n_ce']['max']:.5f}]")
-        print(f"    ||g_действие||     {s['n_act_train']['mean']:.5f}  "
+        print(f"    ||g_действие||     медиана "
+              f"{s['n_act_train']['median']:.5f}  "
               f"[{s['n_act_train']['min']:.5f}, {s['n_act_train']['max']:.5f}]")
-        print(f"    отношение CE/дейст {s['ratio_ce_over_act']['mean']:.2f}  "
+        print(f"    отношение CE/дейст медиана "
+              f"{s['ratio_ce_over_act']['median']:.2f}  "
               f"[{s['ratio_ce_over_act']['min']:.2f}, "
               f"{s['ratio_ce_over_act']['max']:.2f}]")
-        print(f"    cos(CE, действие)  {s['cos_ce_act']['mean']:+.4f}  "
-              f"[{s['cos_ce_act']['min']:+.4f}, {s['cos_ce_act']['max']:+.4f}]")
-        print(f"    cos(действие в весах обучения, в весах гейта) "
-              f"{s['cos_act_train_gate']['mean']:+.4f}")
+        print(f"    cos(CE, действие)  медиана "
+              f"{s['cos_ce_act']['median']:+.4f}  "
+              f"[{s['cos_ce_act']['min']:+.4f}, "
+              f"{s['cos_ce_act']['max']:+.4f}], отрицательных "
+              f"{s['cos_ce_act']['n_negative']} из {s['cos_ce_act']['n']}")
+        for gname in sorted(groups):
+            g = s[f"cos_{gname}"]
+            print(f"      по группе {gname:5s} медиана {g['median']:+.4f}  "
+                  f"[{g['min']:+.4f}, {g['max']:+.4f}]")
+        print(f"    cos суммарных градиентов {cos_sum:+.4f}")
+        print(f"    cos(действие в весах обучения, в весах гейта) медиана "
+              f"{s['cos_act_train_gate']['median']:+.4f}")
         print(f"    ВЕРДИКТ: {txt}")
 
     out = dict(kind="k14i_grad_audit", heads=res, batch=int(a.batch),
