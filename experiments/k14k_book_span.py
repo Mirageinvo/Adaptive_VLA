@@ -232,6 +232,41 @@ def selftest():
     assert np.isnan(b3["none"][0]) and np.isnan(b3["none"][1]), b3["none"]
     assert 0.0 <= b3["_point"]["all"] <= 1.0
     assert abs(b3["_point"]["all"] - fl2.mean()) < 1e-12
+    # --- МАСКИ ПОЗИЦИЙ: ДВЕ ФОРМЫ ПРИЗНАКА ОПРЕДЕЛЁННОСТИ ----------------
+    # Именно здесь прогон упал: построчный признак (n,) подставлялся туда,
+    # где нужна позиционная маска (n*P,). Тест проверяет обе формы, порядок
+    # row-major и отказ на чужих формах.
+    nR, nP = 4, 3
+    q0t = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9], [1, 1, 1]], np.int64)
+    k0t = q0t.copy()
+    k0t[1, 2] = 99                       # ровно одна ошибка: строка 1, поз 2
+    dr = np.array([True, True, False, True])
+    md, mw, mo = position_masks(q0t, k0t, dr, nP)
+    assert md.shape == (nR * nP,) and mw.shape == md.shape
+    assert md.tolist() == [True] * 6 + [False] * 3 + [True] * 3, md.tolist()
+    assert mw.sum() == 1 and mw[1 * nP + 2], np.where(mw)[0]
+    assert (mw | mo == md).all() and not (mw & mo).any()
+    # позиционная форма даёт то же при согласованном входе
+    md2, mw2, mo2 = position_masks(q0t, k0t,
+                                   np.repeat(dr, nP).reshape(nR, nP), nP)
+    assert (md2 == md).all() and (mw2 == mw).all() and (mo2 == mo).all()
+    # ошибка в непосчитанной строке в mw не попадает
+    k0t3 = q0t.copy(); k0t3[2, 0] = 55
+    _, mw3, _ = position_masks(q0t, k0t3, dr, nP)
+    assert not mw3[2 * nP + 0], "ошибка в непосчитанной строке учтена"
+    for bad, why in (((q0t[:, :2], k0t, dr), "q0 формы"),
+                     ((q0t, k0t[:, :2], dr), "k0 формы"),
+                     ((q0t, k0t, np.zeros((nR, nP + 1), bool)),
+                      "определённости формы"),
+                     ((q0t, k0t, np.zeros(nR + 1, bool)),
+                      "определённости формы")):
+        try:
+            position_masks(*bad, nP)
+        except SystemExit as e:
+            assert why in str(e), (why, e)
+        else:
+            raise AssertionError(f"принята чужая форма: {why}")
+
     print("самопроверка k14k_book_span пройдена")
 
 
@@ -250,6 +285,40 @@ def load_codec(ckpt, dev, torch, VisionLanguageActionProcessor):
     return codec, qs
 
 
+def position_masks(q0_rows, k0_rows, defined_rows, n_pos):
+    """Позиционные маски из построчных и построчно-позиционных величин.
+
+    ВЫНЕСЕНО ПОСЛЕ ПАДЕНИЯ. `load_canonical_q0` отдаёт `defined` как
+    ПОСТРОЧНЫЙ признак `q0.min(axis=1) >= 0` формы (n,), а q0 и k0 —
+    построчно-позиционные, формы (n, P). Смешение этих двух форм и было
+    ошибкой: маски длиной n и n*P молча не сходятся только потому, что numpy
+    отказался их транслировать. Функция чистая, чтобы это проверялось тестом,
+    а не прогоном на кластере.
+
+    Возвращает три плоские маски длины n*P в порядке row-major — том же, в
+    каком разворачивается латент (n, P, d) -> (n*P, d).
+    """
+    q0_rows = np.asarray(q0_rows, np.int64)
+    k0_rows = np.asarray(k0_rows, np.int64)
+    n = q0_rows.shape[0]
+    if q0_rows.shape != (n, n_pos):
+        raise SystemExit(f"q0 формы {q0_rows.shape}, ожидалась {(n, n_pos)}")
+    if k0_rows.shape != (n, n_pos):
+        raise SystemExit(f"k0 формы {k0_rows.shape}, ожидалась {(n, n_pos)}")
+    d = np.asarray(defined_rows, bool)
+    if d.shape == (n,):
+        # ПОСТРОЧНЫЙ ПРИЗНАК РАЗМНОЖАЕТСЯ НА ПОЗИЦИИ, а не транслируется
+        # молча: строка либо посчитана планом целиком, либо не посчитана.
+        d = np.repeat(d, n_pos)
+    elif d.shape == (n, n_pos):
+        d = d.reshape(-1)
+    else:
+        raise SystemExit(f"признак определённости формы {d.shape}: ожидалась "
+                         f"{(n,)} или {(n, n_pos)}")
+    wrong = (q0_rows != k0_rows).reshape(-1)
+    return d, wrong & d, (~wrong) & d
+
+
 def measure_part(name, rows, ACT, epi, ktrue, q0, q0_def, books, codec, qs,
                  dev, torch, nearest_code, boot=10000, enc_batch=256):
     """Геометрия остатков одной части. Без декодирования и без обучения."""
@@ -263,18 +332,31 @@ def measure_part(name, rows, ACT, epi, ktrue, q0, q0_def, books, codec, qs,
     ze = torch.cat(ze)                                   # (n, P, d)
     P = int(ze.shape[1])
     q0r = np.asarray(q0[rows], np.int64)
-    if q0r.shape != (n, P):
-        raise SystemExit(f"{name}: q0 формы {q0r.shape}, латент даёт "
-                         f"{(n, P)}")
-    defined = np.asarray(q0_def[rows], bool) if q0_def is not None \
-        else np.ones((n, P), bool)
     k0 = np.asarray(ktrue[rows])[:, 0, :].astype(np.int64)
-    wrong = (q0r != k0)
+    defined = (np.ones(n, bool) if q0_def is None
+               else np.asarray(q0_def)[rows])
+    m_def, m_wrong, m_ok = position_masks(q0r, k0, defined, P)
+    # НЕПОСЧИТАННЫЕ СТРОКИ ОТВЕРГАЮТСЯ, А НЕ МАСКИРУЮТСЯ. В q0 они помечены
+    # -1, а индексация книги значением -1 молча берёт ПОСЛЕДНИЙ элемент и
+    # даёт правдоподобный мусор. Каноническая часть обязана быть покрыта
+    # планом целиком, поэтому это отказ, а не фильтрация.
+    if not m_def.all():
+        raise SystemExit(
+            f"{name}: {int((~m_def).sum())} позиций из {len(m_def)} не "
+            f"посчитаны планом (q0 = -1). Часть покрыта не целиком")
+    if int(q0r.min()) < 0 or int(k0.min()) < 0:
+        raise SystemExit(f"{name}: отрицательный код в q0 или k0")
     # ОСТАТОК СЧИТАЕТСЯ В ЛАТЕНТЕ: вклад уровня берётся через out_project,
-    # а не прямым lookup во внутренней книге.
-    D0 = books[0][torch.from_numpy(q0r.reshape(-1)).to(dev)]
+    # а не прямым lookup во внутренней книге. Индекс обязан быть long:
+    # int32-тензор в индексации torch не принимается.
+    D0 = books[0][torch.from_numpy(q0r.reshape(-1)).long().to(dev)]
     r = (ze.reshape(-1, ze.shape[-1]) - D0)
+    if r.shape[0] != n * P:
+        raise SystemExit(f"{name}: остатков {r.shape[0]}, позиций {n * P}")
     g = geometry(r, books[1], torch)
+    if len(g["rho_fixed"]) != n * P:
+        raise SystemExit(f"{name}: геометрия дала {len(g['rho_fixed'])} "
+                         f"значений на {n * P} позиций")
 
     # --- ARGMIN В ЛАТЕНТЕ ПРОТИВ ВЫБОРА КОДЕКА ---------------------------
     # Кодек выбирает код по расстоянию ПОСЛЕ in_project, а ошибка, которая
@@ -286,10 +368,6 @@ def measure_part(name, rows, ACT, epi, ktrue, q0, q0_def, books, codec, qs,
     k_codec = k_codec.cpu().numpy()
     agree = float((k_codec == g["k_fixed"]).mean())
 
-    flat = lambda x: np.asarray(x).reshape(-1)
-    m_def = flat(defined)
-    m_wrong = flat(wrong) & m_def
-    m_ok = (~flat(wrong)) & m_def
     hi = g["rho_fixed"] > RHO_HI
     eps_pos = np.repeat(np.asarray(epi[rows], np.int64), P)
     bp = boot_prop(hi, eps_pos, {"wrong": m_wrong, "ok": m_ok,
@@ -357,11 +435,21 @@ def measure_part(name, rows, ACT, epi, ktrue, q0, q0_def, books, codec, qs,
           f"[{bp['ok'][0]:.3f}, {bp['ok'][1]:.3f}]")
     print(f"    разность (ошибочный − верный): "
           f"[{bp['d:wrong-ok'][0]:+.3f}, {bp['d:wrong-ok'][1]:+.3f}]")
-    print(f"    ОГРАНИЧЕНИЕ ПРЕДСТАВЛЕНИЯ существенно: {limited}  "
-          f"(нижняя граница {lo_wrong:.3f} > {P_LIMIT} и разность > 0)")
-    print(f"    ограничение именно МАСШТАБА: {scale_limited}  "
-          f"(мед rho_fixed {med_fixed:.3f}, rho_ray {med_ray:.3f}, "
-          f"alpha {med_alpha:.3f})")
+    # КАЖДОЕ УСЛОВИЕ ПЕЧАТАЕТСЯ СО СВОИМ ИСХОДОМ. Строка вида «вердикт False
+    # (условие A и условие B)» читается как утверждение обоих, и по ней не
+    # видно, какое именно не выполнилось.
+    def mark(ok):
+        return "выполнено" if ok else "НЕ выполнено"
+    print(f"    ОГРАНИЧЕНИЕ ПРЕДСТАВЛЕНИЯ существенно: {limited}")
+    print(f"      нижняя граница P(rho_fixed>{RHO_HI}|q0 неверен) "
+          f"{lo_wrong:.3f} > {P_LIMIT}: {mark(lo_wrong > P_LIMIT)}")
+    print(f"      нижняя граница разности {lo_diff:+.3f} > 0: "
+          f"{mark(lo_diff > 0)}")
+    print(f"    ограничение именно МАСШТАБА: {scale_limited}")
+    print(f"      мед rho_fixed {med_fixed:.3f} > {RHO_HI}: "
+          f"{mark(med_fixed > RHO_HI)};  мед rho_ray {med_ray:.3f} < "
+          f"{RHO_HI / 2}: {mark(med_ray < RHO_HI / 2)};  мед alpha "
+          f"{med_alpha:.3f} > {ALPHA_HI}: {mark(med_alpha > ALPHA_HI)}")
     return out
 
 
@@ -409,6 +497,11 @@ def main():
     if a.selftest:
         selftest()
         return 0
+    if a.limit and a.expect_rows_sha1:
+        raise SystemExit(
+            "--limit вместе с --expect-rows-sha1 бессмысленны: отпечаток "
+            "относится к ПОЛНОЙ части, а мерить будем урезанную, и сверка "
+            "утверждала бы неверное")
     if "val_confirm" in a.parts:
         raise SystemExit(
             "val_confirm в этом замере не участвует: геометрия книги не "
