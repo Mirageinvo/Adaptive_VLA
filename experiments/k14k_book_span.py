@@ -395,8 +395,13 @@ def main():
     # ВНЕ дерева — а это единственный способ запустить замер, пока идёт
     # длинный прогон: новый .py внутри репозитория сделал бы дерево грязным,
     # и следующий прогон цепочки отказался бы стартовать.
+    # `utils` живёт в вендоренном каталоге, а не в `src`: у K-14a он попадает
+    # на путь через `src`, которого в чистом клоне нет. Перечисляю оба, чтобы
+    # скрипт работал и там, где `src` есть, и там, где его нет.
     for p in (root, os.path.join(root, "src"),
-              os.path.join(root, "experiments"), here):
+              os.path.join(root, "experiments"),
+              os.path.join(root, "third_party", "actioncodec", "scripts"),
+              here):
         if p not in sys.path:
             sys.path.insert(0, p)
     if a.selftest:
