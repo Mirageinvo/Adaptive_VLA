@@ -422,6 +422,12 @@ def main():
     from k14a_oracle_cache import build_parts
     from depth_rvq_joint12 import code_contribution, nearest_code
     from utils import VisionLanguageActionProcessor
+    # ИМПОРТ НУЖЕН РАДИ ПОБОЧНОГО ДЕЙСТВИЯ, а не ради имени: при загрузке
+    # пакета исполняются AutoConfig.register("action_codec", ...) и
+    # AutoModel.register(...). Без него from_pretrained не узнаёт тип модели
+    # и падает с «Transformers does not recognize this architecture».
+    # pyflakes считает такой импорт неиспользуемым — удалять его нельзя.
+    import actioncodec  # noqa: F401
 
     head, dirty, _ = kc.check_code_clean(a.allow_dirty)
     print(f"  код: коммит {head}" + ("  (--allow-dirty)" if dirty else ""))
