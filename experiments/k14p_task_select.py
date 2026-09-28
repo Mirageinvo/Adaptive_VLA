@@ -25,47 +25,121 @@ import os
 import sys
 
 MIN_FAIL = 2            # из N_SEL состояний; §53.4
+N_TASKS = 10            # LIBERO-10: ровно задачи 0..9
+SUITE = "10"            # имя сюиты в реестре офсетов, НЕ "libero_10"
+SEL_SEED = 100          # единый сид отбора; сиды повторов 101..104
+PROTO = dict(horizon=8, max_steps=600, waiting_steps=10, ensemble="off")
 N_SEL = 10              # состояния 0..9 на отбор
-DEV_RANGE = (10, 40)    # [10, 40) — 30 состояний
-FINAL_RANGE = (40, 50)  # [40, 50) — 10 состояний
+DEV_RANGE = (10, 30)    # [10, 30) — 20 состояний; §53.5
+FINAL_RANGE = (30, 50)  # [30, 50) — 20 состояний; §53.5
 REPEAT_SEEDS = (101, 102, 103, 104)
 BLOCK = 5               # сред за вызов; ограничение памяти хоста, §53.4
 SEED_MODE = "fixed"
 
 
-def load_runs(paths, *, expect_policy=None):
-    """Артефакты k9h одной руки. Состояния не должны пересекаться."""
-    runs, seen = [], {}
+def file_sha(path, chunk=1 << 22):
+    import hashlib
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(chunk), b""):
+            h.update(b)
+    return h.hexdigest()[:12]
+
+
+def load_runs(paths, *, expect_policy=None, expect_seed=SEL_SEED,
+              expect_suite=SUITE, expect_tasks=True):
+    """Артефакты k9h одной руки — СТРОГО, а не по наличию полей.
+
+    Первая редакция была fail-open: принимала набор из двух задач вместо
+    десяти, разные сиды, чужую сюиту, чужие horizon и max_steps и любое
+    соответствие init_state_id номеру среды. Проверка, которая принимает
+    почти всё, охраняет только от опечаток в именах файлов.
+    """
+    runs, seen, sigs = [], {}, {}
     for p in paths:
         if not os.path.exists(p):
             raise SystemExit(f"нет {p}")
-        d = json.load(open(p))
-        for k in ("episodes", "task_id", "init_start", "n_envs", "policy",
-                  "seed", "rollout_seed_mode", "arm_label"):
-            if d.get(k) is None:
-                raise SystemExit(f"{p}: нет поля {k}")
+        try:
+            d = json.load(open(p))
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"{p}: не разбирается как JSON ({e}). Обрезанный "
+                             f"артефакт от убитого процесса — не результат")
+        need = ("episodes", "task_id", "init_start", "n_envs", "policy",
+                "seed", "rollout_seed_mode", "arm_label", "suite", "horizon",
+                "max_steps", "waiting_steps", "ensemble", "script_sha1",
+                "ckpt")
+        miss = [k for k in need if d.get(k) is None]
+        if miss:
+            raise SystemExit(f"{p}: нет полей {miss}")
         if expect_policy and str(d["policy"]) != str(expect_policy):
             raise SystemExit(f"{p}: политика {d['policy']}, отбор идёт по "
                              f"{expect_policy}")
+        if expect_suite is not None and str(d["suite"]) != str(expect_suite):
+            raise SystemExit(f"{p}: сюита {d['suite']!r}, ожидалась "
+                             f"{expect_suite!r}")
+        if expect_seed is not None and int(d["seed"]) != int(expect_seed):
+            raise SystemExit(f"{p}: сид {d['seed']}, отбор идёт на "
+                             f"{expect_seed}")
         if str(d["rollout_seed_mode"]) != SEED_MODE:
             raise SystemExit(
                 f"{p}: режим сида {d['rollout_seed_mode']}, §53.4 требует "
                 f"{SEED_MODE}: иначе один init_state_id получает разные сиды "
                 f"в блоках с разным началом")
+        for k, v in PROTO.items():
+            if str(d.get(k)) != str(v):
+                raise SystemExit(f"{p}: {k} = {d.get(k)}, протокол отбора "
+                                 f"требует {v}")
         t, i0, n = int(d["task_id"]), int(d["init_start"]), int(d["n_envs"])
+        if expect_tasks and not 0 <= t < N_TASKS:
+            raise SystemExit(f"{p}: задача {t} вне 0..{N_TASKS - 1}")
         if len(d["episodes"]) != n:
             raise SystemExit(f"{p}: эпизодов {len(d['episodes'])} при "
                              f"n_envs {n}")
-        for j in range(n):
-            key = (t, i0 + j)
+        # ОДНА МОДЕЛЬ НА ВЕСЬ ОТБОР. Половина задач, посчитанная другими
+        # весами или другой версией скрипта, дала бы доли провалов от разных
+        # политик, сложенные в одну таблицу.
+        sig = (str(d["ckpt"]), str(d["script_sha1"]),
+               str(((d.get("joint") or {}).get("weights_sha1"))),
+               str(((d.get("joint") or {}).get("model_fingerprint"))))
+        sigs.setdefault(sig, []).append(p)
+        for j, e in enumerate(d["episodes"]):
+            for k in ("success", "env_index", "init_state_id"):
+                if e.get(k) is None:
+                    raise SystemExit(f"{p}: в эпизоде {j} нет {k}")
+            if not isinstance(e["success"], bool):
+                raise SystemExit(
+                    f"{p}: success в эпизоде {j} имеет тип "
+                    f"{type(e['success']).__name__}, ожидался bool: 0/1 или "
+                    f"строка прошли бы как истина")
+            if int(e["env_index"]) != j:
+                raise SystemExit(f"{p}: env_index {e['env_index']} в позиции "
+                                 f"{j}: порядок эпизодов не тот")
+            if int(e["init_state_id"]) != i0 + j:
+                raise SystemExit(
+                    f"{p}: init_state_id {e['init_state_id']} при init_start "
+                    f"{i0} и env_index {j}: состояние не то, которое "
+                    f"заявлено")
+            key = (t, int(e["init_state_id"]))
             if key in seen:
                 raise SystemExit(
-                    f"{p}: состояние {i0 + j} задачи {t} уже покрыто "
+                    f"{p}: состояние {key[1]} задачи {t} уже покрыто "
                     f"{seen[key]} — блоки пересекаются, и доля провалов "
                     f"считалась бы по одному состоянию дважды")
             seen[key] = p
         d["_path"] = p
+        d["_sha1"] = file_sha(p)
         runs.append(d)
+    if len(sigs) > 1:
+        raise SystemExit(
+            "отбор посчитан РАЗНЫМИ моделями или версиями скрипта: "
+            + "; ".join(f"{k} -> {len(v)} файлов" for k, v in sigs.items()))
+    if expect_tasks:
+        got_t = sorted({int(d["task_id"]) for d in runs})
+        if got_t != list(range(N_TASKS)):
+            raise SystemExit(
+                f"покрыты задачи {got_t}, а отбор определён на ровно "
+                f"{list(range(N_TASKS))}: подмножество задач — это уже другой "
+                f"набор, и вторичный результат §53 считался бы по нему")
     return runs
 
 
@@ -74,8 +148,9 @@ def select(runs):
     by = {}
     for d in runs:
         t = int(d["task_id"])
-        b = by.setdefault(t, dict(states={}, seeds=set(), paths=[]))
+        b = by.setdefault(t, dict(states={}, seeds=set(), paths=[], shas={}))
         b["paths"].append(d["_path"])
+        b["shas"][d["_path"]] = d.get("_sha1")
         b["seeds"].add(int(d["seed"]))
         for j, e in enumerate(d["episodes"]):
             b["states"][int(d["init_start"]) + j] = bool(e["success"])
@@ -99,7 +174,8 @@ def select(runs):
         out[t] = dict(n_fail=n_fail, n=N_SEL,
                       p_fail=n_fail / float(N_SEL),
                       included=bool(n_fail >= MIN_FAIL),
-                      seed=sorted(b["seeds"])[0], sources=sorted(b["paths"]))
+                      seed=sorted(b["seeds"])[0],
+                      sources=sorted(b["paths"]), source_sha1=b["shas"])
     return out
 
 
@@ -118,11 +194,22 @@ def main():
     ap.add_argument("--expect-policy", default="fast")
     ap.add_argument("--delta", type=float, default=0.05,
                     help="целевой прирост успеха для проверки §37")
+    ap.add_argument("--validate-one", default="",
+                    help="проверить ОДИН артефакт тем же кодом, которым он "
+                         "будет проверен при сборке банков, и выйти. Нужен "
+                         "раннеру при возобновлении: иначе обрезанный или "
+                         "снятый в другой конфигурации файл считался бы "
+                         "готовым")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--out", default="reports/k14p/banks.json")
     a = ap.parse_args()
     if a.selftest:
         selftest()
+        return 0
+    if a.validate_one:
+        load_runs([a.validate_one], expect_policy=a.expect_policy,
+                  expect_tasks=False)
+        print(f"  {a.validate_one}: проверку прошёл")
         return 0
     if not a.runs:
         raise SystemExit("нужны --runs")
@@ -185,10 +272,13 @@ def main():
     return 0
 
 
-def _run(task, i0, succ, seed=100, policy="fast", **kw):
+def _run(task, i0, succ, seed=SEL_SEED, policy="fast", **kw):
     d = dict(task_id=task, init_start=i0, n_envs=len(succ), policy=policy,
              seed=seed, rollout_seed_mode=SEED_MODE, arm_label="fast_s0",
-             episodes=[dict(env_index=j, success=bool(s))
+             suite=SUITE, script_sha1="SS", ckpt="CK", **PROTO,
+             joint=dict(weights_sha1="W", model_fingerprint=None),
+             episodes=[dict(env_index=j, success=bool(s),
+                            init_state_id=i0 + j)
                        for j, s in enumerate(succ)])
     d.update(kw)
     return d
@@ -207,21 +297,22 @@ def selftest():
               w(_run(0, 5, [1, 1, 0, 1, 1]), "b.json"),
               w(_run(1, 0, [1, 1, 1, 1, 1]), "c.json"),
               w(_run(1, 5, [1, 1, 1, 0, 1]), "d.json")]
-        r = select(load_runs(ps, expect_policy="fast"))
+        r = select(load_runs(ps, expect_policy="fast", expect_tasks=False))
         assert r[0]["n_fail"] == 2 and r[0]["included"]
         assert r[1]["n_fail"] == 1 and not r[1]["included"]
         assert abs(r[0]["p_fail"] - 0.2) < 1e-12
 
         # ПЕРЕСЕЧЕНИЕ БЛОКОВ — отказ: иначе состояние учтётся дважды
         try:
-            load_runs([ps[0], w(_run(0, 3, [1, 1, 1, 1, 1]), "e.json")])
+            load_runs([ps[0], w(_run(0, 3, [1, 1, 1, 1, 1]), "e.json")],
+                      expect_tasks=False)
         except SystemExit as e:
             assert "пересекаются" in str(e), e
         else:
             raise AssertionError("приняты пересекающиеся блоки")
         # НЕПОЛНОЕ ПОКРЫТИЕ — отказ
         try:
-            select(load_runs([ps[0]]))
+            select(load_runs([ps[0]], expect_tasks=False))
         except SystemExit as e:
             assert "нет состояний" in str(e), e
         else:
@@ -231,7 +322,8 @@ def selftest():
         # не то, что заявлено.
         try:
             select(load_runs([ps[0], ps[1],
-                              w(_run(0, 10, [1] * 5), "f.json")]))
+                              w(_run(0, 10, [1] * 5), "f.json")],
+                             expect_tasks=False))
         except SystemExit as e:
             assert "вне диапазона" in str(e), e
         else:
@@ -239,7 +331,7 @@ def selftest():
         # ЧУЖОЙ РЕЖИМ СИДА — отказ
         try:
             load_runs([w(_run(0, 0, [1] * 5, rollout_seed_mode="block"),
-                         "g.json")])
+                         "g.json")], expect_tasks=False)
         except SystemExit as e:
             assert "режим сида" in str(e), e
         else:
@@ -247,18 +339,95 @@ def selftest():
         # ЧУЖАЯ ПОЛИТИКА — отказ
         try:
             load_runs([w(_run(0, 0, [1] * 5, policy="depthrvq"), "h.json")],
-                      expect_policy="fast")
+                      expect_policy="fast", expect_tasks=False)
         except SystemExit as e:
             assert "политика" in str(e), e
         else:
             raise AssertionError("принята чужая политика")
         # РАЗНЫЕ СИДЫ внутри задачи — отказ
         try:
-            select(load_runs([ps[0], w(_run(0, 5, [1] * 5, seed=7), "i.json")]))
+            select(load_runs([ps[0],
+                              w(_run(0, 5, [1] * 5, seed=7), "i.json")],
+                             expect_seed=None, expect_tasks=False))
         except SystemExit as e:
             assert "сиды" in str(e), e
         else:
             raise AssertionError("приняты разные сиды в одной задаче")
+
+        # --- ИМЕННО ТЕ СЛУЧАИ, КОТОРЫЕ ПРЕЖДЕ ПРОХОДИЛИ ------------------
+        for kw, why in (
+                (dict(suite="libero_10"), "сюита"),
+                (dict(seed=7), "сид"),
+                (dict(horizon=16), "horizon"),
+                (dict(max_steps=300), "max_steps"),
+                (dict(ensemble="on"), "ensemble"),
+                (dict(waiting_steps=0), "waiting_steps"),
+                (dict(script_sha1=None), "нет полей"),
+                (dict(ckpt=None), "нет полей")):
+            r_ = _run(0, 0, [1, 0, 1, 1, 1])
+            for k_, v_ in kw.items():
+                if v_ is None:
+                    r_.pop(k_, None)
+                else:
+                    r_[k_] = v_
+            try:
+                load_runs([w(r_, f"bad_{why}.json")], expect_policy="fast",
+                          expect_tasks=False)
+            except SystemExit as e:
+                assert why in str(e), (why, e)
+            else:
+                raise AssertionError(f"принят артефакт: {why}")
+        # init_state_id не соответствует init_start + env_index
+        r_ = _run(0, 5, [1, 0, 1, 1, 1])
+        r_["episodes"][2]["init_state_id"] = 99
+        try:
+            load_runs([w(r_, "bad_isid.json")], expect_tasks=False)
+        except SystemExit as e:
+            assert "init_state_id" in str(e), e
+        else:
+            raise AssertionError("принят чужой init_state_id")
+        # success не bool
+        r_ = _run(0, 0, [1, 0, 1, 1, 1])
+        r_["episodes"][1]["success"] = 0
+        try:
+            load_runs([w(r_, "bad_bool.json")], expect_tasks=False)
+        except SystemExit as e:
+            assert "bool" in str(e), e
+        else:
+            raise AssertionError("принят success не-bool")
+        # порядок эпизодов
+        r_ = _run(0, 0, [1, 0, 1, 1, 1])
+        r_["episodes"] = list(reversed(r_["episodes"]))
+        try:
+            load_runs([w(r_, "bad_order.json")], expect_tasks=False)
+        except SystemExit as e:
+            assert "порядок" in str(e) or "init_state_id" in str(e), e
+        else:
+            raise AssertionError("принят перевёрнутый порядок эпизодов")
+        # РАЗНЫЕ МОДЕЛИ в одном отборе
+        r2_ = _run(1, 0, [1, 0, 1, 1, 1], script_sha1="ДРУГАЯ")
+        try:
+            load_runs([ps[0], w(r2_, "bad_model.json")], expect_tasks=False)
+        except SystemExit as e:
+            assert "РАЗНЫМИ моделями" in str(e), e
+        else:
+            raise AssertionError("принят отбор двумя версиями скрипта")
+        # ПОДМНОЖЕСТВО ЗАДАЧ вместо десяти
+        try:
+            load_runs(ps, expect_policy="fast")     # только задачи 0 и 1
+        except SystemExit as e:
+            assert "покрыты задачи" in str(e), e
+        else:
+            raise AssertionError("принято подмножество задач")
+        # ОБРЕЗАННЫЙ JSON
+        q = os.path.join(td, "trunc.json")
+        open(q, "w").write('{"episodes": [')
+        try:
+            load_runs([q], expect_tasks=False)
+        except SystemExit as e:
+            assert "не разбирается" in str(e), e
+        else:
+            raise AssertionError("принят обрезанный JSON")
 
     # предел §37
     assert feasible(0.10, 0.20, 0.05) is False

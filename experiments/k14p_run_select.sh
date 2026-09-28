@@ -19,7 +19,10 @@
 #
 #   bash experiments/k14p_run_select.sh            # cuda:1, сид отбора 100
 #   bash experiments/k14p_run_select.sh cuda:0 100
-set -u
+# set -euo pipefail, А НЕ set -u. При одном -u падение финального
+# k14p_task_select.py не влияло на код возврата: следующий echo возвращал
+# ноль, и раннер сообщал об успехе после ошибки.
+set -euo pipefail
 DEV="${1:-cuda:1}"
 SEL_SEED="${2:-100}"
 
@@ -38,11 +41,23 @@ ARTS=()
 for T in 0 1 2 3 4 5 6 7 8 9; do
   for I0 in 0 5; do
     OUT="reports/k14p/sel_t${T}_i${I0}.json"
+    # ВОЗОБНОВЛЕНИЕ ПРОВЕРЯЕТ АРТЕФАКТ, А НЕ ФАКТ ЕГО СУЩЕСТВОВАНИЯ. Прежде
+    # любой существующий файл пропускался: обрезанный от убитого процесса или
+    # снятый с другой конфигурацией считался готовым. Проверка — тем же
+    # кодом, который потом собирает банки.
     if [ -f "$OUT" ]; then
-      echo "    уже есть $OUT, пропускаю"
-      ARTS+=("$OUT"); continue
+      if python experiments/k14p_task_select.py --validate-one "$OUT"            --expect-policy fast >/dev/null 2>&1; then
+        echo "    уже есть и проверен $OUT, пропускаю"
+        ARTS+=("$OUT"); continue
+      fi
+      echo "    $OUT существует, но проверку не прошёл — пересчитываю"
+      python experiments/k14p_task_select.py --validate-one "$OUT"         --expect-policy fast 2>&1 | tail -3 || true
+      rm -f "$OUT"
     fi
     echo "--- задача $T, состояния $I0-$((I0+4)) $(date), свободно $(free -g | awk 'NR==2{print $7}') ГБ"
+    # rc снимается явно: при set -e непосредственный выход по ошибке не дал
+    # бы напечатать, на каком блоке мы встали.
+    rc=0
     python experiments/k9h_multiarm_gate.py \
       --ckpt ZibinDong/SmolVLM2-2.2B-ActionCodec-BAR-LIBERO \
       --task-suite 10 --task-id "$T" --init-start "$I0" --n-envs 5 \
@@ -50,8 +65,7 @@ for T in 0 1 2 3 4 5 6 7 8 9; do
       --ensemble off --horizon 8 --max-steps 600 \
       --run-tag k14p_select --device "$DEV" \
       --policy fast --policy-ckpt data/k9d_ep3.pt \
-      --arm-label fast_s0 --out "$OUT"
-    rc=$?
+      --arm-label fast_s0 --out "$OUT" || rc=$?
     if [ $rc -ne 0 ]; then
       echo "ОСТАНОВ: задача $T, блок $I0 завершился кодом $rc"
       exit $rc
@@ -62,6 +76,10 @@ for T in 0 1 2 3 4 5 6 7 8 9; do
 done
 
 echo "=== раскатки закончены $(date), артефактов ${#ARTS[@]} ==="
+if [ "${#ARTS[@]}" -ne 20 ]; then
+  echo "ОСТАНОВ: артефактов ${#ARTS[@]}, а отбор определён на 10 задач x 2 блока"
+  exit 3
+fi
 python experiments/k14p_task_select.py --runs "${ARTS[@]}" \
   --expect-policy fast --delta 0.05 --out reports/k14p/banks.json
-echo "=== КОНЕЦ $(date) ==="
+echo "=== КОНЕЦ $(date), банки собраны ==="

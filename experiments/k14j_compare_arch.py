@@ -74,6 +74,15 @@ def load_dump(path):
               "plan_sha1", "q1_cache_sha1"):
         if m.get(k) is None:
             raise SystemExit(f"{path}: в meta нет {k}")
+    # ДАМП БЕЗ ПРОВЕНАНСА ВООБЩЕ — не дамп. Прежде принимался набор, в
+    # котором одновременно нет budget, q0_prov и val_sel: тогда сравниватель
+    # не проверяет ни бюджет, ни черновик, ни агрегат, и утверждение
+    # «равенство условий доказано сравнивателем» становится ложным.
+    have = [k for k in ("budget", "q0_prov", "val_sel") if m.get(k) is not None]
+    if not have:
+        raise SystemExit(
+            f"{path}: нет ни budget, ни q0_prov, ни val_sel. Проверять "
+            f"нечего, и сравнение ничего не доказывало бы")
     if len(d["rows"]) != len(d["se"]) or len(d["rows"]) != len(d["n"]) \
             or len(d["rows"]) != len(d["episode"]):
         raise SystemExit(f"{path}: длины массивов не совпадают")
@@ -369,6 +378,14 @@ def main():
                          f"перезаписывается молча (--overwrite осознанно)")
     os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
     t_ = a.out + f".tmp.{os.getpid()}"
+    # ЧТО ИМЕННО ДОКАЗАНО СРАВНИВАТЕЛЕМ, А ЧТО НЕТ — В ЯВНОМ ВИДЕ.
+    prov = {k: bool(all(d["meta"].get(k) is not None for d in dumps))
+            for k in ("budget", "q0_prov", "val_sel")}
+    out["provenance_checked"] = prov
+    if not prov["budget"]:
+        print("\n  ВНИМАНИЕ: подписи бюджета нет ни в одном дампе. Равенство "
+              "бюджета, цели и оптимизатора сравнивателем НЕ доказано — оно "
+              "обеспечено только скриптом запуска")
     json.dump(out, open(t_, "w"), ensure_ascii=False, indent=1, default=str)
     os.replace(t_, a.out)
     print(f"\n  сохранено: {a.out}")

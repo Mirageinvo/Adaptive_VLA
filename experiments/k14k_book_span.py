@@ -474,6 +474,7 @@ def main():
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--boot", type=int, default=10000)
     ap.add_argument("--allow-dirty", action="store_true")
+    ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--out", default="reports/k14k/book_span.json")
     a = ap.parse_args()
 
@@ -497,6 +498,14 @@ def main():
     if a.selftest:
         selftest()
         return 0
+    if not a.expect_rows_sha1 and not a.limit:
+        raise SystemExit(
+            "--expect-rows-sha1 обязателен: без него замер может молча пойти "
+            "по другим строкам, и его числа нельзя ставить рядом с A0/A01 из "
+            "K-14a. Отпечаток части берётся из артефакта оракула")
+    if os.path.exists(a.out) and not a.overwrite:
+        raise SystemExit(f"{a.out} уже существует: результат не "
+                         f"перезаписывается молча (--overwrite осознанно)")
     if a.limit and a.expect_rows_sha1:
         raise SystemExit(
             "--limit вместе с --expect-rows-sha1 бессмысленны: отпечаток "
@@ -636,6 +645,8 @@ def main():
                    max=float(b.norm(dim=1).max())) for l, b in
                    enumerate(books)},
                q0_prov=q0_prov, cache=a.cache, source_cache_sha1=sha12(src),
+               expect_rows_sha1=a.expect_rows_sha1,
+               cache_meta_sha1=k11a.file_sha1(f"{a.cache}.meta.json"),
                script_sha1=sha12(os.path.abspath(__file__)), parts=res)
     os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
     t_ = a.out + f".tmp.{os.getpid()}"

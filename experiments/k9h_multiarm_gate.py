@@ -581,6 +581,10 @@ def main() -> None:
                          "fast: forward_joint_fast, уровень 0")
     ap.add_argument("--policy-ckpt", default=None,
                     help="чекпойнт формата k9c/k9g; только для --policy fast")
+    ap.add_argument("--save-actions", action="store_true",
+                    help="записать рядом с --out npz с ИСПОЛНЕННЫМИ "
+                         "действиями по шагам: без него пошаговое "
+                         "расхождение рук считать нечем")
     ap.add_argument("--expect-q1-kind", default=None,
                     help="вид головы q1: q1_head для канонической, "
                          "q1_head_unconfirmed для реплики отбора. Без него "
@@ -1330,6 +1334,13 @@ def main() -> None:
                               obs["robot0_eye_in_hand_image"][i].ravel() / 255.0])
                           for i in range(n)]
         calls = steps = 0
+        # ПРИЗНАКИ ТРАЕКТОРИИ ПО КАЖДОЙ СРЕДЕ. Без них заявленный анализ типа
+        # провалов невозможен: по одному биту success нельзя отличить «не туда
+        # пошёл» от «пошёл туда, но не доделал». Стоят 84 КБ на прогон.
+        succ_step = np.full(n, -1, np.int64)
+        done_step = np.full(n, -1, np.int64)
+        grip_pos_step = np.full(n, -1, np.int64)
+        acts_log = []
         while not np.all(done) and steps < args.max_steps:
             state = ((process_state(obs["state"]) - STATE_Q01)
                      / (STATE_Q99 - STATE_Q01) * 2.0 - 1.0)
@@ -1370,17 +1381,60 @@ def main() -> None:
                     ts += 1
                 else:
                     a_t = action[:, t]
+                a_t = np.asarray(a_t)
+                acts_log.append(np.asarray(a_t, np.float32).copy())
+                # ЗНАК ПОСЛЕДНЕГО КАНАЛА ЗАПИСЫВАЕТСЯ КАК НАБЛЮДАЕМОЕ, а не
+                # как «схват закрылся»: ожидание идёт действием
+                # [0,...,-1], то есть минус — раскрытый схват, но толковать
+                # соглашение в имени поля значило бы зашить толкование в
+                # данные.
+                newly_grip = (a_t[:, -1] > 0) & (grip_pos_step < 0) & (~done)
+                grip_pos_step[newly_grip] = steps
                 obs, r_, done, _ = envs.step(a_t)
+                prev_rw = reward
                 reward = np.clip(reward + r_, 0, 1)
+                newly_succ = (reward >= 1.0) & (prev_rw < 1.0)
+                succ_step[newly_succ & (succ_step < 0)] = steps
+                newly_done = np.asarray(done, bool) & (done_step < 0)
+                done_step[newly_done] = steps
                 steps += 1
         # rollout_seed ЛЕЖИТ В КАЖДОМ ЭПИЗОДЕ, а не только в шапке файла:
         # агрегатор сверяет его у обеих рук пары и отказывается сравнивать
         # эпизоды, раскатанные с разными сидами.
+        A = (np.stack(acts_log) if acts_log
+             else np.zeros((0, n, 7), np.float32))       # (T, n, 7)
+        rollout.actions = A
+        rollout.done_step = done_step
+
+        def _ahash(i):
+            """Хеш ИСПОЛНЕННЫХ действий среды до её завершения.
+
+            До завершения, а не до конца раунда: после done действия среды
+            уже не влияют ни на что, и включать их в отпечаток значило бы
+            объявлять разными траектории, различающиеся только хвостом,
+            который никто не исполнял.
+            """
+            end = int(done_step[i]) + 1 if done_step[i] >= 0 else len(A)
+            return hashlib.sha1(np.ascontiguousarray(
+                A[:end, i]).tobytes()).hexdigest()[:16]
+
         return [dict(success=bool(reward[i] >= 1.0), env_steps=steps,
                      policy_calls=calls, init_state_id=args.init_start + i,
                      env_index=i, init_hash=init_hash[i],
                      init_hash_full=init_hash_full[i],
-                     rollout_seed=roll_seed)
+                     rollout_seed=roll_seed,
+                     # ПОШАГОВЫЕ ПРИЗНАКИ: шаг первого успеха, шаг
+                     # завершения, шаг первого положительного знака схвата,
+                     # число исполненных шагов ЭТОЙ среды и отпечаток её
+                     # действий. Последний позволяет сравнить руки пошагово
+                     # без хранения самих действий, а сами действия лежат
+                     # рядом в npz, если он запрошен.
+                     success_step=int(succ_step[i]),
+                     done_step=int(done_step[i]),
+                     grip_positive_step=int(grip_pos_step[i]),
+                     own_steps=int(done_step[i] + 1 if done_step[i] >= 0
+                                   else len(A)),
+                     action_sha1=_ahash(i))
                 for i in range(args.n_envs)]
 
     t0 = time.time()
@@ -1415,6 +1469,10 @@ def main() -> None:
         os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".",
                     exist_ok=True)
         sha = file_sha12(__file__)
+        # АТОМАРНО. Прямая запись в --out оставляла бы после убийства
+        # процесса ОБРЕЗАННЫЙ файл, а раннер принял бы его за готовый
+        # результат и пропустил бы блок при возобновлении.
+        tmp_out = args.out + f".tmp.{os.getpid()}"
         json.dump(dict(summary=s, episodes=eps,
                        arm_label=args.arm_label, run_tag=args.run_tag,
                        policy=args.policy, levels=n_lv, depth=depth,
@@ -1434,8 +1492,37 @@ def main() -> None:
                        device=args.device,
                        ckpt=args.ckpt, joint=policy_meta,
                        script_sha1=sha, argv=vars(args)),
-                  open(args.out, "w"), ensure_ascii=False, indent=1)
+                  open(tmp_out, "w"), ensure_ascii=False, indent=1)
+        json.load(open(tmp_out))      # перечитывается до публикации
+        os.replace(tmp_out, args.out)
         print(f"  сохранено: {args.out}  (sha {sha})")
+        if args.save_actions:
+            # ИСПОЛНЕННЫЕ ДЕЙСТВИЯ РЯДОМ. Пошаговое расхождение рук иначе
+            # считать нечем: отпечаток говорит «разошлись», но не где.
+            ap_ = os.path.splitext(args.out)[0] + ".actions.npz"
+            tmp_a = ap_ + f".tmp.{os.getpid()}"
+            with open(tmp_a, "wb") as fh_:
+                np.savez_compressed(
+                    fh_, actions=np.asarray(rollout.actions, np.float32),
+                    done_step=np.asarray(rollout.done_step, np.int64),
+                    init_state_id=np.asarray(
+                        [e["init_state_id"] for e in eps], np.int64),
+                    action_sha1=np.asarray(
+                        [e["action_sha1"] for e in eps], dtype="U16"),
+                    meta=json.dumps(dict(
+                        arm_label=args.arm_label, policy=args.policy,
+                        task_id=args.task_id, suite=args.task_suite,
+                        init_start=args.init_start, seed=args.seed,
+                        rollout_seed=roll_seed, horizon=args.horizon,
+                        script_sha1=sha,
+                        model_fingerprint=(policy_meta or {}).get(
+                            "model_fingerprint")), ensure_ascii=False))
+            with np.load(tmp_a, allow_pickle=True) as z_:
+                if "actions" not in z_.files:
+                    raise SystemExit(f"{ap_}: массив actions не перечитался")
+            os.replace(tmp_a, ap_)
+            print(f"  действия сохранены: {ap_} "
+                  f"{tuple(np.asarray(rollout.actions).shape)}")
 
 
 if __name__ == "__main__":
