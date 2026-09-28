@@ -565,7 +565,14 @@ def main():
                 f"{a.expect_rows_sha1}: замер и оракул на разных строках")
         print(f"  строки {a.parts[0]} сверены с оракулом: {got}")
 
-    codec, qs = load_codec(a.ckpt or meta.get("ckpt") or "", dev, torch,
+    # ФАКТИЧЕСКИ РАЗРЕШЁННЫЙ ПУТЬ ЗАПИСЫВАЕТСЯ ОТДЕЛЬНО. Прежде в артефакт
+    # шло a.ckpt, и при пустом аргументе там оставалась пустая строка, хотя
+    # кодек брался из меты кэша: артефакт не называл то, чем посчитан.
+    resolved_ckpt = a.ckpt or meta.get("ckpt") or ""
+    if not resolved_ckpt:
+        raise SystemExit("не указан --ckpt и в мете кэша его нет: чем считать "
+                         "кодек, неизвестно")
+    codec, qs = load_codec(resolved_ckpt, dev, torch,
                            VisionLanguageActionProcessor)
     books = []
     with torch.no_grad():
@@ -584,11 +591,12 @@ def main():
     # молча, а сравнивать их с A0/A01 из K-14a было бы нельзя: там другой
     # декодер. Те же три отпечатка, что и в K-14a.
     E_all = torch.stack(books).float()
-    k11a.check_fingerprints(meta, dict(
+    fp_now = dict(
         codebooks_sha1=hashlib.sha1(np.ascontiguousarray(
             E_all.cpu().numpy().astype(np.float32)).tobytes()).hexdigest()[:12],
         decoder_probe=k11a.decoder_probe(codec, E_all.to(dev), dev),
-        codec_state_sha1=k11a.state_sha1(codec)))
+        codec_state_sha1=k11a.state_sha1(codec))
+    k11a.check_fingerprints(meta, fp_now)
     print("  книги, проба декодера и веса кодека сверены с метой кэша K-11a")
     # ТИПЫ ПРОЕКЦИЙ ПЕЧАТАЮТСЯ. Если обе окажутся Identity, совпадение
     # argmin'ов в двух пространствах тривиально гарантировано, и говорить о
@@ -628,10 +636,15 @@ def main():
               cudnn_benchmark=bool(torch.backends.cudnn.benchmark))
     out = dict(kind="k14k_book_span", git_head=head, git_dirty=bool(dirty),
                device=str(dev), runtime=rt, ckpt=a.ckpt,
-               codec_fingerprints=dict(
+               resolved_ckpt=resolved_ckpt,
+               # ОЖИДАЕМЫЕ И ФАКТИЧЕСКИЕ ОТПЕЧАТКИ — ДВА РАЗНЫХ ПОЛЯ. Копия
+               # ожидаемых из меты не доказывает, чем посчитано: она
+               # доказывает лишь, что мету прочитали.
+               codec_fingerprints_expected=dict(
                    codebooks_sha1=meta.get("codebooks_sha1"),
                    decoder_probe=meta.get("decoder_probe"),
                    codec_state_sha1=meta.get("codec_state_sha1")),
+               codec_fingerprints_actual=fp_now,
                projections={str(l): dict(
                    in_project=type(getattr(q_, "in_project", None)).__name__,
                    out_project=type(getattr(q_, "out_project", None)).__name__)

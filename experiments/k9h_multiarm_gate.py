@@ -1469,36 +1469,12 @@ def main() -> None:
         os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".",
                     exist_ok=True)
         sha = file_sha12(__file__)
-        # АТОМАРНО. Прямая запись в --out оставляла бы после убийства
-        # процесса ОБРЕЗАННЫЙ файл, а раннер принял бы его за готовый
-        # результат и пропустил бы блок при возобновлении.
-        tmp_out = args.out + f".tmp.{os.getpid()}"
-        json.dump(dict(summary=s, episodes=eps,
-                       arm_label=args.arm_label, run_tag=args.run_tag,
-                       policy=args.policy, levels=n_lv, depth=depth,
-                       horizon=args.horizon, task_id=args.task_id,
-                       suite=args.task_suite, pos_offset=pos_off,
-                       ensemble=args.ensemble, init_start=args.init_start,
-                       n_envs=args.n_envs, task_description=task_desc,
-                       seed=args.seed, rollout_seed=roll_seed,
-                       rollout_seed_mode=args.rollout_seed_mode,
-                       # УСЛОВИЯ ИСПОЛНЕНИЯ ЗАПИСЫВАЮТСЯ ЯВНО. Без них
-                       # ячейка неотличима от посчитанной другим горизонтом,
-                       # другим числом шагов или на другой карте — а
-                       # чувствительность позднего состояния к численным
-                       # условиям у нас уже измерена (K-11q).
-                       max_steps=args.max_steps,
-                       waiting_steps=args.waiting_steps,
-                       device=args.device,
-                       ckpt=args.ckpt, joint=policy_meta,
-                       script_sha1=sha, argv=vars(args)),
-                  open(tmp_out, "w"), ensure_ascii=False, indent=1)
-        json.load(open(tmp_out))      # перечитывается до публикации
-        os.replace(tmp_out, args.out)
-        print(f"  сохранено: {args.out}  (sha {sha})")
+        # ПОРЯДОК ПУБЛИКАЦИИ: СНАЧАЛА ДЕЙСТВИЯ, ПОТОМ JSON. Если JSON выйдет
+        # первым и запись npz упадёт, возобновление увидит готовый JSON без
+        # действий и посчитает блок сделанным. JSON публикуется последним и
+        # несёт отпечаток npz — тогда наличие JSON означает наличие всего.
+        act_meta = {}
         if args.save_actions:
-            # ИСПОЛНЕННЫЕ ДЕЙСТВИЯ РЯДОМ. Пошаговое расхождение рук иначе
-            # считать нечем: отпечаток говорит «разошлись», но не где.
             ap_ = os.path.splitext(args.out)[0] + ".actions.npz"
             tmp_a = ap_ + f".tmp.{os.getpid()}"
             with open(tmp_a, "wb") as fh_:
@@ -1514,15 +1490,44 @@ def main() -> None:
                         task_id=args.task_id, suite=args.task_suite,
                         init_start=args.init_start, seed=args.seed,
                         rollout_seed=roll_seed, horizon=args.horizon,
-                        script_sha1=sha,
+                        script_sha1=file_sha12(__file__),
                         model_fingerprint=(policy_meta or {}).get(
                             "model_fingerprint")), ensure_ascii=False))
             with np.load(tmp_a, allow_pickle=True) as z_:
                 if "actions" not in z_.files:
                     raise SystemExit(f"{ap_}: массив actions не перечитался")
             os.replace(tmp_a, ap_)
+            act_meta = dict(actions_npz=os.path.basename(ap_),
+                            actions_npz_sha1=file_sha12(ap_),
+                            actions_shape=list(
+                                np.asarray(rollout.actions).shape))
             print(f"  действия сохранены: {ap_} "
-                  f"{tuple(np.asarray(rollout.actions).shape)}")
+                  f"{tuple(np.asarray(rollout.actions).shape)}, sha "
+                  f"{act_meta['actions_npz_sha1']}")
+        # АТОМАРНО. Прямая запись в --out оставляла бы после убийства
+        # процесса ОБРЕЗАННЫЙ файл, а раннер принял бы его за готовый
+        # результат и пропустил бы блок при возобновлении.
+        tmp_out = args.out + f".tmp.{os.getpid()}"
+        json.dump(dict(summary=s, episodes=eps,
+                       arm_label=args.arm_label, run_tag=args.run_tag,
+                       policy=args.policy, levels=n_lv, depth=depth,
+                       horizon=args.horizon, task_id=args.task_id,
+                       suite=args.task_suite, pos_offset=pos_off,
+                       ensemble=args.ensemble, init_start=args.init_start,
+                       n_envs=args.n_envs, task_description=task_desc,
+                       seed=args.seed, rollout_seed=roll_seed,
+                       rollout_seed_mode=args.rollout_seed_mode,
+                       max_steps=args.max_steps,
+                       waiting_steps=args.waiting_steps,
+                       device=args.device,
+                       ckpt=args.ckpt, joint=policy_meta,
+                       **act_meta,
+                       script_sha1=sha, argv=vars(args)),
+                  open(tmp_out, "w"), ensure_ascii=False, indent=1)
+        json.load(open(tmp_out))      # перечитывается до публикации
+        os.replace(tmp_out, args.out)
+        print(f"  сохранено: {args.out}  (sha {sha})")
+
 
 
 if __name__ == "__main__":

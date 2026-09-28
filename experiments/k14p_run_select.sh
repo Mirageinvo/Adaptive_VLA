@@ -15,7 +15,8 @@
 # init_start, и один и тот же init_state_id получил бы разные сиды в двух
 # блоках одной задачи.
 #
-# СОСТОЯНИЯ 0-9 РАСХОДУЮТСЯ. Банки: dev 10-39, final 40-49.
+# СОСТОЯНИЯ 0-9 РАСХОДУЮТСЯ. Банки (§53.5): dev 10-29, final 30-49,
+# по 20 состояний на задачу.
 #
 #   bash experiments/k14p_run_select.sh            # cuda:1, сид отбора 100
 #   bash experiments/k14p_run_select.sh cuda:0 100
@@ -36,6 +37,37 @@ exec >> logs/k14p_select.log 2>&1
 
 echo "=== СТАРТ $(date) === отбор задач, карта $DEV, сид $SEL_SEED"
 echo "    коммит $(git rev-parse --short HEAD 2>/dev/null)"
+
+# ПРЕД-ПРОХОД: СМЕСЬ ВЕРСИЙ ОБНАРУЖИВАЕТСЯ ДО ПЕРВОГО БЛОКА, А НЕ ПОСЛЕ
+# ПОСЛЕДНЕГО. Сборка банков требует единой script_sha1 на весь отбор. Если
+# часть артефактов снята прежней версией k9h, а один битый пришлось бы
+# пересчитать текущей, набор оказался бы смесью двух версий — и был бы
+# справедливо отвергнут через час работы.
+CUR_SHA="$(sha1sum experiments/k9h_multiarm_gate.py | cut -c1-12)"
+OLD_SHAS="$(grep -ho '"script_sha1": "[^"]*"' reports/k14p/sel_t*_i*.json \
+            2>/dev/null | sed 's/.*: "//; s/"//' | sort -u | tr '\n' ' ' \
+            | sed 's/ *$//')"
+NEED_RECOMPUTE=0
+for T in 0 1 2 3 4 5 6 7 8 9; do
+  for I0 in 0 5; do
+    F="reports/k14p/sel_t${T}_i${I0}.json"
+    if [ ! -f "$F" ] || ! python experiments/k14p_task_select.py \
+          --validate-one "$F" --expect-policy fast >/dev/null 2>&1; then
+      NEED_RECOMPUTE=1
+    fi
+  done
+done
+echo "    текущая версия k9h $CUR_SHA; в готовых артефактах: ${OLD_SHAS:-нет}"
+if [ "$NEED_RECOMPUTE" = "1" ] && [ -n "$OLD_SHAS" ] \
+   && [ "$OLD_SHAS" != "$CUR_SHA" ]; then
+  echo "ОСТАНОВ: часть блоков надо пересчитать текущей версией k9h ($CUR_SHA),"
+  echo "  а готовые сняты версией(ями) $OLD_SHAS. Набор получился бы смесью"
+  echo "  версий и был бы отвергнут при сборке банков. Выберите одно:"
+  echo "    1) пересчитать ВСЕ 20 блоков текущей версией:"
+  echo "       rm -f reports/k14p/sel_t*_i*.json  и повторить запуск"
+  echo "    2) пересчитать битый блок на том коммите, которым сняты остальные"
+  exit 4
+fi
 
 ARTS=()
 for T in 0 1 2 3 4 5 6 7 8 9; do
