@@ -1081,14 +1081,15 @@ def main() -> None:
                     raise SystemExit(f"в {k_} головы есть nan или inf")
                 own_q1[k_].data.copy_(v_.to(own_q1[k_].device,
                                             own_q1[k_].dtype))
-        # ОТПЕЧАТОК ПОСЛЕ ЗАГРУЗКИ. Совпадение форм не означает, что
-        # загрузилось именно то состояние.
-        h_ = hashlib.sha1()
-        for k_ in sorted(want_q1):
-            h_.update(k_.encode())
-            h_.update(np.ascontiguousarray(
-                own_q1[k_].detach().float().cpu().numpy()).tobytes())
-        got_sha_q1 = h_.hexdigest()[:12]
+        # ОТПЕЧАТОК ПОСЛЕ ЗАГРУЗКИ, И СЧИТАННЫЙ ТЕМ ЖЕ КОДОМ, ЧТО ЕГО
+        # ЗАПИСАЛ. Совпадение форм не означает, что загрузилось то состояние;
+        # а своя копия формулы отпечатка означает свой отпечаток — тренер
+        # приводит тензоры к float64, и на float32 проверка отвергала бы
+        # правильно загруженную голову.
+        import k14c_train_q1 as _k14c
+        got_sha_q1 = _k14c.state_sha(
+            {k_: own_q1[k_].detach().float().cpu().numpy()
+             for k_ in want_q1})
         if got_sha_q1 != str(q1_obj["selected_state_sha1"]):
             raise SystemExit(
                 f"после загрузки веса головы имеют отпечаток {got_sha_q1}, "

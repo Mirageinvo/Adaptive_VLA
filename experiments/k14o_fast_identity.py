@@ -321,6 +321,7 @@ def main():
                        dict_apply, get_cfg)
     import actioncodec  # noqa: F401  регистрация типа модели в AutoConfig
     import k9h_multiarm_gate as k9h
+    import k14c_train_q1 as k14c
 
     head, dirty, _ = kc.check_code_clean(a.allow_dirty)
     print(f"  код: коммит {head}" + ("  (--allow-dirty)" if dirty else ""))
@@ -423,14 +424,17 @@ def main():
                 if not torch.isfinite(v_).all():
                     raise SystemExit(f"в {k_} есть nan или inf")
                 own[k_].data.copy_(v_.to(own[k_].device, own[k_].dtype))
-        h_ = hashlib.sha1()
-        for k_ in sorted(want):
-            h_.update(k_.encode())
-            h_.update(np.ascontiguousarray(
-                own[k_].detach().float().cpu().numpy()).tobytes())
-        if h_.hexdigest()[:12] != str(q1_obj["selected_state_sha1"]):
+        # ОТПЕЧАТОК СЧИТАЕТСЯ ТЕМ ЖЕ КОДОМ, ЧТО ЕГО ЗАПИСАЛ. Своя копия
+        # формулы уже разошлась с тренеровской: там перед хешированием
+        # тензоры приводятся к float64, а я хешировал float32 — и проверка
+        # отвергала правильно загруженную голову. Две реализации одного
+        # отпечатка — это два разных отпечатка.
+        got_sha = k14c.state_sha({k_: own[k_].detach().float().cpu().numpy()
+                                  for k_ in want})
+        if got_sha != str(q1_obj["selected_state_sha1"]):
             raise SystemExit(
-                "после загрузки веса головы имеют другой отпечаток")
+                f"после загрузки веса головы имеют отпечаток {got_sha}, в "
+                f"чекпойнте {q1_obj['selected_state_sha1']}")
         model.eval()
         print(f"  голова q1 установлена и сверена: {len(st)} тензоров, вид "
               f"{prov_q1['q1_kind']}, сид {prov_q1['q1_seed']}, черновик "
