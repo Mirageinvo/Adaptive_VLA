@@ -318,7 +318,7 @@ def main():
     from joint12_vla import make_joint12_class
     from smolvla.bar import SmolVLABlockwiseAR
     from utils import (STATE_Q01, STATE_Q99, VisionLanguageActionProcessor,
-                       dict_apply, get_cfg)
+                       dict_apply, get_cfg, prompt_template)
     import actioncodec  # noqa: F401  регистрация типа модели в AutoConfig
     import k9h_multiarm_gate as k9h
     import k14c_train_q1 as k14c
@@ -444,9 +444,26 @@ def main():
     Ed = torch.from_numpy(E).float().to(dev)
 
     def build_batch(po, sel):
-        b = proc(images=[np.asarray(IMG[i]) for i in sel],
-                 prompts=[str(tsk[i]) for i in sel],
-                 states=[st_n[i] for i in sel],
+        """Батч строится ДОСЛОВНО как в K-14h, включая шаблон подсказки.
+
+        Своя версия этой функции уже оказалась неверной: процессору нужен
+        `text`, собранный через prompt_template и apply_chat_template, а
+        `prompts`/`states` его параметрами не являются — input_ids просто не
+        создавались. Здесь ровно тот же код, что строит канонический q0.
+        """
+        image = torch.from_numpy(np.asarray(IMG[sel]))
+        msgs = []
+        for gi in sel:
+            mm = prompt_template(
+                st_n[gi], None, str(tsk[gi]),
+                mode=cfg.MODEL.vla_processor.kwargs.mode,
+                action_vocab_size=cfg.MODEL.action_processor.vocab_size,
+                action_token_len=cfg.MODEL.action_processor.token_len)
+            mm[1]["content"] = mm[1]["content"][1:]
+            msgs.append(mm)
+        texts = proc.apply_chat_template(msgs, add_generation_prompt=True)
+        b = proc(text=texts, images=[[image[k].numpy()]
+                                     for k in range(len(sel))],
                  return_tensors="pt", padding=True, padding_side="left",
                  action_processor_kwargs={"embodiment_ids": 0})
         return dict_apply(lambda x: x.to(dev, dt), b)
