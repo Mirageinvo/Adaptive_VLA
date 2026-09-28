@@ -313,7 +313,7 @@ def main():
     import torch
     import k14_common as kc
     import k11a_build_hicora_cache as k11a
-    import k12b_protocol as kb
+    import k11b_hicora_identity as k11b
     from depth_rvq_joint12 import make_joint_depth_rvq_class
     from joint12_vla import make_joint12_class
     from smolvla.bar import SmolVLABlockwiseAR
@@ -352,7 +352,7 @@ def main():
     img_p = os.path.join(os.path.dirname(src), json.loads(
         str(d["meta"]))["images_file"])
     IMG = np.load(img_p, mmap_mode="r")
-    ds_repo, ds_rev = kb.dataset_source(meta)
+    ds_repo, ds_rev = k11b.dataset_source(meta)
     st_n, _sm, _sh = kc.load_states(src, N, ds_repo, ds_rev, keys_sha,
                                    STATE_Q01, STATE_Q99)
     E = np.load(f"{a.cache}.codebooks.npy")
