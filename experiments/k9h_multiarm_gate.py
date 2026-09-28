@@ -208,6 +208,92 @@ def summarize(eps):
                 calls_per_action=calls / max(steps, 1))
 
 
+Q1_KINDS = ("q1_head", "q1_head_unconfirmed")
+Q0_PROV_FIELDS = ("q0_npz_sha1", "q0_manifest_sha1", "gate_r_sha1",
+                  "plan_sha1")
+
+
+def check_depthrvq_q1_ckpt(obj, *, joint_sha1, expect_kind=None,
+                           expect_variant="main", expect_seed=None,
+                           expect_q0_manifest_sha1=None):
+    """Происхождение головы q1. ЧИСТАЯ ФУНКЦИЯ, покрытая мутациями.
+
+    ЗАЧЕМ ИМЕННО ТАК. Прежняя версия требовала наличия `q0_prov`, но нигде
+    его не сверяла, и не фиксировала ни вариант, ни сид, ни привязку к
+    Joint12. Голова другого сида, другого варианта или обученная от ДРУГОГО
+    черновика загрузилась бы без единой жалобы и исполнилась бы в симуляторе
+    под меткой канонической. Наличие поля — не проверка поля.
+
+    `joint_sha1` — отпечаток тех весов Joint12, которые ФАКТИЧЕСКИ загружены
+    в эту модель, а не заявленных в аргументах.
+
+    Возвращает словарь для записи в артефакт: что именно сверено и с чем.
+    """
+    miss = [k for k in ("stage", "variant", "seed", "state",
+                        "trainable_names", "selected_state_sha1", "q0_prov")
+            if obj.get(k) is None]
+    if miss:
+        raise SystemExit(f"в голове q1 нет полей {miss}")
+    if str(obj["stage"]) != "q1":
+        raise SystemExit(f"голова этапа {obj['stage']}, нужен q1")
+    kind = obj.get("kind")
+    if kind is not None and kind not in Q1_KINDS:
+        raise SystemExit(f"голова вида {kind!r}, ожидался один из {Q1_KINDS}")
+    if expect_kind is not None and str(kind) != str(expect_kind):
+        raise SystemExit(f"голова вида {kind!r}, запрошен {expect_kind!r}")
+    if expect_variant is not None and str(obj["variant"]) != str(expect_variant):
+        raise SystemExit(
+            f"голова варианта {obj['variant']!r}, ожидался {expect_variant!r}")
+    if expect_seed is not None and int(obj["seed"]) != int(expect_seed):
+        raise SystemExit(f"голова сида {obj['seed']}, ожидался {expect_seed}")
+    # ПОЛЯ architecture И additive_feedback ЗАВЕДЕНЫ В §49. Головы до него их
+    # не имеют и являются baseline по построению: блока re-attention тогда не
+    # существовало. Отвергать законный артефакт за отсутствие поля, которого
+    # не было, значит мешать работе, ничего не доказывая; подстановка
+    # записывается как ВЫВЕДЕННАЯ.
+    arch_inferred = obj.get("architecture") is None
+    fb_inferred = obj.get("additive_feedback") is None
+    arch = str(obj.get("architecture") or "baseline")
+    fb = str(obj.get("additive_feedback") or "on")
+    if arch != "baseline":
+        raise SystemExit(
+            f"голова архитектуры {arch}: по §49.4 к поведенческому прогону "
+            f"допущена только baseline")
+    if fb != "on":
+        raise SystemExit(f"аддитивная ветвь {fb}: рука собирается только для "
+                         f"основного варианта")
+    j_ck = obj.get("joint_sha1")
+    if j_ck is None:
+        raise SystemExit(
+            "в голове нет joint_sha1: привязать её к весам Joint12 нечем, а "
+            "черновик берётся именно ими")
+    if str(j_ck) != str(joint_sha1):
+        raise SystemExit(
+            f"голова обучена на Joint12 {j_ck}, загружены веса {joint_sha1}: "
+            f"черновик был бы другим")
+    prov = obj["q0_prov"] or {}
+    miss_p = [k for k in Q0_PROV_FIELDS if not prov.get(k)]
+    if miss_p:
+        raise SystemExit(f"в q0_prov головы нет полей {miss_p}")
+    if expect_q0_manifest_sha1 is not None and \
+            str(prov.get("q0_manifest_sha1")) != str(expect_q0_manifest_sha1):
+        raise SystemExit(
+            f"голова обучена от черновика с манифестом "
+            f"{prov.get('q0_manifest_sha1')}, ожидался "
+            f"{expect_q0_manifest_sha1}")
+    return dict(q1_kind=kind, q1_variant=str(obj["variant"]),
+                q1_seed=int(obj["seed"]), q1_architecture=arch,
+                q1_additive_feedback=fb,
+                q1_architecture_inferred=bool(arch_inferred),
+                q1_additive_feedback_inferred=bool(fb_inferred),
+                q1_joint_sha1=str(j_ck),
+                q1_q0_prov={k: prov.get(k) for k in Q0_PROV_FIELDS},
+                q1_checked_against=dict(
+                    joint_sha1=str(joint_sha1), expect_kind=expect_kind,
+                    expect_variant=expect_variant, expect_seed=expect_seed,
+                    expect_q0_manifest_sha1=expect_q0_manifest_sha1))
+
+
 def levels_of(policy, depth_rvq_mode=None):
     """Сколько уровней RVQ собирается в действие для данной политики.
 
@@ -340,6 +426,55 @@ def selftest():
             raise AssertionError(f"принят режим {bad!r}")
     # умолчание режима не влияет на остальные политики
     assert levels_of("fast") == 1 and levels_of("fullbar", "medium") == N_LEVEL
+    # --- ПРОИСХОЖДЕНИЕ ГОЛОВЫ q1: КАЖДАЯ МУТАЦИЯ ОТВЕРГАЕТСЯ -------------
+    # Прежняя версия требовала НАЛИЧИЯ q0_prov и нигде его не сверяла.
+    # Наличие поля — не проверка поля, и голова другого сида, варианта или
+    # обученная от другого черновика проходила бы молча.
+    good_q1 = dict(
+        kind="q1_head", stage="q1", variant="main", seed=0,
+        state={"a": 1}, trainable_names=["a"], selected_state_sha1="S",
+        joint_sha1="J12", architecture="baseline", additive_feedback="on",
+        q0_prov=dict(q0_npz_sha1="Q0", q0_manifest_sha1="QM",
+                     gate_r_sha1="GR", plan_sha1="PL"))
+    ok = check_depthrvq_q1_ckpt(good_q1, joint_sha1="J12",
+                                expect_kind="q1_head", expect_seed=0,
+                                expect_q0_manifest_sha1="QM")
+    assert ok["q1_seed"] == 0 and ok["q1_architecture"] == "baseline"
+    assert ok["q1_q0_prov"]["plan_sha1"] == "PL"
+    assert not ok["q1_architecture_inferred"]
+    # голова до §49: поля выводятся и это помечается
+    old_q1 = {k: v for k, v in good_q1.items()
+              if k not in ("architecture", "additive_feedback")}
+    inf = check_depthrvq_q1_ckpt(old_q1, joint_sha1="J12")
+    assert inf["q1_architecture"] == "baseline"
+    assert inf["q1_architecture_inferred"] and inf["q1_additive_feedback_inferred"]
+    for patch, kw, why in (
+            ({"stage": "q2"}, {}, "этапа"),
+            ({"kind": "smoke"}, {}, "вида"),
+            ({"variant": "static"}, {}, "варианта"),
+            ({"seed": 1}, {"expect_seed": 0}, "сида"),
+            ({"architecture": "reattn_draft"}, {}, "§49.4"),
+            ({"additive_feedback": "off"}, {}, "Аддитивная ветвь"),
+            ({"joint_sha1": "ДРУГОЙ"}, {}, "загружены веса"),
+            ({"joint_sha1": None}, {}, "нет joint_sha1"),
+            ({"q0_prov": dict(q0_npz_sha1="Q0", gate_r_sha1="GR",
+                              plan_sha1="PL")}, {}, "q0_prov"),
+            ({"selected_state_sha1": None}, {}, "нет полей"),
+            ({}, {"expect_kind": "q1_head_unconfirmed"}, "запрошен"),
+            ({}, {"expect_q0_manifest_sha1": "ИНОЙ"}, "манифестом")):
+        mut = dict(good_q1)
+        for k_, v_ in patch.items():
+            if v_ is None:
+                mut.pop(k_, None)
+            else:
+                mut[k_] = v_
+        try:
+            check_depthrvq_q1_ckpt(mut, joint_sha1="J12", **kw)
+        except SystemExit as e:
+            assert why.lower() in str(e).lower(), (patch, kw, why, str(e))
+        else:
+            raise AssertionError(f"принята мутация {patch} {kw}")
+
     # --- СБОРКА УРОВНЕЙ В ТОТ ЖЕ ПОРЯДОК, В КОТОРОМ ИХ ЧИТАЕТ decode ------
     # policy() склеивает уровни по оси 1, decode() разворачивает
     # reshape(-1, n_lv, N_POS). Если порядок разъедется, уровень 1 встанет
@@ -421,7 +556,7 @@ def selftest():
         else:
             raise AssertionError(f"отсутствие поля {k_} принято")
 
-    print("самопроверка k9h пройдена (версия «рука hicora, рука depthrvq, мутации происхождения»): "
+    print("самопроверка k9h пройдена (версия «рука hicora, рука depthrvq, происхождение q1»): "
           "нормировка вызовов, уровни по политике, покрытие "
           "блоков при batch 10 и 5, ключ ячейки, обёртка латента отличается "
           "от кодов и не принимает посторонних полей, происхождение головы "
@@ -446,6 +581,15 @@ def main() -> None:
                          "fast: forward_joint_fast, уровень 0")
     ap.add_argument("--policy-ckpt", default=None,
                     help="чекпойнт формата k9c/k9g; только для --policy fast")
+    ap.add_argument("--expect-q1-kind", default=None,
+                    help="вид головы q1: q1_head для канонической, "
+                         "q1_head_unconfirmed для реплики отбора. Без него "
+                         "принимается любой из двух")
+    ap.add_argument("--expect-q1-variant", default="main")
+    ap.add_argument("--expect-q1-seed", type=int, default=None)
+    ap.add_argument("--expect-q0-manifest-sha1", default=None,
+                    help="отпечаток манифеста канонического q0, от которого "
+                         "голова обучена")
     ap.add_argument("--depth-rvq-cache", default="data/k11a_joint12",
                     help="префикс кэша K-11a: оттуда берутся КНИГИ, на "
                          "которых обучалась голова q1. Сверяются побитово с "
@@ -888,37 +1032,21 @@ def main() -> None:
 
         q1_obj = torch.load(args.q1_ckpt, map_location="cpu",
                             weights_only=False)
-        need_q1 = ("stage", "variant", "seed", "state", "trainable_names",
-                   "selected_state_sha1", "q0_prov")
-        miss_q1 = [k_ for k_ in need_q1 if q1_obj.get(k_) is None]
-        if miss_q1:
-            raise SystemExit(f"в голове q1 нет полей {miss_q1}")
-        if str(q1_obj["stage"]) != "q1":
-            raise SystemExit(f"голова этапа {q1_obj['stage']}, нужен q1")
-        # ПОЛЯ architecture И additive_feedback ЗАВЕДЕНЫ В §49. Головы,
-        # обученные до него, их не имеют — и они baseline по построению, там
-        # блока re-attention не существовало. Отвергать законный артефакт за
-        # отсутствие поля, которого тогда не было, значит мешать работе, не
-        # доказывая ничего; но подстановка записывается как ВЫВЕДЕННАЯ.
-        arch_inferred = q1_obj.get("architecture") is None
-        fb_inferred = q1_obj.get("additive_feedback") is None
-        if arch_inferred or fb_inferred:
-            print(f"    голова снята до §49: architecture"
-                  f"{' выведена baseline' if arch_inferred else ''}"
-                  f"{', ' if arch_inferred and fb_inferred else ''}"
-                  f"{'additive_feedback выведена on' if fb_inferred else ''}")
-        arch_q1 = str(q1_obj.get("architecture") or "baseline")
-        if arch_q1 != "baseline":
-            # §49.4: ни одна re-attention архитектура не прошла правило
-            # отбора. Пускать проигравшего в поведенческий прогон значило бы
-            # дать ему второй шанс на другой метрике.
-            raise SystemExit(
-                f"голова архитектуры {arch_q1}: по §49.4 к поведенческому "
-                f"прогону допущена только baseline")
-        if str(q1_obj.get("additive_feedback") or "on") != "on":
-            raise SystemExit(
-                f"аддитивная ветвь {q1_obj['additive_feedback']}: рука "
-                f"собирается только для основного варианта")
+        prov_q1 = check_depthrvq_q1_ckpt(
+            q1_obj, joint_sha1=weights_sha,
+            expect_kind=args.expect_q1_kind,
+            expect_variant=args.expect_q1_variant,
+            expect_seed=args.expect_q1_seed,
+            expect_q0_manifest_sha1=args.expect_q0_manifest_sha1)
+        if prov_q1["q1_architecture_inferred"] or \
+                prov_q1["q1_additive_feedback_inferred"]:
+            print("    голова снята до §49: отсутствующие поля architecture / "
+                  "additive_feedback выведены как baseline / on")
+        print(f"    происхождение головы сверено: вид {prov_q1['q1_kind']}, "
+              f"вариант {prov_q1['q1_variant']}, сид {prov_q1['q1_seed']}, "
+              f"Joint12 {prov_q1['q1_joint_sha1']}, черновик "
+              f"{prov_q1['q1_q0_prov']['q0_manifest_sha1']}")
+        arch_q1 = prov_q1["q1_architecture"]
         var_q1 = str(q1_obj["variant"])
 
         model.__class__ = make_joint_depth_rvq_class(type(model))
@@ -964,12 +1092,7 @@ def main() -> None:
         policy_meta = dict(policy_meta or {},
                            q1_ckpt=os.path.abspath(args.q1_ckpt),
                            q1_sha1=q1_sha,
-                           q1_kind=q1_obj.get("kind"),
-                           q1_variant=var_q1,
-                           q1_architecture=arch_q1,
-                           q1_architecture_inferred=bool(arch_inferred),
-                           q1_additive_feedback_inferred=bool(fb_inferred),
-                           q1_seed=q1_obj.get("seed"),
+                           **prov_q1,
                            q1_selected_epoch=q1_obj.get("selected_epoch"),
                            q1_val_sel=q1_obj.get("val_sel"),
                            q1_state_sha1=got_sha_q1,

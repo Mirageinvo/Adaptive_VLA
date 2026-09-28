@@ -39,6 +39,17 @@ import sys
 
 import numpy as np
 
+N_ELEM_ROW = 8 * 7      # H_EXEC шагов x каналов; задаётся задачей, не данными
+
+
+def _sha12(path, chunk=1 << 22):
+    import hashlib
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(chunk), b""):
+            h.update(b)
+    return h.hexdigest()[:12]
+
 
 def load_dump(path):
     """Один дамп K-14c: массивы плюс разобранный meta."""
@@ -78,6 +89,27 @@ def load_dump(path):
     for k in ("rows", "episode", "se", "n"):
         d[k] = d[k][o]
     d["path"] = path
+    d["sha1"] = _sha12(path)
+    # ЧИСЛО ЭЛЕМЕНТОВ В СТРОКЕ ФИКСИРОВАНО ЗАДАЧЕЙ: 8 исполняемых шагов на 7
+    # каналов. Одинаковое, но ДРУГОЕ число у всех дампов означало бы другой
+    # горизонт или другой набор каналов, и сравнение шло бы не с тем.
+    nn = np.unique(d["n"])
+    if len(nn) != 1 or int(nn[0]) != N_ELEM_ROW:
+        raise SystemExit(
+            f"{path}: элементов в строке {nn[:3]}, ожидалось {N_ELEM_ROW} "
+            f"(8 шагов x 7 каналов)")
+    # АГРЕГАТ ДАМПА СВЕРЯЕТСЯ С ЧИСЛОМ, ПО КОТОРОМУ ШЁЛ ОТБОР. Тренер это
+    # уже проверял у себя; здесь проверка повторяется на ТОМ ЖЕ файле, чтобы
+    # подменённый или пересобранный дамп не прошёл молча.
+    ms = m.get("val_sel")
+    if ms is not None:
+        agg = rms(d["se"], d["n"])
+        rel = abs(agg - float(ms)) / max(abs(float(ms)), 1e-12)
+        if rel > 1e-6:
+            raise SystemExit(
+                f"{path}: агрегат дампа {agg:.10f} против val_sel "
+                f"{float(ms):.10f} в meta (относительно {rel:.2e})")
+        d["agg_rel"] = float(rel)
     return d
 
 
@@ -121,6 +153,29 @@ def check_comparable(dumps, *, allow_smoke=False):
             if str(q0a.get(k)) != str(q0b.get(k)):
                 raise SystemExit(
                     f"{d['path']}: черновик отличается по {k}")
+        # РАЗЛИЧАТЬСЯ ОБЯЗАНА ТОЛЬКО АРХИТЕКТУРА. Совпадения черновика,
+        # плана и целей для этого мало: при разном бюджете, разной цели или
+        # разном оптимизаторе интервал измерял бы их различие, а надпись
+        # стояла бы про архитектуру.
+        for k in ("variant", "additive_feedback", "epochs", "batch",
+                  "selection_only", "smoke"):
+            if str(m.get(k)) != str(base["meta"].get(k)):
+                raise SystemExit(
+                    f"{d['path']}: {k} = {m.get(k)}, у {base['path']} "
+                    f"{base['meta'].get(k)}: различается не только "
+                    f"архитектура")
+        ba, bb = m.get("budget"), base["meta"].get("budget")
+        if (ba is None) != (bb is None):
+            raise SystemExit(
+                f"{d['path']}: подпись бюджета есть только у одного из "
+                f"дампов — сравнивать их как равнобюджетные нельзя")
+        if ba is not None:
+            skip = {"architecture", "additive_feedback"}
+            bad_b = [k for k in sorted(set(ba) | set(bb))
+                     if k not in skip and str(ba.get(k)) != str(bb.get(k))]
+            if bad_b:
+                raise SystemExit(
+                    f"{d['path']}: подпись бюджета расходится по {bad_b[:6]}")
     nn = np.unique(base["n"])
     if len(nn) != 1:
         raise SystemExit(f"число элементов в строке не постоянно: {nn[:5]}")
@@ -188,6 +243,8 @@ def main():
     ap.add_argument("--allow-smoke", action="store_true",
                     help="принять дампы смоука; только для отладки самого "
                          "сравнения, решение по ним принимать нельзя")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="перезаписать существующий результат сравнения")
     ap.add_argument("--root", default=".")
     ap.add_argument("--out", default="reports/k14j/arch_compare.json")
     a = ap.parse_args()
@@ -296,13 +353,20 @@ def main():
                rule=("нижняя граница 90% парного интервала против опоры "
                      "строго выше нуля; иначе не выбираем никого"),
                sources={str(d["meta"]["architecture"]): dict(
-                   path=d["path"], seed=d["meta"]["seed"],
+                   path=d["path"], sha1=d.get("sha1"),
+                   n_elements_per_row=N_ELEM_ROW,
+                   budget=d["meta"].get("budget"),
+                   agg_rel_to_meta=d.get("agg_rel"),
+                   seed=d["meta"]["seed"],
                    selected_epoch=d["meta"]["selected_epoch"],
                    selected_state_sha1=d["meta"]["selected_state_sha1"],
                    val_sel=d["meta"].get("val_sel"),
                    git_head=d["meta"].get("git_head"),
                    identity_gate_run_id=d["meta"].get("identity_gate_run_id"))
                    for d in dumps})
+    if os.path.exists(a.out) and not a.overwrite:
+        raise SystemExit(f"{a.out} уже существует: результат сравнения не "
+                         f"перезаписывается молча (--overwrite осознанно)")
     os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
     t_ = a.out + f".tmp.{os.getpid()}"
     json.dump(out, open(t_, "w"), ensure_ascii=False, indent=1, default=str)
@@ -313,11 +377,17 @@ def main():
 
 def _mk(path, arch, seed, se, eps, rows=None, n_el=56, **meta):
     rows = np.arange(len(se), dtype=np.int64) if rows is None else rows
+    se_a = np.asarray(se, float)
     m = dict(kind="k14c_rows_val_sel", part="val_sel", variant="main",
              architecture=arch, seed=int(seed), additive_feedback="on",
              selected_epoch=3, selected_state_sha1=f"sha_{arch}_{seed}",
              plan_sha1="PLAN", q1_cache_sha1="CACHE", smoke=False,
-             selection_only=True, val_sel=0.0,
+             selection_only=True, epochs=4, batch=8,
+             # val_sel В МЕТЕ СЧИТАЕТСЯ ИЗ ТЕХ ЖЕ СУММ. Поставить сюда ноль
+             # значило бы писать тест под проверку, которую он должен ловить.
+             val_sel=float(np.sqrt(se_a.sum() / (len(se_a) * n_el))),
+             budget=dict(batch=8, epochs=4, lr=1e-4, wd=0.0,
+                         optimizer="AdamW", lambda_action=1.0),
              q0_prov=dict(q0_npz_sha1="Q0", q0_manifest_sha1="QM",
                           gate_r_sha1="GR"))
     m.update(meta)
@@ -383,8 +453,6 @@ def selftest(kt, kg):
             (_mk(j("x6.npz"), "reattn_draft", 0, base, eps,
                  q0_prov=dict(q0_npz_sha1="ИНОЙ", q0_manifest_sha1="QM",
                               gate_r_sha1="GR")), "черновик отличается"),
-            (_mk(j("x7.npz"), "reattn_draft", 0, base, eps, n_el=55),
-             "число элементов"),
         ]
         for path, why in bad:
             try:
@@ -393,6 +461,43 @@ def selftest(kt, kg):
                 assert why in str(e), (why, str(e))
             else:
                 raise AssertionError(f"принят несравнимый дамп: {why}")
+        # ЧУЖОЕ ЧИСЛО ЭЛЕМЕНТОВ В СТРОКЕ ловится при ЗАГРУЗКЕ: это свойство
+        # задачи (8 шагов x 7 каналов), а не согласованности пары.
+        try:
+            load_dump(_mk(j("x7.npz"), "reattn_draft", 0, base, eps, n_el=55))
+        except SystemExit as e:
+            assert "элементов в строке" in str(e), e
+        else:
+            raise AssertionError("принято чужое число элементов в строке")
+        # ПОДМЕНЁННЫЙ АГРЕГАТ: meta.val_sel не соответствует суммам
+        px7 = _mk(j("x9.npz"), "reattn_draft", 0, base, eps)
+        import numpy as _np
+        with _np.load(px7, allow_pickle=True) as z_:
+            arrs_ = {k_: z_[k_] for k_ in z_.files}
+        mm = json.loads(str(arrs_["meta"])); mm["val_sel"] = 0.5
+        arrs_["meta"] = json.dumps(mm, ensure_ascii=False)
+        with open(px7, "wb") as fh_:
+            _np.savez_compressed(fh_, **arrs_)
+        try:
+            load_dump(px7)
+        except SystemExit as e:
+            assert "агрегат дампа" in str(e), e
+        else:
+            raise AssertionError("принят дамп с чужим val_sel в мете")
+        # РАЗНЫЙ БЮДЖЕТ отвергается
+        pb = _mk(j("xb.npz"), "reattn_draft", 0, base, eps)
+        with _np.load(pb, allow_pickle=True) as z_:
+            arrs_ = {k_: z_[k_] for k_ in z_.files}
+        mm = json.loads(str(arrs_["meta"])); mm["budget"]["lr"] = 3e-4
+        arrs_["meta"] = json.dumps(mm, ensure_ascii=False)
+        with open(pb, "wb") as fh_:
+            _np.savez_compressed(fh_, **arrs_)
+        try:
+            check_comparable([db, load_dump(pb)])
+        except SystemExit as e:
+            assert "подпись бюджета" in str(e), e
+        else:
+            raise AssertionError("принят дамп с другим бюджетом")
         # дамп не того вида
         px = _mk(j("x8.npz"), "reattn_draft", 0, base, eps, part="train")
         try:
@@ -440,7 +545,7 @@ def selftest(kt, kg):
                                 ("кандидат равен", base.copy(), None)):
             _mk(j("e_b.npz"), "baseline", 0, base, eps)
             _mk(j("e_c.npz"), "reattn_draft", 0, se_c, eps)
-            o = j("out.json")
+            o = j(f"out_{want or 'none'}_{tag.split()[-1]}.json")
             r = subprocess.run(
                 [sys.executable, me, "--rows", j("e_b.npz"), j("e_c.npz"),
                  "--boot", "400", "--out", o], capture_output=True, text=True)

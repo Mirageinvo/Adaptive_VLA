@@ -570,6 +570,26 @@ def main():
                   f"латенте, нормы {float(nm_.min()):.4f}..."
                   f"{float(nm_.max()):.4f}, медиана "
                   f"{float(nm_.median()):.4f}")
+    # --- КОДЕК ЗАВЕРЯЕТСЯ, А НЕ ПРИНИМАЕТСЯ НА ВЕРУ ----------------------
+    # Другой кодек тех же форм 2048x512 дал бы правдоподобные числа и прошёл
+    # молча, а сравнивать их с A0/A01 из K-14a было бы нельзя: там другой
+    # декодер. Те же три отпечатка, что и в K-14a.
+    E_all = torch.stack(books).float()
+    k11a.check_fingerprints(meta, dict(
+        codebooks_sha1=hashlib.sha1(np.ascontiguousarray(
+            E_all.cpu().numpy().astype(np.float32)).tobytes()).hexdigest()[:12],
+        decoder_probe=k11a.decoder_probe(codec, E_all.to(dev), dev),
+        codec_state_sha1=k11a.state_sha1(codec)))
+    print("  книги, проба декодера и веса кодека сверены с метой кэша K-11a")
+    # ТИПЫ ПРОЕКЦИЙ ПЕЧАТАЮТСЯ. Если обе окажутся Identity, совпадение
+    # argmin'ов в двух пространствах тривиально гарантировано, и говорить о
+    # нём как о находке нельзя.
+    for lev, qz in enumerate(qs):
+        ip, op = getattr(qz, "in_project", None), getattr(qz, "out_project",
+                                                          None)
+        print(f"    уровень {lev}: in_project {type(ip).__name__}, "
+              f"out_project {type(op).__name__}")
+
     V, DIM = int(books[1].shape[0]), int(books[1].shape[1])
     if (V, DIM) != (EXPECT_VOCAB, EXPECT_DIM):
         raise SystemExit(
@@ -586,8 +606,28 @@ def main():
                                  books, codec, qs, dev, torch, nearest_code,
                                  boot=int(a.boot))
         res[part]["split_meta"] = pmeta[part]
+    # РЕЖИМ ВЫЧИСЛЕНИЙ ЗАПИСЫВАЕТСЯ ЦЕЛИКОМ. z_e пересчитывается на карте,
+    # поэтому результат от неё зависит, и одного слова «cuda:1» мало.
+    rt = dict(device=str(dev),
+              gpu_uuid=(kc.gpu_uuid(dev, torch) if dev.type == "cuda"
+                        else None),
+              torch_version=str(torch.__version__),
+              cuda_version=str(getattr(torch.version, "cuda", None)),
+              tf32_matmul=bool(torch.backends.cuda.matmul.allow_tf32),
+              tf32_cudnn=bool(torch.backends.cudnn.allow_tf32),
+              cudnn_deterministic=bool(torch.backends.cudnn.deterministic),
+              cudnn_benchmark=bool(torch.backends.cudnn.benchmark))
     out = dict(kind="k14k_book_span", git_head=head, git_dirty=bool(dirty),
-               device=str(dev), vocab=V, latent_dim=DIM,
+               device=str(dev), runtime=rt, ckpt=a.ckpt,
+               codec_fingerprints=dict(
+                   codebooks_sha1=meta.get("codebooks_sha1"),
+                   decoder_probe=meta.get("decoder_probe"),
+                   codec_state_sha1=meta.get("codec_state_sha1")),
+               projections={str(l): dict(
+                   in_project=type(getattr(q_, "in_project", None)).__name__,
+                   out_project=type(getattr(q_, "out_project", None)).__name__)
+                   for l, q_ in enumerate(qs)},
+               vocab=V, latent_dim=DIM,
                rho_hi=RHO_HI, p_limit=P_LIMIT, alpha_hi=ALPHA_HI,
                boot=int(a.boot), limit=int(a.limit),
                level_norms={str(l): dict(

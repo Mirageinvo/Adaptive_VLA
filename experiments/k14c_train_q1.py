@@ -1975,6 +1975,11 @@ def main():
             q0_prov=q0_prov, plan_sha1=q0_prov.get("plan_sha1"),
             q1_cache_sha1=man["labels_sha1"],
             git_head=git_head0, code_version=code_v0,
+            # ПОДПИСЬ БЮДЖЕТА ЦЕЛИКОМ. Сравниватель архитектур обязан
+            # доказать, что различалась ТОЛЬКО архитектура; по отдельным
+            # полям (эпохи, батч) этого не доказать — цель, оптимизатор и
+            # веса потери в них не входят.
+            budget=budget,
             identity_gate_run_id=(id_info or {}).get("identity_gate_run_id"))
         arrs_d = dict(rows=d_rows, episode=d_epi, se=d_se, n=d_n,
                       meta=json.dumps(meta_d, ensure_ascii=False,
