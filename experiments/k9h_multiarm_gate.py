@@ -1110,12 +1110,25 @@ def main() -> None:
                            depth_rvq_joint12_sha1=file_sha12(os.path.join(
                                os.path.dirname(os.path.abspath(__file__)),
                                "depth_rvq_joint12.py")))
-        policy_meta["arm_fingerprint"] = hashlib.sha1("|".join([
-            str(args.policy), str(args.arm_label), str(args.depth_rvq_mode),
-            str(q1_sha), str(weights_sha), str(got_sha_q1), str(var_q1),
-            str(arch_q1), str(q1_obj.get("seed")),
-            str(policy_meta["depth_rvq_joint12_sha1"]),
-        ]).encode()).hexdigest()[:12]
+        # ДВА ОТПЕЧАТКА, И ОНИ ОТВЕЧАЮТ НА РАЗНЫЕ ВОПРОСЫ.
+        #
+        # arm_fingerprint включает МЕТКУ: так заведено рукой hicora, и на это
+        # опирается агрегатор, который отказывается, если внутри одной метки
+        # встретились разные модели.
+        #
+        # model_fingerprint метки НЕ включает. Он отвечает на вопрос «та же
+        # это модель или другая», и именно он нужен при сравнении ПОВТОРОВ: у
+        # повторов метки по необходимости разные, и на arm_fingerprint такая
+        # проверка не могла пройти никогда — что и обнаружилось на первом же
+        # смоуке.
+        model_parts = [str(args.policy), str(args.depth_rvq_mode),
+                       str(q1_sha), str(weights_sha), str(got_sha_q1),
+                       str(var_q1), str(arch_q1), str(q1_obj.get("seed")),
+                       str(policy_meta["depth_rvq_joint12_sha1"])]
+        policy_meta["model_fingerprint"] = hashlib.sha1(
+            "|".join(model_parts).encode()).hexdigest()[:12]
+        policy_meta["arm_fingerprint"] = hashlib.sha1("|".join(
+            [str(args.arm_label)] + model_parts).encode()).hexdigest()[:12]
         print(f"  голова q1 установлена: {len(st_q1)} тензоров, вариант "
               f"{var_q1}, архитектура {arch_q1}, сид {q1_obj.get('seed')}, "
               f"эпоха {q1_obj.get('selected_epoch')}, отпечаток состояния "
@@ -1123,7 +1136,9 @@ def main() -> None:
         print(f"  режим {args.depth_rvq_mode}: выходы "
               f"{list(model.depth_rvq_exits)}, уровней в действии "
               f"{levels_of(args.policy, args.depth_rvq_mode)}", flush=True)
-        print(f"  отпечаток руки {policy_meta['arm_fingerprint']}", flush=True)
+        print(f"  отпечаток руки {policy_meta['arm_fingerprint']}, "
+              f"отпечаток модели {policy_meta['model_fingerprint']}",
+              flush=True)
 
     n_lv = levels_of(args.policy, args.depth_rvq_mode)
     print(f"=== suite {args.task_suite}, задача {args.task_id}, офсет {pos_off}")

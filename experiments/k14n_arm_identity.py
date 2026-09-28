@@ -33,8 +33,9 @@
 
      Зато сравнение обязано убедиться, что два повтора — это одна и та же
      МОДЕЛЬ: иначе различие двух разных моделей будет названо шумом
-     исполнения. Сверяется единый отпечаток руки arm_fingerprint, который
-     k9h считает из sha головы, sha Joint12, режима, варианта и сида.
+     исполнения. Сверяется model_fingerprint, который k9h считает из sha
+     головы, sha Joint12, режима, варианта и сида и который, в отличие от
+     arm_fingerprint, НЕ включает метку руки.
 
 ЧЕГО ЗДЕСЬ НЕТ. Анализа rescue/harm: это результат §53, а не смоук. Смоук
 отвечает только на вопрос «сравнимы ли руки вообще».
@@ -105,12 +106,16 @@ def check_same_model(a, b):
     Сверяется единый отпечаток руки, который k9h считает из sha головы, sha
     Joint12, режима, варианта и сида — одно поле вместо перечисления.
     """
-    fa = (a.get("joint") or {}).get("arm_fingerprint")
-    fb = (b.get("joint") or {}).get("arm_fingerprint")
+    # ИМЕННО model_fingerprint, А НЕ arm_fingerprint. Второй включает МЕТКУ
+    # руки, а у повторов метки по необходимости разные — проверка на нём не
+    # могла пройти никогда.
+    fa = (a.get("joint") or {}).get("model_fingerprint")
+    fb = (b.get("joint") or {}).get("model_fingerprint")
     if fa is None or fb is None:
         raise SystemExit(
             f"у повторов {a.get('arm_label')}/{b.get('arm_label')} нет "
-            f"arm_fingerprint: доказать, что это одна модель, нечем")
+            f"model_fingerprint: доказать, что это одна модель, нечем. "
+            f"arm_fingerprint для этого не годится — он включает метку")
     if fa != fb:
         raise SystemExit(
             f"повторы {a.get('arm_label')} и {b.get('arm_label')} — РАЗНЫЕ "
@@ -243,11 +248,11 @@ def selftest():
 
         # ПОВТОР: одна модель -> сравнение допускается, разные -> отказ
         r1 = load(w(_art("m_s0", "depthrvq", [1, 0, 1, 1],
-                         joint=dict(arm_fingerprint="F1")), "r1.json"))
+                         joint=dict(model_fingerprint="F1")), "r1.json"))
         r2 = load(w(_art("m_rep_s0", "depthrvq", [1, 0, 1, 1],
-                         joint=dict(arm_fingerprint="F1")), "r2.json"))
+                         joint=dict(model_fingerprint="F1")), "r2.json"))
         r3 = load(w(_art("m_oth_s0", "depthrvq", [1, 0, 1, 1],
-                         joint=dict(arm_fingerprint="F2")), "r3.json"))
+                         joint=dict(model_fingerprint="F2")), "r3.json"))
         assert check_same_model(r1, r2) == "F1"
         r4 = load(w(_art("m_nof_s0", "depthrvq", [1, 0, 1, 1]), "r4.json"))
         for pair, why in (((r1, r3), "РАЗНЫЕ"), ((r1, r4), "нет"),
