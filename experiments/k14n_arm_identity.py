@@ -25,10 +25,16 @@
      отвечает на более слабый вопрос: сравнимы ли руки по условиям и
      стартовали ли они из одних состояний, и расходятся ли исходы.
 
-  3. ПОВТОР ПРИ ТОМ ЖЕ СИДЕ. Если две раскатки одной руки с одним сидом дают
-     побитово одно и то же, повтор НЕ является новой выборкой, и считать его
-     таковой значит занижать интервал. Тогда повторы обязаны идти с разными
-     execution seeds при одном начальном состоянии (§53.1, пункт 3).
+  3. ПОВТОР ОДНОЙ РУКИ — ДИАГНОСТИКА, А НЕ ДОКАЗАТЕЛЬСТВО. Совпадение
+     исходов двух повторов НЕ доказывает детерминизм: четыре бита success
+     легко совпадают и у двух стохастических раскаток. Поэтому дизайн §53
+     НЕ ставится в зависимость от этого сравнения — разные execution seeds
+     для повторов фиксируются БЕЗУСЛОВНО (§53.2).
+
+     Зато сравнение обязано убедиться, что два повтора — это одна и та же
+     МОДЕЛЬ: иначе различие двух разных моделей будет названо шумом
+     исполнения. Сверяется единый отпечаток руки arm_fingerprint, который
+     k9h считает из sha головы, sha Joint12, режима, варианта и сида.
 
 ЧЕГО ЗДЕСЬ НЕТ. Анализа rescue/harm: это результат §53, а не смоук. Смоук
 отвечает только на вопрос «сравнимы ли руки вообще».
@@ -90,6 +96,27 @@ def check_states(arts):
                         f"{base['arm_label']} {e[k]} — руки стартовали из "
                         f"РАЗНЫХ состояний, парное сравнение недействительно")
     return True
+
+
+def check_same_model(a, b):
+    """Два повтора обязаны быть ОДНОЙ моделью.
+
+    Иначе расхождение двух РАЗНЫХ моделей было бы названо шумом исполнения.
+    Сверяется единый отпечаток руки, который k9h считает из sha головы, sha
+    Joint12, режима, варианта и сида — одно поле вместо перечисления.
+    """
+    fa = (a.get("joint") or {}).get("arm_fingerprint")
+    fb = (b.get("joint") or {}).get("arm_fingerprint")
+    if fa is None or fb is None:
+        raise SystemExit(
+            f"у повторов {a.get('arm_label')}/{b.get('arm_label')} нет "
+            f"arm_fingerprint: доказать, что это одна модель, нечем")
+    if fa != fb:
+        raise SystemExit(
+            f"повторы {a.get('arm_label')} и {b.get('arm_label')} — РАЗНЫЕ "
+            f"модели: отпечатки {fa} и {fb}. Их расхождение нельзя называть "
+            f"шумом исполнения")
+    return fa
 
 
 def diff_episodes(a, b):
@@ -162,17 +189,19 @@ def main():
         for nm in (x, y):
             if nm not in by:
                 raise SystemExit(f"нет метки {nm}; есть {sorted(by)}")
+        check_same_model(by[x], by[y])
         d_ = diff_episodes(by[x], by[y])
         deterministic = not d_
         res["repeat"].append(dict(a=x, b=y, deterministic=deterministic,
                                   n_diff=len(d_)))
         if deterministic:
-            print(f"  ПОВТОР ДЕТЕРМИНИРОВАН: {x} и {y} совпали полностью. "
-                  f"Такие повторы НЕ являются независимой выборкой — при "
-                  f"одном начальном состоянии нужны разные execution seeds")
+            print(f"  исходы повторов {x} и {y} совпали. ЭТО НЕ "
+                  f"доказательство детерминизма: сравниваются исходы "
+                  f"эпизодов, и они совпадают и у стохастических раскаток. "
+                  f"Разные execution seeds фиксируются безусловно (§53.2)")
         else:
-            print(f"  повтор даёт разброс: {x} и {y} разошлись в "
-                  f"{len(d_)} эпизодах — повтор годится как выборка")
+            print(f"  исходы повторов {x} и {y} разошлись в {len(d_)} "
+                  f"эпизодах: разброс исполнения есть и наблюдаем")
     res["passed"] = bool(ok)
     if a.out:
         os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".",
@@ -211,6 +240,24 @@ def selftest():
             q = os.path.join(td, nm)
             json.dump(d, open(q, "w"))
             return q
+
+        # ПОВТОР: одна модель -> сравнение допускается, разные -> отказ
+        r1 = load(w(_art("m_s0", "depthrvq", [1, 0, 1, 1],
+                         joint=dict(arm_fingerprint="F1")), "r1.json"))
+        r2 = load(w(_art("m_rep_s0", "depthrvq", [1, 0, 1, 1],
+                         joint=dict(arm_fingerprint="F1")), "r2.json"))
+        r3 = load(w(_art("m_oth_s0", "depthrvq", [1, 0, 1, 1],
+                         joint=dict(arm_fingerprint="F2")), "r3.json"))
+        assert check_same_model(r1, r2) == "F1"
+        r4 = load(w(_art("m_nof_s0", "depthrvq", [1, 0, 1, 1]), "r4.json"))
+        for pair, why in (((r1, r3), "РАЗНЫЕ"), ((r1, r4), "нет"),
+                          ((r4, r1), "нет")):
+            try:
+                check_same_model(*pair)
+            except SystemExit as ex:
+                assert why in str(ex), (why, ex)
+            else:
+                raise AssertionError(f"приняты повторы: {why}")
 
         a = load(w(_art("fast_s0", "fast", [1, 0, 1, 1]), "a.json"))
         b = load(w(_art("drvq_fast_s0", "depthrvq", [1, 0, 1, 1]), "b.json"))

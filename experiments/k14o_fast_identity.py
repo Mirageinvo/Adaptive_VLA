@@ -25,6 +25,22 @@ medium и full обязан совпасть с fast. Иначе «q0 + q1» с�
 побитово тем же способом, каким их собирает k9h: сумма вкладов уровней,
 затем codec._decode.
 
+ДВА ГЕЙТА, И ВТОРОЙ РАЗРЕШАЕТ §53.
+
+    --build both      ОДНА модель, две точки входа. Локализует причину: если
+                      расходятся здесь, дело в самом проходе depth-RVQ.
+                      Различие расхода аллокатора здесь СПЕЦИАЛЬНО исключено.
+
+    --build fast      и --build depthrvq: сборки ТОЧНО ТАКИЕ, какие делает
+                      k9h для соответствующих рук, в ОТДЕЛЬНЫХ процессах,
+                      с записью q0 и действий в npz; затем --compare сверяет
+                      их побитово. Здесь различие аллокатора НЕ исключено — а
+                      в K-9b именно оно давало расхождение логитов 5.9e-02
+                      при полностью совпадающих весах.
+
+Первый гейт полезен, но разрешать длинный поведенческий прогон обязан второй:
+в §53 руки собираются по-разному, и доказывать надо про них, а не про методы.
+
 БЕЗ СИМУЛЯТОРА. Батчи берутся из канонического плана K-14d, поэтому проверка
 воспроизводима и не зависит от раскаток.
 """
@@ -60,6 +76,85 @@ def compare_exact(name, a, b, out):
     return True
 
 
+EMIT_SAME = ("plan_sha1", "q0_manifest_sha1", "joint_sha1", "rows_sha1",
+             "compute_dtype", "n_batches")
+
+
+def emit_write(path, *, q0, action, rows, meta):
+    """Снимок q0 и действий одной ФАКТИЧЕСКОЙ сборки."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    t = path + f".tmp.{os.getpid()}"
+    with open(t, "wb") as fh:
+        np.savez_compressed(fh, q0=np.asarray(q0, np.int64),
+                            action=np.asarray(action, np.float32),
+                            rows=np.asarray(rows, np.int64),
+                            meta=json.dumps(meta, ensure_ascii=False,
+                                            default=str))
+    with np.load(t, allow_pickle=True) as z:
+        if sorted(z.files) != ["action", "meta", "q0", "rows"]:
+            raise SystemExit(f"{path}: массивы {sorted(z.files)}")
+    os.replace(t, path)
+    print(f"  снимок записан: {path} ({len(np.asarray(rows))} строк)")
+    return path
+
+
+def emit_read(path):
+    if not os.path.exists(path):
+        raise SystemExit(f"нет {path}")
+    with np.load(path, allow_pickle=True) as z:
+        need = ("q0", "action", "rows", "meta")
+        miss = [k for k in need if k not in z.files]
+        if miss:
+            raise SystemExit(f"{path}: нет массивов {miss}")
+        d = dict(q0=np.asarray(z["q0"]), action=np.asarray(z["action"]),
+                 rows=np.asarray(z["rows"]),
+                 meta=json.loads(str(z["meta"])))
+    d["path"] = path
+    return d
+
+
+def compare_emits(pa, pb, out_path):
+    """Побитовая сверка двух снимков, снятых в РАЗНЫХ процессах.
+
+    Это и есть гейт, разрешающий §53: сравниваются ФАКТИЧЕСКИЕ сборки рук, а
+    не две точки входа в одну модель. Различие расхода аллокатора здесь не
+    исключено, и это сознательно: в K-9b оно давало расхождение логитов при
+    совпадающих весах.
+    """
+    A, B = emit_read(pa), emit_read(pb)
+    if str(A["meta"].get("build")) == str(B["meta"].get("build")):
+        raise SystemExit(
+            f"оба снимка сняты сборкой {A['meta'].get('build')}: сравнивать "
+            f"надо РАЗНЫЕ сборки")
+    bad = [k for k in EMIT_SAME
+           if str(A["meta"].get(k)) != str(B["meta"].get(k))]
+    if bad:
+        raise SystemExit(
+            "снимки сняты в разных условиях: " + "; ".join(
+                f"{k}: {A['meta'].get(k)} против {B['meta'].get(k)}"
+                for k in bad))
+    if not np.array_equal(A["rows"], B["rows"]):
+        raise SystemExit("снимки покрывают разные строки")
+    res = {}
+    compare_exact("сборки.q0", A["q0"], B["q0"], res)
+    compare_exact("сборки.action", A["action"], B["action"], res)
+    o = dict(kind="k14o_build_identity", passed=True,
+             run_id=f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}",
+             a=dict(path=pa, **A["meta"]), b=dict(path=pb, **B["meta"]),
+             comparisons=res, rows=int(len(A["rows"])))
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".",
+                exist_ok=True)
+    t = out_path + f".tmp.{os.getpid()}"
+    json.dump(o, open(t, "w"), ensure_ascii=False, indent=1, default=str)
+    os.replace(t, out_path)
+    print(f"\n  ТОЖДЕСТВО ДВУХ ФАКТИЧЕСКИХ СБОРОК ПОДТВЕРЖДЕНО на "
+          f"{len(A['rows'])} строках: {A['meta'].get('build')} и "
+          f"{B['meta'].get('build')} дали побитово один черновик и одно "
+          f"действие")
+    print(f"  сохранено: {out_path}")
+    return 0
+
+
 def selftest():
     out = {}
     a = np.arange(12, dtype=np.int64).reshape(3, 4)
@@ -90,6 +185,72 @@ def selftest():
         pass
     else:
         raise AssertionError("допуск там, где его быть не должно")
+    # --- СНИМКИ И СВЕРКА ДВУХ СБОРОК --------------------------------------
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        j = lambda x: os.path.join(td, x)
+        m0 = dict(plan_sha1="PL", q0_manifest_sha1="QM", joint_sha1="J",
+                  rows_sha1="RS", compute_dtype="float16", n_batches=3)
+        q0 = np.arange(24, dtype=np.int64).reshape(3, 8)
+        act = np.arange(24, dtype=np.float32).reshape(3, 8)
+        rows = np.arange(3, dtype=np.int64)
+        pa = emit_write(j("a.npz"), q0=q0, action=act, rows=rows,
+                        meta=dict(m0, build="fast"))
+        pb = emit_write(j("b.npz"), q0=q0, action=act, rows=rows,
+                        meta=dict(m0, build="depthrvq"))
+        assert compare_emits(pa, pb, j("o1.json")) == 0
+        got = json.load(open(j("o1.json")))
+        assert got["comparisons"]["сборки.q0"]["equal"]
+        assert got["a"]["build"] != got["b"]["build"]
+        # РАСХОЖДЕНИЕ В ОДНОМ КОДЕ обязано быть замечено
+        q0b = q0.copy(); q0b[1, 1] += 1
+        pc = emit_write(j("c.npz"), q0=q0b, action=act, rows=rows,
+                        meta=dict(m0, build="depthrvq"))
+        try:
+            compare_emits(pa, pc, j("o2.json"))
+        except SystemExit as e:
+            assert "сборки.q0" in str(e), e
+        else:
+            raise AssertionError("расхождение кодов между сборками пропущено")
+        # РАСХОЖДЕНИЕ ТОЛЬКО В ДЕЙСТВИИ тоже
+        actb = act.copy()
+        actb[0, 0] = np.nextafter(actb[0, 0], np.float32(np.inf))
+        pd_ = emit_write(j("d.npz"), q0=q0, action=actb, rows=rows,
+                         meta=dict(m0, build="depthrvq"))
+        try:
+            compare_emits(pa, pd_, j("o3.json"))
+        except SystemExit as e:
+            assert "сборки.action" in str(e), e
+        else:
+            raise AssertionError("расхождение действий пропущено")
+        # ОДИНАКОВЫЕ СБОРКИ сравнивать нельзя
+        pe = emit_write(j("e.npz"), q0=q0, action=act, rows=rows,
+                        meta=dict(m0, build="fast"))
+        try:
+            compare_emits(pa, pe, j("o4.json"))
+        except SystemExit as e:
+            assert "РАЗНЫЕ сборки" in str(e), e
+        else:
+            raise AssertionError("приняты два снимка одной сборки")
+        # РАЗНЫЕ УСЛОВИЯ — отказ, и сообщение называет поле
+        pf = emit_write(j("f.npz"), q0=q0, action=act, rows=rows,
+                        meta=dict(m0, build="depthrvq", joint_sha1="ДРУГОЙ"))
+        try:
+            compare_emits(pa, pf, j("o5.json"))
+        except SystemExit as e:
+            assert "joint_sha1" in str(e), e
+        else:
+            raise AssertionError("приняты снимки с разным Joint12")
+        # РАЗНЫЕ СТРОКИ — отказ
+        pg = emit_write(j("g.npz"), q0=q0, action=act,
+                        rows=np.array([0, 1, 5], np.int64),
+                        meta=dict(m0, build="depthrvq"))
+        try:
+            compare_emits(pa, pg, j("o6.json"))
+        except SystemExit as e:
+            assert "разные строки" in str(e), e
+        else:
+            raise AssertionError("приняты снимки по разным строкам")
     print("самопроверка k14o_fast_identity пройдена")
 
 
@@ -108,6 +269,18 @@ def main():
     ap.add_argument("--cfg-path", default="config/eval/bar.yaml")
     ap.add_argument("--variant", default="main")
     ap.add_argument("--n-batches", type=int, default=3)
+    ap.add_argument("--build", default="both",
+                    choices=("both", "fast", "depthrvq"),
+                    help="both: одна модель, две точки входа. fast/depthrvq: "
+                         "сборка ровно как в k9h, с записью в --emit; "
+                         "сверяются отдельным вызовом --compare")
+    ap.add_argument("--depth-rvq-mode", default="fast",
+                    choices=("fast", "medium", "full"),
+                    help="режим для --build depthrvq")
+    ap.add_argument("--emit", default="",
+                    help="npz с q0 и действиями (для --build fast/depthrvq)")
+    ap.add_argument("--compare", nargs=2, default=None, metavar=("A", "B"),
+                    help="сверить два npz, снятых в ОТДЕЛЬНЫХ процессах")
     ap.add_argument("--device", default="cuda:1")
     ap.add_argument("--dtype", default="float16")
     ap.add_argument("--allow-code-drift", default="")
@@ -128,6 +301,13 @@ def main():
         return 0
     if os.path.exists(a.out) and not a.overwrite:
         raise SystemExit(f"{a.out} уже существует (--overwrite осознанно)")
+    if a.compare:
+        return compare_emits(a.compare[0], a.compare[1], a.out)
+    if a.build != "both" and not a.emit:
+        raise SystemExit(f"--build {a.build} требует --emit: сравнение идёт "
+                         f"между ОТДЕЛЬНЫМИ процессами, через файлы")
+    if a.build == "both" and a.emit:
+        raise SystemExit("--emit осмыслен только с --build fast/depthrvq")
 
     import copy
     import torch
@@ -188,46 +368,74 @@ def main():
     # головы и книг не трогает черновик. Две отдельные сборки различались бы
     # ещё и расходом аллокатора, а в K-9b именно он давал расхождение логитов
     # при совпадающих весах.
-    Cls = make_joint_depth_rvq_class(make_joint12_class(SmolVLABlockwiseAR))
-    model = Cls.from_pretrained(**cfg.MODEL.vlm.kwargs).to(dev, dt).eval()
-    model.init_joint_fast(depth=int(meta["depth"]), head_dtype=torch.float32)
-    rn = copy.deepcopy(model.action_expert.norm)
     j_sha = k11a.file_sha1(a.joint_ckpt)
-    kc.load_joint12_strict(model, a.joint_ckpt, int(meta["depth"]),
-                           (meta.get("source") or {}).get("weights_sha1"),
-                           torch, dev)
-    model.init_joint_depth_rvq(refine_norm=rn, books=torch.from_numpy(E),
-                               feedback=(a.variant != "no_feedback"),
-                               head_dtype=torch.float32, verbose_init=False)
-    info = model.configure_joint_depth_rvq(stage="q1", variant=a.variant,
-                                           verbose=False)
-    q1_obj = torch.load(a.q1_ckpt, map_location="cpu", weights_only=False)
-    prov_q1 = k9h.check_depthrvq_q1_ckpt(q1_obj, joint_sha1=j_sha,
-                                         expect_variant=a.variant)
-    st = q1_obj["state"]
-    want = set(info["names"])
-    if set(q1_obj["trainable_names"]) != want or set(st) != want:
-        raise SystemExit(
-            f"белый список головы не совпал: нет {sorted(want - set(st))[:5]}, "
-            f"лишние {sorted(set(st) - want)[:5]}")
-    own = dict(model.named_parameters())
-    with torch.no_grad():
-        for k_, v_ in st.items():
-            if tuple(own[k_].shape) != tuple(v_.shape):
-                raise SystemExit(f"форма {k_}")
-            if not torch.isfinite(v_).all():
-                raise SystemExit(f"в {k_} есть nan или inf")
-            own[k_].data.copy_(v_.to(own[k_].device, own[k_].dtype))
-    h_ = hashlib.sha1()
-    for k_ in sorted(want):
-        h_.update(k_.encode())
-        h_.update(np.ascontiguousarray(
-            own[k_].detach().float().cpu().numpy()).tobytes())
-    if h_.hexdigest()[:12] != str(q1_obj["selected_state_sha1"]):
-        raise SystemExit("после загрузки веса головы имеют другой отпечаток")
-    model.eval()
-    print(f"  голова q1 установлена и сверена: {len(st)} тензоров, вид "
-          f"{prov_q1['q1_kind']}, сид {prov_q1['q1_seed']}")
+    # СБОРКА ЗАВИСИТ ОТ РЕЖИМА, И В ЭТОМ ВСЯ СУТЬ ВТОРОГО ГЕЙТА. Для --build
+    # fast класс БЕЗ depth-RVQ, ровно как у руки fast в k9h: ни норм, ни
+    # голов, ни feedback, ни загруженной q1 — то есть другой расход
+    # аллокатора.
+    if a.build == "fast":
+        Cls = make_joint12_class(SmolVLABlockwiseAR)
+        model = Cls.from_pretrained(**cfg.MODEL.vlm.kwargs).to(dev, dt).eval()
+        model.init_joint_fast(depth=int(meta["depth"]))
+        kc.load_joint12_strict(model, a.joint_ckpt, int(meta["depth"]),
+                               (meta.get("source") or {}).get("weights_sha1"),
+                               torch, dev)
+        model.eval()
+        prov_q1 = {}
+        print("  сборка fast: Joint12 без модулей depth-RVQ")
+    else:
+        Cls = make_joint_depth_rvq_class(make_joint12_class(
+            SmolVLABlockwiseAR))
+        model = Cls.from_pretrained(**cfg.MODEL.vlm.kwargs).to(dev, dt).eval()
+        model.init_joint_fast(depth=int(meta["depth"]),
+                              head_dtype=torch.float32)
+        rn = copy.deepcopy(model.action_expert.norm)
+        kc.load_joint12_strict(model, a.joint_ckpt, int(meta["depth"]),
+                               (meta.get("source") or {}).get("weights_sha1"),
+                               torch, dev)
+        model.init_joint_depth_rvq(refine_norm=rn, books=torch.from_numpy(E),
+                                   feedback=(a.variant != "no_feedback"),
+                                   head_dtype=torch.float32,
+                                   verbose_init=False)
+        info = model.configure_joint_depth_rvq(stage="q1", variant=a.variant,
+                                               verbose=False)
+        q1_obj = torch.load(a.q1_ckpt, map_location="cpu",
+                            weights_only=False)
+        # ЧЕРНОВИК СВЕРЯЕТСЯ ФАКТИЧЕСКИ, а не по наличию полей: голова,
+        # обученная от ДРУГОГО канонического q0, иначе прошла бы. Отпечаток
+        # берётся из только что загруженного артефакта q0, а не переписывается
+        # руками.
+        prov_q1 = k9h.check_depthrvq_q1_ckpt(
+            q1_obj, joint_sha1=j_sha, expect_variant=a.variant,
+            expect_q0_manifest_sha1=q0_prov["q0_manifest_sha1"])
+        st = q1_obj["state"]
+        want = set(info["names"])
+        if set(q1_obj["trainable_names"]) != want or set(st) != want:
+            raise SystemExit(
+                f"белый список головы не совпал: нет "
+                f"{sorted(want - set(st))[:5]}, лишние "
+                f"{sorted(set(st) - want)[:5]}")
+        own = dict(model.named_parameters())
+        with torch.no_grad():
+            for k_, v_ in st.items():
+                if tuple(own[k_].shape) != tuple(v_.shape):
+                    raise SystemExit(f"форма {k_}")
+                if not torch.isfinite(v_).all():
+                    raise SystemExit(f"в {k_} есть nan или inf")
+                own[k_].data.copy_(v_.to(own[k_].device, own[k_].dtype))
+        h_ = hashlib.sha1()
+        for k_ in sorted(want):
+            h_.update(k_.encode())
+            h_.update(np.ascontiguousarray(
+                own[k_].detach().float().cpu().numpy()).tobytes())
+        if h_.hexdigest()[:12] != str(q1_obj["selected_state_sha1"]):
+            raise SystemExit(
+                "после загрузки веса головы имеют другой отпечаток")
+        model.eval()
+        print(f"  голова q1 установлена и сверена: {len(st)} тензоров, вид "
+              f"{prov_q1['q1_kind']}, сид {prov_q1['q1_seed']}, черновик "
+              f"{prov_q1['q1_q0_prov']['q0_manifest_sha1']}")
+
 
     Ed = torch.from_numpy(E).float().to(dev)
 
@@ -256,6 +464,56 @@ def main():
 
     res = {}
     ac16 = torch.autocast(device_type=dev.type, dtype=dt)
+    rows_all = np.concatenate([s_ for _n, _p, s_ in plan]).astype(np.int64)
+    rows_sha = hashlib.sha1(np.ascontiguousarray(rows_all).tobytes()
+                            ).hexdigest()[:12]
+
+    if a.build != "both":
+        # --- СНИМОК ОДНОЙ ФАКТИЧЕСКОЙ СБОРКИ -----------------------------
+        q0_list, act_list = [], []
+        for bi, (nm_, po_, sel_) in enumerate(plan):
+            b = build_batch(po_, sel_)
+            am = b.get("attention_mask")
+            with torch.no_grad(), ac16:
+                v, p_ = model.build_inputs(position_offset=po_, **b)
+                if a.build == "fast":
+                    o = model.forward_joint_fast(
+                        vlm_inputs_embeds=v, attention_mask=am,
+                        position_ids=p_)
+                    lv = [o["pred_codes"]]
+                else:
+                    o = model.forward_joint_depth_rvq(
+                        vlm_inputs_embeds=v, attention_mask=am,
+                        position_ids=p_, mode=a.depth_rvq_mode)
+                    lv = list(o["pred_codes"])
+            q0_list.append(lv[0].cpu().numpy())
+            act_list.append(act_of(lv))
+            bad = int((q0_list[-1] != q0_can[sel_]).sum())
+            if bad:
+                raise SystemExit(f"батч {bi}: q0 расошёлся с каноническим в "
+                                 f"{bad} позициях")
+            print(f"    батч {bi} ({nm_}): {len(sel_)} строк, q0 сверен с "
+                  f"каноническим, слоёв {o['layers_run']}")
+        emit_write(a.emit, q0=np.concatenate(q0_list),
+                   action=np.concatenate(act_list), rows=rows_all,
+                   meta=dict(build=a.build, depth_rvq_mode=(
+                       a.depth_rvq_mode if a.build == "depthrvq" else None),
+                       plan_sha1=q0_prov["plan_sha1"],
+                       q0_manifest_sha1=q0_prov["q0_manifest_sha1"],
+                       joint_sha1=j_sha, rows_sha1=rows_sha,
+                       compute_dtype=a.dtype, n_batches=len(plan),
+                       git_head=head, git_dirty=bool(dirty),
+                       device=str(dev),
+                       gpu_uuid=(kc.gpu_uuid(dev, torch)
+                                 if dev.type == "cuda" else None),
+                       torch_version=str(torch.__version__),
+                       q1_ckpt=(os.path.abspath(a.q1_ckpt)
+                                if a.build == "depthrvq" else None),
+                       **prov_q1))
+        print("  СНИМОК ГОТОВ. Сверка — отдельным вызовом --compare: она и "
+              "есть гейт, разрешающий §53")
+        return 0
+
     for bi, (nm_, po_, sel_) in enumerate(plan):
         b = build_batch(po_, sel_)
         am = b.get("attention_mask")

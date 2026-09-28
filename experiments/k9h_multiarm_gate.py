@@ -587,9 +587,11 @@ def main() -> None:
                          "принимается любой из двух")
     ap.add_argument("--expect-q1-variant", default="main")
     ap.add_argument("--expect-q1-seed", type=int, default=None)
-    ap.add_argument("--expect-q0-manifest-sha1", default=None,
-                    help="отпечаток манифеста канонического q0, от которого "
-                         "голова обучена")
+    ap.add_argument("--expect-q0-manifest", default=None,
+                    help="ПУТЬ к манифесту канонического q0, от которого "
+                         "голова обучена. Отпечаток считается здесь, а не "
+                         "переписывается руками: скопированная вручную sha "
+                         "проверяет копирование, а не файл")
     ap.add_argument("--depth-rvq-cache", default="data/k11a_joint12",
                     help="префикс кэша K-11a: оттуда берутся КНИГИ, на "
                          "которых обучалась голова q1. Сверяются побитово с "
@@ -671,6 +673,9 @@ def main() -> None:
             raise SystemExit(
                 "--policy depthrvq требует --depth-rvq-mode: число уровней "
                 "в действии определяется им, а не умолчанием")
+        if args.expect_q0_manifest and \
+                not os.path.exists(args.expect_q0_manifest):
+            raise SystemExit(f"нет {args.expect_q0_manifest}")
     elif args.q1_ckpt or args.depth_rvq_mode:
         raise SystemExit(
             f"--q1-ckpt и --depth-rvq-mode осмысленны только с --policy "
@@ -1037,7 +1042,8 @@ def main() -> None:
             expect_kind=args.expect_q1_kind,
             expect_variant=args.expect_q1_variant,
             expect_seed=args.expect_q1_seed,
-            expect_q0_manifest_sha1=args.expect_q0_manifest_sha1)
+            expect_q0_manifest_sha1=(file_sha12(args.expect_q0_manifest)
+                                     if args.expect_q0_manifest else None))
         if prov_q1["q1_architecture_inferred"] or \
                 prov_q1["q1_additive_feedback_inferred"]:
             print("    голова снята до §49: отсутствующие поля architecture / "
