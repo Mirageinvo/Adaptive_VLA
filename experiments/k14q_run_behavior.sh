@@ -45,19 +45,53 @@ cd "$ROOT" || exit 1
 export PYTHONPATH="${LIBERO_PATH:-$HOME/LIBERO}"
 export MUJOCO_GL=egl
 export PYTHONUNBUFFERED=1
-OUTD="reports/k14q/$BANK/s$SEED"
+
+# СМОУК ПИШЕТСЯ В ДРУГОЙ КАТАЛОГ И ПОД ДРУГИМ ИМЕНЕМ ЛОГА. Урезанный набор
+# не должен иметь ни одного шанса быть принятым за банк: артефакты банка
+# складываются только в reports/k14q/<банк>/s<сид>, и смоук туда не попадает.
+TASKS_RUN="${SMOKE_TASKS:-0 1 2 3 4 5 6 7 8 9}"
+if [ -n "${SMOKE_TASKS:-}" ] || [ -n "${SMOKE_BLOCKS:-}" ]; then
+  IS_SMOKE=1
+  [ -n "${SMOKE_BLOCKS:-}" ] && STATES="$SMOKE_BLOCKS"
+  OUTD="reports/k14q/smoke_${BANK}_s${SEED}"
+  LOGF="logs/k14q_smoke_${BANK}_s${SEED}.log"
+else
+  IS_SMOKE=0
+  OUTD="reports/k14q/$BANK/s$SEED"
+  LOGF="logs/k14q_${BANK}_s${SEED}.log"
+fi
 mkdir -p logs "$OUTD"
-exec >> "logs/k14q_${BANK}_s${SEED}.log" 2>&1
+exec >> "$LOGF" 2>&1
 
 echo "=== СТАРТ $(date) === банк $BANK, карта $DEV, сид повтора $SEED"
 echo "    коммит $(git rev-parse --short HEAD 2>/dev/null)"
 echo "    состояния блоками: $STATES"
+echo "    задачи: $TASKS_RUN"
+if [ "$IS_SMOKE" = "1" ]; then
+  echo "    РЕЖИМ СМОУКА: набор урезан, артефакты в $OUTD и БАНКОМ НЕ ЯВЛЯЮТСЯ"
+fi
 
-if [ "$BANK" = "final" ] && [ ! -f reports/k14q/final_authorized.txt ]; then
-  echo "ОСТАНОВ: банк final открывается ОДИН раз и только по решению,"
-  echo "  принятому на dev (§53.5). Создайте reports/k14q/final_authorized.txt"
-  echo "  с именем выбранной системы, если решение принято."
-  exit 3
+# НА final ЕДУТ ТОЛЬКО НУЖНЫЕ РУКИ, И ВЫБОР БЕРЁТСЯ ИЗ dev. Запускать все
+# три и выбирать по данным final значило бы выбирать и подтверждать на одной
+# выборке. Имя выбранной системы лежит в файле-разрешении.
+ARMS_RUN="q0 q1 bar"
+if [ "$BANK" = "final" ] && [ "$IS_SMOKE" = "0" ]; then
+  AUTH=reports/k14q/final_authorized.txt
+  if [ ! -f "$AUTH" ]; then
+    echo "ОСТАНОВ: банк final открывается ОДИН раз и только по решению,"
+    echo "  принятому на dev (§53.5). Создайте $AUTH с одной строкой:"
+    echo "    q0        если на dev выбрана она"
+    echo "    q0+q1     если на dev выбрано уточнение"
+    exit 3
+  fi
+  CHOSEN="$(tr -d ' \t\r\n' < "$AUTH")"
+  case "$CHOSEN" in
+    q0)    ARMS_RUN="q0 bar" ;;
+    q0+q1) ARMS_RUN="q0 q1 bar" ;;
+    *) echo "ОСТАНОВ: в $AUTH написано «$CHOSEN», ожидалось q0 или q0+q1"
+       exit 3 ;;
+  esac
+  echo "    выбор из dev: $CHOSEN -> руки: $ARMS_RUN"
 fi
 
 COMMON="--ckpt ZibinDong/SmolVLM2-2.2B-ActionCodec-BAR-LIBERO \
@@ -88,17 +122,26 @@ run_arm () {   # $1 метка, $2 задача, $3 начало блока, $4.
   sleep 10
 }
 
-for T in 0 1 2 3 4 5 6 7 8 9; do
+for T in $TASKS_RUN; do
   for I0 in $STATES; do
     echo "--- задача $T, состояния $I0-$((I0+4)) $(date), свободно $(free -g | awk 'NR==2{print $7}') ГБ"
     # ПОРЯДОК РУК ЗАВИСИТ ОТ (задача, блок, сид) ДЕТЕРМИНИРОВАННО: он
     # перемешан, но воспроизводим, и записан в имени прогона.
-    ORDER=$(( (T * 7 + I0 / 5 * 3 + SEED) % 3 ))
-    case $ORDER in
-      0) SEQ="q0 q1 bar" ;;
-      1) SEQ="q1 bar q0" ;;
-      2) SEQ="bar q0 q1" ;;
-    esac
+    # НОМЕР БЛОКА ВХОДИТ БЕЗ МНОЖИТЕЛЯ 3. С множителем он обнулялся по
+    # модулю трёх, и порядок рук не менялся между блоками одной задачи —
+    # то есть перемешивание работало только по задачам и сиду.
+    ORDER=$(( (T * 7 + I0 / 5 + SEED) % 3 ))
+    # ORDER берётся по модулю числа рук ниже; здесь он только
+    # детерминированно перемешан и воспроизводим.
+    # ПОРЯДОК — ПЕРЕСТАНОВКА ИМЕННО ЗАПУСКАЕМЫХ РУК, а не фиксированной
+    # тройки: на final их может быть две.
+    SEQ=""
+    NA=$(echo $ARMS_RUN | wc -w)
+    for k in $(seq 0 $((NA - 1))); do
+      IDX=$(( (ORDER + k) % NA + 1 ))
+      SEQ="$SEQ $(echo $ARMS_RUN | cut -d' ' -f$IDX)"
+    done
+    SEQ="$(echo $SEQ)"
     echo "    порядок рук: $SEQ"
     for A in $SEQ; do
       case $A in
@@ -112,8 +155,16 @@ done
 
 echo "=== раскатки закончены $(date) ==="
 N=$(ls "$OUTD"/*.json 2>/dev/null | wc -l)
-echo "    артефактов $N (ожидается 150: 3 руки x 10 задач x 5 блоков)"
-if [ "$N" -ne 150 ]; then
+if [ "$IS_SMOKE" = "1" ]; then
+  NT=$(echo $TASKS_RUN | wc -w); NB=$(echo $STATES | wc -w)
+  echo "    артефактов $N (смоук: 3 руки x $NT задач x $NB блоков)"
+  echo "=== СМОУК ЗАКОНЧЕН $(date). Это НЕ банк ==="
+  exit 0
+fi
+NA=$(echo $ARMS_RUN | wc -w)
+EXP=$(( NA * 10 * 5 ))
+echo "    артефактов $N (ожидается $EXP: $NA рук x 10 задач x 5 блоков)"
+if [ "$N" -ne "$EXP" ]; then
   echo "ОСТАНОВ: набор неполный, анализ не запускаю"
   exit 4
 fi

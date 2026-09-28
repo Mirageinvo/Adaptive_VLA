@@ -82,7 +82,9 @@ def load(paths):
                 + "; ".join(f"{k}: {d[k]} против {base[k]}" for k in bad))
         arm = str(d["arm_label"])
         m = meta.setdefault(arm, dict(policy=str(d["policy"]), files=[],
-                                      fingerprints=set(), shas={}))
+                                      fingerprints=set(), shas={},
+                                      script_shas=set()))
+        m["script_shas"].add(str(d.get("script_sha1")))
         m["files"].append(p)
         m["shas"][p] = file_sha(p)
         m["fingerprints"].add(str((d.get("joint") or {}).get(
@@ -222,6 +224,39 @@ def point(values, clusters):
 
 
 SECONDARY_MIN_PFAIL = 0.2      # §53.7: порог доли провалов q0 для задачи
+# ПОЛНОТА БАНКА — ЧАСТЬ ОПРЕДЕЛЕНИЯ, А НЕ ПОЖЕЛАНИЕ (§53.7). Анализ по
+# четверти банка дал бы интервал не того набора, а надпись стояла бы про банк.
+BANK_STATES = dict(dev=list(range(0, 25)), final=list(range(25, 50)))
+BANK_TASKS = list(range(10))
+BANK_SEEDS = [101, 102, 103, 104]
+
+
+def check_complete(bank, clusters, seeds, meta, arms):
+    """Банк покрыт ЦЕЛИКОМ: задачи, состояния, сиды, одна версия кода."""
+    if bank not in BANK_STATES:
+        raise SystemExit(f"банк {bank!r} неизвестен: {sorted(BANK_STATES)}")
+    want_cl = sorted((t, s) for t in BANK_TASKS for s in BANK_STATES[bank])
+    got_cl = sorted(clusters)
+    if got_cl != want_cl:
+        miss = sorted(set(want_cl) - set(got_cl))
+        extra = sorted(set(got_cl) - set(want_cl))
+        raise SystemExit(
+            f"банк {bank} покрыт не целиком: кластеров {len(got_cl)} из "
+            f"{len(want_cl)}, нет {len(miss)} (например {miss[:4]}), лишних "
+            f"{len(extra)} (например {extra[:4]}). Решение по неполному банку "
+            f"относилось бы не к банку")
+    if sorted(seeds) != BANK_SEEDS:
+        raise SystemExit(
+            f"сиды повторов {sorted(seeds)}, а зарегистрированы {BANK_SEEDS}: "
+            f"анализ по части повторов — это другой набор")
+    shas = set()
+    for nm in arms:
+        shas |= set(meta[nm].get("script_shas", ()))
+    if len(shas) > 1:
+        raise SystemExit(
+            f"артефакты сняты разными версиями k9h: {sorted(shas)}")
+    return dict(bank=bank, n_clusters=len(got_cl), seeds=sorted(seeds),
+                script_sha1=(sorted(shas)[0] if shas else None))
 
 
 def secondary_tasks(obs, base_arm, clusters, seeds,
@@ -272,6 +307,15 @@ def main():
     ap.add_argument("--boot-seed", type=int, default=BOOT_SEED)
     ap.add_argument("--bank", default="", choices=("", "dev", "final"),
                     help="какой банк анализируется")
+    ap.add_argument("--allow-partial", action="store_true",
+                    help="разрешить анализ НЕПОЛНОГО банка. Только для "
+                         "отладки: решение по четверти банка относилось бы "
+                         "не к банку")
+    ap.add_argument("--chosen-from-dev", default="",
+                    choices=("", "q0", "q0+q1"),
+                    help="система, выбранная НА dev. Обязателен при --bank "
+                         "final: выбирать заново по данным final значило бы "
+                         "выбирать и подтверждать на одной выборке")
     ap.add_argument("--secondary-tasks", default="",
                     help="через запятую: вторичный набор задач, ОПРЕДЕЛЁННЫЙ "
                          "НА dev. Задаётся только при анализе final; на dev "
@@ -298,6 +342,19 @@ def main():
         if nm not in meta:
             raise SystemExit(f"нет руки {nm}; есть {sorted(meta)}")
     clusters, seeds = align(obs, arms)
+    complete = None
+    if a.bank and not a.allow_partial:
+        complete = check_complete(a.bank, clusters, seeds, meta, arms)
+        print(f"  банк {a.bank} покрыт целиком: {complete['n_clusters']} "
+              f"кластеров, сиды {complete['seeds']}, k9h "
+              f"{complete['script_sha1']}")
+    elif a.allow_partial:
+        print("  ВНИМАНИЕ: --allow-partial, банк не проверен на полноту. "
+              "Это отладочный прогон, а не результат")
+    if a.bank == "final" and not a.chosen_from_dev:
+        raise SystemExit(
+            "--bank final требует --chosen-from-dev: система выбирается на "
+            "dev, а final открывается один раз для ПРОВЕРКИ этого выбора")
     n_task = len(strata(clusters))
     print(f"\n  кластеров {len(clusters)} в {n_task} задачах, повторов "
           f"{len(seeds)} (сиды {seeds}), реплик {a.boot}")
@@ -333,7 +390,16 @@ def main():
             "считается не по тем наблюдениям")
 
     # --- ВЫБОР СИСТЕМЫ И НЕ-ХУЖЕСТЬ У НЕЁ --------------------------------
-    chosen = choose_for_final(lo_imp)
+    if a.chosen_from_dev:
+        chosen = a.chosen_from_dev
+        would = choose_for_final(lo_imp)
+        print(f"\n  ВЫБОР ВЗЯТ ИЗ dev: {chosen}. По данным этого набора "
+              f"правило дало бы {would}"
+              + ("" if would == chosen else
+                 " — РАСХОЖДЕНИЕ, и это факт для отчёта, а не повод "
+                 "переголосовать"))
+    else:
+        chosen = choose_for_final(lo_imp)
     key = "d_cand_ref" if chosen == "q0+q1" else "d_base_ref"
     lo_ni, hi_ni = ci[key]
     vn = verdict_noninf(lo_ni, hi_ni, margin=float(a.margin))
@@ -410,6 +476,9 @@ def main():
                        q_lo=Q_LO, q_hi=Q_HI),
         margin=float(a.margin), point=pt, ci=ci,
         improved=improved, chosen_for_final=chosen,
+        chosen_from_dev=(a.chosen_from_dev or None),
+        would_choose_here=choose_for_final(lo_imp),
+        completeness=complete, allow_partial=bool(a.allow_partial),
         non_inferiority=dict(pair=key, lo=lo_ni, hi=hi_ni, verdict=vn),
         feasibility_37=dict(p_fail=p_fail, discord=pt["discord"],
                             delta=float(a.delta), limit=lim,
