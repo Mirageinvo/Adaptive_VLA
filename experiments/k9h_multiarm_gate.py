@@ -581,6 +581,17 @@ def main() -> None:
                          "fast: forward_joint_fast, уровень 0")
     ap.add_argument("--policy-ckpt", default=None,
                     help="чекпойнт формата k9c/k9g; только для --policy fast")
+    ap.add_argument("--init-starts", default="",
+                    help="несколько блоков в ОДНОМ процессе, через запятую "
+                         "или пробел. Модель и среды загружаются один раз на "
+                         "все блоки: загрузка занимает около 4 минут против "
+                         "2 минут самой раскатки, и на полном банке это "
+                         "разница между 16 и 8 часами на повтор. Среды "
+                         "переставляются через reset(init_state_id), а "
+                         "seed_everything вызывается перед каждым раундом, "
+                         "поэтому блок в цикле получает тот же сид, что "
+                         "получил бы в отдельном процессе. Требует {i0} в "
+                         "--out")
     ap.add_argument("--save-actions", action="store_true",
                     help="записать рядом с --out npz с ИСПОЛНЕННЫМИ "
                          "действиями по шагам: без него пошаговое "
@@ -666,6 +677,17 @@ def main() -> None:
                 "головой Joint12, и её веса — часть исполняемой модели")
     elif args.hicora_ckpt:
         raise SystemExit("--hicora-ckpt имеет смысл только с --policy hicora")
+    blocks = [int(args.init_start)]
+    if args.init_starts:
+        blocks = [int(x) for x in args.init_starts.replace(",", " ").split()]
+        if len(blocks) != len(set(blocks)):
+            raise SystemExit(f"блоки повторяются: {blocks}")
+        if "{i0}" not in args.out:
+            raise SystemExit(
+                "--init-starts требует {i0} в --out: иначе все блоки "
+                "писались бы в один файл, и остался бы только последний")
+    elif "{i0}" in args.out:
+        raise SystemExit("{i0} в --out без --init-starts")
     if args.policy == "depthrvq":
         if not args.policy_ckpt:
             raise SystemExit(
@@ -1296,11 +1318,24 @@ def main() -> None:
             check_assembly(np.concatenate([codes] * N_LEVEL, axis=1))
         return codes
 
-    roll_seed = rollout_seed(args.seed, args.init_start,
-                             args.rollout_seed_mode)
-    print(f"    сид раскатки {roll_seed} (режим {args.rollout_seed_mode})")
+    # ЦИКЛ ПО БЛОКАМ В ОДНОМ ПРОЦЕССЕ. Среды созданы до модели (иначе fork
+    # после инициализации CUDA вешает процесс) и переставляются
+    # reset(init_state_id); модель загружена один раз. Сид сбрасывается перед
+    # каждым раундом внутри rollout(), поэтому блок здесь получает ровно тот
+    # же сид, что получил бы в отдельном процессе.
+    out_pattern = args.out
+    try:
+     for _blk in blocks:
+      args.init_start = int(_blk)
+      args.out = (out_pattern.format(i0=args.init_start)
+                  if "{i0}" in out_pattern else out_pattern)
+      roll_seed = rollout_seed(args.seed, args.init_start,
+                               args.rollout_seed_mode)
+      print(f"\n  --- блок {args.init_start}-{args.init_start + args.n_envs - 1}"
+            f", сид раскатки {roll_seed} (режим {args.rollout_seed_mode})",
+            flush=True)
 
-    def rollout():
+      def rollout():
         # СИД СБРАСЫВАЕТСЯ ПЕРЕД РАУНДОМ, как в K-5b/K-6h/K-9d: иначе расход
         # глобального ГСЧ различался бы между руками и начальные состояния
         # разошлись бы, а вся статистика здесь парная.
@@ -1437,35 +1472,32 @@ def main() -> None:
                      action_sha1=_ahash(i))
                 for i in range(args.n_envs)]
 
-    t0 = time.time()
-    try:
-        eps = rollout()
-        print(f"  успех {sum(e['success'] for e in eps)}/{args.n_envs}, "
-              f"шагов {eps[0]['env_steps']}", flush=True)
-    finally:
-        try:
-            envs.close()
-        except Exception:
-            pass
+      # СРЕДЫ НЕ ЗАКРЫВАЮТСЯ ЗДЕСЬ. Они общие на все блоки задачи и
+      # закрываются один раз после цикла; закрытие внутри цикла обрывало бы
+      # прогон после первого блока.
+      t0 = time.time()
+      eps = rollout()
+      print(f"  успех {sum(e['success'] for e in eps)}/{args.n_envs}, "
+            f"шагов {eps[0]['env_steps']}", flush=True)
 
-    s = summarize(eps)
-    print(f"\n  метка {args.arm_label}, H={args.horizon}, ens={args.ensemble}: "
+      s = summarize(eps)
+      print(f"\n  метка {args.arm_label}, H={args.horizon}, ens={args.ensemble}: "
           f"успех {s['success_rate']:.1%} "
           f"({sum(e['success'] for e in eps)}/{len(eps)}), "
           f"вызовов на действие {s['calls_per_action']:.3f}")
-    print(f"  время: {(time.time() - t0) / 60:.1f} мин")
-    ref = REFERENCE_K6H[args.ensemble]
-    print("\n  ЧИТАТЬ ТАК: не по этому числу. Оно осмысленно только в паре с")
-    print("  другой рукой того же --run-tag при тех же task-id, init-start,")
-    print("  seed и ensemble, и только через k6h_summarize.py --field")
-    print("  arm_label. Опора K-6h при ens=%s: полная BAR %.1f%%, coarse24 "
+      print(f"  время: {(time.time() - t0) / 60:.1f} мин")
+      ref = REFERENCE_K6H[args.ensemble]
+      print("\n  ЧИТАТЬ ТАК: не по этому числу. Оно осмысленно только в паре с")
+      print("  другой рукой того же --run-tag при тех же task-id, init-start,")
+      print("  seed и ensemble, и только через k6h_summarize.py --field")
+      print("  arm_label. Опора K-6h при ens=%s: полная BAR %.1f%%, coarse24 "
           "%.1f%%\n  (по 200 пар на протокол)." % (args.ensemble,
                                                    ref["fullbar"],
                                                    ref["coarse24"]))
-    print("  Латентность здесь НЕ меряется — для неё k7a на фиксированных "
+      print("  Латентность здесь НЕ меряется — для неё k7a на фиксированных "
           "входах.")
 
-    if args.out:
+      if args.out:
         os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".",
                     exist_ok=True)
         sha = file_sha12(__file__)
@@ -1527,6 +1559,14 @@ def main() -> None:
         json.load(open(tmp_out))      # перечитывается до публикации
         os.replace(tmp_out, args.out)
         print(f"  сохранено: {args.out}  (sha {sha})")
+    finally:
+        # ЗАКРЫТИЕ ПОСЛЕ ЦИКЛА И ПРИ ЛЮБОМ ИСХОДЕ: иначе пять процессов
+        # MuJoCo остались бы висеть, а на этом хосте память и так на грани.
+        try:
+            envs.close()
+        except Exception:
+            pass
+
 
 
 

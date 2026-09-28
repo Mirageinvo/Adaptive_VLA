@@ -102,37 +102,46 @@ DRVQ="--policy depthrvq --policy-ckpt data/k9d_ep3.pt \
   --q1-ckpt data/k14c/q1_main_s0.pt --expect-q1-variant main \
   --expect-q1-seed 0 --expect-q0-manifest data/k14d/q0_b8_e0.manifest.json"
 
-run_arm () {   # $1 метка, $2 задача, $3 начало блока, $4... аргументы руки
-  local L="$1" T="$2" I0="$3"; shift 3
-  local OUT="$OUTD/${L}_t${T}_i${I0}.json" rc=0
-  if [ -f "$OUT" ] && python -c "import json,sys;json.load(open('$OUT'))" \
-       >/dev/null 2>&1; then
-    echo "    уже есть $OUT"
+run_arm () {   # $1 метка, $2 задача, $3... аргументы руки
+  # ВСЕ БЛОКИ ЗАДАЧИ — ОДНИМ ПРОЦЕССОМ. Загрузка модели и создание сред
+  # занимают около 4 минут против 2 минут самой раскатки; на полном банке это
+  # разница между 16 и 8 часами на повтор.
+  local L="$1" T="$2"; shift 2
+  local rc=0 NEED=""
+  for I0 in $STATES; do
+    local F="$OUTD/${L}_t${T}_i${I0}.json"
+    if [ -f "$F" ] && python -c "import json;json.load(open('$F'))" \
+         >/dev/null 2>&1; then
+      continue
+    fi
+    rm -f "$F"
+    NEED="$NEED${NEED:+,}$I0"
+  done
+  if [ -z "$NEED" ]; then
+    echo "    $L t$T: все блоки уже есть"
     return 0
   fi
-  rm -f "$OUT"
+  echo "    $L t$T: блоки $NEED"
   python experiments/k9h_multiarm_gate.py $COMMON "$@" \
-    --task-id "$T" --init-start "$I0" \
-    --arm-label "${L}" --out "$OUT" || rc=$?
+    --task-id "$T" --init-starts "$NEED" \
+    --arm-label "${L}" --out "$OUTD/${L}_t${T}_i{i0}.json" || rc=$?
   if [ $rc -ne 0 ]; then
-    echo "ОСТАНОВ: $L, задача $T, блок $I0 — код $rc"
+    echo "ОСТАНОВ: $L, задача $T, блоки $NEED — код $rc"
     return $rc
   fi
-  echo "    $L t$T i$I0: $(grep -h 'успех ' "logs/k14q_${BANK}_s${SEED}.log" | tail -1)"
+  # ЛОГ БЕРЁТСЯ ИЗ $LOGF, А НЕ СОБИРАЕТСЯ ИЗ ИМЁН ЗАНОВО. В режиме смоука
+  # имя другое, и собранный путь указывал на несуществующий файл: строка
+  # прогресса выходила пустой, а grep ругался в лог.
+  echo "    $L t$T готово: $(grep -h 'успех ' "$LOGF" | tail -1)"
   sleep 10
 }
 
 for T in $TASKS_RUN; do
-  for I0 in $STATES; do
-    echo "--- задача $T, состояния $I0-$((I0+4)) $(date), свободно $(free -g | awk 'NR==2{print $7}') ГБ"
-    # ПОРЯДОК РУК ЗАВИСИТ ОТ (задача, блок, сид) ДЕТЕРМИНИРОВАННО: он
-    # перемешан, но воспроизводим, и записан в имени прогона.
-    # НОМЕР БЛОКА ВХОДИТ БЕЗ МНОЖИТЕЛЯ 3. С множителем он обнулялся по
-    # модулю трёх, и порядок рук не менялся между блоками одной задачи —
-    # то есть перемешивание работало только по задачам и сиду.
-    ORDER=$(( (T * 7 + I0 / 5 + SEED) % 3 ))
-    # ORDER берётся по модулю числа рук ниже; здесь он только
-    # детерминированно перемешан и воспроизводим.
+    echo "--- задача $T, блоки $STATES, $(date), свободно $(free -g | awk 'NR==2{print $7}') ГБ"
+    # ПОРЯДОК РУК ТЕПЕРЬ ПЕРЕСТАВЛЯЕТСЯ ПО ЗАДАЧЕ И СИДУ. Блоки идут внутри
+    # одного процесса руки, поэтому переставлять их порядок нечем — и это
+    # цена экономии восьми часов на повтор.
+    ORDER=$(( (T * 7 + SEED) % 3 ))
     # ПОРЯДОК — ПЕРЕСТАНОВКА ИМЕННО ЗАПУСКАЕМЫХ РУК, а не фиксированной
     # тройки: на final их может быть две.
     SEQ=""
@@ -145,12 +154,11 @@ for T in $TASKS_RUN; do
     echo "    порядок рук: $SEQ"
     for A in $SEQ; do
       case $A in
-        q0)  run_arm q0  "$T" "$I0" $DRVQ --depth-rvq-mode fast ;;
-        q1)  run_arm q1  "$T" "$I0" $DRVQ --depth-rvq-mode medium ;;
-        bar) run_arm bar "$T" "$I0" --policy fullbar ;;
+        q0)  run_arm q0  "$T" $DRVQ --depth-rvq-mode fast ;;
+        q1)  run_arm q1  "$T" $DRVQ --depth-rvq-mode medium ;;
+        bar) run_arm bar "$T" --policy fullbar ;;
       esac
     done
-  done
 done
 
 echo "=== раскатки закончены $(date) ==="
