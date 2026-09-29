@@ -602,6 +602,18 @@ def main():
 
     # --- ДИАГНОСТИКА ТИПА ПРОВАЛА И РАСХОЖДЕНИЯ ДЕЙСТВИЙ -----------------
     diag = fail_diag(obs, arms, clusters, seeds)
+    agree = seed_agreement(obs, arms, clusters, seeds)
+    if "note" not in agree:
+        print("\n  СОГЛАСИЕ ПОВТОРОВ (цена дополнительных сидов):")
+        for nm in arms:
+            g = agree[nm]
+            print(f"    {nm:16s} все повторы совпали в "
+                  f"{g['clusters_all_seeds_agree']:4d} из {len(clusters)} "
+                  f"кластеров ({100 * g['frac_agree']:.1f}%), средняя "
+                  f"внутрикластерная дисперсия "
+                  f"{g['mean_within_cluster_var']:.4f}")
+        print("    близко к 100% -> дополнительные повторы интервал НЕ "
+              "сузят: он определяется разбросом между кластерами")
     print(f"\n  расхождение действий {a.base}/{a.cand}: "
           f"{diag['action_disagree_frac']:.3f} наблюдений"
           + ("" if diag["action_sha_available"]
@@ -637,7 +649,7 @@ def main():
         feasibility_37=dict(p_fail=p_fail, discord=pt["discord"],
                             delta=float(a.delta), limit=lim,
                             within=bool(pt["discord"] <= lim)),
-        diagnostics=diag,
+        diagnostics=diag, seed_agreement=agree,
         secondary_rule=dict(min_p_fail=SECONDARY_MIN_PFAIL,
                             defined_on="dev", applied_on="final"),
         secondary_per_task=sec, secondary_included=sec_inc,
@@ -655,6 +667,35 @@ def main():
     os.replace(t_, a.out)
     print(f"\n  сохранено: {a.out}")
     return 0
+
+
+def seed_agreement(obs, arms, clusters, seeds):
+    """Согласие повторов внутри кластера — цена дополнительных сидов.
+
+    ЗАЧЕМ. Повторы гасят ТОЛЬКО внутрикластерный разброс. Если при одном
+    начальном состоянии исход одинаков у всех повторов, дополнительные сиды
+    не сужают интервал вообще: ширина определяется разбросом МЕЖДУ
+    кластерами, а их число от повторов не меняется.
+
+    Считается доля кластеров, где все повторы дали один исход, и оценка
+    внутрикластерной дисперсии. Обе величины нужны, чтобы решать про
+    дополнительные повторы числом, а не на глаз.
+    """
+    out = {}
+    if len(seeds) < 2:
+        return dict(note="повторов меньше двух, согласие не определено")
+    for nm in arms:
+        same = 0
+        wvar = []
+        for (t, s) in clusters:
+            v = [obs[(nm, t, s, sd)]["success"] for sd in seeds]
+            same += int(len(set(v)) == 1)
+            m = float(np.mean(v))
+            wvar.append(m * (1.0 - m))
+        out[nm] = dict(clusters_all_seeds_agree=same,
+                       frac_agree=same / float(len(clusters)),
+                       mean_within_cluster_var=float(np.mean(wvar)))
+    return out
 
 
 def fail_diag(obs, arms, clusters, seeds):
