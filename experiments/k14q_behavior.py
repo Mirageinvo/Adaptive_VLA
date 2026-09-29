@@ -106,6 +106,9 @@ def load(paths):
                     f"{p}: наблюдение {key} уже есть в {obs[key]['path']} — "
                     f"один и тот же прогон учтён бы дважды")
             obs[key] = dict(success=bool(e["success"]), path=p,
+                            init_hash=e.get("init_hash"),
+                            init_hash_full=e.get("init_hash_full"),
+                            rollout_seed=e.get("rollout_seed"),
                             done_step=e.get("done_step"),
                             success_step=e.get("success_step"),
                             grip_positive_step=e.get("grip_positive_step"),
@@ -132,6 +135,24 @@ def align(obs, arms):
                 f"(например {sorted(miss)[:3]}), лишних {len(extra)} "
                 f"(например {sorted(extra)[:3]}). Сравнение парное, и "
                 f"несовпадение состава делает его недействительным")
+    # НАЧАЛЬНОЕ СОСТОЯНИЕ И СИД РАСКАТКИ СВЕРЯЮТСЯ ПОЭПИЗОДНО. Совпадения
+    # номеров (задача, состояние, сид) мало: с переходом на несколько блоков
+    # в одном процессе состояние среды восстанавливается через reset, и если
+    # оно восстановилось не точно, номера совпадут, а старты разойдутся — и
+    # парность, на которой держится весь анализ, станет фикцией.
+    for k in ("init_hash", "init_hash_full", "rollout_seed"):
+        for key in sorted(base):
+            vals = {a: obs[(a,) + key].get(k) for a in arms}
+            if any(v is None for v in vals.values()):
+                miss = [a for a, v in vals.items() if v is None]
+                raise SystemExit(
+                    f"наблюдение {key}: у рук {miss} нет поля {k}. Парность "
+                    f"стартов доказать нечем")
+            if len(set(map(str, vals.values()))) != 1:
+                raise SystemExit(
+                    f"наблюдение {key}: {k} различается по рукам {vals}. "
+                    f"Руки стартовали из РАЗНЫХ состояний, парное сравнение "
+                    f"недействительно")
     clusters = sorted({(t, s) for (t, s, _sd) in base})
     seeds = sorted({sd for (_t, _s, sd) in base})
     for (t, s) in clusters:
@@ -300,6 +321,22 @@ def secondary_tasks(obs, base_arm, clusters, seeds,
     return out
 
 
+def selector_ceiling(sr_base, sr_cand):
+    """Потолок СЕЛЕКТОРА, видящего только начальное состояние.
+
+    P(rescue) — это оракул ПОСТ-ФАКТУМ: он выбирает лучшую из двух политик
+    задним числом для каждой конкретной раскатки, зная исход. Селектор
+    решает ДО исполнения и одинаково для всех повторов одного состояния,
+    поэтому его потолок — среднее положительной части кластерной разности:
+
+        mean_кластеры max(SR_cand(c) - SR_base(c), 0)
+
+    Эта величина не выше P(rescue) и, вообще говоря, строго ниже.
+    """
+    d = np.asarray(sr_cand, float) - np.asarray(sr_base, float)
+    return np.maximum(d, 0.0)
+
+
 def verdict_noninf(lo, hi, margin=MARGIN):
     """Три исхода не-хужести, и все три объявлены заранее."""
     if lo > -margin:
@@ -355,16 +392,26 @@ def main():
     if a.selftest:
         selftest()
         return 0
-    for nm, v in (("--base", a.base), ("--cand", a.cand), ("--ref", a.ref)):
+    for nm, v in (("--base", a.base), ("--ref", a.ref)):
         if not v:
             raise SystemExit(f"нужен {nm}")
+    # ДВУРУКИЙ ПУТЬ. Если на dev выбрана q0, на final руки q1 нет вовсе:
+    # раннер её не запускает. Требовать --cand значило бы отказать в анализе
+    # набора, собранного ровно по правилу §53.5.
+    if not a.cand:
+        if a.bank == "final" and a.chosen_from_dev != "q0":
+            raise SystemExit(
+                "без --cand анализ возможен только при --chosen-from-dev q0: "
+                "иначе кандидат обязан присутствовать")
+        if a.bank != "final":
+            raise SystemExit("--cand обязателен вне банка final")
     if not a.arts:
         raise SystemExit("нужны --arts")
     if os.path.exists(a.out) and not a.overwrite:
         raise SystemExit(f"{a.out} уже существует (--overwrite осознанно)")
 
     obs, meta = load(a.arts)
-    arms = [a.base, a.cand, a.ref]
+    arms = [x for x in (a.base, a.cand, a.ref) if x]
     for nm in arms:
         if nm not in meta:
             raise SystemExit(f"нет руки {nm}; есть {sorted(meta)}")
@@ -396,27 +443,92 @@ def main():
           f"{len(seeds)} (сиды {seeds}), реплик {a.boot}")
 
     sr = {nm: cluster_means(obs, nm, clusters, seeds) for nm in arms}
-    resc, harm = pair_rates(obs, a.base, a.cand, clusters, seeds)
-    vals = dict(sr_base=sr[a.base], sr_cand=sr[a.cand], sr_ref=sr[a.ref],
-                rescue=resc, harm=harm,
-                d_cand_base=sr[a.cand] - sr[a.base],
-                d_cand_ref=sr[a.cand] - sr[a.ref],
-                d_base_ref=sr[a.base] - sr[a.ref],
-                discord=resc + harm)
+    vals = {f"sr_{k}": sr[nm] for k, nm in
+            (("base", a.base), ("cand", a.cand), ("ref", a.ref))
+            if nm is not None}
+    # ТРИ ПАРЫ, А НЕ ОДНА. Дискордантность q0 против q1 НЕ ГОДИТСЯ для
+    # мощности не-хужести: та проверяется на паре q0 против BAR, и у неё своя
+    # дискордантность. Подстановка чужой пары в расчёт объёма — ошибка,
+    # допущенная в первом отчёте.
+    pairs = []
+    if a.cand:
+        pairs.append(("cand", "base", a.cand, a.base))
+        pairs.append(("cand", "ref", a.cand, a.ref))
+    pairs.append(("base", "ref", a.base, a.ref))
+    for tag_a, tag_b, arm_a, arm_b in pairs:
+        r_, h_ = pair_rates(obs, arm_b, arm_a, clusters, seeds)
+        vals[f"rescue_{tag_a}_{tag_b}"] = r_
+        vals[f"harm_{tag_a}_{tag_b}"] = h_
+        vals[f"discord_{tag_a}_{tag_b}"] = r_ + h_
+        vals[f"d_{tag_a}_{tag_b}"] = sr[arm_a] - sr[arm_b]
+    if a.cand:
+        # ИМЕНА ОСНОВНОЙ ПАРЫ СОХРАНЕНЫ: на них ссылаются правила §53.5.
+        vals["rescue"] = vals["rescue_cand_base"]
+        vals["harm"] = vals["harm_cand_base"]
+        vals["discord"] = vals["discord_cand_base"]
+        vals["d_cand_base"] = vals["d_cand_base"]
+    if a.cand:
+        vals["selector_ceiling"] = selector_ceiling(sr[a.base], sr[a.cand])
     ci, _draws = boot(vals, clusters, n=int(a.boot), seed=int(a.boot_seed))
     pt = {k: point(v, clusters) for k, v in vals.items()}
 
-    print(f"\n  {'величина':16s} {'точечно':>9s}  90% интервал")
-    for k in ("sr_base", "sr_cand", "sr_ref", "rescue", "harm", "discord"):
-        print(f"  {k:16s} {pt[k]:+9.4f}  [{ci[k][0]:+.4f}, {ci[k][1]:+.4f}]")
+    print(f"\n  {'величина':22s} {'точечно':>9s}  90% интервал")
+    for k in sorted(vals):
+        print(f"  {k:22s} {pt[k]:+9.4f}  [{ci[k][0]:+.4f}, {ci[k][1]:+.4f}]")
 
     # --- УЛУЧШЕНИЕ: двусторонний 90%, требуется q05 > 0 -------------------
+    if not a.cand:
+        # БЕЗ КАНДИДАТА УЛУЧШЕНИЕ НЕ ОПРЕДЕЛЕНО, И ЭТО ПИШЕТСЯ ЯВНО. «Что
+        # выбрали бы эти данные» здесь не «q0», а НЕНАБЛЮДАЕМО: руки q1 нет.
+        lo_imp = hi_imp = None
+        improved = None
+        chosen = a.chosen_from_dev
+        print(f"\n  КАНДИДАТА НЕТ: анализ двурукий ({a.base} против "
+              f"{a.ref}). Улучшение не определено, выбор взят из dev: "
+              f"{chosen}")
+        key = "d_base_ref"
+        lo_ni, hi_ni = ci[key]
+        vn = verdict_noninf(lo_ni, hi_ni, margin=float(a.margin))
+        print(f"  НЕ-ХУЖЕСТЬ {a.base} против {a.ref}: точечно {pt[key]:+.4f}, "
+              f"односторонняя 95% нижняя граница {lo_ni:+.4f} против порога "
+              f"{-float(a.margin):+.4f}\n    -> {vn}")
+        out2 = dict(
+            kind="k14q_behavior", bank=a.bank, two_arm=True,
+            arms=dict(base=a.base, cand=None, ref=a.ref),
+            n_clusters=len(clusters), n_tasks=n_task, seeds=seeds,
+            boot=int(a.boot), boot_seed=int(a.boot_seed),
+            margin=float(a.margin), point=pt, ci=ci,
+            improved=None, chosen_for_final=chosen,
+            chosen_from_dev=a.chosen_from_dev,
+            would_choose_here="not_observed",
+            completeness=complete, allow_partial=bool(a.allow_partial),
+            is_sensitivity=bool(a.sensitivity),
+            non_inferiority=dict(pair=key, lo=lo_ni, hi=hi_ni, verdict=vn),
+            diagnostics=fail_diag(obs, arms, clusters, seeds),
+            sources={nm: dict(files=meta[nm]["files"],
+                              sha1=meta[nm]["shas"],
+                              policy=meta[nm]["policy"]) for nm in arms},
+            note="двурукий анализ: кандидат не запускался по решению dev")
+        os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".",
+                    exist_ok=True)
+        t2 = a.out + f".tmp.{os.getpid()}"
+        json.dump(out2, open(t2, "w"), ensure_ascii=False, indent=1,
+                  default=str)
+        os.replace(t2, a.out)
+        print(f"\n  сохранено: {a.out}")
+        return 0
     lo_imp, hi_imp = ci["d_cand_base"]
     improved = bool(lo_imp > 0)
     print(f"\n  УЛУЧШЕНИЕ {a.cand} против {a.base}: точечно "
           f"{pt['d_cand_base']:+.4f}, двусторонний 90% "
           f"[{lo_imp:+.4f}, {hi_imp:+.4f}] -> "
           f"{'есть' if improved else 'не доказано'}")
+    print(f"\n  ПОТОЛОК СЕЛЕКТОРА (видит только начальное состояние): "
+          f"{pt['selector_ceiling']:+.4f} "
+          f"[{ci['selector_ceiling'][0]:+.4f}, "
+          f"{ci['selector_ceiling'][1]:+.4f}]")
+    print(f"    для сравнения P(rescue) = {pt['rescue']:+.4f} — это оракул "
+          f"ПОСТ-ФАКТУМ, он знает исход и выбирает задним числом")
     print(f"    сверка тождества: P(rescue) - P(harm) = "
           f"{pt['rescue'] - pt['harm']:+.6f}, разность SR "
           f"{pt['d_cand_base']:+.6f}")
@@ -497,9 +609,14 @@ def main():
     for nm in arms:
         d_ = diag["by_arm"][nm]
         if d_["n_fail"]:
-            print(f"    {nm:16s} провалов {d_['n_fail']:4d}, из них дошли до "
-                  f"схвата {d_['fail_with_grip']:4d}, медиана шага "
-                  f"завершения {d_['median_done_step']}")
+            # «ПОЛОЖИТЕЛЬНЫЙ ЗНАК КОМАНДЫ СХВАТА», А НЕ «ВЗЯЛ ОБЪЕКТ».
+            # Знак команды не доказывает ни того, что рука доехала, ни того,
+            # что схват сомкнулся на объекте: позы объекта у нас нет.
+            print(f"    {nm:16s} провалов {d_['n_fail']:4d}, из них с "
+                  f"положительной командой схвата "
+                  f"{d_['fail_with_grip_positive']:4d}; не завершилось "
+                  f"{d_['n_unfinished']:4d}; медиана шага завершения "
+                  f"{d_['median_done_step']}")
 
     out = dict(
         kind="k14q_behavior", bank=a.bank, arms=dict(base=a.base,
@@ -548,7 +665,7 @@ def fail_diag(obs, arms, clusters, seeds):
     """
     by = {}
     for nm in arms:
-        n_fail = grip = 0
+        n_fail = grip = unfinished = 0
         dones = []
         for (t, s) in clusters:
             for sd in seeds:
@@ -558,9 +675,17 @@ def fail_diag(obs, arms, clusters, seeds):
                     if e.get("grip_positive_step") is not None \
                             and int(e["grip_positive_step"]) >= 0:
                         grip += 1
-                if e.get("done_step") is not None:
-                    dones.append(int(e["done_step"]))
-        by[nm] = dict(n_fail=n_fail, fail_with_grip=grip,
+                # ШАГ ЗАВЕРШЕНИЯ −1 ОЗНАЧАЕТ «НЕ ЗАВЕРШИЛСЯ». Включать его
+                # в медиану значило бы считать незавершённый эпизод
+                # завершившимся на шаге минус один.
+                ds = e.get("done_step")
+                if ds is not None:
+                    if int(ds) >= 0:
+                        dones.append(int(ds))
+                    else:
+                        unfinished += 1
+        by[nm] = dict(n_fail=n_fail, fail_with_grip_positive=grip,
+                      n_unfinished=unfinished,
                       median_done_step=(int(np.median(dones)) if dones
                                         else None))
     base, cand = arms[0], arms[1]
@@ -587,6 +712,12 @@ def _art(arm, policy, task, i0, succ, seed, **kw):
              episodes=[dict(env_index=j, success=bool(s), init_state_id=i0 + j,
                             done_step=100 + j, success_step=(50 if s else -1),
                             grip_positive_step=(20 if s else -1),
+                            # ХЕШИ СТАРТА ОДИНАКОВЫ У ВСЕХ РУК ПО
+                            # ПОСТРОЕНИЮ: они зависят от задачи и состояния,
+                            # но не от руки — именно это и проверяет align.
+                            init_hash=f"IH_{task}_{i0 + j}",
+                            init_hash_full=f"IF_{task}_{i0 + j}",
+                            rollout_seed=int(seed),
                             action_sha1=f"{arm}{task}{i0 + j}")
                        for j, s in enumerate(succ)])
     d.update(kw)
@@ -718,6 +849,53 @@ def selftest():
         assert not s7b[7]["included"]
         sec3 = secondary_tasks(o3, "q0", cl3, [101], min_p_fail=0.41)
         assert not sec3[0]["included"]
+
+    # --- ПОЛНОТА БАНКА: ПРЯМЫЕ ТЕСТЫ (их не было, и это было замечено) ---
+    full_cl = [(t, st) for t in BANK_TASKS for st in BANK_STATES["dev"]]
+    mt = {nm: dict(script_shas={"S1"}) for nm in ("q0", "q1", "bar")}
+    ok_c = check_complete("dev", full_cl, BANK_SEEDS["dev"], mt,
+                          ("q0", "q1", "bar"))
+    assert ok_c["n_clusters"] == 250 and ok_c["script_sha1"] == "S1"
+    assert ok_c["registered_seeds"] == BANK_SEEDS["dev"]
+    for cl_, sd_, mt_, why in (
+            (full_cl[:-1], BANK_SEEDS["dev"], mt, "не целиком"),
+            (full_cl + [(0, 99)], BANK_SEEDS["dev"], mt, "лишних"),
+            (full_cl, [101], mt, "сиды повторов"),
+            (full_cl, [101, 102, 103], mt, "сиды повторов"),
+            (full_cl, BANK_SEEDS["dev"],
+             {nm: dict(script_shas={"S1", "S2"}) for nm in mt}, "версиями")):
+        try:
+            check_complete("dev", cl_, sd_, mt_, ("q0", "q1", "bar"))
+        except SystemExit as e:
+            assert why in str(e), (why, e)
+        else:
+            raise AssertionError(f"принят неполный банк: {why}")
+    try:
+        check_complete("final", full_cl, BANK_SEEDS["final"], mt,
+                       ("q0", "q1", "bar"))
+    except SystemExit as e:
+        assert "не целиком" in str(e), e
+    else:
+        raise AssertionError("состояния dev приняты за final")
+    assert check_complete(
+        "final", [(t, st) for t in BANK_TASKS for st in BANK_STATES["final"]],
+        BANK_SEEDS["final"], mt, ("q0", "q1", "bar"))["n_clusters"] == 250
+    try:
+        check_complete("xxx", full_cl, BANK_SEEDS["dev"], mt, ("q0",))
+    except SystemExit as e:
+        assert "неизвестен" in str(e), e
+    else:
+        raise AssertionError("принят неизвестный банк")
+
+    # --- ПОТОЛОК СЕЛЕКТОРА НЕ ВЫШЕ ОРАКУЛА ПОСТ-ФАКТУМ -------------------
+    # кластер, где кандидат спас один повтор и сломал другой: оракул
+    # засчитает спасение, селектор — ноль, потому что решает до исполнения.
+    b_ = np.array([0.5, 1.0, 0.0])
+    c_ = np.array([0.5, 0.5, 1.0])
+    sc = selector_ceiling(b_, c_)
+    assert sc.tolist() == [0.0, 0.0, 1.0], sc.tolist()
+    assert sc.mean() <= 1.0 / 3 + 1e-12
+    assert (selector_ceiling(b_, b_) == 0).all()
 
     # --- ТРИ ИСХОДА НЕ-ХУЖЕСТИ -------------------------------------------
     assert verdict_noninf(-0.01, +0.02) == "не-хужесть доказана"
