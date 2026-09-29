@@ -228,10 +228,17 @@ SECONDARY_MIN_PFAIL = 0.2      # §53.7: порог доли провалов q0
 # четверти банка дал бы интервал не того набора, а надпись стояла бы про банк.
 BANK_STATES = dict(dev=list(range(0, 25)), final=list(range(25, 50)))
 BANK_TASKS = list(range(10))
-BANK_SEEDS = [101, 102, 103, 104]
+# ПОВТОРЫ ДЛЯ РЕШЕНИЯ ФИКСИРОВАНЫ ДО ДАННЫХ (§53.8). Зарегистрированный
+# максимум — 101..104, но решение принимается на объявленном ПОДМНОЖЕСТВЕ:
+# смотреть на два и потом решать, добирать ли ещё, — это остановка по
+# результату, и она завышает частоту ложных находок. Сиды 103 и 104
+# остаются на ОТДЕЛЬНЫЙ анализ чувствительности, помеченный как таковой.
+BANK_SEEDS = dict(dev=[101, 102], final=[101, 102])
+BANK_SEEDS_RESERVE = [103, 104]
 
 
-def check_complete(bank, clusters, seeds, meta, arms):
+def check_complete(bank, clusters, seeds, meta, arms,
+                   expect_seeds=None):
     """Банк покрыт ЦЕЛИКОМ: задачи, состояния, сиды, одна версия кода."""
     if bank not in BANK_STATES:
         raise SystemExit(f"банк {bank!r} неизвестен: {sorted(BANK_STATES)}")
@@ -245,10 +252,13 @@ def check_complete(bank, clusters, seeds, meta, arms):
             f"{len(want_cl)}, нет {len(miss)} (например {miss[:4]}), лишних "
             f"{len(extra)} (например {extra[:4]}). Решение по неполному банку "
             f"относилось бы не к банку")
-    if sorted(seeds) != BANK_SEEDS:
+    want_seeds = expect_seeds if expect_seeds is not None \
+        else BANK_SEEDS[bank]
+    if sorted(seeds) != sorted(want_seeds):
         raise SystemExit(
-            f"сиды повторов {sorted(seeds)}, а зарегистрированы {BANK_SEEDS}: "
-            f"анализ по части повторов — это другой набор")
+            f"сиды повторов {sorted(seeds)}, а для решения зарегистрированы "
+            f"{sorted(want_seeds)}: анализ по другому набору повторов — это "
+            f"другой набор")
     shas = set()
     for nm in arms:
         shas |= set(meta[nm].get("script_shas", ()))
@@ -256,6 +266,8 @@ def check_complete(bank, clusters, seeds, meta, arms):
         raise SystemExit(
             f"артефакты сняты разными версиями k9h: {sorted(shas)}")
     return dict(bank=bank, n_clusters=len(got_cl), seeds=sorted(seeds),
+                registered_seeds=sorted(want_seeds),
+                reserve_seeds=list(BANK_SEEDS_RESERVE),
                 script_sha1=(sorted(shas)[0] if shas else None))
 
 
@@ -307,6 +319,12 @@ def main():
     ap.add_argument("--boot-seed", type=int, default=BOOT_SEED)
     ap.add_argument("--bank", default="", choices=("", "dev", "final"),
                     help="какой банк анализируется")
+    ap.add_argument("--expect-seeds", default="",
+                    help="другой набор повторов, чем зарегистрированный. "
+                         "Только вместе с --sensitivity")
+    ap.add_argument("--sensitivity", action="store_true",
+                    help="пометить результат как анализ ЧУВСТВИТЕЛЬНОСТИ, а "
+                         "не как основное решение")
     ap.add_argument("--allow-partial", action="store_true",
                     help="разрешить анализ НЕПОЛНОГО банка. Только для "
                          "отладки: решение по четверти банка относилось бы "
@@ -344,7 +362,16 @@ def main():
     clusters, seeds = align(obs, arms)
     complete = None
     if a.bank and not a.allow_partial:
-        complete = check_complete(a.bank, clusters, seeds, meta, arms)
+        exp_sd = ([int(x) for x in a.expect_seeds.replace(",", " ").split()]
+                  if a.expect_seeds else None)
+        if exp_sd is not None and not a.sensitivity:
+            raise SystemExit(
+                "--expect-seeds меняет набор повторов, на котором принимается "
+                "решение. Это допустимо ТОЛЬКО как анализ чувствительности: "
+                "добавьте --sensitivity, и результат будет помечен как "
+                "неосновной")
+        complete = check_complete(a.bank, clusters, seeds, meta, arms,
+                                  expect_seeds=exp_sd)
         print(f"  банк {a.bank} покрыт целиком: {complete['n_clusters']} "
               f"кластеров, сиды {complete['seeds']}, k9h "
               f"{complete['script_sha1']}")
@@ -479,6 +506,7 @@ def main():
         chosen_from_dev=(a.chosen_from_dev or None),
         would_choose_here=choose_for_final(lo_imp),
         completeness=complete, allow_partial=bool(a.allow_partial),
+        is_sensitivity=bool(a.sensitivity),
         non_inferiority=dict(pair=key, lo=lo_ni, hi=hi_ni, verdict=vn),
         feasibility_37=dict(p_fail=p_fail, discord=pt["discord"],
                             delta=float(a.delta), limit=lim,
