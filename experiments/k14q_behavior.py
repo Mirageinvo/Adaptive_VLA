@@ -285,9 +285,18 @@ def secondary_tasks(obs, base_arm, clusters, seeds,
         by.setdefault(int(t), []).extend(v)
     out = {}
     for t, v in sorted(by.items()):
-        pf = 1.0 - float(np.mean(v))
-        out[t] = dict(p_fail=pf, n=len(v),
-                      included=bool(pf >= float(min_p_fail)))
+        n_obs = len(v)
+        n_fail = int(sum(1 for x in v if not x))
+        pf = n_fail / float(n_obs)
+        # СРАВНЕНИЕ СЧЁТОМ, А НЕ ДОЛЕЙ С ПОРОГОМ. При 10 провалах из 50
+        # 1 - 40/50 даёт 0.19999999999999996, и задача, ровно попадающая на
+        # порог 0.2, ОТБРАСЫВАЛАСЬ. На банке dev это исключило задачу 9.
+        # Целые числа сравниваются точно: n_fail/n >= p ровно тогда, когда
+        # n_fail * знаменатель >= n * числитель.
+        from fractions import Fraction
+        fr = Fraction(float(min_p_fail)).limit_denominator(10 ** 6)
+        inc = (n_fail * fr.denominator >= n_obs * fr.numerator)
+        out[t] = dict(p_fail=pf, n=n_obs, n_fail=n_fail, included=bool(inc))
     return out
 
 
@@ -697,6 +706,16 @@ def selftest():
         # порог ровно на границе -> включена
         sec2 = secondary_tasks(o3, "q0", cl3, [101], min_p_fail=0.4)
         assert sec2[0]["included"]
+        # ГРАНИЦА СЧИТАЕТСЯ ТОЧНО. 10 провалов из 50 — это ровно 0.2, и
+        # задача обязана попасть; через 1 - 40/50 она отбрасывалась.
+        fake = {}
+        for i in range(50):
+            fake[("q0", 7, i, 101)] = dict(success=(i >= 10))
+        cl_f = [(7, i) for i in range(50)]
+        s7 = secondary_tasks(fake, "q0", cl_f, [101], min_p_fail=0.2)
+        assert s7[7]["n_fail"] == 10 and s7[7]["included"], s7[7]
+        s7b = secondary_tasks(fake, "q0", cl_f, [101], min_p_fail=0.21)
+        assert not s7b[7]["included"]
         sec3 = secondary_tasks(o3, "q0", cl3, [101], min_p_fail=0.41)
         assert not sec3[0]["included"]
 
