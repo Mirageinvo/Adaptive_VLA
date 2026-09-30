@@ -631,9 +631,11 @@ def selftest() -> None:
     assert not torch.equal(moved["cumulative_latents"][1], old_z1)
 
     print(
-        "depth_aligned_joint12 selftest passed: legacy/new initialization "
-        "is bitwise identical, zero feedback1 is an identity, C0/q0/backbone "
-        "stay frozen, C1/C2 and both depth stages receive finite gradients"
+        "depth_aligned_joint12 selftest passed: legacy/new logits and codes "
+        "are bitwise equal and the new embeddings are exactly the hard book "
+        "rows (the legacy ST expression is not, by design); zero feedback1 "
+        "is an identity, C0/q0/backbone stay frozen, C1/C2 and both depth "
+        "stages receive finite gradients"
     )
 
 

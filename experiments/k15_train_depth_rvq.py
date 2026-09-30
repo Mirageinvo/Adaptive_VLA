@@ -52,6 +52,11 @@ import numpy as np
 
 H_EXEC = 8            # исполняемых позиций чанка, как в K-14
 PATH_NAMES = ("a0", "a1_tok", "a1_pol", "a2_tok", "a2_pol")
+# ГЕЙТ K-15a: СКОЛЬКО БАТЧЕЙ И КАКИЕ ПРИЧИННЫЕ ПРОВЕРКИ ТРЕБУЮТСЯ.
+# Требование живёт в тренере, а не берётся из проверяемого артефакта.
+GATE_MIN_BATCHES = 3
+GATE_CAUSAL_KINDS = ("feedback0_changes_q1", "feedback1_changes_q2",
+                     "probe_old_vs_new_bounded")
 EPS_NORM = 1e-6       # нижний предел нормировки на q0 MSE
 # Веса функции потерь из плана K-15. Изменение любого — новый эксперимент.
 W_A1_POL, W_A1_TOK, W_A2_POL, W_A2_TOK = 0.5, 0.5, 1.0, 0.5
@@ -100,17 +105,21 @@ def check_init_gate(path, *, expect, file_sha, code_version,
     # проходило и в том случае, когда проверка отработала на первом батче и
     # молча пропала на остальных.
     n_batches = int(g.get("n_batches") or 0)
-    if n_batches <= 0:
-        raise SystemExit("в гейте K-15a нет n_batches")
-    kinds = ("feedback0_changes_q1", "feedback1_changes_q2",
-             "probe_old_vs_new_bounded")
-    counts = {k: sum(1 for name in causal if name.endswith(k))
-              for k in kinds}
-    if any(v != n_batches for v in counts.values()):
+    if n_batches < GATE_MIN_BATCHES:
         raise SystemExit(
-            f"причинные проверки неполны: на {n_batches} батчей получено "
-            f"{counts}. Проверка, отработавшая не на всех батчах, "
-            f"доказывает меньше, чем записано в её названии")
+            f"в гейте K-15a батчей {n_batches}, минимум {GATE_MIN_BATCHES}. "
+            f"Артефакт не должен сам назначать себе планку: сверка «по "
+            f"числу батчей из артефакта» проходила и при одном батче")
+    # ТОЧНОЕ МНОЖЕСТВО КЛЮЧЕЙ, А НЕ ИХ КОЛИЧЕСТВО. Подсчёт по суффиксам
+    # проходил при постороннем ключе и при пропуске батча с номером в
+    # середине.
+    expected_causal = {f"batch{i}.{k}"
+                       for i in range(n_batches) for k in GATE_CAUSAL_KINDS}
+    if set(causal) != expected_causal:
+        raise SystemExit(
+            f"набор причинных проверок не тот: нет "
+            f"{sorted(expected_causal - set(causal))[:4]}, посторонние "
+            f"{sorted(set(causal) - expected_causal)[:4]}")
     # АРХИТЕКТУРНЫЕ ФАЙЛЫ СВЕРЯЮТСЯ ПОСОДЕРЖИМОМУ, А НЕ ПО git HEAD.
     # Правка тренера не обязана обесценивать гейт; правка архитектуры
     # обязана, и молча пройти не должна.
@@ -146,6 +155,30 @@ def check_init_gate(path, *, expect, file_sha, code_version,
                 init_gate_causal=len(causal),
                 init_gate_code_version=dict(code_version),
                 decoder_context=dict(decoder_context))
+
+
+def frozen_checksum(model, torch, trainable_names):
+    """Отпечаток всех ЗАМОРОЖЕННЫХ тензоров модели.
+
+    Считается на устройстве по (numel, сумма, сумма квадратов) во float64 и
+    хешируется. Побитовая сверка кодов q0 доказывает, что не поехал уровень
+    0; эта сумма доказывает, что не поехало НИЧЕГО из замороженного, включая
+    то, что на q0 не влияет.
+    """
+    import hashlib as _h
+    acc = _h.sha1()
+    n_tensors = 0
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if name in trainable_names:
+                continue
+            n_tensors += 1
+            v = p.detach().double()
+            acc.update(name.encode())
+            acc.update(np.asarray(
+                [float(p.numel()), float(v.sum()), float((v * v).sum())],
+                np.float64).tobytes())
+    return acc.hexdigest()[:12], n_tensors
 
 
 def weighted_row_error(predicted, target, weights, torch):
@@ -433,6 +466,30 @@ def selftest():
     # по тем же числам, что среднее.
     assert abs(float(rows2.mean()) - st2["rel_residual"]) < 1e-6
 
+    # --- ОТПЕЧАТОК ЗАМОРОЖЕННЫХ ВЕСОВ -------------------------------------
+    import torch.nn as nn_
+    toy = nn_.Module()
+    toy.free = nn_.Linear(3, 3)
+    toy.frozen = nn_.Linear(3, 3)
+    train_names = {"free.weight", "free.bias"}
+    sha_a, n_a = frozen_checksum(toy, torch, train_names)
+    assert n_a == 2, n_a
+    with torch.no_grad():
+        toy.free.weight += 1.0            # обучаемое: отпечаток не меняется
+    sha_b, _ = frozen_checksum(toy, torch, train_names)
+    assert sha_b == sha_a, "отпечаток зависит от обучаемых весов"
+    with torch.no_grad():
+        toy.frozen.bias[0] += 1e-3        # замороженное: обязан измениться
+    sha_c, _ = frozen_checksum(toy, torch, train_names)
+    assert sha_c != sha_a, "сдвиг замороженного веса не изменил отпечаток"
+    # ПЕРЕСТАНОВКА ЗНАКОВ НЕ ПРОХОДИТ: сумма одна, сумма квадратов одна, но
+    # имена и порядок входят в хеш, поэтому проверяем именно сдвиг знака.
+    with torch.no_grad():
+        toy.frozen.bias[0] -= 1e-3
+        toy.frozen.weight[0, 0] *= -1.0
+    sha_d, _ = frozen_checksum(toy, torch, train_names)
+    assert sha_d != sha_a, "смена знака замороженного веса не замечена"
+
     # --- ПРОГНОЗ ВРЕМЕНИ --------------------------------------------------
     f = forecast_runtime(100.0, 100, 16951, 3)
     assert abs(f["per_batch_s"] - 1.0) < 1e-9
@@ -463,12 +520,12 @@ def selftest():
     dctx = {"autocast": "disabled", "channels": 7}
     cfp = {"codebooks_sha1": "c1", "codec_state_sha1": "c2",
            "decoder_probe": "c3"}
-    kinds = ("feedback0_changes_q1", "feedback1_changes_q2",
-             "probe_old_vs_new_bounded")
+    kinds = GATE_CAUSAL_KINDS
+    NB = GATE_MIN_BATCHES
     good = dict(kind="k15_init_identity", passed=True, git_dirty=False,
-                run_id="R", n_batches=2,
+                run_id="R", n_batches=NB,
                 causal_checks={f"batch{i}.{k}": True
-                               for i in range(2) for k in kinds},
+                               for i in range(NB) for k in kinds},
                 code_version=cv, decoder_context=dctx, codec=cfp,
                 **expect)
     fixed = dict(code_version=cv, decoder_context=dctx,
@@ -479,10 +536,42 @@ def selftest():
             json.dump(obj, open(q, "w"))
             return q
         info = check_init_gate(w(good), expect=expect, **fixed)
-        assert info["init_gate_causal"] == 6 and info["init_gate_run_id"] == "R"
-        assert info["init_gate_n_batches"] == 2
+        assert info["init_gate_causal"] == NB * len(kinds)
+        assert info["init_gate_run_id"] == "R"
+        assert info["init_gate_n_batches"] == NB
         assert info["decoder_context"] == dctx
         half = {f"batch0.{k}": True for k in kinds}
+        # АРТЕФАКТ НЕ НАЗНАЧАЕТ СЕБЕ ПЛАНКУ САМ: один батч с полным набором
+        # своих ключей раньше проходил.
+        one = dict(good, n_batches=1,
+                   causal_checks={f"batch0.{k}": True for k in kinds})
+        try:
+            check_init_gate(w(one, "one.json"), expect=expect, **fixed)
+        except SystemExit as e:
+            assert "минимум" in str(e), e
+        else:
+            raise AssertionError("гейт из одного батча принят")
+        # ПОСТОРОННИЙ КЛЮЧ
+        extra = dict(good, causal_checks=dict(good["causal_checks"],
+                                              **{"batch9.чужое": True}))
+        try:
+            check_init_gate(w(extra, "ex.json"), expect=expect, **fixed)
+        except SystemExit as e:
+            assert "посторонние" in str(e), e
+        else:
+            raise AssertionError("гейт с посторонним ключом принят")
+        # ПРОПУЩЕН БАТЧ В СЕРЕДИНЕ, А ОБЩЕЕ ЧИСЛО КЛЮЧЕЙ СОВПАДАЕТ
+        gap = {f"batch{i}.{k}": True for i in (0, 2) for k in kinds}
+        gap[f"batch7.{kinds[0]}"] = True
+        gap[f"batch7.{kinds[1]}"] = True
+        gap[f"batch7.{kinds[2]}"] = True
+        try:
+            check_init_gate(w(dict(good, causal_checks=gap), "gap.json"),
+                            expect=expect, **fixed)
+        except SystemExit as e:
+            assert "не тот" in str(e), e
+        else:
+            raise AssertionError("гейт с пропущенным батчем принят")
         for mut, why in (
                 ({"passed": False}, "не пройден"),
                 ({"kind": "x"}, "описывает"),
@@ -491,12 +580,12 @@ def selftest():
                 ({"causal_checks": dict(good["causal_checks"],
                                         **{"batch0.feedback0_changes_q1":
                                            False})}, "причинных проверок"),
-                # проверка отработала на первом батче и пропала на втором
-                ({"causal_checks": half}, "неполны"),
+                # проверка отработала на первом батче и пропала дальше
+                ({"causal_checks": half}, "не тот"),
                 # новый вид причинной проверки отсутствует целиком
-                ({"causal_checks": {f"batch{i}.{k}": True for i in range(2)
-                                    for k in kinds[:2]}}, "неполны"),
-                ({"n_batches": 0}, "n_batches"),
+                ({"causal_checks": {f"batch{i}.{k}": True for i in range(NB)
+                                    for k in kinds[:2]}}, "не тот"),
+                ({"n_batches": 0}, "минимум"),
                 ({"code_version": dict(cv, **{"bar.py": "ДРУГОЙ"})},
                  "архитектура изменилась"),
                 ({"code_version": {"bar.py": "bbb"}},
@@ -589,6 +678,16 @@ def main():
         print("  --smoke без --limit: беру 2 канонических батча на часть")
     if a.seed is None:
         raise SystemExit("--seed задаётся явно, умолчания у него нет")
+    if float(a.tau_policy) != 1.0:
+        # ПРИ tau_policy != 1 ДВА МЕСТА РАСХОДЯТСЯ: жёсткий выбор политики
+        # использует температуру, а выравнивание получает СЫРЫЕ логиты
+        # политики, то есть работает при tau = 1. Это было бы молча другим
+        # экспериментом, поэтому запрещено до согласования распределений.
+        raise SystemExit(
+            f"--tau-policy {a.tau_policy}: выравнивание считается по сырым "
+            f"логитам политики, то есть при tau=1, а её жёсткий выбор — по "
+            f"масштабированным. Пока эти два места не согласованы, "
+            f"допустимо только 1.0")
     out_path = a.out or (f"data/k15/{'smoke' if a.smoke else 'depth_rvq'}"
                          f"_s{a.seed}.pt")
     if os.path.exists(out_path) and not a.overwrite:
@@ -838,6 +937,27 @@ def main():
     ac16 = torch.autocast(device_type=dev.type, dtype=dt)
     run_batch_checked = [False]
     decode_batched = [None, 0.0]
+    q0_can_dev = torch.as_tensor(np.asarray(q0_can), device=dev)
+    pending_q0 = [None]
+    pending_bad_action = [None]
+    action_shape_checked = [False]
+
+    def check_pending():
+        """Чтение отложенных счётчиков: q0 и конечность пяти действий."""
+        if pending_q0[0] is not None:
+            bad = int(pending_q0[0])
+            pending_q0[0] = None
+            if bad:
+                raise SystemExit(
+                    f"q0 разошёлся с каноническим в {bad} позициях: "
+                    f"обучение относилось бы к другому черновику")
+        if pending_bad_action[0] is not None:
+            bad = int(pending_bad_action[0])
+            pending_bad_action[0] = None
+            if bad:
+                raise SystemExit(
+                    f"в декодированных действиях {bad} нечисловых значений: "
+                    f"дальше считалась бы потеря по nan")
 
     def run_batch(po, sel, train):
         # флаг однократной проверки; список, чтобы не объявлять nonlocal
@@ -849,14 +969,14 @@ def main():
             out = model.forward_depth_aligned_rvq(
                 vlm_inputs_embeds=v, attention_mask=am, position_ids=p_ids,
                 mode="full", tau=float(a.tau_policy))
-        # q0 СВЕРЯЕТСЯ ПОБИТОВО НА КАЖДОМ БАТЧЕ. Расхождение означает, что
-        # черновик поехал, и всё обучение относится не к тому q0.
-        q0_now = out["pred_codes"][0].detach().cpu().numpy()
-        bad = int((q0_now != q0_can[sel]).sum())
-        if bad:
-            raise SystemExit(
-                f"q0 разошёлся с каноническим в {bad} позициях: обучение "
-                f"относилось бы к другому черновику")
+        # q0 СВЕРЯЕТСЯ НА КАЖДОМ БАТЧЕ, НО НА УСТРОЙСТВЕ. Сравнение идёт
+        # каждый батч; на хост счётчик читается в оценке сразу, а в
+        # обучении — раз в несколько сотен батчей, потому что чтение
+        # одного int с GPU останавливает конвейер.
+        q0_bad = (out["pred_codes"][0].detach()
+                  != q0_can_dev[torch.as_tensor(sel, device=dev)]).sum()
+        pending_q0[0] = q0_bad if pending_q0[0] is None \
+            else pending_q0[0] + q0_bad
         c1 = model.depth_aligned_book(1)
         c2 = model.depth_aligned_book(2)
         z0 = out["policy_embeddings"][0]
@@ -914,6 +1034,24 @@ def main():
             acts = dict(zip(names5, dec.chunk(len(lat5), dim=0)))
         else:
             acts = {n_: decode_fp32(x) for n_, x in zip(names5, lat5)}
+        # ФОРМА И ТИП ПЯТИ ДЕЙСТВИЙ ПРОВЕРЯЮТСЯ ОДИН РАЗ, КОНЕЧНОСТЬ —
+        # КАЖДЫЙ БАТЧ. Разошедшаяся форма — ошибка сборки и появится на
+        # первом же батче; nan появляется в середине обучения.
+        if not action_shape_checked[0]:
+            action_shape_checked[0] = True
+            want = (int(len(sel)), int(action.shape[1]), 7)
+            for n_, x_ in acts.items():
+                if tuple(x_.shape) != want:
+                    raise SystemExit(
+                        f"путь {n_} имеет форму {tuple(x_.shape)}, "
+                        f"ожидалось {want}")
+                if x_.dtype != torch.float32:
+                    raise SystemExit(f"путь {n_} имеет тип {x_.dtype}, "
+                                     f"ожидался float32")
+            print(f"  пять путей: форма {want}, тип float32")
+        bad_act = sum((~torch.isfinite(x_)).sum() for x_ in acts.values())
+        pending_bad_action[0] = bad_act if pending_bad_action[0] is None \
+            else pending_bad_action[0] + bad_act
         paths = dict(
             q1_tok_logits=q1_tok_logits,
             q1_pol_logits=out["logits"][1].float(),
@@ -984,6 +1122,10 @@ def main():
                     q0_logits_sha=hashlib.sha1(np.ascontiguousarray(
                         out["logits"][0].detach().float().cpu().numpy()
                     ).tobytes()).hexdigest()[:12])
+        if not train:
+            # В ОЦЕНКЕ ОТЛОЖЕННЫЕ СЧЁТЧИКИ ЧИТАЮТСЯ СРАЗУ: она и так
+            # синхронизируется, а решение принимается по её числам.
+            check_pending()
         return (total if train else None), stat
 
     PATHS5 = PATH_NAMES
@@ -1001,6 +1143,7 @@ def main():
         acc.update(a2_pol_eq=0.0, frac_worse=0.0, d_latent_q1=0.0,
                    d_latent_q2=0.0)
         n_rows = 0
+        dmax = {"d_action_q1": 0.0, "d_action_q2": 0.0}
         codes = {k: [] for k in ("q1_pol", "q2_pol", "q1_tok", "q2_tok")}
         sup_rows, ref_rows, rows_keep = [], [], []
         with torch.no_grad():
@@ -1014,6 +1157,11 @@ def main():
                 acc["frac_worse"] += stat["frac_worse_than_q0"] * w
                 acc["d_latent_q1"] += stat["d_latent_q1"] * w
                 acc["d_latent_q2"] += stat["d_latent_q2"] * w
+                # МАКСИМУМЫ АГРЕГИРУЮТСЯ МАКСИМУМОМ, А НЕ СРЕДНИМ. Они
+                # считались в run_batch и терялись в evaluate — ровно та же
+                # ошибка, из-за которой пропадали два из пяти путей.
+                for k_ in ("d_action_q1", "d_action_q2"):
+                    dmax[k_] = max(dmax[k_], float(stat[k_]))
                 # КОДЫ ХРАНЯТСЯ С ПОЗИЦИЯМИ, А НЕ СПЛЮЩЕННЫМИ: схлопывание
                 # бывает позиционным — книга жива в среднем и мертва на
                 # первой позиции чанка, которая и исполняется.
@@ -1052,6 +1200,7 @@ def main():
                     rows_keep.append({k: stat[f"row_{k}"] for k in PATHS5})
         n = max(n_rows, 1)
         res = {k: v / n for k, v in acc.items()}
+        res.update(dmax)
         for k in PATHS5:
             res[f"rms_{k}"] = float(np.sqrt(res[k]))
         for name, key in (("usage_q1", "q1_pol"), ("usage_q2", "q2_pol"),
@@ -1081,12 +1230,23 @@ def main():
                     s["perplexity"] for s in per_pos[:H_EXEC])))
         sup_all = torch.cat(sup_rows) if sup_rows else None
         ref_all = torch.cat(ref_rows) if ref_rows else None
+        # ОПОРА ДЕКОДЕРА СЧИТАЕТСЯ ТОЛЬКО ДЛЯ a2_pol — ИСПОЛНЯЕМОГО ПУТИ.
+        # Это гейт перед роллаутом, а не полная диагностика: пять путей,
+        # цикл decode->encode и суммы исходных книг как отдельная опора
+        # остаются работой перед поведенческим пилотом.
         res["decoder_support"] = None if sup_all is None else dict(
+            scope="final path a2_pol only",
             rel_residual=float(sup_all.mean()),
+            rel_residual_median=float(sup_all.median()),
             rel_residual_p95=float(torch.quantile(sup_all, 0.95)),
+            rel_residual_p99=float(torch.quantile(sup_all, 0.99)),
             rel_residual_max=float(sup_all.max()),
             reference_rel_residual=float(ref_all.mean()),
+            reference_rel_residual_median=float(ref_all.median()),
             reference_rel_residual_p95=float(torch.quantile(ref_all, 0.95)),
+            reference_rel_residual_p99=float(torch.quantile(ref_all, 0.99)),
+            share_above_reference_p99=float(
+                (sup_all > torch.quantile(ref_all, 0.99)).float().mean()),
             n=int(sup_all.numel()),
             reference="собственная ошибка квантования кодека на истинном "
                       "латенте того же батча")
@@ -1100,7 +1260,9 @@ def main():
               f"{res['rms_a2_pol']:.6f}; хуже q0 "
               f"{100 * res['frac_worse']:.1f}% строк")
         print(f"      поправка: |c1|/|z0| {res['d_latent_q1']:.4f}, "
-              f"|c2|/|z0| {res['d_latent_q2']:.4f}")
+              f"|c2|/|z0| {res['d_latent_q2']:.4f}; max|a1-a0| "
+              f"{res['d_action_q1']:.5f}, max|a2-a1| "
+              f"{res['d_action_q2']:.5f}")
         for lv in (1, 2):
             up, uq = res[f"usage_q{lv}"], res[f"usage_q{lv}_tok"]
             print(f"      книга {lv}: P perplexity {up['perplexity']:.1f}, "
@@ -1110,10 +1272,15 @@ def main():
                   f"макс доля {uq['max_code_share']:.3f}")
         if res["decoder_support"]:
             ds = res["decoder_support"]
-            print(f"      опора декодера: остаток {ds['rel_residual']:.4f} "
-                  f"(p95 {ds['rel_residual_p95']:.4f}) против эталона "
-                  f"{ds['reference_rel_residual']:.4f} "
-                  f"(p95 {ds['reference_rel_residual_p95']:.4f})")
+            print(f"      опора декодера (только a2_pol): остаток "
+                  f"{ds['rel_residual']:.4f}, медиана "
+                  f"{ds['rel_residual_median']:.4f}, p95 "
+                  f"{ds['rel_residual_p95']:.4f}, p99 "
+                  f"{ds['rel_residual_p99']:.4f}; эталон "
+                  f"{ds['reference_rel_residual']:.4f}, p95 "
+                  f"{ds['reference_rel_residual_p95']:.4f}, p99 "
+                  f"{ds['reference_rel_residual_p99']:.4f}; выше эталонного "
+                  f"p99 {100 * ds['share_above_reference_p99']:.1f}% строк")
         return res
 
     # --- ОБУЧЕНИЕ ---------------------------------------------------------
@@ -1135,6 +1302,19 @@ def main():
     print(f"  операций, зависящих от режима: нет "
           f"(проверено {sum(1 for _ in model.named_modules())} модулей)")
 
+    trainable_set = set(info["names"])
+    frozen_sha0, n_frozen = frozen_checksum(model, torch, trainable_set)
+    print(f"  замороженных тензоров {n_frozen}, их отпечаток {frozen_sha0}")
+
+    def check_frozen(tag):
+        sha_, n_ = frozen_checksum(model, torch, trainable_set)
+        if sha_ != frozen_sha0 or n_ != n_frozen:
+            raise SystemExit(
+                f"{tag}: отпечаток замороженных весов {sha_} ({n_} "
+                f"тензоров) против {frozen_sha0} ({n_frozen}) до обучения. "
+                f"Что-то вне белого списка изменилось")
+        return sha_
+
     history = []
     val0 = evaluate(parts["val_sel"], "эпоха 0, без обучения")
     history.append(dict(epoch=0, train_loss=None,
@@ -1143,6 +1323,44 @@ def main():
     snapshots = {0: {k: v.detach().clone()
                      for k, v in model.state_dict().items()
                      if k in set(info["names"])}}
+    if a.smoke:
+        # SMOKE ПРОВЕРЯЕТ, ЧТО ОПТИМИЗАТОР ДЕЙСТВИТЕЛЬНО УЧИТ. Три шага по
+        # ОДНОМУ И ТОМУ ЖЕ микробатчу обязаны уменьшить на нём потерю: иначе
+        # связность собрана, а обучения нет, и это выяснилось бы только
+        # через часы полного прогона.
+        po0, sel0 = parts["train"][0]
+        probe_losses = []
+        for _ in range(3):
+            opt.zero_grad(set_to_none=True)
+            l_probe, _s_probe = run_batch(po0, sel0, True)
+            probe_losses.append(float(l_probe.detach()))
+            l_probe.backward()
+            opt.step()
+        with torch.no_grad():
+            own_p = dict(model.state_dict())
+            for k_, v_ in snapshots[0].items():
+                own_p[k_].copy_(v_)
+        opt.state.clear()
+        opt.zero_grad(set_to_none=True)
+        check_frozen("проба обучаемости")
+        print("  проба обучаемости на одном микробатче: "
+              + " -> ".join(f"{x:.5f}" for x in probe_losses))
+        if not probe_losses[-1] < probe_losses[0]:
+            raise SystemExit(
+                f"три шага по одному микробатчу не уменьшили потерю "
+                f"({probe_losses}): оптимизатор собран, но не учит")
+        sha_back, _n = frozen_checksum(model, torch, trainable_set)
+        st_back = k14c.state_sha({k_: model.state_dict()[k_].detach().float()
+                                  .cpu().numpy() for k_ in info["names"]})
+        st_zero = k14c.state_sha({k_: v_.detach().float().cpu().numpy()
+                                  for k_, v_ in snapshots[0].items()})
+        if st_back != st_zero:
+            raise SystemExit(
+                f"после пробы веса не восстановились: {st_back} против "
+                f"{st_zero}")
+        print(f"  веса после пробы восстановлены побитово ({st_back}), "
+              f"замороженное {sha_back}")
+
     forecast = None
     t_start = time.time()
     order = list(parts["train"])
@@ -1177,6 +1395,7 @@ def main():
                 # обучаемого фиксирован, поэтому «нет градиента» — ошибка
                 # сборки и видна сразу, а nan появляется не бесшумно.
                 if step <= 10 or step % 250 == 0 or step == len(idx):
+                    check_pending()
                     nog = [n_ for n_, p_ in model.named_parameters()
                            if p_.requires_grad and p_.grad is None]
                     nf = [n_ for n_, p_ in model.named_parameters()
@@ -1216,8 +1435,10 @@ def main():
         snapshots[epoch] = {k: v.detach().clone()
                             for k, v in model.state_dict().items()
                             if k in set(info["names"])}
+        check_frozen(f"эпоха {epoch}")
         print(f"  эпоха {epoch}: потеря {train_mean.get('loss', 0.0):.5f}, "
-              f"val_sel RMS a2_pol {val['rms_a2_pol']:.6f}")
+              f"val_sel RMS a2_pol {val['rms_a2_pol']:.6f}, замороженное "
+              f"не двигалось")
 
     best_epoch, best = select_epoch(history)
     with torch.no_grad():
@@ -1235,6 +1456,7 @@ def main():
     # чекпойнт воспроизводит ту строку истории, по которой его выбрали, не
     # проверялось ничем. Ошибка в восстановлении выглядела бы как
     # результат.
+    check_frozen("после восстановления")
     confirm = evaluate(parts["val_sel"], f"переоценка эпохи {best_epoch}",
                        keep_rows=True)
     for name_, got_, want_ in (("RMS a2_pol", confirm["rms_a2_pol"],
@@ -1325,6 +1547,17 @@ def main():
         git_head=git_head, git_dirty=bool(dirty),
         val_confirm="НЕ ОТКРЫВАЛАСЬ; в K-14 уже прочитана, поэтому любое её "
                     "использование будет retrospective",
+        # МАШИНОЧИТАЕМЫЕ ПОЛЯ, А НЕ ТОЛЬКО ФРАЗА. Строку следующий скрипт
+        # прочитать не может, а решение по этой половине принимать нельзя.
+        val_confirm_role="retrospective_reused",
+        val_confirm_used_for_selection=False,
+        val_confirm_evaluated=False,
+        frozen_checksum=frozen_sha0,
+        frozen_tensors=n_frozen,
+        save_load_check="state serialization round-trip: побитовое равенство "
+                        "сохранённых тензоров и state_sha. Воспроизведение "
+                        "логитов, кодов и действия после загрузки —"
+                        " в k15_rollout",
         device=str(dev), compute_dtype=a.dtype,
         torch_version=str(torch.__version__),
         note=("подтверждающая половина не формировалась; отбор эпохи по "

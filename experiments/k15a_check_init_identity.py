@@ -8,13 +8,21 @@ weights it compares:
 * the unchanged K-14 ``forward_joint_depth_rvq``;
 * the new ``forward_depth_aligned_rvq`` with C1/C2 copied from ActionCodec.
 
-The q0->q1 logits, codes, embeddings and decoded action must be bitwise equal.
-The full K-15 path is also run with feedback1 enabled and bypassed; because its
-projection is zero at initialization, q2 must be bitwise equal as well.
+What is proven bitwise, stated exactly:
 
-The output JSON is a required training provenance artifact.  A tolerance is
-not accepted: any initial difference would mix an assembly change with the
-effect of learning.
+* q0->q1 logits and codes are bitwise equal between the two paths;
+* the latent and action reconstructed from HARD CODE ROWS agree bitwise --
+  that reference is rebuilt here as ``books[0][k0] + books[1][k1]``, so it is
+  an idealized sum, NOT the value the legacy path would hand the decoder;
+* the legacy path builds its level>=1 embedding as ``emb + (hard -
+  emb).detach()``, whose value is not the book row.  That error is MEASURED
+  and recorded as ``legacy_st_error`` instead of being assumed;
+* with feedback1 zeroed (its projection is zero-initialized) q2 is bitwise
+  equal; with a NON-ZERO feedback1 the legacy error reaches q2, so the two
+  paths are compared there against a recorded relative limit, with the
+  number of flipped q2 codes written down.
+
+The output JSON is a required training provenance artifact.
 """
 
 from __future__ import annotations
@@ -87,6 +95,17 @@ def compare_bounded(name, left, right, output, *, rel_limit, note):
     right = np.asarray(right).astype(np.float64)
     if left.shape != right.shape:
         raise SystemExit(f"{name}: shapes {left.shape} versus {right.shape}")
+    # ПРОВЕРКА КОНЕЧНОСТИ ДО ВЫЧИТАНИЯ. `nan > limit` равно False, поэтому
+    # без неё нечисловое расхождение объявлялось бы уложившимся в предел, и
+    # обязательный гейт оказывался fail-open. Пара inf/inf даёт в разности
+    # NaN и проходила так же.
+    for side, arr in (("left", left), ("right", right)):
+        n_bad = int(np.count_nonzero(~np.isfinite(arr)))
+        if n_bad:
+            raise SystemExit(
+                f"{name}: в {side} {n_bad}/{arr.size} нечисловых значений "
+                f"(nan или inf). Сравнение с пределом на таких данных "
+                f"ничего не проверяет")
     max_abs = float(np.max(np.abs(left - right))) if left.size else 0.0
     scale = float(np.max(np.abs(left))) if left.size else 0.0
     rel = max_abs / scale if scale > 0 else max_abs
@@ -101,6 +120,10 @@ def compare_bounded(name, left, right, output, *, rel_limit, note):
         "rel_limit": float(rel_limit),
         "expected_cause": note,
     }
+    if not np.isfinite(rel):
+        raise SystemExit(
+            f"{name}: относительное расхождение получилось нечисловым "
+            f"(max {max_abs}, масштаб {scale})")
     if rel > float(rel_limit):
         raise SystemExit(
             f"{name}: относительное расхождение {rel:.3e} больше предела "
@@ -190,6 +213,18 @@ def selftest():
         assert "больше предела" in str(error), error
     else:
         raise AssertionError("расхождение выше предела принято")
+    # NaN И Inf ОБЯЗАНЫ БЫТЬ ОТВЕРГНУТЫ, А НЕ УЛОЖИТЬСЯ В ПРЕДЕЛ
+    for bad_value, why_ in ((np.nan, "nan"), (np.inf, "inf")):
+        spoiled = base.copy()
+        spoiled[2, 2] = bad_value
+        for pair in ((base, spoiled), (spoiled, base), (spoiled, spoiled)):
+            try:
+                compare_bounded("nonfinite", pair[0], pair[1], out,
+                                rel_limit=1e-3, note="о")
+            except SystemExit as error:
+                assert "нечисловых" in str(error), (why_, error)
+            else:
+                raise AssertionError(f"{why_} принят как уложившийся в предел")
     compare_bounded("identical", base, base.copy(), out, rel_limit=0.0,
                     note="точное совпадение")
     assert out["identical"]["equal"] is True
@@ -682,12 +717,14 @@ def main() -> int:
                 as_numpy(expected_embedding),
                 as_numpy(new_full_on["policy_embeddings"][level]),
                 comparisons)
+        # ИМЯ ГОВОРИТ, ЧТО ЭТО ЭТАЛОН ИЗ ЖЁСТКИХ СТРОК КНИГИ, а не
+        # фактический латент legacy-пути: тот отличается на legacy_st_error.
         compare_exact(
-            f"{prefix}.q0q1_latent",
+            f"{prefix}.hard_reconstructed_reference_latent",
             as_numpy(old_z1),
             as_numpy(new_medium["cumulative_latents"][1]), comparisons)
         compare_exact(
-            f"{prefix}.q0q1_action",
+            f"{prefix}.hard_reconstructed_reference_action",
             as_numpy(old_action), as_numpy(new_action), comparisons)
 
         q0_now = as_numpy(new_medium["pred_codes"][0])
@@ -757,10 +794,20 @@ def main() -> int:
     with open(temporary, "w", encoding="utf-8") as handle:
         json.dump(result, handle, ensure_ascii=False, indent=1, default=str)
     os.replace(temporary, args.out)
+    st_worst = max(
+        (v["max_abs"] for k, v in comparisons.items()
+         if k.endswith("legacy_st_error")), default=0.0)
+    q2_flips = sum(v["flips"] for k, v in comparisons.items()
+                   if k.endswith("code2_flips"))
     print(
         f"\nK-15 INITIALIZATION IDENTITY PASSED on {len(plan)} canonical "
-        f"batches / {len(rows_used)} rows.  K-14 and K-15 q0->q1 paths, "
-        "decoded actions, and feedback1 on/off are bitwise equal."
+        f"batches / {len(rows_used)} rows.\n"
+        f"  bitwise equal: q0->q1 logits and codes; latent and action "
+        f"rebuilt from hard code rows; q2 with feedback1 zeroed.\n"
+        f"  NOT bitwise equal, by a measured amount: the legacy path's own "
+        f"level-1 embedding (max {st_worst:.2e}), which is why the "
+        f"non-zero-feedback1 comparison of q2 uses a recorded limit "
+        f"({q2_flips} q2 codes flipped in total)."
     )
     print(f"  saved: {args.out}")
     return 0
