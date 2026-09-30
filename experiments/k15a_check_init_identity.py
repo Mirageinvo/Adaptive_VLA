@@ -560,6 +560,10 @@ def main() -> int:
         compare_exact(
             f"{prefix}.q0_canonical", q0_expected, q0_now, comparisons)
         rows_used.append(np.asarray(rows, np.int64))
+        print(f"    {prefix}.feedback0_changes_q1                 causal: "
+              f"off changes q1")
+        print(f"    {prefix}.feedback1_changes_q2                 causal: "
+              f"probe off changes q2")
         print(f"  batch {batch_index} ({part}, offset {position_offset}) passed")
 
     rows_used = np.concatenate(rows_used)
@@ -578,9 +582,23 @@ def main() -> int:
         "k14_common.py": sha12(inspect.getfile(kc)),
         "bar.py": sha12(inspect.getfile(SmolVLABlockwiseAR)),
     }
+    # ПРИЧИННЫЕ ПРОВЕРКИ ИДУТ В АРТЕФАКТ. Они останавливают прогон при
+    # отказе, но пока их не записать, артефакт не доказывает, что они были:
+    # отличить "проверяли и сошлось" от "не проверяли" по нему нельзя.
+    expected_causal = {f"batch{i}.{name}"
+                       for i in range(len(plan))
+                       for name in ("feedback0_changes_q1",
+                                    "feedback1_changes_q2")}
+    if set(causal) != expected_causal or not all(causal.values()):
+        raise SystemExit(
+            f"причинные проверки неполны: нет "
+            f"{sorted(expected_causal - set(causal))[:4]}, ложных "
+            f"{sorted(k for k, v in causal.items() if not v)[:4]}")
     result = {
         "kind": "k15_init_identity",
         "passed": True,
+        "causal_checks": causal,
+        "feedback_probe_scale": FEEDBACK_PROBE_SCALE,
         "run_id": f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}",
         "git_head": git_head,
         "git_dirty": bool(dirty_code),
