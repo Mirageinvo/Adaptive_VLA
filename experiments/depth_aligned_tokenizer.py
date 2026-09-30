@@ -24,6 +24,8 @@
 import argparse
 import sys
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -69,6 +71,57 @@ def mean_squared_distances(residual: torch.Tensor,
     # нуля, то есть обе лежат в пределах округления float32 от остатка; в
     # этом случае выбор произволен и в точной арифметике тоже.
     return ((r2 - 2.0 * inner + e2) / dim).clamp_min(0.0)
+
+
+def soft_perplexity(probabilities: torch.Tensor) -> torch.Tensor:
+    """Построчная perplexity МЯГКОГО апостериора: exp(энтропия).
+
+    Нужна затем, что hard-perplexity по argmin и мягкая — разные величины.
+    Первая может быть здоровой, пока вторая равна размеру словаря, то есть
+    апостериор равномерен и не несёт ничего. Ровно это и случилось.
+    """
+    p = probabilities.float()
+    entropy = -(p * p.clamp_min(1e-30).log()).sum(-1)
+    return entropy.exp()
+
+
+def calibrate_temperature(distances: torch.Tensor, target_perplexity: float,
+                          *, lo: float = 1e-10, hi: float = 1e10,
+                          iterations: int = 80) -> float:
+    """tau, при которой МЕДИАННАЯ мягкая perplexity равна целевой.
+
+    ЗАЧЕМ. `mean_squared_distances` делит квадрат расстояния на D, поэтому
+    при tau = 1 разброс логитов порядка 1/D, и softmax практически
+    равномерен: измерено расхождение с равномерным в 0.15 % по кросс-
+    энтропии. При равномерном Q член выравнивания превращается в давление
+    «сделай P равномерным», градиент P->Q в книги почти нулевой, а член
+    использования не имеет сигнала. Жёсткий выбор (argmin) от tau не
+    зависит вовсе, поэтому поломка была не видна по путям a1_tok/a2_tok.
+
+    Perplexity монотонно растёт по tau, поэтому деление отрезка корректно.
+    """
+    target = float(target_perplexity)
+    vocab = int(distances.shape[-1])
+    if not 1.0 < target < vocab:
+        raise ValueError(
+            f"целевая perplexity {target} вне (1, {vocab})")
+
+    def ppl(tau: float) -> float:
+        probabilities = torch.softmax(-distances.float() / tau, dim=-1)
+        return float(soft_perplexity(probabilities).median())
+
+    if ppl(lo) > target or ppl(hi) < target:
+        raise ValueError(
+            f"целевая perplexity {target} недостижима: при tau={lo} "
+            f"получается {ppl(lo):.3f}, при tau={hi} — {ppl(hi):.3f}")
+    left, right = lo, hi
+    for _ in range(int(iterations)):
+        middle = math.sqrt(left * right)
+        if ppl(middle) < target:
+            left = middle
+        else:
+            right = middle
+    return math.sqrt(left * right)
 
 
 def tokenizer_logits(residual: torch.Tensor, book: torch.Tensor,
@@ -361,6 +414,41 @@ def selftest() -> None:
     d_on = mean_squared_distances(r_on, b_big)
     assert float(d_on.min()) >= 0.0, float(d_on.min())
     assert d_on.argmin(-1).reshape(-1).tolist() == [5, 9, 9, 40]
+
+    # --- КАЛИБРОВКА ТЕМПЕРАТУРЫ -------------------------------------------
+    # ВОСПРОИЗВЕДЕНИЕ ПОЛОМКИ: при делении на D апостериор равномерен.
+    torch.manual_seed(7)
+    D_real, V_real = 512, 2048
+    book_r = torch.randn(V_real, D_real) * 0.05
+    resid_r = torch.randn(4, 8, D_real) * 0.05
+    d_r = mean_squared_distances(resid_r, book_r)
+    flat = torch.softmax(-d_r, dim=-1)
+    ppl_flat = float(soft_perplexity(flat).median())
+    assert ppl_flat > 0.99 * V_real, (
+        f"мягкая perplexity при tau=1 равна {ppl_flat:.1f}, а поломка "
+        f"состояла в том, что она почти равна {V_real}: проверка больше "
+        f"не воспроизводит то, из-за чего введена калибровка")
+
+    for target in (5.0, 20.0, 100.0):
+        tau_c = calibrate_temperature(d_r, target)
+        got = float(soft_perplexity(
+            torch.softmax(-d_r / tau_c, dim=-1)).median())
+        assert abs(got - target) / target < 0.01, (target, got, tau_c)
+        # ЖЁСТКИЙ ВЫБОР ОТ ТЕМПЕРАТУРЫ НЕ ЗАВИСИТ — поэтому поломка и была
+        # невидима по путям a1_tok/a2_tok
+        assert torch.equal((-d_r).argmax(-1), (-d_r / tau_c).argmax(-1))
+    # МОНОТОННОСТЬ: большая tau — более равномерно
+    t_small = calibrate_temperature(d_r, 5.0)
+    t_big = calibrate_temperature(d_r, 100.0)
+    assert t_small < t_big, (t_small, t_big)
+    for bad_target, why in ((1.0, "вне"), (float(V_real), "вне"),
+                            (0.5, "вне")):
+        try:
+            calibrate_temperature(d_r, bad_target)
+        except ValueError as e:
+            assert why in str(e), (bad_target, e)
+        else:
+            raise AssertionError(f"принята цель {bad_target}")
 
     print("самопроверка depth_aligned_tokenizer пройдена")
 

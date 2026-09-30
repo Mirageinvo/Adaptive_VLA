@@ -872,7 +872,16 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--wd", type=float, default=0.0)
     ap.add_argument("--grip-weight", type=float, default=1.0)
-    ap.add_argument("--tau-tokenizer", type=float, default=1.0)
+    ap.add_argument("--tau-tokenizer", default="auto",
+                    help="температура мягкого апостериора токенизатора. "
+                         "'auto' — калибровка по целевой медианной мягкой "
+                         "perplexity; число — фиксированное значение. При "
+                         "tau=1 апостериор почти равномерен, потому что "
+                         "квадрат расстояния делится на D")
+    ap.add_argument("--tau-target-perplexity", type=float, default=20.0,
+                    help="цель калибровки; объявлена до данных")
+    ap.add_argument("--calib-batches", type=int, default=4,
+                    help="канонических батчей обучения на калибровку tau")
     ap.add_argument("--tau-policy", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--device", default="cuda:1")
@@ -1166,6 +1175,11 @@ def main():
     ac16 = torch.autocast(device_type=dev.type, dtype=dt)
     run_batch_checked = [False]
     decode_batched = [None, 0.0]
+    # ТЕМПЕРАТУРА ТОКЕНИЗАТОРА ПО УРОВНЯМ. Заполняется калибровкой ниже, до
+    # первой эпохи; run_batch читает её по ссылке.
+    tau_tok = {1: 1.0, 2: 1.0}
+    tau_report = {}
+    collect_dist = [False]
     q0_can_dev = torch.as_tensor(np.asarray(q0_can), device=dev)
     pending_q0 = [None]
     pending_bad_action = [None]
@@ -1220,14 +1234,14 @@ def main():
         # hard_straight_through применяла её дважды, и probabilities
         # расходились с логитами, по которым считается выравнивание.
         q1_tok_logits, c1_tok, i1_tok, p1_tok = tok.quantize_residual(
-            r1, c1, temperature=float(a.tau_tokenizer))
+            r1, c1, temperature=tau_tok[1])
         # ПРЕФИКС ДЛЯ ВТОРОГО УРОВНЯ — ФАКТИЧЕСКИЙ q1 МОДЕЛИ, И ОН
         # DETACH-НУТ: иначе токенизатор q2 уменьшал бы собственную задачу,
         # двигая C1. C1 всё равно получает градиент от q1-путей.
         hard_c1 = c1[out["pred_codes"][1]].detach()
         r2 = z_e - z0.detach() - hard_c1
         q2_tok_logits, c2_tok, i2_tok, p2_tok = tok.quantize_residual(
-            r2, c2, temperature=float(a.tau_tokenizer))
+            r2, c2, temperature=tau_tok[2])
         # ФАКТИЧЕСКИЙ ПУТЬ ВЫВОДА БЕРЁТСЯ ИЗ МОДЕЛИ, А НЕ ПЕРЕСОБИРАЕТСЯ:
         # пересборка была бы второй реализацией той же суммы. Один раз
         # проверяем, что она совпадает с z0 + c1_pol + c2_pol.
@@ -1350,6 +1364,15 @@ def main():
                     align2_p_to_q=float(lparts["align2_p_to_q"]),
                     **align_exec_stats(q1_tok_logits, q2_tok_logits, paths,
                                        tok),
+                    **agreement_stats(i1_tok, i2_tok, paths, torch),
+                    soft_ppl_q1=float(tok.soft_perplexity(
+                        p1_tok[:, :H_EXEC]).median()),
+                    soft_ppl_q2=float(tok.soft_perplexity(
+                        p2_tok[:, :H_EXEC]).median()),
+                    soft_ppl_p1=float(tok.soft_perplexity(
+                        paths["q1_pol_probs"][:, :H_EXEC]).median()),
+                    soft_ppl_p2=float(tok.soft_perplexity(
+                        paths["q2_pol_probs"][:, :H_EXEC]).median()),
                     q1_codes=out["pred_codes"][1].detach().cpu().numpy(),
                     q2_codes=out["pred_codes"][2].detach().cpu().numpy(),
                     q1_codes_tok=i1_tok.detach().cpu().numpy(),
@@ -1364,6 +1387,13 @@ def main():
                     q0_logits_sha=hashlib.sha1(np.ascontiguousarray(
                         out["logits"][0].detach().float().cpu().numpy()
                     ).tobytes()).hexdigest()[:12])
+        if not train and collect_dist[0]:
+            # РАССТОЯНИЯ ДЛЯ КАЛИБРОВКИ ВОССТАНАВЛИВАЮТСЯ ИЗ ЛОГИТОВ:
+            # logits = -d / tau, tau > 0, поэтому второй раз считать
+            # расстояния не нужно.
+            for lv, lg in ((1, q1_tok_logits), (2, q2_tok_logits)):
+                stat[f"d{lv}_exec"] = (
+                    -lg[:, :H_EXEC].detach().float() * tau_tok[lv]).cpu()
         if not train:
             # В ОЦЕНКЕ ОТЛОЖЕННЫЕ СЧЁТЧИКИ ЧИТАЮТСЯ СРАЗУ: она и так
             # синхронизируется, а решение принимается по её числам.
@@ -1372,6 +1402,27 @@ def main():
 
     PATHS5 = PATH_NAMES
     q0_logits_ref = {}
+
+    def agreement_stats(i1, i2, paths_, torch_):
+        """Согласие argmax политики с argmin токенизатора и ранг.
+
+        ВЕЛИЧИНА, НЕ ЗАВИСЯЩАЯ ОТ ТЕМПЕРАТУРЫ. Кросс-энтропия Q->P
+        измеряет в основном резкость Q: при почти равномерном Q она равна
+        среднему -log p_k и велика для любой уверенной политики, читает та
+        токенизатор или нет. Согласие по верхнему коду и ранг выбора
+        токенизатора в порядке политики от масштаба логитов не зависят.
+        """
+        res = {}
+        for lv, idx, probs in ((1, i1, paths_["q1_pol_probs"]),
+                               (2, i2, paths_["q2_pol_probs"])):
+            p_exec = probs[:, :H_EXEC].float()
+            want = idx[:, :H_EXEC]
+            res[f"agree{lv}_top1"] = float(
+                (p_exec.argmax(-1) == want).float().mean())
+            chosen = p_exec.gather(-1, want.unsqueeze(-1))
+            res[f"rank{lv}_median"] = float(
+                (p_exec > chosen).sum(-1).float().median())
+        return res
 
     def align_exec_stats(q1_tok_lg, q2_tok_lg, paths_, tok_):
         """Выравнивание ТОЛЬКО на исполняемых позициях, оба направления.
@@ -1407,6 +1458,10 @@ def main():
         align_acc = {f"align{lv}_{d}{suf}": 0.0
                      for lv in (1, 2) for d in ("q_to_p", "p_to_q")
                      for suf in ("", "_exec")}
+        align_acc.update({f"agree{lv}_top1": 0.0 for lv in (1, 2)})
+        align_acc.update({f"rank{lv}_median": 0.0 for lv in (1, 2)})
+        align_acc.update({f"soft_ppl_{s}{lv}": 0.0
+                          for s in ("q", "p") for lv in (1, 2)})
         codes = {k: [] for k in ("q1_pol", "q2_pol", "q1_tok", "q2_tok")}
         sup_rows, ref_rows, rows_keep = [], [], []
         with torch.no_grad():
@@ -1533,6 +1588,13 @@ def main():
               f"политика a1_pol {res['rms_a1_pol']:.6f}, a2_pol "
               f"{res['rms_a2_pol']:.6f}; хуже q0 "
               f"{100 * res['frac_worse']:.1f}% строк")
+        print(f"      апостериор: мягкая perplexity Q "
+              f"{res['soft_ppl_q1']:.1f}/{res['soft_ppl_q2']:.1f}, P "
+              f"{res['soft_ppl_p1']:.1f}/{res['soft_ppl_p2']:.1f}; согласие "
+              f"по верхнему коду {100 * res['agree1_top1']:.2f}%/"
+              f"{100 * res['agree2_top1']:.2f}% при случайном "
+              f"{100 / vocab:.3f}%; медианный ранг выбора Q у P "
+              f"{res['rank1_median']:.0f}/{res['rank2_median']:.0f}")
         print(f"      поправка: |c1|/|z0| {res['d_latent_q1']:.4f}, "
               f"|c2|/|z0| {res['d_latent_q2']:.4f}; max|a1-a0| "
               f"{res['d_action_q1']:.5f}, max|a2-a1| "
@@ -1620,6 +1682,48 @@ def main():
                     f"против {frozen_sha0} до обучения")
             return sha_
         return inv_
+
+    # --- КАЛИБРОВКА ТЕМПЕРАТУРЫ ТОКЕНИЗАТОРА -----------------------------
+    # ПРАВИЛО ОБЪЯВЛЕНО ДО ДАННЫХ: медианная мягкая perplexity апостериора
+    # Q на исполняемых позициях равна --tau-target-perplexity. Без этого
+    # апостериор почти равномерен (квадрат расстояния делится на D), и
+    # тогда член выравнивания сводится к давлению «сделай P равномерным»,
+    # градиент P->Q в книги почти нулевой, а член использования не имеет
+    # сигнала. Жёсткий выбор от температуры не зависит.
+    if str(a.tau_tokenizer).strip().lower() == "auto":
+        collect_dist[0] = True
+        calib = parts["train"][:max(int(a.calib_batches), 1)]
+        dist = {1: [], 2: []}
+        with torch.no_grad():
+            for po, sel in calib:
+                _l, st_c = run_batch(po, sel, False)
+                for lv in (1, 2):
+                    dist[lv].append(st_c[f"d{lv}_exec"])
+        collect_dist[0] = False
+        for lv in (1, 2):
+            d_all = torch.cat(dist[lv], 0)
+            before = float(tok.soft_perplexity(
+                torch.softmax(-d_all, dim=-1)).median())
+            tau_tok[lv] = tok.calibrate_temperature(
+                d_all, float(a.tau_target_perplexity))
+            after = float(tok.soft_perplexity(
+                torch.softmax(-d_all / tau_tok[lv], dim=-1)).median())
+            tau_report[f"level{lv}"] = dict(
+                tau=float(tau_tok[lv]),
+                median_soft_perplexity_before=before,
+                median_soft_perplexity_after=after,
+                target=float(a.tau_target_perplexity),
+                rows=int(d_all.shape[0]), batches=len(calib),
+                vocab=int(d_all.shape[-1]))
+            print(f"  калибровка tau уровня {lv}: {tau_tok[lv]:.4g}; "
+                  f"медианная мягкая perplexity {before:.1f} -> "
+                  f"{after:.1f} при цели {a.tau_target_perplexity:.1f}")
+    else:
+        fixed = float(a.tau_tokenizer)
+        tau_tok[1] = tau_tok[2] = fixed
+        tau_report = dict(mode="fixed", tau=fixed,
+                          note="калибровка не проводилась")
+        print(f"  tau токенизатора задана вручную: {fixed}")
 
     history = []
     val0 = evaluate(parts["val_sel"], "эпоха 0, без обучения")
@@ -1817,9 +1921,10 @@ def main():
     COLLAPSE_MAX_SHARE, COLLAPSE_MIN_PPL = 0.98, 2.0
     ACTION_RANGE_FACTOR = 1.5
     NO_REGRESSION_FACTOR = 1.01
-    # ЗАЗОР, А НЕ СТРОГОЕ `< log V`: почти равномерный читатель формально
-    # оказывался бы «лучше случайного» на величину погрешности.
-    ALIGN_MARGIN = 0.05
+    # ВО СКОЛЬКО РАЗ СОГЛАСИЕ ПО ВЕРХНЕМУ КОДУ ОБЯЗАНО ПРЕВОСХОДИТЬ
+    # СЛУЧАЙНОЕ. Это проверка «связь не разорвана», а не «связь полезна»;
+    # полезность мерит роллаут.
+    ALIGN_AGREE_FACTOR = 5.0
     gates = {}
     # ТЕХНИЧЕСКАЯ ПРИГОДНОСТЬ К РОЛЛАУТУ, А НЕ ПОЛЬЗА. Условия записаны в
     # плане до данных; они не доказывают, что уточнение помогает — это
@@ -1847,37 +1952,53 @@ def main():
         # категории, разные коды возврата.
         category="candidate",
         passed=bool(best_path < float(confirm["rms_a0"])))
-    worst_ch = int(np.argmax(
-        np.asarray(confirm["act_absmax"])
-        / np.maximum(np.asarray(confirm["true_absmax"]), 1e-12)))
+    # ЭТАЛОН ДИАПАЗОНА — ПО ВСЕМУ НАБОРУ, А НЕ ПО ОЦЕНОЧНОЙ ЧАСТИ. Сначала
+    # здесь стоял поканальный максимум истинных действий на тех же строках,
+    # и на smoke из 16 строк канал 4 имел максимум 0.106 при собственном
+    # масштабе канала 0.4+: гейт срабатывал на отклонении 0.3 по абсолютной
+    # величине. `max_act_q` — это max(|q01|, |q99|) по всему набору, та же
+    # величина, которой взвешивается метрика.
+    scale_ref = np.maximum(np.asarray(max_act_q[:7], np.float64), 1e-12)
+    ratios = np.asarray(confirm["act_absmax"]) / scale_ref
+    worst_ch = int(np.argmax(ratios))
     gates["action_range"] = dict(
         act_absmax=confirm["act_absmax"],
-        true_absmax=confirm["true_absmax"],
+        dataset_scale=[float(x) for x in scale_ref],
+        eval_true_absmax=confirm["true_absmax"],
         worst_channel=worst_ch,
-        worst_ratio=float(confirm["act_absmax"][worst_ch]
-                          / max(confirm["true_absmax"][worst_ch], 1e-12)),
-        rule=f"|a2_pol| <= {ACTION_RANGE_FACTOR} * |истинного| поканально",
+        worst_ratio=float(ratios[worst_ch]),
+        rule=(f"|a2_pol| <= {ACTION_RANGE_FACTOR} * max(|q01|,|q99|) "
+              f"по всему набору, поканально"),
         category="rollout_blocker",
-        passed=bool(all(
-            m <= ACTION_RANGE_FACTOR * t
-            for m, t in zip(confirm["act_absmax"], confirm["true_absmax"]))))
+        passed=bool(bool((ratios <= ACTION_RANGE_FACTOR).all())))
+    # НЕ КРОСС-ЭНТРОПИЯ, А СОГЛАСИЕ ПО ВЕРХНЕМУ КОДУ. Кросс-энтропия Q->P
+    # при почти равномерном Q равна среднему -log p_k и велика для любой
+    # уверенной политики, читает та токенизатор или нет: на smoke она
+    # давала 15.4 при log V = 7.62, то есть гейт срабатывал на резкости P,
+    # а не на разрыве. Согласие по верхнему коду и ранг от масштаба логитов
+    # не зависят.
     log_v_ = float(confirm["log_vocab"])
-    # СЧИТАЕТСЯ НА ИСПОЛНЯЕМЫХ ПОЗИЦИЯХ. Среднее по всем 16 позициям могло
-    # скрыть случайного читателя на первых восьми — тех, которые робот и
-    # исполняет.
-    align_vals = [float(confirm[f"align{lv}_q_to_p_exec"]) for lv in (1, 2)]
+    chance = 1.0 / float(vocab)
+    agree_vals = [float(confirm[f"agree{lv}_top1"]) for lv in (1, 2)]
     gates["align_not_broken"] = dict(
-        align1_q_to_p_exec=align_vals[0], align2_q_to_p_exec=align_vals[1],
-        align1_q_to_p_all=float(confirm["align1_q_to_p"]),
-        align2_q_to_p_all=float(confirm["align2_q_to_p"]),
+        agree1_top1=agree_vals[0], agree2_top1=agree_vals[1],
+        chance=chance, factor=ALIGN_AGREE_FACTOR,
+        limit=ALIGN_AGREE_FACTOR * chance,
+        rank1_median=float(confirm["rank1_median"]),
+        rank2_median=float(confirm["rank2_median"]),
+        align1_q_to_p_exec=float(confirm["align1_q_to_p_exec"]),
+        align2_q_to_p_exec=float(confirm["align2_q_to_p_exec"]),
         align1_p_to_q_exec=float(confirm["align1_p_to_q_exec"]),
         align2_p_to_q_exec=float(confirm["align2_p_to_q_exec"]),
-        log_vocab=log_v_, margin=ALIGN_MARGIN,
-        rule=(f"кросс-энтропия Q->P на исполняемых позициях конечна и не "
-              f"больше log V - {ALIGN_MARGIN}"),
+        soft_ppl_q1=float(confirm["soft_ppl_q1"]),
+        soft_ppl_q2=float(confirm["soft_ppl_q2"]),
+        log_vocab=log_v_,
+        rule=(f"согласие argmax политики с argmin токенизатора на "
+              f"исполняемых позициях >= {ALIGN_AGREE_FACTOR} x случайного "
+              f"(1/V)"),
         category="rollout_blocker",
-        passed=bool(all(np.isfinite(v) and v <= log_v_ - ALIGN_MARGIN
-                        for v in align_vals)))
+        passed=bool(all(np.isfinite(v) and v >= ALIGN_AGREE_FACTOR * chance
+                        for v in agree_vals)))
     for lv in (1, 2):
         for side, tag_ in (("", "pol"), ("_tok", "tok")):
             u = confirm[f"usage_q{lv}{side}"]
@@ -1952,7 +2073,9 @@ def main():
         variant="depth_aligned", seed=int(a.seed), epochs=int(a.epochs),
         batch=int(a.batch), accum=int(a.accum), lr=float(a.lr),
         wd=float(a.wd), grip_weight=float(a.grip_weight),
-        tau_tokenizer=float(a.tau_tokenizer), tau_policy=float(a.tau_policy),
+        tau_tokenizer=dict(tau_tok), tau_tokenizer_mode=str(a.tau_tokenizer),
+        tau_target_perplexity=float(a.tau_target_perplexity),
+        tau_calibration=tau_report, tau_policy=float(a.tau_policy),
         loss_weights=dict(a1_pol=W_A1_POL, a1_tok=W_A1_TOK, a2_pol=W_A2_POL,
                           a2_tok=W_A2_TOK, align=W_ALIGN, mono=W_MONO,
                           usage=W_USAGE, eps_norm=EPS_NORM),
@@ -1983,7 +2106,7 @@ def main():
             collapse_min_perplexity=COLLAPSE_MIN_PPL,
             action_range_factor=ACTION_RANGE_FACTOR,
             no_regression_factor=NO_REGRESSION_FACTOR,
-            align_margin_nats=ALIGN_MARGIN),
+            align_agreement_factor=ALIGN_AGREE_FACTOR),
         confirm=confirm,
         decode_batched=bool(decode_batched[0]),
         decode_batched_gap=float(decode_batched[1]),
