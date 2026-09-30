@@ -55,6 +55,23 @@ PATH_NAMES = ("a0", "a1_tok", "a1_pol", "a2_tok", "a2_pol")
 # ГЕЙТ K-15a: СКОЛЬКО БАТЧЕЙ И КАКИЕ ПРИЧИННЫЕ ПРОВЕРКИ ТРЕБУЮТСЯ.
 # Требование живёт в тренере, а не берётся из проверяемого артефакта.
 GATE_MIN_BATCHES = 3
+# ГЕЙТЫ ПРИЁМКИ: ИМЯ -> КАТЕГОРИЯ, ЗАФИКСИРОВАННОЕ ОТОБРАЖЕНИЕ.
+# `rollout_blocker` — кандидата нельзя выпускать на робота, а для
+# decoder_support и align_not_broken под вопросом и само офлайновое число.
+# `candidate` — артефакт исправен, а ответ эксперимента отрицательный.
+# Провенанс, инварианты и нечисловые величины сюда НЕ входят: они
+# останавливают прогон раньше и означают «выводов делать нельзя».
+EXPECTED_GATES = {
+    "collapse_q1_pol": "rollout_blocker",
+    "collapse_q1_tok": "rollout_blocker",
+    "collapse_q2_pol": "rollout_blocker",
+    "collapse_q2_tok": "rollout_blocker",
+    "decoder_support": "rollout_blocker",
+    "action_range": "rollout_blocker",
+    "align_not_broken": "rollout_blocker",
+    "no_regression": "candidate",
+    "any_improvement": "candidate",
+}
 GATE_CAUSAL_KINDS = ("feedback0_changes_q1", "feedback1_changes_q2",
                      "probe_old_vs_new_bounded")
 EPS_NORM = 1e-6       # нижний предел нормировки на q0 MSE
@@ -160,6 +177,35 @@ def check_init_gate(path, *, expect, file_sha, code_version,
                 decoder_context=dict(decoder_context))
 
 
+def classify_gates(gates):
+    """(отказы, отказы-блокеры, отказы-кандидата). Чистая функция.
+
+    ЗАЧЕМ ОТДЕЛЬНО. Прежде категории фильтровались сравнением со строкой,
+    и опечатка в `category` давала отказ, не попавший НИ В ОДИН список:
+    `accepted=false`, оба списка пустые, код возврата 0. Здесь отображение
+    имя->категория фиксировано, и любое расхождение с ним — отказ.
+    """
+    actual = {name: gate.get("category") for name, gate in gates.items()}
+    if actual != EXPECTED_GATES:
+        diff = sorted(set(actual) ^ set(EXPECTED_GATES)) or [
+            f"{k}: {actual[k]} вместо {EXPECTED_GATES[k]}"
+            for k in sorted(actual) if actual[k] != EXPECTED_GATES[k]]
+        raise SystemExit(
+            f"набор гейтов приёмки или их категории не те: {diff[:5]}")
+    for name, gate in gates.items():
+        if not isinstance(gate.get("passed"), bool):
+            raise SystemExit(
+                f"гейт {name}: passed = {gate.get('passed')!r}, а обязан "
+                f"быть bool")
+    failed = sorted(k for k, v in gates.items() if not v["passed"])
+    blocker = [k for k in failed
+               if EXPECTED_GATES[k] == "rollout_blocker"]
+    candidate = [k for k in failed if EXPECTED_GATES[k] == "candidate"]
+    if sorted(blocker + candidate) != failed:
+        raise SystemExit("не все отказы классифицированы")
+    return failed, blocker, candidate
+
+
 def frozen_tensors(model, trainable_names):
     """Пары (имя, тензор) для всего ЗАМОРОЖЕННОГО: параметры И буферы.
 
@@ -221,7 +267,10 @@ def frozen_content_sha(model, torch, trainable_names):
             # ЧЕРЕЗ view(uint8), А НЕ numpy(): на bfloat16 `numpy()`
             # падает с TypeError, и отпечаток замороженного нельзя было бы
             # снять вообще — проверено, падает.
-            acc.update(t_.detach().cpu().contiguous()
+            # reshape(-1) ОБЯЗАТЕЛЕН: `view(dtype)` при другом размере
+            # элемента требует dim() > 0, а нульмерные тензоры в модели
+            # есть — вентиль `alpha` у CodeFeedback именно такой.
+            acc.update(t_.detach().cpu().contiguous().reshape(-1)
                        .view(torch.uint8).numpy().tobytes())
     return acc.hexdigest()[:12], n, elems
 
@@ -561,10 +610,20 @@ def selftest():
     # ОТПЕЧАТОК СНИМАЕТСЯ И С bfloat16: через numpy() он падал бы
     bf = nn_.Module()
     bf.w = nn_.Parameter(torch.ones(3, 4, dtype=torch.bfloat16))
-    sha_bf = frozen_content_sha(bf, torch, set())[0]
+    # НУЛЬМЕРНЫЙ ТЕНЗОР: `view(uint8)` на нём падает без reshape(-1)
+    bf.register_buffer("gate", torch.tensor(1.0))
+    bf.register_buffer("gate16", torch.tensor(1.0, dtype=torch.float16))
+    sha_bf, n_bf, _e_bf = frozen_content_sha(bf, torch, set())
+    assert n_bf == 3, n_bf
     with torch.no_grad():
         bf.w[0, 0] = 2.0
     assert frozen_content_sha(bf, torch, set())[0] != sha_bf
+    with torch.no_grad():
+        bf.w[0, 0] = 1.0
+        bf.gate.fill_(2.0)                  # изменение СКАЛЯРА
+    assert frozen_content_sha(bf, torch, set())[0] != sha_bf, \
+        "изменение нульмерного буфера не замечено"
+    assert frozen_invariant(bf, torch, set())[1] == 3
     assert n_a == n_s == 3 and n_el == 9 + 3 + 4, (n_a, n_s, n_el)
     with torch.no_grad():
         toy.free.weight += 1.0            # обучаемое: ничего не меняется
@@ -604,6 +663,54 @@ def selftest():
     shared.frozen = nn_.Parameter(base)
     shared.free = nn_.Parameter(base)          # то же хранилище
     assert no_alias_between(shared, {"free"}) == [("free", "param:frozen")]
+
+    # --- КЛАССИФИКАЦИЯ ГЕЙТОВ ПРИЁМКИ -------------------------------------
+    def mk_gates(**fails):
+        return {name: dict(category=cat, passed=name not in fails)
+                for name, cat in EXPECTED_GATES.items()}
+
+    assert classify_gates(mk_gates()) == ([], [], [])
+    f_all, f_b, f_c = classify_gates(mk_gates(decoder_support=1))
+    assert (f_all, f_b, f_c) == (["decoder_support"], ["decoder_support"], [])
+    f_all, f_b, f_c = classify_gates(mk_gates(any_improvement=1))
+    assert (f_all, f_b, f_c) == (["any_improvement"], [], ["any_improvement"])
+    # q1 лучше, q2 регрессировал: no_regression — кандидат, а не блокер
+    f_all, f_b, f_c = classify_gates(mk_gates(no_regression=1))
+    assert f_b == [] and f_c == ["no_regression"], (f_b, f_c)
+    f_all, f_b, f_c = classify_gates(mk_gates(action_range=1,
+                                              any_improvement=1))
+    assert f_b == ["action_range"] and f_c == ["any_improvement"]
+    # ОПЕЧАТКА В КАТЕГОРИИ: раньше отказ не попадал ни в один список и
+    # прогон завершался кодом 0
+    typo = mk_gates(decoder_support=1)
+    typo["decoder_support"]["category"] = "techncial"
+    try:
+        classify_gates(typo)
+    except SystemExit as e:
+        assert "категории не те" in str(e), e
+    else:
+        raise AssertionError("гейт с опечаткой в категории классифицирован")
+    for broken, why in (
+            ({k: v for k, v in mk_gates().items() if k != "no_regression"},
+             "категории не те"),
+            (dict(mk_gates(), лишний=dict(category="candidate", passed=True)),
+             "категории не те")):
+        try:
+            classify_gates(broken)
+        except SystemExit as e:
+            assert why in str(e), (why, e)
+        else:
+            raise AssertionError(f"принят неверный набор гейтов: {why}")
+    non_bool = mk_gates()
+    non_bool["align_not_broken"]["passed"] = "false"
+    try:
+        classify_gates(non_bool)
+    except SystemExit as e:
+        assert "обязан быть bool" in str(e), e
+    else:
+        raise AssertionError('passed="false" принят')
+    assert sum(1 for v in EXPECTED_GATES.values()
+               if v == "candidate") == 2, EXPECTED_GATES
 
     # --- ПРОГНОЗ ВРЕМЕНИ --------------------------------------------------
     f = forecast_runtime(100.0, 100, 16951, 3)
@@ -1241,6 +1348,8 @@ def main():
                     align2_q_to_p=float(lparts["align2_q_to_p"]),
                     align1_p_to_q=float(lparts["align1_p_to_q"]),
                     align2_p_to_q=float(lparts["align2_p_to_q"]),
+                    **align_exec_stats(q1_tok_logits, q2_tok_logits, paths,
+                                       tok),
                     q1_codes=out["pred_codes"][1].detach().cpu().numpy(),
                     q2_codes=out["pred_codes"][2].detach().cpu().numpy(),
                     q1_codes_tok=i1_tok.detach().cpu().numpy(),
@@ -1264,6 +1373,23 @@ def main():
     PATHS5 = PATH_NAMES
     q0_logits_ref = {}
 
+    def align_exec_stats(q1_tok_lg, q2_tok_lg, paths_, tok_):
+        """Выравнивание ТОЛЬКО на исполняемых позициях, оба направления.
+
+        Среднее по всем 16 позициям чанка может скрыть случайного читателя
+        на первых восьми, а исполняются именно они.
+        """
+        res = {}
+        for lv, tok_lg, pol_lg in ((1, q1_tok_lg, paths_["q1_pol_logits"]),
+                                   (2, q2_tok_lg, paths_["q2_pol_logits"])):
+            pair = tok_.bidirectional_alignment(tok_lg[:, :H_EXEC],
+                                                pol_lg[:, :H_EXEC])
+            res[f"align{lv}_q_to_p_exec"] = float(
+                pair["tokenizer_to_policy"])
+            res[f"align{lv}_p_to_q_exec"] = float(
+                pair["policy_to_tokenizer"])
+        return res
+
     def evaluate(batch_list, tag, keep_rows=False):
         """Жёсткий вывод на части: та же величина, что и в отборе эпохи.
 
@@ -1278,8 +1404,9 @@ def main():
         n_rows = 0
         dmax = {"d_action_q1": 0.0, "d_action_q2": 0.0}
         absmax = {"act_absmax": None, "true_absmax": None}
-        align_acc = {k: 0.0 for k in ("align1_q_to_p", "align2_q_to_p",
-                                      "align1_p_to_q", "align2_p_to_q")}
+        align_acc = {f"align{lv}_{d}{suf}": 0.0
+                     for lv in (1, 2) for d in ("q_to_p", "p_to_q")
+                     for suf in ("", "_exec")}
         codes = {k: [] for k in ("q1_pol", "q2_pol", "q1_tok", "q2_tok")}
         sup_rows, ref_rows, rows_keep = [], [], []
         with torch.no_grad():
@@ -1513,21 +1640,35 @@ def main():
         # Общая потеря может падать при мёртвой подгруппе: головы учатся,
         # книги стоят, и по одному числу этого не видно.
         grad_mass = {n_: 0.0 for n_ in info["names"]}
-        for _ in range(3):
+        for probe_step in range(3):
             opt.zero_grad(set_to_none=True)
             l_probe, _s_probe = run_batch(po0, sel0, True)
             probe_losses.append(float(l_probe.detach()))
             l_probe.backward()
+            # КОНЕЧНОСТЬ ПРОВЕРЯЕТСЯ ДО opt.step(), А НЕ ПОСЛЕ НЕГО. Шаг по
+            # nan-градиенту портит веса, и после него проверять уже поздно;
+            # а накопленная масса с nan не равна нулю, поэтому проверка на
+            # «мёртвый тензор» такой градиент пропускала.
             for n_, p_ in model.named_parameters():
-                if n_ in grad_mass and p_.grad is not None:
-                    grad_mass[n_] += float(p_.grad.abs().sum())
+                if n_ not in grad_mass:
+                    continue
+                if p_.grad is None:
+                    raise SystemExit(
+                        f"проба, шаг {probe_step + 1}: у {n_} нет "
+                        f"градиента, хотя он в белом списке")
+                if not torch.isfinite(p_.grad).all():
+                    raise SystemExit(
+                        f"проба, шаг {probe_step + 1}: градиент {n_} "
+                        f"нечисловой. Шаг по нему испортил бы веса")
+                grad_mass[n_] += float(p_.grad.abs().sum())
             opt.step()
-        dead = sorted(n_ for n_, v_ in grad_mass.items() if v_ == 0.0)
-        if dead:
+        bad_mass = sorted(n_ for n_, v_ in grad_mass.items()
+                          if not (np.isfinite(v_) and v_ > 0.0))
+        if bad_mass:
             raise SystemExit(
-                f"нулевой градиент за три шага у {dead}: эти тензоры в "
-                f"белом списке, но не обучаются, и падение общей потери их "
-                f"не касается")
+                f"масса градиента за три шага не конечна и положительна у "
+                f"{bad_mass}: эти тензоры в белом списке, но не обучаются, "
+                f"и падение общей потери их не касается")
         print(f"  градиент дошёл до всех {len(grad_mass)} разрешённых "
               f"тензоров, минимальная масса "
               f"{min(grad_mass.values()):.3e}")
@@ -1650,9 +1791,14 @@ def main():
     # чекпойнт воспроизводит ту строку истории, по которой его выбрали, не
     # проверялось ничем. Ошибка в восстановлении выглядела бы как
     # результат.
-    check_frozen("после восстановления", content=True)
+    check_frozen("после восстановления")
     confirm = evaluate(parts["val_sel"], f"переоценка эпохи {best_epoch}",
                        keep_rows=True)
+    # ПОБИТОВЫЙ ОТПЕЧАТОК СНИМАЕТСЯ ПОСЛЕ ИТОГОВОЙ ОЦЕНКИ. Раньше он шёл
+    # до неё, и мутация замороженного буфера внутри самой оценки — то есть
+    # внутри прохода, по которому принимается решение, — оставалась
+    # непроверенной. Полных хеширований по-прежнему два.
+    check_frozen("после итоговой оценки", content=True)
     for name_, got_, want_ in (("RMS a2_pol", confirm["rms_a2_pol"],
                                 best["val_a2_pol_rms"]),
                                ("доля ухудшений", confirm["frac_worse"],
@@ -1671,6 +1817,9 @@ def main():
     COLLAPSE_MAX_SHARE, COLLAPSE_MIN_PPL = 0.98, 2.0
     ACTION_RANGE_FACTOR = 1.5
     NO_REGRESSION_FACTOR = 1.01
+    # ЗАЗОР, А НЕ СТРОГОЕ `< log V`: почти равномерный читатель формально
+    # оказывался бы «лучше случайного» на величину погрешности.
+    ALIGN_MARGIN = 0.05
     gates = {}
     # ТЕХНИЧЕСКАЯ ПРИГОДНОСТЬ К РОЛЛАУТУ, А НЕ ПОЛЬЗА. Условия записаны в
     # плане до данных; они не доказывают, что уточнение помогает — это
@@ -1680,7 +1829,11 @@ def main():
         rms_a0=float(confirm["rms_a0"]),
         limit=float(NO_REGRESSION_FACTOR * confirm["rms_a0"]),
         rule=f"RMS(a2_pol) <= {NO_REGRESSION_FACTOR} * RMS(a0)",
-        category="technical",
+        # КАТЕГОРИЯ candidate, А НЕ БЛОКЕР. Случай «q1 лучше черновика, q2
+        # хуже» — это результат про второй уровень, а не поломка: раньше он
+        # давал код 3 и фразу «выводов делать нельзя», что стирало заранее
+        # оговорённый двухуровневый исход.
+        category="candidate",
         passed=bool(confirm["rms_a2_pol"]
                     <= NO_REGRESSION_FACTOR * confirm["rms_a0"]))
     best_path = min(float(confirm["rms_a1_pol"]), float(confirm["rms_a2_pol"]))
@@ -1704,20 +1857,27 @@ def main():
         worst_ratio=float(confirm["act_absmax"][worst_ch]
                           / max(confirm["true_absmax"][worst_ch], 1e-12)),
         rule=f"|a2_pol| <= {ACTION_RANGE_FACTOR} * |истинного| поканально",
-        category="technical",
+        category="rollout_blocker",
         passed=bool(all(
             m <= ACTION_RANGE_FACTOR * t
             for m, t in zip(confirm["act_absmax"], confirm["true_absmax"]))))
     log_v_ = float(confirm["log_vocab"])
-    align_vals = [float(confirm[f"align{lv}_q_to_p"]) for lv in (1, 2)]
+    # СЧИТАЕТСЯ НА ИСПОЛНЯЕМЫХ ПОЗИЦИЯХ. Среднее по всем 16 позициям могло
+    # скрыть случайного читателя на первых восьми — тех, которые робот и
+    # исполняет.
+    align_vals = [float(confirm[f"align{lv}_q_to_p_exec"]) for lv in (1, 2)]
     gates["align_not_broken"] = dict(
-        align1_q_to_p=align_vals[0], align2_q_to_p=align_vals[1],
-        align1_p_to_q=float(confirm["align1_p_to_q"]),
-        align2_p_to_q=float(confirm["align2_p_to_q"]),
-        log_vocab=log_v_,
-        rule="кросс-энтропия Q->P конечна и меньше log V (лучше случайной)",
-        category="technical",
-        passed=bool(all(np.isfinite(v) and v < log_v_ for v in align_vals)))
+        align1_q_to_p_exec=align_vals[0], align2_q_to_p_exec=align_vals[1],
+        align1_q_to_p_all=float(confirm["align1_q_to_p"]),
+        align2_q_to_p_all=float(confirm["align2_q_to_p"]),
+        align1_p_to_q_exec=float(confirm["align1_p_to_q_exec"]),
+        align2_p_to_q_exec=float(confirm["align2_p_to_q_exec"]),
+        log_vocab=log_v_, margin=ALIGN_MARGIN,
+        rule=(f"кросс-энтропия Q->P на исполняемых позициях конечна и не "
+              f"больше log V - {ALIGN_MARGIN}"),
+        category="rollout_blocker",
+        passed=bool(all(np.isfinite(v) and v <= log_v_ - ALIGN_MARGIN
+                        for v in align_vals)))
     for lv in (1, 2):
         for side, tag_ in (("", "pol"), ("_tok", "tok")):
             u = confirm[f"usage_q{lv}{side}"]
@@ -1733,7 +1893,7 @@ def main():
                 executed_min_perplexity=bp["executed_min_perplexity"],
                 limit_max_share=COLLAPSE_MAX_SHARE,
                 limit_min_perplexity=COLLAPSE_MIN_PPL,
-                category="technical",
+                category="rollout_blocker",
                 passed=bool(
                     u["max_code_share"] <= COLLAPSE_MAX_SHARE
                     and u["perplexity"] >= COLLAPSE_MIN_PPL
@@ -1749,16 +1909,35 @@ def main():
         rel_residual_mean=float(ds["rel_residual"]),
         reference_mean=float(ds["reference_rel_residual"]),
         rule="p95 остатка модели <= p95 остатка кодека на истинном латенте",
-        category="technical",
+        category="rollout_blocker",
         passed=bool(ds["rel_residual_p95"]
                     <= ds["reference_rel_residual_p95"]))
-    failed = sorted(k for k, v in gates.items() if not v["passed"])
-    if len(gates) != 9 or any("category" not in v for v in gates.values()):
-        raise SystemExit(f"гейтов приёмки {len(gates)}, ожидалось 9, и у "
-                         f"каждого обязана быть категория: {sorted(gates)}")
-    failed_tech = [k for k in failed
-                   if gates[k]["category"] == "technical"]
-    failed_cand = [k for k in failed if gates[k]["category"] == "candidate"]
+    failed, failed_tech, failed_cand = classify_gates(gates)
+    # ДВУХУРОВНЕВЫЙ ИСХОД ЗАПИСЫВАЕТСЯ ЯВНО. Уровень может быть кандидатом
+    # сам по себе; для q1 нужны ЕГО диапазон действий и опора декодера, а
+    # они пока считаются только для a2_pol.
+    r0_ = float(confirm["rms_a0"])
+    two_level = {}
+    for lv, key in (("q1", "rms_a1_pol"), ("q2", "rms_a2_pol")):
+        r_ = float(confirm[key])
+        two_level[lv] = dict(
+            rms=r_, improves=bool(r_ < r0_),
+            within_no_regression=bool(r_ <= NO_REGRESSION_FACTOR * r0_))
+    if two_level["q2"]["improves"] and two_level["q2"][
+            "within_no_regression"]:
+        candidate_level = "q2"
+    elif two_level["q1"]["improves"] and two_level["q1"][
+            "within_no_regression"]:
+        candidate_level = "q1"
+    else:
+        candidate_level = "none"
+    two_level["candidate_level"] = candidate_level
+    two_level["note"] = (
+        "диапазон действий и опора декодера измерены только для a2_pol; "
+        "для роллаута кандидата q1 нужны его собственные")
+    print(f"  двухуровневый исход: кандидат {candidate_level} "
+          f"(q1 RMS {two_level['q1']['rms']:.6f}, q2 "
+          f"{two_level['q2']['rms']:.6f}, черновик {r0_:.6f})")
     accepted = None if a.smoke else not failed
     print("  гейты приёмки: " + ("все пройдены" if not failed
                                  else "НЕ ПРОЙДЕНЫ " + ", ".join(failed)))
@@ -1784,19 +1963,27 @@ def main():
         state={k_: v_.detach().cpu() for k_, v_ in model.state_dict().items()
                if k_ in set(info["names"])},
         accepted=accepted, gates=gates,
-        failed_technical=sorted(failed_tech),
+        failed_rollout_blocker=sorted(failed_tech),
         failed_candidate=sorted(failed_cand),
-        accepted_scope="ОФЛАЙНОВЫЕ ТЕХНИЧЕСКИЕ ГЕЙТЫ: схлопывание книг "
-                       "(P и Q, включая исполняемые позиции), опора "
-                       "декодера на финальном пути, отсутствие регрессии "
-                       "по RMS, хотя бы одно улучшение, диапазон действий, "
-                       "неразорванное выравнивание. НЕ доказывает "
-                       "поведенческой пользы: её мерит роллаут",
+        two_level_verdict=two_level,
+        candidate_level=candidate_level,
+        accepted_scope="ОФЛАЙНОВЫЕ ГЕЙТЫ ДВУХ КАТЕГОРИЙ. rollout_blocker: "
+                       "схлопывание книг (P и Q, включая исполняемые "
+                       "позиции), опора декодера на финальном пути, "
+                       "диапазон действий, неразорванное выравнивание на "
+                       "исполняемых позициях. candidate: отсутствие "
+                       "регрессии на a2_pol и хотя бы одно улучшение. "
+                       "Отказ любого из них — результат обучения, а не "
+                       "испорченный артефакт: провенанс, инварианты и "
+                       "конечность останавливают прогон раньше. НЕ "
+                       "доказывает поведенческой пользы: её мерит роллаут",
+        gate_categories=dict(EXPECTED_GATES),
         acceptance_thresholds=dict(
             collapse_max_code_share=COLLAPSE_MAX_SHARE,
             collapse_min_perplexity=COLLAPSE_MIN_PPL,
             action_range_factor=ACTION_RANGE_FACTOR,
-            no_regression_factor=NO_REGRESSION_FACTOR),
+            no_regression_factor=NO_REGRESSION_FACTOR,
+            align_margin_nats=ALIGN_MARGIN),
         confirm=confirm,
         decode_batched=bool(decode_batched[0]),
         decode_batched_gap=float(decode_batched[1]),
@@ -1865,16 +2052,22 @@ def main():
               "голова непригодна")
         return 0
     if failed_tech:
-        print("  ТЕХНИЧЕСКИЙ ОТКАЗ: " + ", ".join(failed_tech)
-              + ". Чекпойнт сохранён с accepted=false; по нему нельзя ни "
-                "роллаут, ни вывод об эксперименте — сначала разобраться, "
-                "почему гейт не прошёл")
+        suspect = [k for k in failed_tech
+                   if k in ("decoder_support", "align_not_broken")]
+        print("  РОЛЛАУТ ЗАБЛОКИРОВАН: " + ", ".join(failed_tech)
+              + ". Чекпойнт сохранён с accepted=false. Это результат "
+                "обучения, а не испорченный артефакт: провенанс, инварианты "
+                "и конечность проверены и прошли."
+              + (f" Но по {', '.join(suspect)} под вопросом и само "
+                 f"офлайновое число: улучшение RMS могло быть "
+                 f"экстраполяцией декодера или чтением наугад."
+                 if suspect else ""))
         return 3
     if failed_cand:
-        print("  ТЕХНИЧЕСКИ ИСПРАВНО, НО НЕ КАНДИДАТ: "
+        print("  РОЛЛАУТ ВОЗМОЖЕН ТЕХНИЧЕСКИ, НО КАНДИДАТА НЕТ: "
               + ", ".join(failed_cand)
-              + ". Это ОТРИЦАТЕЛЬНЫЙ РЕЗУЛЬТАТ, а не поломка: ни один путь "
-                "не лучше черновика, роллаут запускать не за чем")
+              + f". Это ОТРИЦАТЕЛЬНЫЙ РЕЗУЛЬТАТ: уровень-кандидат "
+                f"{candidate_level}")
         return 4
     return 0
 
