@@ -96,11 +96,14 @@ def check_init_gate(path, *, expect, file_sha, code_version,
     # feedback от неподключённого: при нулевой инициализации проверка
     # «выключение ничего не меняет» тавтологична.
     causal = g.get("causal_checks") or {}
-    if not causal or not all(bool(v) for v in causal.values()):
+    # СТРОГО `is not True`, А НЕ `bool(v)`. Строка "false" в Python истинна,
+    # и артефакт с девятью значениями "false" проходил как пройденный.
+    bad_values = sorted(k for k, v in causal.items() if v is not True)
+    if not causal or bad_values:
         raise SystemExit(
-            "в гейте K-15a нет причинных проверок feedback или они не "
-            "пройдены: тождественность при нулевых весах ничего не "
-            "доказывает про подключение путей")
+            f"в гейте K-15a причинные проверки отсутствуют или их значения "
+            f"не True: {bad_values[:4]}. Тождественность при нулевых весах "
+            f"ничего не доказывает про подключение путей")
     # ЧИСЛО ПРИЧИННЫХ ПРОВЕРОК СВЕРЯЕТСЯ С ЧИСЛОМ БАТЧЕЙ. «Хотя бы одна»
     # проходило и в том случае, когда проверка отработала на первом батче и
     # молча пропала на остальных.
@@ -157,28 +160,103 @@ def check_init_gate(path, *, expect, file_sha, code_version,
                 decoder_context=dict(decoder_context))
 
 
-def frozen_checksum(model, torch, trainable_names):
-    """Отпечаток всех ЗАМОРОЖЕННЫХ тензоров модели.
+def frozen_tensors(model, trainable_names):
+    """Пары (имя, тензор) для всего ЗАМОРОЖЕННОГО: параметры И буферы.
 
-    Считается на устройстве по (numel, сумма, сумма квадратов) во float64 и
-    хешируется. Побитовая сверка кодов q0 доказывает, что не поехал уровень
-    0; эта сумма доказывает, что не поехало НИЧЕГО из замороженного, включая
-    то, что на q0 не влияет.
+    Буферы раньше не проверялись вовсе, а книга C0 — именно буфер.
+    """
+    for name, p in model.named_parameters():
+        if name not in trainable_names:
+            yield f"param:{name}", p
+    for name, b in model.named_buffers():
+        if b is not None:
+            yield f"buffer:{name}", b
+
+
+def frozen_invariant(model, torch, trainable_names):
+    """ДЕШЁВЫЙ инвариант замороженного: версии, хранилища, формы.
+
+    ПОЧЕМУ НЕ МОМЕНТЫ. Отпечаток по (сумма, сумма квадратов) инвариантен к
+    ПЕРЕСТАНОВКЕ значений внутри тензора: [1,2,3,4] и [4,3,2,1] давали один
+    и тот же отпечаток. Здесь вместо моментов берутся:
+
+    * `_version` — счётчик изменений на месте: любая in-place запись его
+      увеличивает, а именно так и двигал бы веса оптимизатор;
+    * идентификатор хранилища — ловит ПОДМЕНУ тензора, при которой версия
+      осталась бы нулевой;
+    * форма и тип.
+
+    Побитовое доказательство даёт `frozen_content_sha`; оно дорогое и
+    считается дважды за прогон, а этот инвариант — на каждой эпохе.
     """
     import hashlib as _h
     acc = _h.sha1()
-    n_tensors = 0
+    n = 0
+    for name, t_ in frozen_tensors(model, trainable_names):
+        n += 1
+        try:
+            storage = t_.untyped_storage().data_ptr()
+        except AttributeError:                    # torch < 2.0
+            storage = t_.storage().data_ptr()
+        acc.update(f"{name}|{tuple(t_.shape)}|{t_.dtype}|"
+                   f"{t_._version}|{storage}".encode())
+    return acc.hexdigest()[:12], n
+
+
+def frozen_content_sha(model, torch, trainable_names):
+    """ПОБИТОВЫЙ отпечаток содержимого всего замороженного.
+
+    Единственная проверка, которая ловит любое изменение, включая
+    перестановку. Читает все веса на хост, поэтому вызывается дважды за
+    прогон: до обучения и после восстановления выбранной эпохи.
+    """
+    import hashlib as _h
+    acc = _h.sha1()
+    n, elems = 0, 0
     with torch.no_grad():
-        for name, p in model.named_parameters():
-            if name in trainable_names:
-                continue
-            n_tensors += 1
-            v = p.detach().double()
-            acc.update(name.encode())
-            acc.update(np.asarray(
-                [float(p.numel()), float(v.sum()), float((v * v).sum())],
-                np.float64).tobytes())
-    return acc.hexdigest()[:12], n_tensors
+        for name, t_ in frozen_tensors(model, trainable_names):
+            n += 1
+            elems += int(t_.numel())
+            acc.update(f"{name}|{tuple(t_.shape)}|{t_.dtype}".encode())
+            # ЧЕРЕЗ view(uint8), А НЕ numpy(): на bfloat16 `numpy()`
+            # падает с TypeError, и отпечаток замороженного нельзя было бы
+            # снять вообще — проверено, падает.
+            acc.update(t_.detach().cpu().contiguous()
+                       .view(torch.uint8).numpy().tobytes())
+    return acc.hexdigest()[:12], n, elems
+
+
+def optimizer_covers_exactly(opt, model, trainable_names):
+    """Множество тензоров в оптимизаторе РОВНО равно белому списку.
+
+    Сверка по id: имя в белом списке ничего не гарантирует, если в группу
+    попал другой тензор с тем же содержимым.
+    """
+    in_opt = {id(p) for group in opt.param_groups for p in group["params"]}
+    want = {id(p) for name, p in model.named_parameters()
+            if name in trainable_names}
+    extra = len(in_opt - want)
+    missing = sorted(name for name, p in model.named_parameters()
+                     if name in trainable_names and id(p) not in in_opt)
+    return extra, missing
+
+
+def no_alias_between(model, trainable_names):
+    """Ни один обучаемый тензор не делит хранилище с замороженным."""
+    def sid(t_):
+        try:
+            return t_.untyped_storage().data_ptr()
+        except AttributeError:
+            return t_.storage().data_ptr()
+
+    frozen_ids = {}
+    for name, t_ in frozen_tensors(model, trainable_names):
+        frozen_ids.setdefault(sid(t_), name)
+    clashes = []
+    for name, p in model.named_parameters():
+        if name in trainable_names and sid(p) in frozen_ids:
+            clashes.append((name, frozen_ids[sid(p)]))
+    return clashes
 
 
 def weighted_row_error(predicted, target, weights, torch):
@@ -466,29 +544,66 @@ def selftest():
     # по тем же числам, что среднее.
     assert abs(float(rows2.mean()) - st2["rel_residual"]) < 1e-6
 
-    # --- ОТПЕЧАТОК ЗАМОРОЖЕННЫХ ВЕСОВ -------------------------------------
+    # --- ИНВАРИАНТ И ОТПЕЧАТОК ЗАМОРОЖЕННОГО ------------------------------
     import torch.nn as nn_
     toy = nn_.Module()
     toy.free = nn_.Linear(3, 3)
     toy.frozen = nn_.Linear(3, 3)
+    toy.register_buffer("book", torch.arange(4.0))
     train_names = {"free.weight", "free.bias"}
-    sha_a, n_a = frozen_checksum(toy, torch, train_names)
-    assert n_a == 2, n_a
+    names_f = [n for n, _ in frozen_tensors(toy, train_names)]
+    # БУФЕРЫ ВХОДЯТ В ПРОВЕРКУ: книга C0 — именно буфер, и раньше она в
+    # отпечаток не попадала вовсе.
+    assert names_f == ["param:frozen.weight", "param:frozen.bias",
+                       "buffer:book"], names_f
+    inv_a, n_a = frozen_invariant(toy, torch, train_names)
+    sha_a, n_s, n_el = frozen_content_sha(toy, torch, train_names)
+    # ОТПЕЧАТОК СНИМАЕТСЯ И С bfloat16: через numpy() он падал бы
+    bf = nn_.Module()
+    bf.w = nn_.Parameter(torch.ones(3, 4, dtype=torch.bfloat16))
+    sha_bf = frozen_content_sha(bf, torch, set())[0]
     with torch.no_grad():
-        toy.free.weight += 1.0            # обучаемое: отпечаток не меняется
-    sha_b, _ = frozen_checksum(toy, torch, train_names)
-    assert sha_b == sha_a, "отпечаток зависит от обучаемых весов"
+        bf.w[0, 0] = 2.0
+    assert frozen_content_sha(bf, torch, set())[0] != sha_bf
+    assert n_a == n_s == 3 and n_el == 9 + 3 + 4, (n_a, n_s, n_el)
     with torch.no_grad():
-        toy.frozen.bias[0] += 1e-3        # замороженное: обязан измениться
-    sha_c, _ = frozen_checksum(toy, torch, train_names)
-    assert sha_c != sha_a, "сдвиг замороженного веса не изменил отпечаток"
-    # ПЕРЕСТАНОВКА ЗНАКОВ НЕ ПРОХОДИТ: сумма одна, сумма квадратов одна, но
-    # имена и порядок входят в хеш, поэтому проверяем именно сдвиг знака.
+        toy.free.weight += 1.0            # обучаемое: ничего не меняется
+    assert frozen_invariant(toy, torch, train_names)[0] == inv_a
+    assert frozen_content_sha(toy, torch, train_names)[0] == sha_a
+    # ПЕРЕСТАНОВКА ЗНАЧЕНИЙ — то, что моменты не ловили вовсе: сумма и
+    # сумма квадратов у [0,1,2,3] и [3,2,1,0] совпадают.
     with torch.no_grad():
-        toy.frozen.bias[0] -= 1e-3
-        toy.frozen.weight[0, 0] *= -1.0
-    sha_d, _ = frozen_checksum(toy, torch, train_names)
-    assert sha_d != sha_a, "смена знака замороженного веса не замечена"
+        toy.book.copy_(torch.tensor([3.0, 2.0, 1.0, 0.0]))
+    assert frozen_content_sha(toy, torch, train_names)[0] != sha_a, \
+        "перестановка значений замороженного буфера не замечена"
+    assert frozen_invariant(toy, torch, train_names)[0] != inv_a, \
+        "запись на месте не увеличила _version"
+    with torch.no_grad():
+        toy.book.copy_(torch.arange(4.0))
+    assert frozen_content_sha(toy, torch, train_names)[0] == sha_a
+    # ПОДМЕНА ТЕНЗОРА: версия у нового нулевая, ловится по хранилищу
+    inv_now = frozen_invariant(toy, torch, train_names)[0]
+    toy.frozen.bias = nn_.Parameter(toy.frozen.bias.detach().clone())
+    assert frozen_invariant(toy, torch, train_names)[0] != inv_now, \
+        "подмена замороженного тензора не замечена"
+
+    # --- ОПТИМИЗАТОР НАКРЫВАЕТ РОВНО БЕЛЫЙ СПИСОК -------------------------
+    good_opt = torch.optim.SGD([toy.free.weight, toy.free.bias], lr=0.1)
+    assert optimizer_covers_exactly(good_opt, toy, train_names) == (0, [])
+    wide = torch.optim.SGD([toy.free.weight, toy.free.bias,
+                            toy.frozen.weight], lr=0.1)
+    assert optimizer_covers_exactly(wide, toy, train_names)[0] == 1
+    narrow = torch.optim.SGD([toy.free.weight], lr=0.1)
+    assert optimizer_covers_exactly(narrow, toy, train_names)[1] == \
+        ["free.bias"]
+
+    # --- НЕТ ОБЩЕГО ХРАНИЛИЩА С ЗАМОРОЖЕННЫМ ------------------------------
+    assert no_alias_between(toy, train_names) == []
+    shared = nn_.Module()
+    base = torch.arange(6.0).reshape(2, 3)
+    shared.frozen = nn_.Parameter(base)
+    shared.free = nn_.Parameter(base)          # то же хранилище
+    assert no_alias_between(shared, {"free"}) == [("free", "param:frozen")]
 
     # --- ПРОГНОЗ ВРЕМЕНИ --------------------------------------------------
     f = forecast_runtime(100.0, 100, 16951, 3)
@@ -576,10 +691,17 @@ def selftest():
                 ({"passed": False}, "не пройден"),
                 ({"kind": "x"}, "описывает"),
                 ({"git_dirty": True}, "незакоммиченном"),
-                ({"causal_checks": {}}, "причинных проверок"),
+                ({"causal_checks": {}}, "отсутствуют"),
                 ({"causal_checks": dict(good["causal_checks"],
                                         **{"batch0.feedback0_changes_q1":
-                                           False})}, "причинных проверок"),
+                                           False})}, "не True"),
+                # СТРОКА "false" В PYTHON ИСТИННА: bool(v) её принимал
+                ({"causal_checks": {k: "false" for k in
+                                    good["causal_checks"]}}, "не True"),
+                ({"causal_checks": {k: 1 for k in
+                                    good["causal_checks"]}}, "не True"),
+                ({"causal_checks": {k: None for k in
+                                    good["causal_checks"]}}, "не True"),
                 # проверка отработала на первом батче и пропала дальше
                 ({"causal_checks": half}, "не тот"),
                 # новый вид причинной проверки отсутствует целиком
@@ -1108,6 +1230,17 @@ def main():
                                       .abs().max()),
                     d_action_q2=float((acts["a2_pol"] - acts["a1_pol"])
                                       .abs().max()),
+                    # ПОКАНАЛЬНЫЕ МАКСИМУМЫ ПО ИСПОЛНЯЕМЫМ ПОЗИЦИЯМ: их
+                    # сравнение с истинными действиями и есть проверка
+                    # разумности диапазона.
+                    act_absmax=acts["a2_pol"][:, :H_EXEC].abs()
+                    .amax(dim=(0, 1)).cpu().numpy(),
+                    true_absmax=action[:, :H_EXEC].abs()
+                    .amax(dim=(0, 1)).cpu().numpy(),
+                    align1_q_to_p=float(lparts["align1_q_to_p"]),
+                    align2_q_to_p=float(lparts["align2_q_to_p"]),
+                    align1_p_to_q=float(lparts["align1_p_to_q"]),
+                    align2_p_to_q=float(lparts["align2_p_to_q"]),
                     q1_codes=out["pred_codes"][1].detach().cpu().numpy(),
                     q2_codes=out["pred_codes"][2].detach().cpu().numpy(),
                     q1_codes_tok=i1_tok.detach().cpu().numpy(),
@@ -1144,6 +1277,9 @@ def main():
                    d_latent_q2=0.0)
         n_rows = 0
         dmax = {"d_action_q1": 0.0, "d_action_q2": 0.0}
+        absmax = {"act_absmax": None, "true_absmax": None}
+        align_acc = {k: 0.0 for k in ("align1_q_to_p", "align2_q_to_p",
+                                      "align1_p_to_q", "align2_p_to_q")}
         codes = {k: [] for k in ("q1_pol", "q2_pol", "q1_tok", "q2_tok")}
         sup_rows, ref_rows, rows_keep = [], [], []
         with torch.no_grad():
@@ -1162,6 +1298,13 @@ def main():
                 # ошибка, из-за которой пропадали два из пяти путей.
                 for k_ in ("d_action_q1", "d_action_q2"):
                     dmax[k_] = max(dmax[k_], float(stat[k_]))
+                for k_ in absmax:
+                    absmax[k_] = np.asarray(stat[k_], np.float64) \
+                        if absmax[k_] is None \
+                        else np.maximum(absmax[k_],
+                                        np.asarray(stat[k_], np.float64))
+                for k_ in align_acc:
+                    align_acc[k_] += float(stat[k_]) * w
                 # КОДЫ ХРАНЯТСЯ С ПОЗИЦИЯМИ, А НЕ СПЛЮЩЕННЫМИ: схлопывание
                 # бывает позиционным — книга жива в среднем и мертва на
                 # первой позиции чанка, которая и исполняется.
@@ -1201,6 +1344,10 @@ def main():
         n = max(n_rows, 1)
         res = {k: v / n for k, v in acc.items()}
         res.update(dmax)
+        res.update({k: v / n for k, v in align_acc.items()})
+        res["act_absmax"] = [float(x) for x in absmax["act_absmax"]]
+        res["true_absmax"] = [float(x) for x in absmax["true_absmax"]]
+        res["log_vocab"] = float(np.log(float(vocab)))
         for k in PATHS5:
             res[f"rms_{k}"] = float(np.sqrt(res[k]))
         for name, key in (("usage_q1", "q1_pol"), ("usage_q2", "q2_pol"),
@@ -1302,18 +1449,50 @@ def main():
     print(f"  операций, зависящих от режима: нет "
           f"(проверено {sum(1 for _ in model.named_modules())} модулей)")
 
+    # --- ЗАМОРОЖЕННОЕ: ЧТО ИМЕННО ДОКАЗЫВАЕТСЯ И ЧЕМ ---------------------
     trainable_set = set(info["names"])
-    frozen_sha0, n_frozen = frozen_checksum(model, torch, trainable_set)
-    print(f"  замороженных тензоров {n_frozen}, их отпечаток {frozen_sha0}")
+    extra_opt, missing_opt = optimizer_covers_exactly(opt, model,
+                                                      trainable_set)
+    if extra_opt or missing_opt:
+        raise SystemExit(
+            f"оптимизатор накрывает не белый список: лишних тензоров "
+            f"{extra_opt}, не попало {missing_opt[:4]}")
+    clashes = no_alias_between(model, trainable_set)
+    if clashes:
+        raise SystemExit(
+            f"обучаемый тензор делит хранилище с замороженным: "
+            f"{clashes[:3]}. Шаг оптимизатора двигал бы замороженное")
+    frozen_inv0, n_frozen = frozen_invariant(model, torch, trainable_set)
+    t_hash = time.time()
+    frozen_sha0, n_sha, n_elem_frozen = frozen_content_sha(
+        model, torch, trainable_set)
+    print(f"  замороженных тензоров {n_frozen} ({n_elem_frozen} значений): "
+          f"инвариант {frozen_inv0}, побитовый отпечаток {frozen_sha0} "
+          f"({time.time() - t_hash:.1f} с)")
+    if n_sha != n_frozen:
+        raise SystemExit(f"обход замороженного дал {n_sha} и {n_frozen}")
 
-    def check_frozen(tag):
-        sha_, n_ = frozen_checksum(model, torch, trainable_set)
-        if sha_ != frozen_sha0 or n_ != n_frozen:
+    def check_frozen(tag, content=False):
+        """Дешёвый инвариант всегда, побитовый отпечаток — по требованию.
+
+        Инвариант ловит запись на месте (по `_version`) и подмену тензора
+        (по хранилищу); побитовый отпечаток ловит вообще всё, но читает
+        все веса на хост, поэтому берётся дважды за прогон.
+        """
+        inv_, n_ = frozen_invariant(model, torch, trainable_set)
+        if inv_ != frozen_inv0 or n_ != n_frozen:
             raise SystemExit(
-                f"{tag}: отпечаток замороженных весов {sha_} ({n_} "
-                f"тензоров) против {frozen_sha0} ({n_frozen}) до обучения. "
-                f"Что-то вне белого списка изменилось")
-        return sha_
+                f"{tag}: инвариант замороженного {inv_} ({n_} тензоров) "
+                f"против {frozen_inv0} ({n_frozen}) до обучения: что-то "
+                f"вне белого списка изменено на месте или подменено")
+        if content:
+            sha_, _n, _e = frozen_content_sha(model, torch, trainable_set)
+            if sha_ != frozen_sha0:
+                raise SystemExit(
+                    f"{tag}: побитовый отпечаток замороженного {sha_} "
+                    f"против {frozen_sha0} до обучения")
+            return sha_
+        return inv_
 
     history = []
     val0 = evaluate(parts["val_sel"], "эпоха 0, без обучения")
@@ -1330,26 +1509,41 @@ def main():
         # через часы полного прогона.
         po0, sel0 = parts["train"][0]
         probe_losses = []
+        # И ГРАДИЕНТ КАЖДОГО РАЗРЕШЁННОГО ТЕНЗОРА ОБЯЗАН БЫТЬ НЕНУЛЕВЫМ.
+        # Общая потеря может падать при мёртвой подгруппе: головы учатся,
+        # книги стоят, и по одному числу этого не видно.
+        grad_mass = {n_: 0.0 for n_ in info["names"]}
         for _ in range(3):
             opt.zero_grad(set_to_none=True)
             l_probe, _s_probe = run_batch(po0, sel0, True)
             probe_losses.append(float(l_probe.detach()))
             l_probe.backward()
+            for n_, p_ in model.named_parameters():
+                if n_ in grad_mass and p_.grad is not None:
+                    grad_mass[n_] += float(p_.grad.abs().sum())
             opt.step()
+        dead = sorted(n_ for n_, v_ in grad_mass.items() if v_ == 0.0)
+        if dead:
+            raise SystemExit(
+                f"нулевой градиент за три шага у {dead}: эти тензоры в "
+                f"белом списке, но не обучаются, и падение общей потери их "
+                f"не касается")
+        print(f"  градиент дошёл до всех {len(grad_mass)} разрешённых "
+              f"тензоров, минимальная масса "
+              f"{min(grad_mass.values()):.3e}")
         with torch.no_grad():
             own_p = dict(model.state_dict())
             for k_, v_ in snapshots[0].items():
                 own_p[k_].copy_(v_)
         opt.state.clear()
         opt.zero_grad(set_to_none=True)
-        check_frozen("проба обучаемости")
         print("  проба обучаемости на одном микробатче: "
               + " -> ".join(f"{x:.5f}" for x in probe_losses))
         if not probe_losses[-1] < probe_losses[0]:
             raise SystemExit(
                 f"три шага по одному микробатчу не уменьшили потерю "
                 f"({probe_losses}): оптимизатор собран, но не учит")
-        sha_back, _n = frozen_checksum(model, torch, trainable_set)
+        sha_back = check_frozen("после пробы", content=True)
         st_back = k14c.state_sha({k_: model.state_dict()[k_].detach().float()
                                   .cpu().numpy() for k_ in info["names"]})
         st_zero = k14c.state_sha({k_: v_.detach().float().cpu().numpy()
@@ -1456,7 +1650,7 @@ def main():
     # чекпойнт воспроизводит ту строку истории, по которой его выбрали, не
     # проверялось ничем. Ошибка в восстановлении выглядела бы как
     # результат.
-    check_frozen("после восстановления")
+    check_frozen("после восстановления", content=True)
     confirm = evaluate(parts["val_sel"], f"переоценка эпохи {best_epoch}",
                        keep_rows=True)
     for name_, got_, want_ in (("RMS a2_pol", confirm["rms_a2_pol"],
@@ -1475,7 +1669,55 @@ def main():
     # Эти числа печатались и раньше, но ничего не решали. Теперь они —
     # условия, и они записаны до того, как получены.
     COLLAPSE_MAX_SHARE, COLLAPSE_MIN_PPL = 0.98, 2.0
+    ACTION_RANGE_FACTOR = 1.5
+    NO_REGRESSION_FACTOR = 1.01
     gates = {}
+    # ТЕХНИЧЕСКАЯ ПРИГОДНОСТЬ К РОЛЛАУТУ, А НЕ ПОЛЬЗА. Условия записаны в
+    # плане до данных; они не доказывают, что уточнение помогает — это
+    # мерит §53, — но без них код возврата 0 ничего не означал бы.
+    gates["no_regression"] = dict(
+        rms_a2_pol=float(confirm["rms_a2_pol"]),
+        rms_a0=float(confirm["rms_a0"]),
+        limit=float(NO_REGRESSION_FACTOR * confirm["rms_a0"]),
+        rule=f"RMS(a2_pol) <= {NO_REGRESSION_FACTOR} * RMS(a0)",
+        category="technical",
+        passed=bool(confirm["rms_a2_pol"]
+                    <= NO_REGRESSION_FACTOR * confirm["rms_a0"]))
+    best_path = min(float(confirm["rms_a1_pol"]), float(confirm["rms_a2_pol"]))
+    gates["any_improvement"] = dict(
+        rms_a1_pol=float(confirm["rms_a1_pol"]),
+        rms_a2_pol=float(confirm["rms_a2_pol"]),
+        rms_a0=float(confirm["rms_a0"]),
+        rule="min(RMS(a1_pol), RMS(a2_pol)) < RMS(a0)",
+        # ЭТО НЕ ТЕХНИЧЕСКИЙ ОТКАЗ. Если ни один путь не лучше черновика,
+        # артефакт исправен, а ответ эксперимента отрицательный. Разные
+        # категории, разные коды возврата.
+        category="candidate",
+        passed=bool(best_path < float(confirm["rms_a0"])))
+    worst_ch = int(np.argmax(
+        np.asarray(confirm["act_absmax"])
+        / np.maximum(np.asarray(confirm["true_absmax"]), 1e-12)))
+    gates["action_range"] = dict(
+        act_absmax=confirm["act_absmax"],
+        true_absmax=confirm["true_absmax"],
+        worst_channel=worst_ch,
+        worst_ratio=float(confirm["act_absmax"][worst_ch]
+                          / max(confirm["true_absmax"][worst_ch], 1e-12)),
+        rule=f"|a2_pol| <= {ACTION_RANGE_FACTOR} * |истинного| поканально",
+        category="technical",
+        passed=bool(all(
+            m <= ACTION_RANGE_FACTOR * t
+            for m, t in zip(confirm["act_absmax"], confirm["true_absmax"]))))
+    log_v_ = float(confirm["log_vocab"])
+    align_vals = [float(confirm[f"align{lv}_q_to_p"]) for lv in (1, 2)]
+    gates["align_not_broken"] = dict(
+        align1_q_to_p=align_vals[0], align2_q_to_p=align_vals[1],
+        align1_p_to_q=float(confirm["align1_p_to_q"]),
+        align2_p_to_q=float(confirm["align2_p_to_q"]),
+        log_vocab=log_v_,
+        rule="кросс-энтропия Q->P конечна и меньше log V (лучше случайной)",
+        category="technical",
+        passed=bool(all(np.isfinite(v) and v < log_v_ for v in align_vals)))
     for lv in (1, 2):
         for side, tag_ in (("", "pol"), ("_tok", "tok")):
             u = confirm[f"usage_q{lv}{side}"]
@@ -1491,6 +1733,7 @@ def main():
                 executed_min_perplexity=bp["executed_min_perplexity"],
                 limit_max_share=COLLAPSE_MAX_SHARE,
                 limit_min_perplexity=COLLAPSE_MIN_PPL,
+                category="technical",
                 passed=bool(
                     u["max_code_share"] <= COLLAPSE_MAX_SHARE
                     and u["perplexity"] >= COLLAPSE_MIN_PPL
@@ -1506,16 +1749,24 @@ def main():
         rel_residual_mean=float(ds["rel_residual"]),
         reference_mean=float(ds["reference_rel_residual"]),
         rule="p95 остатка модели <= p95 остатка кодека на истинном латенте",
+        category="technical",
         passed=bool(ds["rel_residual_p95"]
                     <= ds["reference_rel_residual_p95"]))
     failed = sorted(k for k, v in gates.items() if not v["passed"])
+    if len(gates) != 9 or any("category" not in v for v in gates.values()):
+        raise SystemExit(f"гейтов приёмки {len(gates)}, ожидалось 9, и у "
+                         f"каждого обязана быть категория: {sorted(gates)}")
+    failed_tech = [k for k in failed
+                   if gates[k]["category"] == "technical"]
+    failed_cand = [k for k in failed if gates[k]["category"] == "candidate"]
     accepted = None if a.smoke else not failed
     print("  гейты приёмки: " + ("все пройдены" if not failed
                                  else "НЕ ПРОЙДЕНЫ " + ", ".join(failed)))
     for k, v in sorted(gates.items()):
-        print(f"    {k:22s} {'ok' if v['passed'] else 'ОТКАЗ'}  "
+        print(f"    [{v['category'][:4]}] {k:22s} "
+              f"{'ok' if v['passed'] else 'ОТКАЗ'}  "
               + ", ".join(f"{kk}={vv}" for kk, vv in v.items()
-                          if kk not in ("passed", "rule")))
+                          if kk not in ("passed", "rule", "category")))
 
     payload = dict(
         kind=("k15_smoke" if a.smoke else "k15_depth_rvq"), stage="q1q2",
@@ -1533,6 +1784,19 @@ def main():
         state={k_: v_.detach().cpu() for k_, v_ in model.state_dict().items()
                if k_ in set(info["names"])},
         accepted=accepted, gates=gates,
+        failed_technical=sorted(failed_tech),
+        failed_candidate=sorted(failed_cand),
+        accepted_scope="ОФЛАЙНОВЫЕ ТЕХНИЧЕСКИЕ ГЕЙТЫ: схлопывание книг "
+                       "(P и Q, включая исполняемые позиции), опора "
+                       "декодера на финальном пути, отсутствие регрессии "
+                       "по RMS, хотя бы одно улучшение, диапазон действий, "
+                       "неразорванное выравнивание. НЕ доказывает "
+                       "поведенческой пользы: её мерит роллаут",
+        acceptance_thresholds=dict(
+            collapse_max_code_share=COLLAPSE_MAX_SHARE,
+            collapse_min_perplexity=COLLAPSE_MIN_PPL,
+            action_range_factor=ACTION_RANGE_FACTOR,
+            no_regression_factor=NO_REGRESSION_FACTOR),
         confirm=confirm,
         decode_batched=bool(decode_batched[0]),
         decode_batched_gap=float(decode_batched[1]),
@@ -1552,7 +1816,9 @@ def main():
         val_confirm_role="retrospective_reused",
         val_confirm_used_for_selection=False,
         val_confirm_evaluated=False,
-        frozen_checksum=frozen_sha0,
+        frozen_content_sha=frozen_sha0,
+        frozen_invariant=frozen_inv0,
+        frozen_elements=n_elem_frozen,
         frozen_tensors=n_frozen,
         save_load_check="state serialization round-trip: побитовое равенство "
                         "сохранённых тензоров и state_sha. Воспроизведение "
@@ -1598,11 +1864,18 @@ def main():
         print("  РЕЖИМ SMOKE: данные урезаны, решения не принимаются, "
               "голова непригодна")
         return 0
-    if failed:
-        print("  РЕЗУЛЬТАТ НЕ ПРИНЯТ: " + ", ".join(failed)
-              + ". Чекпойнт сохранён, но помечен accepted=false — "
-                "роллаут по нему запускать нельзя")
+    if failed_tech:
+        print("  ТЕХНИЧЕСКИЙ ОТКАЗ: " + ", ".join(failed_tech)
+              + ". Чекпойнт сохранён с accepted=false; по нему нельзя ни "
+                "роллаут, ни вывод об эксперименте — сначала разобраться, "
+                "почему гейт не прошёл")
         return 3
+    if failed_cand:
+        print("  ТЕХНИЧЕСКИ ИСПРАВНО, НО НЕ КАНДИДАТ: "
+              + ", ".join(failed_cand)
+              + ". Это ОТРИЦАТЕЛЬНЫЙ РЕЗУЛЬТАТ, а не поломка: ни один путь "
+                "не лучше черновика, роллаут запускать не за чем")
+        return 4
     return 0
 
 
