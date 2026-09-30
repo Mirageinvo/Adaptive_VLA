@@ -60,7 +60,15 @@ def mean_squared_distances(residual: torch.Tensor,
     e2 = (e * e).sum(-1)
     inner = r @ e.T
     dim = float(e.shape[-1])
-    return (r2 - 2.0 * inner + e2) / dim
+    # ОТСЕЧЕНИЕ НУЛЁМ ОБЯЗАТЕЛЬНО. Раскрытая формула даёт слегка
+    # отрицательный квадрат расстояния, когда остаток почти совпадает со
+    # строкой книги: r2 и e2 считаются независимо и сокращаются не точно.
+    # Для логитов знак несущественен, но эта же функция печатается как
+    # расстояние, а отрицательное расстояние — ложь в отчёте. Отсечение
+    # может изменить argmin только если ДВЕ строки одновременно ушли ниже
+    # нуля, то есть обе лежат в пределах округления float32 от остатка; в
+    # этом случае выбор произволен и в точной арифметике тоже.
+    return ((r2 - 2.0 * inner + e2) / dim).clamp_min(0.0)
 
 
 def tokenizer_logits(residual: torch.Tensor, book: torch.Tensor,
@@ -70,11 +78,34 @@ def tokenizer_logits(residual: torch.Tensor, book: torch.Tensor,
     return -mean_squared_distances(residual, book) / temperature
 
 
+def quantize_residual(residual: torch.Tensor, book: torch.Tensor,
+                      temperature: float = 1.0):
+    """Логиты и жёсткий выбор для остатка: температура применяется ОДИН раз.
+
+    Возвращает (logits, embedding, indices, probabilities).
+
+    ЗАЧЕМ ОТДЕЛЬНАЯ ФУНКЦИЯ. Композиция `tokenizer_logits(r, C, tau)` и
+    `hard_straight_through(logits, C, tau)` применяет температуру ДВАЖДЫ:
+    softmax(-d / tau^2). При tau = 1 это незаметно, а при любом другом —
+    молча другой эксперимент, причём `probabilities` разошлись бы с теми,
+    по которым считается выравнивание. Здесь единственный правильный
+    порядок зафиксирован в одном месте.
+    """
+    logits = tokenizer_logits(residual, book, temperature=temperature)
+    embedding, indices, probabilities = hard_straight_through(
+        logits, book, temperature=1.0)
+    return logits, embedding, indices, probabilities
+
+
 def hard_straight_through(logits: torch.Tensor, book: torch.Tensor,
                           temperature: float = 1.0):
     """Жёсткий lookup вперёд, мягкое ожидание назад. Значение ТОЧНОЕ.
 
     Возвращает (embedding, indices, probabilities).
+
+    ВНИМАНИЕ: `temperature` применяется к УЖЕ ГОТОВЫМ логитам. Если они
+    получены из `tokenizer_logits`, температура там уже применена, и здесь
+    нужна 1.0 — либо, лучше, вызов `quantize_residual`.
 
     ФОРМУЛА ВЫБРАНА ИЗ ДВУХ, И РАЗЛИЧИЕ НЕ КОСМЕТИЧЕСКОЕ:
 
@@ -304,6 +335,32 @@ def selftest() -> None:
         assert "finite" in str(e)
     else:
         raise AssertionError("принята книга с nan")
+
+    # --- ТЕМПЕРАТУРА ПРИМЕНЯЕТСЯ РОВНО ОДИН РАЗ ---------------------------
+    # Композиция двух функций применяла её дважды, и на этом можно было
+    # потерять эксперимент: probabilities разошлись бы с логитами, по
+    # которым считается выравнивание.
+    r_t = torch.randn(3, 5, 16)
+    b_t = torch.randn(32, 16)
+    for tau_t in (0.25, 1.0, 3.0):
+        lg_t, emb_t, idx_t, pr_t = quantize_residual(r_t, b_t,
+                                                     temperature=tau_t)
+        want_lg = -mean_squared_distances(r_t, b_t) / tau_t
+        assert torch.equal(lg_t, want_lg), tau_t
+        assert torch.equal(pr_t, torch.softmax(want_lg, dim=-1)), tau_t
+        assert torch.equal(emb_t, F.embedding(idx_t, b_t.float())), tau_t
+        double = hard_straight_through(lg_t, b_t, temperature=tau_t)[2]
+        if tau_t != 1.0:
+            assert not torch.equal(double, pr_t), (
+                "двойное применение температуры перестало отличаться: "
+                "регрессионная проверка больше ничего не ловит")
+
+    # --- РАССТОЯНИЕ НЕ БЫВАЕТ ОТРИЦАТЕЛЬНЫМ -------------------------------
+    b_big = torch.randn(64, 128) * 7.0
+    r_on = b_big[[5, 9, 9, 40]].clone().reshape(2, 2, 128)
+    d_on = mean_squared_distances(r_on, b_big)
+    assert float(d_on.min()) >= 0.0, float(d_on.min())
+    assert d_on.argmin(-1).reshape(-1).tolist() == [5, 9, 9, 40]
 
     print("самопроверка depth_aligned_tokenizer пройдена")
 

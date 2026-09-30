@@ -72,6 +72,45 @@ def compare_exact(name, left, right, output):
     print(f"    {name:48s} bitwise equal ({left.size} values)")
 
 
+def compare_bounded(name, left, right, output, *, rel_limit, note):
+    """Сравнение с ЗАПИСАННЫМ расхождением и относительным пределом.
+
+    Нужно ровно там, где точного равенства ждать НЕЛЬЗЯ по известной
+    причине: legacy-путь собирает эмбеддинг как `emb + (hard - emb).detach()`,
+    и его значение отличается от строки книги на величину округления. Пока
+    feedback1 нулевой, это отличие никуда не распространяется; при
+    НЕНУЛЕВОМ feedback1 оно доходит до логитов q2. Поэтому здесь не
+    `compare_exact`, но и не молчание: расхождение печатается, пишется в
+    артефакт и обязано укладываться в предел.
+    """
+    left = np.asarray(left).astype(np.float64)
+    right = np.asarray(right).astype(np.float64)
+    if left.shape != right.shape:
+        raise SystemExit(f"{name}: shapes {left.shape} versus {right.shape}")
+    max_abs = float(np.max(np.abs(left - right))) if left.size else 0.0
+    scale = float(np.max(np.abs(left))) if left.size else 0.0
+    rel = max_abs / scale if scale > 0 else max_abs
+    n_differing = int(np.count_nonzero(left != right))
+    output[name] = {
+        "equal": max_abs == 0.0,
+        "max_abs_diff": max_abs,
+        "scale": scale,
+        "rel_diff": rel,
+        "n_differing": n_differing,
+        "size": int(left.size),
+        "rel_limit": float(rel_limit),
+        "expected_cause": note,
+    }
+    if rel > float(rel_limit):
+        raise SystemExit(
+            f"{name}: относительное расхождение {rel:.3e} больше предела "
+            f"{rel_limit:.3e} ({n_differing}/{left.size} значений, max "
+            f"{max_abs:.3e}). Ожидаемая причина: {note}. Такой масштаб "
+            f"причиной не объясняется")
+    print(f"    {name:48s} rel {rel:.2e} <= {rel_limit:.0e} "
+          f"({n_differing}/{left.size})")
+
+
 def require_initialization_status(status):
     required = (
         "c1_exact",
@@ -134,6 +173,34 @@ def selftest():
         assert "c2_exact" in str(error), error
     else:
         raise AssertionError("missing initialization field accepted")
+    # --- СРАВНЕНИЕ С ПРЕДЕЛОМ --------------------------------------------
+    base = np.full((4, 6), 100.0, np.float32)
+    near = base.copy()
+    near[1, 1] = 100.0 + 1e-4          # относительно 1e-6
+    compare_bounded("near", base, near, out, rel_limit=1e-3, note="округление")
+    assert out["near"]["equal"] is False
+    assert out["near"]["n_differing"] == 1
+    assert out["near"]["rel_diff"] < 1e-3 and out["near"]["scale"] == 100.0
+    assert out["near"]["expected_cause"] == "округление"
+    far = base.copy()
+    far[0, 0] = 101.0                  # относительно 1e-2
+    try:
+        compare_bounded("far", base, far, out, rel_limit=1e-3, note="о")
+    except SystemExit as error:
+        assert "больше предела" in str(error), error
+    else:
+        raise AssertionError("расхождение выше предела принято")
+    compare_bounded("identical", base, base.copy(), out, rel_limit=0.0,
+                    note="точное совпадение")
+    assert out["identical"]["equal"] is True
+    try:
+        compare_bounded("shape", base, base[:, :-1], out, rel_limit=1.0,
+                        note="о")
+    except SystemExit as error:
+        assert "shapes" in str(error), error
+    else:
+        raise AssertionError("несовпадение форм принято")
+
     print("k15a_check_init_identity selftest passed")
 
 
@@ -184,7 +251,9 @@ def main() -> int:
     import k14_common as kc
     import k14c_train_q1 as k14c
     import k9h_multiarm_gate as k9h
-    from depth_aligned_joint12 import make_depth_aligned_joint12_class
+    from depth_aligned_joint12 import (architecture_code_version,
+                                       make_action_decoder,
+                                       make_depth_aligned_joint12_class)
     from joint12_vla import make_joint12_class
     from smolvla.bar import SmolVLABlockwiseAR
     from utils import (STATE_Q01, STATE_Q99, VisionLanguageActionProcessor,
@@ -365,9 +434,10 @@ def main() -> int:
     def as_numpy(tensor):
         return tensor.detach().cpu().numpy()
 
-    def decode_latent(latent):
-        decoded, _ = codec._decode(latent.float(), embodiment_ids=0)
-        return decoded[..., :7].float()
+    # ДЕКОДЕР ОБЩИЙ С ТРЕНЕРОМ. Раньше здесь была своя копия, и она
+    # работала внутри fp16 autocast, тогда как тренер декодирует в fp32 вне
+    # autocast: гейт заверял не то действие, которое считает тренер.
+    decode_latent, decoder_context = make_action_decoder(codec, device.type)
 
     comparisons = {}
     causal = {}
@@ -439,6 +509,17 @@ def main() -> int:
                 device=probe_weight.device).reshape(probe_weight.shape)
             probe_weight.copy_(probe_pattern)
             probe_on = model.forward_depth_aligned_rvq(
+                vlm_inputs_embeds=vlm_inputs,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                mode="full",
+            )
+            # СТАРЫЙ ПУТЬ ПРИ ТОМ ЖЕ НЕНУЛЕВОМ feedback1. Сравнение выше
+            # проведено при нулевом feedback1, когда обусловливание второго
+            # уровня не доходит до логитов вообще: тождественность там
+            # выполняется независимо от того, ЧТО подаётся в feedback1.
+            # Именно здесь проверяется, что подаётся то же самое.
+            old_full_probe = model.forward_joint_depth_rvq(
                 vlm_inputs_embeds=vlm_inputs,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -525,6 +606,60 @@ def main() -> int:
                 f"{prefix}: выключение НЕНУЛЕВОГО feedback1 не изменило q2 — "
                 f"путь черновика в слои 19-24 не подключён")
         causal[f"{prefix}.feedback1_changes_q2"] = True
+
+        # --- СТАРЫЙ ПРОТИВ НОВОГО ПРИ НЕНУЛЕВОМ feedback1 ----------------
+        # Уровни 0 и 1 стоят ДО feedback1 и обязаны совпадать побитово.
+        for level in (0, 1):
+            compare_exact(
+                f"{prefix}.probe_old_vs_new.logits{level}",
+                as_numpy(old_full_probe["logits"][level]),
+                as_numpy(probe_on["logits"][level]), comparisons)
+            compare_exact(
+                f"{prefix}.probe_old_vs_new.codes{level}",
+                as_numpy(old_full_probe["pred_codes"][level]),
+                as_numpy(probe_on["pred_codes"][level]), comparisons)
+
+        # ВЕЛИЧИНА СОБСТВЕННОЙ НЕТОЧНОСТИ LEGACY-ПУТИ, ИЗМЕРЕННАЯ, А НЕ
+        # ЗАЯВЛЕННАЯ. Legacy собирает эмбеддинг как `emb + (hard -
+        # emb).detach()`; его значение не равно строке книги. Новый путь
+        # даёт строку побитово. Это и есть причина расхождения ниже.
+        legacy_emb = old_full_probe["embeddings"][1]
+        exact_row = model.depth_rvq_books[1][
+            old_full_probe["pred_codes"][1]].to(legacy_emb.dtype)
+        legacy_gap = (legacy_emb.float() - exact_row.float()).abs()
+        legacy_st = {
+            "max_abs": float(legacy_gap.max()),
+            "n_differing": int((legacy_emb != exact_row).sum()),
+            "size": int(legacy_emb.numel()),
+            "note": "legacy emb + (hard - emb).detach() против строки книги",
+        }
+        comparisons[f"{prefix}.legacy_st_error"] = legacy_st
+        print(f"    {prefix}.legacy_st_error: {legacy_st['n_differing']}/"
+              f"{legacy_st['size']} элементов, max {legacy_st['max_abs']:.2e}")
+
+        # Уровень 2 получает эту неточность через feedback1, поэтому здесь
+        # предел, а не равенство. Коды при этом могут переворачиваться
+        # только на границе, и их число записывается.
+        compare_bounded(
+            f"{prefix}.probe_old_vs_new.logits2",
+            as_numpy(old_full_probe["logits"][2]),
+            as_numpy(probe_on["logits"][2]), comparisons,
+            rel_limit=1e-3,
+            note="неточность legacy-ST в эмбеддинге q1, поданном в feedback1")
+        flips = int((as_numpy(old_full_probe["pred_codes"][2])
+                     != as_numpy(probe_on["pred_codes"][2])).sum())
+        total_codes = int(as_numpy(probe_on["pred_codes"][2]).size)
+        comparisons[f"{prefix}.probe_old_vs_new.code2_flips"] = {
+            "flips": flips, "size": total_codes,
+            "share": flips / max(total_codes, 1)}
+        print(f"    {prefix}.probe_old_vs_new.codes2: перевёрнуто {flips}/"
+              f"{total_codes}")
+        if flips / max(total_codes, 1) > 0.01:
+            raise SystemExit(
+                f"{prefix}: при ненулевом feedback1 старый и новый путь "
+                f"расходятся по кодам q2 в {flips}/{total_codes} позициях. "
+                f"Округление legacy-ST такой доли не объясняет")
+        causal[f"{prefix}.probe_old_vs_new_bounded"] = True
         for level in (0, 1):
             compare_exact(
                 f"{prefix}.probe.levels_before_feedback1.logits{level}",
@@ -562,6 +697,8 @@ def main() -> int:
         rows_used.append(np.asarray(rows, np.int64))
         print(f"    {prefix}.feedback0_changes_q1                 causal: "
               f"off changes q1")
+        print(f"    {prefix}.probe_old_vs_new_bounded             causal: "
+              f"старый и новый путь сошлись при НЕНУЛЕВОМ feedback1")
         print(f"    {prefix}.feedback1_changes_q2                 causal: "
               f"probe off changes q2")
         print(f"  batch {batch_index} ({part}, offset {position_offset}) passed")
@@ -569,26 +706,16 @@ def main() -> int:
     rows_used = np.concatenate(rows_used)
     rows_sha = hashlib.sha1(
         np.ascontiguousarray(rows_used).tobytes()).hexdigest()[:12]
-    code_files = {
-        "depth_aligned_joint12.py": sha12(inspect.getfile(
-            make_depth_aligned_joint12_class)),
-        "depth_aligned_tokenizer.py": sha12(os.path.join(
-            here, "depth_aligned_tokenizer.py")),
-        "k15a_check_init_identity.py": sha12(__file__),
-        "depth_rvq_joint12.py": sha12(os.path.join(here,
-                                                    "depth_rvq_joint12.py")),
-        "depth_rvq_vla.py": sha12(os.path.join(here, "depth_rvq_vla.py")),
-        "joint12_vla.py": sha12(os.path.join(here, "joint12_vla.py")),
-        "k14_common.py": sha12(inspect.getfile(kc)),
-        "bar.py": sha12(inspect.getfile(SmolVLABlockwiseAR)),
-    }
+    code_files = architecture_code_version(
+        here, inspect.getfile(SmolVLABlockwiseAR), sha12)
     # ПРИЧИННЫЕ ПРОВЕРКИ ИДУТ В АРТЕФАКТ. Они останавливают прогон при
     # отказе, но пока их не записать, артефакт не доказывает, что они были:
     # отличить "проверяли и сошлось" от "не проверяли" по нему нельзя.
     expected_causal = {f"batch{i}.{name}"
                        for i in range(len(plan))
                        for name in ("feedback0_changes_q1",
-                                    "feedback1_changes_q2")}
+                                    "feedback1_changes_q2",
+                                    "probe_old_vs_new_bounded")}
     if set(causal) != expected_causal or not all(causal.values()):
         raise SystemExit(
             f"причинные проверки неполны: нет "
@@ -606,6 +733,7 @@ def main() -> int:
         "initialization": initialization,
         "comparisons": comparisons,
         "n_batches": len(plan),
+        "decoder_context": decoder_context,
         "n_rows": int(len(rows_used)),
         "rows_sha1": rows_sha,
         "plan_sha1": q0_provenance["plan_sha1"],

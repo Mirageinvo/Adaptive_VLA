@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import os
 from types import SimpleNamespace
 from typing import Iterable
 
@@ -30,6 +31,77 @@ try:  # support both ``python experiments/...`` and package imports
 except ImportError:
     from depth_rvq_joint12 import DEFAULT_EXITS, make_joint_depth_rvq_class
     from depth_aligned_tokenizer import hard_straight_through
+
+
+# АРХИТЕКТУРНЫЕ ФАЙЛЫ K-15. Гейт записывает их отпечатки, тренер требует
+# точного совпадения. Список НЕ включает сам тренер: правка тренера не
+# обязана обесценивать доказательство про архитектуру, а сверка по git HEAD
+# обесценивала бы его на любой правке чего угодно.
+ARCHITECTURE_FILES = (
+    "depth_aligned_joint12.py",
+    "depth_aligned_tokenizer.py",
+    "k15a_check_init_identity.py",
+    "depth_rvq_joint12.py",
+    "depth_rvq_vla.py",
+    "joint12_vla.py",
+    "k14_common.py",
+)
+
+
+def architecture_code_version(experiments_dir: str, bar_file: str,
+                              sha12) -> dict:
+    """Отпечатки архитектурных файлов, посчитанные ОДНОЙ функцией.
+
+    Пока гейт и тренер считали такой словарь каждый по-своему, сверить их
+    было нельзя: расхождение выглядело бы как разный набор ключей.
+    """
+    version = {name: sha12(os.path.join(experiments_dir, name))
+               for name in ARCHITECTURE_FILES}
+    version["bar.py"] = sha12(bar_file)
+    return version
+
+
+# КОНТЕКСТ ДЕКОДИРОВАНИЯ ОПИСАН ОДИН РАЗ И СОБИРАЕТСЯ ОДНОЙ ФУНКЦИЕЙ.
+# Гейт заверял действие под fp16 autocast, а тренер считал его в fp32 вне
+# autocast, и комментарий «тот же контекст заверил гейт» был неверен. Пока
+# у двух файлов были два своих декодера, такое расхождение не могло быть
+# обнаружено ничем, кроме чтения обоих. Теперь декодер ровно один.
+DECODER_CONTEXT = {
+    "autocast": "disabled",
+    "latent_dtype": "float32",
+    "output_dtype": "float32",
+    "channels": 7,
+    "grad": "allowed (decoder frozen, gradient flows to books and heads)",
+}
+
+
+def make_action_decoder(codec, device_type: str):
+    """(decode, context): единственное декодирование латента в действие.
+
+    Возвращаемый словарь пишется в артефакт гейта и сверяется тренером на
+    точное равенство. Отличие в контексте означает, что тренер считает
+    действие, которого гейт не проверял.
+    """
+    channels = int(DECODER_CONTEXT["channels"])
+
+    def decode(latent: torch.Tensor) -> torch.Tensor:
+        with torch.autocast(device_type=device_type, enabled=False):
+            decoded, _ = codec._decode(latent.float(), embodiment_ids=0)
+            return decoded[..., :channels].float()
+
+    return decode, dict(DECODER_CONTEXT)
+
+
+def _storage_id(tensor: torch.Tensor) -> int:
+    """Идентификатор ХРАНИЛИЩА, а не адрес первого элемента.
+
+    `data_ptr()` у вида со смещением отличается от базового, поэтому
+    сравнение адресов пропускает ровно тот алиасинг, от которого защищает.
+    """
+    try:
+        return tensor.untyped_storage().data_ptr()
+    except AttributeError:            # torch < 2.0
+        return tensor.storage().data_ptr()
 
 
 TRAINABLE_GROUPS = (
@@ -106,16 +178,23 @@ def make_depth_aligned_joint12_class(base_cls):
             # АЛИАСИНГ ПРОВЕРЯЕТСЯ, А НЕ ПОДРАЗУМЕВАЕТСЯ. Если C1 или C2
             # окажутся видом на буфер legacy, обучение молча двигало бы
             # эталон, с которым сверяется гейт, и C0 через общее хранилище.
-            base_ptr = self.depth_rvq_books.data_ptr()
+            # СРАВНИВАЕТСЯ ХРАНИЛИЩЕ, А НЕ АДРЕС ПЕРВОГО ЭЛЕМЕНТА: вид со
+            # смещением (`books[1:]`) имеет ДРУГОЙ data_ptr и то же
+            # хранилище, поэтому проверка по data_ptr пропустила бы именно
+            # тот случай, от которого защищает.
+            base_id = _storage_id(self.depth_rvq_books)
             for level, parameter in ((1, self.depth_aligned_c1),
                                      (2, self.depth_aligned_c2)):
-                if parameter.data_ptr() == base_ptr:
+                if _storage_id(parameter) == base_id:
                     raise RuntimeError(
                         f"C{level} делит хранилище с legacy-буфером книг")
+                if parameter._base is not None:
+                    raise RuntimeError(f"C{level} является видом на другой "
+                                       f"тензор")
                 if not parameter.is_leaf or parameter.grad_fn is not None:
                     raise RuntimeError(f"C{level} не является листом графа")
-            if self.depth_aligned_c1.data_ptr() == \
-                    self.depth_aligned_c2.data_ptr():
+            if _storage_id(self.depth_aligned_c1) == \
+                    _storage_id(self.depth_aligned_c2):
                 raise RuntimeError("C1 и C2 делят одно хранилище")
             self.depth_aligned_feedback_mask = None
 
@@ -176,10 +255,14 @@ def make_depth_aligned_joint12_class(base_cls):
                     fb0.proj.bias is None
                     or torch.count_nonzero(fb0.proj.bias.detach()) == 0),
                 "books_not_aliased": bool(
-                    self.depth_aligned_c1.data_ptr()
-                    != self.depth_rvq_books.data_ptr()
-                    and self.depth_aligned_c2.data_ptr()
-                    != self.depth_rvq_books.data_ptr()),
+                    _storage_id(self.depth_aligned_c1)
+                    != _storage_id(self.depth_rvq_books)
+                    and _storage_id(self.depth_aligned_c2)
+                    != _storage_id(self.depth_rvq_books)
+                    and _storage_id(self.depth_aligned_c1)
+                    != _storage_id(self.depth_aligned_c2)
+                    and self.depth_aligned_c1._base is None
+                    and self.depth_aligned_c2._base is None),
             }
 
         def set_depth_aligned_feedback_mask(self, mask=(True, True)) -> tuple:

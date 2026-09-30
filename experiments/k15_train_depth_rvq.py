@@ -41,6 +41,7 @@ wd двигает параметр при НУЛЕВОМ градиенте, и 
 import argparse
 import copy
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -50,6 +51,7 @@ import time
 import numpy as np
 
 H_EXEC = 8            # исполняемых позиций чанка, как в K-14
+PATH_NAMES = ("a0", "a1_tok", "a1_pol", "a2_tok", "a2_pol")
 EPS_NORM = 1e-6       # нижний предел нормировки на q0 MSE
 # Веса функции потерь из плана K-15. Изменение любого — новый эксперимент.
 W_A1_POL, W_A1_TOK, W_A2_POL, W_A2_TOK = 0.5, 0.5, 1.0, 0.5
@@ -64,7 +66,8 @@ def sha12(path, chunk=1 << 22):
     return h.hexdigest()[:12]
 
 
-def check_init_gate(path, *, expect, file_sha):
+def check_init_gate(path, *, expect, file_sha, code_version,
+                    decoder_context, codec_fingerprints):
     """Гейт тождественности K-15a обязателен, как Gate R в K-14.
 
     Обучать архитектуру, про которую не доказано, что до обучения она
@@ -93,11 +96,45 @@ def check_init_gate(path, *, expect, file_sha):
             "в гейте K-15a нет причинных проверок feedback или они не "
             "пройдены: тождественность при нулевых весах ничего не "
             "доказывает про подключение путей")
-    n0 = sum(1 for k in causal if k.endswith("feedback0_changes_q1"))
-    n1 = sum(1 for k in causal if k.endswith("feedback1_changes_q2"))
-    if n0 < 1 or n1 < 1:
+    # ЧИСЛО ПРИЧИННЫХ ПРОВЕРОК СВЕРЯЕТСЯ С ЧИСЛОМ БАТЧЕЙ. «Хотя бы одна»
+    # проходило и в том случае, когда проверка отработала на первом батче и
+    # молча пропала на остальных.
+    n_batches = int(g.get("n_batches") or 0)
+    if n_batches <= 0:
+        raise SystemExit("в гейте K-15a нет n_batches")
+    kinds = ("feedback0_changes_q1", "feedback1_changes_q2",
+             "probe_old_vs_new_bounded")
+    counts = {k: sum(1 for name in causal if name.endswith(k))
+              for k in kinds}
+    if any(v != n_batches for v in counts.values()):
         raise SystemExit(
-            f"причинные проверки неполны: feedback0 {n0}, feedback1 {n1}")
+            f"причинные проверки неполны: на {n_batches} батчей получено "
+            f"{counts}. Проверка, отработавшая не на всех батчах, "
+            f"доказывает меньше, чем записано в её названии")
+    # АРХИТЕКТУРНЫЕ ФАЙЛЫ СВЕРЯЮТСЯ ПОСОДЕРЖИМОМУ, А НЕ ПО git HEAD.
+    # Правка тренера не обязана обесценивать гейт; правка архитектуры
+    # обязана, и молча пройти не должна.
+    if not isinstance(g.get("code_version"), dict):
+        raise SystemExit("в гейте K-15a нет code_version")
+    drift = [f"{k}: гейт {g['code_version'].get(k)}, сейчас "
+             f"{code_version.get(k)}"
+             for k in sorted(set(code_version) | set(g["code_version"]))
+             if g["code_version"].get(k) != code_version.get(k)]
+    if drift:
+        raise SystemExit(
+            "архитектура изменилась после гейта K-15a, его надо переснять: "
+            + "; ".join(drift))
+    # КОНТЕКСТ ДЕКОДИРОВАНИЯ. Гейт уже заверял действие в fp16 autocast,
+    # пока тренер считал его в fp32 вне autocast, и обнаружить это было
+    # нечем, кроме чтения обоих файлов.
+    if g.get("decoder_context") != decoder_context:
+        raise SystemExit(
+            f"контекст декодера в гейте {g.get('decoder_context')!r} против "
+            f"{decoder_context!r} в тренере: заверено не то действие")
+    if g.get("codec") != codec_fingerprints:
+        raise SystemExit(
+            f"отпечатки кодека в гейте {g.get('codec')!r} против "
+            f"{codec_fingerprints!r} сейчас: декодер не тот")
     bad = [f"{k}: гейт {g.get(k)}, сейчас {expect.get(k)}"
            for k in sorted(expect) if str(g.get(k)) != str(expect.get(k))]
     if bad:
@@ -105,7 +142,10 @@ def check_init_gate(path, *, expect, file_sha):
                          + "; ".join(bad))
     return dict(init_gate=path, init_gate_sha1=file_sha(path),
                 init_gate_run_id=g.get("run_id"),
-                init_gate_causal=len(causal))
+                init_gate_n_batches=n_batches,
+                init_gate_causal=len(causal),
+                init_gate_code_version=dict(code_version),
+                decoder_context=dict(decoder_context))
 
 
 def weighted_row_error(predicted, target, weights, torch):
@@ -129,10 +169,17 @@ def build_losses(paths, target, weights, torch, tok, *,
                  vocab=2048):
     """Функция потерь K-15 целиком. Чистая: ни модели, ни данных внутри.
 
-    `paths` — словарь пяти действий и четырёх наборов логитов:
+    `paths` — словарь пяти действий, четырёх наборов логитов и четырёх
+    наборов вероятностей:
         a0, a1_tok, a1_pol, a2_tok, a2_pol,
         q1_tok_logits, q1_pol_logits, q2_tok_logits, q2_pol_logits,
-        q1_pol_probs, q2_pol_probs.
+        q1_tok_probs, q2_tok_probs, q1_pol_probs, q2_pol_probs.
+
+    РЕГУЛЯРИЗАТОР ИСПОЛЬЗОВАНИЯ ПРИМЕНЯЕТСЯ К Q, как записано в плане:
+    KL(mean Q1) + KL(mean Q2). Он защищает от схлопывания разбиения, а не
+    читателя. Та же величина для P считается и возвращается, но в потерю
+    НЕ входит: схлопывание P — отдельный диагноз, и лечится он не
+    регуляризацией P, а тем, что читать стало нечего.
 
     НОРМИРОВКА НА ОШИБКУ ЧЕРНОВИКА. Все action- и monotonic-члены делятся на
     detached MSE пути a0 с нижним пределом: иначе кросс-энтропии масштаба
@@ -163,14 +210,17 @@ def build_losses(paths, target, weights, torch, tok, *,
     mono2 = tok.monotonic_hinge(rows["a1_pol"].detach(), rows["a2_pol"])
     l_mono = w_mono * (mono1 + mono2) / norm
 
-    l_usage = w_usage * (tok.usage_kl_to_uniform(paths["q1_pol_probs"])
-                         + tok.usage_kl_to_uniform(paths["q2_pol_probs"])
+    l_usage = w_usage * (tok.usage_kl_to_uniform(paths["q1_tok_probs"])
+                         + tok.usage_kl_to_uniform(paths["q2_tok_probs"])
                          ) / log_v
+    with torch.no_grad():
+        usage_pol = (tok.usage_kl_to_uniform(paths["q1_pol_probs"])
+                     + tok.usage_kl_to_uniform(paths["q2_pol_probs"])) / log_v
 
     total = l_action + l_align + l_mono + l_usage
     parts = dict(
         total=total, action=l_action, align=l_align, mono=l_mono,
-        usage=l_usage, norm=norm,
+        usage=l_usage, usage_pol_diagnostic=usage_pol, norm=norm,
         align1_q_to_p=align1["tokenizer_to_policy"],
         align1_p_to_q=align1["policy_to_tokenizer"],
         align2_q_to_p=align2["tokenizer_to_policy"],
@@ -198,10 +248,13 @@ def decoder_support(latent, codec, torch, quantizers, nearest_code,
             residual = residual - contribution
         num = residual.norm(dim=-1)
         den = latent.float().norm(dim=-1).clamp_min(1e-12)
+        rel = (num / den).flatten()
+        # ПОСТРОЧНЫЕ ОТНОШЕНИЯ ВОЗВРАЩАЮТСЯ ЦЕЛИКОМ. Прежде каждый батч
+        # отдавал свой p95, а вызывающий брал их среднее — это НЕ p95
+        # выборки, и на длинном хвосте расходится с ним в разы.
         return dict(abs_residual=float(num.mean()),
-                    rel_residual=float((num / den).mean()),
-                    rel_residual_p95=float(
-                        torch.quantile((num / den).flatten(), 0.95)))
+                    rel_residual=float(rel.mean()),
+                    n=int(rel.numel())), rel.cpu()
 
 
 def forecast_runtime(elapsed_seconds, done_batches, total_batches, epochs):
@@ -283,8 +336,11 @@ def selftest():
         for nm in ("q1_tok_logits", "q1_pol_logits",
                    "q2_tok_logits", "q2_pol_logits"):
             p[nm] = torch.randn(B, P, V, requires_grad=nm.endswith("logits"))
-        p["q1_pol_probs"] = torch.softmax(p["q1_pol_logits"], dim=-1)
-        p["q2_pol_probs"] = torch.softmax(p["q2_pol_logits"], dim=-1)
+        for lv in (1, 2):
+            p[f"q{lv}_tok_probs"] = torch.softmax(
+                p[f"q{lv}_tok_logits"], dim=-1)
+            p[f"q{lv}_pol_probs"] = torch.softmax(
+                p[f"q{lv}_pol_logits"], dim=-1)
         return p
 
     paths = make_paths()
@@ -314,6 +370,29 @@ def selftest():
         "нет градиента по логитам токенизатора: P->Q не работает"
     assert paths["q2_pol_logits"].grad is not None \
         and float(paths["q2_pol_logits"].grad.abs().sum()) > 0
+    # РЕГУЛЯРИЗАТОР ИСПОЛЬЗОВАНИЯ СИДИТ НА Q, А НЕ НА P. Проверяется
+    # причинно: подмена Q-вероятностей на схлопнутые обязана изменить член,
+    # подмена P-вероятностей — не обязана его менять вовсе.
+    # ОДИН И ТОТ ЖЕ БАЗОВЫЙ СЛОВАРЬ: make_paths() каждый раз рисует новые
+    # логиты, и сравнение двух его вызовов сравнивало бы разные входы.
+    base_paths = make_paths()
+    one_hot = torch.zeros(B, P, V)
+    one_hot[..., 3] = 1.0
+    base_usage = float(build_losses(dict(base_paths), target, weights, torch,
+                                    tok, vocab=V)[1]["usage"].detach())
+    collapsed = dict(base_paths)
+    collapsed["q1_tok_probs"] = one_hot
+    collapsed["q2_tok_probs"] = one_hot
+    u_q = float(build_losses(collapsed, target, weights, torch, tok,
+                             vocab=V)[1]["usage"].detach())
+    assert u_q > base_usage * 1.5, (u_q, base_usage)
+    only_p = dict(base_paths)
+    only_p["q1_pol_probs"] = one_hot
+    only_p["q2_pol_probs"] = one_hot
+    out_p = build_losses(only_p, target, weights, torch, tok, vocab=V)[1]
+    assert abs(float(out_p["usage"].detach()) - base_usage) < 1e-6, (
+        "член использования реагирует на P: он снова не на разбиении")
+    assert float(out_p["usage_pol_diagnostic"]) > 0
     # НИЖНИЙ ПРЕДЕЛ НОРМИРОВКИ: при нулевой ошибке черновика не делим на ноль
     zero = make_paths()
     for nm in ("a0", "a1_tok", "a1_pol", "a2_tok", "a2_pol"):
@@ -341,15 +420,18 @@ def selftest():
     qs = [FakeQ(book)]
     # латент РОВНО из книги -> остаток нулевой
     exact = book[torch.tensor([[0, 1, 2]])]
-    st = decoder_support(exact, None, torch, qs, fake_nearest,
-                         fake_contribution)
+    st, rows_st = decoder_support(exact, None, torch, qs, fake_nearest,
+                                  fake_contribution)
     assert st["abs_residual"] < 1e-6 and st["rel_residual"] < 1e-6
+    assert rows_st.numel() == st["n"] == 3
     # латент ВНЕ книги -> остаток заметный
     off = exact + 0.7
-    st2 = decoder_support(off, None, torch, qs, fake_nearest,
-                          fake_contribution)
+    st2, rows2 = decoder_support(off, None, torch, qs, fake_nearest,
+                                 fake_contribution)
     assert st2["rel_residual"] > 0.1, st2
-    assert st2["rel_residual_p95"] >= st2["rel_residual"] * 0.5
+    # ПОСТРОЧНЫЕ ЗНАЧЕНИЯ СОГЛАСОВАНЫ СО СРЕДНИМ: иначе p95 считался бы не
+    # по тем же числам, что среднее.
+    assert abs(float(rows2.mean()) - st2["rel_residual"]) < 1e-6
 
     # --- ПРОГНОЗ ВРЕМЕНИ --------------------------------------------------
     f = forecast_runtime(100.0, 100, 16951, 3)
@@ -377,38 +459,64 @@ def selftest():
     # --- ГЕЙТ K-15a: КАЖДАЯ МУТАЦИЯ ОТВЕРГАЕТСЯ ---------------------------
     import tempfile
     expect = {"joint_sha1": "J", "q1_sha1": "Q", "device": "cuda:1"}
+    cv = {"depth_aligned_joint12.py": "aaa", "bar.py": "bbb"}
+    dctx = {"autocast": "disabled", "channels": 7}
+    cfp = {"codebooks_sha1": "c1", "codec_state_sha1": "c2",
+           "decoder_probe": "c3"}
+    kinds = ("feedback0_changes_q1", "feedback1_changes_q2",
+             "probe_old_vs_new_bounded")
     good = dict(kind="k15_init_identity", passed=True, git_dirty=False,
-                run_id="R", causal_checks={"batch0.feedback0_changes_q1": True,
-                                           "batch0.feedback1_changes_q2": True},
+                run_id="R", n_batches=2,
+                causal_checks={f"batch{i}.{k}": True
+                               for i in range(2) for k in kinds},
+                code_version=cv, decoder_context=dctx, codec=cfp,
                 **expect)
+    fixed = dict(code_version=cv, decoder_context=dctx,
+                 codec_fingerprints=cfp, file_sha=lambda _p: "SH")
     with tempfile.TemporaryDirectory() as td:
         def w(obj, nm="g.json"):
             q = os.path.join(td, nm)
             json.dump(obj, open(q, "w"))
             return q
-        info = check_init_gate(w(good), expect=expect,
-                               file_sha=lambda _p: "SH")
-        assert info["init_gate_causal"] == 2 and info["init_gate_run_id"] == "R"
-        for patch, why in (
+        info = check_init_gate(w(good), expect=expect, **fixed)
+        assert info["init_gate_causal"] == 6 and info["init_gate_run_id"] == "R"
+        assert info["init_gate_n_batches"] == 2
+        assert info["decoder_context"] == dctx
+        half = {f"batch0.{k}": True for k in kinds}
+        for mut, why in (
                 ({"passed": False}, "не пройден"),
                 ({"kind": "x"}, "описывает"),
                 ({"git_dirty": True}, "незакоммиченном"),
                 ({"causal_checks": {}}, "причинных проверок"),
-                ({"causal_checks": {"batch0.feedback0_changes_q1": False,
-                                    "batch0.feedback1_changes_q2": True}},
-                 "причинных проверок"),
-                ({"causal_checks": {"batch0.feedback0_changes_q1": True}},
-                 "неполны"),
+                ({"causal_checks": dict(good["causal_checks"],
+                                        **{"batch0.feedback0_changes_q1":
+                                           False})}, "причинных проверок"),
+                # проверка отработала на первом батче и пропала на втором
+                ({"causal_checks": half}, "неполны"),
+                # новый вид причинной проверки отсутствует целиком
+                ({"causal_checks": {f"batch{i}.{k}": True for i in range(2)
+                                    for k in kinds[:2]}}, "неполны"),
+                ({"n_batches": 0}, "n_batches"),
+                ({"code_version": dict(cv, **{"bar.py": "ДРУГОЙ"})},
+                 "архитектура изменилась"),
+                ({"code_version": {"bar.py": "bbb"}},
+                 "архитектура изменилась"),
+                ({"code_version": None}, "нет code_version"),
+                ({"decoder_context": {"autocast": "enabled", "channels": 7}},
+                 "контекст декодера"),
+                ({"decoder_context": None}, "контекст декодера"),
+                ({"codec": dict(cfp, decoder_probe="ИНОЙ")},
+                 "отпечатки кодека"),
                 ({"joint_sha1": "ДРУГОЙ"}, "другой обстановке")):
             try:
-                check_init_gate(w(dict(good, **patch), "m.json"),
-                                expect=expect, file_sha=lambda _p: "SH")
+                check_init_gate(w(dict(good, **mut), "m.json"),
+                                expect=expect, **fixed)
             except SystemExit as e:
                 assert why in str(e), (why, e)
             else:
-                raise AssertionError(f"гейт принят при {patch}")
+                raise AssertionError(f"гейт принят при {mut}")
         try:
-            check_init_gate("", expect=expect, file_sha=lambda _p: "SH")
+            check_init_gate("", expect=expect, **fixed)
         except SystemExit as e:
             assert "не указан" in str(e)
         else:
@@ -474,6 +582,11 @@ def main():
             f"памяти используйте --accum поверх целых микробатчей")
     if a.limit and not a.smoke:
         raise SystemExit("--limit допустим только со --smoke")
+    if a.smoke and not a.limit:
+        # SMOKE БЕЗ --limit НИЧЕГО НЕ УРЕЗАЛ, то есть был полным прогоном
+        # под именем проверки связности.
+        a.limit = 2
+        print("  --smoke без --limit: беру 2 канонических батча на часть")
     if a.seed is None:
         raise SystemExit("--seed задаётся явно, умолчания у него нет")
     out_path = a.out or (f"data/k15/{'smoke' if a.smoke else 'depth_rvq'}"
@@ -497,7 +610,9 @@ def main():
     import k14c_train_q1 as k14c
     import k9h_multiarm_gate as k9h
     import depth_aligned_tokenizer as tok
-    from depth_aligned_joint12 import make_depth_aligned_joint12_class
+    from depth_aligned_joint12 import (architecture_code_version,
+                                       make_action_decoder,
+                                       make_depth_aligned_joint12_class)
     from depth_rvq_joint12 import code_contribution, nearest_code
     from joint12_vla import make_joint12_class
     from smolvla.bar import SmolVLABlockwiseAR
@@ -545,7 +660,7 @@ def main():
     parts = {}
     for name, po, sel in plan:
         parts.setdefault(name, []).append((po, sel))
-    if a.smoke and a.limit:
+    if a.limit:
         parts = {k: v[:int(a.limit)] for k, v in parts.items()}
     # СМЕЩЕНИЯ ПЛАНА СВЕРЯЮТСЯ СО СТРОКАМИ. Батч, заявленный с одним
     # смещением, а собранный из строк с другим, дал бы другой q0 — и это
@@ -630,6 +745,39 @@ def main():
     quantizers = list(codec.vq.quantizers)
     vocab = int(model.depth_aligned_book(1).shape[0])
 
+    # --- КОДЕК СВЕРЯЕТСЯ ТАК ЖЕ, КАК В K-14c -----------------------------
+    # Тренер декодирует действия этим кодеком, и все цели K-14 построены
+    # его книгами. Другой кодек дал бы другие числа при полном совпадении
+    # всего остального; в K-14c эта сверка уже есть, здесь её не было.
+    with torch.no_grad():
+        idx_all = torch.arange(int(codec.vocab_size), device=dev)[None, :]
+        codec_books = torch.stack([
+            q_.out_project(q_.decode_code(idx_all))[0]
+            for q_ in quantizers]).float()
+    if tuple(codec_books.shape) != tuple(np.asarray(E).shape):
+        raise SystemExit(f"книги кодека {tuple(codec_books.shape)} против "
+                         f"кэша {tuple(np.asarray(E).shape)}")
+    book_gap = float((codec_books.cpu()
+                      - torch.from_numpy(np.asarray(E, np.float32))
+                      ).abs().max())
+    if book_gap > 1e-5:
+        raise SystemExit(f"книги кодека разошлись с кэшем на {book_gap:.3e}")
+    codec_fp = {
+        "codebooks_sha1": hashlib.sha1(np.ascontiguousarray(
+            np.asarray(E, np.float32)).tobytes()).hexdigest()[:12],
+        "codec_state_sha1": k11a.state_sha1(codec),
+        "decoder_probe": k11a.decoder_probe(codec, codec_books, dev),
+    }
+    k11a.check_fingerprints(meta, codec_fp)
+    print(f"  кодек сверен: книги {codec_fp['codebooks_sha1']}, веса "
+          f"{codec_fp['codec_state_sha1']}, проба "
+          f"{codec_fp['decoder_probe']}")
+
+    # ДЕКОДЕР ОБЩИЙ С ГЕЙТОМ: одна функция, один контекст.
+    decode_fp32, decoder_context = make_action_decoder(codec, dev.type)
+    code_version = architecture_code_version(
+        here, inspect.getfile(SmolVLABlockwiseAR), sha12)
+
     # --- ГЕЙТ K-15a ОБЯЗАТЕЛЕН -------------------------------------------
     gate_info = check_init_gate(
         a.init_gate,
@@ -638,7 +786,10 @@ def main():
                     plan_sha1=q0_prov["plan_sha1"],
                     compute_dtype=a.dtype,
                     device=str(dev)),
-        file_sha=k11a.file_sha1)
+        file_sha=k11a.file_sha1,
+        code_version=code_version,
+        decoder_context=decoder_context,
+        codec_fingerprints=codec_fp)
     print(f"  гейт K-15a: {gate_info['init_gate']}, запуск "
           f"{gate_info['init_gate_run_id']}, причинных проверок "
           f"{gate_info['init_gate_causal']}")
@@ -684,19 +835,9 @@ def main():
                  action_processor_kwargs={"embodiment_ids": 0})
         return dict_apply(lambda x: x.to(dev, dt), b)
 
-    def decode_fp32(latent):
-        """ЕДИНЫЙ КОНТЕКСТ: fp32, autocast выключен явно.
-
-        Тот же контекст заверил гейт K-15a. Градиент через декодер нужен —
-        он замороженный, но по нему течёт градиент к книгам и головам, —
-        поэтому no_grad здесь НЕ ставится.
-        """
-        with torch.autocast(device_type=dev.type, enabled=False):
-            x, _ = codec._decode(latent.float(), embodiment_ids=0)
-            return x[..., :7].float()
-
     ac16 = torch.autocast(device_type=dev.type, dtype=dt)
     run_batch_checked = [False]
+    decode_batched = [None, 0.0]
 
     def run_batch(po, sel, train):
         # флаг однократной проверки; список, чтобы не объявлять nonlocal
@@ -726,19 +867,18 @@ def main():
         with torch.no_grad():
             z_e = codec._encode(action.float(), embodiment_ids=0).float()
         r1 = z_e - z0.detach()
-        q1_tok_logits = tok.tokenizer_logits(r1, c1,
-                                             temperature=float(a.tau_tokenizer))
-        c1_tok, _i1, _p1 = tok.hard_straight_through(
-            q1_tok_logits, c1, temperature=float(a.tau_tokenizer))
+        # ТЕМПЕРАТУРА ПРИМЕНЯЕТСЯ ОДИН РАЗ. Композиция tokenizer_logits и
+        # hard_straight_through применяла её дважды, и probabilities
+        # расходились с логитами, по которым считается выравнивание.
+        q1_tok_logits, c1_tok, i1_tok, p1_tok = tok.quantize_residual(
+            r1, c1, temperature=float(a.tau_tokenizer))
         # ПРЕФИКС ДЛЯ ВТОРОГО УРОВНЯ — ФАКТИЧЕСКИЙ q1 МОДЕЛИ, И ОН
         # DETACH-НУТ: иначе токенизатор q2 уменьшал бы собственную задачу,
         # двигая C1. C1 всё равно получает градиент от q1-путей.
         hard_c1 = c1[out["pred_codes"][1]].detach()
         r2 = z_e - z0.detach() - hard_c1
-        q2_tok_logits = tok.tokenizer_logits(r2, c2,
-                                             temperature=float(a.tau_tokenizer))
-        c2_tok, _i2, _p2 = tok.hard_straight_through(
-            q2_tok_logits, c2, temperature=float(a.tau_tokenizer))
+        q2_tok_logits, c2_tok, i2_tok, p2_tok = tok.quantize_residual(
+            r2, c2, temperature=float(a.tau_tokenizer))
         # ФАКТИЧЕСКИЙ ПУТЬ ВЫВОДА БЕРЁТСЯ ИЗ МОДЕЛИ, А НЕ ПЕРЕСОБИРАЕТСЯ:
         # пересборка была бы второй реализацией той же суммы. Один раз
         # проверяем, что она совпадает с z0 + c1_pol + c2_pol.
@@ -749,99 +889,252 @@ def main():
                 raise SystemExit(
                     "накопленный латент модели не равен сумме её же "
                     "эмбеддингов: путь вывода собран по-разному")
+        # ОДИН ВЫЗОВ ДЕКОДЕРА НА ПЯТЬ ПУТЕЙ. Пять отдельных вызовов на
+        # батч из восьми строк — это пять запусков ядер ради 40 строк.
+        # Склейка по батчу законна только если декодер построчный, и это
+        # ПРОВЕРЯЕТСЯ один раз, а не предполагается: подбор ядра cuBLAS
+        # зависит от размера батча, поэтому побитового равенства может и не
+        # быть. Если его нет — работаем по одному и пишем это в артефакт.
+        lat5 = [z0, z0 + c1_tok, z0 + c1_pol, z0 + hard_c1 + c2_tok,
+                out["cumulative_latents"][2]]
+        names5 = ("a0", "a1_tok", "a1_pol", "a2_tok", "a2_pol")
+        if decode_batched[0] is None:
+            with torch.no_grad():
+                joined = decode_fp32(torch.cat([x.detach() for x in lat5], 0))
+                apart = torch.cat([decode_fp32(x.detach()) for x in lat5], 0)
+                same = bool(torch.equal(joined, apart))
+                gap = 0.0 if same else float((joined - apart).abs().max())
+            decode_batched[0] = same
+            decode_batched[1] = gap
+            print(f"  декодер построчный: склейка по батчу "
+                  f"{'побитово совпала' if same else 'РАСХОДИТСЯ'}"
+                  + ("" if same else f" на {gap:.3e}, считаем по одному"))
+        if decode_batched[0]:
+            dec = decode_fp32(torch.cat(lat5, 0))
+            acts = dict(zip(names5, dec.chunk(len(lat5), dim=0)))
+        else:
+            acts = {n_: decode_fp32(x) for n_, x in zip(names5, lat5)}
         paths = dict(
-            a0=decode_fp32(z0),
-            a1_tok=decode_fp32(z0 + c1_tok),
-            a1_pol=decode_fp32(z0 + c1_pol),
-            a2_tok=decode_fp32(z0 + hard_c1 + c2_tok),
-            a2_pol=decode_fp32(out["cumulative_latents"][2]),
             q1_tok_logits=q1_tok_logits,
             q1_pol_logits=out["logits"][1].float(),
             q2_tok_logits=q2_tok_logits,
             q2_pol_logits=out["logits"][2].float(),
+            # РЕГУЛЯРИЗАТОР ИСПОЛЬЗОВАНИЯ ИДЁТ НА Q, КАК В ПЛАНЕ. Он нужен
+            # против схлопывания САМОГО РАЗБИЕНИЯ; на P он удерживал бы от
+            # схлопывания только читателя, а книга могла бы выродиться.
+            # Схлопывание P наблюдается отдельно, по usage_q1_pol.
+            q1_tok_probs=p1_tok, q2_tok_probs=p2_tok,
             q1_pol_probs=out["policy_probabilities"][1],
-            q2_pol_probs=out["policy_probabilities"][2])
+            q2_pol_probs=out["policy_probabilities"][2],
+            **acts)
         total, lparts, rows, means = build_losses(
             paths, action, weights_gate, torch, tok, vocab=vocab)
         with torch.no_grad():
-            # ТА ЖЕ ВЕЛИЧИНА В ВЕСАХ K-14 — для сравнимости с историей, где
-            # обучающая потеря считалась равновесной.
-            _r_eq, eq = weighted_row_error(paths["a2_pol"], action,
-                                           weights, torch)
-            stat = dict(
-                rows=int(len(sel)),
-                a0=float(means["a0"]), a1_tok=float(means["a1_tok"]),
-                a1_pol=float(means["a1_pol"]), a2_tok=float(means["a2_tok"]),
-                a2_pol=float(means["a2_pol"]), a2_pol_equal_weights=float(eq),
-                loss=float(total), loss_action=float(lparts["action"]),
-                loss_align=float(lparts["align"]),
-                loss_mono=float(lparts["mono"]),
-                loss_usage=float(lparts["usage"]),
-                frac_worse_than_q0=float(
-                    (rows["a2_pol"] > rows["a0"]).float().mean()),
-                frac_nonzero_q1=float(
-                    (c1_pol.abs().sum(-1) > 0).float().mean()),
-                q1_codes=out["pred_codes"][1].detach().cpu().numpy(),
-                q2_codes=out["pred_codes"][2].detach().cpu().numpy(),
-                row_a0=rows["a0"].detach().cpu().numpy(),
-                row_a1_pol=rows["a1_pol"].detach().cpu().numpy(),
-                row_a2_pol=rows["a2_pol"].detach().cpu().numpy(),
-                row_a1_tok=rows["a1_tok"].detach().cpu().numpy(),
-                row_a2_tok=rows["a2_tok"].detach().cpu().numpy(),
-                latent=out["cumulative_latents"][2].detach())
+            # В ОБУЧЕНИИ НИ ОДНОГО float(): каждый такой вызов — ожидание
+            # GPU. Числа отдаются тензорами, вызывающий складывает их на
+            # устройстве и читает раз в несколько сотен батчей.
+            track = dict(loss=total.detach(), action=lparts["action"].detach(),
+                         align=lparts["align"].detach(),
+                         mono=lparts["mono"].detach(),
+                         usage=lparts["usage"].detach())
+            for k_ in PATH_NAMES:
+                track[k_] = means[k_].detach()
+            stat = dict(rows=int(len(sel)), track=track)
+            if not train:
+                stat.update(
+                    {k_: float(means[k_]) for k_ in PATH_NAMES},
+                    loss=float(total), loss_action=float(lparts["action"]),
+                    loss_align=float(lparts["align"]),
+                    loss_mono=float(lparts["mono"]),
+                    loss_usage=float(lparts["usage"]))
+                # ПОСТРОЧНЫЕ МАССИВЫ И КОПИИ НА ХОСТ — ТОЛЬКО В ОЦЕНКЕ.
+                # В обучении они считались каждый батч и выбрасывались:
+                # синхронизации с GPU ради чисел, которые никто не читал.
+                _r_eq, eq = weighted_row_error(paths["a2_pol"], action,
+                                               weights, torch)
+                stat.update(
+                    a2_pol_equal_weights=float(eq),
+                    frac_worse_than_q0=float(
+                        (rows["a2_pol"] > rows["a0"]).float().mean()),
+                    # ВЕЛИЧИНА ПОПРАВКИ, А НЕ «НЕНУЛЕВАЯ ЛИ СТРОКА КНИГИ».
+                    # Прежняя доля строк с ненулевой нормой c1 равнялась
+                    # единице по построению: почти все строки книги
+                    # ненулевые, и число ничего не сообщало.
+                    d_latent_q1=float((c1_pol.float().norm(dim=-1)
+                                       / z0.float().norm(dim=-1)
+                                       .clamp_min(1e-12)).mean()),
+                    d_latent_q2=float((c2_pol.float().norm(dim=-1)
+                                       / z0.float().norm(dim=-1)
+                                       .clamp_min(1e-12)).mean()),
+                    d_action_q1=float((acts["a1_pol"] - acts["a0"])
+                                      .abs().max()),
+                    d_action_q2=float((acts["a2_pol"] - acts["a1_pol"])
+                                      .abs().max()),
+                    q1_codes=out["pred_codes"][1].detach().cpu().numpy(),
+                    q2_codes=out["pred_codes"][2].detach().cpu().numpy(),
+                    q1_codes_tok=i1_tok.detach().cpu().numpy(),
+                    q2_codes_tok=i2_tok.detach().cpu().numpy(),
+                    row_a0=rows["a0"].detach().cpu().numpy(),
+                    row_a1_pol=rows["a1_pol"].detach().cpu().numpy(),
+                    row_a2_pol=rows["a2_pol"].detach().cpu().numpy(),
+                    row_a1_tok=rows["a1_tok"].detach().cpu().numpy(),
+                    row_a2_tok=rows["a2_tok"].detach().cpu().numpy(),
+                    latent=out["cumulative_latents"][2].detach(),
+                    latent_true=z_e.detach(),
+                    q0_logits_sha=hashlib.sha1(np.ascontiguousarray(
+                        out["logits"][0].detach().float().cpu().numpy()
+                    ).tobytes()).hexdigest()[:12])
         return (total if train else None), stat
 
-    def evaluate(batch_list, tag):
-        """Жёсткий вывод на части: та же величина, что и в отборе эпохи."""
+    PATHS5 = PATH_NAMES
+    q0_logits_ref = {}
+
+    def evaluate(batch_list, tag, keep_rows=False):
+        """Жёсткий вывод на части: та же величина, что и в отборе эпохи.
+
+        ВСЕ ПЯТЬ ПУТЕЙ АГРЕГИРУЮТСЯ. Прежде считались все пять, а в
+        результат попадали три, и таксономия отказа — ради которой пять
+        путей и заведены — по артефакту была недоказуема.
+        """
         model.eval()
-        acc = {k: 0.0 for k in ("a0", "a1_pol", "a2_pol", "a2_pol_eq",
-                                "frac_worse")}
+        acc = {k: 0.0 for k in PATHS5}
+        acc.update(a2_pol_eq=0.0, frac_worse=0.0, d_latent_q1=0.0,
+                   d_latent_q2=0.0)
         n_rows = 0
-        q1_all, q2_all, sup = [], [], []
+        codes = {k: [] for k in ("q1_pol", "q2_pol", "q1_tok", "q2_tok")}
+        sup_rows, ref_rows, rows_keep = [], [], []
         with torch.no_grad():
             for po, sel in batch_list:
                 _l, stat = run_batch(po, sel, False)
                 w = float(stat["rows"])
                 n_rows += stat["rows"]
-                acc["a0"] += stat["a0"] * w
-                acc["a1_pol"] += stat["a1_pol"] * w
-                acc["a2_pol"] += stat["a2_pol"] * w
+                for k in PATHS5:
+                    acc[k] += stat[k] * w
                 acc["a2_pol_eq"] += stat["a2_pol_equal_weights"] * w
                 acc["frac_worse"] += stat["frac_worse_than_q0"] * w
-                q1_all.append(stat["q1_codes"].reshape(-1))
-                q2_all.append(stat["q2_codes"].reshape(-1))
-                if len(sup) < 8:
-                    sup.append(decoder_support(
-                        stat["latent"], codec, torch, quantizers,
-                        nearest_code, code_contribution))
+                acc["d_latent_q1"] += stat["d_latent_q1"] * w
+                acc["d_latent_q2"] += stat["d_latent_q2"] * w
+                # КОДЫ ХРАНЯТСЯ С ПОЗИЦИЯМИ, А НЕ СПЛЮЩЕННЫМИ: схлопывание
+                # бывает позиционным — книга жива в среднем и мертва на
+                # первой позиции чанка, которая и исполняется.
+                for key_, src_ in (("q1_pol", "q1_codes"),
+                                   ("q2_pol", "q2_codes"),
+                                   ("q1_tok", "q1_codes_tok"),
+                                   ("q2_tok", "q2_codes_tok")):
+                    codes[key_].append(
+                        np.asarray(stat[src_]).reshape(stat["rows"], -1))
+                # ЛОГИТЫ q0 СВЕРЯЮТСЯ ПО ОТПЕЧАТКУ, А НЕ ТОЛЬКО КОДЫ.
+                # Коды — это argmax; замороженная часть могла бы поехать,
+                # не сдвинув argmax ни в одной позиции.
+                key = (po, int(sel[0]), int(sel[-1]))
+                if key in q0_logits_ref:
+                    if q0_logits_ref[key] != stat["q0_logits_sha"]:
+                        raise SystemExit(
+                            f"логиты q0 на батче {key} изменились "
+                            f"({q0_logits_ref[key]} -> "
+                            f"{stat['q0_logits_sha']}): замороженная часть "
+                            f"модели поехала, коды это скрыли")
+                else:
+                    q0_logits_ref[key] = stat["q0_logits_sha"]
+                # ОПОРА ДЕКОДЕРА — НА ВСЕЙ ЧАСТИ, А НЕ НА ПЕРВЫХ ВОСЬМИ
+                # БАТЧАХ, И С ЭТАЛОНОМ. Эталон — собственная ошибка
+                # квантования кодека на ИСТИННОМ латенте: это тот уровень
+                # непредставимости, с которым декодер обучался работать.
+                _s, rel = decoder_support(
+                    stat["latent"], codec, torch, quantizers,
+                    nearest_code, code_contribution)
+                sup_rows.append(rel)
+                _s2, rel2 = decoder_support(
+                    stat["latent_true"], codec, torch, quantizers,
+                    nearest_code, code_contribution)
+                ref_rows.append(rel2)
+                if keep_rows:
+                    rows_keep.append({k: stat[f"row_{k}"] for k in PATHS5})
         n = max(n_rows, 1)
         res = {k: v / n for k, v in acc.items()}
-        res["rms_a2_pol"] = float(np.sqrt(res["a2_pol"]))
-        res["rms_a0"] = float(np.sqrt(res["a0"]))
-        res["rms_a1_pol"] = float(np.sqrt(res["a1_pol"]))
-        res["usage_q1"] = tok.code_usage_stats(
-            torch.from_numpy(np.concatenate(q1_all)), vocab)
-        res["usage_q2"] = tok.code_usage_stats(
-            torch.from_numpy(np.concatenate(q2_all)), vocab)
-        res["decoder_support"] = {
-            k: float(np.mean([s[k] for s in sup])) for k in sup[0]} if sup \
-            else None
+        for k in PATHS5:
+            res[f"rms_{k}"] = float(np.sqrt(res[k]))
+        for name, key in (("usage_q1", "q1_pol"), ("usage_q2", "q2_pol"),
+                          ("usage_q1_tok", "q1_tok"),
+                          ("usage_q2_tok", "q2_tok")):
+            arr = np.concatenate(codes[key], axis=0)
+            if arr.ndim != 2 or arr.shape[1] < H_EXEC:
+                raise SystemExit(
+                    f"{name}: коды имеют форму {arr.shape}, а исполняемых "
+                    f"позиций {H_EXEC}. Разбиение по позициям считало бы "
+                    f"не то")
+            res[name] = tok.code_usage_stats(
+                torch.from_numpy(arr.reshape(-1)), vocab)
+            per_pos = [tok.code_usage_stats(
+                torch.from_numpy(np.ascontiguousarray(arr[:, t])), vocab)
+                for t in range(arr.shape[1])]
+            worst = int(np.argmax([s["max_code_share"] for s in per_pos]))
+            res[name]["by_position"] = dict(
+                n_positions=len(per_pos),
+                worst_position=worst,
+                worst_max_code_share=float(per_pos[worst]["max_code_share"]),
+                worst_perplexity=float(min(s["perplexity"]
+                                           for s in per_pos)),
+                executed_max_code_share=float(max(
+                    s["max_code_share"] for s in per_pos[:H_EXEC])),
+                executed_min_perplexity=float(min(
+                    s["perplexity"] for s in per_pos[:H_EXEC])))
+        sup_all = torch.cat(sup_rows) if sup_rows else None
+        ref_all = torch.cat(ref_rows) if ref_rows else None
+        res["decoder_support"] = None if sup_all is None else dict(
+            rel_residual=float(sup_all.mean()),
+            rel_residual_p95=float(torch.quantile(sup_all, 0.95)),
+            rel_residual_max=float(sup_all.max()),
+            reference_rel_residual=float(ref_all.mean()),
+            reference_rel_residual_p95=float(torch.quantile(ref_all, 0.95)),
+            n=int(sup_all.numel()),
+            reference="собственная ошибка квантования кодека на истинном "
+                      "латенте того же батча")
         res["rows"] = n_rows
-        print(f"    {tag}: RMS a0 {res['rms_a0']:.6f} -> a1_pol "
-              f"{res['rms_a1_pol']:.6f} -> a2_pol {res['rms_a2_pol']:.6f}; "
-              f"хуже q0 {100 * res['frac_worse']:.1f}% строк")
-        print(f"      книги: q1 perplexity {res['usage_q1']['perplexity']:.1f}, "
-              f"мёртвых {res['usage_q1']['dead_codes']}, макс доля "
-              f"{res['usage_q1']['max_code_share']:.3f}; q2 perplexity "
-              f"{res['usage_q2']['perplexity']:.1f}, мёртвых "
-              f"{res['usage_q2']['dead_codes']}")
+        if keep_rows:
+            res["rows_by_path"] = {
+                k: np.concatenate([r[k] for r in rows_keep]) for k in PATHS5}
+        print(f"    {tag}: RMS a0 {res['rms_a0']:.6f}; книга a1_tok "
+              f"{res['rms_a1_tok']:.6f}, a2_tok {res['rms_a2_tok']:.6f}; "
+              f"политика a1_pol {res['rms_a1_pol']:.6f}, a2_pol "
+              f"{res['rms_a2_pol']:.6f}; хуже q0 "
+              f"{100 * res['frac_worse']:.1f}% строк")
+        print(f"      поправка: |c1|/|z0| {res['d_latent_q1']:.4f}, "
+              f"|c2|/|z0| {res['d_latent_q2']:.4f}")
+        for lv in (1, 2):
+            up, uq = res[f"usage_q{lv}"], res[f"usage_q{lv}_tok"]
+            print(f"      книга {lv}: P perplexity {up['perplexity']:.1f}, "
+                  f"мёртвых {up['dead_codes']}, макс доля "
+                  f"{up['max_code_share']:.3f} | Q perplexity "
+                  f"{uq['perplexity']:.1f}, мёртвых {uq['dead_codes']}, "
+                  f"макс доля {uq['max_code_share']:.3f}")
         if res["decoder_support"]:
-            print(f"      опора декодера: относительный остаток "
-                  f"{res['decoder_support']['rel_residual']:.4f} "
-                  f"(p95 {res['decoder_support']['rel_residual_p95']:.4f})")
+            ds = res["decoder_support"]
+            print(f"      опора декодера: остаток {ds['rel_residual']:.4f} "
+                  f"(p95 {ds['rel_residual_p95']:.4f}) против эталона "
+                  f"{ds['reference_rel_residual']:.4f} "
+                  f"(p95 {ds['reference_rel_residual_p95']:.4f})")
         return res
 
     # --- ОБУЧЕНИЕ ---------------------------------------------------------
+    # --- НЕТ ЛИ В МОДЕЛИ ЧЕГО-ТО, ЗАВИСЯЩЕГО ОТ РЕЖИМА -------------------
+    mode_dependent = []
+    for name_, mod_ in model.named_modules():
+        if isinstance(mod_, torch.nn.modules.dropout._DropoutNd):
+            if float(getattr(mod_, "p", 0.0)) > 0.0:
+                mode_dependent.append(f"{name_}: dropout p={mod_.p}")
+        elif isinstance(mod_, torch.nn.modules.batchnorm._BatchNorm):
+            mode_dependent.append(f"{name_}: batchnorm")
+    if mode_dependent:
+        raise SystemExit(
+            "в модели есть операции, зависящие от режима: "
+            + "; ".join(mode_dependent[:5])
+            + ". Обучение идёт в режиме eval именно потому, что train() "
+              "менял бы h18 и h24 при неизменных кодах q0; с такими "
+              "модулями выбор режима надо решать явно, а не молча")
+    print(f"  операций, зависящих от режима: нет "
+          f"(проверено {sum(1 for _ in model.named_modules())} модулей)")
+
     history = []
     val0 = evaluate(parts["val_sel"], "эпоха 0, без обучения")
     history.append(dict(epoch=0, train_loss=None,
@@ -854,26 +1147,44 @@ def main():
     t_start = time.time()
     order = list(parts["train"])
     for epoch in range(1, int(a.epochs) + 1):
-        model.train()
+        # РЕЖИМ eval ДЕРЖИТСЯ И ВО ВРЕМЯ ОПТИМИЗАЦИИ. model.train()
+        # переключает всю VLA, включая замороженные 24 слоя: autograd от
+        # режима не зависит, а dropout зависит, и h18/h24 стали бы другими
+        # при том же q0 — побитовая сверка КОДОВ q0 этого не заметила бы.
+        # Отсутствие активного dropout проверено выше, отказом.
+        model.eval()
         rng = np.random.default_rng(int(a.seed) + epoch)
         idx = rng.permutation(len(order))
-        run_loss, nb, t_ep = 0.0, 0, time.time()
+        run_sum, nb, t_ep = None, 0, time.time()
         opt.zero_grad(set_to_none=True)
         for step, j in enumerate(idx, start=1):
             po, sel = order[j]
             loss, stat = run_batch(po, sel, True)
             (loss / float(a.accum)).backward()
-            run_loss += float(loss.detach())
+            # НАКОПЛЕНИЕ НА УСТРОЙСТВЕ. float(loss) на каждом батче — это
+            # синхронизация с GPU ради числа, которое печатается раз в 250
+            # батчей.
+            if run_sum is None:
+                run_sum = {k_: v_.clone() for k_, v_ in stat["track"].items()}
+            else:
+                for k_, v_ in stat["track"].items():
+                    run_sum[k_] += v_
             nb += 1
             if step % int(a.accum) == 0 or step == len(idx):
-                nog = [n_ for n_, p_ in model.named_parameters()
-                       if p_.requires_grad and p_.grad is None]
-                nf = [n_ for n_, p_ in model.named_parameters()
-                      if p_.requires_grad and p_.grad is not None
-                      and not torch.isfinite(p_.grad).all()]
-                if nog or nf:
-                    raise SystemExit(f"градиенты: нет у {nog[:3]}, "
-                                     f"нечисловые у {nf[:3]}")
+                # ПОЛНАЯ ПРОВЕРКА ГРАДИЕНТОВ — НА ПЕРВЫХ ДЕСЯТИ ШАГАХ И
+                # ДАЛЬШЕ РЕДКО. `isfinite(...).all()` по каждому обучаемому
+                # тензору — это синхронизация с GPU на каждый шаг; список
+                # обучаемого фиксирован, поэтому «нет градиента» — ошибка
+                # сборки и видна сразу, а nan появляется не бесшумно.
+                if step <= 10 or step % 250 == 0 or step == len(idx):
+                    nog = [n_ for n_, p_ in model.named_parameters()
+                           if p_.requires_grad and p_.grad is None]
+                    nf = [n_ for n_, p_ in model.named_parameters()
+                          if p_.requires_grad and p_.grad is not None
+                          and not torch.isfinite(p_.grad).all()]
+                    if nog or nf:
+                        raise SystemExit(f"градиенты: нет у {nog[:3]}, "
+                                         f"нечисловые у {nf[:3]}")
                 opt.step()
                 opt.zero_grad(set_to_none=True)
             if epoch == 1 and step == int(a.forecast_batches):
@@ -886,18 +1197,26 @@ def main():
                       flush=True)
             if step % 250 == 0:
                 el = (time.time() - t_ep) / 60
+                mean_ = {k_: float(v_) / nb for k_, v_ in run_sum.items()}
                 print(f"    эпоха {epoch}: батч {step}/{len(idx)}, потеря "
-                      f"{run_loss / nb:.5f}, {el:.1f} мин, осталось "
+                      f"{mean_['loss']:.5f} (action {mean_['action']:.4f}, "
+                      f"align {mean_['align']:.4f}, mono {mean_['mono']:.4f}, "
+                      f"usage {mean_['usage']:.4f}), a2_pol/a0 "
+                      f"{mean_['a2_pol'] / max(mean_['a0'], 1e-12):.4f}, "
+                      f"{el:.1f} мин, осталось "
                       f"{el * (len(idx) - step) / max(step, 1):.0f} мин",
                       flush=True)
+        train_mean = {k_: float(v_) / max(nb, 1)
+                      for k_, v_ in (run_sum or {}).items()}
         val = evaluate(parts["val_sel"], f"эпоха {epoch}")
-        history.append(dict(epoch=epoch, train_loss=run_loss / max(nb, 1),
+        history.append(dict(epoch=epoch, train_loss=train_mean.get("loss"),
+                            train_parts=train_mean,
                             val_a2_pol_rms=val["rms_a2_pol"],
                             val_frac_worse=val["frac_worse"], val=val))
         snapshots[epoch] = {k: v.detach().clone()
                             for k, v in model.state_dict().items()
                             if k in set(info["names"])}
-        print(f"  эпоха {epoch}: потеря {run_loss / max(nb, 1):.5f}, "
+        print(f"  эпоха {epoch}: потеря {train_mean.get('loss', 0.0):.5f}, "
               f"val_sel RMS a2_pol {val['rms_a2_pol']:.6f}")
 
     best_epoch, best = select_epoch(history)
@@ -911,6 +1230,71 @@ def main():
     sel_sha = k14c.state_sha({k_: model.state_dict()[k_].detach().float()
                               .cpu().numpy() for k_ in info["names"]})
 
+    # --- ПЕРЕОЦЕНКА ВОССТАНОВЛЕННЫХ ВЕСОВ --------------------------------
+    # Раньше веса восстанавливались и сразу сохранялись: что сохранённый
+    # чекпойнт воспроизводит ту строку истории, по которой его выбрали, не
+    # проверялось ничем. Ошибка в восстановлении выглядела бы как
+    # результат.
+    confirm = evaluate(parts["val_sel"], f"переоценка эпохи {best_epoch}",
+                       keep_rows=True)
+    for name_, got_, want_ in (("RMS a2_pol", confirm["rms_a2_pol"],
+                                best["val_a2_pol_rms"]),
+                               ("доля ухудшений", confirm["frac_worse"],
+                                best["val_frac_worse"])):
+        scale_ = max(abs(float(want_)), 1e-12)
+        if abs(float(got_) - float(want_)) / scale_ > 1e-6:
+            raise SystemExit(
+                f"переоценка эпохи {best_epoch} не воспроизвела историю: "
+                f"{name_} {got_!r} против {want_!r}. Восстановленный "
+                f"чекпойнт — не тот, по которому принято решение")
+    print(f"  переоценка воспроизвела строку эпохи {best_epoch}")
+
+    # --- ГЕЙТЫ ПРИЁМКИ: СХЛОПЫВАНИЕ И ОПОРА ДЕКОДЕРА ---------------------
+    # Эти числа печатались и раньше, но ничего не решали. Теперь они —
+    # условия, и они записаны до того, как получены.
+    COLLAPSE_MAX_SHARE, COLLAPSE_MIN_PPL = 0.98, 2.0
+    gates = {}
+    for lv in (1, 2):
+        for side, tag_ in (("", "pol"), ("_tok", "tok")):
+            u = confirm[f"usage_q{lv}{side}"]
+            bp = u["by_position"]
+            # ГЕЙТ СМОТРИТ И НА ИСПОЛНЯЕМЫЕ ПОЗИЦИИ ОТДЕЛЬНО: средняя по
+            # чанку книга может быть жива, а на первых восьми позициях —
+            # той единственной, которую робот исполняет, — мертва.
+            gates[f"collapse_q{lv}_{tag_}"] = dict(
+                max_code_share=float(u["max_code_share"]),
+                perplexity=float(u["perplexity"]),
+                used_codes=int(u["used_codes"]),
+                executed_max_code_share=bp["executed_max_code_share"],
+                executed_min_perplexity=bp["executed_min_perplexity"],
+                limit_max_share=COLLAPSE_MAX_SHARE,
+                limit_min_perplexity=COLLAPSE_MIN_PPL,
+                passed=bool(
+                    u["max_code_share"] <= COLLAPSE_MAX_SHARE
+                    and u["perplexity"] >= COLLAPSE_MIN_PPL
+                    and bp["executed_max_code_share"] <= COLLAPSE_MAX_SHARE
+                    and bp["executed_min_perplexity"] >= COLLAPSE_MIN_PPL))
+    ds = confirm["decoder_support"]
+    # ПОРОГ СРАВНИТЕЛЬНЫЙ, А НЕ ВЫДУМАННЫЙ: уход латента с многообразия
+    # сумм книг не должен превышать той непредставимости, с которой
+    # декодер уже работает на истинных латентах.
+    gates["decoder_support"] = dict(
+        rel_residual_p95=float(ds["rel_residual_p95"]),
+        reference_p95=float(ds["reference_rel_residual_p95"]),
+        rel_residual_mean=float(ds["rel_residual"]),
+        reference_mean=float(ds["reference_rel_residual"]),
+        rule="p95 остатка модели <= p95 остатка кодека на истинном латенте",
+        passed=bool(ds["rel_residual_p95"]
+                    <= ds["reference_rel_residual_p95"]))
+    failed = sorted(k for k, v in gates.items() if not v["passed"])
+    accepted = None if a.smoke else not failed
+    print("  гейты приёмки: " + ("все пройдены" if not failed
+                                 else "НЕ ПРОЙДЕНЫ " + ", ".join(failed)))
+    for k, v in sorted(gates.items()):
+        print(f"    {k:22s} {'ok' if v['passed'] else 'ОТКАЗ'}  "
+              + ", ".join(f"{kk}={vv}" for kk, vv in v.items()
+                          if kk not in ("passed", "rule")))
+
     payload = dict(
         kind=("k15_smoke" if a.smoke else "k15_depth_rvq"), stage="q1q2",
         variant="depth_aligned", seed=int(a.seed), epochs=int(a.epochs),
@@ -922,8 +1306,17 @@ def main():
                           usage=W_USAGE, eps_norm=EPS_NORM),
         channel_weights="metric (max_act_q, grip=grip_weight)",
         decode_context="fp32, autocast disabled",
-        state=({k_: v_.detach().cpu() for k_, v_ in model.state_dict().items()
-                if k_ in set(info["names"])} if not a.smoke else None),
+        # ВЕСА СОХРАНЯЮТСЯ И В SMOKE: иначе сохранение и загрузку в нём
+        # проверить нечем, а это ровно то, что smoke должен покрывать.
+        state={k_: v_.detach().cpu() for k_, v_ in model.state_dict().items()
+               if k_ in set(info["names"])},
+        accepted=accepted, gates=gates,
+        confirm=confirm,
+        decode_batched=bool(decode_batched[0]),
+        decode_batched_gap=float(decode_batched[1]),
+        codec=codec_fp, code_version=code_version,
+        collapse_thresholds=dict(max_code_share=COLLAPSE_MAX_SHARE,
+                                 min_perplexity=COLLAPSE_MIN_PPL),
         trainable_names=info["names"], selected_epoch=best_epoch,
         selected_state_sha1=sel_sha, history=history, forecast=forecast,
         q0_prov=q0_prov, joint_sha1=joint_sha,
@@ -941,9 +1334,26 @@ def main():
     tmp = out_path + f".tmp.{os.getpid()}"
     torch.save(payload, tmp)
     os.replace(tmp, out_path)
-    print(f"  сохранено: {out_path}")
+    # ПРОВЕРКА ОБРАТНОГО ЧТЕНИЯ. Файл читается тем же способом, которым его
+    # прочтёт роллаут, и веса сверяются побитово: молчаливо испорченный
+    # чекпойнт иначе обнаружился бы только в следующем эксперименте.
+    back = torch.load(out_path, map_location="cpu", weights_only=False)
+    if set(back["state"]) != set(payload["state"]):
+        raise SystemExit("после чтения набор весов другой")
+    for k_, v_ in payload["state"].items():
+        if not torch.equal(back["state"][k_], v_):
+            raise SystemExit(f"после чтения {k_} изменился")
+    back_sha = k14c.state_sha({k_: v_.float().numpy()
+                               for k_, v_ in back["state"].items()})
+    if back_sha != sel_sha:
+        raise SystemExit(f"отпечаток после чтения {back_sha} против "
+                         f"{sel_sha}")
+    print(f"  сохранено: {out_path} (обратное чтение сошлось, {sel_sha})")
     if a.summary:
-        light = {k: v for k, v in payload.items() if k != "state"}
+        light = {k: v for k, v in payload.items()
+                 if k not in ("state", "confirm")}
+        light["confirm"] = {k: v for k, v in confirm.items()
+                            if k != "rows_by_path"}
         os.makedirs(os.path.dirname(os.path.abspath(a.summary)) or ".",
                     exist_ok=True)
         t_ = a.summary + f".tmp.{os.getpid()}"
@@ -954,6 +1364,12 @@ def main():
     if a.smoke:
         print("  РЕЖИМ SMOKE: данные урезаны, решения не принимаются, "
               "голова непригодна")
+        return 0
+    if failed:
+        print("  РЕЗУЛЬТАТ НЕ ПРИНЯТ: " + ", ".join(failed)
+              + ". Чекпойнт сохранён, но помечен accepted=false — "
+                "роллаут по нему запускать нельзя")
+        return 3
     return 0
 
 
