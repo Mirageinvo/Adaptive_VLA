@@ -227,6 +227,47 @@ def classify_gates(gates):
     return failed, by_level
 
 
+def choose_candidate(points):
+    """Выбор рабочей точки: СНАЧАЛА КАЧЕСТВО, ПОТОМ СТОИМОСТЬ.
+
+    `points` — {имя: {"rms": float, "layers": int, "eligible": bool}}.
+    Возвращает (имя или "none", отчёт).
+
+    ЭТО НЕ ПАРЕТО, И НАЗВАНИЕ ТЕПЕРЬ ЭТО ГОВОРИТ. При q1 = 0.0800 на 18
+    слоях и q2 = 0.0799 на 24 ни одна точка не доминирует другую — обе в
+    фронте Парето, — а правило всё равно берёт q2. Это допустимый выбор
+    «качество важнее стоимости», но называть его Парето нельзя. Сам фронт
+    считается и записывается отдельно: если в нём больше одной точки,
+    решение между ними — не арифметическое.
+    """
+    eligible = {k: v for k, v in points.items() if v["eligible"]}
+    front = []
+    for name, p in eligible.items():
+        dominated = any(
+            (o["rms"] <= p["rms"] and o["layers"] <= p["layers"]
+             and (o["rms"] < p["rms"] or o["layers"] < p["layers"]))
+            for other, o in eligible.items() if other != name)
+        if not dominated:
+            front.append(name)
+    chosen = "none"
+    if eligible:
+        chosen = min(eligible,
+                     key=lambda k: (round(float(eligible[k]["rms"]), 12),
+                                    int(eligible[k]["layers"]), k))
+    return chosen, dict(
+        rule="quality_first_lexicographic: минимум (RMS, число слоёв)",
+        rule_is_pareto=False,
+        eligible=sorted(eligible),
+        pareto_front=sorted(front),
+        front_size=len(front),
+        front_note=("во фронте одна точка, выбор однозначен"
+                    if len(front) <= 1 else
+                    "во фронте больше одной недоминируемой точки: правило "
+                    "взяло лучшую по качеству, но решение между ними "
+                    "содержательное, а не арифметическое"),
+        points={k: dict(v) for k, v in points.items()})
+
+
 def reading_stats(policy_probs, tokenizer_indices, torch, ks=TOPK_ORACLE):
     """Насколько политика читает выбор токенизатора. Чистая функция.
 
@@ -760,6 +801,31 @@ def selftest():
     shared.free = nn_.Parameter(base)          # то же хранилище
     assert no_alias_between(shared, {"free"}) == [("free", "param:frozen")]
 
+    # --- ВЫБОР РАБОЧЕЙ ТОЧКИ ----------------------------------------------
+    def pt(rms, layers, eligible=True):
+        return dict(rms=rms, layers=layers, eligible=eligible)
+
+    # q1 доминирует: лучше и дешевле
+    ch, rep = choose_candidate({"q1": pt(0.08, 18), "q2": pt(0.09, 24)})
+    assert ch == "q1" and rep["pareto_front"] == ["q1"], rep
+    # q2 качественнее, но дороже: ОБЕ точки недоминируемы, правило берёт
+    # качество — ровно тот случай, который нельзя называть Парето
+    ch, rep = choose_candidate({"q1": pt(0.0800, 18), "q2": pt(0.0799, 24)})
+    assert ch == "q2", ch
+    assert rep["pareto_front"] == ["q1", "q2"] and rep["front_size"] == 2
+    assert rep["rule_is_pareto"] is False
+    # при равном качестве — меньше слоёв
+    ch, rep = choose_candidate({"q1": pt(0.08, 18), "q2": pt(0.08, 24)})
+    assert ch == "q1" and rep["pareto_front"] == ["q1"], rep
+    # непригодный уровень не рассматривается, даже если он лучше
+    ch, _r = choose_candidate({"q1": pt(0.08, 18),
+                              "q2": pt(0.05, 24, eligible=False)})
+    assert ch == "q1", ch
+    # кандидатов нет
+    ch, rep = choose_candidate({"q1": pt(0.08, 18, False),
+                               "q2": pt(0.09, 24, False)})
+    assert ch == "none" and rep["pareto_front"] == [] and rep["eligible"] == []
+
     # --- ЧТЕНИЕ КНИГИ ПОЛИТИКОЙ -------------------------------------------
     V_r = 8
     # РАВНОМЕРНАЯ ПОЛИТИКА: согласие ~1/V, и recall@1 ОБЯЗАН быть около
@@ -1093,6 +1159,12 @@ def main():
     if os.path.exists(out_path) and not a.overwrite:
         raise SystemExit(f"{out_path} уже существует: чекпойнт не "
                          f"перезаписывается молча")
+    # У СВОДКИ ТОТ ЖЕ КОНТРАКТ, ЧТО У ЧЕКПОЙНТА. Иначе при ошибке схемы
+    # (код 5) рядом с новым чекпойнтом оставалась бы СТАРАЯ сводка, и по
+    # ней читались бы прошлые числа как текущие.
+    if a.summary and os.path.exists(a.summary) and not a.overwrite:
+        raise SystemExit(f"{a.summary} уже существует: сводка не "
+                         f"перезаписывается молча")
 
     here = os.path.dirname(os.path.abspath(__file__))
     root = os.path.abspath(a.root)
@@ -1160,6 +1232,11 @@ def main():
     parts = {}
     for name, po, sel in plan:
         parts.setdefault(name, []).append((po, sel))
+    # ПОЛНЫЙ СОСТАВ ЧАСТЕЙ СОХРАНЯЕТСЯ ДО УРЕЗАНИЯ: эталон диапазона
+    # считается по ВСЕМ строкам обучения из плана, иначе в смоуке он вышел
+    # бы по 16 строкам и гейт диапазона там ничего не значил бы. Урезается
+    # только то, что идёт через модель.
+    parts_full = {k: list(v) for k, v in parts.items()}
     if a.limit:
         parts = {k: v[:int(a.limit)] for k, v in parts.items()}
     # СМЕЩЕНИЯ ПЛАНА СВЕРЯЮТСЯ СО СТРОКАМИ. Батч, заявленный с одним
@@ -1191,12 +1268,15 @@ def main():
     # `candidate_level`. Поля «val_confirm НЕ ОТКРЫВАЛАСЬ» и
     # `val_confirm_used_for_selection=False` были при этом ложью.
     train_rows = np.unique(np.concatenate(
-        [np.asarray(sel_, np.int64) for _po, sel_ in parts["train"]]))
+        [np.asarray(sel_, np.int64) for _po, sel_ in parts_full["train"]]))
     act_train = np.abs(np.asarray(
         ACT[train_rows][:, :H_EXEC, :7], np.float64)).reshape(-1, 7)
     act_p99_dataset = np.percentile(act_train, 99.0, axis=0)
     act_ref_prov = dict(
-        scope="train", rows=int(train_rows.size),
+        scope="train (полный план, не урезанный --limit)",
+        rows=int(train_rows.size),
+        batches_in_plan=len(parts_full["train"]),
+        batches_through_model=len(parts["train"]),
         positions=int(H_EXEC), values=int(act_train.shape[0]),
         statistic="p99 |action| per channel, normalized codec units",
         rows_sha1=hashlib.sha1(
@@ -2316,9 +2396,17 @@ def main():
     ACTION_CLIP_BOUND = 1.5
     ALIGN_AGREE_FACTOR = 5.0
     chance = 1.0 / float(vocab)
-    gates = {}
-    for lv in (1, 2):
-        conf = confirm_level[lv]
+
+    def level_gates(conf, lv):
+        """Гейты ОДНОГО уровня по ОДНОМУ снапшоту. Чистая по conf.
+
+        Нужна функцией, а не циклом, потому что те же гейты
+        считаются дважды: официально — по снапшоту своего уровня, и
+        внутри каждого снапшота для обоих уровней, чтобы
+        утверждение про одновременную иерархию опиралось не только
+        на монотонность RMS.
+        """
+        gates = {}
         # --- схлопывание книги этого уровня, P и Q
         for side, tag_ in (("", "pol"), ("_tok", "tok")):
             u = conf[f"usage_q{lv}{side}"]
@@ -2408,6 +2496,12 @@ def main():
             rule=f"RMS(a{lv}_pol) < RMS(a0)",
             category="candidate",
             passed=bool(r_lv < r0_lv))
+        return gates
+
+    gates = {}
+    for lv in (1, 2):
+        gates.update(level_gates(confirm_level[lv], lv))
+
     failed, by_level = classify_gates(gates)
     failed_level = {lv: by_level[lv]["failed"] for lv in (1, 2)}
     blocked_level = {lv: by_level[lv]["blocker"] for lv in (1, 2)}
@@ -2439,40 +2533,53 @@ def main():
     # q2 даже когда он ХУЖЕ q1 и при этом дороже на шесть слоёв: при
     # q0 = 0.100, q1 = 0.080, q2 = 0.090 оно объявило бы кандидатом q2.
     # Среди пригодных берётся меньшая ошибка, при равной — меньше слоёв.
-    eligible_levels = [lv for lv in (1, 2) if two_level[f"q{lv}"]["eligible"]]
-    if eligible_levels:
-        best_lv = min(eligible_levels,
-                      key=lambda lv: (round(two_level[f"q{lv}"]["rms"], 12),
-                                      LEVEL_LAYERS[lv]))
-        candidate_level = f"q{best_lv}"
-    else:
-        candidate_level = "none"
+    candidate_level, choice_report = choose_candidate(
+        {f"q{lv}": dict(rms=two_level[f"q{lv}"]["rms"],
+                        layers=LEVEL_LAYERS[lv],
+                        eligible=two_level[f"q{lv}"]["eligible"])
+         for lv in (1, 2)})
     two_level["candidate_level"] = candidate_level
-    two_level["pareto"] = dict(
-        rule="среди пригодных уровней минимум (RMS, число слоёв)",
-        eligible=[f"q{lv}" for lv in eligible_levels],
-        points={f"q{lv}": dict(rms=two_level[f"q{lv}"]["rms"],
-                               layers=LEVEL_LAYERS[lv],
-                               eligible=two_level[f"q{lv}"]["eligible"])
-                for lv in (1, 2)})
+    two_level["choice"] = choice_report
+    two_level["q2_gain_over_q1"] = float(
+        two_level["q1"]["rms"] - two_level["q2"]["rms"])
+    two_level["q2_extra_layers"] = LEVEL_LAYERS[2] - LEVEL_LAYERS[1]
     # ПОСЛЕДОВАТЕЛЬНОЕ УТОЧНЕНИЕ И ОДНОВРЕМЕННАЯ ИЕРАРХИЯ — РАЗНЫЕ
     # УТВЕРЖДЕНИЯ, И ОБА СЧИТАЮТСЯ ВНУТРИ ОДНОГО СНАПШОТА. «q2 лучше
     # черновика» не означает «q2 уточняет q1»; а лучшие эпохи q1 и q2 могут
     # вообще не совпадать, и тогда это два отдельных развёртываемых
     # чекпойнта, а НЕ два выхода одной обученной иерархии.
     two_level["simultaneous_hierarchy"] = {}
-    for lv in (1, 2):
-        conf = confirm_level[lv]
-        ep_ = best_level[lv][0]
-        two_level["simultaneous_hierarchy"][f"snapshot_q{lv}"] = dict(
+    for snap in (1, 2):
+        conf = confirm_level[snap]
+        ep_ = best_level[snap][0]
+        # ТЕХНИЧЕСКАЯ ПРИГОДНОСТЬ ОБОИХ УРОВНЕЙ ВНУТРИ ЭТОГО СНАПШОТА.
+        # Официальные гейты уровня 1 посчитаны по снапшоту q1; внутри
+        # снапшота q2 промежуточный q1 может быть монотонным по RMS и при
+        # этом схлопнутым, вне опоры декодера или с плохим диапазоном.
+        # Поэтому монотонность RMS называется своим именем, а пригодность
+        # считается отдельно и по этому же снапшоту.
+        inside = {}
+        for lv in (1, 2):
+            g_lv = level_gates(conf, lv)
+            inside[lv] = bool(all(
+                v["passed"] for k, v in g_lv.items()
+                if EXPECTED_GATES[k][0] == "rollout_blocker"))
+        rms_monotone = bool(conf["rms_a2_pol"] < conf["rms_a1_pol"]
+                            < conf["rms_a0"])
+        two_level["simultaneous_hierarchy"][f"snapshot_q{snap}"] = dict(
             epoch=ep_,
             rms_a0=float(conf["rms_a0"]),
             rms_a1_pol=float(conf["rms_a1_pol"]),
             rms_a2_pol=float(conf["rms_a2_pol"]),
             q1_improves_q0=bool(conf["rms_a1_pol"] < conf["rms_a0"]),
             q2_refines_q1=bool(conf["rms_a2_pol"] < conf["rms_a1_pol"]),
-            monotone=bool(conf["rms_a2_pol"] < conf["rms_a1_pol"]
-                          < conf["rms_a0"]))
+            rms_monotone=rms_monotone,
+            q1_technical_valid=inside[1],
+            q2_technical_valid=inside[2],
+            simultaneous_hierarchy_valid=bool(
+                rms_monotone and inside[1] and inside[2]),
+            note="technical_valid — все блокирующие гейты уровня, "
+                 "посчитанные по ЭТОМУ снапшоту")
     same_snapshot = best_level[1][0] == best_level[2][0]
     two_level["same_snapshot"] = bool(same_snapshot)
     two_level["sequential_refinement"] = two_level[
@@ -2499,11 +2606,20 @@ def main():
     print(f"  в снапшоте q2 (эпоха {sh2['epoch']}): a0 {sh2['rms_a0']:.6f} "
           f"-> a1_pol {sh2['rms_a1_pol']:.6f} -> a2_pol "
           f"{sh2['rms_a2_pol']:.6f}; q2 уточняет q1: "
-          f"{'да' if sh2['q2_refines_q1'] else 'НЕТ'}; монотонно: "
-          f"{'да' if sh2['monotone'] else 'НЕТ'}")
-    print(f"  кандидат: {candidate_level} (правило Парето: "
-          f"{two_level['pareto']['rule']}); эпохи уровней "
+          f"{'да' if sh2['q2_refines_q1'] else 'НЕТ'}; монотонно по RMS: "
+          f"{'да' if sh2['rms_monotone'] else 'НЕТ'}; технически пригодны "
+          f"q1/q2 внутри снапшота: "
+          f"{'да' if sh2['q1_technical_valid'] else 'НЕТ'}/"
+          f"{'да' if sh2['q2_technical_valid'] else 'НЕТ'}; иерархия "
+          f"одновременно состоятельна: "
+          f"{'да' if sh2['simultaneous_hierarchy_valid'] else 'НЕТ'}")
+    print(f"  кандидат: {candidate_level} ({choice_report['rule']}); "
+          f"фронт Парето {choice_report['pareto_front']}; выигрыш q2 над q1 "
+          f"{two_level['q2_gain_over_q1']:+.6f} за "
+          f"{two_level['q2_extra_layers']} слоёв; эпохи уровней "
           + ("совпали" if same_snapshot else "РАЗНЫЕ"))
+    if choice_report["front_size"] > 1:
+        print(f"    {choice_report['front_note']}")
     accepted = None if a.smoke else candidate_level != "none"
     # ВЕРХНЕУРОВНЕВЫЕ ПОЛЯ УКАЗЫВАЮТ НА КАНДИДАТА. Прежде `state`,
     # `confirm`, `selected_epoch` и `selected_state_sha1` всегда
@@ -2610,18 +2726,31 @@ def main():
                                  min_perplexity=COLLAPSE_MIN_PPL),
         trainable_names=info["names"], selected_epoch=best_epoch,
         selected_state_sha1=sel_sha, history=history, forecast=forecast,
+        checkpoint_path=os.path.abspath(out_path),
         q0_prov=q0_prov, joint_sha1=joint_sha,
         q1_init=os.path.abspath(a.q1_init),
         q1_init_sha1=k11a.file_sha1(a.q1_init), **q1_prov, **gate_info,
         git_head=git_head, git_dirty=bool(dirty),
-        val_confirm="НЕ ОТКРЫВАЛАСЬ; в K-14 уже прочитана, поэтому любое её "
-                    "использование будет retrospective",
+        val_confirm=("НЕ УЧАСТВОВАЛА НИ В ЧЁМ, ЧТО ВЛИЯЕТ НА ЧИСЛА. Точно: "
+                     "ни одна её строка не прошла через модель, ни одно её "
+                     "значение не вошло ни в одну статистику, эталон или "
+                     "решение. При этом её строки ЗАГРУЖЕНЫ в память "
+                     "вместе со всем кэшем (ACT и состояния читаются для "
+                     "всех N), и смещения её батчей в плане проверены "
+                     "наравне с остальными — говорить «не открывалась» "
+                     "было бы сильнее реализации. В K-14 эта половина уже "
+                     "прочитана, поэтому любое её использование здесь "
+                     "будет retrospective"),
         # МАШИНОЧИТАЕМЫЕ ПОЛЯ, А НЕ ТОЛЬКО ФРАЗА. Строку следующий скрипт
         # прочитать не может, а решение по этой половине принимать нельзя.
         val_confirm_role="retrospective_reused",
         val_confirm_used_for_selection=False,
-        val_confirm_touched_by=("ничем: эталон диапазона считается только по "
-                                "строкам обучения, см. "
+        val_confirm_used_for_training=False,
+        val_confirm_passed_through_model=False,
+        val_confirm_in_any_reference=False,
+        val_confirm_touched_by=("загрузка кэша для всех N строк и проверка "
+                                "смещений плана. Эталон диапазона считается "
+                                "ТОЛЬКО по строкам обучения, см. "
                                 "gates.action_range_q*.reference_provenance"),
         val_confirm_evaluated=False,
         frozen_content_sha=frozen_sha0,
@@ -2699,9 +2828,16 @@ def main():
         except TypeError as err:
             if os.path.exists(t_):
                 os.unlink(t_)
+            # СТАРАЯ СВОДКА ПОМЕЧАЕТСЯ УСТАРЕВШЕЙ, А НЕ ОСТАЁТСЯ ЛЕЖАТЬ
+            # РЯДОМ С НОВЫМ ЧЕКПОЙНТОМ.
+            stale = ""
+            if os.path.exists(a.summary):
+                stale = a.summary + f".stale.{os.getpid()}"
+                os.replace(a.summary, stale)
             print(f"  СХЕМА СВОДКИ НАРУШЕНА: {err}")
-            print(f"  чекпойнт {out_path} сохранён и проверен; "
-                  f"не записана только сводка {a.summary}")
+            print(f"  чекпойнт {out_path} сохранён и проверен; сводка не "
+                  f"записана"
+                  + (f", прежняя переименована в {stale}" if stale else ""))
             return 5
         os.replace(t_, a.summary)
         print(f"  сводка: {a.summary}")
