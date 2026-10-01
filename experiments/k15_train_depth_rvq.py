@@ -2005,8 +2005,15 @@ def main():
                     oracle_rows += int(w_o)
                     oracle_row_ids.append(stat["topk_rows"])
                     for k_, v_ in stat["topk_oracle"].items():
-                        if k_ == "rows" or k_.startswith(
-                                ("rank1_flips", "rank1_positions")):
+                        if k_ == "rows":
+                            # `rows` — это ВЕС, он уже учтён выше и в
+                            # словарь не идёт: иначе он столкнётся с
+                            # собственным полем `rows` ниже.
+                            continue
+                        if k_.startswith(("rank1_flips",
+                                          "rank1_positions")):
+                            # СЧЁТЧИКИ СКЛАДЫВАЮТСЯ КАК ЕСТЬ, без веса и
+                            # без корня: это количества, а не MSE.
                             oracle_plain[k_] = oracle_plain.get(k_, 0.0) + v_
                             continue
                         # ВЗВЕШЕННАЯ СУММА MSE, А НЕ СРЕДНЕЕ СРЕДНИХ
@@ -2141,6 +2148,16 @@ def main():
                         f"{rel_:.2e}. Индексы и латенты сверены побитово, "
                         f"значит такой разрыв объясняется не декодером, а "
                         f"областью подсчёта")
+            # СТОЛКНОВЕНИЕ ИМЁН ЛОВИТСЯ НАЗВАННЫМ ОТКАЗОМ, А НЕ TypeError
+            # ОТ `dict()`: ровно на этом прогон уже падал.
+            own_keys = {"fraction_of_tokenizer_gap", "tokenizer_gap",
+                        "batches", "rows", "rows_sha1", "kind",
+                        "definition", "decoder_jitter", "scope"}
+            clash = sorted((set(oracle_plain) | set(rms_k)) & own_keys)
+            if clash:
+                raise SystemExit(
+                    f"в словаре оракула ключи {clash} сталкиваются с его "
+                    f"собственными полями")
             res["topk_oracle"] = dict(
                 rms_k, **oracle_plain, fraction_of_tokenizer_gap=frac,
                 tokenizer_gap=tok_gap,
