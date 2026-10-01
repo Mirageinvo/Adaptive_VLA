@@ -268,7 +268,8 @@ def choose_candidate(points):
         points={k: dict(v) for k, v in points.items()})
 
 
-def reading_stats(policy_probs, tokenizer_indices, torch, ks=TOPK_ORACLE):
+def reading_stats(policy_probs, tokenizer_indices, torch, ks=TOPK_ORACLE,
+                  policy_indices=None):
     """Насколько политика читает выбор токенизатора. Чистая функция.
 
     `policy_probs` — (..., V), `tokenizer_indices` — (...) того же вида.
@@ -280,6 +281,10 @@ def reading_stats(policy_probs, tokenizer_indices, torch, ks=TOPK_ORACLE):
     """
     probs = policy_probs.float()
     want = tokenizer_indices
+    # СОГЛАСИЕ СЧИТАЕТСЯ ПО КОДУ, КОТОРЫЙ МОДЕЛЬ ИСПОЛНИЛА. argmax по
+    # пересчитанным вероятностям расходится с ним в единичных позициях
+    # (логиты в fp16), и тогда число относилось бы к выбору, которого не
+    # было.
     if probs.shape[:-1] != want.shape:
         raise ValueError(
             f"формы не согласованы: {tuple(probs.shape)} и "
@@ -289,7 +294,14 @@ def reading_stats(policy_probs, tokenizer_indices, torch, ks=TOPK_ORACLE):
     if k_max > vocab:
         raise ValueError(f"k={k_max} больше словаря {vocab}")
     res = {}
-    res["agree_top1"] = float((probs.argmax(-1) == want).float().mean())
+    chosen_idx = probs.argmax(-1) if policy_indices is None \
+        else policy_indices
+    if chosen_idx.shape != want.shape:
+        raise ValueError(
+            f"индексы политики {tuple(chosen_idx.shape)} и токенизатора "
+            f"{tuple(want.shape)} разной формы")
+    res["agree_top1"] = float((chosen_idx == want).float().mean())
+    res["policy_indices_given"] = policy_indices is not None
     top = probs.topk(k_max, dim=-1).indices
     hit = top == want.unsqueeze(-1)
     for k_ in ks:
@@ -842,6 +854,20 @@ def selftest():
     sharp_p[..., 3] = 0.93
     st_s = reading_stats(sharp_p, torch.tensor([[3]]), torch, ks=(1, 2))
     assert st_s["agree_top1"] == 1.0 and st_s["recall_at1"] == 1.0
+    assert st_s["policy_indices_given"] is False
+    # ЯВНО ПЕРЕДАННЫЙ ИСПОЛНЕННЫЙ КОД ПЕРЕБИВАЕТ argmax вероятностей —
+    # именно это расхождение и наблюдалось в единичных позициях
+    st_e = reading_stats(sharp_p, torch.tensor([[3]]), torch, ks=(1, 2),
+                         policy_indices=torch.tensor([[5]]))
+    assert st_e["agree_top1"] == 0.0 and st_e["recall_at1"] == 1.0, st_e
+    assert st_e["policy_indices_given"] is True
+    try:
+        reading_stats(sharp_p, torch.tensor([[3]]), torch, ks=(1,),
+                      policy_indices=torch.tensor([[3], [3]]))
+    except ValueError as e:
+        assert "разной формы" in str(e), e
+    else:
+        raise AssertionError("приняты индексы политики другой формы")
     # КОД ТОКЕНИЗАТОРА НА ВТОРОМ МЕСТЕ
     second = torch.full((1, 1, V_r), 0.01)
     second[..., 3] = 0.90
@@ -1696,7 +1722,8 @@ def main():
                     align2_p_to_q=float(lparts["align2_p_to_q"]),
                     **align_exec_stats(q1_tok_logits, q2_tok_logits, paths,
                                        tok),
-                    **agreement_stats(i1_tok, i2_tok, paths, torch),
+                    **agreement_stats(i1_tok, i2_tok, paths, torch,
+                                      out["pred_codes"]),
                     # ПОСТРОЧНЫЕ ЗНАЧЕНИЯ, А НЕ МЕДИАНЫ ПО БАТЧУ. Среднее
                     # медиан батчей — не медиана выборки; складывать будем
                     # сами значения и брать одну медиану в evaluate.
@@ -1750,20 +1777,21 @@ def main():
                     (2, z0 + hard_c1, c2, paths["q2_pol_probs"],
                      out["cumulative_latents"][2])):
                 idx_k = probs_.topk(max(TOPK_ORACLE), dim=-1).indices
-                # ТОЧНОЕ ПРОВЕРЯЕТСЯ ТОЧНО, ДРОЖАЩЕЕ — ИЗМЕРЯЕТСЯ.
-                # Обязаны совпадать ИНДЕКС ранга 1 с кодом, который модель
-                # исполнила, и собранный латент — побитово. Разница в RMS
-                # после этого может остаться только от самого декодера: он
-                # уже измерен как неинвариантный к составу батча на 4e-06,
-                # и падать из-за этого нельзя.
+                # РАНГ 1 — ЭТО КОД, КОТОРЫЙ МОДЕЛЬ ИСПОЛНИЛА, А НЕ ВЕРХНИЙ
+                # ПО ВЕРОЯТНОСТЯМ. Измерено: они расходятся в единичных
+                # позициях (1 из 128 на одном из батчей смоука) — логиты
+                # считаются в fp16, и при точном совпадении максимума
+                # `argmax` модели и `topk` по float32-вероятностям
+                # разрешают его по-разному. Подстановка делает сравнение
+                # оракула с исполняемым путём точным ПО ПОСТРОЕНИЮ, а не
+                # по совпадению. Число расхождений записывается: если оно
+                # велико, дело не в совпадениях.
                 codes_lv = out["pred_codes"][lv]
-                mism = int((idx_k[..., 0] != codes_lv).sum())
-                if mism:
-                    raise SystemExit(
-                        f"уровень {lv}: верхний код по вероятностям "
-                        f"расходится с исполненным кодом модели в {mism} "
-                        f"позициях. Оракул ранга 1 относился бы не к тому "
-                        f"пути")
+                flips = int((idx_k[..., 0] != codes_lv).sum())
+                idx_k = torch.cat(
+                    [codes_lv.unsqueeze(-1), idx_k[..., 1:]], dim=-1)
+                oracle[f"rank1_flips_level{lv}"] = float(flips)
+                oracle[f"rank1_positions_level{lv}"] = float(codes_lv.numel())
                 lat_rank1 = base_ + book_[idx_k[..., 0]]
                 if not torch.equal(lat_rank1, lat_model):
                     gap_ = float((lat_rank1 - lat_model).abs().max())
@@ -1806,7 +1834,7 @@ def main():
     PATHS5 = PATH_NAMES
     q0_logits_ref = {}
 
-    def agreement_stats(i1, i2, paths_, torch_):
+    def agreement_stats(i1, i2, paths_, torch_, codes_):
         """Согласие argmax политики с argmin токенизатора и ранг.
 
         ВЕЛИЧИНА, НЕ ЗАВИСЯЩАЯ ОТ ТЕМПЕРАТУРЫ. Кросс-энтропия Q->P
@@ -1821,7 +1849,9 @@ def main():
             # ЧИСЛО КОДОВ ВЫШЕ — нуль-базированное: 3 означает четвёртое
             # место. Прежнее имя rank_median читалось как «третье место»,
             # и я так его и прочитал в отчёте.
-            got = reading_stats(probs[:, :H_EXEC], idx[:, :H_EXEC], torch)
+            got = reading_stats(
+                probs[:, :H_EXEC], idx[:, :H_EXEC], torch,
+                policy_indices=codes_[lv][:, :H_EXEC])
             res[f"agree{lv}_top1"] = got["agree_top1"]
             res[f"n_above{lv}_rows"] = got["n_above_rows"].cpu().numpy()
             for k_ in TOPK_ORACLE:
@@ -1877,6 +1907,7 @@ def main():
         sup_rows, sup1_rows, sup_soft_rows = [], [], []
         ref_rows, rows_keep = [], []
         oracle_acc, oracle_n, oracle_rows = {}, 0, 0
+        oracle_plain = {}
         oracle_row_ids = []
         # БАТЧИ ДЛЯ ОРАКУЛА БЕРУТСЯ РАЗРЕЖЕННО ПО ВСЕЙ ЧАСТИ, А НЕ ПЕРВЫЕ
         # ПОДРЯД: первые 32 батча плана — это первые эпизоды, а не выборка
@@ -1974,7 +2005,9 @@ def main():
                     oracle_rows += int(w_o)
                     oracle_row_ids.append(stat["topk_rows"])
                     for k_, v_ in stat["topk_oracle"].items():
-                        if k_ == "rows":
+                        if k_ == "rows" or k_.startswith(
+                                ("rank1_flips", "rank1_positions")):
+                            oracle_plain[k_] = oracle_plain.get(k_, 0.0) + v_
                             continue
                         # ВЗВЕШЕННАЯ СУММА MSE, А НЕ СРЕДНЕЕ СРЕДНИХ
                         oracle_acc[k_] = oracle_acc.get(k_, 0.0) + v_ * w_o
@@ -2109,7 +2142,7 @@ def main():
                         f"значит такой разрыв объясняется не декодером, а "
                         f"областью подсчёта")
             res["topk_oracle"] = dict(
-                rms_k, fraction_of_tokenizer_gap=frac,
+                rms_k, **oracle_plain, fraction_of_tokenizer_gap=frac,
                 tokenizer_gap=tok_gap,
                 batches=oracle_n, rows=int(oracle_rows),
                 rows_sha1=hashlib.sha1(
@@ -2136,7 +2169,13 @@ def main():
                   f"жёсткий {ora['ref_a1_pol']:.6f}/"
                   f"{ora['ref_a2_pol']:.6f}; дрожание декодера "
                   f"{ora['decoder_jitter']['level1']['rel_gap']:.2e}/"
-                  f"{ora['decoder_jitter']['level2']['rel_gap']:.2e}")
+                  f"{ora['decoder_jitter']['level2']['rel_gap']:.2e}; "
+                  f"ранг1 против исполненного кода расходился в "
+                  f"{ora['rank1_flips_level1']:.0f}/"
+                  f"{ora['rank1_positions_level1']:.0f} и "
+                  f"{ora['rank1_flips_level2']:.0f}/"
+                  f"{ora['rank1_positions_level2']:.0f} позициях "
+                  f"(подставлен исполненный)")
             frac_ = ora["fraction_of_tokenizer_gap"]
             print("      доля разрыва до токенизатора — " + "; ".join(
                 f"уровень {lv_}: " + ", ".join(
