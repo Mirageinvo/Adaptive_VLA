@@ -194,7 +194,9 @@ def hard_straight_through(logits: torch.Tensor, book: torch.Tensor,
     return embedding, indices, probs
 
 
-ALIGNMENT_SMOOTHING = 0.01
+# СГЛАЖИВАНИЕ ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНО. Его ввели по неверному доводу — см.
+# docstring ниже — и обратно не включают без замера норм градиентов.
+ALIGNMENT_SMOOTHING = 0.0
 
 
 def bidirectional_alignment(tokenizer_logits_: torch.Tensor,
@@ -207,18 +209,31 @@ def bidirectional_alignment(tokenizer_logits_: torch.Tensor,
     читатель: оно позволяет самому разбиению сдвигаться к различиям,
     представленным на назначенной глубине.
 
-    СГЛАЖИВАНИЕ ОБЯЗАТЕЛЬНО, И ВОТ ПОЧЕМУ. Обе величины — кросс-энтропии, и
-    каждая НЕОГРАНИЧЕНА сверху: когда одно распределение резкое, а другое
-    размазано по кодам вне его носителя, `-log` уходит в десятки нат.
-    Измерено на настоящих данных после калибровки температуры:
-    `policy_to_tokenizer` уровня 2 равнялась 225.6 при log V = 7.62, то есть
-    в 29.6 раза больше величины, на которую член нормируется. Градиент этого
-    члена идёт в КНИГИ, поэтому в таком виде он их и разрушил бы — а книги
-    сейчас как раз рабочая часть (путь a2_tok лучший из пяти).
+    О СГЛАЖИВАНИИ, И ПОЧЕМУ ОНО ВЫКЛЮЧЕНО ПО УМОЛЧАНИЮ.
+
+    Измеренный факт: после калибровки температуры `policy_to_tokenizer`
+    уровня 2 равнялась 225.6 при log V = 7.62, то есть ЗНАЧЕНИЕ члена
+    превышало величину, на которую он нормируется, в 29.6 раза.
+
+    Мой прежний вывод из этого — «такой градиент разрушит книги» — НЕВЕРЕН.
+    У кросс-энтропии через `log_softmax` градиент по логитам равен
+    (softmax - цель) и ограничен единицей по модулю, каким бы большим ни
+    было само значение. Большое значение меняет вклад члена в СУММУ, но не
+    величину градиента.
+
+    Настоящий усилитель здесь другой: логиты токенизатора равны -d / tau
+    при tau порядка 1e-05, поэтому градиент по расстоянию, а значит и по
+    книге, получает множитель 1 / tau. Ограничение значения потери этого
+    не контролирует никак.
 
     Сглаживание предсказываемой стороны внутри логарифма ограничивает
-    каждый член сверху величиной log(V / eps): при eps = 0.01 это 12.23,
-    то есть 1.6 log V. Направление градиента сохраняется.
+    каждый член величиной log(V / eps), но делает и кое-что ещё, о чём
+    умалчивал прежний комментарий: при p_j -> 0 производная по
+    соответствующему логиту стремится к НУЛЮ, то есть подавляется
+    исправляющий градиент именно на самых тяжёлых несовпадениях. Для
+    случайной головы это может работать как неявный прогрев, но это другой
+    механизм, и он не проверен. Поэтому eps = 0 по умолчанию, а решение
+    принимается по замеренным нормам градиентов по компонентам.
     """
     if tokenizer_logits_.shape != policy_logits.shape:
         raise ValueError(
@@ -490,14 +505,41 @@ def selftest() -> None:
     spread = torch.zeros(2, 3, V_a)            # равномерное
     spread[..., 0] = -60.0                     # и нулевая масса на коде 0
     raw = bidirectional_alignment(sharp, spread, smoothing=0.0)
-    bounded = bidirectional_alignment(sharp, spread)
-    limit = math.log(V_a / ALIGNMENT_SMOOTHING)
     assert float(raw["policy_to_tokenizer"]) > 5.0 * math.log(V_a), (
         f"неограниченный член равен {float(raw['policy_to_tokenizer']):.1f}, "
         f"а проверка нужна ровно про его неограниченность")
+    assert raw["bound"] == float("inf")
+    # ПО УМОЛЧАНИЮ СГЛАЖИВАНИЯ НЕТ, и значение совпадает с неограниченным
+    assert ALIGNMENT_SMOOTHING == 0.0
+    default = bidirectional_alignment(sharp, spread)
+    assert float(default["policy_to_tokenizer"]) == float(
+        raw["policy_to_tokenizer"])
+    # ЯВНОЕ СГЛАЖИВАНИЕ ОГРАНИЧИВАЕТ ЧЛЕН, И ЭТО ТОЖЕ ПРОВЕРЯЕТСЯ: опция
+    # остаётся доступной, просто не включена.
+    eps_t = 0.01
+    bounded = bidirectional_alignment(sharp, spread, smoothing=eps_t)
+    limit = math.log(V_a / eps_t)
     for key in ("tokenizer_to_policy", "policy_to_tokenizer"):
         assert float(bounded[key]) <= limit + 1e-4, (key, float(bounded[key]))
     assert abs(bounded["bound"] - limit) < 1e-9
+    # И ПОДАВЛЯЕТ ГРАДИЕНТ НА САМЫХ ТЯЖЁЛЫХ НЕСОВПАДЕНИЯХ — ровно тот
+    # побочный эффект, из-за которого оно выключено по умолчанию.
+    z_hard = torch.full((1, 1, V_a), 0.0, requires_grad=True)
+    tgt = torch.full((1, 1, V_a), -60.0)
+    tgt[..., 1] = 60.0
+    with torch.no_grad():
+        pass
+    g_plain = torch.autograd.grad(
+        bidirectional_alignment(tgt, z_hard,
+                                smoothing=0.0)["tokenizer_to_policy"],
+        z_hard, retain_graph=False)[0].abs().max()
+    z_hard2 = torch.zeros(1, 1, V_a, requires_grad=True)
+    g_smooth = torch.autograd.grad(
+        bidirectional_alignment(tgt, z_hard2,
+                                smoothing=0.5)["tokenizer_to_policy"],
+        z_hard2)[0].abs().max()
+    assert float(g_smooth) < float(g_plain), (float(g_smooth),
+                                              float(g_plain))
     # ГРАДИЕНТ ВСЁ ЕЩЁ ИДЁТ В ОБЕ СТОРОНЫ
     tl = torch.randn(2, 3, V_a, requires_grad=True)
     pl = torch.randn(2, 3, V_a, requires_grad=True)

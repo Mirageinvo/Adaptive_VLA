@@ -56,7 +56,7 @@ PATH_NAMES = ("a0", "a1_tok", "a1_pol", "a2_tok", "a2_pol")
 # лучший из k верхних кодов политики. Прямо отвечает на вопрос, который
 # поставил smoke: политика ставит верный код на медианное место 3, а
 # выигрыш при этом теряется почти весь. Диагностика, не гейт.
-TOPK_ORACLE = (1, 2, 3, 5, 10)
+TOPK_ORACLE = (1, 2, 3, 4, 5, 10)
 # ГЕЙТ K-15a: СКОЛЬКО БАТЧЕЙ И КАКИЕ ПРИЧИННЫЕ ПРОВЕРКИ ТРЕБУЮТСЯ.
 # Требование живёт в тренере, а не берётся из проверяемого артефакта.
 GATE_MIN_BATCHES = 3
@@ -66,17 +66,18 @@ GATE_MIN_BATCHES = 3
 # `candidate` — артефакт исправен, а ответ эксперимента отрицательный.
 # Провенанс, инварианты и нечисловые величины сюда НЕ входят: они
 # останавливают прогон раньше и означают «выводов делать нельзя».
-EXPECTED_GATES = {
-    "collapse_q1_pol": "rollout_blocker",
-    "collapse_q1_tok": "rollout_blocker",
-    "collapse_q2_pol": "rollout_blocker",
-    "collapse_q2_tok": "rollout_blocker",
-    "decoder_support": "rollout_blocker",
-    "action_range": "rollout_blocker",
-    "align_not_broken": "rollout_blocker",
-    "no_regression": "candidate",
-    "any_improvement": "candidate",
-}
+# ГЕЙТЫ ЗАДАНЫ ПО УРОВНЯМ: имя -> (категория, уровень). Уровень 1
+# исполняется за 18 слоёв и не зависит от уровня 2 вообще, поэтому его
+# пригодность считается по его собственным гейтам.
+LEVEL_LAYERS = {1: 18, 2: 24}
+EXPECTED_GATES = {}
+for _lv in (1, 2):
+    for _name in (f"collapse_q{_lv}_pol", f"collapse_q{_lv}_tok",
+                  f"decoder_support_q{_lv}", f"action_range_q{_lv}",
+                  f"align_not_broken_q{_lv}"):
+        EXPECTED_GATES[_name] = ("rollout_blocker", _lv)
+    EXPECTED_GATES[f"improves_q{_lv}"] = ("candidate", _lv)
+del _lv, _name
 GATE_CAUSAL_KINDS = ("feedback0_changes_q1", "feedback1_changes_q2",
                      "probe_old_vs_new_bounded")
 EPS_NORM = 1e-6       # нижний предел нормировки на q0 MSE
@@ -183,18 +184,23 @@ def check_init_gate(path, *, expect, file_sha, code_version,
 
 
 def classify_gates(gates):
-    """(отказы, отказы-блокеры, отказы-кандидата). Чистая функция.
+    """Разбор гейтов по уровням. Чистая функция.
+
+    Возвращает (failed, by_level), где by_level[уровень] — словарь с
+    ключами failed, blocker, candidate.
 
     ЗАЧЕМ ОТДЕЛЬНО. Прежде категории фильтровались сравнением со строкой,
     и опечатка в `category` давала отказ, не попавший НИ В ОДИН список:
     `accepted=false`, оба списка пустые, код возврата 0. Здесь отображение
-    имя->категория фиксировано, и любое расхождение с ним — отказ.
+    имя->(категория, уровень) фиксировано, и любое расхождение с ним —
+    отказ.
     """
     actual = {name: gate.get("category") for name, gate in gates.items()}
-    if actual != EXPECTED_GATES:
-        diff = sorted(set(actual) ^ set(EXPECTED_GATES)) or [
-            f"{k}: {actual[k]} вместо {EXPECTED_GATES[k]}"
-            for k in sorted(actual) if actual[k] != EXPECTED_GATES[k]]
+    want = {name: cat for name, (cat, _lv) in EXPECTED_GATES.items()}
+    if actual != want:
+        diff = sorted(set(actual) ^ set(want)) or [
+            f"{k}: {actual[k]} вместо {want[k]}"
+            for k in sorted(actual) if actual[k] != want[k]]
         raise SystemExit(
             f"набор гейтов приёмки или их категории не те: {diff[:5]}")
     for name, gate in gates.items():
@@ -203,12 +209,22 @@ def classify_gates(gates):
                 f"гейт {name}: passed = {gate.get('passed')!r}, а обязан "
                 f"быть bool")
     failed = sorted(k for k, v in gates.items() if not v["passed"])
-    blocker = [k for k in failed
-               if EXPECTED_GATES[k] == "rollout_blocker"]
-    candidate = [k for k in failed if EXPECTED_GATES[k] == "candidate"]
-    if sorted(blocker + candidate) != failed:
-        raise SystemExit("не все отказы классифицированы")
-    return failed, blocker, candidate
+    by_level = {}
+    for lv in sorted({lv for _c, lv in EXPECTED_GATES.values()}):
+        own = [k for k in failed if EXPECTED_GATES[k][1] == lv]
+        by_level[lv] = dict(
+            failed=own,
+            blocker=[k for k in own
+                     if EXPECTED_GATES[k][0] == "rollout_blocker"],
+            candidate=[k for k in own
+                       if EXPECTED_GATES[k][0] == "candidate"])
+    classified = sorted(k for d in by_level.values() for k in d["failed"])
+    if classified != failed:
+        raise SystemExit("не все отказы отнесены к уровню")
+    for lv, d in by_level.items():
+        if sorted(d["blocker"] + d["candidate"]) != sorted(d["failed"]):
+            raise SystemExit(f"уровень {lv}: отказы не классифицированы")
+    return failed, by_level
 
 
 def frozen_tensors(model, trainable_names):
@@ -366,7 +382,16 @@ def build_losses(paths, target, weights, torch, tok, *,
     align2 = tok.bidirectional_alignment(paths["q2_tok_logits"],
                                          paths["q2_pol_logits"])
     log_v = math.log(float(vocab))
-    l_align = w_align * (align1["total"] + align2["total"]) / log_v
+    # ДВА НАПРАВЛЕНИЯ — ДВА ОТДЕЛЬНЫХ СЛАГАЕМЫХ. Сумма та же, что прежняя
+    # `w * (align1.total + align2.total) / log V`, потому что total =
+    # 0.5 (q->p + p->q). Разделение нужно, чтобы норму градиента КАЖДОГО
+    # направления можно было замерить ровно по той величине, которая стоит
+    # в сумме, а не по пересобранной заново.
+    l_align_q2p = w_align * 0.5 * (align1["tokenizer_to_policy"]
+                                   + align2["tokenizer_to_policy"]) / log_v
+    l_align_p2q = w_align * 0.5 * (align1["policy_to_tokenizer"]
+                                   + align2["policy_to_tokenizer"]) / log_v
+    l_align = l_align_q2p + l_align_p2q
 
     # МОНОТОННОСТЬ МЯГКАЯ И С МАЛЫМ ВЕСОМ. Imitation error — слабый прокси
     # поведения (§48.4, §50.4); большой вес толкал бы модель держаться ближе
@@ -386,6 +411,7 @@ def build_losses(paths, target, weights, torch, tok, *,
     parts = dict(
         total=total, action=l_action, align=l_align, mono=l_mono,
         usage=l_usage, usage_pol_diagnostic=usage_pol, norm=norm,
+        align_q_to_p_term=l_align_q2p, align_p_to_q_term=l_align_p2q,
         align_bound=float(align1["bound"]),
         align_smoothing=float(align1["smoothing"]),
         align1_q_to_p=align1["tokenizer_to_policy"],
@@ -436,16 +462,30 @@ def forecast_runtime(elapsed_seconds, done_batches, total_batches, epochs):
                 batches_per_epoch=int(total_batches), epochs=int(epochs))
 
 
-def select_epoch(history):
-    """Выбор эпохи: минимум q2 policy action RMS на val_sel.
+def select_epoch(history, level=2):
+    """Выбор эпохи ДЛЯ УКАЗАННОГО УРОВНЯ: минимум его action RMS на val_sel.
 
-    Tie-break — меньшая доля строк, где q2 хуже q0. Правило записано до
-    данных; эпоха 0 (без обучения) участвует, как в K-14.
+    Tie-break — меньшая доля строк, где этот уровень хуже q0. Эпоха 0 (без
+    обучения) участвует, как в K-14.
+
+    УРОВЕНЬ — ПАРАМЕТР, А НЕ 2. Прежде эпоха выбиралась только по
+    `val_a2_pol_rms`, и при этом вердикт мог объявить кандидатом q1: тогда
+    сохранялась эпоха, лучшая для НЕ ТОГО уровня, а лучшая эпоха q1 просто
+    терялась. Уровень 1 — отдельная точка (18 слоёв вместо 24), и для
+    статьи потенциально более интересная.
     """
     if not history:
         raise SystemExit("история пуста")
-    best = min(history, key=lambda r: (round(float(r["val_a2_pol_rms"]), 12),
-                                       round(float(r["val_frac_worse"]), 12),
+    if not isinstance(level, int) or level not in (1, 2):
+        raise SystemExit(f"уровень {level!r} не бывает")
+    key = f"val_a{int(level)}_pol_rms"
+    tie = f"val_frac_worse_q{int(level)}"
+    missing = [r["epoch"] for r in history if key not in r or tie not in r]
+    if missing:
+        raise SystemExit(
+            f"в истории эпох {missing[:3]} нет полей {key}/{tie}")
+    best = min(history, key=lambda r: (round(float(r[key]), 12),
+                                       round(float(r[tie]), 12),
                                        int(r["epoch"])))
     return int(best["epoch"]), best
 
@@ -674,23 +714,28 @@ def selftest():
     # --- КЛАССИФИКАЦИЯ ГЕЙТОВ ПРИЁМКИ -------------------------------------
     def mk_gates(**fails):
         return {name: dict(category=cat, passed=name not in fails)
-                for name, cat in EXPECTED_GATES.items()}
+                for name, (cat, _lv) in EXPECTED_GATES.items()}
 
-    assert classify_gates(mk_gates()) == ([], [], [])
-    f_all, f_b, f_c = classify_gates(mk_gates(decoder_support=1))
-    assert (f_all, f_b, f_c) == (["decoder_support"], ["decoder_support"], [])
-    f_all, f_b, f_c = classify_gates(mk_gates(any_improvement=1))
-    assert (f_all, f_b, f_c) == (["any_improvement"], [], ["any_improvement"])
-    # q1 лучше, q2 регрессировал: no_regression — кандидат, а не блокер
-    f_all, f_b, f_c = classify_gates(mk_gates(no_regression=1))
-    assert f_b == [] and f_c == ["no_regression"], (f_b, f_c)
-    f_all, f_b, f_c = classify_gates(mk_gates(action_range=1,
-                                              any_improvement=1))
-    assert f_b == ["action_range"] and f_c == ["any_improvement"]
+    f_all, by_lv = classify_gates(mk_gates())
+    assert f_all == [] and all(not by_lv[lv]["failed"] for lv in (1, 2))
+    # ОТКАЗ УРОВНЯ 2 НЕ КАСАЕТСЯ УРОВНЯ 1 — ровно то, из-за чего случайная
+    # голова q2 блокировала исправный q1.
+    f_all, by_lv = classify_gates(mk_gates(decoder_support_q2=1,
+                                           collapse_q2_pol=1))
+    assert by_lv[1]["failed"] == [] and by_lv[1]["blocker"] == []
+    assert sorted(by_lv[2]["blocker"]) == ["collapse_q2_pol",
+                                           "decoder_support_q2"]
+    f_all, by_lv = classify_gates(mk_gates(improves_q1=1))
+    assert by_lv[1]["candidate"] == ["improves_q1"]
+    assert by_lv[1]["blocker"] == [] and by_lv[2]["failed"] == []
+    f_all, by_lv = classify_gates(mk_gates(action_range_q1=1, improves_q2=1))
+    assert by_lv[1]["blocker"] == ["action_range_q1"]
+    assert by_lv[2]["candidate"] == ["improves_q2"]
+    assert sorted(f_all) == ["action_range_q1", "improves_q2"]
     # ОПЕЧАТКА В КАТЕГОРИИ: раньше отказ не попадал ни в один список и
     # прогон завершался кодом 0
-    typo = mk_gates(decoder_support=1)
-    typo["decoder_support"]["category"] = "techncial"
+    typo = mk_gates(decoder_support_q2=1)
+    typo["decoder_support_q2"]["category"] = "techncial"
     try:
         classify_gates(typo)
     except SystemExit as e:
@@ -698,7 +743,7 @@ def selftest():
     else:
         raise AssertionError("гейт с опечаткой в категории классифицирован")
     for broken, why in (
-            ({k: v for k, v in mk_gates().items() if k != "no_regression"},
+            ({k: v for k, v in mk_gates().items() if k != "improves_q1"},
              "категории не те"),
             (dict(mk_gates(), лишний=dict(category="candidate", passed=True)),
              "категории не те")):
@@ -709,15 +754,17 @@ def selftest():
         else:
             raise AssertionError(f"принят неверный набор гейтов: {why}")
     non_bool = mk_gates()
-    non_bool["align_not_broken"]["passed"] = "false"
+    non_bool["align_not_broken_q1"]["passed"] = "false"
     try:
         classify_gates(non_bool)
     except SystemExit as e:
         assert "обязан быть bool" in str(e), e
     else:
         raise AssertionError('passed="false" принят')
-    assert sum(1 for v in EXPECTED_GATES.values()
-               if v == "candidate") == 2, EXPECTED_GATES
+    assert sum(1 for c, _lv in EXPECTED_GATES.values()
+               if c == "candidate") == 2, EXPECTED_GATES
+    assert len(EXPECTED_GATES) == 12, len(EXPECTED_GATES)
+    assert set(LEVEL_LAYERS) == {1, 2} and LEVEL_LAYERS[1] == 18
 
     # --- ПРОГНОЗ ВРЕМЕНИ --------------------------------------------------
     f = forecast_runtime(100.0, 100, 16951, 3)
@@ -732,15 +779,34 @@ def selftest():
         raise AssertionError("принят нулевой счёт батчей")
 
     # --- ВЫБОР ЭПОХИ ------------------------------------------------------
-    hist = [dict(epoch=0, val_a2_pol_rms=0.20, val_frac_worse=0.5),
-            dict(epoch=1, val_a2_pol_rms=0.15, val_frac_worse=0.4),
-            dict(epoch=2, val_a2_pol_rms=0.15, val_frac_worse=0.3),
-            dict(epoch=3, val_a2_pol_rms=0.18, val_frac_worse=0.1)]
-    ep, best = select_epoch(hist)
+    def row(ep_, r1, r2, w1=0.5, w2=0.5):
+        return dict(epoch=ep_, val_a1_pol_rms=r1, val_a2_pol_rms=r2,
+                    val_frac_worse_q1=w1, val_frac_worse_q2=w2)
+
+    hist = [row(0, 0.30, 0.20, 0.9, 0.5), row(1, 0.25, 0.15, 0.8, 0.4),
+            row(2, 0.28, 0.15, 0.7, 0.3), row(3, 0.22, 0.18, 0.6, 0.1)]
+    ep, best = select_epoch(hist, level=2)
     assert ep == 2, ep                     # tie-break по доле ухудшений
-    assert best["val_frac_worse"] == 0.3
-    hist2 = [dict(epoch=0, val_a2_pol_rms=0.1, val_frac_worse=0.2)]
-    assert select_epoch(hist2)[0] == 0     # эпоха 0 участвует
+    assert best["val_frac_worse_q2"] == 0.3
+    # УРОВЕНЬ 1 ВЫБИРАЕТ ДРУГУЮ ЭПОХУ — ровно та потеря, из-за которой
+    # лучшая эпоха q1 раньше пропадала.
+    ep1, best1 = select_epoch(hist, level=1)
+    assert ep1 == 3 and best1["val_a1_pol_rms"] == 0.22, (ep1, best1)
+    assert select_epoch([row(0, 0.1, 0.1)], level=1)[0] == 0
+    assert select_epoch([row(0, 0.1, 0.1)], level=2)[0] == 0
+    for bad_level in (0, 3, "q1"):
+        try:
+            select_epoch(hist, level=bad_level)
+        except SystemExit as e:
+            assert "не бывает" in str(e), e
+        else:
+            raise AssertionError(f"принят уровень {bad_level}")
+    try:
+        select_epoch([dict(epoch=0, val_a2_pol_rms=0.1)], level=2)
+    except SystemExit as e:
+        assert "нет полей" in str(e), e
+    else:
+        raise AssertionError("принята история без полей уровня")
 
     # --- ГЕЙТ K-15a: КАЖДАЯ МУТАЦИЯ ОТВЕРГАЕТСЯ ---------------------------
     import tempfile
@@ -886,7 +952,7 @@ def main():
                          "tau=1 апостериор почти равномерен, потому что "
                          "квадрат расстояния делится на D")
     ap.add_argument("--tau-target-perplexity", type=float, default=20.0,
-                    help="цель калибровки; объявлена до данных")
+                    help="цель калибровки. Выбрана ПОСЛЕ смоука, который показал почти равномерный апостериор, и зафиксирована до полного прогона — не «до данных»")
     ap.add_argument("--topk-oracle-batches", type=int, default=32,
                     help="на скольких батчах итоговой переоценки считать "
                          "оракул верхних кодов; 0 — не считать")
@@ -999,6 +1065,18 @@ def main():
     st_n, _sm, _sh = kc.load_states(src, N, ds_repo, ds_rev, keys_sha,
                                     STATE_Q01, STATE_Q99)
     max_act_q = np.maximum(np.abs(ACTION_Q01), np.abs(ACTION_Q99))
+    # ЭТАЛОН ДИАПАЗОНА ДЕЙСТВИЙ — В ТЕХ ЖЕ ЕДИНИЦАХ, ЧТО ВЫХОД ДЕКОДЕРА.
+    # Кэш хранит действие НОРМИРОВАННЫМ: в k9a оно поделено на max_act_q,
+    # у схвата перевёрнут знак, и всё обрезано в [-1, 1]. Декодер
+    # возвращает его же. Поэтому эталоном служит p99 |действия| ПО ВСЕМУ
+    # НАБОРУ в этих же единицах и на тех же исполняемых позициях, а не
+    # физический max_act_q и не максимум по оценочным строкам.
+    act_p99_dataset = np.percentile(
+        np.abs(np.asarray(ACT[:, :H_EXEC, :7], np.float64)).reshape(-1, 7),
+        99.0, axis=0)
+    print("  эталон диапазона (p99 |действия| по набору, нормированные "
+          "единицы): "
+          + ", ".join(f"{x:.3f}" for x in act_p99_dataset))
 
     q0_can, _q0_def, q0_man, q0_prov = kc.load_canonical_q0(
         a.q0, gate_r_path=a.gate_r, n_obs=N, keys_sha=keys_sha,
@@ -1191,6 +1269,7 @@ def main():
     tau_report = {}
     collect_dist = [False]
     collect_topk = [0]
+    collect_components = [False]
     q0_can_dev = torch.as_tensor(np.asarray(q0_can), device=dev)
     pending_q0 = [None]
     pending_bad_action = [None]
@@ -1332,6 +1411,15 @@ def main():
             for k_ in PATH_NAMES:
                 track[k_] = means[k_].detach()
             stat = dict(rows=int(len(sel)), track=track)
+        if collect_components[0]:
+            # ТЕНЗОРЫ С ГРАФОМ, не detach: по ним берутся нормы градиентов
+            # по компонентам в смоуке.
+            stat["components"] = {
+                "action": lparts["action"],
+                "align_q_to_p": lparts["align_q_to_p_term"],
+                "align_p_to_q": lparts["align_p_to_q_term"],
+                "mono": lparts["mono"], "usage": lparts["usage"]}
+        with torch.no_grad():
             if not train:
                 stat.update(
                     {k_: float(means[k_]) for k_ in PATH_NAMES},
@@ -1346,7 +1434,9 @@ def main():
                                                weights, torch)
                 stat.update(
                     a2_pol_equal_weights=float(eq),
-                    frac_worse_than_q0=float(
+                    frac_worse_q1=float(
+                        (rows["a1_pol"] > rows["a0"]).float().mean()),
+                    frac_worse_q2=float(
                         (rows["a2_pol"] > rows["a0"]).float().mean()),
                     # ВЕЛИЧИНА ПОПРАВКИ, А НЕ «НЕНУЛЕВАЯ ЛИ СТРОКА КНИГИ».
                     # Прежняя доля строк с ненулевой нормой c1 равнялась
@@ -1376,14 +1466,20 @@ def main():
                     **align_exec_stats(q1_tok_logits, q2_tok_logits, paths,
                                        tok),
                     **agreement_stats(i1_tok, i2_tok, paths, torch),
-                    soft_ppl_q1=float(tok.soft_perplexity(
-                        p1_tok[:, :H_EXEC]).median()),
-                    soft_ppl_q2=float(tok.soft_perplexity(
-                        p2_tok[:, :H_EXEC]).median()),
-                    soft_ppl_p1=float(tok.soft_perplexity(
-                        paths["q1_pol_probs"][:, :H_EXEC]).median()),
-                    soft_ppl_p2=float(tok.soft_perplexity(
-                        paths["q2_pol_probs"][:, :H_EXEC]).median()),
+                    # ПОСТРОЧНЫЕ ЗНАЧЕНИЯ, А НЕ МЕДИАНЫ ПО БАТЧУ. Среднее
+                    # медиан батчей — не медиана выборки; складывать будем
+                    # сами значения и брать одну медиану в evaluate.
+                    **{f"soft_ppl_{s}{lv}_rows": tok.soft_perplexity(
+                        pr[:, :H_EXEC]).reshape(-1).cpu().numpy()
+                       for s, lv, pr in (("q", 1, p1_tok), ("q", 2, p2_tok),
+                                         ("p", 1, paths["q1_pol_probs"]),
+                                         ("p", 2, paths["q2_pol_probs"]))},
+                    # ПОКАНАЛЬНЫЕ АБСОЛЮТНЫЕ ЗНАЧЕНИЯ ДЛЯ p99 — в тех же
+                    # НОРМИРОВАННЫХ единицах, в которых лежит кэш.
+                    **{f"abs_{nm}": acts[nm][:, :H_EXEC].abs()
+                       .reshape(-1, 7).cpu().numpy()
+                       for nm in ("a1_pol", "a2_pol")},
+                    latent1=(z0 + c1_pol).detach(),
                     q1_codes=out["pred_codes"][1].detach().cpu().numpy(),
                     q2_codes=out["pred_codes"][2].detach().cpu().numpy(),
                     q1_codes_tok=i1_tok.detach().cpu().numpy(),
@@ -1449,8 +1545,18 @@ def main():
             res[f"agree{lv}_top1"] = float(
                 (p_exec.argmax(-1) == want).float().mean())
             chosen = p_exec.gather(-1, want.unsqueeze(-1))
-            res[f"rank{lv}_median"] = float(
-                (p_exec > chosen).sum(-1).float().median())
+            # ЧИСЛО КОДОВ ВЫШЕ, А НЕ «РАНГ». Величина нуль-базированная:
+            # 3 означает четвёртое место. Прежнее имя rank_median читалось
+            # как «третье место», и я так его и прочитал в отчёте.
+            above = (p_exec > chosen).sum(-1).reshape(-1)
+            res[f"n_above{lv}_rows"] = above.cpu().numpy()
+            # RECALL@K: попал ли код токенизатора в top-k политики. Это
+            # ПРИСУТСТВИЕ кода, в отличие от оракула, который выбирает
+            # лучший по истинной ошибке и потому мерит «есть ли среди
+            # top-k хоть какой-нибудь полезный код».
+            for k_ in TOPK_ORACLE:
+                res[f"recall{lv}_at{k_}"] = float(
+                    (above < k_).float().mean())
         return res
 
     def align_exec_stats(q1_tok_lg, q2_tok_lg, paths_, tok_):
@@ -1479,8 +1585,8 @@ def main():
         """
         model.eval()
         acc = {k: 0.0 for k in PATHS5}
-        acc.update(a2_pol_eq=0.0, frac_worse=0.0, d_latent_q1=0.0,
-                   d_latent_q2=0.0)
+        acc.update(a2_pol_eq=0.0, frac_worse_q1=0.0, frac_worse_q2=0.0,
+                   d_latent_q1=0.0, d_latent_q2=0.0)
         n_rows = 0
         dmax = {"d_action_q1": 0.0, "d_action_q2": 0.0}
         absmax = {"act_absmax": None, "true_absmax": None}
@@ -1488,11 +1594,14 @@ def main():
                      for lv in (1, 2) for d in ("q_to_p", "p_to_q")
                      for suf in ("", "_exec")}
         align_acc.update({f"agree{lv}_top1": 0.0 for lv in (1, 2)})
-        align_acc.update({f"rank{lv}_median": 0.0 for lv in (1, 2)})
-        align_acc.update({f"soft_ppl_{s}{lv}": 0.0
-                          for s in ("q", "p") for lv in (1, 2)})
+        align_acc.update({f"recall{lv}_at{k_}": 0.0
+                          for lv in (1, 2) for k_ in TOPK_ORACLE})
+        pooled = {f"soft_ppl_{s}{lv}": [] for s in ("q", "p")
+                  for lv in (1, 2)}
+        pooled.update({f"n_above{lv}": [] for lv in (1, 2)})
+        abs_pool = {"a1_pol": [], "a2_pol": []}
         codes = {k: [] for k in ("q1_pol", "q2_pol", "q1_tok", "q2_tok")}
-        sup_rows, ref_rows, rows_keep = [], [], []
+        sup_rows, sup1_rows, ref_rows, rows_keep = [], [], [], []
         oracle_acc, oracle_n = {}, 0
         with torch.no_grad():
             for po, sel in batch_list:
@@ -1502,7 +1611,8 @@ def main():
                 for k in PATHS5:
                     acc[k] += stat[k] * w
                 acc["a2_pol_eq"] += stat["a2_pol_equal_weights"] * w
-                acc["frac_worse"] += stat["frac_worse_than_q0"] * w
+                acc["frac_worse_q1"] += stat["frac_worse_q1"] * w
+                acc["frac_worse_q2"] += stat["frac_worse_q2"] * w
                 acc["d_latent_q1"] += stat["d_latent_q1"] * w
                 acc["d_latent_q2"] += stat["d_latent_q2"] * w
                 # МАКСИМУМЫ АГРЕГИРУЮТСЯ МАКСИМУМОМ, А НЕ СРЕДНИМ. Они
@@ -1543,10 +1653,21 @@ def main():
                 # БАТЧАХ, И С ЭТАЛОНОМ. Эталон — собственная ошибка
                 # квантования кодека на ИСТИННОМ латенте: это тот уровень
                 # непредставимости, с которым декодер обучался работать.
+                for k_ in pooled:
+                    pooled[k_].append(np.asarray(stat[f"{k_}_rows"]))
+                for k_ in abs_pool:
+                    abs_pool[k_].append(np.asarray(stat[f"abs_{k_}"]))
                 _s, rel = decoder_support(
                     stat["latent"], codec, torch, quantizers,
                     nearest_code, code_contribution)
                 sup_rows.append(rel)
+                # ОПОРА ДЕКОДЕРА ДЛЯ УРОВНЯ 1 ТОЖЕ. Кандидатом может
+                # оказаться q1, и тогда гейт обязан относиться к ЕГО
+                # латенту, а не к латенту пути, который не исполняется.
+                _s1, rel1 = decoder_support(
+                    stat["latent1"], codec, torch, quantizers,
+                    nearest_code, code_contribution)
+                sup1_rows.append(rel1)
                 _s2, rel2 = decoder_support(
                     stat["latent_true"], codec, torch, quantizers,
                     nearest_code, code_contribution)
@@ -1564,6 +1685,18 @@ def main():
         res["act_absmax"] = [float(x) for x in absmax["act_absmax"]]
         res["true_absmax"] = [float(x) for x in absmax["true_absmax"]]
         res["log_vocab"] = float(np.log(float(vocab)))
+        # ГЛОБАЛЬНЫЕ МЕДИАНЫ, А НЕ СРЕДНЕЕ МЕДИАН ПО БАТЧАМ.
+        for k_, chunks in pooled.items():
+            flat = np.concatenate(chunks)
+            res[f"{k_}_median"] = float(np.median(flat))
+            res[f"{k_}_mean"] = float(np.mean(flat))
+        # ПОКАНАЛЬНЫЙ p99 КАНДИДАТА — ТА ЖЕ СТАТИСТИКА, ЧТО У ЭТАЛОНА, И В
+        # ТЕХ ЖЕ НОРМИРОВАННЫХ ЕДИНИЦАХ.
+        for k_, chunks in abs_pool.items():
+            flat = np.concatenate(chunks, axis=0)
+            res[f"p99_{k_}"] = [float(x) for x in
+                                np.percentile(flat, 99.0, axis=0)]
+            res[f"absmax_{k_}"] = [float(x) for x in flat.max(axis=0)]
         for k in PATHS5:
             res[f"rms_{k}"] = float(np.sqrt(res[k]))
         for name, key in (("usage_q1", "q1_pol"), ("usage_q2", "q2_pol"),
@@ -1592,27 +1725,38 @@ def main():
                 executed_min_perplexity=float(min(
                     s["perplexity"] for s in per_pos[:H_EXEC])))
         sup_all = torch.cat(sup_rows) if sup_rows else None
+        sup1_all = torch.cat(sup1_rows) if sup1_rows else None
         ref_all = torch.cat(ref_rows) if ref_rows else None
-        # ОПОРА ДЕКОДЕРА СЧИТАЕТСЯ ТОЛЬКО ДЛЯ a2_pol — ИСПОЛНЯЕМОГО ПУТИ.
-        # Это гейт перед роллаутом, а не полная диагностика: пять путей,
-        # цикл decode->encode и суммы исходных книг как отдельная опора
-        # остаются работой перед поведенческим пилотом.
-        res["decoder_support"] = None if sup_all is None else dict(
-            scope="final path a2_pol only",
-            rel_residual=float(sup_all.mean()),
-            rel_residual_median=float(sup_all.median()),
-            rel_residual_p95=float(torch.quantile(sup_all, 0.95)),
-            rel_residual_p99=float(torch.quantile(sup_all, 0.99)),
-            rel_residual_max=float(sup_all.max()),
-            reference_rel_residual=float(ref_all.mean()),
-            reference_rel_residual_median=float(ref_all.median()),
-            reference_rel_residual_p95=float(torch.quantile(ref_all, 0.95)),
-            reference_rel_residual_p99=float(torch.quantile(ref_all, 0.99)),
-            share_above_reference_p99=float(
-                (sup_all > torch.quantile(ref_all, 0.99)).float().mean()),
-            n=int(sup_all.numel()),
-            reference="собственная ошибка квантования кодека на истинном "
-                      "латенте того же батча")
+
+        def support_block(rows_, scope_):
+            if rows_ is None:
+                return None
+            return dict(
+                scope=scope_,
+                rel_residual=float(rows_.mean()),
+                rel_residual_median=float(rows_.median()),
+                rel_residual_p95=float(torch.quantile(rows_, 0.95)),
+                rel_residual_p99=float(torch.quantile(rows_, 0.99)),
+                rel_residual_max=float(rows_.max()),
+                reference_rel_residual=float(ref_all.mean()),
+                reference_rel_residual_median=float(ref_all.median()),
+                reference_rel_residual_p95=float(
+                    torch.quantile(ref_all, 0.95)),
+                reference_rel_residual_p99=float(
+                    torch.quantile(ref_all, 0.99)),
+                share_above_reference_p99=float(
+                    (rows_ > torch.quantile(ref_all, 0.99)).float().mean()),
+                n=int(rows_.numel()),
+                reference="собственная ошибка квантования кодека на "
+                          "истинном латенте того же батча")
+
+        res["decoder_support_q1"] = support_block(sup1_all, "path a1_pol")
+        res["decoder_support_q2"] = support_block(sup_all, "path a2_pol")
+        # ОПОРА ДЕКОДЕРА СЧИТАЕТСЯ ДЛЯ ОБОИХ ИСПОЛНЯЕМЫХ ПУТЕЙ: кандидатом
+        # может оказаться уровень 1, и тогда гейт обязан относиться к его
+        # латенту. Пять путей, цикл decode->encode и суммы исходных книг
+        # как отдельная опора остаются работой перед пилотом.
+        res["decoder_support"] = res["decoder_support_q2"]
         res["rows"] = n_rows
         if oracle_n:
             # RMS, А НЕ MSE: сравнимо с остальными путями.
@@ -1633,15 +1777,23 @@ def main():
         print(f"    {tag}: RMS a0 {res['rms_a0']:.6f}; книга a1_tok "
               f"{res['rms_a1_tok']:.6f}, a2_tok {res['rms_a2_tok']:.6f}; "
               f"политика a1_pol {res['rms_a1_pol']:.6f}, a2_pol "
-              f"{res['rms_a2_pol']:.6f}; хуже q0 "
-              f"{100 * res['frac_worse']:.1f}% строк")
-        print(f"      апостериор: мягкая perplexity Q "
-              f"{res['soft_ppl_q1']:.1f}/{res['soft_ppl_q2']:.1f}, P "
-              f"{res['soft_ppl_p1']:.1f}/{res['soft_ppl_p2']:.1f}; согласие "
-              f"по верхнему коду {100 * res['agree1_top1']:.2f}%/"
+              f"{res['rms_a2_pol']:.6f}; хуже q0: q1 "
+              f"{100 * res['frac_worse_q1']:.1f}%, q2 "
+              f"{100 * res['frac_worse_q2']:.1f}% строк")
+        print(f"      апостериор: мягкая perplexity (медиана) Q "
+              f"{res['soft_ppl_q1_median']:.1f}/"
+              f"{res['soft_ppl_q2_median']:.1f}, P "
+              f"{res['soft_ppl_p1_median']:.1f}/"
+              f"{res['soft_ppl_p2_median']:.1f}")
+        print(f"      чтение книги: согласие top-1 "
+              f"{100 * res['agree1_top1']:.2f}%/"
               f"{100 * res['agree2_top1']:.2f}% при случайном "
-              f"{100 / vocab:.3f}%; медианный ранг выбора Q у P "
-              f"{res['rank1_median']:.0f}/{res['rank2_median']:.0f}")
+              f"{100 / vocab:.3f}%; кодов выше выбора Q (медиана) "
+              f"{res['n_above1_median']:.0f}/{res['n_above2_median']:.0f}; "
+              f"recall@3 {100 * res['recall1_at3']:.1f}%/"
+              f"{100 * res['recall2_at3']:.1f}%, recall@10 "
+              f"{100 * res['recall1_at10']:.1f}%/"
+              f"{100 * res['recall2_at10']:.1f}%")
         print(f"      поправка: |c1|/|z0| {res['d_latent_q1']:.4f}, "
               f"|c2|/|z0| {res['d_latent_q2']:.4f}; max|a1-a0| "
               f"{res['d_action_q1']:.5f}, max|a2-a1| "
@@ -1653,9 +1805,11 @@ def main():
                   f"{up['max_code_share']:.3f} | Q perplexity "
                   f"{uq['perplexity']:.1f}, мёртвых {uq['dead_codes']}, "
                   f"макс доля {uq['max_code_share']:.3f}")
-        if res["decoder_support"]:
-            ds = res["decoder_support"]
-            print(f"      опора декодера (только a2_pol): остаток "
+        for lv_ in (1, 2):
+            ds = res[f"decoder_support_q{lv_}"]
+            if not ds:
+                continue
+            print(f"      опора декодера a{lv_}_pol: остаток "
                   f"{ds['rel_residual']:.4f}, медиана "
                   f"{ds['rel_residual_median']:.4f}, p95 "
                   f"{ds['rel_residual_p95']:.4f}, p99 "
@@ -1731,7 +1885,8 @@ def main():
         return inv_
 
     # --- КАЛИБРОВКА ТЕМПЕРАТУРЫ ТОКЕНИЗАТОРА -----------------------------
-    # ПРАВИЛО ОБЪЯВЛЕНО ДО ДАННЫХ: медианная мягкая perplexity апостериора
+    # ПРАВИЛО ВЫБРАНО ПОСЛЕ СМОУКА И ЗАФИКСИРОВАНО ДО ПОЛНОГО ПРОГОНА:
+    # медианная мягкая perplexity апостериора
     # Q на исполняемых позициях равна --tau-target-perplexity. Без этого
     # апостериор почти равномерен (квадрат расстояния делится на D), и
     # тогда член выравнивания сводится к давлению «сделай P равномерным»,
@@ -1739,6 +1894,9 @@ def main():
     # сигнала. Жёсткий выбор от температуры не зависит.
     if str(a.tau_tokenizer).strip().lower() == "auto":
         collect_dist[0] = True
+        # ЧИСЛО КАЛИБРОВОЧНЫХ БАТЧЕЙ — СКОЛЬКО ЕСТЬ. При --smoke --limit 2
+        # части уже урезаны, поэтому их два, а не четыре; в артефакт идёт
+        # фактическое число.
         calib = parts["train"][:max(int(a.calib_batches), 1)]
         dist = {1: [], 2: []}
         with torch.no_grad():
@@ -1775,8 +1933,10 @@ def main():
     history = []
     val0 = evaluate(parts["val_sel"], "эпоха 0, без обучения")
     history.append(dict(epoch=0, train_loss=None,
+                        val_a1_pol_rms=val0["rms_a1_pol"],
                         val_a2_pol_rms=val0["rms_a2_pol"],
-                        val_frac_worse=val0["frac_worse"], val=val0))
+                        val_frac_worse_q1=val0["frac_worse_q1"],
+                        val_frac_worse_q2=val0["frac_worse_q2"], val=val0))
     snapshots = {0: {k: v.detach().clone()
                      for k, v in model.state_dict().items()
                      if k in set(info["names"])}}
@@ -1787,14 +1947,43 @@ def main():
         # через часы полного прогона.
         po0, sel0 = parts["train"][0]
         probe_losses = []
+        collect_components[0] = True
+        # ГРУППЫ ДЛЯ НОРМ ГРАДИЕНТОВ. «Градиент ненулевой» при tau порядка
+        # 1e-05 почти ничего не говорит: логиты токенизатора равны -d/tau,
+        # поэтому градиент по книге получает множитель 1/tau. Нужны сами
+        # нормы по компонентам и относительный шаг книг.
+        groups = {"books": ["depth_aligned_c1", "depth_aligned_c2"],
+                  "heads": [n for n in info["names"]
+                            if n.startswith("depth_rvq_heads")],
+                  "norms": [n for n in info["names"]
+                            if n.startswith("depth_rvq_norms")],
+                  "feedback": [n for n in info["names"]
+                               if n.startswith("depth_rvq_feedback")]}
+        named = dict(model.named_parameters())
+        group_params = {g: [named[n] for n in ns] for g, ns in groups.items()}
+        books0 = {n: named[n].detach().clone() for n in groups["books"]}
+        probe_report = []
         # И ГРАДИЕНТ КАЖДОГО РАЗРЕШЁННОГО ТЕНЗОРА ОБЯЗАН БЫТЬ НЕНУЛЕВЫМ.
         # Общая потеря может падать при мёртвой подгруппе: головы учатся,
         # книги стоят, и по одному числу этого не видно.
         grad_mass = {n_: 0.0 for n_ in info["names"]}
         for probe_step in range(3):
             opt.zero_grad(set_to_none=True)
-            l_probe, _s_probe = run_batch(po0, sel0, True)
+            l_probe, s_probe = run_batch(po0, sel0, True)
             probe_losses.append(float(l_probe.detach()))
+            # НОРМЫ ГРАДИЕНТА ПО КОМПОНЕНТАМ ПОТЕРИ И ПО ГРУППАМ ВЕСОВ.
+            step_report = {"step": probe_step + 1,
+                           "loss": float(l_probe.detach()), "grad": {}}
+            for cname, ctensor in s_probe["components"].items():
+                row_ = {}
+                for gname, params_ in group_params.items():
+                    gs = torch.autograd.grad(
+                        ctensor, params_, retain_graph=True,
+                        allow_unused=True)
+                    row_[gname] = float(sum(
+                        float(g.norm()) ** 2 for g in gs
+                        if g is not None) ** 0.5)
+                step_report["grad"][cname] = row_
             l_probe.backward()
             # КОНЕЧНОСТЬ ПРОВЕРЯЕТСЯ ДО opt.step(), А НЕ ПОСЛЕ НЕГО. Шаг по
             # nan-градиенту портит веса, и после него проверять уже поздно;
@@ -1813,6 +2002,40 @@ def main():
                         f"нечисловой. Шаг по нему испортил бы веса")
                 grad_mass[n_] += float(p_.grad.abs().sum())
             opt.step()
+            with torch.no_grad():
+                step_report["book_relative_step"] = {
+                    n: float((named[n].detach() - books0[n]).norm()
+                             / books0[n].norm().clamp_min(1e-12))
+                    for n in groups["books"]}
+            _l_ev, s_ev = run_batch(po0, sel0, False)
+            step_report["after_step"] = {
+                k_: float(s_ev[k_]) for k_ in ("agree1_top1", "agree2_top1")}
+            for s_, lv_ in (("q", 1), ("q", 2)):
+                step_report["after_step"][f"soft_ppl_{s_}{lv_}"] = float(
+                    np.median(s_ev[f"soft_ppl_{s_}{lv_}_rows"]))
+            probe_report.append(step_report)
+            print(f"    шаг {probe_step + 1}: потеря "
+                  f"{step_report['loss']:.5f}; нормы градиента по книгам "
+                  + ", ".join(
+                      f"{c}={step_report['grad'][c]['books']:.3e}"
+                      for c in ("action", "align_q_to_p", "align_p_to_q",
+                                "mono", "usage"))
+                  + "; по головам "
+                  + ", ".join(
+                      f"{c}={step_report['grad'][c]['heads']:.3e}"
+                      for c in ("action", "align_q_to_p", "align_p_to_q"))
+                  + "; шаг книг "
+                  + ", ".join(
+                      f"{n.split('_')[-1]}="
+                      f"{step_report['book_relative_step'][n]:.3e}"
+                      for n in groups["books"])
+                  + "; согласие "
+                  f"{100 * step_report['after_step']['agree1_top1']:.2f}%/"
+                  f"{100 * step_report['after_step']['agree2_top1']:.2f}%, "
+                  f"мягкая ppl Q "
+                  f"{step_report['after_step']['soft_ppl_q1']:.1f}/"
+                  f"{step_report['after_step']['soft_ppl_q2']:.1f}")
+        collect_components[0] = False
         bad_mass = sorted(n_ for n_, v_ in grad_mass.items()
                           if not (np.isfinite(v_) and v_ > 0.0))
         if bad_mass:
@@ -1847,6 +2070,8 @@ def main():
         print(f"  веса после пробы восстановлены побитово ({st_back}), "
               f"замороженное {sha_back}")
 
+
+    probe_diagnostics = probe_report if a.smoke else None
     forecast = None
     t_start = time.time()
     order = list(parts["train"])
@@ -1916,8 +2141,11 @@ def main():
         val = evaluate(parts["val_sel"], f"эпоха {epoch}")
         history.append(dict(epoch=epoch, train_loss=train_mean.get("loss"),
                             train_parts=train_mean,
+                            val_a1_pol_rms=val["rms_a1_pol"],
                             val_a2_pol_rms=val["rms_a2_pol"],
-                            val_frac_worse=val["frac_worse"], val=val))
+                            val_frac_worse_q1=val["frac_worse_q1"],
+                            val_frac_worse_q2=val["frac_worse_q2"],
+                            val=val))
         snapshots[epoch] = {k: v.detach().clone()
                             for k, v in model.state_dict().items()
                             if k in set(info["names"])}
@@ -1926,135 +2154,82 @@ def main():
               f"val_sel RMS a2_pol {val['rms_a2_pol']:.6f}, замороженное "
               f"не двигалось")
 
-    best_epoch, best = select_epoch(history)
-    with torch.no_grad():
-        own = dict(model.state_dict())
-        for k_, v_ in snapshots[best_epoch].items():
-            own[k_].copy_(v_)
-    print(f"\n  выбрана эпоха {best_epoch} по val_sel RMS a2_pol "
-          f"({best['val_a2_pol_rms']:.6f}), доля ухудшений "
-          f"{best['val_frac_worse']:.3f}")
-    sel_sha = k14c.state_sha({k_: model.state_dict()[k_].detach().float()
-                              .cpu().numpy() for k_ in info["names"]})
+    # --- ДВА УРОВНЯ — ДВА КАНДИДАТА, ДВА СНАПШОТА ------------------------
+    # Уровень 1 исполняется за 18 слоёв, уровень 2 за 24. Это РАЗНЫЕ
+    # рабочие точки, и выбирать эпоху по одной, а объявлять кандидатом
+    # другую, нельзя: лучшая эпоха для q1 просто терялась.
+    best_level = {}
+    for lv in (1, 2):
+        ep_, row_ = select_epoch(history, level=lv)
+        best_level[lv] = (ep_, row_)
+        print(f"\n  уровень q{lv} ({LEVEL_LAYERS[lv]} слоёв): выбрана "
+              f"эпоха {ep_} по val_sel RMS a{lv}_pol "
+              f"({row_[f'val_a{lv}_pol_rms']:.6f}), доля ухудшений "
+              f"{row_[f'val_frac_worse_q{lv}']:.3f}")
 
-    # --- ПЕРЕОЦЕНКА ВОССТАНОВЛЕННЫХ ВЕСОВ --------------------------------
-    # Раньше веса восстанавливались и сразу сохранялись: что сохранённый
-    # чекпойнт воспроизводит ту строку истории, по которой его выбрали, не
-    # проверялось ничем. Ошибка в восстановлении выглядела бы как
-    # результат.
-    check_frozen("после восстановления")
-    collect_topk[0] = int(a.topk_oracle_batches)
-    confirm = evaluate(parts["val_sel"], f"переоценка эпохи {best_epoch}",
-                       keep_rows=True)
-    collect_topk[0] = 0
-    # ПОБИТОВЫЙ ОТПЕЧАТОК СНИМАЕТСЯ ПОСЛЕ ИТОГОВОЙ ОЦЕНКИ. Раньше он шёл
-    # до неё, и мутация замороженного буфера внутри самой оценки — то есть
-    # внутри прохода, по которому принимается решение, — оставалась
-    # непроверенной. Полных хеширований по-прежнему два.
-    check_frozen("после итоговой оценки", content=True)
-    for name_, got_, want_ in (("RMS a2_pol", confirm["rms_a2_pol"],
-                                best["val_a2_pol_rms"]),
-                               ("доля ухудшений", confirm["frac_worse"],
-                                best["val_frac_worse"])):
-        scale_ = max(abs(float(want_)), 1e-12)
-        if abs(float(got_) - float(want_)) / scale_ > 1e-6:
-            raise SystemExit(
-                f"переоценка эпохи {best_epoch} не воспроизвела историю: "
-                f"{name_} {got_!r} против {want_!r}. Восстановленный "
-                f"чекпойнт — не тот, по которому принято решение")
-    print(f"  переоценка воспроизвела строку эпохи {best_epoch}")
+    confirm_level, sel_sha_level, confirm_cache = {}, {}, {}
+    for lv in (1, 2):
+        ep_, row_ = best_level[lv]
+        with torch.no_grad():
+            own = dict(model.state_dict())
+            for k_, v_ in snapshots[ep_].items():
+                own[k_].copy_(v_)
+        sel_sha_level[lv] = k14c.state_sha(
+            {k_: model.state_dict()[k_].detach().float().cpu().numpy()
+             for k_ in info["names"]})
+        if ep_ in confirm_cache:
+            # ОДНА И ТА ЖЕ ЭПОХА — один проход, а не два одинаковых.
+            confirm_level[lv] = confirm_cache[ep_]
+            print(f"  переоценка q{lv}: эпоха {ep_} уже переоценена")
+        else:
+            check_frozen(f"после восстановления q{lv}")
+            collect_topk[0] = int(a.topk_oracle_batches)
+            conf = evaluate(parts["val_sel"],
+                            f"переоценка q{lv}, эпоха {ep_}", keep_rows=True)
+            collect_topk[0] = 0
+            # ПОБИТОВЫЙ ОТПЕЧАТОК — ПОСЛЕ оценки: мутация замороженного
+            # внутри прохода, по которому принимается решение, иначе
+            # осталась бы непроверенной.
+            check_frozen(f"после итоговой оценки q{lv}", content=True)
+            confirm_cache[ep_] = conf
+            confirm_level[lv] = conf
+        conf = confirm_level[lv]
+        for name_, got_, want_ in (
+                (f"RMS a{lv}_pol", conf[f"rms_a{lv}_pol"],
+                 row_[f"val_a{lv}_pol_rms"]),
+                ("доля ухудшений", conf[f"frac_worse_q{lv}"],
+                 row_[f"val_frac_worse_q{lv}"])):
+            scale_ = max(abs(float(want_)), 1e-12)
+            if abs(float(got_) - float(want_)) / scale_ > 1e-6:
+                raise SystemExit(
+                    f"переоценка q{lv}, эпоха {ep_}, не воспроизвела "
+                    f"историю: {name_} {got_!r} против {want_!r}. "
+                    f"Восстановленный чекпойнт — не тот, по которому "
+                    f"принято решение")
+        print(f"  переоценка q{lv} воспроизвела строку эпохи {ep_}")
+    # Совместимость печати и артефакта: «основной» — исполняемый путь q2.
+    best_epoch, best = best_level[2]
+    confirm = confirm_level[2]
+    sel_sha = sel_sha_level[2]
 
-    # --- ГЕЙТЫ ПРИЁМКИ: СХЛОПЫВАНИЕ И ОПОРА ДЕКОДЕРА ---------------------
-    # Эти числа печатались и раньше, но ничего не решали. Теперь они —
-    # условия, и они записаны до того, как получены.
+    # --- ГЕЙТЫ ПРИЁМКИ: ПО КАЖДОМУ УРОВНЮ НЕЗАВИСИМО --------------------
+    # Уровень 1 вообще не зависит от уровня 2: его логиты считаются до него.
+    # Поэтому схлопнувшаяся или случайная книга 2 НЕ ИМЕЕТ ПРАВА блокировать
+    # исправный q1, который к тому же дешевле на шесть слоёв. Пороги
+    # зафиксированы до полного прогона (часть из них выбрана после смоука —
+    # это отмечено в `thresholds_origin`).
     COLLAPSE_MAX_SHARE, COLLAPSE_MIN_PPL = 0.98, 2.0
     ACTION_RANGE_FACTOR = 1.5
-    NO_REGRESSION_FACTOR = 1.01
-    # ВО СКОЛЬКО РАЗ СОГЛАСИЕ ПО ВЕРХНЕМУ КОДУ ОБЯЗАНО ПРЕВОСХОДИТЬ
-    # СЛУЧАЙНОЕ. Это проверка «связь не разорвана», а не «связь полезна»;
-    # полезность мерит роллаут.
+    ACTION_CLIP_BOUND = 1.5
     ALIGN_AGREE_FACTOR = 5.0
-    gates = {}
-    # ТЕХНИЧЕСКАЯ ПРИГОДНОСТЬ К РОЛЛАУТУ, А НЕ ПОЛЬЗА. Условия записаны в
-    # плане до данных; они не доказывают, что уточнение помогает — это
-    # мерит §53, — но без них код возврата 0 ничего не означал бы.
-    gates["no_regression"] = dict(
-        rms_a2_pol=float(confirm["rms_a2_pol"]),
-        rms_a0=float(confirm["rms_a0"]),
-        limit=float(NO_REGRESSION_FACTOR * confirm["rms_a0"]),
-        rule=f"RMS(a2_pol) <= {NO_REGRESSION_FACTOR} * RMS(a0)",
-        # КАТЕГОРИЯ candidate, А НЕ БЛОКЕР. Случай «q1 лучше черновика, q2
-        # хуже» — это результат про второй уровень, а не поломка: раньше он
-        # давал код 3 и фразу «выводов делать нельзя», что стирало заранее
-        # оговорённый двухуровневый исход.
-        category="candidate",
-        passed=bool(confirm["rms_a2_pol"]
-                    <= NO_REGRESSION_FACTOR * confirm["rms_a0"]))
-    best_path = min(float(confirm["rms_a1_pol"]), float(confirm["rms_a2_pol"]))
-    gates["any_improvement"] = dict(
-        rms_a1_pol=float(confirm["rms_a1_pol"]),
-        rms_a2_pol=float(confirm["rms_a2_pol"]),
-        rms_a0=float(confirm["rms_a0"]),
-        rule="min(RMS(a1_pol), RMS(a2_pol)) < RMS(a0)",
-        # ЭТО НЕ ТЕХНИЧЕСКИЙ ОТКАЗ. Если ни один путь не лучше черновика,
-        # артефакт исправен, а ответ эксперимента отрицательный. Разные
-        # категории, разные коды возврата.
-        category="candidate",
-        passed=bool(best_path < float(confirm["rms_a0"])))
-    # ЭТАЛОН ДИАПАЗОНА — ПО ВСЕМУ НАБОРУ, А НЕ ПО ОЦЕНОЧНОЙ ЧАСТИ. Сначала
-    # здесь стоял поканальный максимум истинных действий на тех же строках,
-    # и на smoke из 16 строк канал 4 имел максимум 0.106 при собственном
-    # масштабе канала 0.4+: гейт срабатывал на отклонении 0.3 по абсолютной
-    # величине. `max_act_q` — это max(|q01|, |q99|) по всему набору, та же
-    # величина, которой взвешивается метрика.
-    scale_ref = np.maximum(np.asarray(max_act_q[:7], np.float64), 1e-12)
-    ratios = np.asarray(confirm["act_absmax"]) / scale_ref
-    worst_ch = int(np.argmax(ratios))
-    gates["action_range"] = dict(
-        act_absmax=confirm["act_absmax"],
-        dataset_scale=[float(x) for x in scale_ref],
-        eval_true_absmax=confirm["true_absmax"],
-        worst_channel=worst_ch,
-        worst_ratio=float(ratios[worst_ch]),
-        rule=(f"|a2_pol| <= {ACTION_RANGE_FACTOR} * max(|q01|,|q99|) "
-              f"по всему набору, поканально"),
-        category="rollout_blocker",
-        passed=bool(bool((ratios <= ACTION_RANGE_FACTOR).all())))
-    # НЕ КРОСС-ЭНТРОПИЯ, А СОГЛАСИЕ ПО ВЕРХНЕМУ КОДУ. Кросс-энтропия Q->P
-    # при почти равномерном Q равна среднему -log p_k и велика для любой
-    # уверенной политики, читает та токенизатор или нет: на smoke она
-    # давала 15.4 при log V = 7.62, то есть гейт срабатывал на резкости P,
-    # а не на разрыве. Согласие по верхнему коду и ранг от масштаба логитов
-    # не зависят.
-    log_v_ = float(confirm["log_vocab"])
     chance = 1.0 / float(vocab)
-    agree_vals = [float(confirm[f"agree{lv}_top1"]) for lv in (1, 2)]
-    gates["align_not_broken"] = dict(
-        agree1_top1=agree_vals[0], agree2_top1=agree_vals[1],
-        chance=chance, factor=ALIGN_AGREE_FACTOR,
-        limit=ALIGN_AGREE_FACTOR * chance,
-        rank1_median=float(confirm["rank1_median"]),
-        rank2_median=float(confirm["rank2_median"]),
-        align1_q_to_p_exec=float(confirm["align1_q_to_p_exec"]),
-        align2_q_to_p_exec=float(confirm["align2_q_to_p_exec"]),
-        align1_p_to_q_exec=float(confirm["align1_p_to_q_exec"]),
-        align2_p_to_q_exec=float(confirm["align2_p_to_q_exec"]),
-        soft_ppl_q1=float(confirm["soft_ppl_q1"]),
-        soft_ppl_q2=float(confirm["soft_ppl_q2"]),
-        log_vocab=log_v_,
-        rule=(f"согласие argmax политики с argmin токенизатора на "
-              f"исполняемых позициях >= {ALIGN_AGREE_FACTOR} x случайного "
-              f"(1/V)"),
-        category="rollout_blocker",
-        passed=bool(all(np.isfinite(v) and v >= ALIGN_AGREE_FACTOR * chance
-                        for v in agree_vals)))
+    gates = {}
     for lv in (1, 2):
+        conf = confirm_level[lv]
+        # --- схлопывание книги этого уровня, P и Q
         for side, tag_ in (("", "pol"), ("_tok", "tok")):
-            u = confirm[f"usage_q{lv}{side}"]
+            u = conf[f"usage_q{lv}{side}"]
             bp = u["by_position"]
-            # ГЕЙТ СМОТРИТ И НА ИСПОЛНЯЕМЫЕ ПОЗИЦИИ ОТДЕЛЬНО: средняя по
-            # чанку книга может быть жива, а на первых восьми позициях —
-            # той единственной, которую робот исполняет, — мертва.
             gates[f"collapse_q{lv}_{tag_}"] = dict(
                 max_code_share=float(u["max_code_share"]),
                 perplexity=float(u["perplexity"]),
@@ -2069,46 +2244,123 @@ def main():
                     and u["perplexity"] >= COLLAPSE_MIN_PPL
                     and bp["executed_max_code_share"] <= COLLAPSE_MAX_SHARE
                     and bp["executed_min_perplexity"] >= COLLAPSE_MIN_PPL))
-    ds = confirm["decoder_support"]
-    # ПОРОГ СРАВНИТЕЛЬНЫЙ, А НЕ ВЫДУМАННЫЙ: уход латента с многообразия
-    # сумм книг не должен превышать той непредставимости, с которой
-    # декодер уже работает на истинных латентах.
-    gates["decoder_support"] = dict(
-        rel_residual_p95=float(ds["rel_residual_p95"]),
-        reference_p95=float(ds["reference_rel_residual_p95"]),
-        rel_residual_mean=float(ds["rel_residual"]),
-        reference_mean=float(ds["reference_rel_residual"]),
-        rule="p95 остатка модели <= p95 остатка кодека на истинном латенте",
-        category="rollout_blocker",
-        passed=bool(ds["rel_residual_p95"]
-                    <= ds["reference_rel_residual_p95"]))
-    failed, failed_tech, failed_cand = classify_gates(gates)
-    # ДВУХУРОВНЕВЫЙ ИСХОД ЗАПИСЫВАЕТСЯ ЯВНО. Уровень может быть кандидатом
-    # сам по себе; для q1 нужны ЕГО диапазон действий и опора декодера, а
-    # они пока считаются только для a2_pol.
-    r0_ = float(confirm["rms_a0"])
+        # --- опора декодера для латента ЭТОГО уровня
+        ds = conf[f"decoder_support_q{lv}"]
+        gates[f"decoder_support_q{lv}"] = dict(
+            scope=ds["scope"],
+            rel_residual_p95=float(ds["rel_residual_p95"]),
+            reference_p95=float(ds["reference_rel_residual_p95"]),
+            rel_residual_mean=float(ds["rel_residual"]),
+            reference_mean=float(ds["reference_rel_residual"]),
+            share_above_reference_p99=float(ds["share_above_reference_p99"]),
+            rule="p95 остатка модели <= p95 остатка кодека на истинном "
+                 "латенте",
+            category="rollout_blocker",
+            passed=bool(ds["rel_residual_p95"]
+                        <= ds["reference_rel_residual_p95"]))
+        # --- диапазон действий: ОДНИ И ТЕ ЖЕ ЕДИНИЦЫ И ОДНА И ТА ЖЕ
+        # СТАТИСТИКА. Кэш хранит действие НОРМИРОВАННЫМ (поделено на
+        # max_act_q, обрезано в [-1,1]), декодер возвращает его же. Прежний
+        # гейт делил нормированный максимум на ФИЗИЧЕСКИЙ max_act_q и
+        # поэтому отказал на смоуке ложно: 0.404/0.204 = 1.99 сравнивало
+        # разные единицы. Теперь p99 кандидата против p99 набора в тех же
+        # единицах, плюс отдельно абсолютный предел нормированной шкалы.
+        p99_cand = np.asarray(conf[f"p99_a{lv}_pol"], np.float64)
+        absmax_cand = np.asarray(conf[f"absmax_a{lv}_pol"], np.float64)
+        ratios = p99_cand / np.maximum(act_p99_dataset, 1e-12)
+        worst_ch = int(np.argmax(ratios))
+        gates[f"action_range_q{lv}"] = dict(
+            units="normalized codec units, as stored in the cache",
+            p99_candidate=[float(x) for x in p99_cand],
+            p99_dataset=[float(x) for x in act_p99_dataset],
+            absmax_candidate=[float(x) for x in absmax_cand],
+            clip_bound=ACTION_CLIP_BOUND,
+            worst_channel=worst_ch,
+            worst_ratio=float(ratios[worst_ch]),
+            rule=(f"p99|a{lv}_pol| <= {ACTION_RANGE_FACTOR} x p99|действия| "
+                  f"по набору, поканально, И max|a{lv}_pol| <= "
+                  f"{ACTION_CLIP_BOUND} в нормированной шкале"),
+            category="rollout_blocker",
+            passed=bool(bool((ratios <= ACTION_RANGE_FACTOR).all())
+                        and bool((absmax_cand <= ACTION_CLIP_BOUND).all())))
+        # --- связь книги и политики НЕ РАЗОРВАНА, величина не зависит от
+        # температуры
+        agree = float(conf[f"agree{lv}_top1"])
+        gates[f"align_not_broken_q{lv}"] = dict(
+            agree_top1=agree, chance=chance, factor=ALIGN_AGREE_FACTOR,
+            limit=ALIGN_AGREE_FACTOR * chance,
+            n_above_median=float(conf[f"n_above{lv}_median"]),
+            recall_at3=float(conf[f"recall{lv}_at3"]),
+            recall_at10=float(conf[f"recall{lv}_at10"]),
+            soft_ppl_q=float(conf[f"soft_ppl_q{lv}_median"]),
+            soft_ppl_p=float(conf[f"soft_ppl_p{lv}_median"]),
+            q_to_p_exec=float(conf[f"align{lv}_q_to_p_exec"]),
+            p_to_q_exec=float(conf[f"align{lv}_p_to_q_exec"]),
+            rule=(f"согласие argmax политики с argmin токенизатора на "
+                  f"исполняемых позициях >= {ALIGN_AGREE_FACTOR} x 1/V"),
+            category="rollout_blocker",
+            passed=bool(np.isfinite(agree)
+                        and agree >= ALIGN_AGREE_FACTOR * chance))
+        # --- уровень вообще лучше черновика. Это КАНДИДАТСКИЙ гейт:
+        # отрицательный ответ — результат, а не поломка. Он включает в себя
+        # прежний no_regression того же уровня: из a < a0 следует
+        # a <= 1.01 a0.
+        r_lv = float(conf[f"rms_a{lv}_pol"])
+        r0_lv = float(conf["rms_a0"])
+        gates[f"improves_q{lv}"] = dict(
+            rms=r_lv, rms_a0=r0_lv,
+            relative=float(r_lv / max(r0_lv, 1e-12)),
+            frac_worse=float(conf[f"frac_worse_q{lv}"]),
+            rule=f"RMS(a{lv}_pol) < RMS(a0)",
+            category="candidate",
+            passed=bool(r_lv < r0_lv))
+    failed, by_level = classify_gates(gates)
+    failed_level = {lv: by_level[lv]["failed"] for lv in (1, 2)}
+    blocked_level = {lv: by_level[lv]["blocker"] for lv in (1, 2)}
+    candidate_failed_level = {lv: by_level[lv]["candidate"] for lv in (1, 2)}
+    failed_tech = sorted(k for lv in (1, 2) for k in blocked_level[lv])
+    failed_cand = sorted(k for lv in (1, 2)
+                         for k in candidate_failed_level[lv])
+    # ДВУХУРОВНЕВЫЙ ИСХОД: ПРИГОДНОСТЬ КАЖДОГО УРОВНЯ СЧИТАЕТСЯ ПО ЕГО
+    # СОБСТВЕННЫМ ГЕЙТАМ. Прежде вердикт мог объявить кандидатом q1, а
+    # гейты при этом относились к q2 целиком — то есть случайная голова
+    # уровня 2 блокировала исправный и более дешёвый уровень 1.
     two_level = {}
-    for lv, key in (("q1", "rms_a1_pol"), ("q2", "rms_a2_pol")):
-        r_ = float(confirm[key])
-        two_level[lv] = dict(
-            rms=r_, improves=bool(r_ < r0_),
-            within_no_regression=bool(r_ <= NO_REGRESSION_FACTOR * r0_))
-    if two_level["q2"]["improves"] and two_level["q2"][
-            "within_no_regression"]:
+    for lv in (1, 2):
+        conf = confirm_level[lv]
+        ep_, _row = best_level[lv]
+        two_level[f"q{lv}"] = dict(
+            layers=LEVEL_LAYERS[lv],
+            epoch=ep_,
+            rms=float(conf[f"rms_a{lv}_pol"]),
+            rms_a0=float(conf["rms_a0"]),
+            rms_tokenizer=float(conf[f"rms_a{lv}_tok"]),
+            improves=bool(conf[f"rms_a{lv}_pol"] < conf["rms_a0"]),
+            failed=sorted(failed_level[lv]),
+            failed_rollout_blocker=sorted(blocked_level[lv]),
+            failed_candidate=sorted(candidate_failed_level[lv]),
+            eligible=bool(not failed_level[lv]),
+            state_sha1=sel_sha_level[lv])
+    if two_level["q2"]["eligible"]:
         candidate_level = "q2"
-    elif two_level["q1"]["improves"] and two_level["q1"][
-            "within_no_regression"]:
+    elif two_level["q1"]["eligible"]:
         candidate_level = "q1"
     else:
         candidate_level = "none"
     two_level["candidate_level"] = candidate_level
     two_level["note"] = (
-        "диапазон действий и опора декодера измерены только для a2_pol; "
-        "для роллаута кандидата q1 нужны его собственные")
-    print(f"  двухуровневый исход: кандидат {candidate_level} "
-          f"(q1 RMS {two_level['q1']['rms']:.6f}, q2 "
-          f"{two_level['q2']['rms']:.6f}, черновик {r0_:.6f})")
-    accepted = None if a.smoke else not failed
+        "уровень 1 исполняется за 18 слоёв, уровень 2 за 24; гейты каждого "
+        "уровня считаны по ЕГО путям и ЕГО латенту, и уровень 1 не зависит "
+        "от состояния книги 2")
+    for lv in (1, 2):
+        d_ = two_level[f"q{lv}"]
+        print(f"  уровень q{lv} ({d_['layers']} слоёв, эпоха {d_['epoch']}): "
+              f"RMS {d_['rms']:.6f} против черновика {d_['rms_a0']:.6f}, "
+              f"книга {d_['rms_tokenizer']:.6f}; "
+              + ("ПРИГОДЕН" if d_["eligible"]
+                 else "не пригоден: " + ", ".join(d_["failed"])))
+    print(f"  кандидат: {candidate_level}")
+    accepted = None if a.smoke else candidate_level != "none"
     print("  гейты приёмки: " + ("все пройдены" if not failed
                                  else "НЕ ПРОЙДЕНЫ " + ", ".join(failed)))
     for k, v in sorted(gates.items()):
@@ -2151,14 +2403,32 @@ def main():
                        "испорченный артефакт: провенанс, инварианты и "
                        "конечность останавливают прогон раньше. НЕ "
                        "доказывает поведенческой пользы: её мерит роллаут",
-        gate_categories=dict(EXPECTED_GATES),
+        gate_categories={k: dict(category=c, level=lv)
+                         for k, (c, lv) in EXPECTED_GATES.items()},
         acceptance_thresholds=dict(
             collapse_max_code_share=COLLAPSE_MAX_SHARE,
             collapse_min_perplexity=COLLAPSE_MIN_PPL,
             action_range_factor=ACTION_RANGE_FACTOR,
-            no_regression_factor=NO_REGRESSION_FACTOR,
+            action_clip_bound=ACTION_CLIP_BOUND,
             align_agreement_factor=ALIGN_AGREE_FACTOR),
+        thresholds_origin=(
+            "до смоука: collapse (0.98 / 2.0), сравнительное правило опоры "
+            "декодера, правило выбора эпохи. ПОСЛЕ СМОУКА и зафиксировано "
+            "до полного прогона: целевая мягкая perplexity 20, множитель "
+            "согласия 5x, множитель диапазона 1.5 и предел нормированной "
+            "шкалы 1.5, замена кросс-энтропийного гейта на согласие по "
+            "верхнему коду"),
         confirm=confirm,
+        confirm_q1=confirm_level[1], confirm_q2=confirm_level[2],
+        selected_epoch_q1=best_level[1][0],
+        selected_epoch_q2=best_level[2][0],
+        selected_state_sha1_q1=sel_sha_level[1],
+        selected_state_sha1_q2=sel_sha_level[2],
+        states={f"q{lv}": {k_: snapshots[best_level[lv][0]][k_]
+                           .detach().cpu()
+                           for k_ in info["names"]} for lv in (1, 2)},
+        level_layers=dict(LEVEL_LAYERS),
+        probe_diagnostics=probe_diagnostics,
         decode_batched=bool(decode_batched[0]),
         decode_batched_gap=float(decode_batched[1]),
         codec=codec_fp, code_version=code_version,
@@ -2203,17 +2473,26 @@ def main():
     # прочтёт роллаут, и веса сверяются побитово: молчаливо испорченный
     # чекпойнт иначе обнаружился бы только в следующем эксперименте.
     back = torch.load(out_path, map_location="cpu", weights_only=False)
-    if set(back["state"]) != set(payload["state"]):
-        raise SystemExit("после чтения набор весов другой")
-    for k_, v_ in payload["state"].items():
-        if not torch.equal(back["state"][k_], v_):
-            raise SystemExit(f"после чтения {k_} изменился")
-    back_sha = k14c.state_sha({k_: v_.float().numpy()
-                               for k_, v_ in back["state"].items()})
-    if back_sha != sel_sha:
-        raise SystemExit(f"отпечаток после чтения {back_sha} против "
-                         f"{sel_sha}")
-    print(f"  сохранено: {out_path} (обратное чтение сошлось, {sel_sha})")
+    checked = []
+    for tag, saved, want_sha in (
+            ("state", payload["state"], sel_sha),
+            ("states.q1", payload["states"]["q1"], sel_sha_level[1]),
+            ("states.q2", payload["states"]["q2"], sel_sha_level[2])):
+        got = back["state"] if tag == "state" else back["states"][
+            tag.split(".")[1]]
+        if set(got) != set(saved):
+            raise SystemExit(f"после чтения набор весов {tag} другой")
+        for k_, v_ in saved.items():
+            if not torch.equal(got[k_], v_):
+                raise SystemExit(f"после чтения {tag}.{k_} изменился")
+        back_sha = k14c.state_sha({k_: v_.float().numpy()
+                                   for k_, v_ in got.items()})
+        if back_sha != want_sha:
+            raise SystemExit(f"отпечаток {tag} после чтения {back_sha} "
+                             f"против {want_sha}")
+        checked.append(f"{tag}={back_sha}")
+    print(f"  сохранено: {out_path} (обратное чтение сошлось: "
+          + ", ".join(checked) + ")")
     if a.summary:
         light = {k: v for k, v in payload.items()
                  if k not in ("state", "confirm")}
@@ -2230,10 +2509,19 @@ def main():
         print("  РЕЖИМ SMOKE: данные урезаны, решения не принимаются, "
               "голова непригодна")
         return 0
-    if failed_tech:
+    # КОД ВОЗВРАТА ПО ПРИГОДНОСТИ УРОВНЕЙ, А НЕ ПО ОБЩЕМУ СПИСКУ ОТКАЗОВ.
+    # Пригодный q1 при сломанном q2 — успех, а не отказ: это рабочая точка
+    # на 18 слоях.
+    if candidate_level != "none":
+        if failed:
+            print(f"  КАНДИДАТ {candidate_level} ПРИГОДЕН; у другого уровня "
+                  f"отказы: {', '.join(failed)}")
+        return 0
+    if all(blocked_level[lv] for lv in (1, 2)):
         suspect = [k for k in failed_tech
-                   if k in ("decoder_support", "align_not_broken")]
-        print("  РОЛЛАУТ ЗАБЛОКИРОВАН: " + ", ".join(failed_tech)
+                   if k.startswith(("decoder_support", "align_not_broken"))]
+        print("  РОЛЛАУТ ЗАБЛОКИРОВАН НА ОБОИХ УРОВНЯХ: "
+              + ", ".join(failed_tech)
               + ". Чекпойнт сохранён с accepted=false. Это результат "
                 "обучения, а не испорченный артефакт: провенанс, инварианты "
                 "и конечность проверены и прошли."
@@ -2242,13 +2530,10 @@ def main():
                  f"экстраполяцией декодера или чтением наугад."
                  if suspect else ""))
         return 3
-    if failed_cand:
-        print("  РОЛЛАУТ ВОЗМОЖЕН ТЕХНИЧЕСКИ, НО КАНДИДАТА НЕТ: "
-              + ", ".join(failed_cand)
-              + f". Это ОТРИЦАТЕЛЬНЫЙ РЕЗУЛЬТАТ: уровень-кандидат "
-                f"{candidate_level}")
-        return 4
-    return 0
+    print("  ТЕХНИЧЕСКИ ИСПРАВНО, НО НИ ОДИН УРОВЕНЬ НЕ ЛУЧШЕ ЧЕРНОВИКА: "
+          + ", ".join(failed_cand or failed)
+          + ". Это ОТРИЦАТЕЛЬНЫЙ РЕЗУЛЬТАТ эксперимента")
+    return 4
 
 
 if __name__ == "__main__":
