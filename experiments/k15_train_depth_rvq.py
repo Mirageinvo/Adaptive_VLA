@@ -1745,10 +1745,32 @@ def main():
             # разделяются и позиционный оракул потребовал бы k^T вариантов
             # либо жадного обхода с k*T декодами на батч.
             oracle = {}
-            for lv, base_, book_, probs_ in (
-                    (1, z0, c1, paths["q1_pol_probs"]),
-                    (2, z0 + hard_c1, c2, paths["q2_pol_probs"])):
+            for lv, base_, book_, probs_, lat_model in (
+                    (1, z0, c1, paths["q1_pol_probs"], z0 + c1_pol),
+                    (2, z0 + hard_c1, c2, paths["q2_pol_probs"],
+                     out["cumulative_latents"][2])):
                 idx_k = probs_.topk(max(TOPK_ORACLE), dim=-1).indices
+                # ТОЧНОЕ ПРОВЕРЯЕТСЯ ТОЧНО, ДРОЖАЩЕЕ — ИЗМЕРЯЕТСЯ.
+                # Обязаны совпадать ИНДЕКС ранга 1 с кодом, который модель
+                # исполнила, и собранный латент — побитово. Разница в RMS
+                # после этого может остаться только от самого декодера: он
+                # уже измерен как неинвариантный к составу батча на 4e-06,
+                # и падать из-за этого нельзя.
+                codes_lv = out["pred_codes"][lv]
+                mism = int((idx_k[..., 0] != codes_lv).sum())
+                if mism:
+                    raise SystemExit(
+                        f"уровень {lv}: верхний код по вероятностям "
+                        f"расходится с исполненным кодом модели в {mism} "
+                        f"позициях. Оракул ранга 1 относился бы не к тому "
+                        f"пути")
+                lat_rank1 = base_ + book_[idx_k[..., 0]]
+                if not torch.equal(lat_rank1, lat_model):
+                    gap_ = float((lat_rank1 - lat_model).abs().max())
+                    raise SystemExit(
+                        f"уровень {lv}: латент ранга 1 не равен побитово "
+                        f"латенту исполняемого пути (max {gap_:.3e}): путь "
+                        f"собран двумя разными способами")
                 errs = []
                 for j in range(max(TOPK_ORACLE)):
                     rows_j, _m_j = weighted_row_error(
@@ -2066,16 +2088,26 @@ def main():
                     frac[f"frac{k_}_level{lv_}"] = (
                         float((base_ - v_) / span_) if abs(span_) > 1e-12
                         else None)
-            # ИНВАРИАНТ: путь ранга 1 — это и есть жёсткий выбор политики.
+            # ИНДЕКСЫ И ЛАТЕНТЫ УЖЕ СВЕРЕНЫ ПОБИТОВО В run_batch. Здесь
+            # остаётся РАЗНИЦА ОТ ДЕКОДЕРА: один и тот же латент,
+            # продекодированный в разных вызовах, даёт слегка разные
+            # действия — тот же эффект, что измеренная неинвариантность к
+            # составу батча. Величина записывается; предел широкий и ловит
+            # только настоящую ошибку области.
+            decoder_jitter = {}
             for lv_ in (1, 2):
                 got_ = rms_k[f"rankpath1_level{lv_}"]
                 want_ = rms_k[f"ref_a{lv_}_pol"]
-                if abs(got_ - want_) / max(want_, 1e-12) > 1e-6:
+                rel_ = abs(got_ - want_) / max(want_, 1e-12)
+                decoder_jitter[f"level{lv_}"] = dict(
+                    rankpath1=got_, hard_path=want_, rel_gap=float(rel_))
+                if rel_ > 1e-3:
                     raise SystemExit(
-                        f"rankpath1_level{lv_} = {got_!r}, а жёсткий путь "
-                        f"a{lv_}_pol на том же поднаборе = {want_!r}: "
-                        f"оракул считается не на тех строках или не по той "
-                        f"величине")
+                        f"rankpath1_level{lv_} = {got_!r} против жёсткого "
+                        f"пути {want_!r} на том же поднаборе: относительно "
+                        f"{rel_:.2e}. Индексы и латенты сверены побитово, "
+                        f"значит такой разрыв объясняется не декодером, а "
+                        f"областью подсчёта")
             res["topk_oracle"] = dict(
                 rms_k, fraction_of_tokenizer_gap=frac,
                 tokenizer_gap=tok_gap,
@@ -2083,6 +2115,7 @@ def main():
                 rows_sha1=hashlib.sha1(
                     np.ascontiguousarray(ids).tobytes()).hexdigest()[:12],
                 kind="rank_path_oracle",
+                decoder_jitter=decoder_jitter,
                 definition=("траектория j берёт j-й по вероятности код на "
                             "каждой позиции чанка; по строке выбирается "
                             "лучший номер ранга. НЕ «лучший код среди "
@@ -2101,7 +2134,9 @@ def main():
             print(f"      на том же поднаборе: a0 {ora['ref_a0']:.6f}, "
                   f"книга {ora['ref_a1_tok']:.6f}/{ora['ref_a2_tok']:.6f}, "
                   f"жёсткий {ora['ref_a1_pol']:.6f}/"
-                  f"{ora['ref_a2_pol']:.6f}")
+                  f"{ora['ref_a2_pol']:.6f}; дрожание декодера "
+                  f"{ora['decoder_jitter']['level1']['rel_gap']:.2e}/"
+                  f"{ora['decoder_jitter']['level2']['rel_gap']:.2e}")
             frac_ = ora["fraction_of_tokenizer_gap"]
             print("      доля разрыва до токенизатора — " + "; ".join(
                 f"уровень {lv_}: " + ", ".join(
@@ -2294,7 +2329,9 @@ def main():
         print(f"  tau токенизатора задана вручную: {fixed}")
 
     history = []
-    val0 = evaluate(parts["val_sel"], "эпоха 0, без обучения")
+    # ОДИН БАТЧ ОРАКУЛА УЖЕ НА ЭПОХЕ 0: его побитовые проверки индексов и
+    # латентов должны сработать в первые минуты, а не после трёх эпох.
+    val0 = evaluate(parts["val_sel"], "эпоха 0, без обучения", topk_budget=1)
     history.append(dict(epoch=0, train_loss=None,
                         val_a1_pol_rms=val0["rms_a1_pol"],
                         val_a2_pol_rms=val0["rms_a2_pol"],
