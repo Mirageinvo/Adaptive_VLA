@@ -1217,6 +1217,17 @@ def main():
     offs = np.asarray(d["pos_offset"])[:N].astype(np.int64)
     tsk = np.asarray(d["task"])[:N]
     E = np.load(f"{a.cache}.codebooks.npy")
+    # НОРМЫ СТРОК КНИГ ПО УРОВНЯМ. В остаточном квантователе нормы должны
+    # падать с уровнем. Если нет — отношение |c2|/|z0| = 3.5, увиденное в
+    # смоуке, объясняется самой книгой, а не головой.
+    _norms = np.linalg.norm(np.asarray(E, np.float64), axis=-1)
+    book_norms = {f"level{i}": dict(
+        mean=float(_norms[i].mean()), median=float(np.median(_norms[i])),
+        p95=float(np.percentile(_norms[i], 95)),
+        max=float(_norms[i].max())) for i in range(_norms.shape[0])}
+    print("  нормы строк книг кодека: " + "; ".join(
+        f"{k}: медиана {v['median']:.4f}, среднее {v['mean']:.4f}, "
+        f"макс {v['max']:.4f}" for k, v in book_norms.items()))
     IMG = np.load(os.path.join(os.path.dirname(src),
                                cmeta["images_file"]), mmap_mode="r")
     ds_repo, ds_rev = k11b.dataset_source(meta)
@@ -1581,6 +1592,31 @@ def main():
             **acts)
         total, lparts, rows, means = build_losses(
             paths, action, weights_gate, torch, tok, vocab=vocab)
+        if not train:
+            # ОЖИДАЕМАЯ ПОПРАВКА ВМЕСТО ЖЁСТКОГО ВЫБОРА. Оракул верхних
+            # кодов показал, что ранжирование политики информативно
+            # (top-3 берёт 48 % доступного выигрыша, top-10 — 68 %), а её
+            # argmax — только 13 %. Значит провал сосредоточен в самом
+            # обязательстве выбрать один код. Ожидаемый эмбеддинг под P —
+            # прямая альтернатива, и она стоит один декод на батч.
+            # ДИАГНОСТИКА, НЕ ПУТЬ ВЫВОДА: в потерю не входит.
+            with torch.no_grad():
+                soft1 = paths["q1_pol_probs"].float() @ c1.float()
+                soft2 = paths["q2_pol_probs"].float() @ c2.float()
+                _r1s, m1s = weighted_row_error(
+                    decode_fp32(z0.float() + soft1), action, weights_gate,
+                    torch)
+                _r2s, m2s = weighted_row_error(
+                    decode_fp32(z0.float() + hard_c1.float() + soft2),
+                    action, weights_gate, torch)
+                soft_stat = dict(
+                    a1_soft=float(m1s), a2_soft=float(m2s),
+                    soft1_norm_ratio=float(
+                        (soft1.norm(dim=-1)
+                         / z0.float().norm(dim=-1).clamp_min(1e-12)).mean()),
+                    soft2_norm_ratio=float(
+                        (soft2.norm(dim=-1)
+                         / z0.float().norm(dim=-1).clamp_min(1e-12)).mean()))
         with torch.no_grad():
             # В ОБУЧЕНИИ НИ ОДНОГО float(): каждый такой вызов — ожидание
             # GPU. Числа отдаются тензорами, вызывающий складывает их на
@@ -1671,7 +1707,7 @@ def main():
                     row_a1_tok=rows["a1_tok"].detach().cpu().numpy(),
                     row_a2_tok=rows["a2_tok"].detach().cpu().numpy(),
                     latent=out["cumulative_latents"][2].detach(),
-                    latent_true=z_e.detach(),
+                    latent_true=z_e.detach(), **soft_stat,
                     q0_logits_sha=hashlib.sha1(np.ascontiguousarray(
                         out["logits"][0].detach().float().cpu().numpy()
                     ).tobytes()).hexdigest()[:12])
@@ -1758,7 +1794,8 @@ def main():
         model.eval()
         acc = {k: 0.0 for k in PATHS5}
         acc.update(a2_pol_eq=0.0, frac_worse_q1=0.0, frac_worse_q2=0.0,
-                   d_latent_q1=0.0, d_latent_q2=0.0)
+                   d_latent_q1=0.0, d_latent_q2=0.0, a1_soft=0.0,
+                   a2_soft=0.0, soft1_norm_ratio=0.0, soft2_norm_ratio=0.0)
         n_rows = 0
         dmax = {"d_action_q1": 0.0, "d_action_q2": 0.0}
         absmax = {"act_absmax": None, "true_absmax": None}
@@ -1785,6 +1822,9 @@ def main():
                 acc["a2_pol_eq"] += stat["a2_pol_equal_weights"] * w
                 acc["frac_worse_q1"] += stat["frac_worse_q1"] * w
                 acc["frac_worse_q2"] += stat["frac_worse_q2"] * w
+                for k_ in ("a1_soft", "a2_soft", "soft1_norm_ratio",
+                           "soft2_norm_ratio"):
+                    acc[k_] += stat[k_] * w
                 acc["d_latent_q1"] += stat["d_latent_q1"] * w
                 acc["d_latent_q2"] += stat["d_latent_q2"] * w
                 # МАКСИМУМЫ АГРЕГИРУЮТСЯ МАКСИМУМОМ, А НЕ СРЕДНИМ. Они
@@ -1871,6 +1911,8 @@ def main():
             res[f"absmax_{k_}"] = [float(x) for x in flat.max(axis=0)]
         for k in PATHS5:
             res[f"rms_{k}"] = float(np.sqrt(res[k]))
+        for k in ("a1_soft", "a2_soft"):
+            res[f"rms_{k}"] = float(np.sqrt(res[k]))
         for name, key in (("usage_q1", "q1_pol"), ("usage_q2", "q2_pol"),
                           ("usage_q1_tok", "q1_tok"),
                           ("usage_q2_tok", "q2_tok")):
@@ -1932,10 +1974,25 @@ def main():
         res["rows"] = n_rows
         if oracle_n:
             # RMS, А НЕ MSE: сравнимо с остальными путями.
+            rms_k = {k_: float(np.sqrt(v_ / oracle_n))
+                     for k_, v_ in oracle_acc.items()}
+            # ДОЛЯ ВЗЯТОГО ВЫИГРЫША: (a0 - top_k) / (a0 - argmin). Именно
+            # она отвечает на вопрос, дельта-функция выигрыш или нет.
+            capture = {}
+            for lv_ in (1, 2):
+                base_ = res["rms_a0"]
+                best_ = res[f"rms_a{lv_}_tok"]
+                span_ = base_ - best_
+                for k_ in TOPK_ORACLE:
+                    v_ = rms_k[f"topk{k_}_level{lv_}"]
+                    capture[f"capture{k_}_level{lv_}"] = float(
+                        (base_ - v_) / span_) if abs(span_) > 1e-12 else None
             res["topk_oracle"] = dict(
-                {k_: float(np.sqrt(v_ / oracle_n))
-                 for k_, v_ in oracle_acc.items()},
+                rms_k, capture=capture,
                 batches=oracle_n,
+                available_gain={f"level{lv_}": float(res["rms_a0"]
+                                                     - res[f"rms_a{lv_}_tok"])
+                                for lv_ in (1, 2)},
                 scope=f"первые {oracle_n} батчей части, диагностика")
             line = "; ".join(
                 f"уровень {lv}: " + ", ".join(
@@ -1943,6 +2000,15 @@ def main():
                     for k_ in TOPK_ORACLE)
                 for lv in (1, 2))
             print(f"      оракул верхних кодов ({oracle_n} батчей) — {line}")
+            cap = res["topk_oracle"]["capture"]
+            print("      взято доступного выигрыша — " + "; ".join(
+                f"уровень {lv_}: " + ", ".join(
+                    f"top{k_} "
+                    + (f"{100 * cap[f'capture{k_}_level{lv_}']:.0f}%"
+                       if cap[f"capture{k_}_level{lv_}"] is not None
+                       else "н/д")
+                    for k_ in TOPK_ORACLE)
+                for lv_ in (1, 2)))
         if keep_rows:
             res["rows_by_path"] = {
                 k: np.concatenate([r[k] for r in rows_keep]) for k in PATHS5}
@@ -1966,6 +2032,12 @@ def main():
               f"{100 * res['recall2_at3']:.1f}%, recall@10 "
               f"{100 * res['recall1_at10']:.1f}%/"
               f"{100 * res['recall2_at10']:.1f}%")
+        print(f"      ожидаемая поправка вместо жёсткой: a1_soft "
+              f"{res['rms_a1_soft']:.6f}, a2_soft {res['rms_a2_soft']:.6f} "
+              f"(жёсткие {res['rms_a1_pol']:.6f}/{res['rms_a2_pol']:.6f}, "
+              f"книга {res['rms_a1_tok']:.6f}/{res['rms_a2_tok']:.6f}); "
+              f"|soft|/|z0| {res['soft1_norm_ratio']:.4f}/"
+              f"{res['soft2_norm_ratio']:.4f}")
         print(f"      поправка: |c1|/|z0| {res['d_latent_q1']:.4f}, "
               f"|c2|/|z0| {res['d_latent_q2']:.4f}; max|a1-a0| "
               f"{res['d_action_q1']:.5f}, max|a2-a1| "
@@ -2722,6 +2794,7 @@ def main():
         decode_batched=bool(decode_batched[0]),
         decode_batched_gap=float(decode_batched[1]),
         codec=codec_fp, code_version=code_version,
+        codec_book_norms=book_norms,
         collapse_thresholds=dict(max_code_share=COLLAPSE_MAX_SHARE,
                                  min_perplexity=COLLAPSE_MIN_PPL),
         trainable_names=info["names"], selected_epoch=best_epoch,
