@@ -1460,7 +1460,7 @@ def main():
     tau_tok = {1: 1.0, 2: 1.0}
     tau_report = {}
     collect_dist = [False]
-    collect_topk = [0]
+    collect_topk = [False]
     collect_components = [False]
     q0_can_dev = torch.as_tensor(np.asarray(q0_can), device=dev)
     pending_q0 = [None]
@@ -1593,30 +1593,44 @@ def main():
         total, lparts, rows, means = build_losses(
             paths, action, weights_gate, torch, tok, vocab=vocab)
         if not train:
-            # ОЖИДАЕМАЯ ПОПРАВКА ВМЕСТО ЖЁСТКОГО ВЫБОРА. Оракул верхних
-            # кодов показал, что ранжирование политики информативно
-            # (top-3 берёт 48 % доступного выигрыша, top-10 — 68 %), а её
-            # argmax — только 13 %. Значит провал сосредоточен в самом
-            # обязательстве выбрать один код. Ожидаемый эмбеддинг под P —
-            # прямая альтернатива, и она стоит один декод на батч.
-            # ДИАГНОСТИКА, НЕ ПУТЬ ВЫВОДА: в потерю не входит.
+            # ДЕКОДИРОВАНИЕ СРЕДНЕГО ЭМБЕДДИНГА, А НЕ ОЖИДАЕМОЕ ДЕЙСТВИЕ.
+            # Считается D(z0 + E_P[C]), а НЕ E_P[D(z0 + C)]: декодер
+            # нелинейный, и это разные объекты. Имя `decode_mean_embedding`
+            # говорит именно то, что считается.
+            # ЗАЧЕМ. Оракул по номеру ранга показал, что ранжирование
+            # политики информативно, а её argmax берёт малую долю разрыва.
+            # Значит стоит проверить отказ от обязательства выбрать один
+            # код. ДИАГНОСТИКА, в потерю не входит и гейтом не является.
             with torch.no_grad():
                 soft1 = paths["q1_pol_probs"].float() @ c1.float()
                 soft2 = paths["q2_pol_probs"].float() @ c2.float()
-                _r1s, m1s = weighted_row_error(
-                    decode_fp32(z0.float() + soft1), action, weights_gate,
-                    torch)
-                _r2s, m2s = weighted_row_error(
-                    decode_fp32(z0.float() + hard_c1.float() + soft2),
-                    action, weights_gate, torch)
+                lat1s = z0.float() + soft1
+                lat2s = z0.float() + hard_c1.float() + soft2
+                act1s = decode_fp32(lat1s)
+                act2s = decode_fp32(lat2s)
+                _r1s, m1s = weighted_row_error(act1s, action, weights_gate,
+                                               torch)
+                _r2s, m2s = weighted_row_error(act2s, action, weights_gate,
+                                               torch)
+                z0n = z0.float().norm(dim=-1).clamp_min(1e-12)
                 soft_stat = dict(
                     a1_soft=float(m1s), a2_soft=float(m2s),
-                    soft1_norm_ratio=float(
-                        (soft1.norm(dim=-1)
-                         / z0.float().norm(dim=-1).clamp_min(1e-12)).mean()),
-                    soft2_norm_ratio=float(
-                        (soft2.norm(dim=-1)
-                         / z0.float().norm(dim=-1).clamp_min(1e-12)).mean()))
+                    soft1_norm_ratio=float((soft1.norm(dim=-1) / z0n).mean()),
+                    soft2_norm_ratio=float((soft2.norm(dim=-1) / z0n).mean()),
+                    # МАКСИМУМ ПОПРАВКИ: отличает уточнение от no-op,
+                    # схлопнувшегося почти в ноль.
+                    d_action_soft1=float((act1s - acts["a0"]).abs().max()),
+                    d_action_soft2=float((act2s - acts["a1_pol"]).abs().max()),
+                    abs_a1_soft=act1s[:, :H_EXEC].abs().reshape(-1, 7)
+                    .cpu().numpy(),
+                    latent1_soft=lat1s.detach())
+                # КОНЕЧНОСТЬ ПРОВЕРЯЕТСЯ И ДЛЯ МЯГКИХ ДЕЙСТВИЙ: общий
+                # счётчик покрывал только пять жёстких путей.
+                bad_soft = ((~torch.isfinite(act1s)).sum()
+                            + (~torch.isfinite(act2s)).sum())
+                pending_bad_action[0] = (
+                    bad_soft if pending_bad_action[0] is None
+                    else pending_bad_action[0] + bad_soft)
         with torch.no_grad():
             # В ОБУЧЕНИИ НИ ОДНОГО float(): каждый такой вызов — ожидание
             # GPU. Числа отдаются тензорами, вызывающий складывает их на
@@ -1708,11 +1722,28 @@ def main():
                     row_a2_tok=rows["a2_tok"].detach().cpu().numpy(),
                     latent=out["cumulative_latents"][2].detach(),
                     latent_true=z_e.detach(), **soft_stat,
+                    # НОРМЫ ВЫБРАННЫХ СТРОК, А НЕ ВСЕЙ КНИГИ, И ПОСТРОЧНО.
+                    # Отношение |c2|/|z0| — среднее дробей, оно взлетает от
+                    # малых |z0|; медианы самих норм отвечают на вопрос
+                    # прямо. Отдельно для выбора политики и токенизатора.
+                    **{f"norm_{nm}_rows": t_.float().norm(dim=-1)
+                       .reshape(-1).cpu().numpy()
+                       for nm, t_ in (("z0", z0), ("c1_pol", c1_pol),
+                                      ("c2_pol", c2_pol),
+                                      ("c1_tok", c1_tok),
+                                      ("c2_tok", c2_tok))},
                     q0_logits_sha=hashlib.sha1(np.ascontiguousarray(
                         out["logits"][0].detach().float().cpu().numpy()
                     ).tobytes()).hexdigest()[:12])
-        if not train and collect_topk[0] > 0:
-            collect_topk[0] -= 1
+        if not train and collect_topk[0]:
+            # ЭТО ОРАКУЛ ПО НОМЕРУ РАНГА, А НЕ «ЛУЧШИЙ КОД СРЕДИ TOP-K».
+            # Траектория j берёт j-й по вероятности код НА КАЖДОЙ позиции
+            # чанка, а затем по строке выбирается лучший НОМЕР РАНГА. Смесь
+            # вида «top-1 на первой позиции, top-2 на второй» не
+            # рассматривается, и это не лень: декодер глобальный по чанку,
+            # 16 латентных токенов дают 20 шагов, поэтому позиции не
+            # разделяются и позиционный оракул потребовал бы k^T вариантов
+            # либо жадного обхода с k*T декодами на батч.
             oracle = {}
             for lv, base_, book_, probs_ in (
                     (1, z0, c1, paths["q1_pol_probs"]),
@@ -1726,9 +1757,17 @@ def main():
                     errs.append(rows_j)
                 stacked = torch.stack(errs, 0)
                 for k_ in TOPK_ORACLE:
-                    oracle[f"topk{k_}_level{lv}"] = float(
+                    oracle[f"rankpath{k_}_level{lv}"] = float(
                         stacked[:k_].min(0).values.mean())
+            # ОПОРНЫЕ ВЕЛИЧИНЫ СЧИТАЮТСЯ НА ЭТИХ ЖЕ СТРОКАХ. Прежде
+            # знаменатель брался по ВСЕЙ val_sel, а оракул — по первым 32
+            # батчам: в смоуке области совпадали, в полном прогоне доли
+            # стали бы арифметически несопоставимыми.
+            for nm in ("a0", "a1_tok", "a2_tok", "a1_pol", "a2_pol"):
+                oracle[f"ref_{nm}"] = float(means[nm])
+            oracle["rows"] = int(len(sel))
             stat["topk_oracle"] = oracle
+            stat["topk_rows"] = np.asarray(sel, np.int64)
         if not train and collect_dist[0]:
             # РАССТОЯНИЯ ДЛЯ КАЛИБРОВКИ ВОССТАНАВЛИВАЮТСЯ ИЗ ЛОГИТОВ:
             # logits = -d / tau, tau > 0, поэтому второй раз считать
@@ -1784,7 +1823,7 @@ def main():
                 pair["policy_to_tokenizer"])
         return res
 
-    def evaluate(batch_list, tag, keep_rows=False):
+    def evaluate(batch_list, tag, keep_rows=False, topk_budget=0):
         """Жёсткий вывод на части: та же величина, что и в отборе эпохи.
 
         ВСЕ ПЯТЬ ПУТЕЙ АГРЕГИРУЮТСЯ. Прежде считались все пять, а в
@@ -1797,7 +1836,8 @@ def main():
                    d_latent_q1=0.0, d_latent_q2=0.0, a1_soft=0.0,
                    a2_soft=0.0, soft1_norm_ratio=0.0, soft2_norm_ratio=0.0)
         n_rows = 0
-        dmax = {"d_action_q1": 0.0, "d_action_q2": 0.0}
+        dmax = {"d_action_q1": 0.0, "d_action_q2": 0.0,
+                "d_action_soft1": 0.0, "d_action_soft2": 0.0}
         absmax = {"act_absmax": None, "true_absmax": None}
         align_acc = {f"align{lv}_{d}{suf}": 0.0
                      for lv in (1, 2) for d in ("q_to_p", "p_to_q")
@@ -1808,13 +1848,28 @@ def main():
         pooled = {f"soft_ppl_{s}{lv}": [] for s in ("q", "p")
                   for lv in (1, 2)}
         pooled.update({f"n_above{lv}": [] for lv in (1, 2)})
-        abs_pool = {"a1_pol": [], "a2_pol": []}
+        pooled.update({f"norm_{nm}": [] for nm in
+                       ("z0", "c1_pol", "c2_pol", "c1_tok", "c2_tok")})
+        abs_pool = {"a1_pol": [], "a2_pol": [], "a1_soft": []}
         codes = {k: [] for k in ("q1_pol", "q2_pol", "q1_tok", "q2_tok")}
-        sup_rows, sup1_rows, ref_rows, rows_keep = [], [], [], []
-        oracle_acc, oracle_n = {}, 0
+        sup_rows, sup1_rows, sup_soft_rows = [], [], []
+        ref_rows, rows_keep = [], []
+        oracle_acc, oracle_n, oracle_rows = {}, 0, 0
+        oracle_row_ids = []
+        # БАТЧИ ДЛЯ ОРАКУЛА БЕРУТСЯ РАЗРЕЖЕННО ПО ВСЕЙ ЧАСТИ, А НЕ ПЕРВЫЕ
+        # ПОДРЯД: первые 32 батча плана — это первые эпизоды, а не выборка
+        # из части. Правило детерминированное.
+        want_oracle = set()
+        if topk_budget:
+            n_take = min(int(topk_budget), len(batch_list))
+            if n_take > 0:
+                want_oracle = set(int(x) for x in np.unique(
+                    np.linspace(0, len(batch_list) - 1, n_take).astype(int)))
         with torch.no_grad():
-            for po, sel in batch_list:
+            for b_idx, (po, sel) in enumerate(batch_list):
+                collect_topk[0] = b_idx in want_oracle
                 _l, stat = run_batch(po, sel, False)
+                collect_topk[0] = False
                 w = float(stat["rows"])
                 n_rows += stat["rows"]
                 for k in PATHS5:
@@ -1830,7 +1885,7 @@ def main():
                 # МАКСИМУМЫ АГРЕГИРУЮТСЯ МАКСИМУМОМ, А НЕ СРЕДНИМ. Они
                 # считались в run_batch и терялись в evaluate — ровно та же
                 # ошибка, из-за которой пропадали два из пяти путей.
-                for k_ in ("d_action_q1", "d_action_q2"):
+                for k_ in dmax:
                     dmax[k_] = max(dmax[k_], float(stat[k_]))
                 for k_ in absmax:
                     absmax[k_] = np.asarray(stat[k_], np.float64) \
@@ -1880,14 +1935,27 @@ def main():
                     stat["latent1"], codec, torch, quantizers,
                     nearest_code, code_contribution)
                 sup1_rows.append(rel1)
+                # ОПОРА ДЕКОДЕРА ДЛЯ МЯГКОГО ЛАТЕНТА: средний эмбеддинг
+                # заведомо не строка книги, и насколько он уходит с
+                # многообразия — главный вопрос к этому пути.
+                _ss, rel_s = decoder_support(
+                    stat["latent1_soft"], codec, torch, quantizers,
+                    nearest_code, code_contribution)
+                sup_soft_rows.append(rel_s)
                 _s2, rel2 = decoder_support(
                     stat["latent_true"], codec, torch, quantizers,
                     nearest_code, code_contribution)
                 ref_rows.append(rel2)
                 if "topk_oracle" in stat:
                     oracle_n += 1
+                    w_o = float(stat["topk_oracle"]["rows"])
+                    oracle_rows += int(w_o)
+                    oracle_row_ids.append(stat["topk_rows"])
                     for k_, v_ in stat["topk_oracle"].items():
-                        oracle_acc[k_] = oracle_acc.get(k_, 0.0) + v_
+                        if k_ == "rows":
+                            continue
+                        # ВЗВЕШЕННАЯ СУММА MSE, А НЕ СРЕДНЕЕ СРЕДНИХ
+                        oracle_acc[k_] = oracle_acc.get(k_, 0.0) + v_ * w_o
                 if keep_rows:
                     rows_keep.append({k: stat[f"row_{k}"] for k in PATHS5})
         n = max(n_rows, 1)
@@ -1902,6 +1970,7 @@ def main():
             flat = np.concatenate(chunks)
             res[f"{k_}_median"] = float(np.median(flat))
             res[f"{k_}_mean"] = float(np.mean(flat))
+            res[f"{k_}_p95"] = float(np.percentile(flat, 95.0))
         # ПОКАНАЛЬНЫЙ p99 КАНДИДАТА — ТА ЖЕ СТАТИСТИКА, ЧТО У ЭТАЛОНА, И В
         # ТЕХ ЖЕ НОРМИРОВАННЫХ ЕДИНИЦАХ.
         for k_, chunks in abs_pool.items():
@@ -1965,6 +2034,9 @@ def main():
                           "истинном латенте того же батча")
 
         res["decoder_support_q1"] = support_block(sup1_all, "path a1_pol")
+        res["decoder_support_q1_soft"] = support_block(
+            torch.cat(sup_soft_rows) if sup_soft_rows else None,
+            "path a1_soft (decode of mean embedding)")
         res["decoder_support_q2"] = support_block(sup_all, "path a2_pol")
         # ОПОРА ДЕКОДЕРА СЧИТАЕТСЯ ДЛЯ ОБОИХ ИСПОЛНЯЕМЫХ ПУТЕЙ: кандидатом
         # может оказаться уровень 1, и тогда гейт обязан относиться к его
@@ -1973,39 +2045,69 @@ def main():
         res["decoder_support"] = res["decoder_support_q2"]
         res["rows"] = n_rows
         if oracle_n:
-            # RMS, А НЕ MSE: сравнимо с остальными путями.
-            rms_k = {k_: float(np.sqrt(v_ / oracle_n))
+            # RMS НА ПОДНАБОРЕ ОРАКУЛА, из его же взвешенных сумм.
+            den = max(oracle_rows, 1)
+            rms_k = {k_: float(np.sqrt(v_ / den))
                      for k_, v_ in oracle_acc.items()}
-            # ДОЛЯ ВЗЯТОГО ВЫИГРЫША: (a0 - top_k) / (a0 - argmin). Именно
-            # она отвечает на вопрос, дельта-функция выигрыш или нет.
-            capture = {}
+            ids = np.unique(np.concatenate(oracle_row_ids))
+            # ДОЛЯ РАЗРЫВА ДО ТОКЕНИЗАТОРА: (a0 - rankpath_k) / (a0 -
+            # a_tok), И ЗНАМЕНАТЕЛЬ ТОЖЕ С ЭТОГО ПОДНАБОРА. Имя говорит,
+            # что это именно разрыв до выбора ТОКЕНИЗАТОРА (argmin
+            # латентного расстояния), а не до минимума ошибки действия по
+            # всей книге.
+            tok_gap, frac = {}, {}
             for lv_ in (1, 2):
-                base_ = res["rms_a0"]
-                best_ = res[f"rms_a{lv_}_tok"]
+                base_ = rms_k["ref_a0"]
+                best_ = rms_k[f"ref_a{lv_}_tok"]
                 span_ = base_ - best_
+                tok_gap[f"level{lv_}"] = float(span_)
                 for k_ in TOPK_ORACLE:
-                    v_ = rms_k[f"topk{k_}_level{lv_}"]
-                    capture[f"capture{k_}_level{lv_}"] = float(
-                        (base_ - v_) / span_) if abs(span_) > 1e-12 else None
+                    v_ = rms_k[f"rankpath{k_}_level{lv_}"]
+                    frac[f"frac{k_}_level{lv_}"] = (
+                        float((base_ - v_) / span_) if abs(span_) > 1e-12
+                        else None)
+            # ИНВАРИАНТ: путь ранга 1 — это и есть жёсткий выбор политики.
+            for lv_ in (1, 2):
+                got_ = rms_k[f"rankpath1_level{lv_}"]
+                want_ = rms_k[f"ref_a{lv_}_pol"]
+                if abs(got_ - want_) / max(want_, 1e-12) > 1e-6:
+                    raise SystemExit(
+                        f"rankpath1_level{lv_} = {got_!r}, а жёсткий путь "
+                        f"a{lv_}_pol на том же поднаборе = {want_!r}: "
+                        f"оракул считается не на тех строках или не по той "
+                        f"величине")
             res["topk_oracle"] = dict(
-                rms_k, capture=capture,
-                batches=oracle_n,
-                available_gain={f"level{lv_}": float(res["rms_a0"]
-                                                     - res[f"rms_a{lv_}_tok"])
-                                for lv_ in (1, 2)},
-                scope=f"первые {oracle_n} батчей части, диагностика")
+                rms_k, fraction_of_tokenizer_gap=frac,
+                tokenizer_gap=tok_gap,
+                batches=oracle_n, rows=int(oracle_rows),
+                rows_sha1=hashlib.sha1(
+                    np.ascontiguousarray(ids).tobytes()).hexdigest()[:12],
+                kind="rank_path_oracle",
+                definition=("траектория j берёт j-й по вероятности код на "
+                            "каждой позиции чанка; по строке выбирается "
+                            "лучший номер ранга. НЕ «лучший код среди "
+                            "top-k»: смеси рангов по позициям не "
+                            "рассматриваются, декодер глобальный по чанку"),
+                scope=("разреженно по части, опорные величины с ЭТОГО же "
+                       "поднабора"))
+            ora = res["topk_oracle"]
             line = "; ".join(
                 f"уровень {lv}: " + ", ".join(
-                    f"top{k_} {res['topk_oracle'][f'topk{k_}_level{lv}']:.6f}"
+                    f"ранг{k_} {ora[f'rankpath{k_}_level{lv}']:.6f}"
                     for k_ in TOPK_ORACLE)
                 for lv in (1, 2))
-            print(f"      оракул верхних кодов ({oracle_n} батчей) — {line}")
-            cap = res["topk_oracle"]["capture"]
-            print("      взято доступного выигрыша — " + "; ".join(
+            print(f"      оракул по номеру ранга ({oracle_n} батчей, "
+                  f"{ora['rows']} строк, {ora['rows_sha1']}) — {line}")
+            print(f"      на том же поднаборе: a0 {ora['ref_a0']:.6f}, "
+                  f"книга {ora['ref_a1_tok']:.6f}/{ora['ref_a2_tok']:.6f}, "
+                  f"жёсткий {ora['ref_a1_pol']:.6f}/"
+                  f"{ora['ref_a2_pol']:.6f}")
+            frac_ = ora["fraction_of_tokenizer_gap"]
+            print("      доля разрыва до токенизатора — " + "; ".join(
                 f"уровень {lv_}: " + ", ".join(
-                    f"top{k_} "
-                    + (f"{100 * cap[f'capture{k_}_level{lv_}']:.0f}%"
-                       if cap[f"capture{k_}_level{lv_}"] is not None
+                    f"ранг{k_} "
+                    + (f"{100 * frac_[f'frac{k_}_level{lv_}']:.0f}%"
+                       if frac_[f"frac{k_}_level{lv_}"] is not None
                        else "н/д")
                     for k_ in TOPK_ORACLE)
                 for lv_ in (1, 2)))
@@ -2032,12 +2134,29 @@ def main():
               f"{100 * res['recall2_at3']:.1f}%, recall@10 "
               f"{100 * res['recall1_at10']:.1f}%/"
               f"{100 * res['recall2_at10']:.1f}%")
-        print(f"      ожидаемая поправка вместо жёсткой: a1_soft "
+        print(f"      декод среднего эмбеддинга: a1_soft "
               f"{res['rms_a1_soft']:.6f}, a2_soft {res['rms_a2_soft']:.6f} "
               f"(жёсткие {res['rms_a1_pol']:.6f}/{res['rms_a2_pol']:.6f}, "
               f"книга {res['rms_a1_tok']:.6f}/{res['rms_a2_tok']:.6f}); "
               f"|soft|/|z0| {res['soft1_norm_ratio']:.4f}/"
-              f"{res['soft2_norm_ratio']:.4f}")
+              f"{res['soft2_norm_ratio']:.4f}; max|a1_soft-a0| "
+              f"{res['d_action_soft1']:.5f}")
+        ds_s = res.get("decoder_support_q1_soft")
+        if ds_s:
+            print(f"      опора декодера a1_soft: остаток "
+                  f"{ds_s['rel_residual']:.4f}, p95 "
+                  f"{ds_s['rel_residual_p95']:.4f}, p99 "
+                  f"{ds_s['rel_residual_p99']:.4f} при эталоне p95 "
+                  f"{ds_s['reference_rel_residual_p95']:.4f}; p99 диапазона "
+                  + ", ".join(f"{x:.3f}" for x in res["p99_a1_soft"]))
+        print("      нормы на данных (медиана, p95): |z0| "
+              f"{res['norm_z0_median']:.4f}/{res['norm_z0_p95']:.4f}; "
+              f"|c1_P| {res['norm_c1_pol_median']:.4f}/"
+              f"{res['norm_c1_pol_p95']:.4f}; |c2_P| "
+              f"{res['norm_c2_pol_median']:.4f}/"
+              f"{res['norm_c2_pol_p95']:.4f}; |c1_Q| "
+              f"{res['norm_c1_tok_median']:.4f}; |c2_Q| "
+              f"{res['norm_c2_tok_median']:.4f}")
         print(f"      поправка: |c1|/|z0| {res['d_latent_q1']:.4f}, "
               f"|c2|/|z0| {res['d_latent_q2']:.4f}; max|a1-a0| "
               f"{res['d_action_q1']:.5f}, max|a2-a1| "
@@ -2180,7 +2299,8 @@ def main():
                         val_a1_pol_rms=val0["rms_a1_pol"],
                         val_a2_pol_rms=val0["rms_a2_pol"],
                         val_frac_worse_q1=val0["frac_worse_q1"],
-                        val_frac_worse_q2=val0["frac_worse_q2"], val=val0))
+                        val_frac_worse_q2=val0["frac_worse_q2"],
+                        val_a1_soft_rms=val0["rms_a1_soft"], val=val0))
     snapshots = {0: {k: v.detach().clone()
                      for k, v in model.state_dict().items()
                      if k in set(info["names"])}}
@@ -2389,7 +2509,7 @@ def main():
                             val_a2_pol_rms=val["rms_a2_pol"],
                             val_frac_worse_q1=val["frac_worse_q1"],
                             val_frac_worse_q2=val["frac_worse_q2"],
-                            val=val))
+                            val_a1_soft_rms=val["rms_a1_soft"], val=val))
         snapshots[epoch] = {k: v.detach().clone()
                             for k, v in model.state_dict().items()
                             if k in set(info["names"])}
@@ -2427,10 +2547,9 @@ def main():
             print(f"  переоценка q{lv}: эпоха {ep_} уже переоценена")
         else:
             check_frozen(f"после восстановления q{lv}")
-            collect_topk[0] = int(a.topk_oracle_batches)
             conf = evaluate(parts["val_sel"],
-                            f"переоценка q{lv}, эпоха {ep_}", keep_rows=True)
-            collect_topk[0] = 0
+                            f"переоценка q{lv}, эпоха {ep_}", keep_rows=True,
+                            topk_budget=int(a.topk_oracle_batches))
             # ПОБИТОВЫЙ ОТПЕЧАТОК — ПОСЛЕ оценки: мутация замороженного
             # внутри прохода, по которому принимается решение, иначе
             # осталась бы непроверенной.
@@ -2652,6 +2771,32 @@ def main():
                 rms_monotone and inside[1] and inside[2]),
             note="technical_valid — все блокирующие гейты уровня, "
                  "посчитанные по ЭТОМУ снапшоту")
+    # МЯГКИЙ ПУТЬ — ОТДЕЛЬНАЯ РАБОЧАЯ ТОЧКА, И ЕГО ЛУЧШАЯ ЭПОХА НЕ ТЕРЯЕТСЯ.
+    # Эпоха и сохраняемые веса выбираются по ЖЁСТКОМУ RMS, поэтому если
+    # мягкий путь окажется лучше, этот прогон его обучением не является.
+    # Снапшоты всех эпох лежат в памяти, так что сохранить ещё один стоит
+    # 24 МБ и ничего больше. Гейтов у него нет: его пригодность к роллауту
+    # не определена, и повышать его до кандидата без них нельзя.
+    soft_epoch = min(history,
+                     key=lambda r: (round(float(r["val_a1_soft_rms"]), 12),
+                                    int(r["epoch"])))
+    two_level["q1_soft"] = dict(
+        layers=LEVEL_LAYERS[1], epoch=int(soft_epoch["epoch"]),
+        rms=float(soft_epoch["val_a1_soft_rms"]),
+        rms_a0=float(confirm_level[1]["rms_a0"]),
+        definition="D(z0 + E_P[C1]) — декод среднего эмбеддинга",
+        improves=bool(soft_epoch["val_a1_soft_rms"]
+                      < confirm_level[1]["rms_a0"]),
+        eligible=None,
+        note=("гейты для этого пути не определены: ни диапазон, ни опора "
+              "декодера для него не оформлены в гейт, поэтому он не "
+              "участвует в выборе кандидата. Снапшот сохранён, чтобы его "
+              "лучшая эпоха не пропала"))
+    print(f"  мягкий путь q1_soft: лучшая эпоха "
+          f"{two_level['q1_soft']['epoch']}, RMS "
+          f"{two_level['q1_soft']['rms']:.6f} против черновика "
+          f"{two_level['q1_soft']['rms_a0']:.6f}; кандидатом НЕ считается")
+
     same_snapshot = best_level[1][0] == best_level[2][0]
     two_level["same_snapshot"] = bool(same_snapshot)
     two_level["sequential_refinement"] = two_level[
@@ -2786,9 +2931,15 @@ def main():
         selected_epoch_q2=best_level[2][0],
         selected_state_sha1_q1=sel_sha_level[1],
         selected_state_sha1_q2=sel_sha_level[2],
-        states={f"q{lv}": {k_: snapshots[best_level[lv][0]][k_]
-                           .detach().cpu()
-                           for k_ in info["names"]} for lv in (1, 2)},
+        states=dict(
+            {f"q{lv}": {k_: snapshots[best_level[lv][0]][k_].detach().cpu()
+                        for k_ in info["names"]} for lv in (1, 2)},
+            q1_soft={k_: snapshots[int(soft_epoch["epoch"])][k_]
+                     .detach().cpu() for k_ in info["names"]}),
+        selected_epoch_q1_soft=int(soft_epoch["epoch"]),
+        selected_state_sha1_q1_soft=k14c.state_sha(
+            {k_: snapshots[int(soft_epoch["epoch"])][k_].detach().float()
+             .cpu().numpy() for k_ in info["names"]}),
         level_layers=dict(LEVEL_LAYERS),
         probe_diagnostics=probe_diagnostics,
         decode_batched=bool(decode_batched[0]),
@@ -2858,6 +3009,8 @@ def main():
     for tag, saved, want_sha in (
             ("state", payload["state"], sel_sha),
             ("states.q1", payload["states"]["q1"], sel_sha_level[1]),
+            ("states.q1_soft", payload["states"]["q1_soft"],
+             payload["selected_state_sha1_q1_soft"]),
             ("states.q2", payload["states"]["q2"], sel_sha_level[2])):
         got = back["state"] if tag == "state" else back["states"][
             tag.split(".")[1]]
