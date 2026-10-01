@@ -194,28 +194,57 @@ def hard_straight_through(logits: torch.Tensor, book: torch.Tensor,
     return embedding, indices, probs
 
 
+ALIGNMENT_SMOOTHING = 0.01
+
+
 def bidirectional_alignment(tokenizer_logits_: torch.Tensor,
-                            policy_logits: torch.Tensor) -> dict:
+                            policy_logits: torch.Tensor,
+                            smoothing: float = ALIGNMENT_SMOOTHING) -> dict:
     """Две кросс-энтропии со stop-gradient между токенизатором и политикой.
 
     `tokenizer_to_policy` учит политику читать разбиение со стороны действия.
     `policy_to_tokenizer` — то, из-за чего это depth alignment, а не ещё один
     читатель: оно позволяет самому разбиению сдвигаться к различиям,
     представленным на назначенной глубине.
+
+    СГЛАЖИВАНИЕ ОБЯЗАТЕЛЬНО, И ВОТ ПОЧЕМУ. Обе величины — кросс-энтропии, и
+    каждая НЕОГРАНИЧЕНА сверху: когда одно распределение резкое, а другое
+    размазано по кодам вне его носителя, `-log` уходит в десятки нат.
+    Измерено на настоящих данных после калибровки температуры:
+    `policy_to_tokenizer` уровня 2 равнялась 225.6 при log V = 7.62, то есть
+    в 29.6 раза больше величины, на которую член нормируется. Градиент этого
+    члена идёт в КНИГИ, поэтому в таком виде он их и разрушил бы — а книги
+    сейчас как раз рабочая часть (путь a2_tok лучший из пяти).
+
+    Сглаживание предсказываемой стороны внутри логарифма ограничивает
+    каждый член сверху величиной log(V / eps): при eps = 0.01 это 12.23,
+    то есть 1.6 log V. Направление градиента сохраняется.
     """
     if tokenizer_logits_.shape != policy_logits.shape:
         raise ValueError(
             f"posterior shapes differ: {tokenizer_logits_.shape} and "
             f"{policy_logits.shape}")
+    eps = float(smoothing)
+    if not 0.0 <= eps < 1.0:
+        raise ValueError(f"smoothing must be in [0, 1): {eps}")
+    vocab = int(tokenizer_logits_.shape[-1])
+
+    def smoothed_log(logits: torch.Tensor) -> torch.Tensor:
+        probabilities = torch.softmax(logits.float(), dim=-1)
+        if eps == 0.0:
+            return probabilities.clamp_min(1e-30).log()
+        return ((1.0 - eps) * probabilities + eps / vocab).log()
+
     q = torch.softmax(tokenizer_logits_.float(), dim=-1)
     p = torch.softmax(policy_logits.float(), dim=-1)
-    q_to_p = -(q.detach() * torch.log_softmax(
-        policy_logits.float(), dim=-1)).sum(-1).mean()
-    p_to_q = -(p.detach() * torch.log_softmax(
-        tokenizer_logits_.float(), dim=-1)).sum(-1).mean()
+    q_to_p = -(q.detach() * smoothed_log(policy_logits)).sum(-1).mean()
+    p_to_q = -(p.detach() * smoothed_log(tokenizer_logits_)).sum(-1).mean()
+    bound = math.log(vocab / eps) if eps > 0 else float("inf")
     return {"tokenizer_to_policy": q_to_p,
             "policy_to_tokenizer": p_to_q,
-            "total": 0.5 * (q_to_p + p_to_q)}
+            "total": 0.5 * (q_to_p + p_to_q),
+            "bound": bound,
+            "smoothing": eps}
 
 
 def usage_kl_to_uniform(probabilities: torch.Tensor) -> torch.Tensor:
@@ -322,7 +351,8 @@ def selftest() -> None:
     tq = torch.randn(3, 4, 7, requires_grad=True)
     pl = torch.randn(3, 4, 7, requires_grad=True)
     al = bidirectional_alignment(tq, pl)
-    assert set(al) == {"tokenizer_to_policy", "policy_to_tokenizer", "total"}
+    assert set(al) == {"tokenizer_to_policy", "policy_to_tokenizer", "total",
+                       "bound", "smoothing"}
     al["total"].backward()
     assert tq.grad is not None and float(tq.grad.abs().sum()) > 0, \
         "направление P->Q не даёт градиента книге: это снова K-14"
@@ -449,6 +479,38 @@ def selftest() -> None:
             assert why in str(e), (bad_target, e)
         else:
             raise AssertionError(f"принята цель {bad_target}")
+
+    # --- ВЫРАВНИВАНИЕ ОГРАНИЧЕНО СВЕРХУ ----------------------------------
+    # ВОСПРОИЗВЕДЕНИЕ ПОЛОМКИ: без сглаживания член неограничен. Резкое q и
+    # размазанное p по кодам вне его носителя — ровно то, что дало 225.6 на
+    # настоящих данных.
+    V_a = 256
+    sharp = torch.full((2, 3, V_a), -40.0)
+    sharp[..., 0] = 40.0                       # почти one-hot на коде 0
+    spread = torch.zeros(2, 3, V_a)            # равномерное
+    spread[..., 0] = -60.0                     # и нулевая масса на коде 0
+    raw = bidirectional_alignment(sharp, spread, smoothing=0.0)
+    bounded = bidirectional_alignment(sharp, spread)
+    limit = math.log(V_a / ALIGNMENT_SMOOTHING)
+    assert float(raw["policy_to_tokenizer"]) > 5.0 * math.log(V_a), (
+        f"неограниченный член равен {float(raw['policy_to_tokenizer']):.1f}, "
+        f"а проверка нужна ровно про его неограниченность")
+    for key in ("tokenizer_to_policy", "policy_to_tokenizer"):
+        assert float(bounded[key]) <= limit + 1e-4, (key, float(bounded[key]))
+    assert abs(bounded["bound"] - limit) < 1e-9
+    # ГРАДИЕНТ ВСЁ ЕЩЁ ИДЁТ В ОБЕ СТОРОНЫ
+    tl = torch.randn(2, 3, V_a, requires_grad=True)
+    pl = torch.randn(2, 3, V_a, requires_grad=True)
+    bidirectional_alignment(tl, pl)["total"].backward()
+    assert tl.grad is not None and float(tl.grad.abs().sum()) > 0
+    assert pl.grad is not None and float(pl.grad.abs().sum()) > 0
+    for bad in (-0.1, 1.0, 1.5):
+        try:
+            bidirectional_alignment(sharp, spread, smoothing=bad)
+        except ValueError as e:
+            assert "smoothing" in str(e), e
+        else:
+            raise AssertionError(f"принято сглаживание {bad}")
 
     print("самопроверка depth_aligned_tokenizer пройдена")
 

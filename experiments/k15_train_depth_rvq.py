@@ -52,6 +52,11 @@ import numpy as np
 
 H_EXEC = 8            # исполняемых позиций чанка, как в K-14
 PATH_NAMES = ("a0", "a1_tok", "a1_pol", "a2_tok", "a2_pol")
+# TOP-K ОРАКУЛ: сколько выигрыша книги достаётся, если разрешить выбрать
+# лучший из k верхних кодов политики. Прямо отвечает на вопрос, который
+# поставил smoke: политика ставит верный код на медианное место 3, а
+# выигрыш при этом теряется почти весь. Диагностика, не гейт.
+TOPK_ORACLE = (1, 2, 3, 5, 10)
 # ГЕЙТ K-15a: СКОЛЬКО БАТЧЕЙ И КАКИЕ ПРИЧИННЫЕ ПРОВЕРКИ ТРЕБУЮТСЯ.
 # Требование живёт в тренере, а не берётся из проверяемого артефакта.
 GATE_MIN_BATCHES = 3
@@ -381,6 +386,8 @@ def build_losses(paths, target, weights, torch, tok, *,
     parts = dict(
         total=total, action=l_action, align=l_align, mono=l_mono,
         usage=l_usage, usage_pol_diagnostic=usage_pol, norm=norm,
+        align_bound=float(align1["bound"]),
+        align_smoothing=float(align1["smoothing"]),
         align1_q_to_p=align1["tokenizer_to_policy"],
         align1_p_to_q=align1["policy_to_tokenizer"],
         align2_q_to_p=align2["tokenizer_to_policy"],
@@ -880,6 +887,9 @@ def main():
                          "квадрат расстояния делится на D")
     ap.add_argument("--tau-target-perplexity", type=float, default=20.0,
                     help="цель калибровки; объявлена до данных")
+    ap.add_argument("--topk-oracle-batches", type=int, default=32,
+                    help="на скольких батчах итоговой переоценки считать "
+                         "оракул верхних кодов; 0 — не считать")
     ap.add_argument("--calib-batches", type=int, default=4,
                     help="канонических батчей обучения на калибровку tau")
     ap.add_argument("--tau-policy", type=float, default=1.0)
@@ -1180,6 +1190,7 @@ def main():
     tau_tok = {1: 1.0, 2: 1.0}
     tau_report = {}
     collect_dist = [False]
+    collect_topk = [0]
     q0_can_dev = torch.as_tensor(np.asarray(q0_can), device=dev)
     pending_q0 = [None]
     pending_bad_action = [None]
@@ -1387,6 +1398,24 @@ def main():
                     q0_logits_sha=hashlib.sha1(np.ascontiguousarray(
                         out["logits"][0].detach().float().cpu().numpy()
                     ).tobytes()).hexdigest()[:12])
+        if not train and collect_topk[0] > 0:
+            collect_topk[0] -= 1
+            oracle = {}
+            for lv, base_, book_, probs_ in (
+                    (1, z0, c1, paths["q1_pol_probs"]),
+                    (2, z0 + hard_c1, c2, paths["q2_pol_probs"])):
+                idx_k = probs_.topk(max(TOPK_ORACLE), dim=-1).indices
+                errs = []
+                for j in range(max(TOPK_ORACLE)):
+                    rows_j, _m_j = weighted_row_error(
+                        decode_fp32(base_ + book_[idx_k[..., j]]),
+                        action, weights_gate, torch)
+                    errs.append(rows_j)
+                stacked = torch.stack(errs, 0)
+                for k_ in TOPK_ORACLE:
+                    oracle[f"topk{k_}_level{lv}"] = float(
+                        stacked[:k_].min(0).values.mean())
+            stat["topk_oracle"] = oracle
         if not train and collect_dist[0]:
             # РАССТОЯНИЯ ДЛЯ КАЛИБРОВКИ ВОССТАНАВЛИВАЮТСЯ ИЗ ЛОГИТОВ:
             # logits = -d / tau, tau > 0, поэтому второй раз считать
@@ -1464,6 +1493,7 @@ def main():
                           for s in ("q", "p") for lv in (1, 2)})
         codes = {k: [] for k in ("q1_pol", "q2_pol", "q1_tok", "q2_tok")}
         sup_rows, ref_rows, rows_keep = [], [], []
+        oracle_acc, oracle_n = {}, 0
         with torch.no_grad():
             for po, sel in batch_list:
                 _l, stat = run_batch(po, sel, False)
@@ -1521,6 +1551,10 @@ def main():
                     stat["latent_true"], codec, torch, quantizers,
                     nearest_code, code_contribution)
                 ref_rows.append(rel2)
+                if "topk_oracle" in stat:
+                    oracle_n += 1
+                    for k_, v_ in stat["topk_oracle"].items():
+                        oracle_acc[k_] = oracle_acc.get(k_, 0.0) + v_
                 if keep_rows:
                     rows_keep.append({k: stat[f"row_{k}"] for k in PATHS5})
         n = max(n_rows, 1)
@@ -1580,6 +1614,19 @@ def main():
             reference="собственная ошибка квантования кодека на истинном "
                       "латенте того же батча")
         res["rows"] = n_rows
+        if oracle_n:
+            # RMS, А НЕ MSE: сравнимо с остальными путями.
+            res["topk_oracle"] = dict(
+                {k_: float(np.sqrt(v_ / oracle_n))
+                 for k_, v_ in oracle_acc.items()},
+                batches=oracle_n,
+                scope=f"первые {oracle_n} батчей части, диагностика")
+            line = "; ".join(
+                f"уровень {lv}: " + ", ".join(
+                    f"top{k_} {res['topk_oracle'][f'topk{k_}_level{lv}']:.6f}"
+                    for k_ in TOPK_ORACLE)
+                for lv in (1, 2))
+            print(f"      оракул верхних кодов ({oracle_n} батчей) — {line}")
         if keep_rows:
             res["rows_by_path"] = {
                 k: np.concatenate([r[k] for r in rows_keep]) for k in PATHS5}
@@ -1896,8 +1943,10 @@ def main():
     # проверялось ничем. Ошибка в восстановлении выглядела бы как
     # результат.
     check_frozen("после восстановления")
+    collect_topk[0] = int(a.topk_oracle_batches)
     confirm = evaluate(parts["val_sel"], f"переоценка эпохи {best_epoch}",
                        keep_rows=True)
+    collect_topk[0] = 0
     # ПОБИТОВЫЙ ОТПЕЧАТОК СНИМАЕТСЯ ПОСЛЕ ИТОГОВОЙ ОЦЕНКИ. Раньше он шёл
     # до неё, и мутация замороженного буфера внутри самой оценки — то есть
     # внутри прохода, по которому принимается решение, — оставалась
@@ -2076,6 +2125,8 @@ def main():
         tau_tokenizer=dict(tau_tok), tau_tokenizer_mode=str(a.tau_tokenizer),
         tau_target_perplexity=float(a.tau_target_perplexity),
         tau_calibration=tau_report, tau_policy=float(a.tau_policy),
+        align_smoothing=float(tok.ALIGNMENT_SMOOTHING),
+        topk_oracle_k=list(TOPK_ORACLE),
         loss_weights=dict(a1_pol=W_A1_POL, a1_tok=W_A1_TOK, a2_pol=W_A2_POL,
                           a2_tok=W_A2_TOK, align=W_ALIGN, mono=W_MONO,
                           usage=W_USAGE, eps_norm=EPS_NORM),
@@ -2128,6 +2179,11 @@ def main():
         val_confirm_evaluated=False,
         frozen_content_sha=frozen_sha0,
         frozen_invariant=frozen_inv0,
+        frozen_invariant_note="ЗНАЧЕНИЕ ЛОКАЛЬНО ДЛЯ ПРОЦЕССА: в него входят "
+                              "идентификаторы хранилищ, то есть адреса. "
+                              "Сравнивать его между прогонами нельзя — для "
+                              "этого есть frozen_content_sha, который между "
+                              "прогонами совпадает",
         frozen_elements=n_elem_frozen,
         frozen_tensors=n_frozen,
         save_load_check="state serialization round-trip: побитовое равенство "
