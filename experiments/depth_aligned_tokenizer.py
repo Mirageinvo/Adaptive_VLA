@@ -245,10 +245,18 @@ def bidirectional_alignment(tokenizer_logits_: torch.Tensor,
     vocab = int(tokenizer_logits_.shape[-1])
 
     def smoothed_log(logits: torch.Tensor) -> torch.Tensor:
-        probabilities = torch.softmax(logits.float(), dim=-1)
+        # ПРИ eps = 0 — РОВНО `log_softmax`, БЕЗ clamp_min. Прежняя версия
+        # брала здесь `softmax(...).clamp_min(1e-30).log()`, и это НЕ
+        # несглаженная кросс-энтропия: значение упиралось в -log(1e-30) =
+        # 69.08 (измеренные 225.6 такая реализация выдать не могла), а
+        # градиент по коду с вероятностью ниже 1e-30 обнулялся — то есть
+        # подавление тяжёлых несовпадений оставалось и при выключенном
+        # сглаживании. Тогда замер «P->Q почти нулевой» в смоуке говорил бы
+        # не о геометрии и не о tau, а об этом clamp.
         if eps == 0.0:
-            return probabilities.clamp_min(1e-30).log()
-        return ((1.0 - eps) * probabilities + eps / vocab).log()
+            return torch.log_softmax(logits.float(), dim=-1)
+        return ((1.0 - eps) * torch.softmax(logits.float(), dim=-1)
+                + eps / vocab).log()
 
     q = torch.softmax(tokenizer_logits_.float(), dim=-1)
     p = torch.softmax(policy_logits.float(), dim=-1)
@@ -505,6 +513,38 @@ def selftest() -> None:
     spread = torch.zeros(2, 3, V_a)            # равномерное
     spread[..., 0] = -60.0                     # и нулевая масса на коде 0
     raw = bidirectional_alignment(sharp, spread, smoothing=0.0)
+    # ПРИ eps = 0 ЭТО РОВНО log_softmax, А НЕ clamp_min(1e-30).
+    # Проверяется тремя признаками: совпадение с log_softmax, рост потери
+    # при удвоении разрыва логитов (clamp упёрся бы в 69.08) и КОНЕЧНЫЙ
+    # НЕНУЛЕВОЙ градиент по тяжело ошибочному коду.
+    q_ref = torch.softmax(sharp.float(), dim=-1)
+    want_q2p = -(q_ref * torch.log_softmax(spread.float(),
+                                           dim=-1)).sum(-1).mean()
+    assert torch.allclose(raw["tokenizer_to_policy"], want_q2p, atol=0,
+                          rtol=1e-6), (float(raw["tokenizer_to_policy"]),
+                                       float(want_q2p))
+    gap1 = torch.zeros(1, 1, V_a)
+    gap1[..., 0] = -200.0
+    gap2 = torch.zeros(1, 1, V_a)
+    gap2[..., 0] = -400.0
+    tgt0 = torch.full((1, 1, V_a), -60.0)
+    tgt0[..., 0] = 60.0
+    l1 = float(bidirectional_alignment(
+        tgt0, gap1, smoothing=0.0)["tokenizer_to_policy"])
+    l2 = float(bidirectional_alignment(
+        tgt0, gap2, smoothing=0.0)["tokenizer_to_policy"])
+    assert l2 > 1.8 * l1, (
+        f"удвоение разрыва логитов дало {l1:.1f} -> {l2:.1f}: потеря во "
+        f"что-то упирается, то есть это не log_softmax")
+    assert l1 > -math.log(1e-30), (
+        f"{l1:.2f} не превышает прежний предел clamp_min, проверка слепа")
+    z_bad = gap1.clone().requires_grad_(True)
+    g_bad = torch.autograd.grad(bidirectional_alignment(
+        tgt0, z_bad, smoothing=0.0)["tokenizer_to_policy"], z_bad)[0]
+    assert torch.isfinite(g_bad).all()
+    assert abs(float(g_bad[0, 0, 0])) > 1e-6, (
+        f"градиент по тяжело ошибочному коду равен {float(g_bad[0, 0, 0])}: "
+        f"исправляющий сигнал обнулён")
     assert float(raw["policy_to_tokenizer"]) > 5.0 * math.log(V_a), (
         f"неограниченный член равен {float(raw['policy_to_tokenizer']):.1f}, "
         f"а проверка нужна ровно про его неограниченность")
