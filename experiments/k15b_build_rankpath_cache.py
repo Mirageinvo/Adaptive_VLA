@@ -15,12 +15,25 @@
 позициям не перебираются (их k^T), коды вне соседства не рассматриваются.
 §50.2 этим не закрыт, и в метаданных кэша это записано.
 
-ВАЖНАЯ ТОНКОСТЬ, КОТОРУЮ РЕШАЕТ ТРЕНЕР, А НЕ КЭШ. Номер ранга выбирается
-по ошибке на ПЕРВЫХ H_EXEC позициях — только они исполняются и только они
-входят в метрику. Коды при этом записываются для ВСЕХ позиций чанка,
-потому что на позициях после H_EXEC ранг выбран критерием, который их не
-оценивал. Кросс-энтропию по умолчанию следует брать по исполняемым
-позициям; поле `rank_selected_on_positions` в кэше говорит об этом прямо.
+ДВЕ РАЗНЫЕ ОСИ, КОТОРЫЕ НЕЛЬЗЯ СМЕШИВАТЬ. Действие имеет 20 временных
+шагов, из которых в метрику входят первые H_EXEC = 8. Латент имеет 16
+КОДОВЫХ позиций. Соответствия «первый код — первый шаг действия» НЕТ:
+`PerceiverDecoder` смотрит на все 16 латентных токенов через
+cross-attention без каузальной маски (`decoder_add_causal_mask = False`,
+шесть слоёв), поэтому коды позиций 8-15 влияют и на первые 8 шагов.
+
+Отсюда контракт:
+
+    выбор ранга и action-член  -> первые 8 ШАГОВ ДЕЙСТВИЯ
+    кросс-энтропия читателя    -> ВСЕ 16 КОДОВЫХ ПОЗИЦИЙ
+    записанные коды            -> все 16, и это правильно
+
+Траектория ранга j подставляет j-й код во ВСЕ 16 позиций, и её малая
+ошибка на первых восьми шагах — результат совместного действия всех
+шестнадцати кодов. Поэтому учить читателя только первым восьми кодам
+значило бы выбросить часть того, чем эта ошибка получена. Поля
+`action_error_positions`, `code_target_positions` и `ce_target_positions`
+в метаданных говорят это прямо.
 
 КНИГА СВЕРЯЕТСЯ, А НЕ ПОДРАЗУМЕВАЕТСЯ. Кэш осмыслен только для той C1,
 на которой построен, поэтому пишется её отпечаток, а при несовпадении с
@@ -29,6 +42,7 @@
 """
 import argparse
 import hashlib
+import inspect
 import json
 import os
 import sys
@@ -171,8 +185,7 @@ def main():
     ap.add_argument("--topk", type=int, default=10,
                     help="сколько РАЗЛИЧНЫХ ближайших кодов проверять; "
                          "обязано совпадать с topk из probe")
-    ap.add_argument("--part", default="train",
-                    help="часть плана; цель нужна только для train")
+
     ap.add_argument("--out", default="data/k15b/rankpath_target_train.npz")
     ap.add_argument("--summary", default="reports/k15b/rankpath_cache.json")
     ap.add_argument("--report-every", type=int, default=500)
@@ -188,6 +201,18 @@ def main():
     if a.selftest:
         selftest()
         return 0
+    # ТОЛЬКО train, И ЭТО НЕ АРГУМЕНТ. `parts_full` в контексте собирается
+    # ДО удаления подтверждающей половины, поэтому аргумент `--part`
+    # позволял построить учительские цели по отложенной части. Назначение у
+    # скрипта одно, поэтому выбора здесь нет.
+    part = "train"
+    # ЦЕЛЬ ЗАВИСИТ ОТ ВЕСОВ КАНАЛОВ. При другом grip_weight получился бы
+    # другой учитель под тем же именем файла, поэтому выбора здесь нет.
+    if float(a.grip_weight) != 1.0:
+        raise SystemExit(
+            f"--grip-weight {a.grip_weight}: вес схвата входит в метрику, по "
+            f"которой выбирается ранг. Другое значение — другая цель, и её "
+            f"нельзя писать под тем же именем")
     if int(a.limit) != 0:
         raise SystemExit(
             f"--limit {a.limit}: кэш обязан покрывать ВСЮ часть, иначе у "
@@ -238,6 +263,15 @@ def main():
     if got_sha != want_sha:
         raise SystemExit(f"{a.c1}: книга внутри даёт {got_sha}, заявлено "
                          f"{want_sha}")
+    # ПРОВЕНАНС ЧЕРНОВИКА У КНИГИ И СЕЙЧАС ОБЯЗАН СОВПАДАТЬ: цель строится
+    # от q0, и книга выбиралась от того же.
+    for key in ("plan_sha1", "q0_manifest_sha1"):
+        want_q0 = (sel.get("q0_prov") or {}).get(key)
+        if want_q0 != ctx.q0_prov.get(key):
+            raise SystemExit(
+                f"{a.c1}: q0_prov.{key} = {want_q0!r}, сейчас "
+                f"{ctx.q0_prov.get(key)!r}. Книга выбрана от другого "
+                f"черновика")
     teacher_target = sel.get("teacher_target")
     if teacher_target != "action_best_rankpath":
         raise SystemExit(
@@ -270,15 +304,16 @@ def main():
             f"--topk {a.topk}, а probe выбирал цель при topk "
             f"{sel.get('topk')}: цель была бы другой")
 
-    if a.part not in ctx.parts_full:
-        raise SystemExit(f"в плане нет части {a.part!r}: "
+    if part not in ctx.parts_full:
+        raise SystemExit(f"в плане нет части {part!r}: "
                          f"{sorted(ctx.parts_full)}")
-    batches = ctx.parts_full[a.part]
+    batches = ctx.parts_full[part]
     rows, slot = build_row_index(batches)
     n_rows = int(rows.size)
     rows_sha = hashlib.sha1(
         np.ascontiguousarray(rows).tobytes()).hexdigest()[:12]
-    print(f"  часть {a.part}: {len(batches)} батчей, {n_rows} строк, "
+    print(f"  часть {part} (жёстко, без выбора): {len(batches)} батчей, "
+          f"{n_rows} строк, "
           f"отпечаток {rows_sha}")
 
     n_pos = int(np.asarray(ctx.q0_can).shape[1])
@@ -363,8 +398,11 @@ def main():
         raise SystemExit(
             f"не заполнено: кодов {int((codes < 0).sum())}, ранга "
             f"{int((ranks < 0).sum())}. Часть строк осталась без цели")
-    if not np.isfinite(err_rank).all() or not np.isfinite(err_latent).all():
-        raise SystemExit("в ошибках есть нечисловые значения")
+    for nm, arr in (("err_rankpath", err_rank), ("err_latent", err_latent),
+                    ("err_draft", err_draft)):
+        if not np.isfinite(arr).all():
+            raise SystemExit(
+                f"{nm}: {int((~np.isfinite(arr)).sum())} нечисловых значений")
     vocab = int(ctx.vocab)
     if int((codes >= vocab).sum()):
         raise SystemExit(f"есть коды вне словаря {vocab}")
@@ -384,7 +422,7 @@ def main():
     content_sha = cache_fingerprint(rows, codes, ranks)
     hist = {int(k): int(c) for k, c in zip(*np.unique(ranks,
                                                       return_counts=True))}
-    print(f"\n  на части {a.part}: черновик {rms['draft']:.6f}, латентная "
+    print(f"\n  на части {part}: черновик {rms['draft']:.6f}, латентная "
           f"цель {rms['latent']:.6f}, rank-path {rms['rankpath']:.6f} "
           f"(−{100 * (1 - rms['rankpath'] / rms['draft']):.1f} % от "
           f"черновика)")
@@ -396,17 +434,52 @@ def main():
           f"с/батч; отпечаток содержимого {content_sha}")
 
     meta = dict(
-        kind="k15b_rankpath_target", part=a.part, topk=int(a.topk),
+        kind="k15b_rankpath_target", part=part, topk=int(a.topk),
         rows=n_rows, positions=n_pos, batches=len(batches),
         rows_sha1=rows_sha, content_sha1=content_sha,
-        rank_selected_on_positions=int(H_EXEC),
-        codes_written_for_positions=n_pos,
+        action_error_positions=int(H_EXEC),
+        code_target_positions=int(n_pos),
+        ce_target_positions="all code positions",
         positions_note=(
-            "номер ранга выбран по взвешенной ошибке действия на первых "
-            f"{H_EXEC} позициях — только они исполняются и входят в "
-            f"метрику. Коды записаны для всех {n_pos} позиций, но на "
-            f"позициях после {H_EXEC} ранг выбран критерием, который их не "
-            f"оценивал: кросс-энтропию по умолчанию брать по исполняемым"),
+            f"ДВЕ РАЗНЫЕ ОСИ. Ранг выбран по взвешенной ошибке действия на "
+            f"первых {H_EXEC} ВРЕМЕННЫХ ШАГАХ — только они входят в "
+            f"метрику. Коды записаны для всех {n_pos} КОДОВЫХ позиций, и "
+            f"кросс-энтропию читателя надо брать по ВСЕМ {n_pos}: "
+            f"PerceiverDecoder смотрит на все латентные токены через "
+            f"cross-attention без каузальной маски, поэтому коды поздних "
+            f"позиций влияют и на первые шаги действия, а малая ошибка "
+            f"траектории получена совместным действием всех кодов"),
+        teacher_metric=dict(
+            action_error_positions=int(H_EXEC),
+            channel_weights=[float(x) for x in
+                             ctx.weights_gate.detach().cpu().numpy()],
+            grip_weight=float(a.grip_weight),
+            decoder_context=dict(ctx.decoder_context),
+            # ЧЕРЕЗ getattr ОТ САМОГО codec: у другого квантователя
+            # атрибута `config` может не быть, и падать на провенансе в
+            # конце двухчасового прохода нельзя.
+            decoder_add_causal_mask=bool(getattr(
+                getattr(codec, "config", None),
+                "decoder_add_causal_mask", False)),
+            decoder_n_layers=int(getattr(
+                getattr(codec, "config", None), "decoder_n_layers", -1)),
+            note="всё, что определяет, какой ранг окажется лучшим"),
+        builder_sha1=k15_context.sha12(os.path.abspath(__file__)),
+        rank_candidates_file=os.path.basename(
+            inspect.getfile(probe.rank_candidates)),
+        rank_candidates_file_sha1=k15_context.sha12(
+            inspect.getfile(probe.rank_candidates)),
+        contract_for_trainer=(
+            "тренер обязан сверить c1_sha1, topk, action_error_positions, "
+            "teacher_metric.channel_weights, teacher_metric.decoder_context, "
+            "rank_candidates_file_sha1, q0_prov и plan_sha1. Свой "
+            "builder_sha1 сверять не нужно: правка печати в построителе "
+            "цель не меняет"),
+        histogram_note=(
+            "гистограмма рангов показывает, как часто action-цель отличается "
+            "от латентного argmin и хватает ли topk. Она НЕ показывает, "
+            "насколько трудно обучить читателя: это покажут held-out "
+            "top-1/recall, action RMS и capture на val_sel"),
         not_a_full_oracle=(
             "§50.2 не закрыт: смеси рангов по позициям (k^T вариантов) не "
             "перебираются, коды вне латентного соседства не "
@@ -435,7 +508,7 @@ def main():
     save_npz(a.out, rows=rows, codes=codes, ranks=ranks,
              err_rankpath=err_rank, err_latent=err_latent,
              err_draft=err_draft,
-             meta=json.dumps(meta, ensure_ascii=False,
+             meta=json.dumps(meta, ensure_ascii=False, allow_nan=False,
                              default=k15t.json_scalar))
     print(f"  кэш сохранён: {a.out} ({content_sha}), обратное чтение сошлось")
 
@@ -445,7 +518,7 @@ def main():
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(dict(meta, cache_file=os.path.abspath(a.out),
                        archived={k: v for k, v in archived.items() if v}),
-                  fh, ensure_ascii=False, indent=1,
+                  fh, ensure_ascii=False, indent=1, allow_nan=False,
                   default=k15t.json_scalar)
     os.replace(tmp, a.summary)
     print(f"  сводка: {a.summary}")
