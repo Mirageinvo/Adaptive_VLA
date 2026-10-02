@@ -166,20 +166,27 @@ def lambda_from_norms(norm_ce, norm_action, target_ratio=LAMBDA_TARGET_RATIO):
 
 
 def collapse_gate(usage):
-    """Схлопывание книги: общее и отдельно на исполняемых позициях."""
+    """Схлопывание книги: общее и худшее по КОДОВЫМ позициям.
+
+    Позиции здесь КОДОВЫЕ, их 16, и берутся ВСЕ. Брать первые H_EXEC
+    нельзя: H_EXEC = 8 относится к шагам ДЕЙСТВИЯ, а поздние коды влияют
+    на первые действия через глобальный cross-attention, поэтому
+    схлопывание позиций 8-15 пропускать нельзя.
+    """
     bp = usage["by_position"]
     return dict(
         max_code_share=float(usage["max_code_share"]),
         perplexity=float(usage["perplexity"]),
         used_codes=int(usage["used_codes"]),
-        executed_max_code_share=bp["executed_max_code_share"],
-        executed_min_perplexity=bp["executed_min_perplexity"],
+        position_max_code_share=bp["position_max_code_share"],
+        position_min_perplexity=bp["position_min_perplexity"],
+        positions=bp["positions"],
         limit_max_share=COLLAPSE_MAX_SHARE,
         limit_min_perplexity=COLLAPSE_MIN_PPL,
         passed=bool(usage["max_code_share"] <= COLLAPSE_MAX_SHARE
                     and usage["perplexity"] >= COLLAPSE_MIN_PPL
-                    and bp["executed_max_code_share"] <= COLLAPSE_MAX_SHARE
-                    and bp["executed_min_perplexity"] >= COLLAPSE_MIN_PPL))
+                    and bp["position_max_code_share"] <= COLLAPSE_MAX_SHARE
+                    and bp["position_min_perplexity"] >= COLLAPSE_MIN_PPL))
 
 
 def range_gate(p99_candidate, p99_dataset, absmax_candidate):
@@ -325,12 +332,21 @@ def selftest():
 
     # --- ГЕЙТЫ ----------------------------------------------------------
     usage_ok = dict(max_code_share=0.1, perplexity=50.0, used_codes=300,
-                    by_position=dict(executed_max_code_share=0.2,
-                                     executed_min_perplexity=20.0))
+                    by_position=dict(positions=16,
+                                     position_max_code_share=0.2,
+                                     position_min_perplexity=20.0))
     assert collapse_gate(usage_ok)["passed"]
+    assert collapse_gate(usage_ok)["positions"] == 16
+    # СХЛОПЫВАНИЕ НА ОДНОЙ КОДОВОЙ ПОЗИЦИИ ЛОВИТСЯ, даже если в среднем
+    # книга выглядит здоровой
     usage_bad = dict(usage_ok, by_position=dict(
-        executed_max_code_share=0.99, executed_min_perplexity=20.0))
+        positions=16, position_max_code_share=0.99,
+        position_min_perplexity=20.0))
     assert not collapse_gate(usage_bad)["passed"]
+    usage_ppl = dict(usage_ok, by_position=dict(
+        positions=16, position_max_code_share=0.2,
+        position_min_perplexity=1.5))
+    assert not collapse_gate(usage_ppl)["passed"]
     assert range_gate([0.5], [1.0], [0.9])["passed"]
     assert not range_gate([0.5], [1.0], [1.6])["passed"]
     assert not range_gate([2.0], [1.0], [0.9])["passed"]
@@ -395,12 +411,15 @@ def main():
         return 0
     if a.phase != "q1_reader":
         raise SystemExit(
-            f"фаза {a.phase} не реализована. `c2_book` требует "
-            f"ДИФФЕРЕНЦИРУЕМОЙ опоры декодера: нынешняя `decoder_support` "
-            f"целиком под no_grad и градиента не даёт, а обучать книгу при "
-            f"замороженном декодере без этого ограничения — ровно та "
-            f"конфигурация, которая сломалась в K-15. `q2_reader` имеет "
-            f"смысл только после неё")
+            f"фаза {a.phase} не реализована, и порядок после P1 такой: "
+            f"(1) проверить ИСХОДНУЮ замороженную C2 относительно "
+            f"ФАКТИЧЕСКИ предсказанного q1; (2) если она содержит полезное "
+            f"уточнение и проходит опору — заморозить её и обучать "
+            f"`q2_reader`; (3) только если исходная C2 непригодна — "
+            f"рассматривать обучение книги с ЯВНЫМ ограничением опоры, для "
+            f"которого нужна дифференцируемая версия `decoder_support` "
+            f"(нынешняя целиком под no_grad). То есть `q2_reader` НЕ "
+            f"требует предварительного обучения книги")
     if int(a.limit) != 0:
         raise SystemExit("--limit не применяется: урезание задаётся --smoke")
     out_path = a.out or (f"data/k15b/{a.phase}"
@@ -507,15 +526,48 @@ def main():
         raise SystemExit(
             f"цель выбрана по {meta['action_error_positions']} шагам, "
             f"сейчас H_EXEC={H_EXEC}")
+    # КЭШ ЗАВИСИТ ОТ ДЕКОДЕРА: цель выбиралась по декодированной ошибке.
+    for key, want in (("codec", ctx.codec_fp),
+                      ("code_version", ctx.code_version),
+                      ("joint_sha1", ctx.joint_sha)):
+        if meta.get(key) != want:
+            raise SystemExit(
+                f"кэш: {key} = {meta.get(key)!r}, сейчас {want!r}. Цель "
+                f"выбиралась другим декодером")
+    # СОДЕРЖИМОЕ МАССИВОВ ПРОВЕРЯЕТСЯ, А НЕ ТОЛЬКО МЕТАДАННЫЕ. Иначе
+    # прошли бы переставленные строки при непереставленных кодах, дубли
+    # строк (присваивание сработало бы по правилу «последняя победила») и
+    # изменённые коды при прежнем content_sha1.
     rows_t = np.asarray(cache["rows"], np.int64)
     codes_t = np.asarray(cache["codes"], np.int64)
+    ranks_t = np.asarray(cache["ranks"], np.int16)
     plan_rows, _slot = cachelib.build_row_index(ctx.parts_full["train"])
     if hashlib.sha1(np.ascontiguousarray(plan_rows).tobytes()
                     ).hexdigest()[:12] != meta["rows_sha1"]:
         raise SystemExit("кэш построен по другому набору строк train")
+    if not np.array_equal(rows_t, plan_rows):
+        raise SystemExit(
+            "порядок строк в кэше не совпал с планом: коды относились бы "
+            "не к тем строкам")
+    if np.unique(rows_t).size != rows_t.size:
+        raise SystemExit("в кэше есть повторяющиеся строки")
+    if not (len(rows_t) == len(codes_t) == len(ranks_t)):
+        raise SystemExit(
+            f"длины массивов кэша расходятся: строк {len(rows_t)}, кодов "
+            f"{len(codes_t)}, рангов {len(ranks_t)}")
     n_pos = int(codes_t.shape[1])
     if int(meta["code_target_positions"]) != n_pos:
         raise SystemExit("число кодовых позиций в кэше не согласовано")
+    if codes_t.shape != (len(plan_rows), n_pos):
+        raise SystemExit(f"форма кодов {codes_t.shape}, ожидалась "
+                         f"{(len(plan_rows), n_pos)}")
+    if int((codes_t < 0).sum()) or int((codes_t >= vocab).sum()):
+        raise SystemExit(f"в кэше есть коды вне [0, {vocab})")
+    got_content = cachelib.cache_fingerprint(rows_t, codes_t, ranks_t)
+    if got_content != meta["content_sha1"]:
+        raise SystemExit(
+            f"отпечаток содержимого кэша {got_content}, в метаданных "
+            f"{meta['content_sha1']}: массивы изменены")
     target_by_row = np.full((int(ctx.N), n_pos), -1, np.int64)
     target_by_row[rows_t] = codes_t
     print(f"  цель: {rows_t.size} строк, {n_pos} кодовых позиций, "
@@ -568,14 +620,21 @@ def main():
             raise SystemExit(f"q0 разошёлся с каноническим в {bad} позициях")
         return out
 
-    def losses(po, sel, out):
-        """CE по всем кодовым позициям + action-член по исполняемым шагам."""
+    # НОРМИРОВКА ACTION-ЧЛЕНА — ОДИН ФИКСИРОВАННЫЙ СКАЛЯР, А НЕ ОШИБКА
+    # ЧЕРНОВИКА НА БАТЧЕ. Батчевая нормировка перевзвешивала батчи — малая
+    # ошибка q0 давала больший вес, — и глобальный оптимум расходился с
+    # агрегированным RMS, по которому идёт отбор. Масштаб всё равно
+    # поглощается калибровкой lambda.
+    action_scale = float(meta["rms_draft"]) ** 2
+
+    def losses(po, sel, out, table, table_name):
+        """CE по всем КОДОВЫМ позициям + action-член по шагам действия."""
         action = torch.from_numpy(
             np.asarray(ctx.ACT[sel], np.float32)).to(dev)[..., :7]
-        tgt = torch.from_numpy(target_by_row[np.asarray(sel, np.int64)]
-                               ).to(dev)
+        tgt = torch.from_numpy(table[np.asarray(sel, np.int64)]).to(dev)
         if int((tgt < 0).sum()):
-            raise SystemExit("в батче есть строки без цели в кэше")
+            raise SystemExit(
+                f"в батче есть строки без цели в таблице {table_name}")
         logits = out["logits"][1].float()
         ce = F.cross_entropy(logits.reshape(-1, vocab), tgt.reshape(-1))
         z0 = out["policy_embeddings"][0]
@@ -588,9 +647,9 @@ def main():
                 ctx.decode_fp32(z0), action, ctx.weights_gate, torch)
         # НОРМИРОВКА — ПОСТОЯННАЯ ПО ПАРАМЕТРАМ: она перевзвешивает батчи,
         # но положение минимума внутри батча не двигает.
-        norm = m_draft.detach().clamp_min(1e-6)
-        return ce, m_pol / norm, dict(
-            ce=ce, action=m_pol / norm, m_pol=m_pol, m_draft=m_draft,
+        act_term = m_pol / action_scale
+        return ce, act_term, dict(
+            ce=ce, action=act_term, m_pol=m_pol, m_draft=m_draft,
             agree=float((out["pred_codes"][1] == tgt).float().mean()))
 
     # --- КАЛИБРОВКА LAMBDA ----------------------------------------------
@@ -599,7 +658,7 @@ def main():
         n_ce, n_act = 0.0, 0.0
         for po, sel in parts["train"][:max(int(a.calib_batches), 1)]:
             out = forward(po, sel)
-            ce, act, _d = losses(po, sel, out)
+            ce, act, _d = losses(po, sel, out, target_by_row, "train")
             g_ce = torch.autograd.grad(ce, head_params, retain_graph=True,
                                        allow_unused=True)
             g_act = torch.autograd.grad(act, head_params, retain_graph=False,
@@ -613,9 +672,12 @@ def main():
         lam_report = dict(mode="auto", target_ratio=LAMBDA_TARGET_RATIO,
                           norm_ce=n_ce / nb, norm_action=n_act / nb,
                           batches=nb, lambda_action=lam)
-        print(f"  калибровка lambda: |g_CE| {n_ce / nb:.3e}, |g_action| "
-              f"{n_act / nb:.3e} -> lambda {lam:.4g} при целевом отношении "
-              f"{LAMBDA_TARGET_RATIO}")
+        print(f"  калибровка lambda по ВСЕМУ белому списку фазы "
+              f"({len(train_names)} тензоров: нормы, головы, feedback): "
+              f"|g_CE| {n_ce / nb:.3e}, |g_action| {n_act / nb:.3e} -> "
+              f"lambda {lam:.4g} при целевом НАЧАЛЬНОМ отношении "
+              f"{LAMBDA_TARGET_RATIO}. На последующих шагах отношение не "
+              f"поддерживается")
     else:
         lam = float(a.lambda_action)
         lam_report = dict(mode="fixed", lambda_action=lam)
@@ -625,10 +687,17 @@ def main():
     # Книга заморожена и q0 каноничен, поэтому цель на val фиксирована:
     # пересчитывать её каждую эпоху значило бы платить десять декодов на
     # батч за неизменный ответ.
-    print("  считаю учителя на val_sel (один раз)...")
+    # ЗДЕСЬ ЖЕ СОБИРАЮТСЯ ЦЕЛЕВЫЕ КОДЫ ДЛЯ val_sel. Кэш покрывает только
+    # train, а train и val_sel не пересекаются, поэтому без этого все
+    # val-цели равнялись бы -1 и прогон останавливался бы на первой же
+    # оценке. Дополнительных декодирований не нужно: `near`, `stack` и
+    # `best_j` в этом проходе уже есть.
+    print("  считаю учителя на val_sel (один раз) и собираю его цели...")
     t_teacher = time.time()
     acc_t = dict(draft=0.0, latent=0.0, rank=0.0)
     n_rows_val = 0
+    val_target_by_row = np.full((int(ctx.N), n_pos), -1, np.int64)
+    val_rows_seen = []
     with torch.no_grad():
         for po, sel in parts["val_sel"]:
             out = forward(po, sel)
@@ -648,6 +717,12 @@ def main():
                     ctx.weights_gate, torch)
                 errs.append(rows_j)
             stack = torch.stack(errs, 0)
+            best_j = stack.argmin(0)
+            idx_ = best_j.view(-1, 1, 1).expand(-1, near.shape[1], 1)
+            best_code = near.gather(-1, idx_).squeeze(-1)
+            rr = np.asarray(sel, np.int64)
+            val_target_by_row[rr] = best_code.cpu().numpy().astype(np.int64)
+            val_rows_seen.append(rr)
             w = float(len(sel))
             n_rows_val += len(sel)
             acc_t["rank"] += float(stack.min(0).values.mean()) * w
@@ -656,11 +731,38 @@ def main():
                 ctx.decode_fp32(z0), action, ctx.weights_gate, torch)
             acc_t["draft"] += float(m0) * w
     nv = max(n_rows_val, 1)
+    val_rows = np.concatenate(val_rows_seen)
+    if np.unique(val_rows).size != val_rows.size:
+        raise SystemExit("строки val_sel повторяются: цель зависела бы от "
+                         "порядка обхода")
+    if int((val_target_by_row[val_rows] < 0).sum()):
+        raise SystemExit("часть строк val_sel осталась без цели")
+    if int((val_target_by_row[val_rows] >= vocab).sum()):
+        raise SystemExit("в целях val_sel есть коды вне словаря")
+    print(f"  цели val_sel собраны: {val_rows.size} строк, "
+          f"{n_pos} кодовых позиций")
     teacher = {k: float(np.sqrt(v / nv)) for k, v in acc_t.items()}
     print(f"  val_sel: черновик {teacher['draft']:.6f}, латентная цель "
           f"{teacher['latent']:.6f}, учитель {teacher['rank']:.6f}; "
           f"разрыв {teacher['draft'] - teacher['rank']:.6f} "
           f"({time.time() - t_teacher:.0f} с)")
+    # ДЕШЁВЫЙ СИЛЬНЫЙ ГЕЙТ: в полном режиме учитель тут и учитель, которого
+    # probe записал в книгу, считаются на одной и той же части одной и той
+    # же замороженной книгой — значит обязаны совпасть.
+    book_teacher = book.get("teacher_rms")
+    if not a.smoke and book_teacher is not None:
+        rel = abs(teacher["rank"] - float(book_teacher)) / max(
+            float(book_teacher), 1e-12)
+        if rel > 1e-4:
+            raise SystemExit(
+                f"учитель на val_sel {teacher['rank']!r} против записанного "
+                f"probe {book_teacher!r} (относительно {rel:.2e}): считается "
+                f"не то же самое")
+        print(f"  учитель сошёлся с записанным probe ({book_teacher:.6f}, "
+              f"относительно {rel:.1e})")
+    elif a.smoke:
+        print("  SMOKE: сверка учителя с probe пропущена — часть урезана, "
+              "и первые батчи val_sel смещены по RMS")
     cap_target = teacher["draft"] - CAPTURE_THRESHOLD * (
         teacher["draft"] - teacher["rank"])
     print(f"  порог capture {CAPTURE_THRESHOLD} означает RMS(a1_pol) <= "
@@ -674,7 +776,8 @@ def main():
         with torch.no_grad():
             for po, sel in parts["val_sel"]:
                 out = forward(po, sel)
-                ce, act, d = losses(po, sel, out)
+                ce, act, d = losses(po, sel, out, val_target_by_row,
+                                    "val_sel")
                 w = float(len(sel))
                 n_rows += len(sel)
                 acc["a0"] += float(d["m_draft"]) * w
@@ -713,11 +816,13 @@ def main():
             per_pos = [ctx.tok.code_usage_stats(
                 torch.from_numpy(np.ascontiguousarray(flat[:, t])), vocab)
                 for t in range(flat.shape[1])]
+            # ВСЕ КОДОВЫЕ ПОЗИЦИИ, А НЕ ПЕРВЫЕ H_EXEC: это разные оси.
             res[nm]["by_position"] = dict(
-                executed_max_code_share=float(max(
-                    s["max_code_share"] for s in per_pos[:H_EXEC])),
-                executed_min_perplexity=float(min(
-                    s["perplexity"] for s in per_pos[:H_EXEC])))
+                positions=len(per_pos),
+                position_max_code_share=float(max(
+                    s["max_code_share"] for s in per_pos)),
+                position_min_perplexity=float(min(
+                    s["perplexity"] for s in per_pos)))
         s_all, r_all = torch.cat(sup), torch.cat(ref)
         res["support"] = dict(
             mean=float(s_all.mean()),
@@ -741,7 +846,10 @@ def main():
               f"{res['support']['reference_p95']:.4f}; диапазон "
               f"{'ok' if res['range']['passed'] else 'ОТКАЗ'}; книга P "
               f"perplexity {res['usage_p']['perplexity']:.1f}, мёртвых "
-              f"{res['usage_p']['dead_codes']}")
+              f"{res['usage_p']['dead_codes']}, худшая кодовая позиция: "
+              f"доля {res['usage_p']['by_position']['position_max_code_share']:.3f}, "
+              f"perplexity "
+              f"{res['usage_p']['by_position']['position_min_perplexity']:.1f}")
         return res
 
     history = []
@@ -765,7 +873,7 @@ def main():
         for step, j in enumerate(idx, start=1):
             po, sel = order[j]
             out = forward(po, sel)
-            ce, act, d = losses(po, sel, out)
+            ce, act, d = losses(po, sel, out, target_by_row, "train")
             total = ce + lam * act
             (total / float(a.accum)).backward()
             with torch.no_grad():
