@@ -36,10 +36,18 @@
 шестнадцати кодов, и учить только первым восьми значило бы выбросить часть
 того, чем она получена.
 
-ФАЗЫ. Реализована только `q1_reader`. `c2_book` требует
-ДИФФЕРЕНЦИРУЕМОЙ опоры декодера — нынешняя `decoder_support` целиком под
-`no_grad` и в потерю не годится, — а `q2_reader` имеет смысл только после
-неё. Обе отвергаются явным отказом, а не заглушкой.
+ФАЗЫ. Реализована только `q1_reader`. Порядок после неё такой:
+
+    1. проверить ИСХОДНУЮ замороженную C2 относительно ФАКТИЧЕСКИ
+       предсказанного q1;
+    2. если она содержит полезное уточнение и проходит опору — заморозить
+       её и обучать `q2_reader`;
+    3. только если исходная C2 непригодна — рассматривать обучение книги с
+       ЯВНЫМ ограничением опоры, для которого нужна дифференцируемая
+       версия `decoder_support` (нынешняя целиком под `no_grad`).
+
+То есть `q2_reader` НЕ требует предварительного обучения книги. Обе
+нереализованные фазы отвергаются явным отказом, а не заглушкой.
 """
 import argparse
 import hashlib
@@ -67,9 +75,14 @@ PHASE_WHITELIST = {
 }
 # Поля кэша, которые тренер ОБЯЗАН сверить. `builder_sha1` здесь нет
 # намеренно: правка печати в построителе цель не меняет.
-CACHE_CONTRACT = ("c1_sha1", "topk", "action_error_positions",
-                  "rank_candidates_file_sha1", "plan_sha1",
-                  "teacher_target", "part")
+CACHE_CONTRACT = ("kind", "part", "teacher_target", "c1_sha1", "topk",
+                  "action_error_positions", "code_target_positions",
+                  "rank_candidates_file_sha1", "plan_sha1", "q0_prov",
+                  "rows_sha1", "content_sha1", "codec", "code_version",
+                  "joint_sha1", "teacher_metric")
+# Вложенные поля метрики: цель зависит от каждого.
+CACHE_METRIC_FIELDS = ("action_error_positions", "channel_weights",
+                       "decoder_context")
 
 
 def capture(rms_draft, rms_teacher, rms_policy):
@@ -105,8 +118,19 @@ def phase_names(all_names, phase):
     return picked
 
 
-def check_cache_contract(meta, book, ctx_q0_prov, plan_sha1, topk):
-    """Кэш осмыслен только для своей книги и своей обстановки. Fail-closed."""
+def check_cache_contract(meta, book, expect):
+    """Кэш осмыслен только для своей книги и своей обстановки. Fail-closed.
+
+    ВСЕ проверки метаданных собраны здесь, а не частью здесь и частью в
+    `main()`: иначе половина мутаций остаётся непокрытой самопроверкой, а
+    формулировка «отсутствие любого поля — отказ» оказывается сильнее
+    теста. Проверки МАССИВОВ остаются в `main()` — им нужны сами массивы.
+
+    `expect` — словарь ожиданий: q0_prov, plan_sha1, topk, codec,
+    code_version, joint_sha1, channel_weights, decoder_context,
+    rank_candidates_file_sha1, action_error_positions,
+    code_target_positions.
+    """
     problems = []
     missing = [f for f in CACHE_CONTRACT if f not in meta]
     if missing:
@@ -121,15 +145,36 @@ def check_cache_contract(meta, book, ctx_q0_prov, plan_sha1, topk):
     same("teacher_target", meta.get("teacher_target"),
          "action_best_rankpath")
     same("c1_sha1", meta.get("c1_sha1"), book.get("c1_sha1"))
-    same("topk", meta.get("topk"), int(topk))
-    same("plan_sha1", meta.get("plan_sha1"), plan_sha1)
+    same("topk", meta.get("topk"), int(expect["topk"]))
+    same("plan_sha1", meta.get("plan_sha1"), expect["plan_sha1"])
+    for key in ("codec", "code_version", "joint_sha1"):
+        same(key, meta.get(key), expect[key])
+    same("action_error_positions", meta.get("action_error_positions"),
+         int(expect["action_error_positions"]))
+    same("code_target_positions", meta.get("code_target_positions"),
+         int(expect["code_target_positions"]))
+    same("rank_candidates_file_sha1", meta.get("rank_candidates_file_sha1"),
+         expect["rank_candidates_file_sha1"])
     for key in ("plan_sha1", "q0_manifest_sha1"):
         same(f"q0_prov.{key}", (meta.get("q0_prov") or {}).get(key),
-             ctx_q0_prov.get(key))
+             expect["q0_prov"].get(key))
+    for key in ("rows_sha1", "content_sha1"):
+        if not meta.get(key):
+            problems.append(f"{key} в кэше пустой")
     # ЦЕЛЬ ЗАВИСИТ ОТ МЕТРИКИ, ПО КОТОРОЙ ВЫБРАН РАНГ.
     tm = meta.get("teacher_metric") or {}
-    if not tm:
-        problems.append("в кэше нет teacher_metric")
+    absent = [f for f in CACHE_METRIC_FIELDS if f not in tm]
+    if absent:
+        problems.append(f"в teacher_metric нет полей {absent}")
+    else:
+        same("teacher_metric.action_error_positions",
+             int(tm["action_error_positions"]),
+             int(expect["action_error_positions"]))
+        same("teacher_metric.channel_weights",
+             [float(x) for x in tm["channel_weights"]],
+             [float(x) for x in expect["channel_weights"]])
+        same("teacher_metric.decoder_context", tm["decoder_context"],
+             expect["decoder_context"])
     return problems, tm
 
 
@@ -281,33 +326,69 @@ def selftest():
     else:
         raise AssertionError("принят список без тензоров фазы")
 
-    # --- КОНТРАКТ КЭША: ОТСУТСТВИЕ ПОЛЯ — ОТКАЗ -------------------------
+    # --- КОНТРАКТ КЭША: КАЖДОЕ ПОЛЕ И КАЖДАЯ МУТАЦИЯ --------------------
     q0p = {"plan_sha1": "P", "q0_manifest_sha1": "M"}
     book = {"c1_sha1": "B"}
+    dctx = {"autocast": "disabled"}
+    weights = [0.9, 0.9, 0.9, 0.2, 0.26, 0.37, 1.0]
+    expect = dict(q0_prov=dict(q0p), plan_sha1="P", topk=10, codec={"c": "1"},
+                  code_version={"bar.py": "b"}, joint_sha1="J",
+                  channel_weights=list(weights), decoder_context=dict(dctx),
+                  rank_candidates_file_sha1="R", action_error_positions=8,
+                  code_target_positions=16)
     meta = dict(kind="k15b_rankpath_target", part="train",
                 teacher_target="action_best_rankpath", c1_sha1="B", topk=10,
-                action_error_positions=8, rank_candidates_file_sha1="R",
-                plan_sha1="P", q0_prov=dict(q0p),
-                teacher_metric=dict(action_error_positions=8))
-    probs, tm = check_cache_contract(meta, book, q0p, "P", 10)
+                action_error_positions=8, code_target_positions=16,
+                rank_candidates_file_sha1="R", plan_sha1="P",
+                q0_prov=dict(q0p), rows_sha1="RS", content_sha1="CS",
+                codec={"c": "1"}, code_version={"bar.py": "b"},
+                joint_sha1="J",
+                teacher_metric=dict(action_error_positions=8,
+                                    channel_weights=list(weights),
+                                    decoder_context=dict(dctx)))
+    probs, tm = check_cache_contract(meta, book, expect)
     assert probs == [] and tm["action_error_positions"] == 8, probs
+    # ОТСУТСТВИЕ ЛЮБОГО ОБЯЗАТЕЛЬНОГО ПОЛЯ
     for field in CACHE_CONTRACT:
         broken = {k: v for k, v in meta.items() if k != field}
-        assert check_cache_contract(broken, book, q0p, "P", 10)[0], field
-    for key, val in (("c1_sha1", "ДРУГАЯ"), ("topk", 5),
-                     ("part", "val_sel"), ("plan_sha1", "ИНОЙ"),
-                     ("teacher_target", "latent")):
+        assert check_cache_contract(broken, book, expect)[0], field
+    # ОТСУТСТВИЕ ЛЮБОГО ВЛОЖЕННОГО ПОЛЯ МЕТРИКИ
+    for field in CACHE_METRIC_FIELDS:
+        tm_broken = {k: v for k, v in meta["teacher_metric"].items()
+                     if k != field}
+        probs, _t = check_cache_contract(
+            dict(meta, teacher_metric=tm_broken), book, expect)
+        assert any(field in p for p in probs), field
+    # ИЗМЕНЕНИЕ ЛЮБОГО ПОЛЯ
+    for key, val in (("kind", "другое"), ("part", "val_sel"),
+                     ("teacher_target", "latent"), ("c1_sha1", "ДРУГАЯ"),
+                     ("topk", 5), ("plan_sha1", "ИНОЙ"),
+                     ("codec", {"c": "2"}), ("code_version", {"bar.py": "x"}),
+                     ("joint_sha1", "ИНОЙ"), ("action_error_positions", 4),
+                     ("code_target_positions", 20),
+                     ("rank_candidates_file_sha1", "ИНОЙ")):
         probs, _tm = check_cache_contract(dict(meta, **{key: val}), book,
-                                          q0p, "P", 10)
+                                          expect)
         assert any(key in p for p in probs), (key, probs)
+    for key in ("rows_sha1", "content_sha1"):
+        probs, _tm = check_cache_contract(dict(meta, **{key: ""}), book,
+                                          expect)
+        assert any(key in p for p in probs), key
     probs, _tm = check_cache_contract(
         dict(meta, q0_prov={"plan_sha1": "P", "q0_manifest_sha1": "ИНОЙ"}),
-        book, q0p, "P", 10)
+        book, expect)
     assert any("q0_manifest_sha1" in p for p in probs), probs
-    probs, tm = check_cache_contract({k: v for k, v in meta.items()
-                                      if k != "teacher_metric"},
-                                     book, q0p, "P", 10)
-    assert any("teacher_metric" in p for p in probs) and tm == {}
+    # МУТАЦИИ ВНУТРИ МЕТРИКИ: веса каналов и контекст декодера
+    for key, val in (("channel_weights", [1.0] * 7),
+                     ("decoder_context", {"autocast": "enabled"}),
+                     ("action_error_positions", 4)):
+        probs, _tm = check_cache_contract(
+            dict(meta, teacher_metric=dict(meta["teacher_metric"],
+                                           **{key: val})), book, expect)
+        assert any(key in p for p in probs), (key, probs)
+    # КНИГА С ДРУГИМ ОТПЕЧАТКОМ
+    probs, _tm = check_cache_contract(meta, {"c1_sha1": "ИНАЯ"}, expect)
+    assert any("c1_sha1" in p for p in probs), probs
 
     # --- ВЫБОР ЭПОХИ ----------------------------------------------------
     hist = [dict(epoch=0, val_rms_a1_pol=0.143, val_ce=7.0),
@@ -504,36 +585,21 @@ def main():
     # было бы тавтологией, а цель зависит от topk напрямую.
     if book.get("topk") is None:
         raise SystemExit(f"{a.c1}: нет topk, с чем сверять кэш — неизвестно")
-    problems, tmetric = check_cache_contract(
-        meta, book, ctx.q0_prov, ctx.q0_prov.get("plan_sha1"),
-        int(book["topk"]))
+    n_pos_model = int(np.asarray(ctx.q0_can).shape[1])
+    expect = dict(
+        q0_prov=ctx.q0_prov, plan_sha1=ctx.q0_prov.get("plan_sha1"),
+        topk=int(book["topk"]), codec=ctx.codec_fp,
+        code_version=ctx.code_version, joint_sha1=ctx.joint_sha,
+        channel_weights=[float(x) for x in
+                         ctx.weights_gate.detach().cpu().numpy()],
+        decoder_context=ctx.decoder_context,
+        rank_candidates_file_sha1=k15_context.sha12(
+            inspect.getfile(probe.rank_candidates)),
+        action_error_positions=int(H_EXEC),
+        code_target_positions=n_pos_model)
+    problems, tmetric = check_cache_contract(meta, book, expect)
     if problems:
         raise SystemExit("кэш цели не подходит: " + "; ".join(problems[:6]))
-    want_weights = [float(x) for x in
-                    ctx.weights_gate.detach().cpu().numpy()]
-    if [float(x) for x in tmetric.get("channel_weights", [])] != want_weights:
-        raise SystemExit(
-            f"веса каналов цели {tmetric.get('channel_weights')} против "
-            f"{want_weights}: цель выбрана по другой метрике")
-    if tmetric.get("decoder_context") != ctx.decoder_context:
-        raise SystemExit("контекст декодера цели не тот")
-    if meta.get("rank_candidates_file_sha1") != k15_context.sha12(
-            inspect.getfile(probe.rank_candidates)):
-        raise SystemExit(
-            "файл функции кандидатов изменился после построения кэша: "
-            "множество кандидатов могло стать другим")
-    if int(meta["action_error_positions"]) != int(H_EXEC):
-        raise SystemExit(
-            f"цель выбрана по {meta['action_error_positions']} шагам, "
-            f"сейчас H_EXEC={H_EXEC}")
-    # КЭШ ЗАВИСИТ ОТ ДЕКОДЕРА: цель выбиралась по декодированной ошибке.
-    for key, want in (("codec", ctx.codec_fp),
-                      ("code_version", ctx.code_version),
-                      ("joint_sha1", ctx.joint_sha)):
-        if meta.get(key) != want:
-            raise SystemExit(
-                f"кэш: {key} = {meta.get(key)!r}, сейчас {want!r}. Цель "
-                f"выбиралась другим декодером")
     # СОДЕРЖИМОЕ МАССИВОВ ПРОВЕРЯЕТСЯ, А НЕ ТОЛЬКО МЕТАДАННЫЕ. Иначе
     # прошли бы переставленные строки при непереставленных кодах, дубли
     # строк (присваивание сработало бы по правилу «последняя победила») и
@@ -556,8 +622,9 @@ def main():
             f"длины массивов кэша расходятся: строк {len(rows_t)}, кодов "
             f"{len(codes_t)}, рангов {len(ranks_t)}")
     n_pos = int(codes_t.shape[1])
-    if int(meta["code_target_positions"]) != n_pos:
-        raise SystemExit("число кодовых позиций в кэше не согласовано")
+    if n_pos != n_pos_model:
+        raise SystemExit(
+            f"кодовых позиций в кэше {n_pos}, у модели {n_pos_model}")
     if codes_t.shape != (len(plan_rows), n_pos):
         raise SystemExit(f"форма кодов {codes_t.shape}, ожидалась "
                          f"{(len(plan_rows), n_pos)}")
@@ -620,11 +687,12 @@ def main():
             raise SystemExit(f"q0 разошёлся с каноническим в {bad} позициях")
         return out
 
-    # НОРМИРОВКА ACTION-ЧЛЕНА — ОДИН ФИКСИРОВАННЫЙ СКАЛЯР, А НЕ ОШИБКА
-    # ЧЕРНОВИКА НА БАТЧЕ. Батчевая нормировка перевзвешивала батчи — малая
-    # ошибка q0 давала больший вес, — и глобальный оптимум расходился с
-    # агрегированным RMS, по которому идёт отбор. Масштаб всё равно
-    # поглощается калибровкой lambda.
+    # ОДИН ФИКСИРОВАННЫЙ СКАЛЯР НА ВСЁ ОБУЧЕНИЕ. Прежняя версия делила на
+    # ошибку черновика НА БАТЧЕ, и это перевзвешивало батчи: малая ошибка
+    # q0 давала больший вес, а глобальный оптимум расходился с
+    # агрегированным RMS, по которому идёт отбор. Здесь знаменатель
+    # постоянный, батчи равноправны, направление глобального градиента
+    # соответствует метрике, а масштаб поглощается калибровкой lambda.
     action_scale = float(meta["rms_draft"]) ** 2
 
     def losses(po, sel, out, table, table_name):
@@ -750,7 +818,11 @@ def main():
     # probe записал в книгу, считаются на одной и той же части одной и той
     # же замороженной книгой — значит обязаны совпасть.
     book_teacher = book.get("teacher_rms")
-    if not a.smoke and book_teacher is not None:
+    if not a.smoke and book_teacher is None:
+        raise SystemExit(
+            f"{a.c1}: нет teacher_rms, сверить учителя не с чем. "
+            f"Отсутствие обязательного поля — отказ, а не пропуск проверки")
+    if not a.smoke:
         rel = abs(teacher["rank"] - float(book_teacher)) / max(
             float(book_teacher), 1e-12)
         if rel > 1e-4:
@@ -760,7 +832,7 @@ def main():
                 f"не то же самое")
         print(f"  учитель сошёлся с записанным probe ({book_teacher:.6f}, "
               f"относительно {rel:.1e})")
-    elif a.smoke:
+    else:
         print("  SMOKE: сверка учителя с probe пропущена — часть урезана, "
               "и первые батчи val_sel смещены по RMS")
     cap_target = teacher["draft"] - CAPTURE_THRESHOLD * (
