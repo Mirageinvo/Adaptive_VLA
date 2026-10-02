@@ -666,11 +666,18 @@ def main():
     model.eval()   # обучение в eval, как в K-15
 
     parts = {k: list(v) for k, v in ctx.parts.items()}
+    report_every = int(a.report_every)
     if a.smoke:
         n_take = max(int(a.smoke_batches), 1)
         parts = {k: v[:min(n_take, len(v))] for k, v in parts.items()}
+        # ИНТЕРВАЛ ОТЧЁТА В СМОУКЕ ПОДГОНЯЕТСЯ ПОД ЧИСЛО БАТЧЕЙ. При 100
+        # батчах и интервале 250 ни одна строка с обучающей потерей не
+        # печаталась, и ровно та проверка, ради которой смоук и нужен —
+        # падает ли CE, — оказывалась непроверяемой по выводу.
+        report_every = max(5, min(report_every,
+                                  max(1, len(parts["train"]) // 10)))
         print(f"  РЕЖИМ SMOKE: по {len(parts['train'])} батчей на часть, "
-              f"решения не принимаются")
+              f"отчёт каждые {report_every} батчей, решения не принимаются")
     q0_dev = torch.as_tensor(np.asarray(ctx.q0_can), device=dev)
 
     def forward(po, sel):
@@ -939,8 +946,8 @@ def main():
         model.eval()
         rng = np.random.default_rng(int(a.seed) + epoch)
         idx = rng.permutation(len(order))
-        run = None
-        nb = 0
+        run, prev_run = None, None
+        nb, prev_nb = 0, 0
         opt.zero_grad(set_to_none=True)
         for step, j in enumerate(idx, start=1):
             po, sel = order[j]
@@ -955,7 +962,7 @@ def main():
                        for k, v in cur.items()}
             nb += 1
             if step % int(a.accum) == 0 or step == len(idx):
-                if step <= 10 or step % int(a.report_every) == 0 \
+                if step <= 10 or step % report_every == 0 \
                         or step == len(idx):
                     nog = [n for n in train_names if named[n].grad is None]
                     nf = [n for n in train_names
@@ -974,13 +981,28 @@ def main():
                 print(f"    ПРОГНОЗ: {forecast['per_batch_s']:.2f} с/батч, "
                       f"{forecast['total_h']:.1f} ч на {a.epochs} эпох",
                       flush=True)
-            if step % int(a.report_every) == 0:
-                m = {k: float(v) / nb for k, v in run.items()}
+            if step % report_every == 0:
+                # СРЕДНЕЕ ПО ОКНУ, А НЕ ПО ВСЕЙ ЭПОХЕ: накопленное с начала
+                # среднее сглаживает траекторию и скрывает, падает ли
+                # потеря ПРЯМО СЕЙЧАС.
+                win = {k: float(v) / max(nb - prev_nb, 1)
+                       for k, v in ((k2, run[k2] - prev_run[k2])
+                                    for k2 in run)} if prev_run else \
+                    {k: float(v) / nb for k, v in run.items()}
+                cum = {k: float(v) / nb for k, v in run.items()}
+                prev_run = {k: v.clone() for k, v in run.items()}
+                prev_nb = nb
                 el = (time.time() - t_start) / 60
-                print(f"    эпоха {epoch}: батч {step}/{len(idx)}, потеря "
-                      f"{m['total']:.4f} (CE {m['ce']:.4f}, action "
-                      f"{m['action']:.4f}), {el:.1f} мин", flush=True)
+                print(f"    эпоха {epoch}: батч {step}/{len(idx)}, окно: "
+                      f"потеря {win['total']:.4f} (CE {win['ce']:.4f}, "
+                      f"action {win['action']:.4f}); с начала: CE "
+                      f"{cum['ce']:.4f}; {el:.1f} мин", flush=True)
         train_mean = {k: float(v) / max(nb, 1) for k, v in (run or {}).items()}
+        # ОБУЧАЮЩИЕ СРЕДНИЕ ПЕЧАТАЮТСЯ ВСЕГДА, А НЕ ТОЛЬКО ПО ИНТЕРВАЛУ:
+        # иначе при коротком прогоне они попадали только в историю.
+        print(f"  эпоха {epoch}: обучающая потеря {train_mean.get('total', 0):.4f} "
+              f"(CE {train_mean.get('ce', 0):.4f}, action "
+              f"{train_mean.get('action', 0):.4f}) по {nb} батчам")
         inv, _n = k15t.frozen_invariant(model, torch, set(train_names))
         if inv != frozen_inv0:
             raise SystemExit(
