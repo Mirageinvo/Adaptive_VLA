@@ -167,10 +167,16 @@ def range_ok(p99_candidate, p99_dataset, absmax_candidate):
 # это другая версия артефакта, а не допустимая вариация.
 EXPECTED_STATES = ("q1", "q1_soft", "q2")
 
-CHECKPOINT_FIELDS = ("joint_sha1", "codec", "code_version", "variant",
-                     "batch", "compute_dtype", "q1_init_sha1",
-                     "decoder_context", "init_gate_sha1", "q0_prov",
-                     "frozen_content_sha")
+# `variant` в чекпойнте — это МЕТКА АРХИТЕКТУРЫ ("depth_aligned"), а
+# `--variant` — вариант чекпойнта K-14 ("main"). Сравнивать их нельзя: это
+# разные величины, и первая версия проверки на этом ложно отказала. Сторона
+# K-14 пинится отпечатком файла `q1_init_sha1` и полем `q1_variant`, которое
+# тренер пишет из `check_depthrvq_q1_ckpt`.
+CHECKPOINT_LABELS = dict(variant="depth_aligned", stage="q1q2")
+CHECKPOINT_FIELDS = ("joint_sha1", "codec", "code_version", "stage",
+                     "variant", "batch", "compute_dtype", "q1_init_sha1",
+                     "q1_variant", "decoder_context", "init_gate_sha1",
+                     "q0_prov", "frozen_content_sha")
 
 
 def check_checkpoint(obj, ctx, a, file_sha1, frozen_sha):
@@ -187,10 +193,15 @@ def check_checkpoint(obj, ctx, a, file_sha1, frozen_sha):
     same("joint_sha1", obj.get("joint_sha1"), ctx.joint_sha)
     same("codec", obj.get("codec"), ctx.codec_fp)
     same("code_version", obj.get("code_version"), ctx.code_version)
-    same("variant", str(obj.get("variant")), str(a.variant))
+    # МЕТКИ АРТЕФАКТА сверяются с литералами, а не с аргументами запуска.
+    for key, want in CHECKPOINT_LABELS.items():
+        same(f"метка {key}", str(obj.get(key)), want)
     same("batch", int(obj.get("batch", -1)), int(a.batch))
     same("compute_dtype", str(obj.get("compute_dtype")), str(a.dtype))
     same("q1_init_sha1", obj.get("q1_init_sha1"), file_sha1(a.q1_init))
+    # СТОРОНА K-14: вариант её чекпойнта, записанный тренером из
+    # check_depthrvq_q1_ckpt, против текущего --variant.
+    same("q1_variant", str(obj.get("q1_variant")), str(a.variant))
     same("decoder_context", obj.get("decoder_context"), ctx.decoder_context)
     same("init_gate_sha1", obj.get("init_gate_sha1"),
          ctx.gate_info.get("init_gate_sha1"))
@@ -350,8 +361,10 @@ def selftest():
     args = SimpleNamespace(variant="main", batch=8, dtype="float16",
                            q1_init="x")
     good = dict(joint_sha1="J", codec={"codebooks_sha1": "c"},
-                code_version={"bar.py": "b"}, variant="main", batch=8,
+                code_version={"bar.py": "b"},
+                stage="q1q2", variant="depth_aligned", batch=8,
                 compute_dtype="float16", q1_init_sha1="Q",
+                q1_variant="main",
                 decoder_context={"autocast": "off"}, init_gate_sha1="G",
                 q0_prov={"plan_sha1": "P", "q0_manifest_sha1": "M"},
                 frozen_content_sha="F")
@@ -365,6 +378,17 @@ def selftest():
     assert any("frozen_content_sha" in p for p in check_checkpoint(
         dict(good, frozen_content_sha="ДРУГОЙ"), ctx, args,
         lambda _p: "Q", "F"))
+    # МЕТКА АРХИТЕКТУРЫ СРАВНИВАЕТСЯ С ЛИТЕРАЛОМ, А НЕ С --variant:
+    # на этом первая версия ложно отказала.
+    assert check_checkpoint(dict(good, variant="depth_aligned"), ctx, args,
+                            lambda _p: "Q", "F") == []
+    assert any("метка variant" in p for p in check_checkpoint(
+        dict(good, variant="main"), ctx, args, lambda _p: "Q", "F"))
+    assert any("метка stage" in p for p in check_checkpoint(
+        dict(good, stage="другое"), ctx, args, lambda _p: "Q", "F"))
+    # А ВАРИАНТ ЧЕКПОЙНТА K-14 — именно с --variant
+    assert any("q1_variant" in p for p in check_checkpoint(
+        dict(good, q1_variant="другой"), ctx, args, lambda _p: "Q", "F"))
 
     # --- СОСТОЯНИЯ: ВЫЧИСЛЕННЫЙ SHA, А НЕ ЗАЯВЛЕННЫЙ --------------------
     def fake_state_sha(st):
