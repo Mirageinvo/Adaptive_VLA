@@ -65,6 +65,10 @@ LAMBDA_TARGET_RATIO = 0.175     # норма градиента action / CE на
 COLLAPSE_MAX_SHARE, COLLAPSE_MIN_PPL = 0.98, 2.0
 ACTION_RANGE_FACTOR, ACTION_CLIP_BOUND = 1.5, 1.5
 
+# ПРОБА ОБУЧАЕМОСТИ. Требование к падению CE на ФИКСИРОВАННОМ маленьком
+# наборе объявлено до запуска: если на 160 строках за 150 шагов потерю не
+# удаётся уронить хотя бы на треть, дело не в объёме данных.
+OVERFIT_DROP_FACTOR = 0.67
 PHASES = ("q1_reader", "c2_book", "q2_reader")
 PHASE_WHITELIST = {
     "q1_reader": ("depth_rvq_norms.0.", "depth_rvq_heads.0.",
@@ -473,6 +477,10 @@ def main():
     ap.add_argument("--accum", type=int, default=1)
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--smoke-batches", type=int, default=100)
+    ap.add_argument("--overfit-batches", type=int, default=4,
+                    help="сколько ФИКСИРОВАННЫХ батчей брать в пробу "
+                         "обучаемости; 0 — не проводить")
+    ap.add_argument("--overfit-steps", type=int, default=150)
     ap.add_argument("--out", default="")
     ap.add_argument("--summary", default="")
     ap.add_argument("--report-every", type=int, default=250)
@@ -939,6 +947,69 @@ def main():
     capture0 = val0["capture"]
     snapshots = {0: {k: named[k].detach().clone() for k in train_names}}
 
+    # --- ПРОБА ОБУЧАЕМОСТИ: МОЖНО ЛИ ВООБЩЕ УРОНИТЬ CE ------------------
+    # Смоук на 500 батчах показал ПЛОСКУЮ траекторию: колебание ±0.12 без
+    # тренда. Это не различает «шаг неверен» и «шагов слишком мало», потому
+    # что батч канонически равен 8, и шум градиента на 2048-классовой
+    # задаче перекрывает улучшение за такое число шагов. Проба снимает
+    # вопрос: на ФИКСИРОВАННОМ маленьком наборе потеря обязана упасть, и
+    # если не падает — дело не в объёме данных.
+    overfit = None
+    if a.smoke and int(a.overfit_batches) > 0:
+        fixed = parts["train"][:int(a.overfit_batches)]
+        n_fix = sum(len(s) for _p, s in fixed)
+        steps = int(a.overfit_steps)
+        print(f"\n  ПРОБА ОБУЧАЕМОСТИ: {len(fixed)} фиксированных батчей "
+              f"({n_fix} строк), {steps} шагов, требование — CE не выше "
+              f"{OVERFIT_DROP_FACTOR} от начальной")
+        trace, win = [], []
+        opt.zero_grad(set_to_none=True)
+        for st in range(1, steps + 1):
+            po, sel = fixed[(st - 1) % len(fixed)]
+            out = forward(po, sel)
+            ce, act, _d = losses(po, sel, out, target_by_row, "train")
+            (ce + lam * act).backward()
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+            win.append(float(ce.detach()))
+            if st % max(steps // 6, 1) == 0:
+                trace.append((st, float(np.mean(win))))
+                print(f"    шаг {st}/{steps}: CE по окну "
+                      f"{np.mean(win):.4f}", flush=True)
+                win = []
+        first, last = trace[0][1], trace[-1][1]
+        overfit = dict(steps=steps, batches=len(fixed), rows=n_fix,
+                       trace=trace, ce_first=float(first),
+                       ce_last=float(last),
+                       ratio=float(last / max(first, 1e-12)),
+                       required=OVERFIT_DROP_FACTOR,
+                       passed=bool(last <= OVERFIT_DROP_FACTOR * first))
+        # ВЕСА ВОЗВРАЩАЮТСЯ ПОБИТОВО, СОСТОЯНИЕ ADAM СБРАСЫВАЕТСЯ: проба не
+        # имеет права повлиять на сам прогон.
+        with torch.no_grad():
+            for k_, v_ in snapshots[0].items():
+                named[k_].copy_(v_)
+        opt.state.clear()
+        opt.zero_grad(set_to_none=True)
+        back_sha = ctx.k14c.state_sha(
+            {k: named[k].detach().float().cpu().numpy() for k in train_names})
+        zero_sha = ctx.k14c.state_sha(
+            {k: v.detach().float().cpu().numpy()
+             for k, v in snapshots[0].items()})
+        if back_sha != zero_sha:
+            raise SystemExit(f"после пробы веса не восстановились: "
+                             f"{back_sha} против {zero_sha}")
+        print(f"  проба: CE {first:.4f} -> {last:.4f} (отношение "
+              f"{overfit['ratio']:.3f}, требуется <= "
+              f"{OVERFIT_DROP_FACTOR}) — "
+              f"{'ПРОЙДЕНА' if overfit['passed'] else 'НЕ ПРОЙДЕНА'}; "
+              f"веса восстановлены побитово ({back_sha})")
+        if not overfit["passed"]:
+            print("    ЗНАЧИТ ДЕЛО НЕ В ОБЪЁМЕ ДАННЫХ: на 160 строках за "
+                  f"{steps} шагов потеря не падает. Полный прогон запускать "
+                  f"бессмысленно, пока не разобрались с шагом обучения или "
+                  f"самой постановкой")
+
     order = list(parts["train"])
     forecast = None
     t_start = time.time()
@@ -1077,6 +1148,7 @@ def main():
         teacher=teacher, capture_epoch0=capture0,
         capture_target_rms=float(cap_target),
         gates=gates, verdict=out_verdict, forecast=forecast,
+        overfit_probe=overfit,
         c1_file=os.path.abspath(a.c1), c1_sha1=book["c1_sha1"],
         target_file=os.path.abspath(a.target),
         target_content_sha1=meta["content_sha1"],
