@@ -38,8 +38,20 @@
 
 ЧЕКПОЙНТ ПРОВЕРЯЕТСЯ FAIL-CLOSED. Записать `source_checkpoint_sha1` в выход
 недостаточно: это опознаёт чужой чекпойнт, но не доказывает, что он собран
-в той же обстановке. Сверяются одиннадцать полей, включая ПОБИТОВЫЙ
-отпечаток замороженного, и отсутствие обязательного поля — отказ.
+в той же обстановке. Сверяются одиннадцать полей, и отсутствие любого —
+отказ. Отпечаток замороженного покрывает МОДЕЛЬ побитово; декодер в него не
+входит и заверяется отдельно тремя отпечатками кодека.
+
+ОТПЕЧАТКИ СОСТОЯНИЙ ВЫЧИСЛЯЮТСЯ, А НЕ ЧИТАЮТСЯ. Дедупликация по
+`selected_state_sha1_*` из самого файла позволяла подменить тензор в алиасе,
+оставив прежний заявленный отпечаток: такое состояние объединялось с
+настоящим и не проверялось никогда. Отдельно считается отпечаток САМОЙ
+КНИГИ C1 — уникальность полных состояний её уникальности не доказывает.
+
+НА ПОЗИЦИЮ ПРИХОДИТСЯ 15 ВЫЗОВОВ ДЕКОДЕРА: десять кандидатов и пять
+остальных путей. Путь токенизатора и rank-path берутся из уже посчитанных
+кандидатов, поэтому инвариант «ранг 1 = a1_tok» — это один и тот же тензор,
+а не совпадение двух декодирований.
 """
 import argparse
 import hashlib
@@ -151,6 +163,10 @@ def range_ok(p99_candidate, p99_dataset, absmax_candidate):
                 clip_bound=ACTION_CLIP_BOUND)
 
 
+# СОСТАВ СОСТОЯНИЙ ЗАФИКСИРОВАН. Отсутствие одного или лишнее состояние —
+# это другая версия артефакта, а не допустимая вариация.
+EXPECTED_STATES = ("q1", "q1_soft", "q2")
+
 CHECKPOINT_FIELDS = ("joint_sha1", "codec", "code_version", "variant",
                      "batch", "compute_dtype", "q1_init_sha1",
                      "decoder_context", "init_gate_sha1", "q0_prov",
@@ -181,10 +197,79 @@ def check_checkpoint(obj, ctx, a, file_sha1, frozen_sha):
     for key in ("plan_sha1", "q0_manifest_sha1"):
         same(f"q0_prov.{key}", (obj.get("q0_prov") or {}).get(key),
              ctx.q0_prov.get(key))
-    # САМАЯ СИЛЬНАЯ ПРОВЕРКА: отпечаток покрывает backbone, q0, C0 и
-    # декодер побитово, а не их имена.
+    # Отпечаток покрывает ПОБИТОВО модель: backbone, q0, C0, нормы и
+    # головы. Декодер в него НЕ входит — он заверяется отдельно тремя
+    # отпечатками кодека, которые сверяются строкой выше.
     same("frozen_content_sha", obj.get("frozen_content_sha"), frozen_sha)
     return problems
+
+
+def validate_states(obj, names, shapes, state_sha, c1_sha, torch,
+                    expected=EXPECTED_STATES):
+    """Проверка и дедупликация состояний. SHA ВЫЧИСЛЯЕТСЯ, а не берётся.
+
+    Прежняя версия группировала состояния по `selected_state_sha1_*`,
+    прочитанному из самого чекпойнта, а фактический отпечаток считала
+    только для представителя группы. Подменённый тензор в алиасе с прежним
+    заявленным SHA объединялся с настоящим и не проверялся никогда.
+
+    Возвращает (по состояниям, группы по состоянию, группы по книге C1).
+    Книга проверяется отдельным отпечатком: уникальность полных состояний
+    НЕ доказывает уникальность книг.
+    """
+    states = obj.get("states")
+    if not isinstance(states, dict) or not states:
+        raise SystemExit("в чекпойнте нет словаря states")
+    if set(states) != set(expected):
+        raise SystemExit(
+            f"набор состояний {sorted(states)}, ожидался {sorted(expected)}: "
+            f"это другая версия артефакта")
+    per = {}
+    for tag in sorted(states):
+        st = states[tag]
+        if set(st) != set(names):
+            raise SystemExit(f"состояние {tag}: набор весов не тот")
+        want = obj.get(f"selected_state_sha1_{tag}")
+        if want is None:
+            raise SystemExit(
+                f"состояние {tag}: нет selected_state_sha1_{tag}. "
+                f"Отсутствие обязательного отпечатка — отказ, а не допуск")
+        if obj.get(f"selected_epoch_{tag}") is None:
+            raise SystemExit(f"состояние {tag}: нет selected_epoch_{tag}")
+        for k_, v_ in st.items():
+            if tuple(v_.shape) != tuple(shapes[k_]):
+                raise SystemExit(f"{tag}.{k_}: форма {tuple(v_.shape)} "
+                                 f"против {tuple(shapes[k_])}")
+            if not torch.isfinite(v_).all():
+                raise SystemExit(f"{tag}.{k_}: нечисловые значения")
+        got = state_sha(st)
+        if got != want:
+            raise SystemExit(
+                f"состояние {tag}: вычисленный отпечаток {got}, заявленный "
+                f"{want}. Веса подменены или артефакт испорчен")
+        per[tag] = dict(state_sha1=got, c1_sha1=c1_sha(st),
+                        epoch=obj[f"selected_epoch_{tag}"])
+    groups, books = {}, {}
+    for tag in sorted(per):
+        groups.setdefault(per[tag]["state_sha1"], []).append(tag)
+        books.setdefault(per[tag]["c1_sha1"], []).append(tag)
+    return per, groups, books
+
+
+def archive_existing(path):
+    """Переносит существующий файл в версию со штампом времени.
+
+    Без этого старый `c1_selected.pt` переживал отказ: новый файл не
+    создавался, а канонический путь оставался занят прежним — в том числе
+    созданным ПРЕДЫДУЩЕЙ версией probe, когда запись шла до гейтов.
+    """
+    if not os.path.exists(path):
+        return None
+    dest = f"{path}.{time.strftime('%Y%m%dT%H%M%S')}.bak"
+    if os.path.exists(dest):
+        dest = f"{dest}.{os.getpid()}"
+    os.replace(path, dest)
+    return dest
 
 
 def selftest():
@@ -281,6 +366,114 @@ def selftest():
         dict(good, frozen_content_sha="ДРУГОЙ"), ctx, args,
         lambda _p: "Q", "F"))
 
+    # --- СОСТОЯНИЯ: ВЫЧИСЛЕННЫЙ SHA, А НЕ ЗАЯВЛЕННЫЙ --------------------
+    def fake_state_sha(st):
+        return hashlib.sha1(b"".join(
+            np.ascontiguousarray(st[k].numpy()).tobytes()
+            for k in sorted(st))).hexdigest()[:12]
+
+    def fake_c1_sha(st):
+        return hashlib.sha1(np.ascontiguousarray(
+            st["depth_aligned_c1"].numpy()).tobytes()).hexdigest()[:12]
+
+    nm = ["depth_aligned_c1", "head.weight"]
+    shp = {"depth_aligned_c1": (3, 2), "head.weight": (2,)}
+
+    def mk_state(book, head):
+        return {"depth_aligned_c1": torch.full((3, 2), float(book)),
+                "head.weight": torch.full((2,), float(head))}
+
+    s_a, s_b = mk_state(1, 1), mk_state(2, 2)
+    base = dict(states={"q1": s_a, "q1_soft": s_a, "q2": s_b})
+    for tag, st in base["states"].items():
+        base[f"selected_state_sha1_{tag}"] = fake_state_sha(st)
+        base[f"selected_epoch_{tag}"] = 0
+    per, groups, books = validate_states(
+        base, nm, shp, fake_state_sha, fake_c1_sha, torch)
+    assert len(per) == 3 and len(groups) == 2 and len(books) == 2, (
+        len(per), len(groups), len(books))
+    assert sorted(groups[fake_state_sha(s_a)]) == ["q1", "q1_soft"]
+
+    # ПОДМЕНА ТЕНЗОРА В АЛИАСЕ ПРИ ПРЕЖНЕМ ЗАЯВЛЕННОМ SHA — прежняя
+    # версия объединяла такое состояние с настоящим и не проверяла никогда
+    tampered = dict(base)
+    tampered["states"] = dict(base["states"], q1_soft=mk_state(9, 9))
+    try:
+        validate_states(tampered, nm, shp, fake_state_sha, fake_c1_sha, torch)
+    except SystemExit as e:
+        assert "вычисленный отпечаток" in str(e), e
+    else:
+        raise AssertionError("подменённый алиас принят")
+
+    # ОДНА И ТА ЖЕ КНИГА ПРИ РАЗНЫХ ГОЛОВАХ: состояний три, книг две
+    shared = dict(states={"q1": mk_state(1, 1), "q1_soft": mk_state(1, 5),
+                          "q2": mk_state(2, 2)})
+    for tag, st in shared["states"].items():
+        shared[f"selected_state_sha1_{tag}"] = fake_state_sha(st)
+        shared[f"selected_epoch_{tag}"] = 1
+    per_s, groups_s, books_s = validate_states(
+        shared, nm, shp, fake_state_sha, fake_c1_sha, torch)
+    assert len(groups_s) == 3 and len(books_s) == 2, (len(groups_s),
+                                                      len(books_s))
+
+    for broken, why in (
+            (dict(base, states={k: v for k, v in base["states"].items()
+                                if k != "q2"}), "набор состояний"),
+            (dict(base, states=dict(base["states"], лишнее=s_a)),
+             "набор состояний"),
+            ({}, "нет словаря states")):
+        try:
+            validate_states(broken, nm, shp, fake_state_sha, fake_c1_sha,
+                            torch)
+        except SystemExit as e:
+            assert why in str(e), (why, e)
+        else:
+            raise AssertionError(f"принят неверный набор: {why}")
+    for field in ("selected_state_sha1_q2", "selected_epoch_q2"):
+        broken = {k: v for k, v in base.items() if k != field}
+        try:
+            validate_states(broken, nm, shp, fake_state_sha, fake_c1_sha,
+                            torch)
+        except SystemExit as e:
+            assert field.rsplit("_", 1)[0] in str(e) or field in str(e), e
+        else:
+            raise AssertionError(f"принято отсутствие {field}")
+    bad_shape = dict(base)
+    bad_shape["states"] = dict(base["states"],
+                               q2={"depth_aligned_c1": torch.zeros(4, 2),
+                                   "head.weight": torch.zeros(2)})
+    bad_shape["selected_state_sha1_q2"] = fake_state_sha(
+        bad_shape["states"]["q2"])
+    try:
+        validate_states(bad_shape, nm, shp, fake_state_sha, fake_c1_sha,
+                        torch)
+    except SystemExit as e:
+        assert "форма" in str(e), e
+    else:
+        raise AssertionError("принята неверная форма")
+    nan_state = dict(base)
+    bad = mk_state(1, 1)
+    bad["head.weight"][0] = float("nan")
+    nan_state["states"] = dict(base["states"], q2=bad)
+    nan_state["selected_state_sha1_q2"] = fake_state_sha(bad)
+    try:
+        validate_states(nan_state, nm, shp, fake_state_sha, fake_c1_sha,
+                        torch)
+    except SystemExit as e:
+        assert "нечисловые" in str(e), e
+    else:
+        raise AssertionError("приняты нечисловые значения")
+
+    # --- АРХИВИРОВАНИЕ СТАРОГО АРТЕФАКТА --------------------------------
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "c1.pt")
+        assert archive_existing(p) is None
+        open(p, "w").write("старое")
+        dest = archive_existing(p)
+        assert dest and os.path.exists(dest) and not os.path.exists(p)
+        assert open(dest).read() == "старое"
+
     print("самопроверка k15b_probe_and_extract пройдена")
 
 
@@ -322,6 +515,14 @@ def main():
         if os.path.exists(path) and not a.overwrite:
             raise SystemExit(f"{path} уже существует: без --overwrite не "
                              f"перезаписываю")
+    # СТАРЫЕ АРТЕФАКТЫ УБИРАЮТСЯ С КАНОНИЧЕСКИХ ПУТЕЙ СРАЗУ, А НЕ
+    # ПЕРЕЗАПИСЫВАЮТСЯ В КОНЦЕ. Иначе при отказе, падении или
+    # smoke-источнике на пути оставался прежний `c1_selected.pt` — в том
+    # числе созданный предыдущей версией probe, которая писала до гейтов.
+    archived = {p: archive_existing(p) for p in (a.out, a.out_c1)}
+    for path, dest in archived.items():
+        if dest:
+            print(f"  прежний {path} перенесён в {dest}")
 
     ctx = k15_context.build(a)
     torch = ctx.torch
@@ -331,7 +532,8 @@ def main():
     ac16 = torch.autocast(device_type=dev.type, dtype=dt)
     k15t = k15_context.k15t
 
-    # ОТПЕЧАТОК ЗАМОРОЖЕННОГО СЧИТАЕТСЯ, А НЕ ОБЕЩАЕТСЯ В docstring.
+    # ОТПЕЧАТОК ЗАМОРОЖЕННОГО СЧИТАЕТСЯ, А НЕ ОБЕЩАЕТСЯ В docstring. Он
+    # покрывает модель; декодер заверяется отпечатками кодека.
     frozen_sha, n_frozen, n_elem = k15t.frozen_content_sha(
         model, torch, set(names))
     print(f"  замороженного: {n_frozen} тензоров, {n_elem} значений, "
@@ -353,38 +555,35 @@ def main():
         raise SystemExit("чекпойнт K-15 собран в другой обстановке: "
                          + "; ".join(problems[:6]))
     print(f"  чекпойнт {a.checkpoint}: обстановка сверена по "
-          f"{len(CHECKPOINT_FIELDS)} полям, включая побитовый отпечаток "
-          f"замороженного")
+          f"{len(CHECKPOINT_FIELDS)} полям — побитовый отпечаток "
+          f"замороженного по модели плюс три отпечатка кодека отдельно")
 
-    states = obj.get("states")
-    if not isinstance(states, dict) or not states:
-        raise SystemExit("в чекпойнте нет словаря states")
     if set(obj.get("trainable_names", [])) != set(names):
         raise SystemExit("белый список чекпойнта не совпал с текущим")
     own_shapes = {k: tuple(v.shape) for k, v in model.state_dict().items()}
-    for tag, st in states.items():
-        if set(st) != set(names):
-            raise SystemExit(f"состояние {tag}: набор весов не тот")
-        if obj.get(f"selected_state_sha1_{tag}") is None:
-            raise SystemExit(
-                f"состояние {tag}: нет selected_state_sha1_{tag}. "
-                f"Отсутствие обязательного отпечатка — отказ, а не допуск")
-        for k_, v_ in st.items():
-            if tuple(v_.shape) != own_shapes[k_]:
-                raise SystemExit(f"{tag}.{k_}: форма {tuple(v_.shape)} "
-                                 f"против {own_shapes[k_]}")
-            if not torch.isfinite(v_).all():
-                raise SystemExit(f"{tag}.{k_}: нечисловые значения")
 
-    # ДЕДУПЛИКАЦИЯ: q1 и q1_soft в прошлом прогоне оказались идентичны, и
-    # треть работы ушла впустую.
-    by_sha = {}
-    for tag in sorted(states):
-        by_sha.setdefault(obj[f"selected_state_sha1_{tag}"], []).append(tag)
-    unique = {tags[0]: (sha, tags) for sha, tags in by_sha.items()}
-    print(f"  состояний {sorted(states)}, уникальных по отпечатку "
-          f"{len(unique)}: " + "; ".join(
+    def state_sha_of(st):
+        return ctx.k14c.state_sha(
+            {k_: v_.detach().float().cpu().numpy() for k_, v_ in st.items()})
+
+    def c1_sha_of(st):
+        return hashlib.sha1(np.ascontiguousarray(
+            st["depth_aligned_c1"].detach().float().cpu().numpy()
+        ).tobytes()).hexdigest()[:12]
+
+    states = obj["states"]
+    state_info, groups, books = validate_states(
+        obj, names, own_shapes, state_sha_of, c1_sha_of, torch)
+    unique = {tags[0]: (sha, tags) for sha, tags in groups.items()}
+    print(f"  состояний {sorted(states)}, уникальных по ВЫЧИСЛЕННОМУ "
+          f"отпечатку {len(groups)}: " + "; ".join(
               f"{t} = {'+'.join(tags)}" for t, (_s, tags) in unique.items()))
+    print(f"  различных книг C1: {len(books)}: " + "; ".join(
+        f"{sha} = {'+'.join(tags)}" for sha, tags in books.items()))
+    if len(books) != len(groups):
+        print("    ВНИМАНИЕ: число книг и число состояний не совпало — "
+              "значит разные головы при одной книге, и книжные числа у них "
+              "совпадут, а читательские нет")
 
     batch_list = ctx.parts["val_sel"]
     take = strided(len(batch_list), a.batches)
@@ -433,10 +632,23 @@ def main():
         agree = recall3 = recall10 = 0.0
         codes_q, codes_p, rank_choice = [], [], []
         rank_flips, first_batch = 0, [True]
-        t0 = time.time()
+        # ДВА ТАЙМЕРА. `cache` измеряет РОВНО те операции, которые сделает
+        # построитель кэша: проход, кодирование действия, расстояния,
+        # кандидаты, их декодирование и выбор лучшего ранга. Полное время
+        # probe включает ещё семь путей, пять замеров опоры и агрегацию на
+        # хосте, и проецировать кэш по нему значило бы завысить его
+        # стоимость — а порог бюджета стоит рядом.
+        t_total, t_cache = 0.0, 0.0
+
+        def sync():
+            if dev.type == "cuda":
+                torch.cuda.synchronize(dev)
+
         model.eval()
         with torch.no_grad():
             for po, sel in chosen_batches:
+                sync()
+                tb0 = time.time()
                 b = ctx.build_batch(po, sel)
                 am = b.get("attention_mask")
                 with ac16:
@@ -479,28 +691,42 @@ def main():
                 rank_flips += int(
                     ((-d1).topk(int(a.topk), dim=-1).indices[..., 0]
                      != i1).sum())
-                errs = []
+                errs, decoded = [], []
                 for j in range(near.shape[-1]):
+                    dec_j = ctx.decode_fp32(z0 + c1[near[..., j]])
                     rows_j, _m = k15t.weighted_row_error(
-                        ctx.decode_fp32(z0 + c1[near[..., j]]), action,
-                        ctx.weights_gate, torch)
+                        dec_j, action, ctx.weights_gate, torch)
                     errs.append(rows_j)
+                    decoded.append(dec_j)
                 stack = torch.stack(errs, 0)
                 best_j = stack.argmin(0)
+                sync()
+                t_cache += time.time() - tb0
                 rank_choice.append(best_j.cpu().numpy())
                 idx = best_j.view(-1, 1, 1).expand(-1, near.shape[1], 1)
                 best_code = near.gather(-1, idx).squeeze(-1)
 
+                # ДЕКОДЫ ПЕРЕИСПОЛЬЗУЮТСЯ: ранг 0 — это и есть путь
+                # токенизатора, а лучший ранг — путь a1_rank. Прежде они
+                # декодировались по второму разу, и инвариант «ранг 1 =
+                # a1_tok» опирался на детерминированность декодера; теперь
+                # это один и тот же тензор.
+                dec_stack = torch.stack(decoded, 0)
+                rows_idx = torch.arange(len(sel), device=best_j.device)
                 lat = dict(
-                    a0=z0, a1_tok=z0 + c1_tok, a1_rank=z0 + c1[best_code],
-                    a1_pol=z0 + c1_pol, a1_soft=z0.float() + soft1,
+                    a0=z0, a1_pol=z0 + c1_pol, a1_soft=z0.float() + soft1,
                     a2_tok=z0 + hard_c1 + c2_tok,
                     a2_pol=out["cumulative_latents"][2])
                 w = float(len(sel))
                 n_rows += len(sel)
-                acts, means = {}, {}
-                for nm, z in lat.items():
-                    acts[nm] = ctx.decode_fp32(z)
+                acts = {"a1_tok": decoded[0],
+                        "a1_rank": dec_stack[best_j, rows_idx]}
+                lat["a1_tok"] = z0 + c1_tok
+                lat["a1_rank"] = z0 + c1[best_code]
+                means = {}
+                for nm in PATHS:
+                    if nm not in acts:
+                        acts[nm] = ctx.decode_fp32(lat[nm])
                     _rows, mean = k15t.weighted_row_error(
                         acts[nm], action, ctx.weights_gate, torch)
                     means[nm] = float(mean)
@@ -508,12 +734,17 @@ def main():
                 # ИНВАРИАНТ: ранг 1 — это и есть путь токенизатора, и он
                 # проверяется на КАЖДОМ батче, а не на первом.
                 r1_mean = float(stack[0].mean())
-                if abs(r1_mean - means["a1_tok"]) / max(
-                        means["a1_tok"], 1e-12) > 1e-9:
+                if r1_mean != means["a1_tok"]:
                     raise SystemExit(
                         f"ранг 1 дал {r1_mean!r}, путь токенизатора "
-                        f"{means['a1_tok']!r}: кандидаты собраны не из того "
-                        f"кода")
+                        f"{means['a1_tok']!r}: это один и тот же тензор, "
+                        f"расхождение невозможно")
+                best_mean = float(stack.min(0).values.mean())
+                if abs(best_mean - means["a1_rank"]) / max(
+                        means["a1_rank"], 1e-12) > 1e-9:
+                    raise SystemExit(
+                        f"лучший ранг дал {best_mean!r}, путь a1_rank "
+                        f"{means['a1_rank']!r}: выбор ранга собран не так")
                 first_batch[0] = False
                 for nm in sup:
                     z = z_e if nm == "reference" else lat[nm]
@@ -534,13 +765,24 @@ def main():
                 agree += rd["agree_top1"] * w
                 recall3 += rd["recall_at3"] * w
                 recall10 += rd["recall_at10"] * w
-        elapsed = time.time() - t0
+                sync()
+                t_total += time.time() - tb0
+        elapsed = t_total
         n = max(n_rows, 1)
         res = {f"rms_{k}": float(np.sqrt(v / n)) for k, v in acc.items()}
+        nb = max(len(chosen_batches), 1)
         res.update(rows=n_rows, seconds=float(elapsed),
-                   seconds_per_batch=float(
-                       elapsed / max(len(chosen_batches), 1)),
-                   rank1_flips_vs_topk=int(rank_flips))
+                   seconds_per_batch=float(elapsed / nb),
+                   cache_seconds=float(t_cache),
+                   cache_seconds_per_batch=float(t_cache / nb),
+                   cache_timing_note=(
+                       "cache_* измеряет только операции построителя кэша: "
+                       "проход, кодирование действия, расстояния, кандидаты, "
+                       "их декодирование и выбор ранга. Полное время probe "
+                       "включает ещё пять путей, пять замеров опоры и "
+                       "агрегацию на хосте"),
+                   decodes_per_batch=int(a.topk) + len(PATHS) - 2,
+                   rank1_flips_vs_tokenizer_argmin=int(rank_flips))
         ref = torch.cat(sup["reference"])
         ref_p95 = float(torch.quantile(ref, 0.95))
         ref_p99 = float(torch.quantile(ref, 0.99))
@@ -641,8 +883,15 @@ def main():
         print(f"    {r['seconds_per_batch']:.2f} с/батч")
 
     # --- ВЫБОР: СНАЧАЛА ЦЕЛЬ КНИГИ, ПОТОМ ГЕЙТЫ ЕЁ ПУТИ -----------------
-    per_batch = max(r["seconds_per_batch"] for r in per_state.values())
-    cache_hours = per_batch * len(ctx.parts_full["train"]) / 3600.0
+    # ПРОЕКЦИЯ КЭША — ПО ЕГО СОБСТВЕННОМУ ТАЙМЕРУ. Полное время probe
+    # включает диагностику, которой у построителя кэша нет, и порог
+    # бюджета стоит рядом: завышение прямо меняет выбранную цель.
+    per_batch_cache = max(r["cache_seconds_per_batch"]
+                          for r in per_state.values())
+    per_batch_total = max(r["seconds_per_batch"] for r in per_state.values())
+    n_train = len(ctx.parts_full["train"])
+    cache_hours = per_batch_cache * n_train / 3600.0
+    probe_hours_equivalent = per_batch_total * n_train / 3600.0
     table = {}
     for tag, r in per_state.items():
         dec = target_decision(r["relative_gain_rank_over_latent"],
@@ -672,7 +921,9 @@ def main():
               f"{('ok' if t['range_passed'] else 'ОТКАЗ'):>9} "
               f"{('да' if t['admissible'] else 'НЕТ'):>10}")
     print(f"    полный кэш train оценён в {cache_hours:.1f} ч при бюджете "
-          f"{CACHE_BUDGET_HOURS:.1f} ч")
+          f"{CACHE_BUDGET_HOURS:.1f} ч ({per_batch_cache:.2f} с/батч по "
+          f"таймеру кэша; по полному времени probe вышло бы "
+          f"{probe_hours_equivalent:.1f} ч — это НЕ стоимость кэша)")
 
     admissible = {t: v for t, v in table.items() if v["admissible"]}
     unconstrained = min(table, key=lambda t: (
@@ -732,12 +983,16 @@ def main():
                     exist_ok=True)
         tmp = a.out_c1 + f".tmp.{os.getpid()}"
         torch.save(payload, tmp)
-        os.replace(tmp, a.out_c1)
-        back = torch.load(a.out_c1, map_location="cpu", weights_only=False)
+        # ПРОВЕРКА ДО `os.replace`, А НЕ ПОСЛЕ: иначе испорченный файл уже
+        # занял бы канонический путь, а отказ случился бы после.
+        back = torch.load(tmp, map_location="cpu", weights_only=False)
         if not torch.equal(back["c1"], c1_sel) or back["c1_sha1"] != c1_sha:
+            os.unlink(tmp)
             raise SystemExit("книга после обратного чтения отличается")
         if back.get("accepted") is not True:
+            os.unlink(tmp)
             raise SystemExit("в файле книги нет accepted=True")
+        os.replace(tmp, a.out_c1)
         c1_written = os.path.abspath(a.out_c1)
         print(f"  книга сохранена: {a.out_c1} ({c1_sha}), accepted=True")
     elif kind == "k15_smoke":
@@ -749,7 +1004,10 @@ def main():
                 "cache_hours", "c1_file", "c1_sha1", "codec", "code_version",
                 "q0_prov", "joint_sha1", "git_head", "git_dirty",
                 "frozen_content_sha", "target_rule", "cache_budget_hours",
-                "not_a_full_oracle", "rankpath_definition"}
+                "not_a_full_oracle", "rankpath_definition",
+                "cache_seconds_per_batch", "probe_hours_equivalent",
+                "probe_seconds_per_batch", "train_batches_in_plan",
+                "state_info", "books", "archived", "frozen_scope"}
     clash = sorted(set(ctx.gate_info) & own_keys)
     if clash:
         raise SystemExit(f"ключи {clash} из gate_info сталкиваются с полями "
@@ -764,13 +1022,29 @@ def main():
         rankpath_definition=(
             "траектория j берёт j-й по близости код НА КАЖДОЙ позиции чанка; "
             "по строке выбирается лучший НОМЕР РАНГА. Кандидаты на позицию "
-            "различны, первый — исполняемый код модели"),
+            "различны. ПЕРВЫЙ — ЛАТЕНТНЫЙ ARGMIN ТОКЕНИЗАТОРА, а не "
+            "исполняемый код модели: исполняемый код это pred_codes[1], он "
+            "участвует только в пути a1_pol. Поэтому инвариант ранга 1 — "
+            "совпадение с a1_tok"),
+        frozen_scope=(
+            "frozen_content_sha обходит ТОЛЬКО модель: backbone, q0, C0, "
+            "нормы и головы. Декодер в неё не входит, он заверяется "
+            "отдельно тремя отпечатками кодека (codebooks_sha1, "
+            "codec_state_sha1, decoder_probe). Совокупный контракт "
+            "покрывает оба, один frozen SHA — нет"),
         not_a_full_oracle=(
             "§50.2 этим НЕ закрыт по двум причинам: лучший по действию код "
             "может лежать вне топ-k ближайших латентных строк, и смеси "
             "рангов по позициям (k^T вариантов) не перебираются вовсе"),
         per_state=per_state, table=table, selection=selection,
+        state_info=state_info,
+        books={sha: tags for sha, tags in books.items()},
+        archived={k: v for k, v in archived.items() if v},
         cache_hours=float(cache_hours),
+        cache_seconds_per_batch=float(per_batch_cache),
+        probe_hours_equivalent=float(probe_hours_equivalent),
+        probe_seconds_per_batch=float(per_batch_total),
+        train_batches_in_plan=int(n_train),
         cache_budget_hours=CACHE_BUDGET_HOURS,
         target_rule=[dict(below=t if np.isfinite(t) else None, choice=c,
                           why=w) for t, c, w in TARGET_RULE],
@@ -788,6 +1062,13 @@ def main():
     print(f"  отчёт: {a.out}")
 
     if best is None:
+        # ПОСЛЕ ОТКАЗА КАНОНИЧЕСКОГО ФАЙЛА БЫТЬ НЕ ДОЛЖНО. Архивирование
+        # шло в начале, так что путь обязан быть свободен; проверяем, а не
+        # предполагаем.
+        if os.path.exists(a.out_c1):
+            raise SystemExit(
+                f"допустимой книги нет, но {a.out_c1} существует: его надо "
+                f"убрать, иначе следующий тренер загрузит непригодную книгу")
         print("\n  РЕШЕНИЕ: допустимой книги нет. По дереву остаётся "
               "восстановить эпоху 1 (2.2 ч обучения) и проверить, есть ли "
               "точка между качеством и опорой.")
