@@ -73,7 +73,7 @@ CAPTURE_MIN = 0.20
 # проверку вывода и короткий разведочный роллаут.
 PILOT_GAIN = 0.05
 OVERFIT_DROP = 0.67
-OVERFIT_WINDOWS = 6
+OVERFIT_CHECK_EVERY = 50
 DEFAULT_HEADS = ("h18_linear", "h24_linear", "h24_candidate")
 # Развёртываемая архитектура читает h24. h18-голова — абляция глубины: её
 # исход печатается, но ни успехом, ни отказом всего запуска не является.
@@ -169,6 +169,24 @@ def check_m2(m2, man, rows_val, smoke=False):
     if problems:
         return None, problems
     return float(cap_soft) + PILOT_GAIN, []
+
+
+def probe_rows(n_total, n_take):
+    """Строки пробы — РАВНОМЕРНО по всей части, а не первые подряд.
+
+    Первые строки плана — соседние кадры одних эпизодов: признаки у них
+    почти совпадают, а лучший ранг от кадра к кадру скачет. Такие
+    противоречивые почти-дубликаты не разделит никакая голова, и regret
+    упирается в плато — на smoke-кэше это выглядело как технический отказ
+    всех голов. Проба проверяет КОНВЕЙЕР, и эта помеха ей не нужна.
+    """
+    n_total, n_take = int(n_total), int(n_take)
+    if n_total <= 0 or n_take <= 0:
+        raise ValueError("нет строк для пробы")
+    if n_take >= n_total:
+        return np.arange(n_total)
+    return np.unique(np.linspace(0, n_total - 1, n_take).round()
+                     .astype(np.int64))
 
 
 def archive_working(path):
@@ -443,22 +461,42 @@ def train_head(head, inp_tr, costs_tr, inp_va, costs_va, draft_va,
     return history, states
 
 
-def overfit_probe(head, inp, idx, costs, torch, steps, lr, wd):
-    """Проба обучаемости на фиксированных строках, с восстановлением."""
+def overfit_probe(head, inp, idx, costs, torch, steps, lr, wd,
+                  check_every=OVERFIT_CHECK_EVERY, drop=OVERFIT_DROP):
+    """Проба конвейера на фиксированных строках, с восстановлением.
+
+    REGRET ИЗМЕРЯЕТСЯ ТОЧНО, А НЕ СРЕДНИМ ПО ОКНУ: до первого шага и в
+    контрольных точках, на том же батче, без градиента. Прежняя версия
+    сравнивала средние по окнам, и первое окно уже содержало большую часть
+    падения — на smoke-кэше это дало отношение 0.71-0.84 при hard-затрате,
+    упавшей вдвое, то есть ложный технический отказ всех голов.
+
+    Проба ОСТАНАВЛИВАЕТСЯ, как только regret опустился до `drop` от
+    начального; `steps` — бюджет, а не обязательная длина. Argmax
+    становится верным раньше, чем softmax сосредотачивается, поэтому
+    фиксированная короткая проба меряла скорость сжатия распределения, а не
+    исправность конвейера.
+    """
     import k15c_rank_selector as rs
     dev = inp.device
     snap = {k: v.detach().clone() for k, v in head.state_dict().items()}
     c = torch.as_tensor(np.asarray(costs[idx], np.float32), device=dev)
     kw = inp.batch(idx)
-    head.eval()
-    with torch.no_grad():
-        s0 = head(**kw).detach().clone()
+
+    def exact():
+        head.eval()
+        with torch.no_grad():
+            sc = head(**kw)
+            return (float(rs.expected_regret(sc, c, torch)), sc.detach())
+
+    r0, s0 = exact()
+    s0 = s0.clone()
     hard_before = float(rs.hard_selected_cost(s0, c, torch)[0].mean())
     opt = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=wd)
-    trace, win = [], []
-    finite, grad_nonzero = True, False
-    head.train()
+    trace = [r0]
+    finite, grad_nonzero, used = bool(np.isfinite(r0)), False, 0
     for st in range(1, int(steps) + 1):
+        head.train()
         loss = rs.expected_regret(head(**kw), c, torch)
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -469,22 +507,26 @@ def overfit_probe(head, inp, idx, costs, torch, steps, lr, wd):
             finite = finite and bool(np.isfinite(gn))
             grad_nonzero = bool(gn > 0.0)
         opt.step()
-        win.append(float(loss.detach()))
-        if st % max(int(steps) // OVERFIT_WINDOWS, 1) == 0:
-            trace.append(float(np.mean(win)))
-            win = []
-    head.eval()
-    with torch.no_grad():
-        s1 = head(**kw)
+        used = st
+        if st % int(check_every) == 0 or st == int(steps):
+            r, _ = exact()
+            trace.append(r)
+            finite = finite and bool(np.isfinite(r))
+            if r <= drop * r0 + 1e-12 or not finite:
+                break
+    _r, s1 = exact()
     hard_after = float(rs.hard_selected_cost(s1, c, torch)[0].mean())
     changed = any(not torch.equal(v, snap[k])
                   for k, v in head.state_dict().items())
     head.load_state_dict(snap)
-    with torch.no_grad():
-        s2 = head(**kw)
-    return probe_verdict(trace, hard_before, hard_after, changed,
-                         bool(torch.equal(s2, s0)), finite=finite,
-                         grad_nonzero=grad_nonzero)
+    _r2, s2 = exact()
+    out = probe_verdict(trace, hard_before, hard_after, changed,
+                        bool(torch.equal(s2, s0)), finite=finite,
+                        grad_nonzero=grad_nonzero, drop=drop)
+    out.update(steps_used=int(used), steps_budget=int(steps),
+               lr=float(lr), measured="exact, before training and at "
+                                      "checkpoints, same batch, no grad")
+    return out
 
 
 def selftest():
@@ -627,6 +669,20 @@ def selftest():
     assert check_m2(dict(m2_t, c1_sha1="ИНАЯ"), man_t, rows_v,
                     smoke=True)[0] is None
 
+    # --- СТРОКИ ПРОБЫ: РАВНОМЕРНО ПО ЧАСТИ -----------------------------
+    pr = probe_rows(121100, 64)
+    assert len(pr) == 64 and pr[0] == 0 and pr[-1] == 121099, pr[[0, -1]]
+    assert np.all(np.diff(pr) > 1000), "строки пробы идут подряд"
+    assert probe_rows(10, 64).tolist() == list(range(10))
+    assert len(set(probe_rows(100, 64).tolist())) == 64
+    for bad in ((0, 64), (10, 0)):
+        try:
+            probe_rows(*bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"принято {bad}")
+
     # --- АРХИВ ПРЕЖНЕГО РАБОЧЕГО ЧЕКПОЙНТА ------------------------------
     import tempfile
     with tempfile.TemporaryDirectory() as td:
@@ -749,8 +805,10 @@ def main():
     # запоминает любая исправная голова. Неумение запомнить сотни
     # неоднозначных строк было бы научным результатом, а не поломкой.
     ap.add_argument("--overfit-rows", type=int, default=64)
-    ap.add_argument("--overfit-steps", type=int, default=300)
-    ap.add_argument("--overfit-lr", type=float, default=3e-3)
+    # БЮДЖЕТ, А НЕ ДЛИНА: проба останавливается, как только regret упал до
+    # OVERFIT_DROP от начального. На 64 строках 2000 шагов — секунды.
+    ap.add_argument("--overfit-steps", type=int, default=2000)
+    ap.add_argument("--overfit-lr", type=float, default=1e-2)
     ap.add_argument("--out", default="data/k15c/selectors")
     ap.add_argument("--summary", default="")
     ap.add_argument("--overwrite", action="store_true")
@@ -928,11 +986,13 @@ def main():
         n_par = sum(p.numel() for p in head.parameters())
         print(f"\n  {name}: {n_par} параметров, вход {src}")
         path = os.path.join(a.out, f"{name}{tag}_s{a.seed}.pt")
-        probe_idx = np.arange(min(int(a.overfit_rows), len(tr["costs"])))
+        probe_idx = probe_rows(len(tr["costs"]), int(a.overfit_rows))
         pv = overfit_probe(head, inp_tr, probe_idx, tr["costs"], torch,
                            steps=int(a.overfit_steps), lr=float(a.overfit_lr),
                            wd=0.0)
-        print(f"    проба обучаемости на {len(probe_idx)} строках: regret "
+        pv["rows"] = [int(x) for x in probe_idx]
+        print(f"    проба обучаемости на {len(probe_idx)} строках, "
+              f"{pv['steps_used']} шагов из {pv['steps_budget']}: regret "
               f"{pv['first']:.4e} -> {pv['last']:.4e} (отношение "
               f"{pv['ratio']:.3f}), hard {pv['hard_before']:.4e} -> "
               f"{pv['hard_after']:.4e}; "
