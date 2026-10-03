@@ -18,6 +18,15 @@
 Первые две нужны для сравнения глубин: польза h24 против h18 — прямой
 ответ на вопрос, добавляют ли слои 19-24 селективную информацию.
 
+СЛЕДУЮЩАЯ ДЕШЁВАЯ ГОЛОВА, если первые не возьмут порог — `h24_positional`,
+а не пулинг вниманием. `h24_candidate` и `h24_candidate_attn` сравнивают
+УСРЕДНЁННЫЙ по позициям h24 с УСРЕДНЁННЫМ эмбеддингом пути и не
+сопоставляют позицию с позицией. Позиционная голова считает совместимость
+каждой пары (t, j) — проекция h24[t] против проекции C1[code[t, j]] — и
+лишь потом агрегирует по 16 позициям; к этому добавлены признаки
+лог-вероятностей и ЯВНОЕ смещение по номеру ранга. Эквивариантной она
+поэтому не является — и не должна: номер ранга здесь признак по замыслу.
+
 ПУЛИНГ ДЕЛАЕТСЯ ДО ОБУЧЕНИЯ, И ЭТО ТОЧНО, А НЕ ПРИБЛИЖЁННО. LayerNorm с
 обучаемым аффинным преобразованием коммутирует со средним по позициям:
 
@@ -48,7 +57,12 @@ import numpy as np
 N_CAND = 8
 LN_EPS = 1e-5                  # безаффинная норма до пулинга, фиксирована
 N_SCORE_FEATURES = 5
-HEADS = ("h18_linear", "h24_linear", "h24_candidate", "h24_candidate_attn")
+HEADS = ("h18_linear", "h24_linear", "h24_candidate", "h24_candidate_attn",
+         "h24_positional")
+# Головы, которым нужен ПОЛНЫЙ h24 [B, 16, D], а не готовый пулинг.
+NEEDS_FULL_H24 = ("h24_candidate_attn", "h24_positional")
+# Головы, которым нужна сама книга C1 (поиск строк по кодам внутри головы).
+NEEDS_BOOK = ("h24_positional",)
 
 
 def ln_mean_pool(h, torch, eps=LN_EPS):
@@ -93,8 +107,12 @@ def candidate_embeddings(top_codes, book, torch):
 
 
 def build_head(name, d_model, e_dim, torch, proj=128, feat_mean=None,
-               feat_std=None):
-    """Фабрика головы по имени. Все головы возвращают [B, 8]."""
+               feat_std=None, book=None):
+    """Фабрика головы по имени. Все головы возвращают [B, 8].
+
+    Все головы принимают один и тот же набор именованных входов (ctx,
+    cand_emb, cand_feat, h_full, cand_codes) и берут из него своё.
+    """
     nn = torch.nn
 
     class LinearHead(nn.Module):
@@ -149,7 +167,7 @@ def build_head(name, d_model, e_dim, torch, proj=128, feat_mean=None,
             return ctx * self.gamma + self.beta
 
         def forward(self, ctx=None, cand_emb=None, cand_feat=None,
-                    h_full=None):
+                    h_full=None, **_kw):
             c = self.ctx_proj(self.pooled(ctx, h_full))           # [B, P]
             e = self.cand_proj(self.cand_norm(cand_emb.float()))   # [B,8,P]
             f = self.feat_proj((cand_feat.float() - self.feat_mean)
@@ -157,8 +175,56 @@ def build_head(name, d_model, e_dim, torch, proj=128, feat_mean=None,
             z = torch.cat([c.unsqueeze(1).expand_as(e), e, f], dim=-1)
             return self.mlp(z).squeeze(-1)                          # [B, 8]
 
+    class PositionalHead(nn.Module):
+        """Совместимость h24[t] с кодом кандидата в позиции t, по парам."""
+
+        def __init__(self):
+            super().__init__()
+            if book is None:
+                raise ValueError("позиционной голове нужна книга C1")
+            # КНИГА — НЕСОХРАНЯЕМЫЙ БУФЕР: она заморожена и сверяется по
+            # отпечатку снаружи, а в чекпойнте головы её копия была бы
+            # вторым, неподконтрольным источником.
+            self.register_buffer("book", book.detach().float().clone(),
+                                 persistent=False)
+            self.gamma = nn.Parameter(torch.ones(d_model))
+            self.beta = nn.Parameter(torch.zeros(d_model))
+            self.h_proj = nn.Linear(d_model, proj)
+            self.code_norm = nn.LayerNorm(e_dim)
+            self.code_proj = nn.Linear(e_dim, proj)
+            fm = (torch.zeros(N_SCORE_FEATURES) if feat_mean is None
+                  else torch.as_tensor(feat_mean, dtype=torch.float32))
+            fs = (torch.ones(N_SCORE_FEATURES) if feat_std is None
+                  else torch.as_tensor(feat_std, dtype=torch.float32))
+            self.register_buffer("feat_mean", fm.clone())
+            self.register_buffer("feat_std", fs.clamp_min(1e-6).clone())
+            self.rank_bias = nn.Parameter(torch.zeros(N_CAND))
+            self.mlp = nn.Sequential(
+                nn.Linear(2 + N_SCORE_FEATURES, proj), nn.GELU(),
+                nn.Linear(proj, 1))
+            self.scale = float(proj) ** -0.5
+
+        def forward(self, h_full=None, cand_codes=None, cand_feat=None,
+                    **_kw):
+            import torch.nn.functional as F
+            if h_full is None or cand_codes is None:
+                raise ValueError("позиционной голове нужны h_full и "
+                                 "cand_codes")
+            x = F.layer_norm(h_full.float(), (d_model,), eps=LN_EPS)
+            x = self.h_proj(x * self.gamma + self.beta)            # [B,T,P]
+            e = self.code_proj(self.code_norm(
+                self.book[cand_codes.long()]))                     # [B,T,K,P]
+            compat = (x.unsqueeze(2) * e).sum(-1) * self.scale     # [B,T,K]
+            agg = torch.stack([compat.mean(1), compat.max(1).values],
+                              dim=-1)                              # [B,K,2]
+            f = (cand_feat.float() - self.feat_mean) / self.feat_std
+            z = torch.cat([agg, f], dim=-1)
+            return self.mlp(z).squeeze(-1) + self.rank_bias        # [B,K]
+
     if name in ("h18_linear", "h24_linear"):
         return LinearHead()
+    if name == "h24_positional":
+        return PositionalHead()
     if name == "h24_candidate":
         return CandidateHead(attn=False)
     if name == "h24_candidate_attn":
@@ -235,19 +301,46 @@ def selftest():
     ctx = torch.randn(B, D)
     cf = candidate_score_features(torch.randn(B, T, 8), torch)
     for name in HEADS:
-        head = build_head(name, D, E, torch, proj=16).eval()
-        kw = dict(ctx=ctx, cand_emb=ce, cand_feat=cf, h_full=h)
+        head = build_head(name, D, E, torch, proj=16, book=book).eval()
+        kw = dict(ctx=ctx, cand_emb=ce, cand_feat=cf, h_full=h,
+                  cand_codes=codes)
         s = head(**kw)
         assert s.shape == (B, 8) and torch.isfinite(s).all(), (name, s.shape)
         # СТРОКИ БАТЧА НЕ СМЕШИВАЮТСЯ: оценка строки не зависит от соседей
         s1 = head(ctx=ctx[1:2], cand_emb=ce[1:2], cand_feat=cf[1:2],
-                  h_full=h[1:2])
+                  h_full=h[1:2], cand_codes=codes[1:2])
         assert torch.allclose(s1, s[1:2], atol=1e-5), name
         if "candidate" in name:
             p = torch.randperm(8)
             sp = head(ctx=ctx, cand_emb=ce[:, p], cand_feat=cf[:, p],
-                      h_full=h)
+                      h_full=h, cand_codes=codes[..., p])
             assert torch.allclose(sp, s[:, p], atol=1e-5), name
+    # ПОЗИЦИОННАЯ ГОЛОВА ДЕЙСТВИТЕЛЬНО СМОТРИТ ПОЗИЦИЮ НА ПОЗИЦИЮ: если
+    # переставить ПОЗИЦИИ у h24 и не переставить у кодов, оценки меняются,
+    # а при согласованной перестановке среднее совместимостей сохраняется
+    pos = build_head("h24_positional", D, E, torch, proj=16,
+                     book=book).eval()
+    with torch.no_grad():
+        for prm in pos.parameters():
+            prm.normal_(0.0, 0.5)
+    base = pos(h_full=h, cand_codes=codes, cand_feat=cf)
+    pt = torch.randperm(T)
+    same = pos(h_full=h[:, pt], cand_codes=codes[:, pt], cand_feat=cf)
+    assert torch.allclose(same, base, atol=1e-4), "согласованная перестановка"
+    mixed = pos(h_full=h[:, pt], cand_codes=codes, cand_feat=cf)
+    assert not torch.allclose(mixed, base, atol=1e-3), "позиции не видны"
+    try:
+        build_head("h24_positional", D, E, torch)
+    except ValueError as e:
+        assert "книга" in str(e), e
+    else:
+        raise AssertionError("позиционная голова собрана без книги")
+    # КНИГА НЕ ПОПАДАЕТ В СОСТОЯНИЕ
+    assert "book" not in pos.state_dict()
+    other_p = build_head("h24_positional", D, E, torch, proj=16, book=book)
+    other_p.load_state_dict(pos.state_dict())
+    assert torch.equal(other_p(h_full=h, cand_codes=codes, cand_feat=cf),
+                       base)
     # ЛИНЕЙНАЯ ГОЛОВА ЭКВИВАРИАНТНОЙ НЕ ЯВЛЯЕТСЯ — и не должна: она выдаёт
     # оценку НОМЕРУ ранга, это и есть её отличие от candidate
     try:

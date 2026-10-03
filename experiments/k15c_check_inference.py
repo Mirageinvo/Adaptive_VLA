@@ -25,8 +25,9 @@
 ОШИБКА ДЕКОДА СВЕРЯЕТСЯ С ДОПУСКОМ, А НЕ ПОБИТОВО. В кэше каждый ранг
 декодировался целым батчем, здесь в одном батче смешаны разные ранги, а
 декодер не строго независим по строкам: в K-15 измерено расхождение
-порядка 4e-6 при другом составе батча. Коды и выбор — побитово, действие —
-с допуском COST_REL.
+порядка 4e-6 при другом составе батча. Коды и выбор — побитово, ошибка
+строки — по правилу |live - cached| <= COST_ATOL + COST_RTOL * |cached|,
+с записью и абсолютного, и относительного максимума.
 
 ПУЛИНГ — ПО h24, ПРИВЕДЁННОМУ К fp16, как в кэше. Голова обучалась на
 сохранённом в fp16 состоянии, и путь вывода определён так же; построитель
@@ -46,16 +47,30 @@ import numpy as np
 
 LOGPROB_ABS = 1e-5
 SCORE_ABS = 1e-4
-COST_REL = 1e-4
+# ОШИБКА СТРОКИ СВЕРЯЕТСЯ КАК |live - cached| <= ATOL + RTOL * |cached|.
+# Только относительная мера ломалась бы на строке с почти нулевой MSE:
+# безобидное абсолютное расхождение декодера (порядка 4e-6 в действии, то
+# есть порядка 1e-8..1e-6 в MSE строки) давало бы там огромную долю.
+COST_RTOL = 1e-4
+COST_ATOL = 1e-7
 RMS_REL = 1e-5
 
 
-def compare_rows(live, cached, rel):
-    """Наибольшее относительное расхождение и число строк за пределом."""
+def compare_rows(live, cached, rtol=COST_RTOL, atol=COST_ATOL):
+    """(макс. абсолютное, макс. относительное, строк за пределом).
+
+    Предел — atol + rtol * |cached|, как в numpy.isclose. Оба максимума
+    записываются: по одному абсолютному не видно масштаба, по одному
+    относительному — ложных тревог на почти нулевых строках.
+    """
     lv = np.asarray(live, np.float64)
     cv = np.asarray(cached, np.float64)
-    r = np.abs(lv - cv) / np.maximum(np.abs(cv), 1e-12)
-    return float(r.max()) if r.size else 0.0, int((r > rel).sum())
+    if lv.size == 0:
+        return 0.0, 0.0, 0
+    d = np.abs(lv - cv)
+    rel = d / np.maximum(np.abs(cv), 1e-12)
+    over = int((d > atol + rtol * np.abs(cv)).sum())
+    return float(d.max()), float(rel.max()), over
 
 
 def roundtrip_verdict(checks):
@@ -66,11 +81,18 @@ def roundtrip_verdict(checks):
 
 
 def selftest():
-    m, n = compare_rows([1.0, 2.0, 3.0001], [1.0, 2.0, 3.0], 1e-4)
-    assert n == 0 and m < 1e-4, (m, n)
-    m, n = compare_rows([1.0, 2.1], [1.0, 2.0], 1e-4)
-    assert n == 1 and abs(m - 0.05) < 1e-12, (m, n)
-    assert compare_rows([], [], 1e-4) == (0.0, 0)
+    a_, r_, n = compare_rows([1.0, 2.0, 3.0001], [1.0, 2.0, 3.0])
+    assert n == 0 and r_ < 1e-4 and abs(a_ - 1e-4) < 1e-9, (a_, r_, n)
+    a_, r_, n = compare_rows([1.0, 2.1], [1.0, 2.0])
+    assert n == 1 and abs(r_ - 0.05) < 1e-12, (a_, r_, n)
+    assert compare_rows([], []) == (0.0, 0.0, 0)
+    # ПОЧТИ НУЛЕВАЯ СТРОКА: огромная относительная доля, но абсолютно
+    # безобидно — не считается расхождением
+    a_, r_, n = compare_rows([2e-8], [1e-9])
+    assert n == 0 and r_ > 10.0 and a_ < 1e-7, (a_, r_, n)
+    # а настоящее расхождение на той же строке ловится
+    a_, r_, n = compare_rows([5e-7], [1e-9])
+    assert n == 1, (a_, r_, n)
     v = roundtrip_verdict(dict(a=True, b=True))
     assert v["code"] == 0 and v["passed"]
     v = roundtrip_verdict(dict(a=True, b=False, c=False))
@@ -150,7 +172,8 @@ def main():
     c1 = model.depth_aligned_book(1)
     head = rs.build_head(head_name, int(sel_obj["d_model"]),
                          int(sel_obj["e_dim"]), torch,
-                         proj=int(sel_obj["proj"])).to(dev)
+                         proj=int(sel_obj["proj"]),
+                         book=c1.detach().float()).to(dev)
     head.load_state_dict(sel_obj["state"])
     head.eval()
 
@@ -177,9 +200,12 @@ def main():
         c_codes.astype(np.int64)), c1.detach().float().cpu(), torch)
     feat_c = rs.candidate_score_features(torch.from_numpy(
         np.array(c_lp, np.float32)), torch)
-    inp_c = tr.Inputs(torch, ctx_c, emb_c, feat_c,
-                      h_full=h24_c if head_name.endswith("_attn") else None,
-                      device=dev)
+    inp_c = tr.Inputs(
+        torch, ctx_c, emb_c, feat_c,
+        h_full=h24_c if head_name in rs.NEEDS_FULL_H24 else None,
+        device=dev,
+        cand_codes=(torch.from_numpy(c_codes.astype(np.int64))
+                    if head_name in rs.NEEDS_BOOK else None))
     scores_c = tr.scores_for(head, inp_c, np.arange(len(c_rows)), torch)
     eval_c = tr.evaluate_scores(scores_c, c_costs, c_draft, c_teacher)
     pick_c = scores_c.argmax(1)
@@ -190,7 +216,8 @@ def main():
     q0_dev = torch.as_tensor(np.asarray(ctx.q0_can), device=dev)
     ac16 = torch.autocast(device_type=dev.type, dtype=ctx.dt)
     stats = dict(code_mismatch=0, lp_max=0.0, score_max=0.0,
-                 pick_mismatch=0, cost_max=0.0, cost_over=0, draft_max=0.0,
+                 pick_mismatch=0, cost_abs_max=0.0, cost_rel_max=0.0,
+                 cost_over=0, draft_abs_max=0.0, draft_rel_max=0.0,
                  draft_over=0)
     live_sel = np.full(len(c_rows), np.nan)
     sup_sel, sup_ref, abs_act = [], [], []
@@ -224,7 +251,7 @@ def main():
             kw = dict(ctx=rs.ln_mean_pool(h24s, torch),
                       cand_emb=rs.candidate_embeddings(top8, c1, torch),
                       cand_feat=rs.candidate_score_features(lp8, torch),
-                      h_full=h24s)
+                      h_full=h24s, cand_codes=top8)
             sc = head(**kw).float()
             stats["score_max"] = max(stats["score_max"], float(
                 np.abs(sc.cpu().numpy() - scores_c[ii]).max()))
@@ -245,13 +272,14 @@ def main():
                 ctx.decode_fp32(z0), action, ctx.weights_gate, torch)
             rl = rows_sel.cpu().numpy()
             live_sel[ii] = rl
-            m_c, o_c = compare_rows(
-                rl, c_costs[ii, pick.cpu().numpy()], COST_REL)
-            stats["cost_max"] = max(stats["cost_max"], m_c)
+            ac_, rc_, o_c = compare_rows(rl, c_costs[ii,
+                                                     pick.cpu().numpy()])
+            stats["cost_abs_max"] = max(stats["cost_abs_max"], ac_)
+            stats["cost_rel_max"] = max(stats["cost_rel_max"], rc_)
             stats["cost_over"] += o_c
-            m_d, o_d = compare_rows(rows_d.cpu().numpy(), c_draft[ii],
-                                    COST_REL)
-            stats["draft_max"] = max(stats["draft_max"], m_d)
+            ad_, rd_, o_d = compare_rows(rows_d.cpu().numpy(), c_draft[ii])
+            stats["draft_abs_max"] = max(stats["draft_abs_max"], ad_)
+            stats["draft_rel_max"] = max(stats["draft_rel_max"], rd_)
             stats["draft_over"] += o_d
             z_e = cb.codec_encode(ctx, action)
             sup_sel.append(k15t.decoder_support(
@@ -306,9 +334,12 @@ def main():
           f"лог-вероятности до {stats['lp_max']:.1e}; логиты головы до "
           f"{stats['score_max']:.1e}; выбор расходится в "
           f"{stats['pick_mismatch']} строках")
-    print(f"    ошибка выбранного пути против кэша: до {stats['cost_max']:.1e}"
-          f" относительно, за пределом {COST_REL} — {stats['cost_over']} "
-          f"строк; черновик до {stats['draft_max']:.1e}")
+    print(f"    ошибка выбранного пути против кэша: до "
+          f"{stats['cost_abs_max']:.1e} абсолютно и "
+          f"{stats['cost_rel_max']:.1e} относительно; за пределом "
+          f"{COST_ATOL:g} + {COST_RTOL:g}*|кэш| — {stats['cost_over']} "
+          f"строк; черновик до {stats['draft_abs_max']:.1e} абсолютно, "
+          f"за пределом {stats['draft_over']}")
     frozen_s = ("не двигалось" if checks["frozen_unchanged"]
                 else "ИЗМЕНИЛОСЬ")
     print(f"    опора p95 {p95_sel:.4f} при эталоне {p95_ref:.4f} на тех же "
@@ -326,7 +357,8 @@ def main():
                             n=int(s_sel.numel())),
                range=dict(p99_candidate=p99, absmax_candidate=amax, **rng_),
                tolerances=dict(logprob_abs=LOGPROB_ABS, score_abs=SCORE_ABS,
-                               cost_rel=COST_REL, rms_rel=RMS_REL),
+                               cost_rtol=COST_RTOL, cost_atol=COST_ATOL,
+                               rms_rel=RMS_REL),
                decodes_per_batch_at_inference=1,
                cache_manifest_sha1=cb.sha_file(
                    os.path.join(a.rank_cache, "manifest.json")),

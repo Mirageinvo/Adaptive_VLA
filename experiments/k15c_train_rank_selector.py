@@ -12,8 +12,11 @@ q1 и backbone заморожены), поэтому прогон занимае
     h24_linear     — главный sanity baseline
     h24_candidate  — предлагаемая архитектура
 
-Одна дополнительная попытка разрешена только если ни одна не взяла порог:
-`--heads h24_candidate_attn` (пулинг вниманием вместо среднего).
+Если ни одна не взяла порог, следующая дешёвая голова на том же кэше —
+`--heads h24_positional`: совместимость h24[t] с кодом кандидата в позиции
+t по каждой паре (t, j), а не усреднённого с усреднённым. Пулинг вниманием
+(`h24_candidate_attn`) этого сопоставления не даёт и потому не основной
+следующий вариант.
 
 ФУНКЦИЯ ПОТЕРЬ — ОЖИДАЕМЫЙ REGRET ПО ИСХОДНЫМ ЗАТРАТАМ:
 
@@ -31,15 +34,27 @@ val_sel: argmax оценок, его затрата, корень из сред�
 приводится только как диагностика и по ней ничего не решается; переводить
 её в долю разрыва аналитической формулой нельзя.
 
-ПРОБА ОБУЧАЕМОСТИ ПЕРЕД ПОЛНЫМ ОБУЧЕНИЕМ. На фиксированных строках
-train regret обязан падать, hard-затрата — улучшиться, параметры —
-измениться, а логиты после восстановления снимка — совпасть побитово. Это
-проверка конвейера, а не научная достижимость; если проба не прошла, полное
-обучение не запускается и исход — код 3.
+ПРОБА КОНВЕЙЕРА ПЕРЕД ПОЛНЫМ ОБУЧЕНИЕМ, на 64 фиксированных строках train.
+Обязательно: всё конечно, градиент ненулевой, параметры изменились, снимок
+восстанавливается побитово, regret заметно упал. Монотонность и улучшение
+hard argmax — только диагностика: неумение запомнить неоднозначные строки
+было бы научным результатом, а не поломкой. Отказ пробы снимает ТОЛЬКО эту
+голову.
 
-КОДЫ: 0 — хотя бы одна голова взяла критерий; 4 — ни одна; 3 — проба
-обучаемости или нечисловые величины; провенанс кэша — отказ с текстом.
-Выбор делается на val_sel и помечается так; val_confirm не открывается.
+ДВА СТАТУСА ПОРОГА. Основной — зарегистрированные 0.20. Разведочный —
+доля разрыва мягкого пути M2 плюс 0.05 (около 11.9 %): он не доказывает
+архитектурный успех, а лишь оправдывает проверку вывода и короткий
+разведочный роллаут. Остальные условия у обоих одинаковы.
+
+РЕШАЮТ ТОЛЬКО h24-ГОЛОВЫ. h18_linear — абляция глубины: её исход
+печатается и пишется, но ни успехом, ни отказом запуска не является, и
+технический отказ одной головы не отменяет успех другой.
+
+КОДЫ: 0 — h24-голова взяла основной критерий; 6 — только разведочный
+(2 занят argparse, 5 в K-15 означал сбой схемы сводки); 4 — порогов нет;
+3 — ни одной технически оценённой h24-головы; провенанс кэша — отказ с
+текстом. Выбор делается на val_sel и помечается так; val_confirm не
+открывается.
 """
 import argparse
 import hashlib
@@ -51,9 +66,21 @@ import time
 import numpy as np
 
 CAPTURE_MIN = 0.20
+# РАЗВЕДОЧНЫЙ ПОРОГ — не научный критерий. Число = доля разрыва мягкого
+# пути M2 плюс 0.05: это порог сетки (k, tau) из M2, объявленный до данных
+# 03.10.2026. Его ПРИМЕНЕНИЕ к головам K-15c зарегистрировано до их
+# обучения. Он не доказывает архитектурный успех, а лишь оправдывает
+# проверку вывода и короткий разведочный роллаут.
+PILOT_GAIN = 0.05
 OVERFIT_DROP = 0.67
 OVERFIT_WINDOWS = 6
 DEFAULT_HEADS = ("h18_linear", "h24_linear", "h24_candidate")
+# Развёртываемая архитектура читает h24. h18-голова — абляция глубины: её
+# исход печатается, но ни успехом, ни отказом всего запуска не является.
+DEPLOYABLE_PREFIX = "h24_"
+# Коды исхода. 2 занят argparse (ошибка аргументов), 5 в K-15 означал сбой
+# схемы сводки, поэтому разведочный исход — 6.
+CODE_PRIMARY, CODE_PILOT, CODE_NONE, CODE_TECH = 0, 6, 4, 3
 
 
 def rms(costs):
@@ -139,18 +166,28 @@ def baselines(costs_val, draft, teacher, costs_train):
 
 
 def probe_verdict(trace, hard_before, hard_after, changed, restored_equal,
-                  drop=OVERFIT_DROP):
-    """Проба обучаемости: четыре условия, все обязательны."""
+                  finite=True, grad_nonzero=True, drop=OVERFIT_DROP):
+    """Проба конвейера. ТЕХНИЧЕСКАЯ, а не мера способности модели.
+
+    Обязательно: всё конечно, градиент ненулевой, параметры изменились,
+    снимок восстанавливается побитово, regret заметно упал. Монотонность и
+    улучшение hard argmax — диагностика: гладкий regret может падать при
+    неизменном argmax, и неумение головы запомнить неоднозначные строки —
+    научный результат, а не поломка.
+    """
     first, last = float(trace[0]), float(trace[-1])
     monotone = all(float(b) <= float(a) * (1.0 + 1e-3) + 1e-12
                    for a, b in zip(trace, trace[1:]))
     checks = dict(
-        regret_dropped=bool(last <= drop * first + 1e-12),
-        regret_monotone=bool(monotone),
-        hard_improved=bool(hard_after < hard_before),
+        finite=bool(finite) and all(np.isfinite(trace)),
+        grad_nonzero=bool(grad_nonzero),
         params_changed=bool(changed),
-        restore_exact=bool(restored_equal))
+        restore_exact=bool(restored_equal),
+        regret_dropped=bool(last <= drop * first + 1e-12))
+    diagnostics = dict(regret_monotone=bool(monotone),
+                       hard_improved=bool(hard_after < hard_before))
     return dict(passed=all(checks.values()), checks=checks,
+                diagnostics=diagnostics,
                 first=first, last=last, ratio=float(last / max(first, 1e-12)),
                 hard_before=float(hard_before), hard_after=float(hard_after),
                 trace=[float(x) for x in trace], required_drop=float(drop))
@@ -164,34 +201,68 @@ def select_epoch(history):
                                        int(h["epoch"])))
 
 
-def head_verdict(val, base, finite, reproducible, cap_min=CAPTURE_MIN):
-    """Критерий головы. Точность в нём не участвует."""
-    checks = dict(
-        capture_ok=bool(val.get("capture") is not None
-                        and float(val["capture"]) >= cap_min - 1e-12),
+def head_verdict(val, base, finite, reproducible, cap_min=CAPTURE_MIN,
+                 pilot_min=None):
+    """Критерий головы: основной и разведочный. Точность не участвует.
+
+    Общие условия у обоих: лучше ранга 0, лучше лучшего фиксированного
+    ранга, всё конечно, выбранное состояние воспроизводится. Различаются
+    только порогом доли разрыва.
+    """
+    cap = val.get("capture")
+    common = dict(
         better_than_rank0=bool(val["rms"] < base["fixed_rank0"]["rms"]),
         better_than_best_fixed=bool(
             val["rms"] < base["best_fixed_rank"]["rms"]),
         finite=bool(finite), reproducible=bool(reproducible))
-    return dict(passed=all(checks.values()), checks=checks,
-                capture_min=float(cap_min))
+    primary_cap = bool(cap is not None and float(cap) >= cap_min - 1e-12)
+    pilot_cap = (None if pilot_min is None else
+                 bool(cap is not None and float(cap) >= pilot_min - 1e-12))
+    primary = primary_cap and all(common.values())
+    pilot = (None if pilot_cap is None else
+             bool(pilot_cap and all(common.values())))
+    return dict(passed=bool(primary), primary_passed=bool(primary),
+                pilot_passed=pilot,
+                checks=dict(common, capture_primary=primary_cap,
+                            capture_pilot=pilot_cap),
+                capture_min=float(cap_min),
+                pilot_min=(None if pilot_min is None else float(pilot_min)))
 
 
-def overall_code(verdicts, technical_failures):
-    if technical_failures:
-        return 3
-    return 0 if any(v["passed"] for v in verdicts.values()) else 4
+def overall_code(results):
+    """Общий исход по головам. Решают ТОЛЬКО развёртываемые h24-головы.
+
+    0 — хотя бы одна h24-голова взяла основной критерий;
+    6 — основной не взят, но хотя бы одна взяла разведочный;
+    4 — хотя бы одна h24-голова технически оценена, порогов нет;
+    3 — ни одной технически оценённой h24-головы.
+    Технический отказ одной головы не отменяет успех другой, а h18 —
+    абляция и на код не влияет вовсе.
+    """
+    dep = {k: v for k, v in results.items()
+           if k.startswith(DEPLOYABLE_PREFIX)}
+    ok = {k: v for k, v in dep.items()
+          if v.get("trained") and not v.get("technical")}
+    if not ok:
+        return CODE_TECH
+    if any(v["verdict"]["primary_passed"] for v in ok.values()):
+        return CODE_PRIMARY
+    if any(v["verdict"].get("pilot_passed") for v in ok.values()):
+        return CODE_PILOT
+    return CODE_NONE
 
 
 class Inputs:
     """Входы головы по индексам строк. Держит тензоры на устройстве."""
 
     def __init__(self, torch, ctx, cand_emb, cand_feat, h_full=None,
-                 device="cpu"):
+                 device="cpu", cand_codes=None):
         self.torch = torch
         self.ctx = None if ctx is None else ctx.to(device)
         self.cand_emb = cand_emb.to(device)
         self.cand_feat = cand_feat.to(device)
+        self.cand_codes = (None if cand_codes is None
+                           else cand_codes.to(device))
         self.h_full = h_full           # memmap или тензор на CPU
         self.device = device
 
@@ -200,6 +271,8 @@ class Inputs:
         i = t.as_tensor(np.asarray(idx), device=self.device)
         kw = dict(ctx=None if self.ctx is None else self.ctx[i],
                   cand_emb=self.cand_emb[i], cand_feat=self.cand_feat[i])
+        if self.cand_codes is not None:
+            kw["cand_codes"] = self.cand_codes[i]
         if self.h_full is not None:
             srt = np.sort(np.asarray(idx))
             back = np.argsort(np.argsort(np.asarray(idx)))
@@ -290,11 +363,18 @@ def overfit_probe(head, inp, idx, costs, torch, steps, lr, wd):
     hard_before = float(rs.hard_selected_cost(s0, c, torch)[0].mean())
     opt = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=wd)
     trace, win = [], []
+    finite, grad_nonzero = True, False
     head.train()
     for st in range(1, int(steps) + 1):
         loss = rs.expected_regret(head(**kw), c, torch)
         opt.zero_grad(set_to_none=True)
         loss.backward()
+        finite = finite and bool(torch.isfinite(loss))
+        if st == 1:
+            gn = sum(float(p.grad.norm()) ** 2 for p in head.parameters()
+                     if p.grad is not None) ** 0.5
+            finite = finite and bool(np.isfinite(gn))
+            grad_nonzero = bool(gn > 0.0)
         opt.step()
         win.append(float(loss.detach()))
         if st % max(int(steps) // OVERFIT_WINDOWS, 1) == 0:
@@ -310,7 +390,8 @@ def overfit_probe(head, inp, idx, costs, torch, steps, lr, wd):
     with torch.no_grad():
         s2 = head(**kw)
     return probe_verdict(trace, hard_before, hard_after, changed,
-                         bool(torch.equal(s2, s0)))
+                         bool(torch.equal(s2, s0)), finite=finite,
+                         grad_nonzero=grad_nonzero)
 
 
 def selftest():
@@ -367,33 +448,78 @@ def selftest():
                - np.sqrt(costs.mean(1).mean())) < 1e-12
     assert b["majority_rank"]["rank"] in (0, 1, 2)
 
-    # --- ПРОБА, ВЫБОР ЭПОХИ, ИСХОД --------------------------------------
+    # --- ПРОБА: ОБЯЗАТЕЛЬНОЕ И ДИАГНОСТИКА ------------------------------
     pv = probe_verdict([1.0, 0.8, 0.6, 0.5, 0.4, 0.3], 0.9, 0.5, True, True)
     assert pv["passed"], pv
-    assert not probe_verdict([1.0, 0.9, 0.95, 0.5], 0.9, 0.5, True,
-                             True)["checks"]["regret_monotone"]
-    assert not probe_verdict([1.0, 0.9], 0.9, 0.5, True,
-                             True)["checks"]["regret_dropped"]
-    assert not probe_verdict([1.0, 0.5], 0.9, 0.9, True,
-                             True)["checks"]["hard_improved"]
+    # НЕМОНОТОННОСТЬ И НЕУЛУЧШЕННЫЙ argmax — ТОЛЬКО ДИАГНОСТИКА
+    nm = probe_verdict([1.0, 0.9, 0.95, 0.5], 0.9, 0.5, True, True)
+    assert nm["passed"] and not nm["diagnostics"]["regret_monotone"], nm
+    nh = probe_verdict([1.0, 0.5], 0.9, 0.9, True, True)
+    assert nh["passed"] and not nh["diagnostics"]["hard_improved"], nh
+    # ОБЯЗАТЕЛЬНЫЕ — каждое по отдельности валит пробу
+    assert not probe_verdict([1.0, 0.9], 0.9, 0.5, True, True)["passed"]
     assert not probe_verdict([1.0, 0.5], 0.9, 0.5, False, True)["passed"]
     assert not probe_verdict([1.0, 0.5], 0.9, 0.5, True, False)["passed"]
+    assert not probe_verdict([1.0, 0.5], 0.9, 0.5, True, True,
+                             finite=False)["passed"]
+    assert not probe_verdict([1.0, 0.5], 0.9, 0.5, True, True,
+                             grad_nonzero=False)["passed"]
+    assert not probe_verdict([1.0, float("nan")], 0.9, 0.5, True,
+                             True)["passed"]
+
+    # --- ВЫБОР ЭПОХИ ----------------------------------------------------
     hist = [dict(epoch=0, val=dict(rms=0.14)),
             dict(epoch=1, val=dict(rms=0.12)),
             dict(epoch=2, val=dict(rms=0.12))]
     assert select_epoch(hist)["epoch"] == 1
+
+    # --- КРИТЕРИЙ: ОСНОВНОЙ И РАЗВЕДОЧНЫЙ -------------------------------
     base = dict(fixed_rank0=dict(rms=0.143),
                 best_fixed_rank=dict(rms=0.143))
     good = dict(rms=0.12, capture=0.30)
-    assert head_verdict(good, base, True, True)["passed"]
-    assert not head_verdict(dict(rms=0.12, capture=0.19), base, True,
-                            True)["passed"]
-    assert not head_verdict(good, base, True, False)["passed"]
+    v = head_verdict(good, base, True, True, pilot_min=0.119)
+    assert v["primary_passed"] and v["pilot_passed"] and v["passed"], v
+    mid = head_verdict(dict(rms=0.13, capture=0.15), base, True, True,
+                       pilot_min=0.119)
+    assert not mid["primary_passed"] and mid["pilot_passed"], mid
+    low = head_verdict(dict(rms=0.14, capture=0.10), base, True, True,
+                       pilot_min=0.119)
+    assert not low["primary_passed"] and not low["pilot_passed"], low
+    # ОБЩИЕ УСЛОВИЯ ДЕРЖАТ И РАЗВЕДОЧНЫЙ: невоспроизводимое — не пилот
+    nr = head_verdict(dict(rms=0.13, capture=0.15), base, True, False,
+                      pilot_min=0.119)
+    assert not nr["pilot_passed"], nr
     assert not head_verdict(dict(rms=0.15, capture=0.30), base, True,
                             True)["checks"]["better_than_rank0"]
-    assert overall_code({"a": dict(passed=True)}, []) == 0
-    assert overall_code({"a": dict(passed=False)}, []) == 4
-    assert overall_code({"a": dict(passed=True)}, ["x"]) == 3
+    # БЕЗ ЭТАЛОНА M2 РАЗВЕДОЧНЫЙ СТАТУС НЕ ОПРЕДЕЛЁН, А НЕ «ПРОЙДЕН»
+    assert head_verdict(good, base, True, True)["pilot_passed"] is None
+
+    # --- ОБЩИЙ ИСХОД: РЕШАЮТ ТОЛЬКО h24-ГОЛОВЫ --------------------------
+    def r(primary=False, pilot=False, trained=True, technical=False):
+        return dict(trained=trained, technical=technical,
+                    verdict=dict(primary_passed=primary,
+                                 pilot_passed=pilot))
+    # Сценарий из ревью: h24_linear прошла, h18_linear не прошла пробу
+    assert overall_code({"h24_linear": r(primary=True),
+                         "h18_linear": r(trained=False,
+                                         technical=True)}) == CODE_PRIMARY
+    # Отказ одной h24-головы не отменяет успех другой
+    assert overall_code({"h24_linear": r(primary=True),
+                         "h24_candidate": r(trained=False,
+                                            technical=True)}) == CODE_PRIMARY
+    # h18 прошла, h24 — нет: это НЕ успех развёртываемой архитектуры
+    assert overall_code({"h18_linear": r(primary=True),
+                         "h24_linear": r()}) == CODE_NONE
+    assert overall_code({"h24_linear": r(pilot=True)}) == CODE_PILOT
+    assert overall_code({"h24_linear": r(primary=True),
+                         "h24_candidate": r(pilot=True)}) == CODE_PRIMARY
+    # ни одной технически оценённой h24 — технический исход
+    assert overall_code({"h18_linear": r(primary=True),
+                         "h24_linear": r(trained=False,
+                                         technical=True)}) == CODE_TECH
+    assert overall_code({"h18_linear": r(primary=True)}) == CODE_TECH
+    assert len({CODE_PRIMARY, CODE_PILOT, CODE_NONE, CODE_TECH}) == 4
+    assert 2 not in (CODE_PRIMARY, CODE_PILOT, CODE_NONE, CODE_TECH)
 
     # --- СКВОЗНОЕ ОБУЧЕНИЕ НА СИНТЕТИКЕ ---------------------------------
     # Лучший ранг строки линейно задан состоянием: голова, видящая его,
@@ -468,7 +594,10 @@ def main():
     ap.add_argument("--patience", type=int, default=8)
     ap.add_argument("--proj", type=int, default=128)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--overfit-rows", type=int, default=512)
+    # ПРОБА МАЛЕНЬКАЯ НАМЕРЕННО: она проверяет конвейер, и 64 строки
+    # запоминает любая исправная голова. Неумение запомнить сотни
+    # неоднозначных строк было бы научным результатом, а не поломкой.
+    ap.add_argument("--overfit-rows", type=int, default=64)
     ap.add_argument("--overfit-steps", type=int, default=300)
     ap.add_argument("--overfit-lr", type=float, default=3e-3)
     ap.add_argument("--out", default="data/k15c/selectors")
@@ -483,6 +612,7 @@ def main():
     import torch
     import k15c_build_rank_cache as cb
     import k15c_rank_selector as rs
+    import k15_train_depth_rvq as k15t
     heads = [h.strip() for h in a.heads.split(",") if h.strip()]
     for h in heads:
         if h not in rs.HEADS:
@@ -559,7 +689,7 @@ def main():
             feat.append(rs.candidate_score_features(lp[s:s + 8192], torch))
         data[part] = dict(
             ctx24=pooled(part, "h24"), ctx18=pooled(part, "h18"),
-            emb=torch.cat(emb, 0), feat=torch.cat(feat, 0),
+            emb=torch.cat(emb, 0), feat=torch.cat(feat, 0), codes=codes,
             costs=np.asarray(arr(part, "rank_costs"), np.float64),
             draft=np.asarray(arr(part, "draft_cost"), np.float64),
             tasks=np.asarray(arr(part, "task_ids")),
@@ -575,15 +705,26 @@ def main():
 
     va, tr = data["val_sel"], data["train"]
     base = baselines(va["costs"], va["draft"], teacher_va, tr["costs"])
-    m2_soft = None
+    m2_soft, pilot_min, pilot_origin = None, None, None
     if os.path.exists(a.m2):
         with open(a.m2, encoding="utf-8") as fh:
             m2 = json.load(fh)
         best_grid = (m2.get("decision") or {}).get("best") or {}
         m2_soft = dict(a1_soft=(m2.get("rms") or {}).get("a1_soft"),
+                       capture_soft=m2.get("capture_soft"),
                        best_grid_rms=best_grid.get("rms"),
                        best_grid_k=best_grid.get("k"),
                        best_grid_tau=best_grid.get("tau"))
+        if m2_soft["capture_soft"] is not None:
+            pilot_min = float(m2_soft["capture_soft"]) + PILOT_GAIN
+            pilot_origin = (
+                "capture(a1_soft) из канонического M2 плюс 0.05: порог "
+                "сетки (k, tau), объявленный до данных 03.10.2026; "
+                "применение к головам K-15c зарегистрировано до их обучения. "
+                "Разведочный статус, НЕ научный критерий")
+    if pilot_min is None:
+        print("  ВНИМАНИЕ: в M2 нет capture_soft — разведочный статус не "
+              "определяется, только основной критерий")
     r_d, r_t = rms(va["draft"]), rms(teacher_va)
     print(f"\n  ОПОРНЫЕ ЧИСЛА val_sel (черновик {r_d:.6f}, учитель "
           f"{r_t:.6f}):")
@@ -597,11 +738,15 @@ def main():
         print(f"    мягкий путь M2 (внешняя опора) RMS "
               f"{m2_soft['a1_soft']:.6f}; лучшая точка сетки "
               f"{m2_soft.get('best_grid_rms')}")
+    print(f"  ПОРОГИ: основной {100 * CAPTURE_MIN:.0f} %"
+          + ("" if pilot_min is None else
+             f"; разведочный {100 * pilot_min:.1f} % (мягкий M2 + 5 п.п., "
+             f"оправдывает только проверку вывода и короткий роллаут)"))
 
     feat_mean = tr["feat"].mean((0, 1))
     feat_std = tr["feat"].std((0, 1))
     task_vocab = man.get("task_vocab")
-    results, technical = {}, []
+    results = {}
     os.makedirs(a.out, exist_ok=True)
     for name in heads:
         src = "h18" if name.startswith("h18") else "h24"
@@ -611,15 +756,18 @@ def main():
             print(f"\n  {name}: h18 в кэше не сохранён — голова пропущена")
             results[name] = dict(skipped="h18 не сохранён")
             continue
-        attn = name.endswith("_attn")
+        full = name in rs.NEEDS_FULL_H24
+        need_codes = name in rs.NEEDS_BOOK
         inp_tr = Inputs(torch, ctx_tr, tr["emb"], tr["feat"],
-                        h_full=tr["h24"] if attn else None, device=dev)
+                        h_full=tr["h24"] if full else None, device=dev,
+                        cand_codes=tr["codes"] if need_codes else None)
         inp_va = Inputs(torch, ctx_va, va["emb"], va["feat"],
-                        h_full=va["h24"] if attn else None, device=dev)
+                        h_full=va["h24"] if full else None, device=dev,
+                        cand_codes=va["codes"] if need_codes else None)
         torch.manual_seed(int(a.seed))
         head = rs.build_head(name, d_model, int(C1.shape[1]), torch,
                              proj=int(a.proj), feat_mean=feat_mean,
-                             feat_std=feat_std).to(dev)
+                             feat_std=feat_std, book=C1).to(dev)
         n_par = sum(p.numel() for p in head.parameters())
         print(f"\n  {name}: {n_par} параметров, вход {src}")
         probe_idx = np.arange(min(int(a.overfit_rows), len(tr["costs"])))
@@ -632,10 +780,13 @@ def main():
               f"{pv['hard_after']:.4e}; "
               + ("ПРОЙДЕНА" if pv["passed"] else
                  "НЕ ПРОЙДЕНА "
-                 f"{[k for k, v in pv['checks'].items() if not v]}"))
+                 f"{[k for k, v in pv['checks'].items() if not v]}")
+              + f"; диагностика {pv['diagnostics']}")
+        # ТЕХНИЧЕСКИЙ ОТКАЗ ОТНОСИТСЯ К ЭТОЙ ГОЛОВЕ, а не ко всему запуску:
+        # чужая проба не может отменить успех другой головы.
         if not pv["passed"]:
-            technical.append(f"{name}: проба обучаемости")
-            results[name] = dict(overfit_probe=pv, trained=False)
+            results[name] = dict(overfit_probe=pv, trained=False,
+                                 technical="проба конвейера не пройдена")
             continue
         try:
             hist, states = train_head(
@@ -645,9 +796,8 @@ def main():
                 seed=int(a.seed), task_ids=va["tasks"],
                 task_vocab=task_vocab)
         except (FloatingPointError, ValueError) as e:
-            technical.append(f"{name}: {e}")
             results[name] = dict(overfit_probe=pv, trained=False,
-                                 error=str(e))
+                                 technical=str(e))
             continue
         sel = select_epoch(hist)
         head.load_state_dict(states[sel["epoch"]])
@@ -673,7 +823,7 @@ def main():
         torch.save(payload, tmp)
         back = torch.load(tmp, map_location="cpu", weights_only=False)
         fresh = rs.build_head(name, d_model, int(C1.shape[1]), torch,
-                              proj=int(a.proj)).to(dev)
+                              proj=int(a.proj), book=C1).to(dev)
         fresh.load_state_dict(back["state"])
         idx_chk = np.arange(min(2048, len(va["costs"])))
         loaded_equal = np.array_equal(scores_for(fresh, inp_va, idx_chk,
@@ -683,7 +833,8 @@ def main():
         os.replace(tmp, path)
         finite = all(np.isfinite(h["val"]["rms"]) for h in hist)
         verdict = head_verdict(sel["val"], base, finite,
-                               bool(reproduced and loaded_equal))
+                               bool(reproduced and loaded_equal),
+                               pilot_min=pilot_min)
         results[name] = dict(
             overfit_probe=pv, trained=True, selected_epoch=int(sel["epoch"]),
             epochs_run=len(hist) - 1, val=sel["val"],
@@ -701,14 +852,21 @@ def main():
               f"% (диагностика); ранг 0 у {100 * v['share_rank0']:.1f} %")
         print(f"    гистограмма выбора: " + ", ".join(
             f"{k}:{c}" for k, c in sorted(v["histogram"].items())))
+        failed = [k for k, x in verdict["checks"].items() if x is False]
+        role = ("" if name.startswith(DEPLOYABLE_PREFIX)
+                else " — АБЛЯЦИЯ ГЛУБИНЫ, на исход не влияет")
         print(f"    воспроизведение {'ok' if reproduced else 'НЕТ'}, "
               f"сохранение/загрузка {'ok' if loaded_equal else 'НЕТ'}; "
-              f"критерий {'ПРОЙДЕН' if verdict['passed'] else 'не пройден'}"
-              f" {[k for k, x in verdict['checks'].items() if not x] or ''}")
+              f"основной {'ПРОЙДЕН' if verdict['primary_passed'] else 'нет'}"
+              f", разведочный "
+              + {True: "ПРОЙДЕН", False: "нет", None: "не определён"}[
+                  verdict["pilot_passed"]]
+              + f"{role} {failed or ''}")
 
     trained = {k: v for k, v in results.items() if v.get("trained")}
-    verdicts = {k: v["verdict"] for k, v in trained.items()}
-    code = overall_code(verdicts, technical)
+    technical = {k: v["technical"] for k, v in results.items()
+                 if v.get("technical")}
+    code = overall_code(results)
     depth = None
     if "h18_linear" in trained and "h24_linear" in trained:
         r18 = trained["h18_linear"]["val"]["rms"]
@@ -723,16 +881,31 @@ def main():
               f"h24_linear {r24:.6f} "
               f"({100 * (depth['h24_capture'] or 0):.1f} %) — "
               f"{depth['relation']}")
-    outcome = {0: "хотя бы одна голова взяла критерий: дальше проверка "
-                  "вывода настоящим проходом",
-               4: "ни одна голова не взяла критерий на замороженном h24",
-               3: f"технический отказ: {technical}"}[code]
+    outcome = {
+        CODE_PRIMARY: "h24-голова взяла ОСНОВНОЙ критерий: дальше проверка "
+                      "вывода, safety-роллаут задач 8-9 и парный dev",
+        CODE_PILOT: "основной критерий не взят, но h24-голова взяла "
+                    "РАЗВЕДОЧНЫЙ порог: проверка вывода и только короткий "
+                    "разведочный роллаут, архитектурного успеха это не "
+                    "доказывает",
+        CODE_NONE: "ни одна h24-голова не взяла порогов на замороженном "
+                   "h24: кэш не пересобирать, следующая дешёвая голова — "
+                   "h24_positional",
+        CODE_TECH: f"ни одной технически оценённой h24-головы: {technical}",
+    }[code]
+    if technical:
+        print(f"\n  технические отказы отдельных голов: {technical}")
     print(f"\n  ИСХОД: {outcome} (код {code}). Выбор на val_sel — часть "
           f"отбора, не независимая проверка; val_confirm не открывалась")
     out = dict(kind="k15c_selector_summary", code=code, outcome=outcome,
                heads=heads, results=results, baselines=base, depth=depth,
                m2_soft=m2_soft, technical_failures=technical,
-               capture_min=CAPTURE_MIN, selected_on="val_sel",
+               capture_min=CAPTURE_MIN, pilot_min=pilot_min,
+               pilot_origin=pilot_origin,
+               deployable_prefix=DEPLOYABLE_PREFIX,
+               codes=dict(primary=CODE_PRIMARY, pilot=CODE_PILOT,
+                          none=CODE_NONE, technical=CODE_TECH),
+               selected_on="val_sel",
                val_confirm_used_for_selection=False,
                cache=os.path.abspath(a.cache),
                cache_canonical=bool(man["canonical"]),
@@ -747,9 +920,10 @@ def main():
                 exist_ok=True)
     tmp = summary + f".tmp.{os.getpid()}"
     with open(tmp, "w", encoding="utf-8") as fh:
+        # СТРОГАЯ СХЕМА: прежний `default=str` молча превращал бы любой
+        # неописанный объект в строку, и ошибка артефакта не всплывала бы.
         json.dump(out, fh, ensure_ascii=False, indent=1, allow_nan=False,
-                  default=lambda o: o.item() if hasattr(o, "item")
-                  else str(o))
+                  default=k15t.json_scalar)
     os.replace(tmp, summary)
     print(f"  сводка: {summary}")
     return int(code)
