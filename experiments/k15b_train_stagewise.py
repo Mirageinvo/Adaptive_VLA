@@ -50,6 +50,7 @@
 нереализованные фазы отвергаются явным отказом, а не заглушкой.
 """
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -70,6 +71,7 @@ ACTION_RANGE_FACTOR, ACTION_CLIP_BOUND = 1.5, 1.5
 # сотни шагов потерю не удаётся уронить хотя бы на треть, дело не в объёме
 # данных, а в шаге обучения или в самой постановке.
 OVERFIT_DROP_FACTOR = 0.67
+ZERO_TAG = "e0s0"             # тег необученной точки — ОДИН на весь файл
 PHASES = ("q1_reader", "c2_book", "q2_reader")
 PHASE_WHITELIST = {
     "q1_reader": ("depth_rvq_norms.0.", "depth_rvq_heads.0.",
@@ -472,6 +474,25 @@ def selftest():
     v = verdict(mk(), None, 0.034)
     assert v["code"] == 3, v
 
+    # --- КЛЮЧИ СНАПШОТОВ: ПУТЬ SMOKE САМОПРОВЕРКОЙ НЕ ИСПОЛНЯЕТСЯ ------
+    # В 2632b1c ключ нулевого снапшота переименовали 0 -> "e0s0", а две
+    # ссылки в пробе обучаемости остались числовыми. Это гарантированный
+    # KeyError, но только под --smoke: ни самопроверка, ни полный прогон
+    # такую строку не исполняют. Разбор дерева модуля закрывает именно
+    # этот класс — индекс-константа у `snapshots` обязана быть
+    # объявленным тегом, а числовая не бывает.
+    subs = [n for n in ast.walk(ast.parse(
+                open(os.path.abspath(__file__), encoding="utf-8").read()))
+            if isinstance(n, ast.Subscript)
+            and isinstance(n.value, ast.Name) and n.value.id == "snapshots"]
+    assert len(subs) >= 2, len(subs)
+    for n in subs:
+        if isinstance(n.slice, ast.Constant):
+            raise AssertionError(
+                f"строка {n.lineno}: snapshots[{n.slice.value!r}] — "
+                f"нулевой снапшот берётся только как snapshots[ZERO_TAG], "
+                f"остальные теги вычисляются")
+
     print("самопроверка k15b_train_stagewise пройдена")
 
 
@@ -479,6 +500,10 @@ def main():
     ap = argparse.ArgumentParser(
         description="K-15b: поэтапное обучение, фаза q1_reader")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--no-save-all-points", dest="save_all_points",
+                    action="store_false",
+                    help="не сохранять состояния всех оценённых точек")
+    ap.set_defaults(save_all_points=True)
     ap.add_argument("--phase", default="q1_reader", choices=PHASES)
     ap.add_argument("--c1", default="data/k15b/c1_selected.pt")
     ap.add_argument("--target", default="data/k15b/rankpath_target_train.npz")
@@ -962,12 +987,17 @@ def main():
 
     history = []
     val0 = evaluate("эпоха 0, без обучения")
-    history.append(dict(tag="e0s0", epoch=0, step=0, train_loss=None,
+    history.append(dict(tag=ZERO_TAG, epoch=0, step=0, train_loss=None,
                         val_rms_a1_pol=val0["rms_a1_pol"],
                         val_ce=val0["ce"], val=val0))
     capture0 = val0["capture"]
-    snapshots = {"e0s0": {k: named[k].detach().clone()
-                          for k in train_names}}
+    snapshots = {ZERO_TAG: {k: named[k].detach().clone()
+                            for k in train_names}}
+    # ДАЛЬШЕ НУЛЕВОЙ СНАПШОТ БЕРЁТСЯ ТОЛЬКО ПО ЭТОМУ ИМЕНИ: ключ пишется
+    # ровно один раз, рядом с созданием. Переименование тега больше не
+    # может разойтись с местом использования — так и случилось в 2632b1c,
+    # где `snapshots[0]` в пробе пережил переход на строковые теги.
+    zero_snap = snapshots[ZERO_TAG]
 
     # --- ПРОБА ОБУЧАЕМОСТИ: МОЖНО ЛИ ВООБЩЕ УРОНИТЬ CE ------------------
     # Смоук на 500 батчах показал ПЛОСКУЮ траекторию: колебание ±0.12 без
@@ -1009,7 +1039,7 @@ def main():
         # ВЕСА ВОЗВРАЩАЮТСЯ ПОБИТОВО, СОСТОЯНИЕ ADAM СБРАСЫВАЕТСЯ: проба не
         # имеет права повлиять на сам прогон.
         with torch.no_grad():
-            for k_, v_ in snapshots[0].items():
+            for k_, v_ in zero_snap.items():
                 named[k_].copy_(v_)
         opt.state.clear()
         opt.zero_grad(set_to_none=True)
@@ -1017,7 +1047,7 @@ def main():
             {k: named[k].detach().float().cpu().numpy() for k in train_names})
         zero_sha = ctx.k14c.state_sha(
             {k: v.detach().float().cpu().numpy()
-             for k, v in snapshots[0].items()})
+             for k, v in zero_snap.items()})
         if back_sha != zero_sha:
             raise SystemExit(f"после пробы веса не восстановились: "
                              f"{back_sha} против {zero_sha}")
@@ -1027,6 +1057,12 @@ def main():
               f"{'ПРОЙДЕНА' if overfit['passed'] else 'НЕ ПРОЙДЕНА'}; "
               f"веса восстановлены побитово ({back_sha})")
         if not overfit["passed"]:
+            # ЭТО ГЕЙТ, А НЕ ПЕЧАТЬ. Раньше провал только сообщался, и
+            # smoke всё равно отдавал 0 — контракт кода был слабее отчёта
+            # о нём. Смоук при этом доводится до конца: его вторая задача
+            # — прогнать всю обвязку (гейты, выбор точки, сохранение), и
+            # артефакт с диагностикой нужен именно при провале. Отказ
+            # отдаётся кодом возврата в самом конце.
             print(f"    ЗНАЧИТ ДЕЛО НЕ В ОБЪЁМЕ ДАННЫХ: на {n_fix} строках "
                   f"за {steps} шагов потеря не падает. Полный прогон "
                   f"запускать бессмысленно, пока не разобрались с шагом "
@@ -1189,12 +1225,25 @@ def main():
         ce_positions="all code positions",
         action_error_positions=int(H_EXEC),
         state={k: named[k].detach().cpu() for k in train_names},
+        # ВСЕ ОЦЕНЁННЫЕ ТОЧКИ, А НЕ ТОЛЬКО ВЫБРАННАЯ. Прогон 02.10.2026
+        # сохранил одну выбранную точку — ею оказалась НЕОБУЧЕННАЯ e0s0, и
+        # состояния, на которых CE дошла до 4.6984, после выхода процесса
+        # перестали существовать. Любой вопрос к обученному читателю
+        # (мягкий путь, агрегация логитов в грубые классы) стоил бы с тех
+        # пор повторного шестичасового прогона. Три тензора на точку — это
+        # десятки мегабайт, несопоставимо с ценой их потери.
+        all_states={h["tag"]: {k: v.detach().cpu()
+                               for k, v in snapshots[h["tag"]].items()}
+                    for h in history} if a.save_all_points else None,
+        save_all_points=bool(a.save_all_points),
         trainable_names=train_names, selected_epoch=best_epoch,
         selected_state_sha1=sel_sha, history=history, confirm=confirm,
         teacher=teacher, capture_epoch0=capture0,
         capture_target_rms=float(cap_target),
         gates=gates, verdict=out_verdict, forecast=forecast,
         overfit_probe=overfit, selected_tag=best_tag,
+        overfit_probe_blocked=bool(overfit is not None
+                                   and not overfit["passed"]),
         selected_step=best_step, eval_every=int(a.eval_every),
         points_evaluated=len(history),
         c1_file=os.path.abspath(a.c1), c1_sha1=book["c1_sha1"],
@@ -1213,16 +1262,21 @@ def main():
     tmp = out_path + f".tmp.{os.getpid()}"
     torch.save(payload, tmp)
     back = torch.load(tmp, map_location="cpu", weights_only=False)
-    for k_, v_ in payload["state"].items():
-        if not torch.equal(back["state"][k_], v_):
-            os.unlink(tmp)
-            raise SystemExit(f"после чтения {k_} изменился")
+    checked = [("state", payload["state"], back["state"])]
+    for t, d in (payload["all_states"] or {}).items():
+        checked.append((f"all_states/{t}", d, back["all_states"][t]))
+    for where, block, got in checked:
+        for k_, v_ in block.items():
+            if not torch.equal(got[k_], v_):
+                os.unlink(tmp)
+                raise SystemExit(f"после чтения {where}/{k_} изменился")
     os.replace(tmp, out_path)
     print(f"  сохранено: {out_path} (обратное чтение сошлось)")
 
     os.makedirs(os.path.dirname(os.path.abspath(summary)) or ".",
                 exist_ok=True)
-    light = {k: v for k, v in payload.items() if k != "state"}
+    light = {k: v for k, v in payload.items()
+             if k not in ("state", "all_states")}
     tmp = summary + f".tmp.{os.getpid()}"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(light, fh, ensure_ascii=False, indent=1, allow_nan=False,
@@ -1232,6 +1286,13 @@ def main():
 
     if a.smoke:
         print("  РЕЖИМ SMOKE: данные урезаны, решения не принимаются")
+        if payload["overfit_probe_blocked"]:
+            print(f"  ОТКАЗ: проба обучаемости не пройдена — CE "
+                  f"{overfit['ce_first']:.4f} -> {overfit['ce_last']:.4f}, "
+                  f"отношение {overfit['ratio']:.3f} при требовании "
+                  f"<= {OVERFIT_DROP_FACTOR}. Код 3: это технический "
+                  f"блокер, полный прогон не запускать")
+            return 3
         return 0
     return int(out_verdict["code"])
 
