@@ -10,7 +10,7 @@
 ЕДИНИЦА — КЛАСТЕР (задача, init_state_id); один сид, раскатка
 детерминирована. Все величины — с равным весом задач, как в K-14q.
 
-ДВА РЕЖИМА И ДВА РАЗНЫХ РЕШЕНИЯ, ОБА ОБЪЯВЛЕНЫ ДО ДАННЫХ (04.10.2026):
+ДВА РЕЖИМА И ДВА РАЗНЫХ РЕШЕНИЯ, ОБА ОБЪЯВЛЕНЫ ДО ДАННЫХ (03.10.2026):
 
     safety  ТЕХНИЧЕСКИЙ пилот на задачах 8-9. Проходит, если набор полон
             и парен, артефакты сняты одной версией харнесса, у каждой руки
@@ -136,6 +136,9 @@ def main():
     ap.add_argument("--allow-partial", action="store_true",
                     help="только для смоука: неполный набор не является "
                          "результатом")
+    ap.add_argument("--allow-preflight", action="store_true",
+                    help="принять артефакты предполётной проверки механики. "
+                         "Только вместе с --allow-partial: это не результат")
     ap.add_argument("--boot", type=int, default=kb.N_BOOT)
     ap.add_argument("--out", default="")
     ap.add_argument("--overwrite", action="store_true")
@@ -148,6 +151,14 @@ def main():
     if os.path.exists(a.out) and not a.overwrite:
         raise SystemExit(f"{a.out} уже существует")
 
+    if a.allow_preflight and not a.allow_partial:
+        raise SystemExit("--allow-preflight только вместе с --allow-partial")
+    # АРТЕФАКТЫ ПРЕДПОЛЁТНОЙ ПРОВЕРКИ НЕ ЯВЛЯЮТСЯ РЕЗУЛЬТАТОМ: без явного
+    # разрешения они отвергаются, чтобы не попасть в настоящий анализ.
+    for p_ in a.arts:
+        if ((json.load(open(p_)).get("joint") or {}).get("preflight")
+                and not a.allow_preflight):
+            raise SystemExit(f"{p_}: артефакт предполётной проверки")
     obs, meta = kb.load(a.arts)
     arms = [a.base, a.cand]
     for nm in arms:
@@ -219,7 +230,7 @@ def main():
                partial=bool(a.allow_partial),
                thresholds=dict(catastrophe=CATASTROPHE,
                                harm_ratio=HARM_RATIO,
-                               declared="до данных, 04.10.2026"))
+                               declared="до данных, 03.10.2026"))
     os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".",
                 exist_ok=True)
     tmp = a.out + f".tmp.{os.getpid()}"

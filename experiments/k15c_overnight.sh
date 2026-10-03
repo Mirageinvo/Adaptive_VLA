@@ -47,6 +47,18 @@ done
 export PYTHONPATH="${HOME}/LIBERO"
 export MUJOCO_GL=egl
 export PYTHONUNBUFFERED=1
+# ФАЙЛЫ, КОТОРЫЕ ЦЕПОЧКА ПЕРЕЗАПИСЫВАЕТ, НЕ ДОЛЖНЫ ОТСЛЕЖИВАТЬСЯ GIT.
+# Проверка чистоты кода пропускает только НОВЫЕ файлы в reports/, data/,
+# logs/; изменённый или переименованный в .bak отслеживаемый отчёт она
+# считает грязным кодом, и следующий этап с моделью отказал бы посреди
+# ночи. Git здесь только читается.
+TRACKED="$(git ls-files reports/k15c data/k15c logs/k15c 2>/dev/null | head -3)"
+if [ -n "$TRACKED" ]; then
+    echo "ОТКАЗ: в git отслеживаются файлы, которые цепочка перезапишет:" >&2
+    echo "$TRACKED" | sed 's/^/    /' >&2
+    echo "  уберите их из индекса (git rm --cached) и закоммитьте" >&2
+    exit 1
+fi
 
 stage() { echo; echo "=== $* — $(date '+%H:%M:%S') ==="; }
 
@@ -89,6 +101,22 @@ done
 echo "  все самопроверки пройдены"
 
 stage "1. кэш"
+# ЕСЛИ ПОСТРОИТЕЛЬ УЖЕ ИДЁТ (например, оставлен от прежнего раннера), его
+# дожидаются, а не запускают второй рядом: два построителя писали бы в один
+# канонический каталог. Шаблон ПРИВЯЗАН К НАЧАЛУ командной строки, то есть к
+# самому запуску python: просто подстрока ловила бы и чужие процессы, где
+# имя файла лишь упомянуто (grep, редактор, оболочка), и цепочка ждала бы
+# до утра.
+BUILDER_RE='^python[0-9.]* +([^ ]*/)?k15c_build_rank_cache\.py'
+if pgrep -f "$BUILDER_RE" >/dev/null; then
+    echo "  построитель кэша уже работает — жду его окончания:"
+    pgrep -af "$BUILDER_RE" | sed 's/^/    /'
+    while pgrep -f "$BUILDER_RE" >/dev/null; do
+        sleep "${WAIT_POLL:-120}"
+        echo "    $(date '+%H:%M') ещё работает"
+    done
+    echo "  построитель завершился"
+fi
 if python3 - <<'PY'
 import sys
 sys.path.insert(0, "experiments")
@@ -111,9 +139,11 @@ else
             --device "$DEVICE" --epochs 2 --overwrite
     C=$?
     grep -hE "проба обучаемости" "$LOGDIR/train_smoke_${STAMP}.log" | head -4
-    # 0/3/4/6 на сотне строк ничего не значат научно; падение — останов.
-    case "$C" in 0|3|4|6) ;; *)
-        echo "ОТКАЗ: тренер упал на smoke-кэше" >&2; exit 1 ;; esac
+    # 0/4/6 на сотне строк ничего не значат научно. Но 3 — технический
+    # отказ ВСЕХ h24-голов, то есть конвейер не работает, и строить полный
+    # кэш под него незачем.
+    case "$C" in 0|4|6) ;; *)
+        echo "ОТКАЗ: тренер на smoke-кэше дал код $C" >&2; exit 1 ;; esac
     run_one cache "$REP/cache.exit" "$LOGDIR/cache_${STAMP}.log" \
         python3 experiments/k15c_build_rank_cache.py --device "$DEVICE" \
             --overwrite \
@@ -165,7 +195,8 @@ REPORT="$REP/inference_${HEAD_NAME}.json"
 echo "  голова $BEST ($KEY)"
 run_one inference "$REP/inference.exit" "$LOGDIR/inference_${STAMP}.log" \
     python3 experiments/k15c_check_inference.py --device "$DEVICE" \
-        --selector "$BEST" --summary "$REPORT" --overwrite
+        --selector "$BEST" --selector-summary "$SUMMARY" \
+        --summary "$REPORT" --overwrite
 CI=$?
 tail -n 8 "$LOGDIR/inference_${STAMP}.log"
 [ "$CI" = 0 ] || { echo "=== ИТОГ: проверка вывода не сошлась (код $CI)" \

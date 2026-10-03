@@ -634,6 +634,11 @@ def main() -> None:
                          "собирается")
     ap.add_argument("--rank-cache", default="data/k15c/rank_cache",
                     help="K-15c: канонический кэш, на котором обучена голова")
+    ap.add_argument("--k15c-preflight", action="store_true",
+                    help="K-15c: проверка МЕХАНИКИ роллаута на smoke-голове "
+                         "и smoke-кэше, без отчёта проверки вывода. Только "
+                         "в каталог с /preflight/ в пути; настоящая голова "
+                         "этим путём не принимается")
     ap.add_argument("--arm-label", default=None,
                     help="ОБЯЗАТЕЛЕН. Различает руки внутри эксперимента, "
                          "например fullbar, coarse24_b10, coarse24_b5, "
@@ -722,12 +727,18 @@ def main() -> None:
             f"--q1-ckpt и --depth-rvq-mode осмысленны только с --policy "
             f"depthrvq, задано --policy {args.policy}")
     if args.policy == "k15c":
-        if not args.selector or not args.inference_report:
-            raise SystemExit("--policy k15c требует --selector и "
-                             "--inference-report")
-    elif args.selector or args.inference_report:
-        raise SystemExit("--selector и --inference-report осмысленны только "
-                         "с --policy k15c")
+        if not args.selector:
+            raise SystemExit("--policy k15c требует --selector")
+        if args.k15c_preflight:
+            if "/preflight/" not in str(args.out or ""):
+                raise SystemExit("--k15c-preflight пишет только в каталог с "
+                                 "/preflight/ в пути: его артефакты не "
+                                 "должны смешаться с настоящими")
+        elif not args.inference_report:
+            raise SystemExit("--policy k15c требует --inference-report")
+    elif args.selector or args.inference_report or args.k15c_preflight:
+        raise SystemExit("--selector, --inference-report и "
+                         "--k15c-preflight осмысленны только с --policy k15c")
     if args.policy == "fast" and not args.policy_ckpt:
         raise SystemExit("--policy fast требует --policy-ckpt")
     if args.policy not in ("fast", "hicora", "depthrvq") and args.policy_ckpt:
@@ -878,7 +889,7 @@ def main() -> None:
         import k15c_policy as _k15c
         k15c_arm = _k15c.build_arm(args.device, args.selector,
                                    args.rank_cache, args.inference_report,
-                                   torch)
+                                   torch, preflight=args.k15c_preflight)
         model, proc = k15c_arm.model, k15c_arm.proc
     else:
         Joint = make_joint12_class(SmolVLABlockwiseAR)
@@ -1255,6 +1266,17 @@ def main() -> None:
                 a_ = x[..., :7].float().cpu().numpy()
             if not np.isfinite(a_).all():
                 raise SystemExit("декодер вернул nan/inf в действиях")
+            if args.policy == "k15c":
+                # ПРЕДЕЛ НОРМИРОВАННОЙ ШКАЛЫ НА ИСПОЛНЯЕМЫХ ШАГАХ — тот же
+                # ACTION_CLIP_BOUND, что в офлайновом гейте диапазона. Выход
+                # за него на живой раскатке — сигнал безопасности, и рука
+                # останавливается, а не исполняет его.
+                from k15b_probe_and_extract import ACTION_CLIP_BOUND
+                amax = float(np.abs(a_[:, :args.horizon]).max())
+                if amax > ACTION_CLIP_BOUND:
+                    raise SystemExit(
+                        f"рука k15c: |действие| {amax:.3f} в нормированной "
+                        f"шкале выше предела {ACTION_CLIP_BOUND}")
             return a_
         K = codes.reshape(-1, n_lv, N_POS) if n_lv > 1 else codes.reshape(-1, 1, N_POS)
         with torch.no_grad():

@@ -73,6 +73,32 @@ def compare_rows(live, cached, rtol=COST_RTOL, atol=COST_ATOL):
     return float(d.max()), float(rel.max()), over
 
 
+def selector_status(summary, sel_sha):
+    """Статус головы по сводке тренера: primary, pilot или отказ.
+
+    Голова ищется по ОТПЕЧАТКУ ФАЙЛА, а не по имени: путь мог быть
+    перезаписан следующим прогоном. Ровно одна запись, иначе отказ.
+    Возвращает (статус, имя головы, проблемы).
+    """
+    hits = [(k, v) for k, v in (summary.get("results") or {}).items()
+            if v.get("checkpoint_sha1") == sel_sha]
+    if len(hits) != 1:
+        return None, None, [f"в сводке тренера {len(hits)} записей с этим "
+                            f"файлом головы, нужна ровно одна"]
+    name, v = hits[0]
+    if v.get("technical") or not v.get("trained"):
+        return None, name, ["голова в сводке — технический отказ"]
+    if not str(name).startswith("h24_"):
+        return None, name, ["развёртывается только h24-голова"]
+    verdict = v.get("verdict") or {}
+    if verdict.get("primary_passed"):
+        return "primary", name, []
+    if verdict.get("pilot_passed"):
+        return "pilot", name, []
+    return None, name, ["голова не взяла ни основного, ни разведочного "
+                        "порога: роллаут ей не положен"]
+
+
 def roundtrip_verdict(checks):
     """Все проверки обязательны; список провалов — в исход."""
     failed = sorted(k for k, v in checks.items() if not v)
@@ -93,6 +119,21 @@ def selftest():
     # а настоящее расхождение на той же строке ловится
     a_, r_, n = compare_rows([5e-7], [1e-9])
     assert n == 1, (a_, r_, n)
+    # --- СТАТУС ГОЛОВЫ ИЗ СВОДКИ ТРЕНЕРА --------------------------------
+    def res(prim, pil, tech=None, sha="S", trained=True):
+        return dict(checkpoint_sha1=sha, technical=tech, trained=trained,
+                    verdict=dict(primary_passed=prim, pilot_passed=pil))
+    summ = dict(results=dict(h24_candidate=res(True, True),
+                             h24_linear=res(False, True, sha="L")))
+    assert selector_status(summ, "S")[:2] == ("primary", "h24_candidate")
+    assert selector_status(summ, "L")[0] == "pilot"
+    for bad in (dict(results=dict(h24_linear=res(False, False))),
+                dict(results=dict(h24_linear=res(True, True, tech="x"))),
+                dict(results=dict(h18_linear=res(True, True))),
+                dict(results=dict(a=res(True, True), b=res(True, True))),
+                dict(results={})):
+        st_, _n, probs = selector_status(bad, "S")
+        assert st_ is None and probs, bad
     v = roundtrip_verdict(dict(a=True, b=True))
     assert v["code"] == 0 and v["passed"]
     v = roundtrip_verdict(dict(a=True, b=False, c=False))
@@ -113,8 +154,15 @@ def main():
     # K-11a), и argparse отказывался бы собирать парсер.
     ap.add_argument("--rank-cache", default="data/k15c/rank_cache")
     ap.add_argument("--selector", required=False, default="")
+    ap.add_argument("--selector-summary", default="",
+                    help="сводка тренера, в которой обучена голова: из неё "
+                         "берётся статус primary/pilot. Без неё — отказ")
     ap.add_argument("--summary", default="")
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--allow-smoke", action="store_true",
+                    help="ПРЕДПОЛЁТНАЯ ПРОВЕРКА конвейера на smoke-кэше и "
+                         "smoke-голове. Отчёт помечается smoke=True, пишется "
+                         "под отдельным именем, и рука роллаута его не примет")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
@@ -122,6 +170,9 @@ def main():
         return 0
     if not a.selector:
         raise SystemExit("--selector обязателен: путь к чекпойнту головы")
+    if not a.selector_summary or not os.path.exists(a.selector_summary):
+        raise SystemExit("--selector-summary обязателен: статус головы "
+                         "(основной или разведочный порог) берётся из неё")
     if int(a.limit) != 0:
         raise SystemExit("--limit не применяется: проверяется вся val_sel")
 
@@ -133,11 +184,15 @@ def main():
     sel_obj = _torch.load(a.selector, map_location="cpu", weights_only=False)
     if sel_obj.get("kind") != "k15c_rank_selector":
         raise SystemExit(f"{a.selector}: kind {sel_obj.get('kind')!r}")
-    if sel_obj.get("smoke"):
-        raise SystemExit("голова обучена на smoke-кэше: проверять её "
-                         "настоящим проходом бессмысленно")
+    if bool(sel_obj.get("smoke")) != bool(a.allow_smoke):
+        raise SystemExit(
+            "голова обучена на smoke-кэше: настоящую проверку вывода по ней "
+            "не делают" if sel_obj.get("smoke") else
+            "--allow-smoke — только для smoke-головы: настоящая голова "
+            "проверяется настоящим прогоном")
     head_name = sel_obj["head"]
-    summary = a.summary or f"reports/k15c/inference_{head_name}.json"
+    summary = a.summary or (f"reports/k15c/inference_{head_name}"
+                            f"{'_smoke' if a.allow_smoke else ''}.json")
     if os.path.exists(summary) and not a.overwrite:
         raise SystemExit(f"{summary} уже существует: без --overwrite не "
                          f"перезаписываю")
@@ -145,7 +200,8 @@ def main():
         raise SystemExit("голова на h18: для неё проверка вывода другая, "
                          "а развёртываемая архитектура — h24")
 
-    man, problems = cb.validate_cache(a.rank_cache)
+    man, problems = cb.validate_cache(a.rank_cache,
+                                      allow_smoke=bool(a.allow_smoke))
     if problems:
         raise SystemExit("кэш не принят: " + "; ".join(problems[:6]))
     if cb.sha_file(os.path.join(a.rank_cache, "manifest.json")) \
@@ -160,6 +216,21 @@ def main():
                              f"кэше {man.get(key)!r}")
     if str(a.selector).endswith(".technical_fail.pt"):
         raise SystemExit("это чекпойнт головы с техническим отказом")
+    with open(a.selector_summary, encoding="utf-8") as fh:
+        tr_summary = json.load(fh)
+    status, st_name, st_problems = selector_status(
+        tr_summary, cb.sha_file(a.selector))
+    if st_problems and a.allow_smoke and st_name is not None \
+            and all("порога" in x for x in st_problems):
+        # НА SMOKE-КЭШЕ ПОРОГИ НИЧЕГО НЕ ЗНАЧАТ: проверяется конвейер.
+        status, st_problems = "smoke", []
+    if st_problems:
+        raise SystemExit("статус головы: " + "; ".join(st_problems))
+    if st_name != head_name:
+        raise SystemExit(f"в сводке голова {st_name!r}, в чекпойнте "
+                         f"{head_name!r}")
+    print(f"  голова {head_name}: статус {status} по сводке "
+          f"{a.selector_summary}")
 
     S = cb.load_stack(a)
     ctx, torch, model, k15t = S.ctx, S.torch, S.model, S.k15t
@@ -231,7 +302,10 @@ def main():
     seen = np.zeros(len(c_rows), bool)
     t0 = time.time()
     with torch.no_grad():
-        for po, sel in ctx.parts_full["val_sel"]:
+        # НА SMOKE-КЭШЕ — ТОЛЬКО ЕГО БАТЧИ; на каноническом — вся val_sel.
+        batches = [(po, sel) for po, sel in ctx.parts_full["val_sel"]
+                   if not a.allow_smoke or int(sel[0]) in slot]
+        for po, sel in batches:
             b = ctx.build_batch(po, sel)
             with ac16:
                 v, p_ids = model.build_inputs(position_offset=po, **b)
@@ -250,8 +324,11 @@ def main():
             # ВЫБОР — ТОЙ ЖЕ ФУНКЦИЕЙ, ЧТО В РОЛЛАУТЕ. Совпадение выбора
             # здесь и там — следствие построения, а не двух копий кода.
             z0 = out["policy_embeddings"][0]
-            sel_ = rs.select_from_outputs(out["logits"][1], z0, h24, head,
-                                          c1, torch)
+            try:
+                sel_ = rs.select_from_outputs(out["logits"][1], z0, h24,
+                                              head, c1, torch)
+            except ValueError as e:
+                raise SystemExit(f"выбор на val_sel: {e}")
             top8, lp8 = sel_["top"], sel_["logprobs"]
             sc, pick, z_sel = sel_["scores"], sel_["pick"], sel_["z"]
             stats["code_mismatch"] += int(
@@ -348,8 +425,12 @@ def main():
              else "НЕ СОШЛОСЬ: " + str(verdict["failed"]))
     print(f"  ИСХОД: {out_s} (код {verdict['code']})")
     out = dict(kind="k15c_inference_check", head=head_name,
+               smoke=bool(a.allow_smoke),
                selector=os.path.abspath(a.selector),
                selector_file_sha1=cb.sha_file(a.selector),
+               selector_status=status,
+               selector_summary=os.path.abspath(a.selector_summary),
+               selector_summary_sha1=cb.sha_file(a.selector_summary),
                # Роллаут обязан исполнять ТУ ЖЕ функцию выбора, что прошла
                # эту проверку: модуль голов привязывается по отпечатку.
                selector_module_sha1=cb.sha_file(rs.__file__),

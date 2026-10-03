@@ -1071,6 +1071,9 @@ def main():
             epochs_run=len(hist) - 1, val=sel["val"],
             reproduced=bool(reproduced), save_load_equal=bool(loaded_equal),
             verdict=verdict, checkpoint=os.path.abspath(path),
+            # ОТПЕЧАТОК ФАЙЛА — по нему проверка вывода находит статус
+            # головы (основной / разведочный) в этой сводке.
+            checkpoint_sha1=cb.sha_file(path),
             technical=("; ".join(tech) if tech else None),
             trajectory=[dict(epoch=h["epoch"], rms=h["val"]["rms"],
                              capture=h["val"]["capture"],

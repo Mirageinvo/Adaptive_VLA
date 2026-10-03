@@ -252,6 +252,18 @@ def hard_selected_cost(scores, costs, torch):
     return costs.gather(-1, pick.unsqueeze(-1)).squeeze(-1), pick
 
 
+def stable_order(logits, torch):
+    """Устойчивый порядок кодов по убыванию логитов.
+
+    СОБСТВЕННАЯ КОПИЯ, А НЕ ИМПОРТ ИЗ k15b_measure_soft: выбор обязан зависеть
+    ТОЛЬКО от этого модуля, чтобы его отпечаток в отчёте проверки вывода
+    покрывал всю функцию выбора. Совпадение с `reader_order`, по которому
+    строился кэш, сверяется в самопроверке — в том числе на ничьих, — а
+    проверка вывода сверяет коды с кэшем побитово.
+    """
+    return torch.sort(logits, dim=-1, descending=True, stable=True).indices
+
+
 def select_from_outputs(q1_logits, z0, h24, head, book, torch, k=N_CAND):
     """ОДНА функция выбора — и для проверки вывода, и для роллаута.
 
@@ -267,16 +279,21 @@ def select_from_outputs(q1_logits, z0, h24, head, book, torch, k=N_CAND):
     построения, а не двух согласованных копий.
     """
     import torch.nn.functional as F
-    import k15b_measure_soft as ms
     lg = q1_logits.float()
-    top = ms.reader_order(lg, torch)[..., :int(k)]
+    top = stable_order(lg, torch)[..., :int(k)]
     lp = F.log_softmax(lg, dim=-1).gather(-1, top)
+    # КОНЕЧНОСТЬ ДО argmax: argmax по NaN молча вернул бы какой-то ранг, и
+    # рука исполнила бы его как выбор.
+    if not bool(torch.isfinite(lp).all()):
+        raise ValueError("лог-вероятности q1 не конечны")
     h24s = h24.half().float()
     kw = dict(ctx=ln_mean_pool(h24s, torch),
               cand_emb=candidate_embeddings(top, book, torch),
               cand_feat=candidate_score_features(lp, torch),
               h_full=h24s, cand_codes=top)
     scores = head(**kw).float()
+    if not bool(torch.isfinite(scores).all()):
+        raise ValueError("оценки головы не конечны")
     pick = scores.argmax(-1)
     codes = top.gather(-1, pick.view(-1, 1, 1).expand(
         -1, top.shape[1], 1)).squeeze(-1)
@@ -421,6 +438,14 @@ def selftest():
     s_ = torch.zeros(2, 8, requires_grad=True)
     expected_regret(s_, costs, torch).backward()
     assert int(s_.grad[0].argmin()) == 1 and int(s_.grad[1].argmin()) == 0
+    # --- СВОЯ СОРТИРОВКА СОВПАДАЕТ С ТОЙ, ПО КОТОРОЙ СТРОИЛСЯ КЭШ ---------
+    import k15b_measure_soft as ms
+    for lg_t in (torch.randn(4, 16, 2048),
+                 torch.zeros(2, 3, 50),                     # полные ничьи
+                 torch.randint(0, 3, (3, 16, 2048)).float()):  # частые ничьи
+        assert torch.equal(stable_order(lg_t, torch),
+                           ms.reader_order(lg_t, torch))
+
     # --- ОБЩАЯ ФУНКЦИЯ ВЫБОРА ------------------------------------------
     V = 30
     lg_ = torch.randn(B, T, V)
@@ -443,6 +468,15 @@ def selftest():
         # логвероятности — от полного softmax, а не от восьми
         assert torch.allclose(out["logprobs"], torch.log_softmax(
             lg_, -1).gather(-1, out["top"]))
+    # НЕКОНЕЧНЫЕ ВХОДЫ ОТВЕРГАЮТСЯ ДО argmax
+    bad_lg = lg_.clone()
+    bad_lg[0, 0, 0] = float("nan")
+    try:
+        select_from_outputs(bad_lg, z0_, h, head, book, torch)
+    except ValueError as e:
+        assert "не конечны" in str(e), e
+    else:
+        raise AssertionError("принят NaN в логитах")
     print(f"самопроверка k15c_rank_selector пройдена: {len(HEADS)} головы, "
           f"{N_SCORE_FEATURES} признаков кандидата, эквивариантность и "
           f"точность пулинга сверены")

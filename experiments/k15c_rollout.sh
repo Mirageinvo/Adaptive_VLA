@@ -18,6 +18,13 @@
 #         один декод. Рука собирается только с отчётом проверки вывода,
 #         пройденным ЭТОЙ головой и ЭТИМ модулем голов.
 #
+# РЕЖИМ ПРИВЯЗАН К СТАТУСУ ГОЛОВЫ из отчёта проверки вывода: dev — только
+# при основном пороге (primary), safety — при основном или разведочном.
+#
+# КАТАЛОГ АРТЕФАКТОВ НЕСЁТ ОТПЕЧАТКИ головы, отчёта проверки вывода и
+# харнесса. Готовые блоки пропускаются только внутри него: роллауты другой
+# головы или другой версии харнесса не будут приняты за готовые.
+#
 # КАРТА — та же, что у гейта K-15a: рука k15c сверяет device. Git здесь не
 # вызывается, кроме чтения хеша коммита для лога.
 #
@@ -46,6 +53,18 @@ done
 export PYTHONPATH="${LIBERO_PATH:-$HOME/LIBERO}"
 export MUJOCO_GL=egl
 export PYTHONUNBUFFERED=1
+
+STATUS="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))\
+.get('selector_status') or '')" "$REPORT")"
+case "$MODE:$STATUS" in
+  dev:primary|safety:primary|safety:pilot) ;;
+  *) echo "ОТКАЗ: режим $MODE при статусе головы «$STATUS»: dev положен только"
+     echo "  при основном пороге, safety — при основном или разведочном"
+     exit 3 ;;
+esac
+sha12 () { sha1sum "$1" | cut -c1-12; }
+TAG="sel$(sha12 "$SELECTOR")_rep$(sha12 "$REPORT")_k9h$(sha12 \
+experiments/k9h_multiarm_gate.py)"
 # САМОПРОВЕРКИ ДО СРЕД И МОДЕЛИ: секунды, без GPU.
 for m in k15c_rank_selector k15c_policy k15c_behavior k9h_multiarm_gate; do
   if ! python3 "experiments/${m}.py" --selftest >/dev/null; then
@@ -57,11 +76,11 @@ TASKS_RUN="${SMOKE_TASKS:-$TASKS}"
 if [ -n "${SMOKE_TASKS:-}" ] || [ -n "${SMOKE_BLOCKS:-}" ]; then
   IS_SMOKE=1
   [ -n "${SMOKE_BLOCKS:-}" ] && STATES="$SMOKE_BLOCKS"
-  OUTD="reports/k15c/rollout/smoke_${MODE}_s${SEED}"
+  OUTD="reports/k15c/rollout/smoke_${MODE}_s${SEED}/${TAG}"
   LOGF="logs/k15c/rollout_smoke_${MODE}_s${SEED}.log"
 else
   IS_SMOKE=0
-  OUTD="reports/k15c/rollout/${MODE}/s${SEED}"
+  OUTD="reports/k15c/rollout/${MODE}/s${SEED}/${TAG}"
   LOGF="logs/k15c/rollout_${MODE}_s${SEED}.log"
 fi
 mkdir -p logs/k15c "$OUTD"
@@ -69,7 +88,8 @@ exec >> "$LOGF" 2>&1
 
 echo "=== СТАРТ $(date) === режим $MODE, карта $DEV, сид $SEED"
 echo "    коммит $(git rev-parse --short HEAD 2>/dev/null)"
-echo "    голова $SELECTOR, проверка вывода $REPORT"
+echo "    голова $SELECTOR (статус $STATUS), проверка вывода $REPORT"
+echo "    каталог $OUTD"
 echo "    задачи: $TASKS_RUN; блоки состояний: $STATES"
 [ "$IS_SMOKE" = "1" ] && echo "    СМОУК: набор урезан, артефакты в $OUTD"
 
@@ -128,7 +148,9 @@ done
 
 echo "=== раскатки закончены $(date) ==="
 NT=$(echo $TASKS_RUN | wc -w); NB=$(echo $STATES | wc -w)
-N=$(ls "$OUTD"/*.json 2>/dev/null | wc -l)
+# ТОЛЬКО ФАЙЛЫ РУК: сводка анализа лежит рядом и в подсчёт входить не должна.
+ARTS=$(ls "$OUTD"/q0_t*_i*.json "$OUTD"/k15c_t*_i*.json 2>/dev/null || true)
+N=$(echo $ARTS | wc -w)
 EXP=$(( 2 * NT * NB ))
 echo "    артефактов $N (ожидается $EXP: 2 руки x $NT задач x $NB блоков)"
 if [ "$N" -ne "$EXP" ]; then
@@ -136,17 +158,24 @@ if [ "$N" -ne "$EXP" ]; then
   exit 4
 fi
 if [ "$IS_SMOKE" = "1" ]; then
-  echo "=== СМОУК ЗАКОНЧЕН $(date). Это НЕ результат ==="
+  # АНАЛИЗ СМОУКА ПРОВЕРЯЕТ ПАРНОСТЬ, ПРОВЕНАНС И КОНЕЧНОСТЬ ДЕЙСТВИЙ, и его
+  # отказ — отказ смоука. Код 4 (катастрофа по разности успеха) на пяти
+  # эпизодах ничего не значит и смоук не валит.
+  SC=0
   python3 experiments/k15c_behavior.py --mode "$MODE" --allow-partial \
-    --arts "$OUTD"/*.json --out "$OUTD/behavior_smoke.json" --overwrite \
-    || true
+    --arts $ARTS --out "$OUTD/behavior_smoke.json" --overwrite || SC=$?
+  if [ "$SC" != 0 ] && [ "$SC" != 4 ]; then
+    echo "ОСТАНОВ: анализ смоука отказал (код $SC)"
+    exit "$SC"
+  fi
+  echo "=== СМОУК ЗАКОНЧЕН $(date). Это НЕ результат ==="
   exit 0
 fi
 # ПРИ set -e ОТКАЗ АНАЛИЗА ОБОРВАЛ БЫ СКРИПТ ДО СТРОКИ ИТОГА: код
 # забирается явно.
 CODE=0
-python3 experiments/k15c_behavior.py --mode "$MODE" --arts "$OUTD"/*.json \
-  --out "reports/k15c/rollout/behavior_${MODE}_s${SEED}.json" --overwrite \
-  || CODE=$?
+python3 experiments/k15c_behavior.py --mode "$MODE" --arts $ARTS \
+  --out "reports/k15c/rollout/behavior_${MODE}_s${SEED}_${TAG}.json" \
+  --overwrite || CODE=$?
 echo "=== КОНЕЦ $(date), анализ: код $CODE ==="
 exit $CODE

@@ -615,7 +615,12 @@ def main():
     if "val_confirm" in parts:
         raise SystemExit("val_confirm не открывается ни при каком исходе")
     if smoke:
-        parts = {p: v[:int(a.smoke_batches)] for p, v in parts.items()}
+        # SMOKE БЕРЁТ БАТЧИ РАВНОМЕРНО ПО ЧАСТИ, А НЕ ПЕРВЫЕ ПОДРЯД. Первые
+        # батчи плана — соседние кадры одних эпизодов: почти одинаковые
+        # признаки при скачущем лучшем ранге. На таком наборе проба головы
+        # упиралась в плато и давала ложный технический отказ всех голов.
+        parts = {p: [v[i] for i in probe.strided(len(v), int(a.smoke_batches))]
+                 for p, v in parts.items()}
     import k15b_build_rankpath_cache as cachelib
     index = {p: cachelib.build_row_index(v) for p, v in parts.items()}
     n_rows = {p: int(index[p][0].size) for p in PARTS}
