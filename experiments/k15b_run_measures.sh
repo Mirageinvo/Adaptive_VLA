@@ -8,11 +8,19 @@
 #
 # ЧТО ЗАПУСКАЕТСЯ
 #   1. геометрия книги   — CPU, секунды, НИЧЕГО НЕ РЕШАЕТ, описание;
-#   2. M2, мягкий путь   — решающий, 30-40 мин, на первой карте;
-#   3. M1, грубый путь   — пересъёмка под текущий код, 18 мин, на второй.
-# Второй и третий идут ПАРАЛЛЕЛЬНО на разных картах. CUDA_VISIBLE_DEVICES
-# не выставляется намеренно: robosuite выводит из неё MUJOCO_EGL_DEVICE_ID,
-# и EGL перестаёт инициализироваться. Карта задаётся только --device.
+#   2. M2, мягкий путь   — решающий, 30-40 мин;
+#   3. M1, грубый путь   — пересъёмка под текущий код, 18 мин.
+#
+# ПОЧЕМУ ПОСЛЕДОВАТЕЛЬНО, А НЕ НА ДВУХ КАРТАХ. Гейт K-15a снят на
+# конкретной карте, и `k15_context` сверяет `device` как часть обстановки:
+# на другой карте любой замер отказывает словами «гейт снят в другой
+# обстановке». Переснимать гейт под вторую карту нельзя дёшево — на нём
+# висит вся цепочка провенанса. Поэтому оба GPU-замера идут друг за
+# другом на ОДНОЙ карте, той же, что у гейта.
+#
+# CUDA_VISIBLE_DEVICES не выставляется намеренно: robosuite выводит из неё
+# MUJOCO_EGL_DEVICE_ID, и EGL перестаёт инициализироваться. Карта задаётся
+# только --device.
 #
 # КОДЫ ЗАМЕРОВ: 0 порог пройден; 3 технический блокер или неполная часть;
 #               4 отрицательный результат по объявленному порогу;
@@ -21,8 +29,8 @@
 # ЗАПУСКАТЬ ИЗ КОРНЯ РЕПОЗИТОРИЯ. Git здесь не вызывается намеренно.
 set -uo pipefail
 
-DEV_SOFT="${1:-cuda:1}"
-DEV_IFACE="${2:-cuda:0}"
+# ОДНА КАРТА НА ОБА ЗАМЕРА: та, на которой снят гейт K-15a.
+DEVICE="${1:-cuda:1}"
 STAMP="$(date +%Y%m%dT%H%M%S)"
 LOGDIR="logs/k15b"
 REP="reports/k15b"
@@ -76,32 +84,29 @@ run_one geometry "$REP/book_geometry.exit" "$GEO_LOG" \
 GEO=$?
 tail -n 30 "$GEO_LOG"
 
-echo
-echo "=== 2/3 и 3/3 параллельно: M2 на $DEV_SOFT, M1 на $DEV_IFACE ==="
-SOFT_LOG="$LOGDIR/measure_soft_${STAMP}.log"
-IFACE_LOG="$LOGDIR/measure_interface_${STAMP}.log"
-echo "  M2: $SOFT_LOG"
-echo "  M1: $IFACE_LOG"
-
-# ОКРУЖЕНИЕ ЭКСПОРТИРУЕТСЯ, А НЕ СТАВИТСЯ ПЕРЕД ВЫЗОВОМ ФУНКЦИИ:
-# присваивание перед вызовом shell-функции ведёт себя по-разному в разных
-# оболочках, а здесь вызов ещё и уходит в фон. LIBERO нужен обоим
-# прогонам, геометрии он был не нужен и до сюда не доходил.
+# ОКРУЖЕНИЕ ЭКСПОРТИРУЕТСЯ ОДИН РАЗ. LIBERO нужен обоим GPU-замерам,
+# геометрии он был не нужен и до сюда не доходил.
 export PYTHONPATH="${HOME}/LIBERO"
 export MUJOCO_GL=egl
 
+SOFT_LOG="$LOGDIR/measure_soft_${STAMP}.log"
+IFACE_LOG="$LOGDIR/measure_interface_${STAMP}.log"
+
+echo
+echo "=== 2/3 M2, мягкий путь, РЕШАЮЩИЙ, на $DEVICE ==="
+echo "  лог: $SOFT_LOG"
 run_one soft "$REP/measure_soft.exit" "$SOFT_LOG" \
     python3 experiments/k15b_measure_soft.py \
-        --device "$DEV_SOFT" --overwrite &
-PID_SOFT=$!
+        --device "$DEVICE" --overwrite
+SOFT=$?
 
+echo
+echo "=== 3/3 M1, грубый путь, пересъёмка, на $DEVICE ==="
+echo "  лог: $IFACE_LOG"
 run_one iface "$REP/interface_measure.exit" "$IFACE_LOG" \
     python3 experiments/k15b_measure_interface.py \
-        --device "$DEV_IFACE" --overwrite &
-PID_IFACE=$!
-
-wait "$PID_SOFT"; SOFT=$?
-wait "$PID_IFACE"; IFACE=$?
+        --device "$DEVICE" --overwrite
+IFACE=$?
 
 echo
 echo "=== хвост M2 ==="
