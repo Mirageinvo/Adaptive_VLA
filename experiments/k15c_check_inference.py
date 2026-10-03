@@ -153,6 +153,15 @@ def main():
     if cb.sha_file(os.path.join(a.rank_cache, "manifest.json")) \
             != sel_obj.get("cache_manifest_sha1"):
         raise SystemExit("голова обучалась на другом кэше")
+    # ЯВНО, А НЕ ТОЛЬКО ЧЕРЕЗ ОТПЕЧАТОК МАНИФЕСТА: книга и читатель головы
+    # сверяются с кэшем напрямую, как и обещает отчёт.
+    for key, ck_key in (("c1_sha1", "c1_sha1"),
+                        ("reader_state_sha1", "reader_state_sha1")):
+        if sel_obj.get(ck_key) != man.get(key):
+            raise SystemExit(f"{key}: у головы {sel_obj.get(ck_key)!r}, в "
+                             f"кэше {man.get(key)!r}")
+    if str(a.selector).endswith(".technical_fail.pt"):
+        raise SystemExit("это чекпойнт головы с техническим отказом")
 
     S = cb.load_stack(a)
     ctx, torch, model, k15t = S.ctx, S.torch, S.model, S.k15t

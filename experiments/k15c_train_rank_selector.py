@@ -95,6 +95,82 @@ def capture(rms_draft, rms_teacher, rms_policy):
     return float((float(rms_draft) - float(rms_policy)) / gap)
 
 
+M2_KIND = "k15b_soft_operating_point"
+M2_REL = 1e-6
+
+
+def sorted_rows_sha(rows):
+    """Отпечаток МНОЖЕСТВА строк в порядке M2: np.unique по int64.
+
+    Кэш хранит строки в порядке плана, а M2 хешировал отсортированные, поэтому
+    сравнивать их отпечатки напрямую нельзя — только после приведения.
+    """
+    u = np.unique(np.asarray(rows, np.int64))
+    return hashlib.sha1(np.ascontiguousarray(u).tobytes()).hexdigest()[:12]
+
+
+def check_m2(m2, man, rows_val, smoke=False):
+    """M2 против кэша. Возвращает (разведочный порог, проблемы). Fail-closed.
+
+    Разведочный порог берётся из M2, поэтому подменённый или устаревший M2
+    мог бы перевести исход 4 <-> 6. Проверяется: вид артефакта, отбор на
+    ПОЛНОЙ val_sel, та же книга, тот же читатель, тот же кодек и код, те же
+    строки, те же черновик и учитель, что посчитаны в кэше, и внутренняя
+    арифметика самой доли мягкого пути. На smoke-кэше часть val_sel урезана,
+    поэтому сверка строк и агрегатов там пропускается, а провенанс — нет.
+    """
+    problems = []
+
+    def need(cond, msg):
+        if not cond:
+            problems.append(msg)
+
+    need(m2.get("kind") == M2_KIND,
+         f"kind {m2.get('kind')!r}, ожидался {M2_KIND!r}")
+    need(m2.get("selected_on") == "val_sel",
+         f"selected_on {m2.get('selected_on')!r}: нужна полная val_sel")
+    teacher = m2.get("teacher") or {}
+    need(teacher.get("full_val_sel") is True, "M2 снят не на всей val_sel")
+    need(m2.get("c1_sha1") == man.get("c1_sha1"), "M2 снят с другой книгой")
+    need((m2.get("reader") or {}).get("point_state_sha1")
+         == man.get("reader_state_sha1"), "M2 снят с другим читателем")
+    for key in ("codec", "code_version", "joint_sha1"):
+        need(m2.get(key) == man.get(key), f"{key} M2 не совпал с кэшем")
+    draft, rank = teacher.get("draft"), teacher.get("rank")
+    a1_soft = (m2.get("rms") or {}).get("a1_soft")
+    cap_soft = m2.get("capture_soft")
+    nums = (draft, rank, a1_soft, cap_soft)
+    if any(x is None for x in nums) \
+            or not all(np.isfinite(float(x)) for x in nums):
+        problems.append("в M2 нет черновика, учителя, мягкого пути или его "
+                        "доли разрыва")
+        return None, problems
+    want = capture(draft, rank, a1_soft)
+    need(want is not None and abs(float(cap_soft) - want) <= 1e-9,
+         f"capture_soft {cap_soft!r} не равна capture(черновик, учитель, "
+         f"мягкий) = {want!r}")
+    if not smoke:
+        vs = (man.get("parts") or {}).get("val_sel") or {}
+        need(int(m2.get("rows", -1)) == int(vs.get("rows", -2)),
+             f"строк в M2 {m2.get('rows')}, в кэше {vs.get('rows')}")
+        need(int(m2.get("batches", -1)) == int(vs.get("batches", -2)),
+             f"батчей в M2 {m2.get('batches')}, в кэше {vs.get('batches')}")
+        need(m2.get("rows_sha1") == sorted_rows_sha(rows_val),
+             "множество строк val_sel в M2 не то, что в кэше")
+        agg = vs.get("aggregates") or {}
+        for key, val in (("draft", draft), ("teacher", rank)):
+            ref = agg.get(key)
+            rel = (abs(float(val) - float(ref)) / max(abs(float(ref)), 1e-12)
+                   if ref is not None else float("inf"))
+            need(rel <= M2_REL, f"{key} M2 {val!r} против кэша {ref!r}")
+        ref = ((man.get("m2_check") or {}).get("reference") or {})
+        need(ref.get("draft") == draft and ref.get("teacher") == rank,
+             "M2 не тот, с которым сверялся построитель кэша")
+    if problems:
+        return None, problems
+    return float(cap_soft) + PILOT_GAIN, []
+
+
 def evaluate_scores(scores, costs, draft, teacher, task_ids=None,
                     task_vocab=None):
     """Все метрики исполняемого выбора по оценкам [N, 8]. Чистая функция."""
@@ -494,6 +570,46 @@ def selftest():
     # БЕЗ ЭТАЛОНА M2 РАЗВЕДОЧНЫЙ СТАТУС НЕ ОПРЕДЕЛЁН, А НЕ «ПРОЙДЕН»
     assert head_verdict(good, base, True, True)["pilot_passed"] is None
 
+    # --- M2 ПРОТИВ КЭША: FAIL-CLOSED ------------------------------------
+    rows_v = np.array([30, 10, 20], np.int64)        # порядок плана
+    man_t = dict(c1_sha1="C", reader_state_sha1="R", codec={"c": 1},
+                 code_version={"v": 1}, joint_sha1="J",
+                 parts=dict(val_sel=dict(rows=3, batches=1, aggregates=dict(
+                     draft=0.145469, teacher=0.072892))),
+                 m2_check=dict(reference=dict(draft=0.145469,
+                                              teacher=0.072892)))
+    m2_t = dict(kind=M2_KIND, selected_on="val_sel", c1_sha1="C",
+                reader=dict(point_state_sha1="R"), codec={"c": 1},
+                code_version={"v": 1}, joint_sha1="J", rows=3, batches=1,
+                rows_sha1=sorted_rows_sha([10, 20, 30]),
+                teacher=dict(full_val_sel=True, draft=0.145469,
+                             rank=0.072892),
+                rms=dict(a1_soft=0.140457),
+                capture_soft=capture(0.145469, 0.072892, 0.140457))
+    pm, probs = check_m2(m2_t, man_t, rows_v)
+    assert probs == [] and abs(pm - (m2_t["capture_soft"] + 0.05)) < 1e-12
+    # ОТПЕЧАТОК — МНОЖЕСТВА СТРОК: порядок плана его не меняет
+    assert sorted_rows_sha([30, 10, 20]) == sorted_rows_sha([10, 20, 30])
+    for key, val in (("kind", "иное"), ("selected_on", "val_sel_subset"),
+                     ("c1_sha1", "ИНАЯ"), ("codec", {"c": 2}),
+                     ("code_version", {"v": 2}), ("joint_sha1", "И"),
+                     ("rows", 4), ("batches", 2),
+                     ("rows_sha1", sorted_rows_sha([10, 20, 31])),
+                     ("reader", dict(point_state_sha1="ИНОЙ")),
+                     ("capture_soft", 0.5)):
+        pm_, probs_ = check_m2(dict(m2_t, **{key: val}), man_t, rows_v)
+        assert pm_ is None and probs_, (key, probs_)
+    for tkey, val in (("full_val_sel", False), ("draft", 0.15),
+                      ("rank", 0.07)):
+        bad_t = dict(m2_t, teacher=dict(m2_t["teacher"], **{tkey: val}))
+        assert check_m2(bad_t, man_t, rows_v)[0] is None, tkey
+    assert check_m2({k: v for k, v in m2_t.items() if k != "capture_soft"},
+                    man_t, rows_v)[0] is None
+    # SMOKE: строки и агрегаты не сверяются, провенанс — сверяется
+    assert check_m2(dict(m2_t, rows=99), man_t, rows_v, smoke=True)[1] == []
+    assert check_m2(dict(m2_t, c1_sha1="ИНАЯ"), man_t, rows_v,
+                    smoke=True)[0] is None
+
     # --- ОБЩИЙ ИСХОД: РЕШАЮТ ТОЛЬКО h24-ГОЛОВЫ --------------------------
     def r(primary=False, pilot=False, trained=True, technical=False):
         return dict(trained=trained, technical=technical,
@@ -518,6 +634,14 @@ def selftest():
                          "h24_linear": r(trained=False,
                                          technical=True)}) == CODE_TECH
     assert overall_code({"h18_linear": r(primary=True)}) == CODE_TECH
+    # ОБУЧЕНА, НО НЕВОСПРОИЗВОДИМА — технический отказ, а не наука:
+    # такая голова исключается, даже если её числа «прошли»
+    assert overall_code({"h24_linear": r(primary=True,
+                                         technical=True)}) == CODE_TECH
+    assert overall_code({"h24_linear": r(primary=True, technical=True),
+                         "h24_candidate": r(pilot=True)}) == CODE_PILOT
+    assert overall_code({"h24_linear": r(technical=True),
+                         "h24_candidate": r(primary=True)}) == CODE_PRIMARY
     assert len({CODE_PRIMARY, CODE_PILOT, CODE_NONE, CODE_TECH}) == 4
     assert 2 not in (CODE_PRIMARY, CODE_PILOT, CODE_NONE, CODE_TECH)
 
@@ -705,26 +829,32 @@ def main():
 
     va, tr = data["val_sel"], data["train"]
     base = baselines(va["costs"], va["draft"], teacher_va, tr["costs"])
-    m2_soft, pilot_min, pilot_origin = None, None, None
-    if os.path.exists(a.m2):
-        with open(a.m2, encoding="utf-8") as fh:
-            m2 = json.load(fh)
-        best_grid = (m2.get("decision") or {}).get("best") or {}
-        m2_soft = dict(a1_soft=(m2.get("rms") or {}).get("a1_soft"),
-                       capture_soft=m2.get("capture_soft"),
-                       best_grid_rms=best_grid.get("rms"),
-                       best_grid_k=best_grid.get("k"),
-                       best_grid_tau=best_grid.get("tau"))
-        if m2_soft["capture_soft"] is not None:
-            pilot_min = float(m2_soft["capture_soft"]) + PILOT_GAIN
-            pilot_origin = (
-                "capture(a1_soft) из канонического M2 плюс 0.05: порог "
-                "сетки (k, tau), объявленный до данных 03.10.2026; "
-                "применение к головам K-15c зарегистрировано до их обучения. "
-                "Разведочный статус, НЕ научный критерий")
-    if pilot_min is None:
-        print("  ВНИМАНИЕ: в M2 нет capture_soft — разведочный статус не "
-              "определяется, только основной критерий")
+    # M2 ОБЯЗАТЕЛЕН И ПРОВЕРЯЕТСЯ: из него берётся разведочный порог, и
+    # подменённый или устаревший файл переводил бы исход 4 <-> 6.
+    if not os.path.exists(a.m2):
+        raise SystemExit(f"нет {a.m2}: разведочный порог взять неоткуда")
+    with open(a.m2, encoding="utf-8") as fh:
+        m2 = json.load(fh)
+    rows_val = np.asarray(arr("val_sel", "rows"))
+    pilot_min, m2_problems = check_m2(m2, man, rows_val,
+                                      smoke=bool(a.allow_smoke))
+    if m2_problems:
+        raise SystemExit(f"{a.m2} не соответствует кэшу: "
+                         + "; ".join(m2_problems[:6]))
+    m2_sha = cb.sha_file(a.m2)
+    pilot_origin = (
+        "capture(a1_soft) из канонического M2 плюс 0.05: порог сетки "
+        "(k, tau), объявленный до данных 03.10.2026; применение к головам "
+        "K-15c зарегистрировано до их обучения. Разведочный статус, НЕ "
+        "научный критерий")
+    best_grid = (m2.get("decision") or {}).get("best") or {}
+    m2_soft = dict(a1_soft=(m2.get("rms") or {}).get("a1_soft"),
+                   capture_soft=m2.get("capture_soft"),
+                   best_grid_rms=best_grid.get("rms"),
+                   best_grid_k=best_grid.get("k"),
+                   best_grid_tau=best_grid.get("tau"))
+    print(f"  M2 {a.m2} ({m2_sha}) сверен с кэшем"
+          + (" (smoke: без строк и агрегатов)" if a.allow_smoke else ""))
     r_d, r_t = rms(va["draft"]), rms(teacher_va)
     print(f"\n  ОПОРНЫЕ ЧИСЛА val_sel (черновик {r_d:.6f}, учитель "
           f"{r_t:.6f}):")
@@ -830,8 +960,25 @@ def main():
                                                  torch),
                                       scores_for(head, inp_va, idx_chk,
                                                  torch))
-        os.replace(tmp, path)
         finite = all(np.isfinite(h["val"]["rms"]) for h in hist)
+        # НЕВОСПРОИЗВОДИМОЕ — ТЕХНИЧЕСКИЙ ОТКАЗ, А НЕ НАУЧНЫЙ ОТРИЦАТЕЛЬНЫЙ
+        # РЕЗУЛЬТАТ. Голова исключается из исхода, а её чекпойнт не
+        # публикуется под рабочим именем: раннер и проверка вывода не должны
+        # его найти.
+        tech = [why for ok_, why in (
+            (finite, "в истории нечисловой RMS"),
+            (reproduced, "выбранная эпоха не воспроизвелась"),
+            (loaded_equal, "сохранение/загрузка изменили оценки"))
+            if not ok_]
+        if tech:
+            # ПРЕЖНИЙ ФАЙЛ С РАБОЧИМ ИМЕНЕМ — В АРХИВ: иначе чекпойнт
+            # прошлого прогона лежал бы под рабочим именем и выглядел бы
+            # действующим, хотя эта голова в этом прогоне отказала.
+            if os.path.exists(path):
+                os.replace(path, f"{path}.stale."
+                                 f"{time.strftime('%Y%m%dT%H%M%S')}.bak")
+            path = path[:-3] + ".technical_fail.pt"
+        os.replace(tmp, path)
         verdict = head_verdict(sel["val"], base, finite,
                                bool(reproduced and loaded_equal),
                                pilot_min=pilot_min)
@@ -840,6 +987,7 @@ def main():
             epochs_run=len(hist) - 1, val=sel["val"],
             reproduced=bool(reproduced), save_load_equal=bool(loaded_equal),
             verdict=verdict, checkpoint=os.path.abspath(path),
+            technical=("; ".join(tech) if tech else None),
             trajectory=[dict(epoch=h["epoch"], rms=h["val"]["rms"],
                              capture=h["val"]["capture"],
                              train_regret=h["train_regret"]) for h in hist])
@@ -852,6 +1000,9 @@ def main():
               f"% (диагностика); ранг 0 у {100 * v['share_rank0']:.1f} %")
         print(f"    гистограмма выбора: " + ", ".join(
             f"{k}:{c}" for k, c in sorted(v["histogram"].items())))
+        if tech:
+            print(f"    ТЕХНИЧЕСКИЙ ОТКАЗ: {'; '.join(tech)} — голова "
+                  f"исключена из исхода, чекпойнт записан как {path}")
         failed = [k for k, x in verdict["checks"].items() if x is False]
         role = ("" if name.startswith(DEPLOYABLE_PREFIX)
                 else " — АБЛЯЦИЯ ГЛУБИНЫ, на исход не влияет")
@@ -899,7 +1050,8 @@ def main():
           f"отбора, не независимая проверка; val_confirm не открывалась")
     out = dict(kind="k15c_selector_summary", code=code, outcome=outcome,
                heads=heads, results=results, baselines=base, depth=depth,
-               m2_soft=m2_soft, technical_failures=technical,
+               m2_soft=m2_soft, m2_file=os.path.abspath(a.m2),
+               m2_sha1=m2_sha, technical_failures=technical,
                capture_min=CAPTURE_MIN, pilot_min=pilot_min,
                pilot_origin=pilot_origin,
                deployable_prefix=DEPLOYABLE_PREFIX,
