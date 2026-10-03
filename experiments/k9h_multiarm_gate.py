@@ -635,10 +635,10 @@ def main() -> None:
     ap.add_argument("--rank-cache", default="data/k15c/rank_cache",
                     help="K-15c: канонический кэш, на котором обучена голова")
     ap.add_argument("--k15c-preflight", action="store_true",
-                    help="K-15c: проверка МЕХАНИКИ роллаута на smoke-голове "
-                         "и smoke-кэше, без отчёта проверки вывода. Только "
-                         "в каталог с /preflight/ в пути; настоящая голова "
-                         "этим путём не принимается")
+                    help="K-15c: предполётная проверка роллаута на "
+                         "smoke-голове, smoke-кэше и smoke-отчёте проверки "
+                         "вывода. Только в каталог с /preflight/ в пути; "
+                         "настоящая голова этим путём не принимается")
     ap.add_argument("--arm-label", default=None,
                     help="ОБЯЗАТЕЛЕН. Различает руки внутри эксперимента, "
                          "например fullbar, coarse24_b10, coarse24_b5, "
@@ -727,15 +727,16 @@ def main() -> None:
             f"--q1-ckpt и --depth-rvq-mode осмысленны только с --policy "
             f"depthrvq, задано --policy {args.policy}")
     if args.policy == "k15c":
-        if not args.selector:
-            raise SystemExit("--policy k15c требует --selector")
-        if args.k15c_preflight:
-            if "/preflight/" not in str(args.out or ""):
-                raise SystemExit("--k15c-preflight пишет только в каталог с "
-                                 "/preflight/ в пути: его артефакты не "
-                                 "должны смешаться с настоящими")
-        elif not args.inference_report:
-            raise SystemExit("--policy k15c требует --inference-report")
+        # ОТЧЁТ ПРОВЕРКИ ВЫВОДА НУЖЕН И В ПРЕДПОЛЁТНОМ РЕЖИМЕ: там он
+        # smoke-отчёт, и связь «отчёт -> рука» проверяется теми же
+        # условиями, что ночью.
+        if not args.selector or not args.inference_report:
+            raise SystemExit("--policy k15c требует --selector и "
+                             "--inference-report")
+        if args.k15c_preflight and "/preflight/" not in str(args.out or ""):
+            raise SystemExit("--k15c-preflight пишет только в каталог с "
+                             "/preflight/ в пути: его артефакты не должны "
+                             "смешаться с настоящими")
     elif args.selector or args.inference_report or args.k15c_preflight:
         raise SystemExit("--selector, --inference-report и "
                          "--k15c-preflight осмысленны только с --policy k15c")

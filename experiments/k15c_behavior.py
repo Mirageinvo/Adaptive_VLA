@@ -67,6 +67,26 @@ def dev_verdict(technical, rescue, harm, ratio=HARM_RATIO):
         f"{rescue:.4f} = {ratio * rescue:.4f}"))
 
 
+# КАКОЙ СТАТУС ГОЛОВЫ ДОПУСКАЕТ КАКОЙ РЕЖИМ. Раннер это уже проверяет, но
+# анализ не полагается на раннер: dev положен только голове, взявшей
+# основной порог, safety — основной или разведочный.
+MODE_STATUS = dict(dev=("primary",), safety=("primary", "pilot"))
+
+
+def check_status(statuses, mode, allow_preflight=False):
+    """Статусы головы в артефактах руки k15c против режима. Проблемы."""
+    allowed = MODE_STATUS[mode] + (("preflight",) if allow_preflight else ())
+    got = sorted({str(x) for x in statuses})
+    if not got:
+        return ["у руки k15c нет ни одного артефакта со статусом головы"]
+    if len(got) > 1:
+        return [f"у руки k15c разные статусы головы: {got}"]
+    if got[0] not in allowed:
+        return [f"статус головы {got[0]!r} не допускает режим {mode}: "
+                f"нужен один из {list(allowed)}"]
+    return []
+
+
 def pick_histogram(paths, arm):
     """Распределение выбранных рангов по артефактам руки k15c."""
     hist = np.zeros(8, np.int64)
@@ -118,6 +138,13 @@ def selftest():
     assert dev_verdict([], 0.10, 0.03)["code"] == 0
     assert dev_verdict([], 0.10, 0.031)["code"] == 4
     assert dev_verdict(["x"], 0.10, 0.0)["code"] == 3
+    assert check_status(["primary"] * 3, "dev") == []
+    assert check_status(["pilot"], "dev")              # разведочный — не dev
+    assert check_status(["pilot"], "safety") == []
+    assert check_status(["primary", "pilot"], "safety")  # смесь статусов
+    assert check_status([], "safety")
+    assert check_status(["preflight"], "safety")
+    assert check_status(["preflight"], "safety", allow_preflight=True) == []
     print("самопроверка k15c_behavior пройдена")
 
 
@@ -180,6 +207,12 @@ def main():
                          f"{sorted(shas)}")
     bad, act_max = finite_actions(meta[a.cand]["files"])
     technical += bad
+    statuses = [(json.load(open(p_)).get("joint") or {}).get(
+        "selector_status") for p_ in meta[a.cand]["files"]]
+    status_problems = check_status(statuses, a.mode,
+                                   allow_preflight=a.allow_preflight)
+    if status_problems:
+        raise SystemExit("; ".join(status_problems))
 
     sr_b = kb.cluster_means(obs, a.base, clusters, seeds)
     sr_c = kb.cluster_means(obs, a.cand, clusters, seeds)

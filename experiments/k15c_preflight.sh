@@ -9,7 +9,10 @@
 #   2. тренер голов на smoke-кэше — нужна хотя бы одна обученная h24-голова;
 #   3. проверка вывода настоящим проходом (--allow-smoke);
 #   4. роллаут обеих рук на задаче 8, две среды: q0 и k15c
-#      (--k15c-preflight) — первый живой запуск руки k15c в харнессе;
+#      (--k15c-preflight) — первый живой запуск руки k15c в харнессе. Рука
+#      получает smoke-отчёт шага 3 и проверяет его ТЕМИ ЖЕ условиями, что
+#      ночью настоящий: та же голова, тот же модуль голов, тот же кэш,
+#      проверка пройдена;
 #   5. парный анализ этих двух артефактов (--allow-preflight).
 #
 # Всё пишется в отдельные места (rank_cache_smoke, *_smoke, preflight/), и
@@ -125,11 +128,12 @@ if [ -z "$HEAD" ]; then
 fi
 echo "  голова для дальнейших шагов: $HEAD"
 
+REPORT="$OUTD/inference_smoke.json"
 step "3. проверка вывода, smoke" "0" "$LOGD/3_inference_smoke.log" \
     python3 experiments/k15c_check_inference.py --device "$DEV_MODEL" \
         --rank-cache data/k15c/rank_cache_smoke --selector "$HEAD" \
         --selector-summary reports/k15c/selector_smoke_s0.json \
-        --allow-smoke --overwrite || finish
+        --summary "$REPORT" --allow-smoke --overwrite || finish
 grep -hE "настоящий проход|выбор расходится|ИСХОД" \
     "$LOGD/3_inference_smoke.log" | sed 's/^/  /'
 
@@ -148,7 +152,7 @@ step "4a. роллаут руки q0" "0" "$LOGD/4a_rollout_q0.log" \
         --out "$OUTD/q0_t8_i{i0}.json" || finish
 step "4b. роллаут руки k15c" "0" "$LOGD/4b_rollout_k15c.log" \
     python3 experiments/k9h_multiarm_gate.py $COMMON \
-        --policy k15c --selector "$HEAD" \
+        --policy k15c --selector "$HEAD" --inference-report "$REPORT" \
         --rank-cache data/k15c/rank_cache_smoke --k15c-preflight \
         --arm-label k15c --out "$OUTD/k15c_t8_i{i0}.json" || finish
 grep -hE "проверка k15c|тождество сборки|успех " \

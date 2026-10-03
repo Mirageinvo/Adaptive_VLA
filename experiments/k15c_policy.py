@@ -58,9 +58,12 @@ def check_binding(sel_obj, sel_path, sel_sha, man, man_sha, report,
     need(sel_obj.get("kind") == ARM_KIND, f"голова: kind "
          f"{sel_obj.get('kind')!r}")
     if preflight:
-        # ПРЕДПОЛЁТНАЯ ПРОВЕРКА МЕХАНИКИ: допускается ТОЛЬКО smoke-голова на
-        # smoke-кэше, чтобы настоящий результат нельзя было получить этим
-        # путём ни по ошибке, ни намеренно. Отчёт проверки вывода не нужен.
+        # ПРЕДПОЛЁТНАЯ ПРОВЕРКА: допускается ТОЛЬКО smoke-голова на
+        # smoke-кэше со smoke-отчётом проверки вывода, чтобы настоящий
+        # результат нельзя было получить этим путём ни по ошибке, ни
+        # намеренно. Связь «отчёт -> рука» проверяется ТЕМИ ЖЕ условиями,
+        # что ночью: иначе предполётная проверка не покрывала бы контракт,
+        # на котором держится настоящий запуск.
         need(sel_obj.get("smoke") is True,
              "предполётная проверка — только для smoke-головы")
         need(man.get("canonical") is False,
@@ -87,13 +90,15 @@ def check_binding(sel_obj, sel_path, sel_sha, man, man_sha, report,
         need(man.get(key) == stack.get(key),
              f"{key}: в кэше {man.get(key)!r}, в обстановке "
              f"{stack.get(key)!r}")
-    if preflight:
-        return p
     if report is None:
         p.append("нет отчёта проверки вывода")
         return p
-    need(report.get("smoke") is not True,
-         "отчёт проверки вывода снят на smoke-кэше")
+    if preflight:
+        need(report.get("smoke") is True,
+             "предполётная проверка — только со smoke-отчётом")
+    else:
+        need(report.get("smoke") is not True,
+             "отчёт проверки вывода снят на smoke-кэше")
     need(report.get("kind") == REPORT_KIND,
          f"отчёт: kind {report.get('kind')!r}")
     need((report.get("verdict") or {}).get("passed") is True,
@@ -111,7 +116,8 @@ def check_binding(sel_obj, sel_path, sel_sha, man, man_sha, report,
     # СТАТУС ГОЛОВЫ ПРИВЯЗАН К ОТЧЁТУ: роллаут положен только голове,
     # взявшей основной или разведочный порог. Режим роллаута (dev только
     # для основного) проверяет раннер по этому же полю.
-    need(report.get("selector_status") in ("primary", "pilot"),
+    allowed = ("primary", "pilot") + (("smoke",) if preflight else ())
+    need(report.get("selector_status") in allowed,
          f"статус головы {report.get('selector_status')!r}: роллаут положен "
          f"только при основном или разведочном пороге")
     return p
@@ -167,8 +173,8 @@ def build_arm(device, selector, rank_cache, inference_report, torch,
     import k15c_build_rank_cache as cb
     import k15c_rank_selector as rs
 
-    for f in ([selector, os.path.join(rank_cache, "manifest.json")]
-              + ([] if preflight else [inference_report])):
+    for f in (selector, os.path.join(rank_cache, "manifest.json"),
+              inference_report):
         if not os.path.exists(f):
             raise SystemExit(f"нет {f}")
     sel_obj = torch.load(selector, map_location="cpu", weights_only=False)
@@ -179,10 +185,8 @@ def build_arm(device, selector, rank_cache, inference_report, torch,
     if problems:
         raise SystemExit("кэш не принят: " + "; ".join(problems[:6]))
     man_sha = cb.sha_file(os.path.join(rank_cache, "manifest.json"))
-    report = None
-    if not preflight:
-        with open(inference_report, encoding="utf-8") as fh:
-            report = json.load(fh)
+    with open(inference_report, encoding="utf-8") as fh:
+        report = json.load(fh)
 
     S = cb.load_stack(stack_namespace(device))
     # ЧЕРЕЗ JSON: в манифесте поля прошли сериализацию, и сравнивать надо
@@ -215,14 +219,13 @@ def build_arm(device, selector, rank_cache, inference_report, torch,
         arm="k15c", selector=os.path.abspath(selector),
         selector_status=("preflight" if preflight
                          else report.get("selector_status")),
+        inference_report_smoke=bool(report.get("smoke")),
         preflight=bool(preflight),
         selector_file_sha1=sel_sha, head=sel_obj["head"],
         selected_epoch=sel_obj.get("selected_epoch"),
         selector_module_sha1=module_sha,
-        inference_report=(None if preflight
-                          else os.path.abspath(inference_report)),
-        inference_report_sha1=(None if preflight
-                               else cb.sha_file(inference_report)),
+        inference_report=os.path.abspath(inference_report),
+        inference_report_sha1=cb.sha_file(inference_report),
         rank_cache_manifest_sha1=man_sha, c1_sha1=stack["c1_sha1"],
         reader_state_sha1=stack["reader_state_sha1"],
         frozen_content_sha=stack["frozen_content_sha"],
@@ -327,18 +330,34 @@ def selftest():
     # ОТЧЁТ, СНЯТЫЙ НА SMOKE-КЭШЕ, НАСТОЯЩЕЙ РУКОЙ НЕ ПРИНИМАЕТСЯ
     assert check_binding(sel, "x/h.pt", "S", man, "M", dict(rep, smoke=True),
                          "MOD", stack)
-    # ПРЕДПОЛЁТНЫЙ РЕЖИМ: smoke-голова на smoke-кэше без отчёта — можно,
-    # настоящая голова или канонический кэш — нельзя
+    # ПРЕДПОЛЁТНЫЙ РЕЖИМ: smoke-голова, smoke-кэш и smoke-ОТЧЁТ, связанные
+    # теми же условиями, что настоящий запуск
     sm_sel, sm_man = dict(sel, smoke=True), dict(man, canonical=False)
-    assert check_binding(sm_sel, "x/h.pt", "S", sm_man, "M", None, "MOD",
+    sm_rep = dict(rep, smoke=True, selector_status="smoke")
+    assert check_binding(sm_sel, "x/h.pt", "S", sm_man, "M", sm_rep, "MOD",
                          stack, preflight=True) == []
-    assert check_binding(sel, "x/h.pt", "S", sm_man, "M", None, "MOD",
-                         stack, preflight=True)
-    assert check_binding(sm_sel, "x/h.pt", "S", man, "M", None, "MOD",
-                         stack, preflight=True)
-    # и обстановку предполётный режим всё равно сверяет
-    assert check_binding(sm_sel, "x/h.pt", "S", sm_man, "M", None, "MOD",
-                         dict(stack, plan_sha1="X"), preflight=True)
+    for why, kw in (
+            ("настоящая голова", dict(sel_=sel)),
+            ("канонический кэш", dict(man_=man)),
+            ("нет отчёта", dict(rep_=None)),
+            ("настоящий отчёт", dict(rep_=dict(rep))),
+            ("отчёт другой головы", dict(rep_=dict(sm_rep,
+                                                   selector_file_sha1="X"))),
+            ("отчёт другим модулем", dict(module_="ИНОЙ")),
+            ("отчёт на другом кэше", dict(rep_=dict(sm_rep,
+                                                    cache_manifest_sha1="X"))),
+            ("проверка не пройдена", dict(rep_=dict(sm_rep, verdict=dict(
+                passed=False)))),
+            ("другая обстановка", dict(stack_=dict(stack, plan_sha1="X")))):
+        got = check_binding(kw.get("sel_", sm_sel), "x/h.pt", "S",
+                            kw.get("man_", sm_man), "M",
+                            kw.get("rep_", sm_rep) if "rep_" in kw
+                            else sm_rep, kw.get("module_", "MOD"),
+                            kw.get("stack_", stack), preflight=True)
+        assert got, f"предполётная мутация «{why}» не поймана"
+    # статус smoke вне предполётного режима не принимается
+    assert check_binding(sel, "x/h.pt", "S", man, "M",
+                         dict(rep, selector_status="smoke"), "MOD", stack)
     # РАЗВЕДОЧНЫЙ СТАТУС ДЛЯ РУКИ ДОПУСТИМ — ограничение режима у раннера
     assert check_binding(sel, "x/h.pt", "S", man, "M",
                          dict(rep, selector_status="pilot"), "MOD",
