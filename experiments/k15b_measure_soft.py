@@ -33,17 +33,23 @@ tau, поэтому все пять значений tau обязаны дать
 и равняться единице при k = словарь. Каждый из этих инвариантов проверяет
 именно ту арифметику, которой считаются все остальные точки.
 
-ПОТОЛОК ДВУХСТУПЕНЧАТОГО ЧИТАТЕЛЯ. Для малых k дополнительно считается
-лучший из k кандидатов ПО ОШИБКЕ ДЕЙСТВИЯ. Это ceiling схемы «h18 сужает
-до k, h24 выбирает», и он НЕ развёртываем: выбор требует истинного
-действия. Приводится как потолок, не как результат.
+СОГЛАСОВАННЫЙ RANK-PATH ПО ПОРЯДКУ ЧИТАТЕЛЯ. Для малых k считается
+лучший ЕДИНЫЙ ранг для всей строки среди первых k кодов порядка: берутся
+ровно k траекторий «ранг j во всех шестнадцати кодовых позициях», и из них
+выбирается лучшая по ошибке действия. ПОТОЛКОМ ВТОРОГО ЧИТАТЕЛЯ ЭТО НЕ
+ЯВЛЯЕТСЯ: читатель на h24 вправе брать разные ранги в разных позициях, и
+таких вариантов k^16, перебрать их нельзя. Величина приводится как
+диагностическая НИЖНЯЯ оценка возможностей более общего второго читателя и
+сама не развёртываема — выбор требует истинного действия.
 
 ПОРОГ ОБЪЯВЛЕН ДО ДАННЫХ, 03.10.2026. Лучшая точка обязана пройти опору и
 диапазон И взять долю разрыва не меньше, чем мягкий путь плюс 0.05, то
 есть около 11.9 % при нынешних числах. Иначе сужение области не работает
 и остаётся обучение исполняемого пути по action-члену. Выбор делается на
 `val_sel` и помечается как выбранный на этой части; `val_confirm` не
-открывается ни при каком исходе.
+открывается ни при каком исходе. При `--batches != 0` часть неполная, и
+тогда рабочая точка НЕ выбирается вовсе: исход — код 3, `accepted` ложно,
+`selected_on` равно "val_sel_subset".
 """
 import argparse
 import hashlib
@@ -57,22 +63,33 @@ import numpy as np
 
 TOPK_GRID = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048)
 TAU_GRID = (0.25, 0.5, 1.0, 2.0, 4.0)
-ORACLE_TOPK = (2, 4, 8)
+ORACLE_TOPK = (1, 2, 4, 8)
 SOFT_GAIN_MIN = 0.05
 K1_ABS_LIMIT = 1e-5            # допуск вырожденного инварианта при k=1
 
 
-def topk_mask(logits, k, torch):
-    """Маска top-k по логитам. Только логиты, никакого истинного действия."""
-    vocab = int(logits.shape[-1])
+def reader_order(logits, torch):
+    """ОДИН детерминированный порядок кодов по логитам, по убыванию.
+
+    Отдельный `topk` на каждое k НЕ даёт вложенных наборов: при равных
+    логитах на границе отсечения разные вызовы вольны включить разные из
+    совпавших кодов, и тогда recall@k перестаёт быть неубывающим, а «ранг
+    j» в одном месте перестаёт означать то же, что в другом. Устойчивая
+    сортировка снимает оба вопроса: все маски — префиксы этого порядка, и
+    rank-path-оракул берёт ранги из него же.
+    """
+    return torch.sort(logits, dim=-1, descending=True,
+                      stable=True).indices
+
+
+def prefix_mask(order, k, torch):
+    """Маска из первых k кодов порядка. Вложенность по построению."""
+    vocab = int(order.shape[-1])
     k = int(k)
     if not (1 <= k <= vocab):
         raise ValueError(f"k={k} вне [1, {vocab}]")
-    if k == vocab:
-        return torch.ones_like(logits, dtype=torch.bool)
-    idx = logits.topk(k, dim=-1).indices
-    m = torch.zeros_like(logits, dtype=torch.bool)
-    return m.scatter_(-1, idx, True)
+    m = torch.zeros(order.shape, dtype=torch.bool, device=order.device)
+    return m.scatter_(-1, order[..., :k], True)
 
 
 def soft_masked(weights, mask, book, fallback, torch, eps=1e-12):
@@ -141,17 +158,30 @@ def selftest():
     import torch
     import k15b_measure_interface as mi
 
-    # --- МАСКА TOP-K ----------------------------------------------------
+    # --- ПОРЯДОК И ПРЕФИКСНЫЕ МАСКИ -------------------------------------
     lg = torch.tensor([[[0.0, 5.0, 1.0, 2.0]]])
-    assert topk_mask(lg, 1, torch).tolist() == [[[False, True, False,
-                                                  False]]]
-    assert topk_mask(lg, 2, torch).tolist() == [[[False, True, False,
-                                                  True]]]
-    assert bool(topk_mask(lg, 4, torch).all())
-    assert int(topk_mask(lg, 3, torch).sum()) == 3
+    ordr = reader_order(lg, torch)
+    assert ordr.tolist() == [[[1, 3, 2, 0]]], ordr
+    assert prefix_mask(ordr, 1, torch).tolist() == [[[False, True, False,
+                                                      False]]]
+    assert prefix_mask(ordr, 2, torch).tolist() == [[[False, True, False,
+                                                      True]]]
+    assert bool(prefix_mask(ordr, 4, torch).all())
+    assert int(prefix_mask(ordr, 3, torch).sum()) == 3
+    # ВЛОЖЕННОСТЬ ПО ПОСТРОЕНИЮ, В ТОМ ЧИСЛЕ НА ПОЛНЫХ НИЧЬИХ, где
+    # отдельные вызовы topk вольны вернуть разные наборы
+    ties = torch.zeros(1, 1, 6)
+    o_t = reader_order(ties, torch)
+    assert sorted(o_t.flatten().tolist()) == list(range(6))
+    for ka, kb in ((1, 2), (2, 3), (3, 6)):
+        ma, mb = prefix_mask(o_t, ka, torch), prefix_mask(o_t, kb, torch)
+        assert int((ma & ~mb).sum()) == 0, (ka, kb)
+        assert int(ma.sum()) == ka and int(mb.sum()) == kb
+    assert reader_order(torch.tensor([[[1.0, 1.0, 1.0]]]),
+                        torch).tolist() == [[[0, 1, 2]]]
     for bad in (0, 5):
         try:
-            topk_mask(lg, bad, torch)
+            prefix_mask(ordr, bad, torch)
         except ValueError as e:
             assert "вне" in str(e), e
         else:
@@ -162,23 +192,29 @@ def selftest():
     p = torch.tensor([[[0.1, 0.4, 0.2, 0.3]]])
     fb = bk[torch.tensor([[1]])]
     # k=1: ПОБИТОВО строка книги, и так при любой температуре
-    emb1, deg1 = soft_masked(p, topk_mask(p.log(), 1, torch), bk, fb, torch)
+    op = reader_order(p.log(), torch)
+    emb1, deg1 = soft_masked(p, prefix_mask(op, 1, torch), bk, fb,
+                             torch)
     assert torch.equal(emb1, bk[torch.tensor([[1]])]), emb1
     assert not bool(deg1.any())
     for tau in (0.25, 1.0, 4.0):
         pt = torch.softmax(p.log() / tau, dim=-1)
-        e, _d = soft_masked(pt, topk_mask(p.log(), 1, torch), bk, fb, torch)
+        e, _d = soft_masked(pt, prefix_mask(op, 1, torch), bk, fb,
+                            torch)
         assert torch.equal(e, emb1), (tau, e)
     # k=2: веса 0.4 и 0.3 -> (0.4*[3,0] + 0.3*[0,5]) / 0.7
-    emb2, _d2 = soft_masked(p, topk_mask(p.log(), 2, torch), bk, fb, torch)
+    emb2, _d2 = soft_masked(p, prefix_mask(op, 2, torch), bk, fb,
+                            torch)
     assert abs(float(emb2[0, 0, 0]) - 1.2 / 0.7) < 1e-6, emb2
     assert abs(float(emb2[0, 0, 1]) - 1.5 / 0.7) < 1e-6, emb2
     # k=V: обычное среднее по всему распределению
-    embV, _dV = soft_masked(p, topk_mask(p.log(), 4, torch), bk, fb, torch)
+    embV, _dV = soft_masked(p, prefix_mask(op, 4, torch), bk, fb,
+                            torch)
     assert torch.allclose(embV, p @ bk, atol=1e-6), embV
     # ВЫРОЖДЕННАЯ МАССА -> ПРЕДСТАВИТЕЛЬ, А НЕ НОЛЬ
     z = torch.tensor([[[0.0, 0.0, 0.0, 0.0]]])
-    embz, degz = soft_masked(z, topk_mask(p.log(), 2, torch), bk, fb, torch)
+    embz, degz = soft_masked(z, prefix_mask(op, 2, torch), bk, fb,
+                             torch)
     assert bool(degz.all()) and torch.equal(embz, fb)
     # СОГЛАСОВАНО С КЛАСТЕРНОЙ ВЕРСИЕЙ ИЗ M1 НА ОБЩЕМ СЛУЧАЕ
     lab = torch.tensor([0, 0, 1, 1])
@@ -189,7 +225,7 @@ def selftest():
     assert torch.equal(e_cl, e_mk), (e_cl, e_mk)
 
     # --- ЭФФЕКТИВНАЯ ОПОРА ВЕСА -----------------------------------------
-    one = effective_support(p, topk_mask(p.log(), 1, torch), torch)
+    one = effective_support(p, prefix_mask(op, 1, torch), torch)
     assert abs(float(one) - 1.0) < 1e-5, one
     flat = torch.full((1, 1, 4), 0.25)
     assert abs(float(effective_support(
@@ -427,7 +463,7 @@ def main():
     keyf = (lambda k_, t_: f"k{int(k_)}_t{float(t_):g}")
     acc = {nm: 0.0 for nm in BASE}
     acc.update({keyf(k_, t_): 0.0 for k_ in ks for t_ in taus})
-    acc.update({f"oracle_top{k_}": 0.0 for k_ in ORACLE_TOPK})
+    acc.update({f"aligned_rankpath_top{k_}": 0.0 for k_ in ORACLE_TOPK})
     sup = {"reference": [], "reference_strided": [], "a1_pol": [],
            "a1_soft": []}
     rng_abs = {"a1_pol": [], "a1_soft": []}
@@ -440,6 +476,7 @@ def main():
     degen = {keyf(k_, t_): 0.0 for k_ in ks for t_ in taus}
     prob_gap, n_rows, forecast = 0.0, 0, None
     gaps = dict(k1_vs_hard=0.0, k1_across_tau=0.0)
+    top1_vs_pred = [0]
     q0_dev = torch.as_tensor(np.asarray(ctx.q0_can), device=dev)
     ac16 = torch.autocast(device_type=dev.type, dtype=ctx.dt)
     c1 = model.depth_aligned_book(1)
@@ -520,21 +557,35 @@ def main():
                 (torch.softmax(lg, dim=-1) - probs_model).abs().max()))
 
             # --- РАЗВЁРТКА (k, tau) -----------------------------------
-            masks = {int(k_): topk_mask(lg, int(k_), torch) for k_ in ks}
+            # ОДИН ПОРЯДОК НА ВСЁ: маски — его префиксы, ранги оракула —
+            # его же элементы. Отдельный topk на каждое k давал бы
+            # невложенные наборы на ничьих и разъехавшееся понятие ранга.
+            order = reader_order(lg, torch)
+            top1 = order[..., 0]
+            mism = int((top1 != pred).sum())
+            if mism:
+                top1_vs_pred[0] += mism
+            masks = {int(k_): prefix_mask(order, int(k_), torch)
+                     for k_ in ks}
             if bi == 1:
-                # МАСКИ ВЛОЖЕНЫ ПО ПОСТРОЕНИЮ, И ИМЕННО ЭТО ДЕЛАЕТ
-                # recall@k неубывающим. Проверяется на первом батче.
                 for ka, kb in zip(ks, ks[1:]):
                     if int((masks[ka] & ~masks[kb]).sum()):
                         raise SystemExit(
-                            f"маска top-{ka} не вложена в top-{kb}")
+                            f"маска {ka} не вложена в {kb}: порядок не "
+                            f"один")
+                for k_ in ks:
+                    if int(masks[int(k_)].sum()) != int(k_) * B * n_pos:
+                        raise SystemExit(f"в маске k={k_} не {k_} кодов")
                 if not bool(masks[ks[-1]].all()):
                     raise SystemExit("маска при k=словарь не полная")
             for k_ in ks:
                 recall[int(k_)] += float(masks[int(k_)].gather(
                     -1, target.unsqueeze(-1)).squeeze(-1)
                     .float().mean()) * w
-            fallback = c1f[pred]
+            # ПАДАЮЩИЙ ВАРИАНТ БЕРЁТСЯ ИЗ ТОГО ЖЕ ПОРЯДКА, А НЕ ИЗ
+            # `pred`: иначе при ничьей в argmax вырожденный инвариант
+            # k=1 сравнивал бы два разных кода.
+            fallback = c1f[top1]
             emb_k1 = None
             for t_ in taus:
                 p_t = torch.softmax(lg / float(t_), dim=-1)
@@ -544,12 +595,12 @@ def main():
                                            fallback, torch)
                     if int(k_) == 1:
                         # ВЕС ВЫРОЖДАЕТСЯ В ЕДИНИЦУ: при любой температуре
-                        # это строка книги под argmax. Сравнение не
-                        # побитовое, а с допуском K1_ABS_LIMIT: в сумме
-                        # 2047 слагаемых — ровно нули, и на fp32-gemm это
-                        # точно, но tf32 на Ampere округлил бы и
-                        # единственное произведение. Настоящая ошибка в
-                        # маске или нормировке даёт расхождение порядка
+                        # это строка книги под первым кодом порядка.
+                        # Сравнение не побитовое, а с допуском
+                        # K1_ABS_LIMIT: в сумме 2047 слагаемых — ровно
+                        # нули, на fp32-gemm это точно, но tf32 округлил
+                        # бы и единственное произведение. Настоящая ошибка
+                        # в маске или нормировке даёт расхождение порядка
                         # самой поправки, а не 1e-7.
                         g = float((emb - fallback).abs().max())
                         gaps["k1_vs_hard"] = max(gaps["k1_vs_hard"], g)
@@ -575,17 +626,22 @@ def main():
                     lat = z0.float() + emb
                     record(key, ctx.decode_fp32(lat), lat, keep)
 
-            # --- ПОТОЛОК ДВУХСТУПЕНЧАТОЙ СХЕМЫ ------------------------
+            # --- СОГЛАСОВАННЫЙ RANK-PATH ПО ПОРЯДКУ ЧИТАТЕЛЯ ----------
+            # ЭТО НЕ ПОТОЛОК ОБЩЕГО ВТОРОГО ЧИТАТЕЛЯ. Берутся ровно k
+            # траекторий: ранг j во ВСЕХ кодовых позициях, затем лучшая
+            # по ошибке действия. Второй читатель, способный выбирать
+            # разные ранги в разных позициях, имеет k^T вариантов, и эта
+            # величина — диагностическая НИЖНЯЯ оценка его возможностей.
+            errs_o = []
+            for j in range(max(ORACLE_TOPK)):
+                dec_j = ctx.decode_fp32(z0 + c1[order[..., j]])
+                rows_j, _m = k15t.weighted_row_error(
+                    dec_j, action, ctx.weights_gate, torch)
+                errs_o.append(rows_j)
+            st_o = torch.stack(errs_o, 0)
             for k_ in ORACLE_TOPK:
-                idx = lg.topk(int(k_), dim=-1).indices
-                errs_o = []
-                for j in range(int(k_)):
-                    dec_j = ctx.decode_fp32(z0 + c1[idx[..., j]])
-                    rows_j, _m = k15t.weighted_row_error(
-                        dec_j, action, ctx.weights_gate, torch)
-                    errs_o.append(rows_j)
-                acc[f"oracle_top{k_}"] += float(
-                    torch.stack(errs_o, 0).min(0).values.mean()) * w
+                acc[f"aligned_rankpath_top{k_}"] += float(
+                    st_o[:int(k_)].min(0).values.mean()) * w
 
             if bi == min(20, len(chosen)):
                 forecast = k15t.forecast_runtime(time.time() - t0, bi,
@@ -604,6 +660,8 @@ def main():
     print(f"  вырожденный инвариант k=1: расхождение со строкой книги "
           f"{gaps['k1_vs_hard']:.3e}, между температурами "
           f"{gaps['k1_across_tau']:.3e} при пределе {K1_ABS_LIMIT}")
+    print(f"  первый код порядка расходится с argmax модели в "
+          f"{top1_vs_pred[0]} позициях из {n_rows * n_pos}")
     # --- СВЕРКИ ---------------------------------------------------------
     draft, teach = rms["a0"], rms["a1_rank"]
     book_teacher = book.get("teacher_rms")
@@ -636,7 +694,9 @@ def main():
               "мягкое среднее по одному коду — это жёсткий путь")
              for t_ in taus]
             + [(keyf(ks[-1], 1.0), "a1_soft",
-                "вся маска при tau=1 — это нынешний мягкий путь")]):
+                "вся маска при tau=1 — это нынешний мягкий путь"),
+               ("aligned_rankpath_top1", "a1_pol",
+                "ранг 0 порядка читателя — это и есть исполняемый код")]):
         got = abs(rms[name] - rms[other]) / max(rms[other], 1e-12)
         consistency[name] = dict(against=other, rel=float(got), why=why,
                                  limit=mi.PATH_REL_LIMIT,
@@ -708,15 +768,26 @@ def main():
                 effective_support=float(eff[key] / n),
                 degenerate_share=float(degen[key] / n)))
     decision = soft_decision(points, capture_soft)
+    # НЕПОЛНАЯ ЧАСТЬ НЕ ДАЁТ РАБОЧЕЙ ТОЧКИ. Прежде при --batches != 0
+    # выбор всё равно делался, `accepted` мог стать истиной, а
+    # `selected_on` писалось как "val_sel" — то есть неполная выборка
+    # выдавалась за ту часть, на которой объявлен отбор.
+    if not full_val:
+        decision = dict(code=3, outcome=(
+            f"взято {len(chosen)} батчей из {len(batch_list)}: это "
+            f"диагностический прогон, рабочая точка не выбирается и "
+            f"учитель с probe не сверялся"), best=None,
+            full_val_sel=False, would_have_been=decision)
     if broken:
         decision = dict(code=3, outcome=(
             f"структурные инварианты не сошлись ({broken}): рабочая точка "
             f"не выбирается, числа сохранены для разбора"),
             best=None, broken=broken, would_have_been=decision)
 
-    ceiling = {int(k_): dict(
-        rms=float(rms[f"oracle_top{k_}"]),
-        capture=trainer.capture(draft, teach, rms[f"oracle_top{k_}"]))
+    aligned = {int(k_): dict(
+        rms=float(rms[f"aligned_rankpath_top{k_}"]),
+        capture=trainer.capture(draft, teach,
+                                rms[f"aligned_rankpath_top{k_}"]))
         for k_ in ORACLE_TOPK}
 
     # --- ОТЧЁТ ----------------------------------------------------------
@@ -742,12 +813,17 @@ def main():
     print("\n  эффективное число кодов под маской при tau=1: " + ", ".join(
         f"k={k_} {by_key[keyf(k_, 1.0)]['effective_support']:.1f}"
         for k_ in ks))
-    print("\n  ПОТОЛОК ДВУХСТУПЕНЧАТОЙ СХЕМЫ (не развёртываем, выбор "
-          "требует истинного действия):")
+    print("\n  СОГЛАСОВАННЫЙ RANK-PATH ПО ПОРЯДКУ ЧИТАТЕЛЯ. Это НЕ "
+          "потолок второго читателя:")
+    print("    берутся ровно k траекторий «ранг j во всех 16 позициях», "
+          "лучшая по ошибке действия. Читатель на h24, выбирающий разные "
+          "ранги в разных позициях, имеет k^16 вариантов, поэтому ниже — "
+          "диагностическая НИЖНЯЯ оценка его возможностей, и выбор "
+          "требует истинного действия, то есть не развёртываем:")
     for k_ in ORACLE_TOPK:
-        print(f"    лучший из top-{k_} по ошибке действия: "
-              f"{ceiling[k_]['rms']:.6f} "
-              f"({100 * (ceiling[k_]['capture'] or 0):.1f} %)")
+        print(f"    лучший согласованный ранг из {k_}: "
+              f"{aligned[k_]['rms']:.6f} "
+              f"({100 * (aligned[k_]['capture'] or 0):.1f} %)")
     if decision.get("best"):
         bp = by_key[decision["best"]["key"]]
         print(f"\n  ЛУЧШАЯ ПРОШЕДШАЯ ТОЧКА: k={bp['k']}, tau={bp['tau']}, "
@@ -767,8 +843,17 @@ def main():
         accepted=bool(decision["code"] == 0),
         thresholds=dict(soft_gain_min=SOFT_GAIN_MIN,
                         declared="до данных, 03.10.2026"),
-        selected_on="val_sel", val_confirm_used_for_selection=False,
-        decision=decision, points=points, ceiling_oracle_topk=ceiling,
+        selected_on=("val_sel" if full_val else "val_sel_subset"),
+        val_confirm_used_for_selection=False,
+        decision=decision, points=points,
+        aligned_rankpath_topk=aligned,
+        aligned_rankpath_note=(
+            "лучший ЕДИНЫЙ ранг для всей строки среди первых k кодов "
+            "порядка читателя. Это НЕ потолок второго читателя: тот может "
+            "брать разные ранги в разных кодовых позициях, и таких "
+            "вариантов k^16. Диагностическая нижняя оценка, выбор требует "
+            "истинного действия"),
+        top1_vs_pred_mismatches=int(top1_vs_pred[0]),
         recall={str(k_): v for k_, v in recall.items()},
         rms=rms, consistency=consistency,
         capture_hard=capture_hard, capture_soft=capture_soft,
@@ -790,7 +875,7 @@ def main():
                     trained=bool(point != trainer.ZERO_TAG),
                     history_entry=hp),
         grid=dict(topk=[int(x) for x in ks], tau=[float(t) for t in taus],
-                  oracle_topk=[int(x) for x in ORACLE_TOPK]),
+                  aligned_rankpath_topk=[int(x) for x in ORACLE_TOPK]),
         rows=int(n_rows), rows_sha1=rows_sha, batches=len(chosen),
         batches_in_part=len(batch_list), seconds=float(elapsed),
         forecast=forecast, support_every=int(every),

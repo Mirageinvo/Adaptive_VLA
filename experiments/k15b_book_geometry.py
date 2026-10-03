@@ -23,29 +23,38 @@
      другого неразличимо между «далеко в ту же сторону» и «близко к нулю».
   3. Распределение БЛИЖАЙШЕГО СОСЕДА по евклиду и по косинусу — это и есть
      предел, доступный любому разбиению с настоящей строкой-представителем.
-  4. НИЖНЯЯ ГРАНИЦА ДЛЯ ЛЮБОГО РАЗБИЕНИЯ. Разбиение на K < V групп
-     заставляет минимум V-K строк пользоваться представителем, отличным от
-     себя, и каждая такая строка платит не меньше, чем до своего
-     ближайшего соседа. Значит для ЛЮБОГО разбиения
+  4. НИЖНЯЯ ГРАНИЦА. Разбиение на K < V групп заставляет минимум V-K
+     строк пользоваться представителем, отличным от себя, и каждая такая
+     строка платит не меньше, чем до своего ближайшего соседа. Значит для
+     любого разбиения
 
-         mean_k rel(k) >= (сумма V-K наименьших rel до соседа) / V.
+         mean_k rel(k) >= (сумма V-K наименьших rel до соседа) / V,
 
-     Граница не зависит ни от алгоритма, ни от сбалансированности, ни от
-     метрики кластеризации — только от того, что представитель обязан быть
-     настоящей строкой книги. Она НЕ распространяется на центроиды и
-     обучаемые представители: там вопрос переносится в опору декодера, а
-     мягкие пути её, по измерению M1, проходят с запасом.
+     а при неравномерном использовании кодов — то же с весами, где
+     отбрасываются K наибольших слагаемых p_k * rel(k).
+
+     ЧТО ИМЕННО ЭТА ГРАНИЦА ОГРАНИЧИВАЕТ, И ЧТО НЕТ. Она ограничивает
+     СРЕДНЕЕ ОТНОСИТЕЛЬНОЕ РАССТОЯНИЕ В ЛАТЕНТЕ при представителе —
+     настоящей строке книги. Она НЕ ограничивает action RMS на реально
+     встречающихся состояниях, и перехода между этими двумя величинами
+     здесь не доказано: далёкие латенты могут давать близкие действия,
+     чувствительность декодера зависит от z0, и численный порог ниже с
+     долей разрыва никак не связан. Поэтому граница НЕ закрывает ни
+     грубую иерархию вообще, ни action-aware разбиение, ни центроиды и
+     обучаемые представители, ни мягкий coarse-to-fine интерфейс, и она
+     НЕ является гейтом ни для одного из них.
   5. Перезапуски k-medoids с разными seed: вырожденные размеры могут быть
      свойством данных, а могут — одной неудачной инициализации.
   6. Кластеризация по НОРМАЛИЗОВАННЫМ строкам (то есть по косинусу), с
      оценкой результата в ИСХОДНОМ пространстве: важно не то, насколько
      похожи направления, а сколько поправки доживает до декодера.
 
-ПОРОГ ОБЪЯВЛЕН ДО ДАННЫХ, 03.10.2026: если нижняя граница при K = 64 ниже
-0.50, то жёсткое разбиение с настоящей строкой-представителем ещё имеет
-запас и его стоит искать лучшим алгоритмом — код 0. Если нет, это
-семейство исключено целиком, независимо от алгоритма — код 4, и остаются
-только мягкие или обучаемые представители.
+ЭТОТ ЗАМЕР НИЧЕГО НЕ РЕШАЕТ И ВСЕГДА ВОЗВРАЩАЕТ 0. Он описывает книгу.
+Численный ориентир 0.50 объявлен до данных, 03.10.2026, и формулируется
+ровно так: «достижимо ли при K <= 64 и представителе-настоящей-строке
+среднее по строкам книги относительное латентное искажение ниже 0.50».
+Ответ на этот вопрос — утверждение о латентной геометрии, и ни запускать,
+ни отменять M2 или action-aware разбиение он не может.
 """
 import argparse
 import hashlib
@@ -88,6 +97,38 @@ def partition_lower_bound(rel_nn, K):
     if K == V:
         return 0.0
     return float(rel[:V - K].sum() / V)
+
+
+def partition_lower_bound_weighted(rel_nn, weights, K):
+    """То же при неравномерном использовании кодов.
+
+    Вклад строки, не ставшей представителем, не меньше p_k * rel(k), а
+    представителями выгоднее всего сделать K строк с наибольшим таким
+    вкладом. При равных весах совпадает с невзвешенной границей.
+    """
+    rel = np.asarray(rel_nn, np.float64)
+    w = np.asarray(weights, np.float64)
+    if rel.shape != w.shape:
+        raise ValueError(f"формы {rel.shape} и {w.shape}")
+    if float(w.sum()) <= 0.0:
+        raise ValueError("нулевые веса")
+    V, K = int(rel.size), int(K)
+    if not (1 <= K <= V):
+        raise ValueError(f"K={K} вне [1, {V}]")
+    term = np.sort(rel * (w / w.sum()))
+    return float(term[:V - K].sum()) if K < V else 0.0
+
+
+def cosine_nearest(C, cos):
+    """Ближайший сосед ПО КОСИНУСУ: максимум косинуса при j != k.
+
+    Прежняя версия обещала это в заголовке, а считала косинус до
+    ЕВКЛИДОВА ближайшего соседа — другая величина.
+    """
+    M = np.asarray(cos, np.float64).copy()
+    np.fill_diagonal(M, -np.inf)
+    idx = M.argmax(1)
+    return idx.astype(np.int64), M[np.arange(M.shape[0]), idx]
 
 
 def cosine_to(X, idx):
@@ -168,6 +209,41 @@ def selftest():
     r = np.sqrt(float(mi.pairwise_sq(short)[0, 1])) / 1.0
     assert abs(r - 0.98) < 1e-12, r
 
+    # --- ВЗВЕШЕННАЯ ГРАНИЦА СОВПАДАЕТ С НЕВЗВЕШЕННОЙ ПРИ РАВНЫХ ВЕСАХ --
+    for K in (1, 2, 3, 4):
+        a_ = partition_lower_bound(rel, K)
+        b_ = partition_lower_bound_weighted(rel, np.ones_like(rel), K)
+        assert abs(a_ - b_) < 1e-15, (K, a_, b_)
+    # ПРИ ПЕРЕКОШЕННЫХ ВЕСАХ ПРЕДСТАВИТЕЛЯМИ ВЫГОДНЕЕ ЧАСТЫЕ СТРОКИ
+    wt = np.array([100.0, 1.0, 1.0, 1.0])
+    bw = partition_lower_bound_weighted(rel, wt, 1)
+    assert abs(bw - (0.2 + 0.3 + 0.4) / 103.0) < 1e-12, bw
+    for bad_w in (np.zeros(4), ):
+        try:
+            partition_lower_bound_weighted(rel, bad_w, 2)
+        except ValueError as e:
+            assert "веса" in str(e), e
+        else:
+            raise AssertionError("приняты нулевые веса")
+    try:
+        partition_lower_bound_weighted(rel, np.ones(3), 2)
+    except ValueError as e:
+        assert "формы" in str(e), e
+    else:
+        raise AssertionError("приняты веса другой длины")
+
+    # --- БЛИЖАЙШИЙ ПО КОСИНУСУ ОТЛИЧАЕТСЯ ОТ БЛИЖАЙШЕГО ПО ЕВКЛИДУ ----
+    W = np.array([[1.0, 0.0], [10.0, 0.1], [1.2, 0.5]])
+    Dw = mi.pairwise_sq(W)
+    cosw = (W @ W.T) / np.outer(np.linalg.norm(W, axis=-1),
+                                np.linalg.norm(W, axis=-1))
+    e_idx, _e_d = nearest_other(Dw)
+    c_idx, c_val = cosine_nearest(W, cosw)
+    assert e_idx[0] == 2, e_idx          # по евклиду ближе короткая строка
+    assert c_idx[0] == 1, c_idx          # по косинусу ближе длинная
+    assert c_val[0] > 0.999, c_val
+    assert cosine_nearest(W, cosw)[1].shape == (3,)
+
     d = describe([1.0, 2.0, 3.0], "x")
     assert d["x"]["median"] == 2.0 and d["x"]["max"] == 3.0
     print(f"самопроверка k15b_book_geometry пройдена: порог границы при "
@@ -184,6 +260,10 @@ def main():
         description="K-15b: геометрия книги C1, без GPU")
     ap.add_argument("--c1", default="data/k15b/c1_selected.pt")
     ap.add_argument("--cache", default="data/k11a_joint12")
+    ap.add_argument("--target", default="data/k15b/rankpath_target_train.npz",
+                    help="кэш целей; по нему берутся веса использования "
+                         "кодов. Если файла нет, считается только "
+                         "равномерный вариант")
     ap.add_argument("--summary", default="reports/k15b/book_geometry.json")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--selftest", action="store_true")
@@ -229,28 +309,62 @@ def main():
     D = mi.pairwise_sq(C)
     nn_idx, nn_d = nearest_other(D)
     rel_nn = nn_d / np.maximum(nrm, 1e-300)
-    cos_nn = cosine_to(C, nn_idx)
+    cos_to_euclid_nn = cosine_to(C, nn_idx)
+    cosmat = (C @ C.T) / np.maximum(np.outer(nrm, nrm), 1e-300)
+    cnn_idx, cnn_val = cosine_nearest(C, cosmat)
+    rel_to_cosine_nn = np.sqrt(D[np.arange(V), cnn_idx]) / np.maximum(
+        nrm, 1e-300)
     stats = {}
     stats.update(describe(nrm, "row_norm"))
     stats.update(describe(rel_nn, "nearest_other_rel"))
-    stats.update(describe(cos_nn, "nearest_other_cosine"))
+    stats.update(describe(cos_to_euclid_nn, "cosine_to_euclid_nearest"))
+    # БЛИЖАЙШИЙ ПО КОСИНУСУ — ОТДЕЛЬНАЯ ВЕЛИЧИНА, а не косинус до
+    # евклидова соседа: в заголовке обещалась именно она.
+    stats.update(describe(cnn_val, "cosine_nearest_value"))
+    stats.update(describe(rel_to_cosine_nn, "rel_to_cosine_nearest"))
+    stats.update(describe((cnn_idx != nn_idx).astype(np.float64),
+                          "cosine_nn_differs_from_euclid_nn"))
     print(f"\n  НОРМЫ СТРОК: медиана {stats['row_norm']['median']:.4f}, "
           f"p05 {stats['row_norm']['p05']:.4f}, p95 "
           f"{stats['row_norm']['p95']:.4f}, минимум "
           f"{stats['row_norm']['min']:.4f}")
-    print(f"  ДО БЛИЖАЙШЕЙ ДРУГОЙ СТРОКИ: относительное расстояние "
-          f"медиана {stats['nearest_other_rel']['median']:.4f}, p05 "
-          f"{stats['nearest_other_rel']['p05']:.4f}; косинус медиана "
-          f"{stats['nearest_other_cosine']['median']:.4f}")
+    print(f"  ДО БЛИЖАЙШЕЙ ПО ЕВКЛИДУ: относительное расстояние медиана "
+          f"{stats['nearest_other_rel']['median']:.4f}, p05 "
+          f"{stats['nearest_other_rel']['p05']:.4f}; косинус до неё "
+          f"медиана {stats['cosine_to_euclid_nearest']['median']:.4f}")
+    print(f"  ДО БЛИЖАЙШЕЙ ПО КОСИНУСУ: косинус медиана "
+          f"{stats['cosine_nearest_value']['median']:.4f}, p95 "
+          f"{stats['cosine_nearest_value']['p95']:.4f}; относительное "
+          f"расстояние до неё медиана "
+          f"{stats['rel_to_cosine_nearest']['median']:.4f}; это другая "
+          f"строка, чем евклидов сосед, в "
+          f"{100 * stats['cosine_nn_differs_from_euclid_nn']['mean']:.1f} "
+          f"% случаев")
     print(f"  для справки: у ортогональных векторов равной нормы "
           f"относительное расстояние {np.sqrt(2.0):.4f}, а не 1")
 
+    # --- ВЕСА ИСПОЛЬЗОВАНИЯ КОДОВ ---------------------------------------
+    usage = None
+    if os.path.exists(a.target):
+        cache = np.load(a.target, allow_pickle=True)
+        codes = np.asarray(cache["codes"], np.int64).reshape(-1)
+        usage = np.bincount(codes, minlength=V).astype(np.float64)
+        print(f"\n  веса использования взяты из {a.target}: "
+              f"{codes.size} целевых кодов, различных "
+              f"{int((usage > 0).sum())}/{V}")
+    else:
+        print(f"\n  {a.target} нет: взвешенная граница не считается")
+
     bounds = {int(K): partition_lower_bound(rel_nn, K) for K in KS}
-    print("\n  НИЖНЯЯ ГРАНИЦА ДЛЯ ЛЮБОГО РАЗБИЕНИЯ С НАСТОЯЩИМ "
-          "ПРЕДСТАВИТЕЛЕМ:")
+    bounds_w = ({int(K): partition_lower_bound_weighted(rel_nn, usage, K)
+                 for K in KS} if usage is not None else None)
+    print("  НИЖНЯЯ ГРАНИЦА СРЕДНЕГО ОТНОСИТЕЛЬНОГО ЛАТЕНТНОГО "
+          "ИСКАЖЕНИЯ\n  (представитель — настоящая строка книги; про "
+          "action RMS это НЕ утверждение):")
     for K in KS:
-        print(f"    K={K:3d}: среднее относительное расстояние не ниже "
-              f"{bounds[K]:.4f}")
+        extra = ("" if bounds_w is None
+                 else f", с весами использования {bounds_w[int(K)]:.4f}")
+        print(f"    K={K:3d}: не ниже {bounds[K]:.4f}{extra}")
 
     # --- ФАКТИЧЕСКИЕ РАЗБИЕНИЯ, ПЕРЕЗАПУСКИ, КОСИНУСНАЯ ВЕРСИЯ ---------
     Cn = C / np.maximum(nrm, 1e-300)[:, None]
@@ -299,23 +413,30 @@ def main():
               f"медоида {cosine['cosine_to_medoid_mean']:.4f}")
 
     bound64 = bounds[max(KS)]
-    if bound64 < BOUND_MAX:
-        verdict = dict(code=0, outcome=(
-            f"нижняя граница при K={max(KS)} равна {bound64:.4f} < "
-            f"{BOUND_MAX}: у жёсткого разбиения с настоящей строкой-"
-            f"представителем есть запас, и неудача medoid-варианта в M1 "
-            f"относится к алгоритму, а не к семейству"))
-    else:
-        verdict = dict(code=4, outcome=(
-            f"нижняя граница при K={max(KS)} равна {bound64:.4f} >= "
-            f"{BOUND_MAX}: ЛЮБОЕ разбиение на {max(KS)} и меньше групп с "
-            f"настоящей строкой-представителем теряет столько же, "
-            f"независимо от алгоритма, метрики и сбалансированности. "
-            f"Остаются мягкие и обучаемые представители"))
-    print(f"\n  ИСХОД: {verdict['outcome']} (код {verdict['code']})")
+    statement = dict(
+        question=(f"достижимо ли при K <= {max(KS)} и представителе — "
+                  f"настоящей строке книги среднее по строкам книги "
+                  f"относительное ЛАТЕНТНОЕ искажение ниже {BOUND_MAX}"),
+        bound_at_max_k=float(bound64),
+        bound_below_threshold=bool(bound64 < BOUND_MAX),
+        threshold=float(BOUND_MAX),
+        weighted_bound_at_max_k=(None if bounds_w is None
+                                 else float(bounds_w[max(KS)])),
+        decides_nothing=("это утверждение о латентной геометрии. Перехода "
+                         "к action RMS на встречающихся состояниях здесь "
+                         "НЕ доказано: далёкие латенты могут давать "
+                         "близкие действия, чувствительность декодера "
+                         "зависит от z0, а порог с долей разрыва не "
+                         "связан. Ни M2, ни action-aware разбиение, ни "
+                         "центроиды, ни мягкий coarse-to-fine этот замер "
+                         "не открывает и не закрывает"))
+    print(f"\n  УТВЕРЖДЕНИЕ: {statement['question']} — "
+          + ("ДА" if statement["bound_below_threshold"] else "НЕТ")
+          + f" (граница {bound64:.4f})")
+    print("  ЭТО НЕ ГЕЙТ. " + statement["decides_nothing"])
 
     payload = dict(
-        kind="k15b_book_geometry", verdict=verdict,
+        kind="k15b_book_geometry", statement=statement, decides=None,
         threshold=dict(bound_max=BOUND_MAX,
                        declared="до данных, 03.10.2026"),
         c1_file=os.path.abspath(a.c1), c1_sha1=got,
@@ -323,18 +444,27 @@ def main():
         source_epoch=obj.get("source_epoch"),
         codec_book_gap=codec_gap, vocab=int(V), dim=int(dim),
         stats=stats, lower_bounds={str(k): v for k, v in bounds.items()},
+        lower_bounds_weighted=(None if bounds_w is None
+                               else {str(k): v
+                                     for k, v in bounds_w.items()}),
+        usage_file=(os.path.abspath(a.target)
+                    if usage is not None else None),
         per_k={str(k): v for k, v in per_k.items()},
         ks=[int(k) for k in KS], restart_seeds=[int(s) for s in RESTART_SEEDS],
         orthogonal_reference_rel=float(np.sqrt(2.0)),
-        note=("Относительное расстояние до представителя около единицы НЕ "
+        note=("ЭТОТ ЗАМЕР НИЧЕГО НЕ РЕШАЕТ: он описывает книгу и всегда "
+              "возвращает 0. "
+              "Относительное расстояние до представителя около единицы НЕ "
               "означает ортогональность строк: у ортогональных векторов "
               "равной нормы оно равно sqrt(2). Значение около 1 "
               "совместимо с коротким представителем около начала "
               "координат, и нормы медоидов здесь приведены именно для "
               "этой проверки. Нижняя граница относится ко всем "
               "разбиениям, где представитель — настоящая строка книги, и "
-              "НЕ относится к центроидам, мягким средним и обучаемым "
-              "представителям"))
+              "НЕ относится ни к центроидам, ни к мягким средним, ни к "
+              "обучаемым представителям, ни к разбиению, построенному по "
+              "ошибке ДЕЙСТВИЯ, и вообще не является утверждением об "
+              "action RMS"))
     os.makedirs(os.path.dirname(os.path.abspath(a.summary)) or ".",
                 exist_ok=True)
     tmp = a.summary + f".tmp.{os.getpid()}"
@@ -343,7 +473,7 @@ def main():
                   allow_nan=False)
     os.replace(tmp, a.summary)
     print(f"  сводка: {a.summary}")
-    return int(verdict["code"])
+    return 0
 
 
 if __name__ == "__main__":

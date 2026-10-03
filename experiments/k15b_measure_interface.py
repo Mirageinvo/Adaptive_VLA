@@ -283,8 +283,12 @@ def cluster_choice(probs, member, torch):
     на CUDA атомарное сложение по повторяющимся индексам даёт
     порядок-зависимую сумму в младших разрядах, и выбор кластера мог бы
     отличаться между прогонами на почти-ничьих. При тождественном
-    разбиении матрица единичная, и результат побитово равен входу —
-    к каждой вероятности прибавляются ровно нули, что точно.
+    разбиении матрица единичная, и в арифметике fp32 результат равен
+    входу — к каждой вероятности прибавляются ровно нули. ПОБИТОВОСТЬ
+    этим не гарантирована: GEMM с пониженной точностью накопления (tf32
+    и подобные) округлил бы и единственное произведение. Основной вывод
+    держится не на ней, а на точной сверке ЦЕЛЫХ кодов при вырожденном K,
+    которая идёт на каждом батче.
     """
     if int(member.shape[0]) != int(probs.shape[-1]):
         raise ValueError(f"строк матрицы {int(member.shape[0])}, кодов "
@@ -1308,6 +1312,15 @@ def main():
         per_k[K] = row
     decision = cluster_decision(
         {K: per_k[K] for K in ks}, capture_hard)
+    # НЕПОЛНАЯ ЧАСТЬ НЕ ДАЁТ РЕШЕНИЯ. Прежде при --batches != 0 решение
+    # всё равно принималось, а пропускалась только сверка учителя с
+    # probe: неполная выборка выдавалась за часть отбора.
+    if not full_val:
+        decision = dict(code=3, outcome=(
+            f"взято {len(chosen)} батчей из {len(batch_list)}: это "
+            f"диагностический прогон, решение по грубому интерфейсу не "
+            f"принимается и учитель с probe не сверялся"),
+            passed_ks=[], full_val_sel=False, would_have_been=decision)
     if broken:
         decision = dict(code=3, outcome=(
             f"структурные инварианты путей не сошлись ({broken}): решение "
@@ -1397,6 +1410,8 @@ def main():
     payload = dict(
         kind="k15b_coarse_clusters",
         accepted=bool(decision["code"] == 0),
+        selected_on=("val_sel" if full_val else "val_sel_subset"),
+        val_confirm_used_for_selection=False,
         accepted_ks=[int(k) for k in decision["passed_ks"]],
         thresholds=dict(oracle_capture_min=ORACLE_CAPTURE_MIN,
                         reader_capture_margin=READER_CAPTURE_MARGIN,
