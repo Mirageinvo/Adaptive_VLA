@@ -263,19 +263,33 @@ def extracted_bits(ce_baseline, ce_model):
     return float((float(ce_baseline) - float(ce_model)) / np.log(2.0))
 
 
-def cluster_choice(probs, labels, K, torch):
-    """Вероятность КЛАСТЕРА и выбор читателя: (B,T,V) -> (B,T,K), (B,T).
+def membership_matrix(labels, K, torch, device=None, dtype=None):
+    """Матрица принадлежности V x K: одна единица в строке, остальное ноль."""
+    lab = torch.as_tensor(labels, dtype=torch.long, device=device)
+    if int(lab.dim()) != 1:
+        raise ValueError(f"метки должны быть вектором, получено {lab.shape}")
+    if int(lab.min()) < 0 or int(lab.max()) >= int(K):
+        raise ValueError(f"метки вне [0, {K})")
+    m = torch.zeros(int(lab.numel()), int(K), device=lab.device,
+                    dtype=(dtype or torch.float32))
+    m[torch.arange(int(lab.numel()), device=lab.device), lab] = 1.0
+    return m
 
-    Суммирование идёт по меткам книги, поэтому при тождественном
-    разбиении результат — та же самая раскладка в том же порядке, и
-    argmax по кластерам совпадает с argmax по кодам даже на точных ничьих.
+
+def cluster_choice(probs, member, torch):
+    """Вероятность КЛАСТЕРА и выбор читателя: (B,T,V) x (V,K) -> (B,T,K).
+
+    Умножение на ФИКСИРОВАННУЮ матрицу принадлежности, а не `index_add_`:
+    на CUDA атомарное сложение по повторяющимся индексам даёт
+    порядок-зависимую сумму в младших разрядах, и выбор кластера мог бы
+    отличаться между прогонами на почти-ничьих. При тождественном
+    разбиении матрица единичная, и результат побитово равен входу —
+    к каждой вероятности прибавляются ровно нули, что точно.
     """
-    if int(labels.numel()) != int(probs.shape[-1]):
-        raise ValueError(f"метк {int(labels.numel())}, кодов "
+    if int(member.shape[0]) != int(probs.shape[-1]):
+        raise ValueError(f"строк матрицы {int(member.shape[0])}, кодов "
                          f"{int(probs.shape[-1])}")
-    pc = torch.zeros(tuple(probs.shape[:-1]) + (int(K),),
-                     device=probs.device, dtype=probs.dtype)
-    pc.index_add_(-1, labels, probs)
+    pc = probs @ member
     return pc, pc.argmax(-1)
 
 
@@ -466,7 +480,10 @@ def selftest():
                         [0.1, 0.1, 0.1, 0.7]]])
     lb = torch.tensor([0, 0, 1, 1])
     bk = torch.tensor([[1.0, 0.0], [3.0, 0.0], [0.0, 1.0], [0.0, 5.0]])
-    pc, choice = cluster_choice(pr, lb, 2, torch)
+    mem = membership_matrix(lb, 2, torch)
+    assert mem.shape == (4, 2) and mem.sum().item() == 4.0
+    assert mem.sum(1).tolist() == [1.0] * 4
+    pc, choice = cluster_choice(pr, mem, torch)
     assert torch.allclose(pc, torch.tensor([[[0.7, 0.3], [0.2, 0.8]]]))
     assert choice.tolist() == [[0, 1]], choice
     med = torch.tensor([0, 2])
@@ -486,18 +503,26 @@ def selftest():
     assert bool(deg0.all()) and torch.equal(emb0, fb0), (emb0, deg0)
     # ТОЖДЕСТВЕННОЕ РАЗБИЕНИЕ: это и есть структурный инвариант прогона
     ident = torch.arange(4)
-    pc_i, ch_i = cluster_choice(pr, ident, 4, torch)
+    pc_i, ch_i = cluster_choice(pr, membership_matrix(ident, 4, torch),
+                                torch)
     assert torch.equal(pc_i, pr) and torch.equal(ch_i, pr.argmax(-1))
     fb_i = bk[ident[ch_i]]
     emb_i, deg_i = soft_inside(pr, ident, ch_i, bk, fb_i, torch)
     assert not bool(deg_i.any())
     assert torch.equal(emb_i, bk[pr.argmax(-1)]), emb_i
     try:
-        cluster_choice(pr, torch.arange(3), 2, torch)
+        cluster_choice(pr, membership_matrix(torch.arange(3), 3, torch),
+                       torch)
     except ValueError as e:
         assert "кодов" in str(e), e
     else:
-        raise AssertionError("принято неверное число меток")
+        raise AssertionError("принята матрица не того размера")
+    try:
+        membership_matrix(torch.tensor([0, 5]), 2, torch)
+    except ValueError as e:
+        assert "вне" in str(e), e
+    else:
+        raise AssertionError("принята метка вне диапазона")
 
     # --- КОРЗИНЫ И МАСКИ ------------------------------------------------
     assert match_bucket_index(0) == 0 and match_bucket_index(2) == 1
@@ -892,6 +917,8 @@ def main():
                                   dtype=torch.long) for K in ks_all}
     med_dev = {K: torch.as_tensor(clusters[K][1], device=dev,
                                   dtype=torch.long) for K in ks_all}
+    mem_dev = {K: membership_matrix(clusters[K][0], K, torch, device=dev,
+                                    dtype=torch.float32) for K in ks_all}
     lpm_cl = {}
     for K in ks_all:
         labels = clusters[K][0]
@@ -932,7 +959,11 @@ def main():
                        oracle_soft_degenerate=0.0,
                        reader_soft_degenerate=0.0) for K in ks_all}
     buckets = [dict(sum=0.0, n=0) for _ in MATCH_BUCKETS]
-    sup = {"reference": []}
+    # ДВЕ ЭТАЛОННЫЕ ОПОРЫ, ПО ОДНОЙ НА КАЖДОЕ РАСПИСАНИЕ. Гейт сравнивает
+    # p95 кандидата с p95 кодека на истинном латенте, и сравнивать их надо
+    # НА ОДНИХ СТРОКАХ: пути a1_pol и a1_soft считаются на каждом батче, а
+    # грубые — на каждом n-м, поэтому у них свой эталон по тем же батчам.
+    sup = {"reference": [], "reference_strided": []}
     rng_abs = {}
     for nm in ["a1_pol", "a1_soft"] + [f"K{K}_{p}" for K in ks_all
                                        for p in CL_PATHS]:
@@ -1008,9 +1039,13 @@ def main():
                               True)
             lat_soft = z0.float() + probs @ c1.float()
             record("a1_soft", ctx.decode_fp32(lat_soft), lat_soft, True)
-            sup["reference"].append(k15t.decoder_support(
+            keep = (bi % every == 0)
+            ref_rows = k15t.decoder_support(
                 z_e.detach(), codec, torch, ctx.quantizers,
-                ctx.nearest_code, ctx.code_contribution)[1])
+                ctx.nearest_code, ctx.code_contribution)[1]
+            sup["reference"].append(ref_rows)
+            if keep:
+                sup["reference_strided"].append(ref_rows)
 
             # --- ВЕРОЯТНОСТНЫЕ ЧИСЛА ЧИТАТЕЛЯ И BASELINE ---------------
             ce_r = F.cross_entropy(logits.reshape(-1, vocab),
@@ -1045,11 +1080,10 @@ def main():
                 record(f"sub{m}", ctx.decode_fp32(z0 + c1[code_m]))
 
             # --- ГРУБЫЙ ИНТЕРФЕЙС -------------------------------------
-            keep = (bi % every == 0)
             for K in ks_all:
                 lab, md = lab_dev[K], med_dev[K]
                 true_cl = lab[target]
-                pc, read_cl = cluster_choice(probs, lab, K, torch)
+                pc, read_cl = cluster_choice(probs, mem_dev[K], torch)
                 for nm, cl in (("oracle", true_cl), ("reader", read_cl)):
                     code = md[cl]
                     if K == vocab:
@@ -1157,18 +1191,31 @@ def main():
     ref_all = torch.cat(sup["reference"])
     ref_p95 = float(torch.quantile(ref_all, 0.95))
     ref_p99 = float(torch.quantile(ref_all, 0.99))
+    ref_str = torch.cat(sup["reference_strided"])
+    ref_str_p95 = float(torch.quantile(ref_str, 0.95))
+    ref_str_p99 = float(torch.quantile(ref_str, 0.99))
 
-    def sup_stats(name):
+    def sup_stats(name, strided=False):
         if not sup.get(name):
             return None
         v = torch.cat(sup[name])
         p95 = float(torch.quantile(v, 0.95))
+        r95 = ref_str_p95 if strided else ref_p95
+        r99 = ref_str_p99 if strided else ref_p99
+        rn = int(ref_str.numel() if strided else ref_all.numel())
+        if int(v.numel()) != rn:
+            raise SystemExit(
+                f"опора {name}: {int(v.numel())} значений против {rn} у "
+                f"эталона — гейт перестал быть парным")
         return dict(n=int(v.numel()), mean=float(v.mean()), p95=p95,
                     p99=float(torch.quantile(v, 0.99)),
-                    reference_p95=ref_p95, reference_p99=ref_p99,
-                    passed=bool(p95 <= ref_p95),
+                    reference_p95=r95, reference_p99=r99,
+                    reference_n=rn,
+                    reference_scope=("каждый n-й батч, те же строки"
+                                     if strided else "все батчи"),
+                    passed=bool(p95 <= r95),
                     rule="p95 остатка пути <= p95 остатка кодека на "
-                         "истинном латенте")
+                         "истинном латенте, НА ТЕХ ЖЕ СТРОКАХ")
 
     def rng_stats(name):
         if not rng_abs.get(name):
@@ -1176,7 +1223,9 @@ def main():
         flat = np.concatenate(rng_abs[name], axis=0)
         p99 = [float(x) for x in np.percentile(flat, 99.0, axis=0)]
         amax = [float(x) for x in flat.max(axis=0)]
-        return dict(rows=int(flat.shape[0]), p99_candidate=p99,
+        return dict(values=int(flat.shape[0]),
+                    rows=int(flat.shape[0] // int(H_EXEC)),
+                    positions=int(H_EXEC), p99_candidate=p99,
                     absmax_candidate=amax,
                     p99_dataset=[float(x) for x in ctx.act_p99_dataset],
                     **probe.range_ok(p99, ctx.act_p99_dataset, amax))
@@ -1188,6 +1237,8 @@ def main():
         ce_reader=float(ce_reader), ce_marginal=float(ce_marg),
         extracted_bits=extracted_bits(ce_marg, ce_reader),
         marginal_entropy_bits_train=float(h_train_bits),
+        entropy_note=("энтропия СГЛАЖЕННОГО ПОЗИЦИОННОГО МАРГИНАЛА train, "
+                      "а не истинная энтропия цели"),
         upper_bound_bits=float(np.log2(vocab)),
         p_target_arithmetic_mean=float(scal["p_target"] / n),
         p_target_geometric_mean=float(np.exp(-ce_reader)),
@@ -1197,9 +1248,13 @@ def main():
         distinct_target_codes_train=int(used_train),
         vocab=int(vocab), smoothing_alpha=float(MARGINAL_ALPHA),
         note=("`extracted_bits` = (CE_marginal - CE_reader)/ln2 — это "
-              "ВАРИАЦИОННАЯ НИЖНЯЯ ОЦЕНКА выигрыша над контекстно-"
-              "независимым предсказателем, а НЕ взаимная информация между "
-              "h18 и целью и не предел возможностей представления. "
+              "HELD-OUT LOG-LOSS GAIN над позиционным маргиналом train, "
+              "в битовом эквиваленте. Вариационной нижней оценкой "
+              "взаимной информации это НЕ является: baseline — "
+              "сглаженный маргинал обучающей части, а не истинное p(Y), "
+              "поэтому неравенство CE_baseline >= H(Y) не гарантировано. "
+              "Это и не взаимная информация между h18 и целью, и не "
+              "предел возможностей читателя. "
               "Прежняя величина log2(2048) - CE была неверна: она "
               "предполагала равномерность целевых кодов и точность "
               "условного распределения читателя. Геометрическое среднее "
@@ -1238,7 +1293,7 @@ def main():
             key = f"K{K}_{nm}"
             row[f"rms_{nm}"] = float(rms[key])
             row[f"capture_{nm}"] = trainer.capture(draft, teach, rms[key])
-            row[f"support_{nm}"] = sup_stats(key)
+            row[f"support_{nm}"] = sup_stats(key, strided=True)
             row[f"range_{nm}"] = rng_stats(key)
         row["ce_reader_cluster"] = float(cl_scal[K]["ce_reader"] / n)
         row["ce_marginal_cluster"] = float(cl_scal[K]["ce_marg"] / n)
@@ -1283,10 +1338,12 @@ def main():
           f"{rms['a1_soft']:.6f} ({100 * (capture_soft or 0):.1f} %)")
     print(f"\n  ИНФОРМАЦИЯ (всё на одних и тех же {n_rows} строках):")
     print(f"    CE маргинала по позициям {ce_marg:.4f}, CE читателя "
-          f"{ce_reader:.4f} -> извлечено "
-          f"{information['extracted_bits']:.3f} бит над baseline")
-    print(f"    энтропия цели на train {h_train_bits:.3f} бит (не "
-          f"{np.log2(vocab):.0f}); различных кодов {used_train}/{vocab}")
+          f"{ce_reader:.4f} -> выигрыш held-out log-loss "
+          f"{information['extracted_bits']:.3f} бит-эквивалента над "
+          f"маргиналом (НЕ вся информация в h18)")
+    print(f"    энтропия СГЛАЖЕННОГО МАРГИНАЛА цели на train "
+          f"{h_train_bits:.3f} бит (не {np.log2(vocab):.0f}); различных "
+          f"кодов {used_train}/{vocab}")
     print(f"    вероятность цели: арифметическое среднее "
           f"{100 * information['p_target_arithmetic_mean']:.3f} %, "
           f"геометрическое "
@@ -1332,7 +1389,8 @@ def main():
                       f"эталоне {s_['reference_p95']:.4f} "
                       f"({'ok' if s_['passed'] else 'ОТКАЗ'}), диапазон "
                       f"{'ok' if g_['passed'] else 'ОТКАЗ'} по "
-                      f"{g_['rows']} строкам")
+                      f"{g_['rows']} строкам ({g_['values']} позиций "
+                      f"действия)")
     print(f"\n  ИСХОД: {decision['outcome']} (код {decision['code']})")
 
     # --- СОХРАНЕНИЕ -----------------------------------------------------
@@ -1363,7 +1421,9 @@ def main():
                      relative_to_probe=rel, full_val_sel=bool(full_val)),
         support=dict(a1_pol=sup_stats("a1_pol"),
                      a1_soft=sup_stats("a1_soft"),
-                     reference_p95=ref_p95, reference_p99=ref_p99),
+                     reference_p95=ref_p95, reference_p99=ref_p99,
+                     reference_strided_p95=ref_str_p95,
+                     reference_strided_p99=ref_str_p99),
         range={nm: rng_stats(nm) for nm in ("a1_pol", "a1_soft")},
         reader=dict(checkpoint=os.path.abspath(a.checkpoint), point=point,
                     point_state_sha1=point_sha, selected_tag=sel_tag,
