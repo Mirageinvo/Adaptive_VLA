@@ -33,6 +33,35 @@ tau, поэтому все пять значений tau обязаны дать
 и равняться единице при k = словарь. Каждый из этих инвариантов проверяет
 именно ту арифметику, которой считаются все остальные точки.
 
+ФИКСИРОВАННЫЙ РАНГ — ГЛАВНОЕ ДОБАВЛЕНИЕ. Для каждого j от 0 до 7 берётся
+j-й код порядка читателя во ВСЕХ позициях и считаются RMS, доля разрыва,
+опора, диапазон и доля строк, где он лучше ранга 0. Это развёртываемая
+точка БЕЗ ОБУЧЕНИЯ ВООБЩЕ — одно целое число. Её порог не новый: это уже
+объявленные 0.20 доли разрыва из фазы `q1_reader`. Если его берёт
+фиксированный ранг, учить нечего и дальше идёт roll-out.
+
+РАСПРЕДЕЛЕНИЕ ЛУЧШЕГО РАНГА приводится как ОПИСАНИЕ: гистограмма,
+энтропия, majority и его доля, доля строк с ненулевым лучшим рангом.
+Энтропия здесь — баланс классов, и go/no-go по ней не ставится: восемь
+равномерных классов могут идеально разделяться по h24, а низкая энтропия
+означает лишь сильный majority baseline. Достижимость покажет только
+отложенная голова.
+
+НЕОДНОЗНАЧНОСТЬ ЦЕЛИ. Сохраняется распределение разности ошибки второго и
+лучшего ранга и доли ничьих при нескольких допусках. Это нужно для выбора
+функции потерь: при частых ничьих жёсткая метка наказывает безвредные
+«ошибки», и учить надо ожидаемый regret
+
+    L = sum_j p(j | h24) * (e_j - min_l e_l),
+
+для чего обучающий кэш обязан хранить ВСЕ восемь ошибок на строку, а не
+только argmin, а CE остаётся малым вспомогательным членом.
+
+ПОРЯДКИ СРАВНИВАЮТСЯ ПРИ ОДИНАКОВОМ k. Префиксы ЛАТЕНТНОГО порядка
+считаются бесплатно из тех же десяти декодов, что и учитель, при k = 1, 2,
+4, 8 и 10. Прежнее сравнение «47.4 % у читателя против 100 % у латентного»
+мерило заодно и разницу в числе кандидатов.
+
 СОГЛАСОВАННЫЙ RANK-PATH ПО ПОРЯДКУ ЧИТАТЕЛЯ. Для малых k считается
 лучший ЕДИНЫЙ ранг для всей строки среди первых k кодов порядка: берутся
 ровно k траекторий «ранг j во всех шестнадцати кодовых позициях», и из них
@@ -42,10 +71,13 @@ tau, поэтому все пять значений tau обязаны дать
 диагностическая НИЖНЯЯ оценка возможностей более общего второго читателя и
 сама не развёртываема — выбор требует истинного действия.
 
-ПОРОГ ОБЪЯВЛЕН ДО ДАННЫХ, 03.10.2026. Лучшая точка обязана пройти опору и
-диапазон И взять долю разрыва не меньше, чем мягкий путь плюс 0.05, то
-есть около 11.9 % при нынешних числах. Иначе сужение области не работает
-и остаётся обучение исполняемого пути по action-члену. Выбор делается на
+ПОРОГИ ОБЪЯВЛЕНЫ ДО ДАННЫХ И ИХ ДВА, ПО СЕМЕЙСТВАМ. Фиксированный ранг
+проверяется первым, потому что это точка проще: одно целое число и ни
+одного обученного параметра, порог — объявленные 0.20. Сетка (k, tau) идёт
+второй: её лучшая точка обязана пройти опору и диапазон И взять долю
+разрыва не меньше, чем мягкий путь плюс 0.05, то есть около 11.9 % при
+нынешних числах. Не прошло ни одно семейство — развёртываемой точки без
+обучения нет, и остаётся обучение по action-члену. Выбор делается на
 `val_sel` и помечается как выбранный на этой части; `val_confirm` не
 открывается ни при каком исходе. При `--batches != 0` часть неполная, и
 тогда рабочая точка НЕ выбирается вовсе: исход — код 3, `accepted` ложно,
@@ -66,6 +98,12 @@ TAU_GRID = (0.25, 0.5, 1.0, 2.0, 4.0)
 ORACLE_TOPK = (1, 2, 4, 8)
 SOFT_GAIN_MIN = 0.05
 K1_ABS_LIMIT = 1e-5            # допуск вырожденного инварианта при k=1
+RANK_TIE_THRESHOLDS = (0.0, 0.01, 0.05, 0.10)
+LATENT_PREFIX = (1, 2, 4, 8, 10)
+# Порог для ФИКСИРОВАННОГО ранга — это уже зарегистрированный научный
+# порог фазы `q1_reader`, а не новое число: 0.20 доли разрыва. Если его
+# берёт фиксированный ранг, обучать нечего — он развёртываем как есть.
+FIXED_RANK_CAPTURE_MIN = 0.20
 
 
 def reader_order(logits, torch):
@@ -115,6 +153,83 @@ def effective_support(weights, mask, torch, eps=1e-12):
     return ent.exp()
 
 
+def rank_stats(best_ranks, k):
+    """Описание распределения лучшего ранга. ТОЛЬКО описание.
+
+    Энтропия здесь — баланс классов, и ставить по ней go/no-go нельзя:
+    восемь равномерных классов могут идеально разделяться по h24, а низкая
+    энтропия означает лишь сильный majority baseline. Достижимость
+    покажет только отложенная голова, а не это число.
+    """
+    b = np.asarray(best_ranks, np.int64)
+    if b.size == 0:
+        raise ValueError("пустой набор рангов")
+    if int(b.min()) < 0 or int(b.max()) >= int(k):
+        raise ValueError(f"ранги вне [0, {k})")
+    hist = np.bincount(b, minlength=int(k)).astype(np.int64)
+    pr = hist / float(hist.sum())
+    nz = pr[pr > 0]
+    maj = int(hist.argmax())
+    return dict(
+        rows=int(b.size),
+        histogram={int(i): int(c) for i, c in enumerate(hist)},
+        entropy_bits=float(-(nz * np.log2(nz)).sum()),
+        max_entropy_bits=float(np.log2(int(k))),
+        majority_rank=maj, majority_share=float(pr[maj]),
+        share_nonzero=float((b != 0).mean()),
+        note=("энтропия — описание баланса классов, НЕ мера сложности "
+              "задачи и не основание решать, учить ли голову"))
+
+
+def tie_shares(gap_rel, thresholds=RANK_TIE_THRESHOLDS):
+    """Доля строк, где второй ранг не хуже лучшего более чем на t.
+
+    Нужна для выбора функции потерь: при частых ничьих обычная
+    кросс-энтропия штрафует безвредные «ошибки», и учить надо ожидаемый
+    regret, а для него кэш обязан хранить ВСЕ восемь ошибок, а не argmin.
+    """
+    g = np.asarray(gap_rel, np.float64)
+    if g.size == 0:
+        raise ValueError("пустой набор разностей")
+    if float(g.min()) < -1e-9:
+        raise ValueError("разность второго и лучшего отрицательна")
+    return {f"{float(t):g}": float((g <= float(t)).mean())
+            for t in thresholds}
+
+
+def training_free_decision(points, fixed_points, capture_base,
+                           gain_min=SOFT_GAIN_MIN,
+                           fixed_min=FIXED_RANK_CAPTURE_MIN):
+    """Есть ли развёртываемая точка БЕЗ обучения. Два семейства, два порога.
+
+    Фиксированный ранг проверяется первым: это точка проще — одно целое
+    число и ни одного обученного параметра. Его порог — уже объявленный
+    научный порог фазы. Сетка (k, tau) идёт вторым со своим порогом
+    «мягкий путь плюс gain_min».
+    """
+    fx = [p for p in fixed_points
+          if int(p["rank"]) > 0 and p.get("support_passed")
+          and p.get("range_passed") and p.get("capture") is not None]
+    if fx:
+        best_fx = max(fx, key=lambda p: float(p["capture"]))
+        if float(best_fx["capture"]) >= float(fixed_min) - 1e-12:
+            got = 100 * float(best_fx["capture"])
+            return dict(code=0, family="fixed_rank", best=dict(best_fx),
+                        required=float(fixed_min),
+                        outcome=(f"фиксированный ранг {best_fx['rank']} "
+                                 f"берёт {got:.1f} % разрыва при пороге "
+                                 f"{100 * float(fixed_min):.0f} %: это "
+                                 f"развёртываемая точка БЕЗ обучения, "
+                                 f"дальше roll-out, а не голова"))
+    out = soft_decision(points, capture_base, gain_min=gain_min)
+    out["family"] = "soft_grid"
+    out["fixed_rank_best"] = (None if not fx else
+                              dict(max(fx, key=lambda p:
+                                       float(p["capture"]))))
+    out["fixed_rank_required"] = float(fixed_min)
+    return out
+
+
 def soft_decision(points, capture_base, gain_min=SOFT_GAIN_MIN):
     """Исход замера. Чистая функция.
 
@@ -157,6 +272,7 @@ def soft_decision(points, capture_base, gain_min=SOFT_GAIN_MIN):
 def selftest():
     import torch
     import k15b_measure_interface as mi
+    import k15b_train_stagewise as trainer
 
     # --- ПОРЯДОК И ПРЕФИКСНЫЕ МАСКИ -------------------------------------
     lg = torch.tensor([[[0.0, 5.0, 1.0, 2.0]]])
@@ -285,9 +401,85 @@ def selftest():
         found += 1
     assert found >= 1, "не нашёлся сбор артефакта"
 
+    # --- РАСПРЕДЕЛЕНИЕ ЛУЧШЕГО РАНГА ------------------------------------
+    rs = rank_stats([0, 0, 1, 7, 1, 1, 0, 0], 8)
+    assert rs["rows"] == 8 and rs["majority_rank"] == 0
+    assert abs(rs["majority_share"] - 0.5) < 1e-12
+    assert abs(rs["share_nonzero"] - 0.5) < 1e-12
+    assert rs["histogram"][1] == 3 and rs["histogram"][7] == 1
+    assert rs["histogram"][2] == 0 and len(rs["histogram"]) == 8
+    assert abs(rs["max_entropy_bits"] - 3.0) < 1e-12
+    # энтропия: 0.5*1 + 0.375*log2(1/0.375) + 0.125*3
+    want = -(0.5 * np.log2(0.5) + 0.375 * np.log2(0.375)
+             + 0.125 * np.log2(0.125))
+    assert abs(rs["entropy_bits"] - want) < 1e-12, rs["entropy_bits"]
+    assert 0.0 <= rs["entropy_bits"] <= rs["max_entropy_bits"] + 1e-12
+    one = rank_stats([3] * 10, 8)
+    assert abs(one["entropy_bits"]) < 1e-12 and one["majority_rank"] == 3
+    assert abs(one["share_nonzero"] - 1.0) < 1e-12
+    flat = rank_stats(list(range(8)), 8)
+    assert abs(flat["entropy_bits"] - 3.0) < 1e-12
+    for bad in ([], [0, 8], [-1]):
+        try:
+            rank_stats(bad, 8)
+        except ValueError as e:
+            assert "пустой" in str(e) or "вне" in str(e), e
+        else:
+            raise AssertionError(f"принято {bad}")
+
+    # --- НИЧЬИ ----------------------------------------------------------
+    ts = tie_shares([0.0, 0.005, 0.02, 0.2], (0.0, 0.01, 0.05, 0.1))
+    assert ts["0"] == 0.25 and ts["0.01"] == 0.5, ts
+    assert ts["0.05"] == 0.75 and ts["0.1"] == 0.75, ts
+    for bad in ([], [-1.0]):
+        try:
+            tie_shares(bad)
+        except ValueError as e:
+            assert "пустой" in str(e) or "отрицательна" in str(e), e
+        else:
+            raise AssertionError(f"принято {bad}")
+
+    # --- РЕШЕНИЕ ПО ДВУМ СЕМЕЙСТВАМ -------------------------------------
+    soft_pts = [dict(k=16, tau=1.0, capture=0.08, support_passed=True,
+                     range_passed=True)]
+    fixed_ok = [dict(rank=0, capture=0.034, support_passed=True,
+                     range_passed=True),
+                dict(rank=3, capture=0.25, support_passed=True,
+                     range_passed=True)]
+    d = training_free_decision(soft_pts, fixed_ok, 0.069)
+    assert d["code"] == 0 and d["family"] == "fixed_rank", d
+    assert d["best"]["rank"] == 3 and "roll-out" in d["outcome"], d
+    # РАНГ 0 НЕ СЧИТАЕТСЯ: это и есть нынешний жёсткий путь
+    only0 = [dict(rank=0, capture=0.9, support_passed=True,
+                  range_passed=True)]
+    d0 = training_free_decision(soft_pts, only0, 0.069)
+    assert d0["code"] == 4 and d0["family"] == "soft_grid", d0
+    assert d0["fixed_rank_best"] is None, d0
+    # НЕ ПРОШЁЛ ОПОРУ — НЕ РАБОЧАЯ ТОЧКА
+    nosup = [dict(rank=2, capture=0.5, support_passed=False,
+                  range_passed=True)]
+    assert training_free_decision(soft_pts, nosup, 0.069)["code"] == 4
+    # НИЖЕ ПОРОГА ФИКСИРОВАННОГО — УХОДИМ В СЕТКУ, НО ЧИСЛО ЗАПИСАНО
+    weak = [dict(rank=2, capture=0.12, support_passed=True,
+                 range_passed=True)]
+    dw = training_free_decision(soft_pts, weak, 0.069)
+    assert dw["code"] == 4 and dw["fixed_rank_best"]["rank"] == 2, dw
+    assert abs(dw["fixed_rank_required"] - 0.20) < 1e-12
+    # СЕТКА МОЖЕТ ПРОЙТИ САМА
+    strong_soft = [dict(k=16, tau=1.0, capture=0.2, support_passed=True,
+                        range_passed=True)]
+    ds = training_free_decision(strong_soft, weak, 0.069)
+    assert ds["code"] == 0 and ds["family"] == "soft_grid", ds
+
     assert TOPK_GRID[0] == 1 and TOPK_GRID[-1] == 2048
     assert 1.0 in TAU_GRID and len(TOPK_GRID) * len(TAU_GRID) == 60
     assert all(k in TOPK_GRID for k in ORACLE_TOPK)
+    assert max(ORACLE_TOPK) == 8 and max(LATENT_PREFIX) == 10
+    assert abs(FIXED_RANK_CAPTURE_MIN
+               - trainer.CAPTURE_THRESHOLD) < 1e-12, (
+        "порог фиксированного ранга обязан совпадать с объявленным "
+        "научным порогом фазы, а не быть новым числом")
+    assert RANK_TIE_THRESHOLDS[0] == 0.0
     print(f"самопроверка k15b_measure_soft пройдена: {len(TOPK_GRID)} "
           f"значений k, {len(TAU_GRID)} температур, порог "
           f"мягкий+{SOFT_GAIN_MIN}")
@@ -464,6 +656,8 @@ def main():
     acc = {nm: 0.0 for nm in BASE}
     acc.update({keyf(k_, t_): 0.0 for k_ in ks for t_ in taus})
     acc.update({f"aligned_rankpath_top{k_}": 0.0 for k_ in ORACLE_TOPK})
+    acc.update({f"fixed_rank{j}": 0.0 for j in range(max(ORACLE_TOPK))})
+    acc.update({f"latent_rankpath_top{k_}": 0.0 for k_ in LATENT_PREFIX})
     sup = {"reference": [], "reference_strided": [], "a1_pol": [],
            "a1_soft": []}
     rng_abs = {"a1_pol": [], "a1_soft": []}
@@ -471,12 +665,17 @@ def main():
         for t_ in taus:
             sup[keyf(k_, t_)] = []
             rng_abs[keyf(k_, t_)] = []
+    for j in range(max(ORACLE_TOPK)):
+        sup[f"fixed_rank{j}"] = []
+        rng_abs[f"fixed_rank{j}"] = []
     recall = {int(k_): 0.0 for k_ in ks}
     eff = {keyf(k_, t_): 0.0 for k_ in ks for t_ in taus}
     degen = {keyf(k_, t_): 0.0 for k_ in ks for t_ in taus}
     prob_gap, n_rows, forecast = 0.0, 0, None
     gaps = dict(k1_vs_hard=0.0, k1_across_tau=0.0)
     top1_vs_pred = [0]
+    rank_rows, gap_abs, gap_rel = [], [], []
+    beats0 = np.zeros(max(ORACLE_TOPK), np.int64)
     q0_dev = torch.as_tensor(np.asarray(ctx.q0_can), device=dev)
     ac16 = torch.autocast(device_type=dev.type, dtype=ctx.dt)
     c1 = model.depth_aligned_book(1)
@@ -534,6 +733,13 @@ def main():
                 errs.append(rows_j)
                 decoded.append(dec_j)
             stack = torch.stack(errs, 0)
+            # ПРЕФИКСЫ ЛАТЕНТНОГО ПОРЯДКА — БЕСПЛАТНО, декоды уже сделаны.
+            # Нужны, чтобы сравнивать порядок читателя с латентным ПРИ
+            # ОДИНАКОВОМ k: 47.4 % при k=8 против 100 % при k=10 мерили
+            # заодно и разницу в числе кандидатов.
+            for kp in LATENT_PREFIX:
+                acc[f"latent_rankpath_top{kp}"] += float(
+                    stack[:int(kp)].min(0).values.mean()) * w
             best_j = stack.argmin(0)
             idx_ = best_j.view(-1, 1, 1).expand(-1, near.shape[1], 1)
             target = near.gather(-1, idx_).squeeze(-1)
@@ -634,14 +840,27 @@ def main():
             # величина — диагностическая НИЖНЯЯ оценка его возможностей.
             errs_o = []
             for j in range(max(ORACLE_TOPK)):
-                dec_j = ctx.decode_fp32(z0 + c1[order[..., j]])
-                rows_j, _m = k15t.weighted_row_error(
-                    dec_j, action, ctx.weights_gate, torch)
-                errs_o.append(rows_j)
+                lat_j = z0 + c1[order[..., j]]
+                # ФИКСИРОВАННЫЙ РАНГ — РАЗВЁРТЫВАЕМАЯ ТОЧКА БЕЗ ОБУЧЕНИЯ,
+                # поэтому у него должны быть свои опора и диапазон, а не
+                # только RMS. Декод тот же, что нужен оракулу.
+                errs_o.append(record(f"fixed_rank{j}",
+                                     ctx.decode_fp32(lat_j), lat_j, keep))
             st_o = torch.stack(errs_o, 0)
             for k_ in ORACLE_TOPK:
                 acc[f"aligned_rankpath_top{k_}"] += float(
                     st_o[:int(k_)].min(0).values.mean()) * w
+            b0 = st_o[0]
+            for j in range(max(ORACLE_TOPK)):
+                beats0[j] += int((st_o[j] < b0).sum())
+            # ЛУЧШИЙ РАНГ И НЕОДНОЗНАЧНОСТЬ ЦЕЛИ. Разность второго и
+            # лучшего нужна для выбора функции потерь: при частых ничьих
+            # жёсткая метка наказывала бы безвредные «ошибки».
+            two = st_o.topk(2, dim=0, largest=False).values
+            rank_rows.append(st_o.argmin(0).cpu().numpy())
+            ga = (two[1] - two[0]).cpu().numpy()
+            gap_abs.append(ga)
+            gap_rel.append(ga / np.maximum(two[0].cpu().numpy(), 1e-12))
 
             if bi == min(20, len(chosen)):
                 forecast = k15t.forecast_runtime(time.time() - t0, bi,
@@ -696,7 +915,13 @@ def main():
             + [(keyf(ks[-1], 1.0), "a1_soft",
                 "вся маска при tau=1 — это нынешний мягкий путь"),
                ("aligned_rankpath_top1", "a1_pol",
-                "ранг 0 порядка читателя — это и есть исполняемый код")]):
+                "ранг 0 порядка читателя — это и есть исполняемый код"),
+               ("fixed_rank0", "a1_pol",
+                "фиксированный ранг 0 — это и есть исполняемый путь"),
+               ("latent_rankpath_top1", "a1_tok",
+                "ранг 0 латентного порядка — это путь токенизатора"),
+               (f"latent_rankpath_top{max(LATENT_PREFIX)}", "a1_rank",
+                "полный латентный префикс — это и есть учитель")]):
         got = abs(rms[name] - rms[other]) / max(rms[other], 1e-12)
         consistency[name] = dict(against=other, rel=float(got), why=why,
                                  limit=mi.PATH_REL_LIMIT,
@@ -711,6 +936,17 @@ def main():
     else:
         print(f"  структурные инварианты сошлись: {len(consistency)} "
               f"сверок, худшая относительная разность {worst:.2e}")
+
+    # ПРЕФИКСНЫЕ ОРАКУЛЫ МОНОТОННЫ ПО ПОСТРОЕНИЮ: минимум по большему
+    # множеству не бывает хуже. Нарушение означало бы, что префиксы
+    # собраны из разных порядков.
+    for fam, grid in (("aligned_rankpath_top", ORACLE_TOPK),
+                      ("latent_rankpath_top", LATENT_PREFIX)):
+        for ka, kb in zip(grid, grid[1:]):
+            if rms[f"{fam}{kb}"] > rms[f"{fam}{ka}"] + 1e-12:
+                raise SystemExit(
+                    f"{fam}{kb} = {rms[f'{fam}{kb}']!r} хуже {fam}{ka} = "
+                    f"{rms[f'{fam}{ka}']!r}: префиксы не из одного порядка")
 
     # --- ОПОРА И ДИАПАЗОН -----------------------------------------------
     ref_all = torch.cat(sup["reference"])
@@ -767,7 +1003,47 @@ def main():
                 range_passed=bool(g_ is not None and g_["passed"]),
                 effective_support=float(eff[key] / n),
                 degenerate_share=float(degen[key] / n)))
-    decision = soft_decision(points, capture_soft)
+    fixed_points = []
+    for j in range(max(ORACLE_TOPK)):
+        key = f"fixed_rank{j}"
+        s_ = sup_stats(key, strided=True)
+        g_ = rng_stats(key)
+        fixed_points.append(dict(
+            key=key, rank=int(j), rms=float(rms[key]),
+            capture=trainer.capture(draft, teach, rms[key]),
+            support=s_, range=g_,
+            support_passed=bool(s_ is not None and s_["passed"]),
+            range_passed=bool(g_ is not None and g_["passed"]),
+            share_better_than_rank0=float(beats0[j] / n)))
+    rank_info = rank_stats(np.concatenate(rank_rows), max(ORACLE_TOPK))
+    if rank_info["rows"] != n_rows:
+        raise SystemExit(f"гистограмма рангов по {rank_info['rows']} "
+                         f"строкам против {n_rows} пройденных")
+    if not (0.0 <= rank_info["entropy_bits"]
+            <= rank_info["max_entropy_bits"] + 1e-9):
+        raise SystemExit(f"энтропия ранга {rank_info['entropy_bits']} вне "
+                         f"[0, {rank_info['max_entropy_bits']}]")
+    ga = np.concatenate(gap_abs)
+    gr = np.concatenate(gap_rel)
+    ambiguity = dict(
+        ties=tie_shares(gr),
+        gap_abs=dict(median=float(np.median(ga)),
+                     p95=float(np.percentile(ga, 95)),
+                     mean=float(ga.mean())),
+        gap_rel=dict(median=float(np.median(gr)),
+                     p95=float(np.percentile(gr, 95)),
+                     mean=float(gr.mean())),
+        note=("разность ошибки ВТОРОГО и ЛУЧШЕГО ранга. При частых ничьих "
+              "жёсткая метка наказывала бы безвредные «ошибки», и учить "
+              "надо ожидаемый regret sum_j p(j) * (e_j - min_l e_l), для "
+              "чего кэш обязан хранить ВСЕ восемь ошибок на строку, а не "
+              "только argmin. CE тогда — малый вспомогательный член"))
+    latent_prefix = {int(kp): dict(
+        rms=float(rms[f"latent_rankpath_top{kp}"]),
+        capture=trainer.capture(draft, teach,
+                                rms[f"latent_rankpath_top{kp}"]))
+        for kp in LATENT_PREFIX}
+    decision = training_free_decision(points, fixed_points, capture_soft)
     # НЕПОЛНАЯ ЧАСТЬ НЕ ДАЁТ РАБОЧЕЙ ТОЧКИ. Прежде при --batches != 0
     # выбор всё равно делался, `accepted` мог стать истиной, а
     # `selected_on` писалось как "val_sel" — то есть неполная выборка
@@ -813,6 +1089,36 @@ def main():
     print("\n  эффективное число кодов под маской при tau=1: " + ", ".join(
         f"k={k_} {by_key[keyf(k_, 1.0)]['effective_support']:.1f}"
         for k_ in ks))
+    print("\n  ФИКСИРОВАННЫЙ РАНГ — развёртываем без обучения вообще "
+          f"(порог {100 * FIXED_RANK_CAPTURE_MIN:.0f} %):")
+    for fp in fixed_points:
+        mark = "" if (fp["support_passed"] and fp["range_passed"]) else "*"
+        print(f"    ранг {fp['rank']}: RMS {fp['rms']:.6f} "
+              f"({100 * (fp['capture'] or 0):6.1f} %){mark:1s}, лучше "
+              f"ранга 0 на {100 * fp['share_better_than_rank0']:5.1f} % "
+              f"строк")
+    print(f"\n  ЛУЧШИЙ РАНГ: majority {rank_info['majority_rank']} с "
+          f"долей {100 * rank_info['majority_share']:.1f} %; не нулевой у "
+          f"{100 * rank_info['share_nonzero']:.1f} % строк; энтропия "
+          f"{rank_info['entropy_bits']:.3f} из "
+          f"{rank_info['max_entropy_bits']:.0f} бит")
+    print("    гистограмма: " + ", ".join(
+        f"{i}:{c}" for i, c in sorted(rank_info["histogram"].items())))
+    print("    энтропия — ОПИСАНИЕ баланса классов, не мера сложности: "
+          "восемь равномерных классов могут идеально разделяться по h24, "
+          "а низкая энтропия означает лишь сильный majority baseline")
+    print(f"    ничьи: второй ранг не хуже лучшего у "
+          + ", ".join(f"{100 * v:.1f} % при t={t}"
+                      for t, v in ambiguity["ties"].items()))
+    print(f"    разность второго и лучшего: медиана "
+          f"{ambiguity['gap_abs']['median']:.3e} абсолютно, "
+          f"{100 * ambiguity['gap_rel']['median']:.1f} % относительно")
+    print("\n  ЛАТЕНТНЫЙ ПОРЯДОК ПРИ ТЕХ ЖЕ k (сравнение порядков "
+          "честное только при равном k):")
+    for kp in LATENT_PREFIX:
+        print(f"    латентный префикс {kp}: "
+              f"{latent_prefix[kp]['rms']:.6f} "
+              f"({100 * (latent_prefix[kp]['capture'] or 0):.1f} %)")
     print("\n  СОГЛАСОВАННЫЙ RANK-PATH ПО ПОРЯДКУ ЧИТАТЕЛЯ. Это НЕ "
           "потолок второго читателя:")
     print("    берутся ровно k траекторий «ранг j во всех 16 позициях», "
@@ -824,7 +1130,18 @@ def main():
         print(f"    лучший согласованный ранг из {k_}: "
               f"{aligned[k_]['rms']:.6f} "
               f"({100 * (aligned[k_]['capture'] or 0):.1f} %)")
-    if decision.get("best"):
+    if decision.get("family") == "fixed_rank":
+        bp = decision["best"]
+        print(f"\n  РАЗВЁРТЫВАЕМО БЕЗ ОБУЧЕНИЯ: фиксированный ранг "
+              f"{bp['rank']}, RMS {bp['rms']:.6f}, доля "
+              f"{100 * (bp['capture'] or 0):.1f} % при пороге "
+              f"{100 * decision['required']:.0f} %")
+        print(f"    опора p95 {bp['support']['p95']:.4f} при эталоне "
+              f"{bp['support']['reference_p95']:.4f}; диапазон "
+              f"{'ok' if bp['range_passed'] else 'ОТКАЗ'}")
+        print("    ВЫБРАН НА val_sel — часть отбора, не независимая "
+              "проверка; val_confirm не открывалась")
+    elif decision.get("best"):
         bp = by_key[decision["best"]["key"]]
         print(f"\n  ЛУЧШАЯ ПРОШЕДШАЯ ТОЧКА: k={bp['k']}, tau={bp['tau']}, "
               f"RMS {bp['rms']:.6f}, доля {100 * (bp['capture'] or 0):.1f} "
@@ -846,6 +1163,18 @@ def main():
         selected_on=("val_sel" if full_val else "val_sel_subset"),
         val_confirm_used_for_selection=False,
         decision=decision, points=points,
+        fixed_rank_points=fixed_points,
+        fixed_rank_capture_min=FIXED_RANK_CAPTURE_MIN,
+        best_rank=rank_info, target_ambiguity=ambiguity,
+        latent_prefix=latent_prefix,
+        latent_prefix_note=(
+            "префиксы ЛАТЕНТНОГО порядка, посчитанные из тех же десяти "
+            "декодов, что и учитель. Нужны, чтобы сравнивать порядок "
+            "читателя с латентным ПРИ ОДИНАКОВОМ k: прежнее сравнение "
+            "47.4 % при k=8 против 100 % при k=10 мерило заодно и "
+            "разницу в числе кандидатов"),
+        beats_rank0_share={int(j): float(beats0[j] / n)
+                           for j in range(max(ORACLE_TOPK))},
         aligned_rankpath_topk=aligned,
         aligned_rankpath_note=(
             "лучший ЕДИНЫЙ ранг для всей строки среди первых k кодов "
