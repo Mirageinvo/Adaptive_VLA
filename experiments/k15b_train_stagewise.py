@@ -66,8 +66,9 @@ COLLAPSE_MAX_SHARE, COLLAPSE_MIN_PPL = 0.98, 2.0
 ACTION_RANGE_FACTOR, ACTION_CLIP_BOUND = 1.5, 1.5
 
 # ПРОБА ОБУЧАЕМОСТИ. Требование к падению CE на ФИКСИРОВАННОМ маленьком
-# наборе объявлено до запуска: если на 160 строках за 150 шагов потерю не
-# удаётся уронить хотя бы на треть, дело не в объёме данных.
+# наборе объявлено до запуска: если на нескольких десятках строк за полторы
+# сотни шагов потерю не удаётся уронить хотя бы на треть, дело не в объёме
+# данных, а в шаге обучения или в самой постановке.
 OVERFIT_DROP_FACTOR = 0.67
 PHASES = ("q1_reader", "c2_book", "q2_reader")
 PHASE_WHITELIST = {
@@ -182,8 +183,11 @@ def check_cache_contract(meta, book, expect):
     return problems, tm
 
 
-def select_epoch(history):
-    """Эпоха по минимуму RMS исполняемого пути; tie-break по CE.
+def select_point(history):
+    """ТОЧКА по минимуму RMS исполняемого пути; tie-break по CE и порядку.
+
+    Точка, а не эпоха: val считается и ВНУТРИ эпохи, поэтому лучшей может
+    оказаться середина. Прежняя версия выбирала только из границ эпох.
 
     `capture` монотонно убывает по RMS при фиксированных черновике и
     учителе на той же части, поэтому минимум RMS и максимум capture — это
@@ -192,10 +196,11 @@ def select_epoch(history):
     """
     if not history:
         raise SystemExit("история пуста")
+    order = {r["tag"]: i for i, r in enumerate(history)}
     best = min(history, key=lambda r: (round(float(r["val_rms_a1_pol"]), 12),
                                        round(float(r["val_ce"]), 12),
-                                       int(r["epoch"])))
-    return int(best["epoch"]), best
+                                       order[r["tag"]]))
+    return str(best["tag"]), best
 
 
 def lambda_from_norms(norm_ce, norm_action, target_ratio=LAMBDA_TARGET_RATIO):
@@ -395,12 +400,22 @@ def selftest():
     assert any("c1_sha1" in p for p in probs), probs
 
     # --- ВЫБОР ЭПОХИ ----------------------------------------------------
-    hist = [dict(epoch=0, val_rms_a1_pol=0.143, val_ce=7.0),
-            dict(epoch=1, val_rms_a1_pol=0.120, val_ce=5.0),
-            dict(epoch=2, val_rms_a1_pol=0.120, val_ce=4.0)]
-    ep, best = select_epoch(hist)
-    assert ep == 2 and best["val_ce"] == 4.0, (ep, best)
-    assert select_epoch(hist[:1])[0] == 0
+    hist = [dict(tag="e0s0", epoch=0, step=0, val_rms_a1_pol=0.143,
+                 val_ce=7.0),
+            dict(tag="e1s5000", epoch=1, step=5000, val_rms_a1_pol=0.120,
+                 val_ce=5.0),
+            dict(tag="e1", epoch=1, step=15138, val_rms_a1_pol=0.120,
+                 val_ce=4.0)]
+    tag, best = select_point(hist)
+    assert tag == "e1" and best["val_ce"] == 4.0, (tag, best)
+    # ЛУЧШАЯ ТОЧКА МОЖЕТ БЫТЬ СЕРЕДИНОЙ ЭПОХИ — прежняя версия выбирала
+    # только из границ
+    mid = [hist[0], dict(tag="e1s5000", epoch=1, step=5000,
+                         val_rms_a1_pol=0.110, val_ce=5.0),
+           dict(tag="e1", epoch=1, step=15138, val_rms_a1_pol=0.130,
+                val_ce=4.0)]
+    assert select_point(mid)[0] == "e1s5000", select_point(mid)
+    assert select_point(hist[:1])[0] == "e0s0"
 
     # --- КАЛИБРОВКА LAMBDA ----------------------------------------------
     lam = lambda_from_norms(10.0, 2.0, target_ratio=0.2)
@@ -484,6 +499,12 @@ def main():
     ap.add_argument("--out", default="")
     ap.add_argument("--summary", default="")
     ap.add_argument("--report-every", type=int, default=250)
+    ap.add_argument("--eval-every", type=int, default=5000,
+                    help="оценивать val_sel каждые N батчей внутри эпохи "
+                         "со снапшотом; 0 — только на границах эпох. Проход "
+                         "val стоит минуты, снапшот 8 МБ, зато сигнал "
+                         "появляется раньше и лучшая точка может быть "
+                         "серединой эпохи")
     ap.add_argument("--overwrite", action="store_true")
     here = os.path.dirname(os.path.abspath(__file__))
     if here not in sys.path:
@@ -941,11 +962,12 @@ def main():
 
     history = []
     val0 = evaluate("эпоха 0, без обучения")
-    history.append(dict(epoch=0, train_loss=None,
+    history.append(dict(tag="e0s0", epoch=0, step=0, train_loss=None,
                         val_rms_a1_pol=val0["rms_a1_pol"],
                         val_ce=val0["ce"], val=val0))
     capture0 = val0["capture"]
-    snapshots = {0: {k: named[k].detach().clone() for k in train_names}}
+    snapshots = {"e0s0": {k: named[k].detach().clone()
+                          for k in train_names}}
 
     # --- ПРОБА ОБУЧАЕМОСТИ: МОЖНО ЛИ ВООБЩЕ УРОНИТЬ CE ------------------
     # Смоук на 500 батчах показал ПЛОСКУЮ траекторию: колебание ±0.12 без
@@ -1005,10 +1027,10 @@ def main():
               f"{'ПРОЙДЕНА' if overfit['passed'] else 'НЕ ПРОЙДЕНА'}; "
               f"веса восстановлены побитово ({back_sha})")
         if not overfit["passed"]:
-            print("    ЗНАЧИТ ДЕЛО НЕ В ОБЪЁМЕ ДАННЫХ: на 160 строках за "
-                  f"{steps} шагов потеря не падает. Полный прогон запускать "
-                  f"бессмысленно, пока не разобрались с шагом обучения или "
-                  f"самой постановкой")
+            print(f"    ЗНАЧИТ ДЕЛО НЕ В ОБЪЁМЕ ДАННЫХ: на {n_fix} строках "
+                  f"за {steps} шагов потеря не падает. Полный прогон "
+                  f"запускать бессмысленно, пока не разобрались с шагом "
+                  f"обучения или самой постановкой")
 
     order = list(parts["train"])
     forecast = None
@@ -1052,6 +1074,21 @@ def main():
                 print(f"    ПРОГНОЗ: {forecast['per_batch_s']:.2f} с/батч, "
                       f"{forecast['total_h']:.1f} ч на {a.epochs} эпох",
                       flush=True)
+            if int(a.eval_every) > 0 and step % int(a.eval_every) == 0 \
+                    and step != len(idx):
+                # ОЦЕНКА ВНУТРИ ЭПОХИ. Иначе первый сигнал приходит через
+                # две с лишним часа, а выбирать можно только из границ
+                # эпох — тогда как лучшая точка может быть серединой.
+                tag_i = f"e{epoch}s{step}"
+                vi = evaluate(f"эпоха {epoch}, батч {step}")
+                history.append(dict(
+                    tag=tag_i, epoch=epoch, step=step,
+                    train_loss=float(run["total"]) / max(nb, 1),
+                    val_rms_a1_pol=vi["rms_a1_pol"], val_ce=vi["ce"],
+                    val=vi))
+                snapshots[tag_i] = {k: named[k].detach().clone()
+                                    for k in train_names}
+                model.eval()
             if step % report_every == 0:
                 # СРЕДНЕЕ ПО ОКНУ, А НЕ ПО ВСЕЙ ЭПОХЕ: накопленное с начала
                 # среднее сглаживает траекторию и скрывает, падает ли
@@ -1080,21 +1117,27 @@ def main():
                 f"эпоха {epoch}: инвариант замороженного {inv} против "
                 f"{frozen_inv0} — сдвинулось что-то вне белого списка фазы")
         val = evaluate(f"эпоха {epoch}")
-        history.append(dict(epoch=epoch, train_loss=train_mean.get("total"),
+        history.append(dict(tag=f"e{epoch}", epoch=epoch, step=len(idx),
+                            train_loss=train_mean.get("total"),
                             train_parts=train_mean,
                             val_rms_a1_pol=val["rms_a1_pol"],
                             val_ce=val["ce"], val=val))
-        snapshots[epoch] = {k: named[k].detach().clone() for k in train_names}
+        snapshots[f"e{epoch}"] = {k: named[k].detach().clone()
+                                  for k in train_names}
 
-    best_epoch, best = select_epoch(history)
+    best_tag, best = select_point(history)
+    best_epoch, best_step = int(best["epoch"]), int(best["step"])
+    print(f"\n  лучшая точка {best_tag}: эпоха {best_epoch}, батч "
+          f"{best_step}, RMS {best['val_rms_a1_pol']:.6f} из "
+          f"{len(history)} оценённых")
     with torch.no_grad():
-        for k_, v_ in snapshots[best_epoch].items():
+        for k_, v_ in snapshots[best_tag].items():
             named[k_].copy_(v_)
     # ОТПЕЧАТОК ОБУЧЕННЫХ ВЕСОВ. `frozen_content_sha` с пустым белым
     # списком хешировала бы всю модель — 2.4e9 значений ради трёх тензоров.
     sel_sha = ctx.k14c.state_sha(
         {k: named[k].detach().float().cpu().numpy() for k in train_names})
-    confirm = evaluate(f"переоценка эпохи {best_epoch}")
+    confirm = evaluate(f"переоценка точки {best_tag}")
     for nm, got, want in (("RMS", confirm["rms_a1_pol"],
                            best["val_rms_a1_pol"]),
                           ("CE", confirm["ce"], best["val_ce"])):
@@ -1123,9 +1166,12 @@ def main():
                                 **collapse_gate(confirm["usage_p"])),
     }
     out_verdict = verdict(gates, confirm["capture"], capture0)
-    print(f"\n  capture: эпоха 0 {100 * (capture0 or 0):.1f} % -> эпоха "
-          f"{best_epoch} {100 * (confirm['capture'] or 0):.1f} % при пороге "
+    print(f"\n  capture: эпоха 0 {100 * (capture0 or 0):.1f} % -> точка "
+          f"{best_tag} {100 * (confirm['capture'] or 0):.1f} % при пороге "
           f"{100 * CAPTURE_THRESHOLD:.0f} %")
+    print("  траектория capture по оценённым точкам: " + ", ".join(
+        f"{h['tag']} "
+        f"{100 * (h['val'].get('capture') or 0):.1f} %" for h in history))
     for k, v in sorted(gates.items()):
         print(f"    [{v['category'][:4]}] {k:18s} "
               f"{'ok' if v['passed'] else 'ОТКАЗ'}")
@@ -1148,7 +1194,9 @@ def main():
         teacher=teacher, capture_epoch0=capture0,
         capture_target_rms=float(cap_target),
         gates=gates, verdict=out_verdict, forecast=forecast,
-        overfit_probe=overfit,
+        overfit_probe=overfit, selected_tag=best_tag,
+        selected_step=best_step, eval_every=int(a.eval_every),
+        points_evaluated=len(history),
         c1_file=os.path.abspath(a.c1), c1_sha1=book["c1_sha1"],
         target_file=os.path.abspath(a.target),
         target_content_sha1=meta["content_sha1"],
