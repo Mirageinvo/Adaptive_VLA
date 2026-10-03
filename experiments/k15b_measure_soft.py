@@ -238,6 +238,7 @@ def training_free_decision(points, fixed_points, capture_base,
             and float(best_fx["capture"]) >= float(fixed_min) - 1e-12:
         got = 100 * float(best_fx["capture"])
         return dict(code=0, family="fixed_rank", best=dict(best_fx),
+                    families_evaluated=["fixed_rank", "soft_grid"],
                     required=float(fixed_min),
                     outcome=(f"фиксированный ранг {best_fx['rank']} берёт "
                              f"{got:.1f} % разрыва при пороге "
@@ -245,7 +246,7 @@ def training_free_decision(points, fixed_points, capture_base,
                              f"точка БЕЗ ДОПОЛНИТЕЛЬНОГО обучения, новых "
                              f"параметров и головы h24, дальше roll-out"))
     out = soft_decision(points, capture_base, gain_min=gain_min)
-    out["family"] = "soft_grid"
+    out["families_evaluated"] = ["fixed_rank", "soft_grid"]
     out["fixed_rank_best"] = (None if best_fx is None else dict(best_fx))
     out["fixed_rank_required"] = float(fixed_min)
     # КОД 3 ОЗНАЧАЕТ «ВЫБИРАТЬ НЕ ИЗ ЧЕГО», А НЕ «ПОРОГ НЕ ВЗЯТ». Если
@@ -261,6 +262,10 @@ def training_free_decision(points, fixed_points, capture_base,
             f"{100 * float(best_fx['capture']):.1f} % при требуемых "
             f"{100 * float(fixed_min):.0f} %: технически исправная точка "
             f"есть, научный порог не взят ни одним семейством")
+    # ПОБЕДИВШЕЕ СЕМЕЙСТВО СУЩЕСТВУЕТ ТОЛЬКО ПРИ КОДЕ 0. Прежде здесь
+    # оставалось "soft_grid" и при отказе, то есть поле называло
+    # семейство, которое ничего не взяло.
+    out["family"] = "soft_grid" if out["code"] == 0 else "none"
     return out
 
 
@@ -488,7 +493,8 @@ def selftest():
     only0 = [dict(rank=0, capture=0.9, support_passed=True,
                   range_passed=True)]
     d0 = training_free_decision(soft_pts, only0, 0.069)
-    assert d0["code"] == 4 and d0["family"] == "soft_grid", d0
+    assert d0["code"] == 4 and d0["family"] == "none", d0
+    assert d0["families_evaluated"] == ["fixed_rank", "soft_grid"], d0
     assert d0["fixed_rank_best"] is None, d0
     # НЕ ПРОШЁЛ ОПОРУ — НЕ РАБОЧАЯ ТОЧКА
     nosup = [dict(rank=2, capture=0.5, support_passed=False,
@@ -507,13 +513,14 @@ def selftest():
                      range_passed=True)]
     dm = training_free_decision(bad_soft, weak, 0.069)
     assert dm["code"] == 4, dm
-    assert dm["family"] == "soft_grid" and dm["fixed_rank_best"]["rank"] == 2
+    assert dm["family"] == "none" and dm["fixed_rank_best"]["rank"] == 2
     assert "научный порог не взят" in dm["outcome"], dm
     # А ВОТ КОГДА НЕ ПРОШЛО НИ ОДНО СЕМЕЙСТВО — ЭТО ВСЁ ЕЩЁ 3
     none_ok = [dict(rank=2, capture=0.5, support_passed=False,
                     range_passed=True)]
     dn = training_free_decision(bad_soft, none_ok, 0.069)
     assert dn["code"] == 3 and dn["fixed_rank_best"] is None, dn
+    assert dn["family"] == "none", dn
     # НЕПОЛОЖИТЕЛЬНЫЙ РАЗРЫВ ОСТАЁТСЯ ТЕХНИЧЕСКИМ БЛОКЕРОМ
     assert training_free_decision(bad_soft, weak, None)["code"] == 3
     # СЕТКА МОЖЕТ ПРОЙТИ САМА
@@ -521,6 +528,9 @@ def selftest():
                         range_passed=True)]
     ds = training_free_decision(strong_soft, weak, 0.069)
     assert ds["code"] == 0 and ds["family"] == "soft_grid", ds
+    # И ТОЛЬКО ПРИ КОДЕ 0 ПОЛЕ НАЗЫВАЕТ СЕМЕЙСТВО
+    assert training_free_decision(soft_pts, fixed_ok,
+                                  0.069)["family"] == "fixed_rank"
 
     assert TOPK_GRID[0] == 1 and TOPK_GRID[-1] == 2048
     assert 1.0 in TAU_GRID and len(TOPK_GRID) * len(TAU_GRID) == 60
