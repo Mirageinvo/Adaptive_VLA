@@ -125,12 +125,10 @@ def main():
     if int(a.limit) != 0:
         raise SystemExit("--limit не применяется: проверяется вся val_sel")
 
-    import k15b_measure_soft as ms
     import k15b_probe_and_extract as probe
     import k15c_rank_selector as rs
     import k15c_train_rank_selector as tr
     import torch as _torch
-    import torch.nn.functional as F
 
     sel_obj = _torch.load(a.selector, map_location="cpu", weights_only=False)
     if sel_obj.get("kind") != "k15c_rank_selector":
@@ -249,29 +247,21 @@ def main():
             if seen[ii].any():
                 raise SystemExit("строка val_sel встречена дважды")
             seen[ii] = True
-            lg = out["logits"][1].float()
-            top8 = ms.reader_order(lg, torch)[..., :8]
+            # ВЫБОР — ТОЙ ЖЕ ФУНКЦИЕЙ, ЧТО В РОЛЛАУТЕ. Совпадение выбора
+            # здесь и там — следствие построения, а не двух копий кода.
+            z0 = out["policy_embeddings"][0]
+            sel_ = rs.select_from_outputs(out["logits"][1], z0, h24, head,
+                                          c1, torch)
+            top8, lp8 = sel_["top"], sel_["logprobs"]
+            sc, pick, z_sel = sel_["scores"], sel_["pick"], sel_["z"]
             stats["code_mismatch"] += int(
                 (top8.cpu().numpy() != c_codes[ii].astype(np.int64)).sum())
-            lp8 = F.log_softmax(lg, dim=-1).gather(-1, top8)
             stats["lp_max"] = max(stats["lp_max"], float(
                 np.abs(lp8.cpu().numpy() - c_lp[ii]).max()))
-            h24s = h24.half().float()
-            kw = dict(ctx=rs.ln_mean_pool(h24s, torch),
-                      cand_emb=rs.candidate_embeddings(top8, c1, torch),
-                      cand_feat=rs.candidate_score_features(lp8, torch),
-                      h_full=h24s, cand_codes=top8)
-            sc = head(**kw).float()
             stats["score_max"] = max(stats["score_max"], float(
                 np.abs(sc.cpu().numpy() - scores_c[ii]).max()))
-            pick = sc.argmax(-1)
             stats["pick_mismatch"] += int(
                 (pick.cpu().numpy() != pick_c[ii]).sum())
-            codes_sel = top8.gather(
-                -1, pick.view(-1, 1, 1).expand(-1, top8.shape[1], 1)
-            ).squeeze(-1)
-            z0 = out["policy_embeddings"][0]
-            z_sel = z0 + c1[codes_sel]
             action = torch.from_numpy(np.asarray(
                 ctx.ACT[sel], np.float32)).to(dev)[..., :7]
             act_sel = ctx.decode_fp32(z_sel)              # ОДИН декод
@@ -358,7 +348,12 @@ def main():
              else "НЕ СОШЛОСЬ: " + str(verdict["failed"]))
     print(f"  ИСХОД: {out_s} (код {verdict['code']})")
     out = dict(kind="k15c_inference_check", head=head_name,
-               selector=os.path.abspath(a.selector), verdict=verdict,
+               selector=os.path.abspath(a.selector),
+               selector_file_sha1=cb.sha_file(a.selector),
+               # Роллаут обязан исполнять ТУ ЖЕ функцию выбора, что прошла
+               # эту проверку: модуль голов привязывается по отпечатку.
+               selector_module_sha1=cb.sha_file(rs.__file__),
+               verdict=verdict,
                checks=checks, stats=stats, rms_live=rms_live,
                capture_live=cap_live, cache_eval=eval_c,
                live_per_task=per_task_live,

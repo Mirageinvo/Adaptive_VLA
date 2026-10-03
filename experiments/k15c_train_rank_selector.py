@@ -171,6 +171,23 @@ def check_m2(m2, man, rows_val, smoke=False):
     return float(cap_soft) + PILOT_GAIN, []
 
 
+def archive_working(path):
+    """Прежний чекпойнт с РАБОЧИМ именем — в архив. Возвращает новый путь.
+
+    Вызывается при ЛЮБОМ техническом отказе головы: пробы, исключения при
+    обучении, невоспроизводимости. Иначе файл прошлого прогона лежал бы под
+    рабочим именем и выглядел бы действующим, хотя в этом прогоне голова
+    отказала.
+    """
+    if not os.path.exists(path):
+        return None
+    dest = f"{path}.stale.{time.strftime('%Y%m%dT%H%M%S')}.bak"
+    if os.path.exists(dest):
+        dest = f"{dest}.{os.getpid()}"
+    os.replace(path, dest)
+    return dest
+
+
 def evaluate_scores(scores, costs, draft, teacher, task_ids=None,
                     task_vocab=None):
     """Все метрики исполняемого выбора по оценкам [N, 8]. Чистая функция."""
@@ -610,6 +627,16 @@ def selftest():
     assert check_m2(dict(m2_t, c1_sha1="ИНАЯ"), man_t, rows_v,
                     smoke=True)[0] is None
 
+    # --- АРХИВ ПРЕЖНЕГО РАБОЧЕГО ЧЕКПОЙНТА ------------------------------
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        wp = os.path.join(td, "h24_linear_s0.pt")
+        assert archive_working(wp) is None            # нечего архивировать
+        open(wp, "w").write("старый")
+        dest = archive_working(wp)
+        assert dest and ".stale." in dest and not os.path.exists(wp)
+        assert open(dest).read() == "старый"
+
     # --- ОБЩИЙ ИСХОД: РЕШАЮТ ТОЛЬКО h24-ГОЛОВЫ --------------------------
     def r(primary=False, pilot=False, trained=True, technical=False):
         return dict(trained=trained, technical=technical,
@@ -900,6 +927,7 @@ def main():
                              feat_std=feat_std, book=C1).to(dev)
         n_par = sum(p.numel() for p in head.parameters())
         print(f"\n  {name}: {n_par} параметров, вход {src}")
+        path = os.path.join(a.out, f"{name}{tag}_s{a.seed}.pt")
         probe_idx = np.arange(min(int(a.overfit_rows), len(tr["costs"])))
         pv = overfit_probe(head, inp_tr, probe_idx, tr["costs"], torch,
                            steps=int(a.overfit_steps), lr=float(a.overfit_lr),
@@ -916,7 +944,8 @@ def main():
         # чужая проба не может отменить успех другой головы.
         if not pv["passed"]:
             results[name] = dict(overfit_probe=pv, trained=False,
-                                 technical="проба конвейера не пройдена")
+                                 technical="проба конвейера не пройдена",
+                                 archived_stale=archive_working(path))
             continue
         try:
             hist, states = train_head(
@@ -927,7 +956,8 @@ def main():
                 task_vocab=task_vocab)
         except (FloatingPointError, ValueError) as e:
             results[name] = dict(overfit_probe=pv, trained=False,
-                                 technical=str(e))
+                                 technical=str(e),
+                                 archived_stale=archive_working(path))
             continue
         sel = select_epoch(hist)
         head.load_state_dict(states[sel["epoch"]])
@@ -935,7 +965,6 @@ def main():
             scores_for(head, inp_va, np.arange(len(va["costs"])), torch),
             va["costs"], va["draft"], teacher_va)
         reproduced = again["rms"] == sel["val"]["rms"]
-        path = os.path.join(a.out, f"{name}{tag}_s{a.seed}.pt")
         payload = dict(
             kind="k15c_rank_selector", head=name, smoke=bool(a.allow_smoke),
             d_model=d_model, e_dim=int(C1.shape[1]), proj=int(a.proj),
@@ -971,12 +1000,7 @@ def main():
             (loaded_equal, "сохранение/загрузка изменили оценки"))
             if not ok_]
         if tech:
-            # ПРЕЖНИЙ ФАЙЛ С РАБОЧИМ ИМЕНЕМ — В АРХИВ: иначе чекпойнт
-            # прошлого прогона лежал бы под рабочим именем и выглядел бы
-            # действующим, хотя эта голова в этом прогоне отказала.
-            if os.path.exists(path):
-                os.replace(path, f"{path}.stale."
-                                 f"{time.strftime('%Y%m%dT%H%M%S')}.bak")
+            archive_working(path)
             path = path[:-3] + ".technical_fail.pt"
         os.replace(tmp, path)
         verdict = head_verdict(sel["val"], base, finite,

@@ -82,7 +82,7 @@ import time
 import numpy as np
 
 N_POS, N_LEVEL = 16, 3
-POLICIES = ("fullbar", "coarse24", "fast", "hicora", "depthrvq")
+POLICIES = ("fullbar", "coarse24", "fast", "hicora", "depthrvq", "k15c")
 
 # Режимы depth-RVQ повторяют имена базового класса: сколько уровней успевает
 # выдать ОДИН сегментированный проход, остановившись на соответствующем
@@ -310,6 +310,11 @@ def levels_of(policy, depth_rvq_mode=None):
                 f"для depthrvq нужен режим из {sorted(DEPTH_RVQ_MODES)}, "
                 f"дано {depth_rvq_mode!r}")
         return DEPTH_RVQ_MODES[depth_rvq_mode]
+    # K-15c: черновик q0 плюс выбранный путь книги C1 — два уровня. Действие
+    # приходит НЕПРЕРЫВНЫМ латентом (`Latent`), и число здесь — описание, а
+    # не способ сборки.
+    if policy == "k15c":
+        return 2
     return N_LEVEL if policy == "fullbar" else 1
 
 
@@ -426,6 +431,7 @@ def selftest():
             raise AssertionError(f"принят режим {bad!r}")
     # умолчание режима не влияет на остальные политики
     assert levels_of("fast") == 1 and levels_of("fullbar", "medium") == N_LEVEL
+    assert "k15c" in POLICIES and levels_of("k15c") == 2
     # --- ПРОИСХОЖДЕНИЕ ГОЛОВЫ q1: КАЖДАЯ МУТАЦИЯ ОТВЕРГАЕТСЯ -------------
     # Прежняя версия требовала НАЛИЧИЯ q0_prov и нигде его не сверяла.
     # Наличие поля — не проверка поля, и голова другого сида, варианта или
@@ -619,6 +625,15 @@ def main() -> None:
                     help="fast: только q0 (слой 12); medium: q0+q1 (слой 18); "
                          "full: q0+q1+q2 (слой 24). ОДИН сегментированный "
                          "проход в любом случае")
+    ap.add_argument("--selector", default=None,
+                    help="K-15c: чекпойнт h24-головы выбора ранга; только "
+                         "для --policy k15c")
+    ap.add_argument("--inference-report", default=None,
+                    help="K-15c: отчёт проверки вывода, пройденный ЭТОЙ "
+                         "головой и ЭТИМ модулем голов; без него рука не "
+                         "собирается")
+    ap.add_argument("--rank-cache", default="data/k15c/rank_cache",
+                    help="K-15c: канонический кэш, на котором обучена голова")
     ap.add_argument("--arm-label", default=None,
                     help="ОБЯЗАТЕЛЕН. Различает руки внутри эксперимента, "
                          "например fullbar, coarse24_b10, coarse24_b5, "
@@ -706,6 +721,13 @@ def main() -> None:
         raise SystemExit(
             f"--q1-ckpt и --depth-rvq-mode осмысленны только с --policy "
             f"depthrvq, задано --policy {args.policy}")
+    if args.policy == "k15c":
+        if not args.selector or not args.inference_report:
+            raise SystemExit("--policy k15c требует --selector и "
+                             "--inference-report")
+    elif args.selector or args.inference_report:
+        raise SystemExit("--selector и --inference-report осмысленны только "
+                         "с --policy k15c")
     if args.policy == "fast" and not args.policy_ckpt:
         raise SystemExit("--policy fast требует --policy-ckpt")
     if args.policy not in ("fast", "hicora", "depthrvq") and args.policy_ckpt:
@@ -847,10 +869,23 @@ def main() -> None:
                                {"task_id": args.task_id, "image_size": 224},
                                args.n_envs)
 
-    Joint = make_joint12_class(SmolVLABlockwiseAR)
-    model = Joint.from_pretrained(**cfg.MODEL.vlm.kwargs).to(dev, dtype).eval()
-    proc = VisionLanguageActionProcessor.from_pretrained(
-        args.ckpt, trust_remote_code=True, mode="discrete")
+    k15c_arm = None
+    if args.policy == "k15c":
+        # РУКА K-15c СОБИРАЕТ СВОЮ, КАНОНИЧЕСКУЮ МОДЕЛЬ — ту же, на которой
+        # построены кэш и голова, со своими проверками и гейтом K-15a. Вторая
+        # копия базовой модели здесь не создаётся. Среды уже подняты: порядок
+        # «среды до CUDA» соблюдён.
+        import k15c_policy as _k15c
+        k15c_arm = _k15c.build_arm(args.device, args.selector,
+                                   args.rank_cache, args.inference_report,
+                                   torch)
+        model, proc = k15c_arm.model, k15c_arm.proc
+    else:
+        Joint = make_joint12_class(SmolVLABlockwiseAR)
+        model = Joint.from_pretrained(
+            **cfg.MODEL.vlm.kwargs).to(dev, dtype).eval()
+        proc = VisionLanguageActionProcessor.from_pretrained(
+            args.ckpt, trust_remote_code=True, mode="discrete")
 
     policy_meta, depth = None, 24
     res_norm_orig = None
@@ -914,6 +949,17 @@ def main() -> None:
               f"веса sha {weights_sha}, source={obj.get('source')}, "
               f"ствол {dig}"
               + ("" if ck_dig is not None else " (в чекпойнте не записан)"))
+    elif args.policy == "k15c":
+        policy_meta = dict(k15c_arm.meta)
+        policy_meta["arm_fingerprint"] = hashlib.sha1("|".join(
+            [str(args.arm_label), policy_meta["model_fingerprint"]]
+        ).encode()).hexdigest()[:12]
+        print(f"  рука k15c: голова {policy_meta['head']} (эпоха "
+              f"{policy_meta['selected_epoch']}), файл "
+              f"{policy_meta['selector_file_sha1']}, модуль голов "
+              f"{policy_meta['selector_module_sha1']}, проверка вывода "
+              f"{policy_meta['inference_report_sha1']}; отпечаток модели "
+              f"{policy_meta['model_fingerprint']}", flush=True)
     else:
         # init_joint_fast НЕ ВЫЗЫВАЕТСЯ: он создаёт fast_head и сдвигает
         # аллокатор, а в K-9b именно сдвиг аллокатора давал расхождение
@@ -924,7 +970,7 @@ def main() -> None:
 
     import contextlib
     autocast = (torch.autocast("cuda", dtype=torch.float16)
-                if args.policy in ("fast", "hicora", "depthrvq")
+                if args.policy in ("fast", "hicora", "depthrvq", "k15c")
                 else contextlib.nullcontext())
 
     ac = proc.action_processor
@@ -1270,6 +1316,15 @@ def main() -> None:
                       f"пределе {lim:.4f}", flush=True)
             return Latent(out["z"])
 
+        if args.policy == "k15c":
+            # ОДИН ПРОХОД НА 24 СЛОЯ, ОДИН ДЕКОД. Выбор — функцией, которая
+            # прошла проверку вывода; харнесс декодирует полученный латент.
+            z, q0c = k15c_arm.act(batch, pos_off, autocast, first)
+            if first:
+                # ТОЖДЕСТВО КОДЕКА — на собственных кодах q0, как у depthrvq.
+                check_assembly(np.concatenate([q0c] * N_LEVEL, axis=1))
+            return Latent(z)
+
         if args.policy == "depthrvq":
             # ОДИН СЕГМЕНТИРОВАННЫЙ ПРОХОД. Слои 1-12 исполняются один раз,
             # уровни снимаются на выходах 12/18/24 по ходу; режим задаёт,
@@ -1553,6 +1608,9 @@ def main() -> None:
                        waiting_steps=args.waiting_steps,
                        device=args.device,
                        ckpt=args.ckpt, joint=policy_meta,
+                       # ВЫБРАННЫЕ РАНГИ ЭТОГО БЛОКА; счётчик обнуляется.
+                       k15c_picks=(k15c_arm.stats.take()
+                                   if k15c_arm is not None else None),
                        **act_meta,
                        script_sha1=sha, argv=vars(args)),
                   open(tmp_out, "w"), ensure_ascii=False, indent=1)

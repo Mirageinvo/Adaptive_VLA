@@ -53,7 +53,7 @@ echo "=== 0. самопроверки ==="
 for m in k15_context k15b_probe_and_extract k15b_build_rankpath_cache \
          k15b_train_stagewise k15b_measure_interface k15b_measure_soft \
          k15c_rank_selector k15c_build_rank_cache k15c_train_rank_selector \
-         k15c_check_inference; do
+         k15c_check_inference k15c_policy k15c_behavior; do
     if ! python3 "experiments/${m}.py" --selftest; then
         echo "ОТКАЗ: самопроверка ${m} не прошла" >&2
         exit 1

@@ -252,8 +252,45 @@ def hard_selected_cost(scores, costs, torch):
     return costs.gather(-1, pick.unsqueeze(-1)).squeeze(-1), pick
 
 
+def select_from_outputs(q1_logits, z0, h24, head, book, torch, k=N_CAND):
+    """ОДНА функция выбора — и для проверки вывода, и для роллаута.
+
+    Вход — то, что даёт один проход `mode="full"`: логиты q1 [B, T, V],
+    черновик z0 [B, T, E], h24 [B, T, D] из pre-hook, обученная голова и
+    замороженная книга C1 [V, E]. Выход — латент выбранного пути и всё, что
+    нужно для сверки с кэшем.
+
+    Порядок кодов — тот же устойчивый `sort`, что в M2 и в построителе кэша.
+    h24 приводится к fp16 до пулинга: голова обучалась на сохранённом в fp16
+    состоянии, и путь вывода определён так же. Проверка вывода и роллаут
+    вызывают ИМЕННО ЭТУ функцию, поэтому совпадение их выбора — следствие
+    построения, а не двух согласованных копий.
+    """
+    import torch.nn.functional as F
+    import k15b_measure_soft as ms
+    lg = q1_logits.float()
+    top = ms.reader_order(lg, torch)[..., :int(k)]
+    lp = F.log_softmax(lg, dim=-1).gather(-1, top)
+    h24s = h24.half().float()
+    kw = dict(ctx=ln_mean_pool(h24s, torch),
+              cand_emb=candidate_embeddings(top, book, torch),
+              cand_feat=candidate_score_features(lp, torch),
+              h_full=h24s, cand_codes=top)
+    scores = head(**kw).float()
+    pick = scores.argmax(-1)
+    codes = top.gather(-1, pick.view(-1, 1, 1).expand(
+        -1, top.shape[1], 1)).squeeze(-1)
+    z = z0 + book[codes]
+    return dict(z=z, pick=pick, codes=codes, top=top, logprobs=lp,
+                scores=scores)
+
+
 def selftest():
+    import os
     import torch
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
     torch.manual_seed(0)
 
     # --- ПУЛИНГ: НОРМА С АФФИННЫМ КОММУТИРУЕТ СО СРЕДНИМ -----------------
@@ -384,6 +421,28 @@ def selftest():
     s_ = torch.zeros(2, 8, requires_grad=True)
     expected_regret(s_, costs, torch).backward()
     assert int(s_.grad[0].argmin()) == 1 and int(s_.grad[1].argmin()) == 0
+    # --- ОБЩАЯ ФУНКЦИЯ ВЫБОРА ------------------------------------------
+    V = 30
+    lg_ = torch.randn(B, T, V)
+    z0_ = torch.randn(B, T, E)
+    for name in ("h24_linear", "h24_candidate", "h24_positional"):
+        head = build_head(name, D, E, torch, proj=16, book=book).eval()
+        with torch.no_grad():
+            out = select_from_outputs(lg_, z0_, h, head, book, torch)
+        assert out["top"].shape == (B, T, 8) and out["z"].shape == (B, T, E)
+        # первый код порядка — argmax логитов, коды внутри позиции различны
+        assert torch.equal(out["top"][..., 0], lg_.argmax(-1))
+        srt = out["top"].sort(-1).values
+        assert int((srt[..., 1:] == srt[..., :-1]).sum()) == 0
+        assert torch.equal(out["pick"], out["scores"].argmax(-1))
+        # выбранный путь — ранг pick во ВСЕХ позициях
+        for b in range(B):
+            assert torch.equal(out["codes"][b],
+                               out["top"][b, :, int(out["pick"][b])])
+        assert torch.equal(out["z"], z0_ + book[out["codes"]])
+        # логвероятности — от полного softmax, а не от восьми
+        assert torch.allclose(out["logprobs"], torch.log_softmax(
+            lg_, -1).gather(-1, out["top"]))
     print(f"самопроверка k15c_rank_selector пройдена: {len(HEADS)} головы, "
           f"{N_SCORE_FEATURES} признаков кандидата, эквивариантность и "
           f"точность пулинга сверены")
