@@ -189,6 +189,59 @@ def probe_rows(n_total, n_take):
                      .astype(np.int64))
 
 
+LOSSES = ("regret", "mse", "huber")
+
+
+def make_loss(kind, delta_scale, torch):
+    """Функция потерь по имени. Все принимают (оценки [B, 8], затраты).
+
+    regret — ожидаемый regret softmax-выбора, как в первой очереди.
+
+    mse / huber — РЕГРЕССИЯ ПО ЗАТРАТАМ: голова предсказывает восемь
+    величин Delta_j = e_j - e_0 (у ранга 0 ноль по определению), а
+    исполняется argmin предсказанного Delta. Оценка головы — это
+    -Delta_j / delta_scale, поэтому argmax оценок = argmin Delta, и
+    проверка вывода и роллаут работают без изменений. Отличие от regret
+    принципиальное: модель оценивает условную стоимость каждого пути
+    непосредственно, а не должна через softmax вырастить почти
+    дискретное решение. Масштаб — ОДНА постоянная по train, иначе
+    перевзвешивались бы строки.
+    """
+    import torch.nn.functional as F
+    import k15c_rank_selector as rs
+    if kind not in LOSSES:
+        raise ValueError(f"потеря {kind!r} не бывает: {LOSSES}")
+    if kind == "regret":
+        return lambda sc, c: rs.expected_regret(sc, c, torch)
+    if not float(delta_scale) > 0.0:
+        raise ValueError(f"масштаб Delta {delta_scale} не положителен")
+
+    def reg(sc, c):
+        target = -(c - c[:, :1]) / float(delta_scale)
+        if kind == "mse":
+            return F.mse_loss(sc.float(), target)
+        return F.smooth_l1_loss(sc.float(), target, beta=1.0)
+    return reg
+
+
+def episode_holdout(episodes, frac, seed):
+    """(маска обучения, маска отбора) по ЭПИЗОДАМ, а не по строкам.
+
+    Соседние кадры одного эпизода почти одинаковы; разбиение по строкам
+    положило бы их по разные стороны, и отбор эпохи мерил бы
+    запоминание, а не обобщение.
+    """
+    ep = np.asarray(episodes)
+    uniq = np.unique(ep)
+    if len(uniq) < 2:
+        raise ValueError("для отложенной части нужно хотя бы два эпизода")
+    rng = np.random.default_rng(int(seed))
+    k = max(1, int(round(float(frac) * len(uniq))))
+    hold = set(rng.permutation(uniq)[:k].tolist())
+    sel = np.array([e in hold for e in ep.tolist()])
+    return ~sel, sel
+
+
 def archive_working(path):
     """Прежний чекпойнт с РАБОЧИМ именем — в архив. Возвращает новый путь.
 
@@ -367,7 +420,7 @@ class Inputs:
     """Входы головы по индексам строк. Держит тензоры на устройстве."""
 
     def __init__(self, torch, ctx, cand_emb, cand_feat, h_full=None,
-                 device="cpu", cand_codes=None):
+                 device="cpu", cand_codes=None, h_index=None):
         self.torch = torch
         self.ctx = None if ctx is None else ctx.to(device)
         self.cand_emb = cand_emb.to(device)
@@ -375,7 +428,22 @@ class Inputs:
         self.cand_codes = (None if cand_codes is None
                            else cand_codes.to(device))
         self.h_full = h_full           # memmap или тензор на CPU
+        # Номера строк в h_full для локальных индексов: у подмножества
+        # тензоры нарезаны, а memmap общий.
+        self.h_index = None if h_index is None else np.asarray(h_index)
         self.device = device
+
+    def subset(self, rows):
+        """Те же входы для подмножества строк (локальные индексы)."""
+        t = self.torch
+        r = t.as_tensor(np.asarray(rows), device=self.device)
+        base = (np.arange(len(self.cand_emb)) if self.h_index is None
+                else self.h_index)
+        return Inputs(t, None if self.ctx is None else self.ctx[r],
+                      self.cand_emb[r], self.cand_feat[r], self.h_full,
+                      self.device,
+                      None if self.cand_codes is None else self.cand_codes[r],
+                      h_index=base[np.asarray(rows)])
 
     def batch(self, idx):
         t = self.torch
@@ -385,8 +453,10 @@ class Inputs:
         if self.cand_codes is not None:
             kw["cand_codes"] = self.cand_codes[i]
         if self.h_full is not None:
-            srt = np.sort(np.asarray(idx))
-            back = np.argsort(np.argsort(np.asarray(idx)))
+            g = np.asarray(idx) if self.h_index is None \
+                else self.h_index[np.asarray(idx)]
+            srt = np.sort(g)
+            back = np.argsort(np.argsort(g))
             hf = t.from_numpy(np.asarray(self.h_full[srt],
                                          np.float32))[back]
             kw["h_full"] = hf.to(self.device)
@@ -405,9 +475,14 @@ def scores_for(head, inp, idx_all, torch, chunk=4096):
 
 def train_head(head, inp_tr, costs_tr, inp_va, costs_va, draft_va,
                teacher_va, torch, *, epochs, batch, lr, wd, patience, seed,
-               log=print, task_ids=None, task_vocab=None):
-    """Полное обучение по regret, оценка каждой эпохи, все состояния."""
+               log=print, task_ids=None, task_vocab=None, loss_fn=None):
+    """Полное обучение, оценка каждой эпохи на части отбора, все состояния.
+
+    `loss_fn` — из make_loss; по умолчанию ожидаемый regret.
+    """
     import k15c_rank_selector as rs
+    if loss_fn is None:
+        loss_fn = (lambda sc_, c_: rs.expected_regret(sc_, c_, torch))
     dev = inp_tr.device
     c_tr = torch.as_tensor(np.asarray(costs_tr, np.float32), device=dev)
     opt = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=wd)
@@ -440,8 +515,7 @@ def train_head(head, inp_tr, costs_tr, inp_va, costs_va, draft_va,
         for s in range(0, n, int(batch)):
             ii = perm[s:s + int(batch)]
             sc = head(**inp_tr.batch(ii))
-            loss = rs.expected_regret(sc, c_tr[torch.as_tensor(
-                ii, device=dev)], torch)
+            loss = loss_fn(sc, c_tr[torch.as_tensor(ii, device=dev)])
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"эпоха {epoch}: regret не конечен")
             opt.zero_grad(set_to_none=True)
@@ -462,7 +536,8 @@ def train_head(head, inp_tr, costs_tr, inp_va, costs_va, draft_va,
 
 
 def overfit_probe(head, inp, idx, costs, torch, steps, lr, wd,
-                  check_every=OVERFIT_CHECK_EVERY, drop=OVERFIT_DROP):
+                  check_every=OVERFIT_CHECK_EVERY, drop=OVERFIT_DROP,
+                  loss_fn=None):
     """Проба конвейера на фиксированных строках, с восстановлением.
 
     REGRET ИЗМЕРЯЕТСЯ ТОЧНО, А НЕ СРЕДНИМ ПО ОКНУ: до первого шага и в
@@ -478,6 +553,8 @@ def overfit_probe(head, inp, idx, costs, torch, steps, lr, wd,
     исправность конвейера.
     """
     import k15c_rank_selector as rs
+    if loss_fn is None:
+        loss_fn = (lambda sc_, c_: rs.expected_regret(sc_, c_, torch))
     dev = inp.device
     snap = {k: v.detach().clone() for k, v in head.state_dict().items()}
     c = torch.as_tensor(np.asarray(costs[idx], np.float32), device=dev)
@@ -487,7 +564,7 @@ def overfit_probe(head, inp, idx, costs, torch, steps, lr, wd,
         head.eval()
         with torch.no_grad():
             sc = head(**kw)
-            return (float(rs.expected_regret(sc, c, torch)), sc.detach())
+            return (float(loss_fn(sc, c)), sc.detach())
 
     r0, s0 = exact()
     s0 = s0.clone()
@@ -497,7 +574,7 @@ def overfit_probe(head, inp, idx, costs, torch, steps, lr, wd,
     finite, grad_nonzero, used = bool(np.isfinite(r0)), False, 0
     for st in range(1, int(steps) + 1):
         head.train()
-        loss = rs.expected_regret(head(**kw), c, torch)
+        loss = loss_fn(head(**kw), c)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         finite = finite and bool(torch.isfinite(loss))
@@ -669,6 +746,53 @@ def selftest():
     assert check_m2(dict(m2_t, c1_sha1="ИНАЯ"), man_t, rows_v,
                     smoke=True)[0] is None
 
+    # --- РЕГРЕССИЯ ПО ЗАТРАТАМ ------------------------------------------
+    c_ = torch.tensor([[1.0, 0.5, 2.0, 3, 3, 3, 3, 3],
+                       [0.2, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]])
+    for kind in ("mse", "huber"):
+        f_ = make_loss(kind, 0.5, torch)
+        perfect = -(c_ - c_[:, :1]) / 0.5          # ровно цель регрессии
+        assert float(f_(perfect, c_)) < 1e-12, kind
+        assert float(f_(torch.zeros_like(c_), c_)) > 0.0
+        # argmax совершенной оценки = argmin затраты
+        assert perfect.argmax(-1).tolist() == c_.argmin(-1).tolist()
+        sc_ = torch.zeros_like(c_, requires_grad=True)
+        f_(sc_, c_).backward()
+        assert torch.isfinite(sc_.grad).all()
+    assert abs(float(make_loss("regret", 1.0, torch)(
+        torch.zeros_like(c_), c_)) - float(
+        ((c_ - c_.min(1, keepdim=True).values).mean(1)).mean())) < 1e-6
+    for bad in (("иное", 1.0), ("mse", 0.0)):
+        try:
+            make_loss(bad[0], bad[1], torch)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"принято {bad}")
+
+    # --- ОТЛОЖЕННАЯ ЧАСТЬ ПО ЭПИЗОДАМ ------------------------------------
+    eps = np.repeat(np.arange(20), 5)
+    fit_m, sel_m = episode_holdout(eps, 0.1, 0)
+    assert int(sel_m.sum()) == 10 and int(fit_m.sum()) == 90
+    assert not set(eps[fit_m].tolist()) & set(eps[sel_m].tolist())
+    f2, s2 = episode_holdout(eps, 0.1, 0)
+    assert np.array_equal(s2, sel_m)                 # детерминированно
+    try:
+        episode_holdout(np.zeros(5), 0.1, 0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("принят один эпизод")
+
+    # --- ПОДМНОЖЕСТВО ВХОДОВ --------------------------------------------
+    hf = np.arange(6 * 2 * 3, dtype=np.float32).reshape(6, 2, 3)
+    inp_ = Inputs(torch, torch.arange(6.0).view(6, 1), torch.zeros(6, 8, 2),
+                  torch.zeros(6, 8, 5), h_full=hf)
+    sub = inp_.subset(np.array([4, 1, 5]))
+    kw_ = sub.batch(np.array([2, 0]))
+    assert kw_["ctx"].view(-1).tolist() == [5.0, 4.0], kw_["ctx"]
+    assert np.array_equal(kw_["h_full"].numpy(), hf[[5, 4]])
+
     # --- СТРОКИ ПРОБЫ: РАВНОМЕРНО ПО ЧАСТИ -----------------------------
     pr = probe_rows(121100, 64)
     assert len(pr) == 64 and pr[0] == 0 and pr[-1] == 121099, pr[[0, -1]]
@@ -778,6 +902,63 @@ def selftest():
           "отбор эпохи, восстановление)")
 
 
+def load_features(cache, man, C1, torch, rs):
+    """Признаки голов из кэша — ОДИН код для тренера и диагностики.
+
+    Возвращает (arr, data, teacher_va): доступ к массивам, по части —
+    пулинг h24/h18, эмбеддинги и признаки кандидатов, коды, затраты,
+    черновик, задачи и memmap полного h24; учитель val_sel.
+    """
+    def arr(part, name):
+        return np.load(os.path.join(cache,
+                                    man["arrays"][f"{part}_{name}"]["file"]),
+                       mmap_mode="r")
+
+    def pooled(part, src):
+        if src == "h24":
+            h = arr(part, "h24")
+        elif man["h18_mode"] == "full":
+            h = arr(part, "h18")
+        elif man["h18_mode"] == "mean":
+            return torch.from_numpy(np.asarray(arr(part, "h18_lnmean"),
+                                               np.float32))
+        else:
+            return None
+        out = []
+        for s_ in range(0, h.shape[0], 4096):
+            out.append(rs.ln_mean_pool(torch.from_numpy(
+                np.asarray(h[s_:s_ + 4096], np.float32)), torch))
+        return torch.cat(out, 0)
+
+    data = {}
+    for part in ("train", "val_sel"):
+        # КОПИИ, А НЕ ВИДЫ НА memmap: файл открыт только на чтение, и
+        # тензор поверх него был бы незаписываемым видом.
+        codes = torch.from_numpy(np.array(arr(part, "top8_codes"),
+                                          np.int64))
+        lp = torch.from_numpy(np.array(arr(part, "top8_logprobs"),
+                                       np.float32))
+        emb, feat = [], []
+        for s_ in range(0, codes.shape[0], 8192):
+            emb.append(rs.candidate_embeddings(codes[s_:s_ + 8192], C1,
+                                               torch))
+            feat.append(rs.candidate_score_features(lp[s_:s_ + 8192],
+                                                    torch))
+        data[part] = dict(
+            ctx24=pooled(part, "h24"), ctx18=pooled(part, "h18"),
+            emb=torch.cat(emb, 0), feat=torch.cat(feat, 0), codes=codes,
+            costs=np.asarray(arr(part, "rank_costs"), np.float64),
+            draft=np.asarray(arr(part, "draft_cost"), np.float64),
+            tasks=np.asarray(arr(part, "task_ids")),
+            rows=np.asarray(arr(part, "rows")),
+            h24=arr(part, "h24"))
+        for k_ in ("ctx24", "emb", "feat"):
+            if not torch.isfinite(data[part][k_]).all():
+                raise SystemExit(f"{part}.{k_}: нечисловые значения")
+    teacher_va = np.asarray(arr("val_sel", "teacher_cost"), np.float64)
+    return arr, data, teacher_va
+
+
 def sha12_bytes(b):
     return hashlib.sha1(b).hexdigest()[:12]
 
@@ -809,6 +990,18 @@ def main():
     # OVERFIT_DROP от начального. На 64 строках 2000 шагов — секунды.
     ap.add_argument("--overfit-steps", type=int, default=2000)
     ap.add_argument("--overfit-lr", type=float, default=1e-2)
+    ap.add_argument("--loss", choices=LOSSES, default="regret",
+                    help="regret — ожидаемый regret softmax-выбора; mse и "
+                         "huber — регрессия восьми Delta_j = e_j - e_0, "
+                         "исполняется argmin предсказанного Delta")
+    ap.add_argument("--select-on", choices=("val_sel", "train_holdout"),
+                    default="val_sel",
+                    help="где выбирать эпоху. train_holdout — отложенная "
+                         "часть ЭПИЗОДОВ train; тогда val_sel только "
+                         "оценивает и остаётся чище")
+    ap.add_argument("--holdout-frac", type=float, default=0.1)
+    ap.add_argument("--k11a-cache", default="data/k11a_joint12",
+                    help="префикс кэша K-11a: из него номера эпизодов строк")
     ap.add_argument("--out", default="data/k15c/selectors")
     ap.add_argument("--summary", default="")
     ap.add_argument("--overwrite", action="store_true")
@@ -827,7 +1020,12 @@ def main():
         if h not in rs.HEADS:
             raise SystemExit(f"голова {h!r} не бывает: {rs.HEADS}")
     tag = "_smoke" if a.allow_smoke else ""
-    summary = a.summary or f"reports/k15c/selector{tag}_s{a.seed}.json"
+    # ВАРИАНТ ПОТЕРЬ И ОТБОРА — В ИМЕНАХ ФАЙЛОВ: иначе регрессия
+    # перезаписала бы сводку и чекпойнты первой очереди, а отказ её головы
+    # архивировал бы их как устаревшие.
+    vt = ("" if (a.loss == "regret" and a.select_on == "val_sel")
+          else f"_{a.loss}_{a.select_on}")
+    summary = a.summary or f"reports/k15c/selector{vt}{tag}_s{a.seed}.json"
     if os.path.exists(summary) and not a.overwrite:
         raise SystemExit(f"{summary} уже существует: без --overwrite не "
                          f"перезаписываю")
@@ -854,11 +1052,6 @@ def main():
     if int(C1.shape[1]) != int(man["e_dim"]):
         raise SystemExit("размерность книги не та, что в кэше")
 
-    def arr(part, name):
-        return np.load(os.path.join(a.cache,
-                                    man["arrays"][f"{part}_{name}"]["file"]),
-                       mmap_mode="r")
-
     d_model = int(man["d_model"])
     # БЕЗ МОЛЧАЛИВОГО ОТКАТА НА CPU: запрошенная карта либо есть, либо
     # это отказ. Карта здесь любая — тренер не загружает модель и гейт
@@ -866,47 +1059,8 @@ def main():
     if a.device.startswith("cuda") and not torch.cuda.is_available():
         raise SystemExit(f"запрошено {a.device}, а CUDA недоступна")
     dev = torch.device(a.device)
-
-    def pooled(part, src):
-        if src == "h24":
-            h = arr(part, "h24")
-        elif man["h18_mode"] == "full":
-            h = arr(part, "h18")
-        elif man["h18_mode"] == "mean":
-            return torch.from_numpy(np.asarray(arr(part, "h18_lnmean"),
-                                               np.float32))
-        else:
-            return None
-        out = []
-        for s in range(0, h.shape[0], 4096):
-            out.append(rs.ln_mean_pool(torch.from_numpy(
-                np.asarray(h[s:s + 4096], np.float32)), torch))
-        return torch.cat(out, 0)
-
-    data = {}
     t_prep = time.time()
-    for part in ("train", "val_sel"):
-        # КОПИИ, А НЕ ВИДЫ НА memmap: файл открыт только на чтение, и
-        # тензор поверх него был бы незаписываемым видом.
-        codes = torch.from_numpy(np.array(arr(part, "top8_codes"),
-                                          np.int64))
-        lp = torch.from_numpy(np.array(arr(part, "top8_logprobs"),
-                                       np.float32))
-        emb, feat = [], []
-        for s in range(0, codes.shape[0], 8192):
-            emb.append(rs.candidate_embeddings(codes[s:s + 8192], C1, torch))
-            feat.append(rs.candidate_score_features(lp[s:s + 8192], torch))
-        data[part] = dict(
-            ctx24=pooled(part, "h24"), ctx18=pooled(part, "h18"),
-            emb=torch.cat(emb, 0), feat=torch.cat(feat, 0), codes=codes,
-            costs=np.asarray(arr(part, "rank_costs"), np.float64),
-            draft=np.asarray(arr(part, "draft_cost"), np.float64),
-            tasks=np.asarray(arr(part, "task_ids")),
-            h24=arr(part, "h24"))
-        for k_ in ("ctx24", "emb", "feat"):
-            if not torch.isfinite(data[part][k_]).all():
-                raise SystemExit(f"{part}.{k_}: нечисловые значения")
-    teacher_va = np.asarray(arr("val_sel", "teacher_cost"), np.float64)
+    arr, data, teacher_va = load_features(a.cache, man, C1, torch, rs)
     print(f"  признаки подготовлены за {time.time() - t_prep:.0f} с: "
           f"train {len(data['train']['costs'])} строк, val_sel "
           f"{len(data['val_sel']['costs'])}; d_model {d_model}, книга "
@@ -958,6 +1112,37 @@ def main():
              f"; разведочный {100 * pilot_min:.1f} % (мягкий M2 + 5 п.п., "
              f"оправдывает только проверку вывода и короткий роллаут)"))
 
+    # --- ЧАСТЬ ОТБОРА ЭПОХИ ---------------------------------------------
+    n_tr = len(tr["costs"])
+    holdout = None
+    if a.select_on == "train_holdout":
+        with open(f"{a.k11a_cache}.meta.json", encoding="utf-8") as fh:
+            meta11 = json.load(fh)
+        epi_all = np.asarray(np.load(meta11["cache"],
+                                     allow_pickle=True)["episode"])
+        rows_tr = np.asarray(arr("train", "rows"))
+        if int(rows_tr.max()) >= len(epi_all):
+            raise SystemExit("строки train вне кэша K-11a")
+        ep_tr = epi_all[rows_tr]
+        ep_va = set(epi_all[rows_val].tolist())
+        fit_m, sel_m = episode_holdout(ep_tr, a.holdout_frac, a.seed)
+        holdout = dict(fit=np.flatnonzero(fit_m), sel=np.flatnonzero(sel_m),
+                       episodes_train=int(len(np.unique(ep_tr))),
+                       episodes_holdout=int(len(np.unique(ep_tr[sel_m]))),
+                       episodes_shared_with_val_sel=int(len(
+                           set(ep_tr.tolist()) & ep_va)))
+        print(f"  отбор эпохи — на ЭПИЗОДАХ train: отложено "
+              f"{holdout['episodes_holdout']} из "
+              f"{holdout['episodes_train']} эпизодов, "
+              f"{len(holdout['sel'])} строк; эпизодов, общих с val_sel: "
+              f"{holdout['episodes_shared_with_val_sel']}")
+    fit_idx = holdout["fit"] if holdout else np.arange(n_tr)
+    d_fit = (tr["costs"] - tr["costs"][:, :1])[fit_idx][:, 1:]
+    delta_scale = float(np.std(d_fit))
+    loss_fn = make_loss(a.loss, delta_scale, torch)
+    print(f"  потеря {a.loss}" + ("" if a.loss == "regret" else
+                                  f", масштаб Delta {delta_scale:.4e}"))
+
     feat_mean = tr["feat"].mean((0, 1))
     feat_std = tr["feat"].std((0, 1))
     task_vocab = man.get("task_vocab")
@@ -985,14 +1170,28 @@ def main():
                              feat_std=feat_std, book=C1).to(dev)
         n_par = sum(p.numel() for p in head.parameters())
         print(f"\n  {name}: {n_par} параметров, вход {src}")
-        path = os.path.join(a.out, f"{name}{tag}_s{a.seed}.pt")
-        probe_idx = probe_rows(len(tr["costs"]), int(a.overfit_rows))
-        pv = overfit_probe(head, inp_tr, probe_idx, tr["costs"], torch,
+        path = os.path.join(a.out, f"{name}{vt}{tag}_s{a.seed}.pt")
+        if holdout:
+            inp_fit = inp_tr.subset(holdout["fit"])
+            inp_sel = inp_tr.subset(holdout["sel"])
+            c_fit = tr["costs"][holdout["fit"]]
+            c_sel = tr["costs"][holdout["sel"]]
+            # НА train УЧИТЕЛЯ НЕТ: доля здесь — от оракульного запаса
+            # (черновик -> лучший из восьми), только для журнала. Эпоха
+            # выбирается по hard RMS, а порог проверяется на val_sel.
+            sel_args = (c_sel, tr["draft"][holdout["sel"]], c_sel.min(1))
+            sel_tasks = tr["tasks"][holdout["sel"]]
+        else:
+            inp_fit, inp_sel, c_fit = inp_tr, inp_va, tr["costs"]
+            sel_args = (va["costs"], va["draft"], teacher_va)
+            sel_tasks = va["tasks"]
+        probe_idx = probe_rows(len(c_fit), int(a.overfit_rows))
+        pv = overfit_probe(head, inp_fit, probe_idx, c_fit, torch,
                            steps=int(a.overfit_steps), lr=float(a.overfit_lr),
-                           wd=0.0)
+                           wd=0.0, loss_fn=loss_fn)
         pv["rows"] = [int(x) for x in probe_idx]
         print(f"    проба обучаемости на {len(probe_idx)} строках, "
-              f"{pv['steps_used']} шагов из {pv['steps_budget']}: regret "
+              f"{pv['steps_used']} шагов из {pv['steps_budget']}: {a.loss} "
               f"{pv['first']:.4e} -> {pv['last']:.4e} (отношение "
               f"{pv['ratio']:.3f}), hard {pv['hard_before']:.4e} -> "
               f"{pv['hard_after']:.4e}; "
@@ -1009,11 +1208,11 @@ def main():
             continue
         try:
             hist, states = train_head(
-                head, inp_tr, tr["costs"], inp_va, va["costs"], va["draft"],
-                teacher_va, torch, epochs=int(a.epochs), batch=int(a.batch),
+                head, inp_fit, c_fit, inp_sel, *sel_args, torch,
+                epochs=int(a.epochs), batch=int(a.batch),
                 lr=float(a.lr), wd=float(a.wd), patience=int(a.patience),
-                seed=int(a.seed), task_ids=va["tasks"],
-                task_vocab=task_vocab)
+                seed=int(a.seed), task_ids=sel_tasks,
+                task_vocab=task_vocab, loss_fn=loss_fn)
         except (FloatingPointError, ValueError) as e:
             results[name] = dict(overfit_probe=pv, trained=False,
                                  technical=str(e),
@@ -1022,9 +1221,16 @@ def main():
         sel = select_epoch(hist)
         head.load_state_dict(states[sel["epoch"]])
         again = evaluate_scores(
-            scores_for(head, inp_va, np.arange(len(va["costs"])), torch),
-            va["costs"], va["draft"], teacher_va)
+            scores_for(head, inp_sel, np.arange(len(sel_args[0])), torch),
+            *sel_args)
         reproduced = again["rms"] == sel["val"]["rms"]
+        # ПОРОГИ ПРОВЕРЯЮТСЯ НА val_sel ВСЕГДА. При отборе на эпизодах
+        # train это отдельная оценка выбранного состояния, не участвовавшая
+        # в выборе.
+        val_eval = evaluate_scores(
+            scores_for(head, inp_va, np.arange(len(va["costs"])), torch),
+            va["costs"], va["draft"], teacher_va, task_ids=va["tasks"],
+            task_vocab=task_vocab)
         payload = dict(
             kind="k15c_rank_selector", head=name, smoke=bool(a.allow_smoke),
             d_model=d_model, e_dim=int(C1.shape[1]), proj=int(a.proj),
@@ -1036,7 +1242,9 @@ def main():
             cache=os.path.abspath(a.cache), c1_sha1=man["c1_sha1"],
             reader_state_sha1=man["reader_state_sha1"],
             hyper=dict(epochs=a.epochs, batch=a.batch, lr=a.lr, wd=a.wd,
-                       patience=a.patience, seed=a.seed, loss="regret",
+                       patience=a.patience, seed=a.seed, loss=a.loss,
+                       delta_scale=delta_scale, select_on=a.select_on,
+                       holdout_frac=(a.holdout_frac if holdout else None),
                        lambda_ce=0.0))
         tmp = path + f".tmp.{os.getpid()}"
         torch.save(payload, tmp)
@@ -1063,12 +1271,13 @@ def main():
             archive_working(path)
             path = path[:-3] + ".technical_fail.pt"
         os.replace(tmp, path)
-        verdict = head_verdict(sel["val"], base, finite,
+        verdict = head_verdict(val_eval, base, finite,
                                bool(reproduced and loaded_equal),
                                pilot_min=pilot_min)
         results[name] = dict(
             overfit_probe=pv, trained=True, selected_epoch=int(sel["epoch"]),
-            epochs_run=len(hist) - 1, val=sel["val"],
+            epochs_run=len(hist) - 1, val=val_eval,
+            selection=dict(on=a.select_on, metrics=sel["val"]),
             reproduced=bool(reproduced), save_load_equal=bool(loaded_equal),
             verdict=verdict, checkpoint=os.path.abspath(path),
             # ОТПЕЧАТОК ФАЙЛА — по нему проверка вывода находит статус
@@ -1078,7 +1287,11 @@ def main():
             trajectory=[dict(epoch=h["epoch"], rms=h["val"]["rms"],
                              capture=h["val"]["capture"],
                              train_regret=h["train_regret"]) for h in hist])
-        v = sel["val"]
+        v = val_eval
+        if holdout:
+            print(f"    отбор на эпизодах train: hard RMS "
+                  f"{sel['val']['rms']:.6f}, ранг 0 у "
+                  f"{100 * sel['val']['share_rank0']:.1f} % строк")
         print(f"    ВЫБРАНА эпоха {sel['epoch']} из {len(hist) - 1}: hard RMS "
               f"{v['rms']:.6f}, доля {100 * (v['capture'] or 0):.1f} % "
               f"(порог {100 * CAPTURE_MIN:.0f} %); regret медиана "
@@ -1144,7 +1357,12 @@ def main():
                deployable_prefix=DEPLOYABLE_PREFIX,
                codes=dict(primary=CODE_PRIMARY, pilot=CODE_PILOT,
                           none=CODE_NONE, technical=CODE_TECH),
-               selected_on="val_sel",
+               selected_on=("train_episode_holdout" if holdout
+                            else "val_sel"),
+               loss=a.loss, delta_scale=delta_scale,
+               holdout=(None if not holdout else {
+                   k: v for k, v in holdout.items()
+                   if k not in ("fit", "sel")}),
                val_confirm_used_for_selection=False,
                cache=os.path.abspath(a.cache),
                cache_canonical=bool(man["canonical"]),

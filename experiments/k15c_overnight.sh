@@ -92,7 +92,7 @@ stage "0. самопроверки"
 for m in k15_context k15b_probe_and_extract k15b_build_rankpath_cache \
          k15b_train_stagewise k15b_measure_interface k15b_measure_soft \
          k15c_rank_selector k15c_build_rank_cache k15c_train_rank_selector \
-         k15c_check_inference k15c_policy k15c_behavior k9h_multiarm_gate; do
+         k15c_check_inference k15c_policy k15c_behavior k15c_cache_diagnostics k9h_multiarm_gate; do
     if ! python3 "experiments/${m}.py" --selftest >/dev/null 2>&1; then
         echo "ОТКАЗ: самопроверка ${m} не прошла" >&2
         exit 1
