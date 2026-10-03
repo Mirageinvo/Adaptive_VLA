@@ -61,6 +61,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 
 import numpy as np
 
@@ -137,6 +138,21 @@ def cosine_to(X, idx):
     nrm = np.linalg.norm(X, axis=-1)
     denom = np.maximum(nrm * nrm[np.asarray(idx, np.int64)], 1e-300)
     return (X * X[np.asarray(idx, np.int64)]).sum(-1) / denom
+
+
+def archive_existing(path):
+    """Переносит существующий файл в версию со штампом времени.
+
+    Как в probe: при повторном прогоне прежняя сводка не затирается
+    молча, иначе сравнить две версии описания было бы нечем.
+    """
+    if not os.path.exists(path):
+        return None
+    dest = f"{path}.{time.strftime('%Y%m%dT%H%M%S')}.bak"
+    if os.path.exists(dest):
+        dest = f"{dest}.{os.getpid()}"
+    os.replace(path, dest)
+    return dest
 
 
 def describe(v, name):
@@ -274,6 +290,9 @@ def main():
     if os.path.exists(a.summary) and not a.overwrite:
         raise SystemExit(f"{a.summary} уже существует: без --overwrite не "
                          f"перезаписываю")
+    archived = archive_existing(a.summary)
+    if archived:
+        print(f"  прежняя сводка перенесена в {archived}")
     import torch
 
     obj = torch.load(a.c1, map_location="cpu", weights_only=False)
@@ -449,6 +468,7 @@ def main():
                                      for k, v in bounds_w.items()}),
         usage_file=(os.path.abspath(a.target)
                     if usage is not None else None),
+        archived=archived,
         per_k={str(k): v for k, v in per_k.items()},
         ks=[int(k) for k in KS], restart_seeds=[int(s) for s in RESTART_SEEDS],
         orthogonal_reference_rel=float(np.sqrt(2.0)),
