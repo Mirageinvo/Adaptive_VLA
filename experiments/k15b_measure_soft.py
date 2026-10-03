@@ -35,10 +35,13 @@ tau, поэтому все пять значений tau обязаны дать
 
 ФИКСИРОВАННЫЙ РАНГ — ГЛАВНОЕ ДОБАВЛЕНИЕ. Для каждого j от 0 до 7 берётся
 j-й код порядка читателя во ВСЕХ позициях и считаются RMS, доля разрыва,
-опора, диапазон и доля строк, где он лучше ранга 0. Это развёртываемая
-точка БЕЗ ОБУЧЕНИЯ ВООБЩЕ — одно целое число. Её порог не новый: это уже
-объявленные 0.20 доли разрыва из фазы `q1_reader`. Если его берёт
-фиксированный ранг, учить нечего и дальше идёт roll-out.
+опора, диапазон и доля строк, где он лучше ранга 0.
+
+«БЕЗ ОБУЧЕНИЯ ВООБЩЕ» ЭТО НЕ ЕСТЬ: порядок берётся у уже обученного
+читателя q1, то есть обучение в системе присутствует. Точно так:
+фиксированный ранг не требует ДОПОЛНИТЕЛЬНОГО обучения, новых параметров
+и головы h24, и развёртывается заменой argmax на фиксированный
+порядковый ранг. Если он берёт порог, дальше идёт roll-out.
 
 РАСПРЕДЕЛЕНИЕ ЛУЧШЕГО РАНГА приводится как ОПИСАНИЕ: гистограмма,
 энтропия, majority и его доля, доля строк с ненулевым лучшим рангом.
@@ -71,13 +74,24 @@ j-й код порядка читателя во ВСЕХ позициях и с
 диагностическая НИЖНЯЯ оценка возможностей более общего второго читателя и
 сама не развёртываема — выбор требует истинного действия.
 
-ПОРОГИ ОБЪЯВЛЕНЫ ДО ДАННЫХ И ИХ ДВА, ПО СЕМЕЙСТВАМ. Фиксированный ранг
-проверяется первым, потому что это точка проще: одно целое число и ни
-одного обученного параметра, порог — объявленные 0.20. Сетка (k, tau) идёт
-второй: её лучшая точка обязана пройти опору и диапазон И взять долю
+ПОРОГОВ ДВА, ПО СЕМЕЙСТВАМ, И ИХ ПРОВЕНАНС РАЗНЫЙ. Фиксированный ранг
+проверяется первым, потому что это точка проще: одно целое число, ни
+одного нового параметра. Его порог 0.20 — ЧИСЛО, унаследованное от фазы
+`q1_reader`, где оно объявлено до данных; ПРИМЕНЕНИЕ этого числа к
+семейству фиксированных рангов зарегистрировано после первого M2, когда
+стал виден согласованный rank-path, но до измерения отдельных рангов.
+Сетка (k, tau) идёт второй, и её порог объявлен до данных полностью,
+03.10.2026: лучшая точка обязана пройти опору и диапазон И взять долю
 разрыва не меньше, чем мягкий путь плюс 0.05, то есть около 11.9 % при
-нынешних числах. Не прошло ни одно семейство — развёртываемой точки без
-обучения нет, и остаётся обучение по action-члену. Выбор делается на
+нынешних числах.
+
+КОДЫ ИСХОДА РАЗВЕДЕНЫ. Код 0 — какое-то семейство взяло свой порог. Код
+4 — технически допустимая точка есть хотя бы в одном семействе, но
+научный порог не взят ни одним. Код 3 — выбирать не из чего вовсе: ни
+одной точки, прошедшей опору и диапазон, либо неположительный разрыв до
+учителя. Прежняя версия отдавала 3 в случае «сетка не прошла гейты, а
+фиксированный ранг прошёл, но не дотянул до порога», и это было неверно:
+технический блокер и недостигнутый порог — разные исходы. Выбор делается на
 `val_sel` и помечается как выбранный на этой части; `val_confirm` не
 открывается ни при каком исходе. При `--batches != 0` часть неполная, и
 тогда рабочая точка НЕ выбирается вовсе: исход — код 3, `accepted` ложно,
@@ -100,10 +114,19 @@ SOFT_GAIN_MIN = 0.05
 K1_ABS_LIMIT = 1e-5            # допуск вырожденного инварианта при k=1
 RANK_TIE_THRESHOLDS = (0.0, 0.01, 0.05, 0.10)
 LATENT_PREFIX = (1, 2, 4, 8, 10)
-# Порог для ФИКСИРОВАННОГО ранга — это уже зарегистрированный научный
-# порог фазы `q1_reader`, а не новое число: 0.20 доли разрыва. Если его
-# берёт фиксированный ранг, обучать нечего — он развёртываем как есть.
+# Порог для ФИКСИРОВАННОГО ранга. ЧИСЛО унаследовано от фазы `q1_reader`,
+# где 0.20 было объявлено до данных. ПРИМЕНЕНИЕ его к семейству
+# фиксированных рангов зарегистрировано позже — после первого M2, когда
+# стал виден согласованный rank-path, но ДО измерения отдельных
+# фиксированных рангов. Называть это предрегистрацией целиком было бы
+# неверно, поэтому происхождение числа и происхождение его применения
+# записываются в артефакт раздельно.
 FIXED_RANK_CAPTURE_MIN = 0.20
+FIXED_RANK_THRESHOLD_ORIGIN = dict(
+    capture_min=FIXED_RANK_CAPTURE_MIN,
+    numeric_origin="inherited_from_q1_reader",
+    application_origin=("registered_after_initial_M2_"
+                        "before_per_rank_measurement"))
 
 
 def reader_order(logits, torch):
@@ -210,23 +233,34 @@ def training_free_decision(points, fixed_points, capture_base,
     fx = [p for p in fixed_points
           if int(p["rank"]) > 0 and p.get("support_passed")
           and p.get("range_passed") and p.get("capture") is not None]
-    if fx:
-        best_fx = max(fx, key=lambda p: float(p["capture"]))
-        if float(best_fx["capture"]) >= float(fixed_min) - 1e-12:
-            got = 100 * float(best_fx["capture"])
-            return dict(code=0, family="fixed_rank", best=dict(best_fx),
-                        required=float(fixed_min),
-                        outcome=(f"фиксированный ранг {best_fx['rank']} "
-                                 f"берёт {got:.1f} % разрыва при пороге "
-                                 f"{100 * float(fixed_min):.0f} %: это "
-                                 f"развёртываемая точка БЕЗ обучения, "
-                                 f"дальше roll-out, а не голова"))
+    best_fx = (max(fx, key=lambda p: float(p["capture"])) if fx else None)
+    if best_fx is not None \
+            and float(best_fx["capture"]) >= float(fixed_min) - 1e-12:
+        got = 100 * float(best_fx["capture"])
+        return dict(code=0, family="fixed_rank", best=dict(best_fx),
+                    required=float(fixed_min),
+                    outcome=(f"фиксированный ранг {best_fx['rank']} берёт "
+                             f"{got:.1f} % разрыва при пороге "
+                             f"{100 * float(fixed_min):.0f} %: рабочая "
+                             f"точка БЕЗ ДОПОЛНИТЕЛЬНОГО обучения, новых "
+                             f"параметров и головы h24, дальше roll-out"))
     out = soft_decision(points, capture_base, gain_min=gain_min)
     out["family"] = "soft_grid"
-    out["fixed_rank_best"] = (None if not fx else
-                              dict(max(fx, key=lambda p:
-                                       float(p["capture"]))))
+    out["fixed_rank_best"] = (None if best_fx is None else dict(best_fx))
     out["fixed_rank_required"] = float(fixed_min)
+    # КОД 3 ОЗНАЧАЕТ «ВЫБИРАТЬ НЕ ИЗ ЧЕГО», А НЕ «ПОРОГ НЕ ВЗЯТ». Если
+    # сетка не дала ни одной прошедшей гейты точки, но технически
+    # исправный фиксированный ранг существует, то блокера нет — есть
+    # недостигнутый научный порог, и это код 4.
+    if out["code"] == 3 and capture_base is not None \
+            and best_fx is not None:
+        out["code"] = 4
+        out["outcome"] = (
+            f"ни одна точка сетки не прошла опору и диапазон, а лучший "
+            f"допустимый фиксированный ранг {best_fx['rank']} даёт "
+            f"{100 * float(best_fx['capture']):.1f} % при требуемых "
+            f"{100 * float(fixed_min):.0f} %: технически исправная точка "
+            f"есть, научный порог не взят ни одним семейством")
     return out
 
 
@@ -259,7 +293,8 @@ def soft_decision(points, capture_base, gain_min=SOFT_GAIN_MIN):
             f"точка k={best['k']}, tau={best['tau']} берёт "
             f"{100 * float(best['capture']):.1f} % разрыва против "
             f"{100 * float(capture_base):.1f} % у мягкого пути: сужение "
-            f"области усреднения работает и развёртываемо без обучения"))
+            f"области усреднения работает и развёртывается без "
+            f"ДОПОЛНИТЕЛЬНОГО обучения"))
     else:
         out.update(code=4, outcome=(
             f"лучшая прошедшая точка k={best['k']}, tau={best['tau']} даёт "
@@ -465,6 +500,22 @@ def selftest():
     dw = training_free_decision(soft_pts, weak, 0.069)
     assert dw["code"] == 4 and dw["fixed_rank_best"]["rank"] == 2, dw
     assert abs(dw["fixed_rank_required"] - 0.20) < 1e-12
+    # ТЕХНИЧЕСКИ ИСПРАВНАЯ ТОЧКА ЕСТЬ, ПОРОГ НЕ ВЗЯТ -> 4, А НЕ 3.
+    # Прежде это был код 3 с текстом «ни одна точка не прошла опору»,
+    # хотя фиксированный ранг опору проходил.
+    bad_soft = [dict(k=16, tau=1.0, capture=0.08, support_passed=False,
+                     range_passed=True)]
+    dm = training_free_decision(bad_soft, weak, 0.069)
+    assert dm["code"] == 4, dm
+    assert dm["family"] == "soft_grid" and dm["fixed_rank_best"]["rank"] == 2
+    assert "научный порог не взят" in dm["outcome"], dm
+    # А ВОТ КОГДА НЕ ПРОШЛО НИ ОДНО СЕМЕЙСТВО — ЭТО ВСЁ ЕЩЁ 3
+    none_ok = [dict(rank=2, capture=0.5, support_passed=False,
+                    range_passed=True)]
+    dn = training_free_decision(bad_soft, none_ok, 0.069)
+    assert dn["code"] == 3 and dn["fixed_rank_best"] is None, dn
+    # НЕПОЛОЖИТЕЛЬНЫЙ РАЗРЫВ ОСТАЁТСЯ ТЕХНИЧЕСКИМ БЛОКЕРОМ
+    assert training_free_decision(bad_soft, weak, None)["code"] == 3
     # СЕТКА МОЖЕТ ПРОЙТИ САМА
     strong_soft = [dict(k=16, tau=1.0, capture=0.2, support_passed=True,
                         range_passed=True)]
@@ -1033,6 +1084,11 @@ def main():
         gap_rel=dict(median=float(np.median(gr)),
                      p95=float(np.percentile(gr, 95)),
                      mean=float(gr.mean())),
+        definition=("gap_abs = second_best_row_MSE - best_row_MSE; "
+                    "gap_rel = (second_best_row_MSE - best_row_MSE) / "
+                    "best_row_MSE. Обе — ПОСТРОЧНЫЕ взвешенные MSE по "
+                    "первым восьми шагам действия, а не доли от RMS и не "
+                    "доли разрыва до черновика"),
         note=("разность ошибки ВТОРОГО и ЛУЧШЕГО ранга. При частых ничьих "
               "жёсткая метка наказывала бы безвредные «ошибки», и учить "
               "надо ожидаемый regret sum_j p(j) * (e_j - min_l e_l), для "
@@ -1089,8 +1145,11 @@ def main():
     print("\n  эффективное число кодов под маской при tau=1: " + ", ".join(
         f"k={k_} {by_key[keyf(k_, 1.0)]['effective_support']:.1f}"
         for k_ in ks))
-    print("\n  ФИКСИРОВАННЫЙ РАНГ — развёртываем без обучения вообще "
-          f"(порог {100 * FIXED_RANK_CAPTURE_MIN:.0f} %):")
+    print("\n  ФИКСИРОВАННЫЙ РАНГ — замена argmax на порядковый ранг: "
+          "без ДОПОЛНИТЕЛЬНОГО обучения, новых параметров и головы h24 "
+          f"(порог {100 * FIXED_RANK_CAPTURE_MIN:.0f} %, число из фазы "
+          f"q1_reader, применение к этому семейству зарегистрировано "
+          f"после первого M2):")
     for fp in fixed_points:
         mark = "" if (fp["support_passed"] and fp["range_passed"]) else "*"
         print(f"    ранг {fp['rank']}: RMS {fp['rms']:.6f} "
@@ -1110,9 +1169,11 @@ def main():
     print(f"    ничьи: второй ранг не хуже лучшего у "
           + ", ".join(f"{100 * v:.1f} % при t={t}"
                       for t, v in ambiguity["ties"].items()))
-    print(f"    разность второго и лучшего: медиана "
-          f"{ambiguity['gap_abs']['median']:.3e} абсолютно, "
-          f"{100 * ambiguity['gap_rel']['median']:.1f} % относительно")
+    print(f"    (second_best_row_MSE - best_row_MSE): медиана "
+          f"{ambiguity['gap_abs']['median']:.3e}; то же, делённое на "
+          f"best_row_MSE: медиана "
+          f"{100 * ambiguity['gap_rel']['median']:.1f} %, p95 "
+          f"{100 * ambiguity['gap_rel']['p95']:.1f} %")
     print("\n  ЛАТЕНТНЫЙ ПОРЯДОК ПРИ ТЕХ ЖЕ k (сравнение порядков "
           "честное только при равном k):")
     for kp in LATENT_PREFIX:
@@ -1132,7 +1193,8 @@ def main():
               f"({100 * (aligned[k_]['capture'] or 0):.1f} %)")
     if decision.get("family") == "fixed_rank":
         bp = decision["best"]
-        print(f"\n  РАЗВЁРТЫВАЕМО БЕЗ ОБУЧЕНИЯ: фиксированный ранг "
+        print(f"\n  РАБОЧАЯ ТОЧКА БЕЗ ДОПОЛНИТЕЛЬНОГО ОБУЧЕНИЯ: "
+              f"фиксированный ранг "
               f"{bp['rank']}, RMS {bp['rms']:.6f}, доля "
               f"{100 * (bp['capture'] or 0):.1f} % при пороге "
               f"{100 * decision['required']:.0f} %")
@@ -1158,13 +1220,15 @@ def main():
     payload = dict(
         kind="k15b_soft_operating_point",
         accepted=bool(decision["code"] == 0),
-        thresholds=dict(soft_gain_min=SOFT_GAIN_MIN,
-                        declared="до данных, 03.10.2026"),
+        thresholds=dict(
+            soft_grid=dict(gain_min=SOFT_GAIN_MIN,
+                           base="capture(a1_soft)",
+                           declared="до данных, 03.10.2026"),
+            fixed_rank=dict(FIXED_RANK_THRESHOLD_ORIGIN)),
         selected_on=("val_sel" if full_val else "val_sel_subset"),
         val_confirm_used_for_selection=False,
         decision=decision, points=points,
         fixed_rank_points=fixed_points,
-        fixed_rank_capture_min=FIXED_RANK_CAPTURE_MIN,
         best_rank=rank_info, target_ambiguity=ambiguity,
         latent_prefix=latent_prefix,
         latent_prefix_note=(
