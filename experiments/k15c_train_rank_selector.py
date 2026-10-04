@@ -224,22 +224,92 @@ def make_loss(kind, delta_scale, torch):
     return reg
 
 
-def episode_holdout(episodes, frac, seed):
-    """(маска обучения, маска отбора) по ЭПИЗОДАМ, а не по строкам.
+def episode_holdout(episodes, tasks, frac, seed):
+    """(маска обучения, маска отбора, сведения) по ЭПИЗОДАМ, по задачам.
 
     Соседние кадры одного эпизода почти одинаковы; разбиение по строкам
-    положило бы их по разные стороны, и отбор эпохи мерил бы
-    запоминание, а не обобщение.
+    положило бы их по разные стороны, и отбор эпохи мерил бы запоминание.
+    Эпизоды откладываются ОТДЕЛЬНО ВНУТРИ КАЖДОЙ ЗАДАЧИ: глобальный выбор
+    мог бы не дать задаче ни одного отложенного эпизода или дать ей
+    непропорционально много. Каждый эпизод обязан принадлежать одной
+    задаче, у каждой задачи — хотя бы один эпизод в обучении и один в
+    отборе.
     """
-    ep = np.asarray(episodes)
-    uniq = np.unique(ep)
-    if len(uniq) < 2:
-        raise ValueError("для отложенной части нужно хотя бы два эпизода")
+    ep = np.asarray(episodes, np.int64)
+    tk = np.asarray(tasks, np.int64)
+    if ep.shape != tk.shape:
+        raise ValueError("эпизоды и задачи разной длины")
+    by_ep = {}
+    for e, t in zip(ep.tolist(), tk.tolist()):
+        by_ep.setdefault(e, set()).add(t)
+    multi = [e for e, ts in by_ep.items() if len(ts) > 1]
+    if multi:
+        raise ValueError(f"эпизоды {multi[:3]} относятся к нескольким "
+                         f"задачам")
     rng = np.random.default_rng(int(seed))
-    k = max(1, int(round(float(frac) * len(uniq))))
-    hold = set(rng.permutation(uniq)[:k].tolist())
-    sel = np.array([e in hold for e in ep.tolist()])
-    return ~sel, sel
+    hold, info = set(), {}
+    for t in sorted(set(tk.tolist())):
+        eps_t = np.array(sorted(e for e, ts in by_ep.items() if t in ts))
+        if len(eps_t) < 2:
+            raise ValueError(f"в задаче {t} эпизодов {len(eps_t)}: нужно "
+                             f"хотя бы два — один в обучение, один в отбор")
+        k = min(max(1, int(round(float(frac) * len(eps_t)))),
+                len(eps_t) - 1)
+        h_t = rng.permutation(eps_t)[:k]
+        hold |= set(h_t.tolist())
+        m_t = tk == t
+        info[int(t)] = dict(episodes_fit=int(len(eps_t) - k),
+                            episodes_holdout=int(k),
+                            rows_fit=int((m_t & ~np.isin(ep, h_t)).sum()),
+                            rows_holdout=int((m_t & np.isin(ep, h_t)).sum()))
+    sel = np.isin(ep, np.array(sorted(hold), np.int64))
+    return ~sel, sel, info
+
+
+def check_episode_binding(keys, meta_keys, q0man_sha, cache_q0man_sha,
+                          q0man_keys):
+    """Номера эпизодов привязаны к источнику строк кэша. Проблемы.
+
+    Цепочка: ключи (эпизод, шаг) из K-11a совпадают с его собственным
+    отпечатком; манифест канонического q0 — тот, на который ссылается кэш
+    рангов; и q0 построен ровно по этим ключам.
+    """
+    p = []
+    if keys != meta_keys:
+        p.append(f"ключи K-11a {keys} против записанных {meta_keys}")
+    if q0man_sha != cache_q0man_sha:
+        p.append(f"манифест q0 {q0man_sha}, кэш рангов ссылается на "
+                 f"{cache_q0man_sha}")
+    if q0man_keys != keys:
+        p.append(f"q0 построен по ключам {q0man_keys}, а не {keys}")
+    return p
+
+
+def load_episodes(k11a_prefix, q0_path, man):
+    """(эпизоды, шаги, провенанс) строк датасета. Fail-closed."""
+    with open(f"{k11a_prefix}.meta.json", encoding="utf-8") as fh:
+        meta = json.load(fh)
+    d = np.load(meta["cache"], allow_pickle=True)
+    n = int(meta["n_obs"])
+    # ТОТ ЖЕ СПОСОБ, ЧТО В k15_context: эпизоды int64, шаги как есть.
+    epi = np.asarray(d["episode"])[:n].astype(np.int64)
+    stp = np.asarray(d["step"])[:n]
+    keys = hashlib.sha1(np.ascontiguousarray(
+        np.stack([epi, stp])).tobytes()).hexdigest()[:12]
+    man_p = (q0_path[:-4] if q0_path.endswith(".npz") else q0_path) \
+        + ".manifest.json"
+    with open(man_p, encoding="utf-8") as fh:
+        q0man = json.load(fh)
+    import k15c_build_rank_cache as cb
+    problems = check_episode_binding(
+        keys, meta.get("keys_sha1"), cb.sha_file(man_p),
+        (man.get("q0_prov") or {}).get("q0_manifest_sha1"),
+        q0man.get("keys_sha1"))
+    if problems:
+        raise SystemExit("номера эпизодов не привязаны к источнику строк: "
+                         + "; ".join(problems))
+    return epi, stp, dict(keys_sha1=keys, k11a_meta=f"{k11a_prefix}"
+                          f".meta.json", q0_manifest=man_p)
 
 
 def archive_working(path):
@@ -494,11 +564,15 @@ def train_head(head, inp_tr, costs_tr, inp_va, costs_va, draft_va,
         sc = scores_for(head, inp_va, idx_va, torch)
         val = evaluate_scores(sc, costs_va, draft_va, teacher_va,
                               task_ids=task_ids, task_vocab=task_vocab)
-        history.append(dict(epoch=int(epoch), train_regret=train_loss,
+        # train_objective — средняя по батчам ОБУЧАЮЩАЯ функция потерь по
+        # ходу изменения параметров (regret, mse или huber), а не оценка
+        # чекпойнта; train_regret оставлен для совместимости сводок.
+        history.append(dict(epoch=int(epoch), train_objective=train_loss,
+                            train_regret=train_loss,
                             val=val))
         states[int(epoch)] = {k: v.detach().cpu().clone()
                               for k, v in head.state_dict().items()}
-        log(f"      эпоха {epoch:3d}: train regret "
+        log(f"      эпоха {epoch:3d}: train objective "
             + ("—" if train_loss is None else f"{train_loss:.4e}")
             + f"; val hard RMS {val['rms']:.6f}, доля "
             f"{100 * (val['capture'] or 0):.1f} %, ранг 0 у "
@@ -770,19 +844,34 @@ def selftest():
         else:
             raise AssertionError(f"принято {bad}")
 
-    # --- ОТЛОЖЕННАЯ ЧАСТЬ ПО ЭПИЗОДАМ ------------------------------------
+    # --- ОТЛОЖЕННАЯ ЧАСТЬ: ПО ЭПИЗОДАМ, ВНУТРИ КАЖДОЙ ЗАДАЧИ ------------
+    # задача 0 — 18 эпизодов, задача 1 — 2 эпизода; глобальный выбор мог бы
+    # не дать задаче 1 ни одного отложенного эпизода
     eps = np.repeat(np.arange(20), 5)
-    fit_m, sel_m = episode_holdout(eps, 0.1, 0)
-    assert int(sel_m.sum()) == 10 and int(fit_m.sum()) == 90
+    tks = np.where(eps < 18, 0, 1)
+    fit_m, sel_m, info_h = episode_holdout(eps, tks, 0.1, 0)
     assert not set(eps[fit_m].tolist()) & set(eps[sel_m].tolist())
-    f2, s2 = episode_holdout(eps, 0.1, 0)
+    assert info_h[0]["episodes_holdout"] == 2, info_h
+    assert info_h[1]["episodes_holdout"] == 1, info_h
+    assert info_h[1]["episodes_fit"] == 1, info_h
+    assert sum(v["rows_holdout"] for v in info_h.values()) == int(sel_m.sum())
+    f2, s2, _i2 = episode_holdout(eps, tks, 0.1, 0)
     assert np.array_equal(s2, sel_m)                 # детерминированно
-    try:
-        episode_holdout(np.zeros(5), 0.1, 0)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("принят один эпизод")
+    for bad_ep, bad_tk in ((np.zeros(5), np.zeros(5)),        # один эпизод
+                           (np.array([0, 0, 1, 1]),
+                            np.array([0, 1, 0, 0]))):         # две задачи
+        try:
+            episode_holdout(bad_ep, bad_tk, 0.1, 0)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("принят негодный набор эпизодов")
+
+    # --- ПРИВЯЗКА НОМЕРОВ ЭПИЗОДОВ К ИСТОЧНИКУ СТРОК ---------------------
+    assert check_episode_binding("K", "K", "Q", "Q", "K") == []
+    assert check_episode_binding("K", "X", "Q", "Q", "K")
+    assert check_episode_binding("K", "K", "Q", "R", "K")
+    assert check_episode_binding("K", "K", "Q", "Q", "X")
 
     # --- ПОДМНОЖЕСТВО ВХОДОВ --------------------------------------------
     hf = np.arange(6 * 2 * 3, dtype=np.float32).reshape(6, 2, 3)
@@ -1002,6 +1091,9 @@ def main():
     ap.add_argument("--holdout-frac", type=float, default=0.1)
     ap.add_argument("--k11a-cache", default="data/k11a_joint12",
                     help="префикс кэша K-11a: из него номера эпизодов строк")
+    ap.add_argument("--q0", default="data/k14d/q0_b8_e0.npz",
+                    help="канонический q0: через его манифест номера "
+                         "эпизодов привязываются к источнику строк кэша")
     ap.add_argument("--out", default="data/k15c/selectors")
     ap.add_argument("--summary", default="")
     ap.add_argument("--overwrite", action="store_true")
@@ -1116,26 +1208,46 @@ def main():
     n_tr = len(tr["costs"])
     holdout = None
     if a.select_on == "train_holdout":
-        with open(f"{a.k11a_cache}.meta.json", encoding="utf-8") as fh:
-            meta11 = json.load(fh)
-        epi_all = np.asarray(np.load(meta11["cache"],
-                                     allow_pickle=True)["episode"])
+        epi_all, _stp_all, ep_prov = load_episodes(a.k11a_cache, a.q0, man)
         rows_tr = np.asarray(arr("train", "rows"))
         if int(rows_tr.max()) >= len(epi_all):
             raise SystemExit("строки train вне кэша K-11a")
         ep_tr = epi_all[rows_tr]
         ep_va = set(epi_all[rows_val].tolist())
-        fit_m, sel_m = episode_holdout(ep_tr, a.holdout_frac, a.seed)
-        holdout = dict(fit=np.flatnonzero(fit_m), sel=np.flatnonzero(sel_m),
-                       episodes_train=int(len(np.unique(ep_tr))),
-                       episodes_holdout=int(len(np.unique(ep_tr[sel_m]))),
-                       episodes_shared_with_val_sel=int(len(
-                           set(ep_tr.tolist()) & ep_va)))
-        print(f"  отбор эпохи — на ЭПИЗОДАХ train: отложено "
+        try:
+            fit_m, sel_m, per_task = episode_holdout(
+                ep_tr, tr["tasks"], a.holdout_frac, a.seed)
+        except ValueError as e:
+            raise SystemExit(f"отложенная часть: {e}")
+
+        def sha_of(x):
+            return hashlib.sha1(np.ascontiguousarray(
+                np.asarray(x, np.int64)).tobytes()).hexdigest()[:12]
+
+        holdout = dict(
+            fit=np.flatnonzero(fit_m), sel=np.flatnonzero(sel_m),
+            episodes_train=int(len(np.unique(ep_tr))),
+            episodes_holdout=int(len(np.unique(ep_tr[sel_m]))),
+            episodes_shared_with_val_sel=int(len(
+                set(ep_tr.tolist()) & ep_va)),
+            per_task=per_task, stratified_by="task",
+            fit_rows_sha1=sha_of(rows_tr[fit_m]),
+            holdout_rows_sha1=sha_of(rows_tr[sel_m]),
+            fit_episodes_sha1=sha_of(np.unique(ep_tr[fit_m])),
+            holdout_episodes_sha1=sha_of(np.unique(ep_tr[sel_m])),
+            episode_source=ep_prov)
+        print(f"  отбор эпохи — на ЭПИЗОДАХ train, по задачам: отложено "
               f"{holdout['episodes_holdout']} из "
               f"{holdout['episodes_train']} эпизодов, "
               f"{len(holdout['sel'])} строк; эпизодов, общих с val_sel: "
-              f"{holdout['episodes_shared_with_val_sel']}")
+              f"{holdout['episodes_shared_with_val_sel']}; источник "
+              f"эпизодов привязан (ключи {ep_prov['keys_sha1']})")
+        for t_, v_ in per_task.items():
+            nm_ = (man.get("task_vocab") or [])[t_] \
+                if t_ < len(man.get("task_vocab") or []) else t_
+            print(f"    задача {nm_}: эпизодов {v_['episodes_fit']} + "
+                  f"{v_['episodes_holdout']}, строк {v_['rows_fit']} + "
+                  f"{v_['rows_holdout']}")
     fit_idx = holdout["fit"] if holdout else np.arange(n_tr)
     d_fit = (tr["costs"] - tr["costs"][:, :1])[fit_idx][:, 1:]
     delta_scale = float(np.std(d_fit))
@@ -1143,8 +1255,10 @@ def main():
     print(f"  потеря {a.loss}" + ("" if a.loss == "regret" else
                                   f", масштаб Delta {delta_scale:.4e}"))
 
-    feat_mean = tr["feat"].mean((0, 1))
-    feat_std = tr["feat"].std((0, 1))
+    # СТАНДАРТИЗАЦИЯ ПРИЗНАКОВ — ТОЛЬКО ПО СТРОКАМ ОБУЧЕНИЯ: отложенная
+    # часть не должна влиять ни на что, кроме выбора эпохи.
+    feat_mean = tr["feat"][fit_idx].mean((0, 1))
+    feat_std = tr["feat"][fit_idx].std((0, 1))
     task_vocab = man.get("task_vocab")
     results = {}
     os.makedirs(a.out, exist_ok=True)
@@ -1286,7 +1400,8 @@ def main():
             technical=("; ".join(tech) if tech else None),
             trajectory=[dict(epoch=h["epoch"], rms=h["val"]["rms"],
                              capture=h["val"]["capture"],
-                             train_regret=h["train_regret"]) for h in hist])
+                             train_objective=h["train_objective"])
+                        for h in hist])
         v = val_eval
         if holdout:
             print(f"    отбор на эпизодах train: hard RMS "
@@ -1339,9 +1454,13 @@ def main():
                     "РАЗВЕДОЧНЫЙ порог: проверка вывода и только короткий "
                     "разведочный роллаут, архитектурного успеха это не "
                     "доказывает",
-        CODE_NONE: "ни одна h24-голова не взяла порогов на замороженном "
-                   "h24: кэш не пересобирать, следующая дешёвая голова — "
-                   "h24_positional",
+        CODE_NONE: ("ни одна h24-голова не взяла порогов на замороженном "
+                    "h24: кэш не пересобирать; "
+                    + ("следующая дешёвая голова — h24_positional"
+                       if "h24_positional" not in heads else
+                       "следующий шаг определяет диагностика кэша "
+                       "(k15c_cache_diagnostics.py), а не автоматически "
+                       "LoRA")),
         CODE_TECH: f"ни одной технически оценённой h24-головы: {technical}",
     }[code]
     if technical:

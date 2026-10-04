@@ -23,9 +23,11 @@
 
 2. ПЕРЕНОС РЕШЕНИЯ НА СОСЕДНИЕ КАДРЫ. Берётся лучший ранг кадра t и
    применяется к затратам кадра t+d того же эпизода, d = 1, 2, 4, 8.
-   Считаются RMS, доля оракульного запаса (и доля разрыва на val_sel), с
-   бутстрапом по ЭПИЗОДАМ и по задачам; совпадение лучшего ранга у
-   соседей — рядом, против случайного sum p^2.
+   Считаются RMS, доля оракульного запаса (и доля разрыва на val_sel) с
+   90 % интервалом бутстрапа по ЭПИЗОДАМ; по задачам — только точечные
+   значения, без интервалов. Совпадение лучшего ранга у соседей — рядом,
+   против случайной опоры ПО ТЕМ ЖЕ ПАРАМ: sum_j p_i(j) * p_j(j), где p_i
+   и p_j — распределения лучшего ранга у первых и вторых кадров пар.
 
    ЭТО НЕ ГЕЙТ ДЛЯ LoRA. Номер ранга у соседних кадров означает разные
    коды (порядок кандидатов меняется), чанки действий соседей сдвинуты и
@@ -89,17 +91,25 @@ def neighbour_pairs(episodes, steps, d):
 
 
 def transfer_metrics(costs, i, j):
-    """Лучший ранг кадра i, применённый к затратам кадра j."""
+    """Лучший ранг кадра i, применённый к затратам кадра j.
+
+    Случайная опора совпадения — ПО ЭТИМ ЖЕ ПАРАМ: произведение
+    распределений лучшего ранга у первых и у вторых кадров. Опора по всей
+    части была бы неверна для любого подмножества, маргинал которого
+    отличается от общего, — в частности для каждой задачи.
+    """
     c = np.asarray(costs, np.float64)
     best = c.argmin(1)
     cj = c[j]
     moved = cj[np.arange(len(j)), best[i]]
     r0, rt, ro = rms(cj[:, 0]), rms(moved), rms(cj.min(1))
-    p = np.bincount(best, minlength=c.shape[1]) / float(len(best))
+    k = c.shape[1]
+    pi = np.bincount(best[i], minlength=k) / float(len(i))
+    pj = np.bincount(best[j], minlength=k) / float(len(j))
     return dict(pairs=int(len(i)), rms_rank0=r0, rms_transfer=rt,
                 rms_oracle=ro, oracle_share=share(r0, ro, rt),
                 same_best_rank=float((best[i] == best[j]).mean()),
-                chance_same=float((p ** 2).sum()))
+                chance_same=float((pi * pj).sum()))
 
 
 def boot_by_episode(fn, episodes, n=N_BOOT, seed=BOOT_SEED):
@@ -118,6 +128,39 @@ def boot_by_episode(fn, episodes, n=N_BOOT, seed=BOOT_SEED):
     if not vals:
         return None
     return [float(np.percentile(vals, 5)), float(np.percentile(vals, 95))]
+
+
+def check_pair(summ, name, res, ck, ck_file_sha, man, man_sha,
+               allow_smoke=False):
+    """Пара «сводка — чекпойнт» принадлежит ЭТОМУ кэшу. Проблемы.
+
+    Старый, заменённый или технически отказавший чекпойнт иначе попал бы
+    в переоценку и дал бы правдоподобные числа.
+    """
+    p = []
+
+    def need(cond, msg):
+        if not cond:
+            p.append(msg)
+
+    need(summ.get("kind") == "k15c_selector_summary",
+         f"сводка вида {summ.get('kind')!r}")
+    need(summ.get("cache_manifest_sha1") == man_sha,
+         "сводка снята на другом кэше")
+    need(res.get("trained") is True, "голова не обучена")
+    need(not res.get("technical"),
+         f"технический отказ: {res.get('technical')}")
+    need(res.get("checkpoint_sha1") == ck_file_sha,
+         "файл чекпойнта не тот, что записан в сводке")
+    need(ck.get("kind") == "k15c_rank_selector",
+         f"чекпойнт вида {ck.get('kind')!r}")
+    need(ck.get("head") == name, f"в чекпойнте голова {ck.get('head')!r}")
+    need(ck.get("cache_manifest_sha1") == man_sha,
+         "чекпойнт обучен на другом кэше")
+    for key in ("c1_sha1", "reader_state_sha1"):
+        need(ck.get(key) == man.get(key), f"{key} чекпойнта не тот")
+    need(allow_smoke or not ck.get("smoke"), "smoke-чекпойнт")
+    return p
 
 
 def selftest():
@@ -156,6 +199,46 @@ def selftest():
     assert tn["oracle_share"] < 0.3, tn["oracle_share"]
     assert abs(tn["chance_same"] - 1 / 8) < 0.05
 
+    # СЛУЧАЙНАЯ ОПОРА — ПО САМИМ ПАРАМ, А НЕ ПО ВСЕЙ ЧАСТИ. В подмножестве
+    # лучший ранг всегда 0: совпадение 100 %, и опора обязана быть 100 %,
+    # хотя по всей части лучший ранг распределён иначе.
+    mixed = np.full((6, 8), 0.5)
+    mixed[[0, 1, 2], 0] = 0.1                         # подмножество: ранг 0
+    mixed[[3, 4, 5], 5] = 0.1                         # остальное: ранг 5
+    ts = transfer_metrics(mixed, np.array([0, 1]), np.array([1, 2]))
+    assert ts["same_best_rank"] == 1.0 and abs(ts["chance_same"]
+                                               - 1.0) < 1e-12, ts
+    tm2 = transfer_metrics(mixed, np.array([0, 3]), np.array([1, 4]))
+    assert abs(tm2["chance_same"] - 0.5) < 1e-12, tm2
+
+    # --- ПРИВЯЗКА ПАРЫ «СВОДКА — ЧЕКПОЙНТ» ------------------------------
+    man_t = dict(c1_sha1="C", reader_state_sha1="R")
+    summ_t = dict(kind="k15c_selector_summary", cache_manifest_sha1="M")
+    res_t = dict(trained=True, technical=None, checkpoint_sha1="F")
+    ck_t = dict(kind="k15c_rank_selector", head="h24_linear",
+                cache_manifest_sha1="M", c1_sha1="C", reader_state_sha1="R",
+                smoke=False)
+    assert check_pair(summ_t, "h24_linear", res_t, ck_t, "F", man_t,
+                      "M") == []
+    for why, kw in (
+            ("вид сводки", dict(summ=dict(summ_t, kind="иное"))),
+            ("сводка с другого кэша", dict(summ=dict(
+                summ_t, cache_manifest_sha1="X"))),
+            ("технический отказ", dict(res=dict(res_t, technical="x"))),
+            ("не обучена", dict(res=dict(res_t, trained=False))),
+            ("файл подменён", dict(file_sha="X")),
+            ("вид чекпойнта", dict(ck=dict(ck_t, kind="иное"))),
+            ("другая голова", dict(ck=dict(ck_t, head="h24_candidate"))),
+            ("чекпойнт с другого кэша", dict(ck=dict(
+                ck_t, cache_manifest_sha1="X"))),
+            ("другая книга", dict(ck=dict(ck_t, c1_sha1="X"))),
+            ("другой читатель", dict(ck=dict(ck_t, reader_state_sha1="X"))),
+            ("smoke", dict(ck=dict(ck_t, smoke=True)))):
+        got = check_pair(kw.get("summ", summ_t), "h24_linear",
+                         kw.get("res", res_t), kw.get("ck", ck_t),
+                         kw.get("file_sha", "F"), man_t, "M")
+        assert got, f"мутация «{why}» не поймана"
+
     # --- БУТСТРАП ПО ЭПИЗОДАМ ------------------------------------------
     ci = boot_by_episode(lambda idx: float(np.mean(idx)), epi, n=200)
     assert ci is not None and ci[0] <= ci[1]
@@ -172,6 +255,7 @@ def main():
     ap.add_argument("--cache", default="data/k15c/rank_cache")
     ap.add_argument("--c1", default="data/k15b/c1_selected.pt")
     ap.add_argument("--k11a-cache", default="data/k11a_joint12")
+    ap.add_argument("--q0", default="data/k14d/q0_b8_e0.npz")
     ap.add_argument("--summaries", nargs="*", default=None,
                     help="сводки тренера; по умолчанию все несмоук-сводки "
                          "reports/k15c/selector*_s0.json")
@@ -204,12 +288,10 @@ def main():
     arr, data, teacher_va = tr.load_features(a.cache, man, C1, torch, rs)
     va, trn = data["val_sel"], data["train"]
     dev = torch.device(a.device)
-    with open(f"{a.k11a_cache}.meta.json", encoding="utf-8") as fh:
-        m11 = json.load(fh)
-    d11 = np.load(m11["cache"], allow_pickle=True)
-    epi_all, stp_all = np.asarray(d11["episode"]), np.asarray(d11["step"])
+    # ТЕ ЖЕ ЭПИЗОДЫ И ТА ЖЕ ПРИВЯЗКА К ИСТОЧНИКУ СТРОК, ЧТО В ТРЕНЕРЕ.
+    epi_all, stp_all, ep_prov = tr.load_episodes(a.k11a_cache, a.q0, man)
     vocab = man.get("task_vocab") or []
-    out = dict(kind="k15c_cache_diagnostics",
+    out = dict(kind="k15c_cache_diagnostics", episode_source=ep_prov,
                cache_manifest_sha1=cb.sha_file(os.path.join(
                    a.cache, "manifest.json")), reevaluation={},
                neighbours={})
@@ -221,14 +303,27 @@ def main():
                                                 ".json")
                            if "_smoke" not in p)
     print(f"  сводок тренера: {len(summaries)}")
+    man_sha = cb.sha_file(os.path.join(a.cache, "manifest.json"))
+    out["rejected"] = {}
     for sp in summaries:
         summ = json.load(open(sp, encoding="utf-8"))
         for name, res in (summ.get("results") or {}).items():
-            if not res.get("trained") or not os.path.exists(
-                    res.get("checkpoint", "")):
+            key0 = f"{os.path.basename(sp)}:{name}"
+            ck_path = res.get("checkpoint") or ""
+            if not os.path.exists(ck_path):
+                why = ([f"технический отказ: {res.get('technical')}"]
+                       if res.get("technical") else []) + \
+                    ["нет файла чекпойнта"]
+                out["rejected"][key0] = why
+                print(f"  {key0}: НЕ ОЦЕНИВАЕТСЯ — {'; '.join(why)}")
                 continue
-            ck = torch.load(res["checkpoint"], map_location="cpu",
-                            weights_only=False)
+            ck = torch.load(ck_path, map_location="cpu", weights_only=False)
+            probs = check_pair(summ, name, res, ck, cb.sha_file(ck_path),
+                               man, man_sha, allow_smoke=a.allow_smoke)
+            if probs:
+                out["rejected"][key0] = probs
+                print(f"  {key0}: НЕ ОЦЕНИВАЕТСЯ — {'; '.join(probs)}")
+                continue
             states = ck.get("all_states") or {}
             last = max(states) if states else None
             src = "h18" if name.startswith("h18") else "h24"
