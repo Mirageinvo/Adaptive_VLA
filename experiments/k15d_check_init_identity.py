@@ -236,14 +236,20 @@ def main():
             loss, _ = dr.level_loss(o["actions"][lv], o["logits"][lv],
                                     act[:, :o["a0"].shape[1], :7],
                                     ref.loss_scale, H_EXEC)
+            ok(f"{tag}.loss_finite_{p}", bool(torch.isfinite(loss)),
+               f"{float(loss):.4e}")
             (loss * 1024.0).backward()
+            # Живой градиент — конечный и ненулевой: NaN и Inf прошли бы
+            # проверку «сумма не равна нулю».
             dead = [n for n, q in ref.named_parameters() if n in train
-                    and (q.grad is None or float(q.grad.abs().sum()) == 0.0)]
+                    and (q.grad is None
+                         or not bool(torch.isfinite(q.grad).all())
+                         or float(q.grad.abs().sum()) == 0.0)]
             leak = [n for n, q in ref.named_parameters() if n not in train
                     and q.grad is not None]
             mleak = sum(1 for q in model.parameters() if q.grad is not None)
             ok(f"{tag}.grad_{p}", not dead and not leak and not mleak,
-               f"без градиента {dead[:3]}, утечка {leak[:3]}, модель "
+               f"без конечного ненулевого градиента {dead[:3]}, утечка {leak[:3]}, модель "
                f"{mleak}")
             ref.zero_grad(set_to_none=True)
         ref.set_phase(None)

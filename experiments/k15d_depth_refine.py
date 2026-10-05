@@ -296,7 +296,7 @@ class DepthRefiner(nn.Module):
     # --- прямой проход ------------------------------------------------------
     def run(self, model, *, vlm_inputs_embeds, attention_mask, position_ids,
             decode, train_level=None, stop_after=None, fb_mode=None,
-            teacher=None, keep_hidden=False):
+            replace_prev=None, keep_hidden=False):
         """Один проход q0 -> уровни. Возвращает q0, a0 и действия уровней.
 
         train_level: уровень, по которому строится граф; всё до него идёт
@@ -304,8 +304,9 @@ class DepthRefiner(nn.Module):
         fb_mode: {уровень: "normal"|"zero"|"shuffle"} — диагностика
           причинности; shuffle подаёт в φ план соседней строки батча, база
           сложения и признаки головы остаются своими.
-        teacher: {уровень: чанк [B,T,7]} — предыдущий план уровня заменяется
-          демонстрацией целиком (база, φ, признаки).
+        replace_prev: {уровень: чанк [B,T,7]} — предыдущий план уровня
+          заменяется данным чанком целиком (база, φ, признаки головы);
+          диагностика подставляет туда демонстрацию.
         """
         if self._attached_to != id(model):
             raise RuntimeError("хуки LoRA не установлены на эту модель")
@@ -315,14 +316,14 @@ class DepthRefiner(nn.Module):
         if stop_after is None:
             stop_after = train_level if train_level is not None else names[-1]
         fb_mode = dict(fb_mode or {})
-        teacher = dict(teacher or {})
+        replace_prev = dict(replace_prev or {})
         for k, v in fb_mode.items():
             if k not in names or not (isinstance(v, torch.Tensor)
                                       or v in FB_MODES):
                 raise ValueError(f"fb_mode {k}={v!r}")
-        for k in teacher:
+        for k in replace_prev:
             if k not in names:
-                raise ValueError(f"teacher {k}")
+                raise ValueError(f"replace_prev {k}")
 
         batch = int(vlm_inputs_embeds.shape[0])
         device, dtype = vlm_inputs_embeds.device, vlm_inputs_embeds.dtype
@@ -374,8 +375,8 @@ class DepthRefiner(nn.Module):
         out["logit0"] = lg_prev
         for name, lo, hi in self.levels:
             grad = (name == train_level)
-            if teacher.get(name) is not None:
-                prev = teacher[name].float().to(device)
+            if replace_prev.get(name) is not None:
+                prev = replace_prev[name].float().to(device)
                 lg_prev = grip_logit(prev[:, :self.h_exec, 6])
             with (torch.enable_grad() if grad else torch.no_grad()):
                 mode = fb_mode.get(name, "normal")
@@ -801,7 +802,7 @@ def selftest():
                 o_z2 = ref.run(m, decode=decode, fb_mode={"2": "zero"}, **x)
                 assert torch.equal(o_z2["actions"]["1"], o_f["actions"]["1"])
                 tch = o_f["a0"] * 0.5
-                o_t = ref.run(m, decode=decode, teacher={"2": tch}, **x)
+                o_t = ref.run(m, decode=decode, replace_prev={"2": tch}, **x)
                 assert not torch.equal(o_t["actions"]["2"],
                                        o_f["actions"]["2"])
                 assert torch.equal(o_t["actions"]["1"], o_f["actions"]["1"])

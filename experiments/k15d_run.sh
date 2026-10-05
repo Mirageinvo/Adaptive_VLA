@@ -42,6 +42,20 @@ if [ -n "$TRACKED" ]; then
     exit 1
 fi
 HEAD_SHA="$(git rev-parse --short HEAD 2>/dev/null)"
+HEAD_FULL="$(git rev-parse HEAD 2>/dev/null)"
+GATE_JSON="${REP}/init_identity.json"
+
+gate_run_id() {
+    python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_id"])' \
+        "$GATE_JSON" 2>/dev/null
+}
+
+# Маркер check: коммит, сид, карта и запуск гейта. full по чужому маркеру
+# (другой сид, другая карта, переснятый гейт) не стартует.
+check_marker() {
+    printf 'commit=%s seed=%s device=%s gate_run_id=%s\n' \
+        "$HEAD_FULL" "$SEED" "$DEVICE" "$(gate_run_id)"
+}
 
 stage() { echo; echo "=== $* — $(date '+%H:%M:%S') ==="; }
 
@@ -90,13 +104,18 @@ do_check() {
     run_one smoke_h1p2 $T --phase h1p2 --mode smoke \
         --phase1 "data/k15d/h1p1_s${SEED}_smoke.pt" --allow-smoke-phase1 \
         || return 1
-    printf '%s\n' "$HEAD_SHA" > "${CODES}/check_passed"
-    echo "  CHECK ПРОЙДЕН в коммите $HEAD_SHA"
+    check_marker > "${CODES}/check_passed"
+    echo "  CHECK ПРОЙДЕН: $(cat "${CODES}/check_passed")"
 }
 
 do_full() {
-    if [ "$(cat "${CODES}/check_passed" 2>/dev/null)" != "$HEAD_SHA" ]; then
-        echo "ОТКАЗ: check не пройден в коммите $HEAD_SHA" >&2
+    local want got
+    want="$(check_marker)"
+    got="$(cat "${CODES}/check_passed" 2>/dev/null)"
+    if [ "$got" != "$want" ]; then
+        echo "ОТКАЗ: check не пройден в этой обстановке" >&2
+        echo "  маркер: ${got:-нет}" >&2
+        echo "  нужно:  $want" >&2
         return 1
     fi
     stage "4. полная эпоха d0"
@@ -105,17 +124,30 @@ do_full() {
     stage "5. полная эпоха h1p1"
     run_one full_h1p1 $T --phase h1p1 --mode full
     local c_p1=$?
+    local c_p2=3
     if [ "$c_p1" -ne 0 ] && [ "$c_p1" -ne 4 ]; then
         echo "  h1p1: технический отказ, h1p2 не запускается"
-        return 1
+    else
+        stage "6. полная эпоха h1p2"
+        run_one full_h1p2 $T --phase h1p2 --mode full \
+            --phase1 "data/k15d/h1p1_s${SEED}.pt"
+        c_p2=$?
     fi
-    stage "6. полная эпоха h1p2"
-    run_one full_h1p2 $T --phase h1p2 --mode full \
-        --phase1 "data/k15d/h1p1_s${SEED}.pt"
-    local c_p2=$?
     echo
     echo "  коды: d0 $c_d0, h1p1 $c_p1, h1p2 $c_p2 (0 — допущен к роллауту," \
-         "4 — исправен, но не допущен, 3 — технический отказ)"
+         "4 — исправен, но не допущен, иное — технический отказ)"
+    # ИТОГ ПО ФИНАЛЬНЫМ ВАРИАНТАМ (D0 и H1p2): 0 — хотя бы один допущен;
+    # 4 — оба технически исправны, ни один не допущен; 3 — технический
+    # отказ без допущенного финального варианта.
+    if [ "$c_d0" -eq 0 ] || [ "$c_p2" -eq 0 ]; then
+        echo "  ИТОГ: есть допущенный финальный вариант"
+        return 0
+    elif [ "$c_d0" -eq 4 ] && [ "$c_p2" -eq 4 ]; then
+        echo "  ИТОГ: оба финальных варианта исправны, ни один не допущен"
+        return 4
+    fi
+    echo "  ИТОГ: технический отказ, допущенного финального варианта нет"
+    return 3
 }
 
 echo "=== K-15d $WHAT: старт $(date), карта $DEVICE, сид $SEED, коммит" \

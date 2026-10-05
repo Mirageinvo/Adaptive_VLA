@@ -183,6 +183,10 @@ def main():
     tag_run = f"{a.phase}_s{a.seed}{suffix}"
     out = a.out or f"data/k15d/{tag_run}.pt"
     report = a.report or f"reports/k15d/{tag_run}.json"
+    rows_npz = os.path.splitext(report)[0] + "_rows.npz"
+    partial, validating = out + ".partial", out + ".validating"
+    run_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + \
+        f"-{os.getpid()}"
     t_start = time.time()
 
     ctx = k15_context.build(a)
@@ -197,13 +201,22 @@ def main():
         device=str(dev), compute_dtype=a.dtype, code=kg.code_shas(),
         architecture_code_version=ctx.code_version,
         joint_sha1=ctx.joint_sha, plan_sha1=ctx.q0_prov["plan_sha1"],
-        frozen_sha1=frozen0, stats_sha1=stats["sha1"], hp=dict(dr.HP)))
+        frozen_sha1=frozen0, stats_sha1=stats["sha1"], hp=dict(dr.HP),
+        seed=int(a.seed)))
     print(f"  гейт K-15d {gate['run_id']} сверен; статистика "
           f"{stats['sha1']}, замороженное {frozen0}")
 
     variant = dr.PHASE_VARIANT[a.phase]
     names_eval, lv = eval_levels(a.phase)
     ref, n_hooks = dr.make_refiner(ctx, variant, stats, a.seed)
+    # Начальное состояние обязано быть тем, что аттестовал гейт: тот же
+    # сид гейта ещё не гарантирует ту же инициализацию.
+    init_sha = dr.state_sha(ref)
+    want_init = ((gate.get("variants") or {}).get(variant) or {}).get(
+        "init_state_sha1")
+    if init_sha != want_init:
+        raise SystemExit(f"начальное состояние {variant} {init_sha}, гейт "
+                         f"аттестовал {want_init}")
     phase1_prov = None
     if a.phase == "h1p2":
         p1 = torch.load(a.phase1, map_location="cpu", weights_only=False)
@@ -215,11 +228,15 @@ def main():
             problems.append(f"режим фазы 1 {p1.get('mode')}")
         for key, want in (("stats_sha1", stats["sha1"]),
                           ("frozen_sha1", frozen0),
-                          ("gate_run_id", gate["run_id"])):
+                          ("gate_run_id", gate["run_id"]),
+                          ("seed", int(a.seed)),
+                          ("status", "complete"),
+                          ("final", True),
+                          ("technical_ok", True)):
             if p1.get(key) != want:
-                problems.append(f"{key}: {p1.get(key)} против {want}")
-        if p1.get("technical_ok") is not True:
-            problems.append("фаза 1 технически не исправна")
+                problems.append(f"{key}: {p1.get(key)!r} против {want!r}")
+        if not p1.get("selected_tag") or not p1.get("selected_level_sha1"):
+            problems.append("нет выбранной точки фазы 1")
         if problems:
             raise SystemExit("чекпойнт h1p1 не подходит: "
                              + "; ".join(problems))
@@ -231,7 +248,7 @@ def main():
         lv1_names = {n for n, _ in ref.phase_named_parameters("h1p1")}
         if dr.state_sha(ref, lv1_names) != p1["selected_level_sha1"]:
             raise SystemExit("уровень 1 загрузился не тем")
-        phase1_prov = dict(file=a.phase1,
+        phase1_prov = dict(file=a.phase1, run_id=p1.get("run_id"),
                            file_sha1=ctx.k11a.file_sha1(a.phase1),
                            selected=p1["selected_tag"],
                            level_sha1=p1["selected_level_sha1"],
@@ -268,6 +285,8 @@ def main():
     q0_dev = torch.as_tensor(np.asarray(ctx.q0_can), device=dev)
     ac16 = torch.autocast(device_type=dev.type, dtype=ctx.dt)
     tasks_all = np.asarray(ctx.tsk)
+    epi = getattr(ctx, "epi", None)
+    epi = None if epi is None else np.asarray(epi)
     act_p99 = np.asarray(ctx.act_p99_dataset, np.float64)
 
     def target(sel):
@@ -359,27 +378,38 @@ def main():
                 n_rows += len(sel)
             if diagnostics:
                 nb = len(batches)
-                for mode in ("zero", "foreign") + (
-                        ("teacher",) if a.phase == "h1p2" else ()):
+                same_ep = []
+                for mode in ("zero", "far_batch") + (
+                        ("ground_truth_prev",) if a.phase == "h1p2"
+                        else ()):
                     s_, n_ = 0.0, 0
                     for i, (po, sel) in enumerate(batches):
                         kw = {}
                         if mode == "zero":
                             kw["fb_mode"] = {lv: "zero"}
-                        elif mode == "foreign":
-                            # план далёкого батча: другой эпизод, не сосед
-                            other = prev_plans[(i + nb // 2) % nb]
-                            if other.shape[0] != len(sel):
-                                idx = torch.arange(len(sel)) % other.shape[0]
-                                other = other[idx]
+                        elif mode == "far_batch":
+                            # План батча через половину списка. Другой
+                            # эпизод не гарантирован — доля строк с тем же
+                            # эпизодом измеряется и пишется в отчёт.
+                            j = (i + nb // 2) % nb
+                            other = prev_plans[j]
+                            o_sel = np.asarray(batches[j][1], np.int64)
+                            idx = np.arange(len(sel)) % other.shape[0]
+                            other = other[torch.as_tensor(idx)]
+                            if epi is not None:
+                                same_ep.append(epi[np.asarray(sel, np.int64)]
+                                               == epi[o_sel[idx]])
                             kw["fb_mode"] = {lv: other.to(dev)}
                         else:
-                            kw["teacher"] = {"2": target(sel)}
+                            kw["replace_prev"] = {"2": target(sel)}
                         o = forward(po, sel, stop_after=lv, **kw)
                         r = row_err(o["actions"][lv], target(sel))
                         s_ += float(r.sum())
                         n_ += len(sel)
                     diag[mode] = float(np.sqrt(s_ / max(n_, 1)))
+                diag["far_batch_same_episode_share"] = (
+                    float(np.concatenate(same_ep).mean()) if same_ep
+                    else None)
         n = max(n_rows, 1)
         rms = {k: float(np.sqrt(acc[k]["sum"] / n)) for k in keys}
         res = dict(
@@ -407,9 +437,10 @@ def main():
         if diagnostics:
             res["diagnostics"] = dict(
                 level=lv, normal=rms[lv], **diag,
-                note="обнуление/чужой план — вход φ уровня; teacher — "
-                     "демонстрация вместо a1 целиком. Для отбора не "
-                     "используются")
+                note="zero/far_batch — вход φ уровня (обнулён / план "
+                     "далёкого батча); ground_truth_prev — демонстрация "
+                     "вместо a1 целиком (база, φ, признаки головы). Для "
+                     "отбора не используются")
         if keep_rows:
             res["_rows"] = {k: np.concatenate(v) for k, v in
                             rows_out.items()}
@@ -432,6 +463,17 @@ def main():
 
     def group_of(n):
         return n.split(".", 1)[0]
+
+    # ПОВТОРНЫЙ ЗАПУСК АРХИВИРУЕТ ВСЕ ФАЙЛЫ ПРОГОНА СОГЛАСОВАННО. Иначе после
+    # падения рядом лежали бы старый завершённый отчёт и новый чекпойнт.
+    # Канонический .pt появляется только в самом конце и служит маркером
+    # завершения; снапшоты пишутся в .partial.
+    # АРХИВИРУЕТСЯ ПОСЛЕ ВСЕХ ПРОВЕРОК ПРЕДУСЛОВИЙ: отказавший запуск (чужой
+    # сид, негодная фаза 1) не должен убирать прежний исправный результат.
+    for f_ in (out, report, rows_npz, partial, validating):
+        if os.path.exists(f_):
+            os.replace(f_, f"{f_}.{run_id}.bak")
+            print(f"  прежний {f_} -> .{run_id}.bak")
 
     # --- нулевая точка: уровень обязан совпасть со своим входом -------------
     technical = {}
@@ -500,13 +542,17 @@ def main():
                 all(abs(m["rms"][k] - m["rms"]["a0"]) == 0.0
                     for k in names_eval) if a.phase != "h1p2" else
                 m["rms"]["2"] == m["rms"]["1"])
-        save_checkpoint(final=False)
+        save_checkpoint(partial, "partial")
 
-    def save_checkpoint(final, selected=None, adm=None, extra=None):
-        os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    def save_checkpoint(path, status, selected=None, adm=None, extra=None):
+        """status: partial (снапшоты), validating (до проверки загрузки),
+        complete (канонический файл, пишется последним)."""
+        assert status in ("partial", "validating", "complete")
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         obj = dict(
             kind=KIND, phase=a.phase, variant=variant, mode=a.mode,
-            seed=int(a.seed), final=bool(final),
+            seed=int(a.seed), status=status, run_id=run_id,
+            final=(status == "complete"),
             refiner=ref.export(), states=states,
             history=[dict(h, metrics={k: v for k, v in h["metrics"].items()
                                       if not k.startswith("_")})
@@ -518,9 +564,9 @@ def main():
             admission=adm)
         if selected is not None and a.phase in ("h1p1", "h1p2", "d0"):
             obj["selected_level_sha1"] = dr.state_sha(ref, set(train_names))
-        tmp = out + ".tmp"
+        tmp = path + ".tmp"
         torch.save(obj, tmp)
-        os.replace(tmp, out)
+        os.replace(tmp, path)
 
     # --- обучение ----------------------------------------------------------
     report_every = int(a.report_every)
@@ -651,9 +697,12 @@ def main():
         print_metrics(f"{sel_tag}, повтор", final)
         dg = final["diagnostics"]
         print(f"  причинность ({lv}): обычный {dg['normal']:.6f}, обнулённый"
-              f" φ {dg['zero']:.6f}, чужой план {dg['foreign']:.6f}"
-              + (f", teacher a1 {dg['teacher']:.6f}" if "teacher" in dg
-                 else "") + f" ({time.time() - t_d:.0f} с)")
+              f" φ {dg['zero']:.6f}, план далёкого батча "
+              f"{dg['far_batch']:.6f} (тот же эпизод у "
+              f"{dg['far_batch_same_episode_share']} строк)"
+              + (f", демонстрация вместо a1 {dg['ground_truth_prev']:.6f}"
+                 if "ground_truth_prev" in dg else "")
+              + f" ({time.time() - t_d:.0f} с)")
         rec = [h for h in history if h["tag"] == sel_tag][0]["metrics"]
         rel = abs(final["rms"][lv] - rec["rms"][lv]) / max(rec["rms"][lv],
                                                            1e-12)
@@ -673,7 +722,6 @@ def main():
                 max(final["absmax"][k]) <= ADMIT["clip_bound"]
                 for k in names_eval))
         adm = admission(final, lv, act_p99, smoke=(a.mode != "full"))
-        rows_npz = os.path.splitext(report)[0] + "_rows.npz"
         os.makedirs(os.path.dirname(os.path.abspath(rows_npz)),
                     exist_ok=True)
         val_rows = np.concatenate([np.asarray(s, np.int64)
@@ -688,10 +736,11 @@ def main():
                    selected_tag=sel_tag, selected_state_sha1=sel_sha,
                    final=final, admission=adm, rows_file=rows_npz)
         # сохранение и загрузка: чекпойнт с диска воспроизводит выход
-        technical_ok_pre = all(technical.values())
-        save_checkpoint(final=True, selected=sel_tag, adm=adm,
-                        extra=dict(technical_ok=technical_ok_pre))
-        obj = torch.load(out, map_location="cpu", weights_only=False)
+        # Проверочный файл — под отдельным именем со статусом validating:
+        # канонический появится только после всех проверок.
+        save_checkpoint(validating, "validating", selected=sel_tag, adm=adm,
+                        extra=dict(technical_ok=None))
+        obj = torch.load(validating, map_location="cpu", weights_only=False)
         with torch.no_grad():
             o_mem = forward(po0, sel0, stop_after=lv)
         ref.detach_hooks()
@@ -720,17 +769,24 @@ def main():
     elif a.mode == "full" and not adm["admissible"]:
         code = 4
     rep["exit_code"] = code
-    if a.mode == "overfit":
-        save_checkpoint(final=True, extra=dict(technical_ok=technical_ok))
-    else:
-        save_checkpoint(final=True, selected=rep["selected_tag"], adm=adm,
-                        extra=dict(technical_ok=technical_ok))
+    rep["run_id"] = run_id
     os.makedirs(os.path.dirname(os.path.abspath(report)), exist_ok=True)
     tmp = report + ".tmp"
     with open(tmp, "w") as f:
         json.dump(rep, f, indent=1, ensure_ascii=False,
                   default=k15t.json_scalar)
     os.replace(tmp, report)
+    # КАНОНИЧЕСКИЙ ЧЕКПОЙНТ — ПОСЛЕДНИМ: его наличие и есть маркер
+    # завершённого прогона, отчёт с тем же run_id уже лежит рядом.
+    if a.mode == "overfit":
+        save_checkpoint(out, "complete",
+                        extra=dict(technical_ok=technical_ok))
+    else:
+        save_checkpoint(out, "complete", selected=rep["selected_tag"],
+                        adm=adm, extra=dict(technical_ok=technical_ok))
+    for f_ in (partial, validating):
+        if os.path.exists(f_):
+            os.remove(f_)
     bad = [k for k, v in technical.items() if not v]
     print(f"ИТОГ {a.phase}/{a.mode}: технически "
           f"{'исправно' if technical_ok else 'ОТКАЗ ' + str(bad)}; код "
@@ -818,6 +874,7 @@ def _fake_ctx(n_rows=200, seed=0):
     tr = [(0, rows[i:i + 8]) for i in range(0, 160, 8)]
     va = [(0, rows[i:i + 8]) for i in range(160, n_rows, 8)]
     tasks = np.array([f"task{i % 3}" for i in range(n_rows)])
+    epi = rows // 10
 
     def build_batch(po, sel):
         return dict(v=X[np.asarray(sel)], attention_mask=torch.ones(
@@ -829,7 +886,8 @@ def _fake_ctx(n_rows=200, seed=0):
                                    val_confirm=[(0, rows[:8])]),
         ACT=act.astype(np.float32), act_p99_dataset=np.percentile(
             np.abs(act[:, :8]).reshape(-1, 7), 99, axis=0),
-        decode_fp32=decode, tsk=tasks, weights_gate=torch.ones(7),
+        decode_fp32=decode, tsk=tasks, epi=epi,
+        weights_gate=torch.ones(7),
         build_batch=build_batch, gate_info=dict(init_gate="fake"),
         git_head="fake", dirty=False, q0_prov=dict(plan_sha1="fakeplan"),
         code_version=dict(fake=1), joint_sha="fakejoint",
@@ -841,6 +899,7 @@ def _fake_ctx(n_rows=200, seed=0):
 def integration():
     """Реальные main() гейта и тренера на игрушечной среде, CPU."""
     import tempfile
+    import torch
     global REF_Q0_VAL_RMS
     saved = (k15_context.build, REF_Q0_VAL_RMS, sys.argv)
     ctx = _fake_ctx()
@@ -884,11 +943,43 @@ def integration():
                 run("h1p2", "full", ["--phase1",
                                      os.path.join(td, "h1p1_smoke.pt")])
                 codes["h1p2_from_smoke_refused"] = 1
-            except SystemExit:
-                codes["h1p2_from_smoke_refused"] = 0
+            except SystemExit as e:
+                codes["h1p2_from_smoke_refused"] = 0 if 'режим фазы 1' in str(e) else str(e)
+            # чужой сид: гейт снят с seed 0
+            try:
+                run("d0", "smoke", ["--seed", "1"])
+                codes["seed_mismatch_refused"] = 1
+            except SystemExit as e:
+                codes["seed_mismatch_refused"] = 0 if 'seed' in str(e) else str(e)
+            # h1p2 от незавершённой фазы 1
+            p1f = os.path.join(td, "h1p1_full.pt")
+            ck = torch.load(p1f, map_location="cpu", weights_only=False)
+            bad = os.path.join(td, "h1p1_partial.pt")
+            torch.save(dict(ck, status="partial", final=False), bad)
+            try:
+                run("h1p2", "smoke", ["--phase1", bad,
+                                      "--allow-smoke-phase1"])
+                codes["partial_phase1_refused"] = 1
+            except SystemExit as e:
+                codes["partial_phase1_refused"] = 0 if 'status' in str(e) else str(e)
+            # повтор архивирует прежние файлы прогона
+            codes["rerun_d0"] = run("d0", "smoke")
+            baks = [f for f in os.listdir(td) if f.startswith("d0_smoke")
+                    and f.endswith(".bak")]
+            codes["rerun_archived"] = 0 if len(baks) >= 3 else 1
             rep2 = json.load(open(os.path.join(td, "h1p2_full.json")))
             dg = rep2["final"]["diagnostics"]
-            assert {"normal", "zero", "foreign", "teacher"} <= set(dg)
+            assert {"normal", "zero", "far_batch",
+                    "ground_truth_prev"} <= set(dg)
+            assert dg["far_batch_same_episode_share"] is not None
+            ck = torch.load(os.path.join(td, "h1p2_full.pt"),
+                            map_location="cpu", weights_only=False)
+            assert ck["status"] == "complete" and ck["final"] is True
+            assert ck["run_id"] == rep2["run_id"]
+            assert not os.path.exists(os.path.join(td, "h1p2_full.pt")
+                                      + ".partial")
+            assert not os.path.exists(os.path.join(td, "h1p2_full.pt")
+                                      + ".validating")
             assert rep2["phase1"]["selected"] is not None
             assert os.path.exists(rep2["rows_file"])
     finally:
@@ -896,7 +987,8 @@ def integration():
     print("  коды:", codes)
     for k in ("gate", "overfit_d0", "overfit_h1p1", "overfit_h1p2",
               "smoke_d0", "smoke_h1p1", "smoke_h1p2",
-              "h1p2_from_smoke_refused"):
+              "h1p2_from_smoke_refused", "seed_mismatch_refused",
+              "partial_phase1_refused", "rerun_d0", "rerun_archived"):
         assert codes[k] == 0, (k, codes[k])
     for k in ("full_h1p1", "full_h1p2"):
         assert codes[k] in (0, 4), (k, codes[k])
