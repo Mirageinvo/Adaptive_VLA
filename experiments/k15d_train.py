@@ -519,12 +519,16 @@ def main():
     skipped = 0
     run_stats = dict(loss=0.0, arm=0.0, grip=0.0, r_lv=0.0, r0=0.0, n=0)
     t0 = time.time()
+    # Время оценок на val вычитается из скорости шага: иначе в smoke две
+    # оценки на 100 шагов раздували «с/шаг» в 1.6 раза.
+    eval_time = [0.0]
 
     def snapshot(step):
         tag = f"step{step:06d}"
         t_e = time.time()
         m = evaluate(val_b)
         print_metrics(tag, m)
+        eval_time[0] += time.time() - t_e
         print(f"    оценка {time.time() - t_e:.0f} с")
         states[tag] = phase_state()
         history.append(dict(tag=tag, step=step, metrics=m,
@@ -616,8 +620,12 @@ def main():
             run_stats["n"] += 1
         if (step + 1) % report_every == 0 or step + 1 == total:
             k_ = max(run_stats["n"], 1)
-            el = time.time() - t0
-            eta = el / (step + 1) * (total - step - 1)
+            el = time.time() - t0 - eval_time[0]
+            n_left_snaps = sum(1 for s_ in snaps if s_ > step)
+            per_eval = eval_time[0] / max(sum(1 for s_ in snaps
+                                              if s_ <= step), 1)
+            eta = el / (step + 1) * (total - step - 1) \
+                + per_eval * n_left_snaps
             print(f"  шаг {step + 1}/{total}: потеря "
                   f"{run_stats['loss'] / k_:.4f} (рука "
                   f"{run_stats['arm'] / k_:.4f}, схват "
@@ -627,7 +635,9 @@ def main():
                   + ", ".join(f"{g} {last_grad[g]:.2e}" for g in GROUPS)
                   + f"; clip {float(gn):.2e}; lr {sched.get_last_lr()[0]:.2e}"
                   f"; scale {scaler.get_scale():.0f}, пропусков {skipped}; "
-                  f"{el / (step + 1):.2f} с/шаг, осталось {eta / 60:.0f} мин",
+                  f"{el / (step + 1):.2f} с/шаг без оценок (оценки "
+                  f"{eval_time[0] / 60:.0f} мин), осталось "
+                  f"~{eta / 60:.0f} мин",
                   flush=True)
             run_stats = {k: 0.0 for k in run_stats}
             run_stats["n"] = 0
