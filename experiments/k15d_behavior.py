@@ -42,6 +42,7 @@ CATASTROPHE = -0.15
 MODES = dict(safety=dict(tasks=[8, 9], states=list(range(25))),
              dev=dict(tasks=list(range(10)), states=list(range(25))),
              confirm=dict(tasks=list(range(8)), states=list(range(25))),
+             final=dict(tasks=list(range(10)), states=list(range(25, 50))),
              target=dict(tasks=None, states=list(range(25))))
 # ПОДТВЕРЖДАЮЩЕЕ ПРАВИЛО, ЗАФИКСИРОВАННОЕ ДО РОЛЛАУТОВ (07.10.2026).
 # Гипотеза «h18 лучше q0» родилась на safety (задачи 8-9, состояния 0-24),
@@ -56,27 +57,37 @@ CONFIRM = dict(base="q0", cand="h18", tasks=list(range(8)),
                rule="ci90_lo > 0", registered="07.10.2026, до роллаутов",
                # параметры бутстрапа K-14q, сверяются с ним при анализе
                n_boot=10000, boot_seed=53, quantiles=[5, 95])
+# ФИНАЛЬНАЯ ПРОВЕРКА, ЗАФИКСИРОВАННАЯ ДО РОЛЛАУТОВ (07.10.2026). Открывается
+# только после пройденного confirm, на замороженном h18 (чекпойнт
+# h1p1_s0.pt) и финальном банке K-14q: задачи 0-9, состояния 25-49, 250
+# кластеров. Пара, вес задач, бутстрап и правило — те же, что в confirm.
+FINAL = dict(CONFIRM, tasks=list(range(10)), states=list(range(25, 50)),
+             requires="пройденный confirm с тем же исполнением h18",
+             registered="07.10.2026, до роллаутов")
+RULES = dict(confirm=CONFIRM, final=FINAL)
 
 
-def check_confirm_args(*, allow_partial, boot, arms, tasks, kb_consts):
-    """confirm не допускает ни одного ручного отступления от правила."""
+def check_confirm_args(*, allow_partial, boot, arms, tasks, kb_consts,
+                       rule=CONFIRM):
+    """confirm и final не допускают ни одного ручного отступления."""
+    R = rule
     p = []
     if allow_partial:
         p.append("confirm запрещает --allow-partial")
-    if int(boot) != CONFIRM["n_boot"]:
-        p.append(f"confirm требует {CONFIRM['n_boot']} бутстрап-реплик, "
+    if int(boot) != R["n_boot"]:
+        p.append(f"confirm требует {R['n_boot']} бутстрап-реплик, "
                  f"дано {boot}")
-    if list(arms) != [CONFIRM["base"], CONFIRM["cand"]]:
-        p.append(f"confirm требует ровно {CONFIRM['base']},"
-                 f"{CONFIRM['cand']}, дано {list(arms)}")
+    if list(arms) != [R["base"], R["cand"]]:
+        p.append(f"confirm требует ровно {R['base']},"
+                 f"{R['cand']}, дано {list(arms)}")
     if tasks:
         p.append("--tasks в confirm запрещён: задачи фиксированы правилом")
     for k, v in (("n_boot", kb_consts.get("n_boot")),
                  ("boot_seed", kb_consts.get("boot_seed")),
                  ("quantiles", kb_consts.get("quantiles"))):
-        if v != CONFIRM[k]:
+        if v != R[k]:
             p.append(f"бутстрап K-14q изменился: {k} {v!r}, правило "
-                     f"{CONFIRM[k]!r}")
+                     f"{R[k]!r}")
     return p
 SEEDS = [101]
 ARMS = ("q0", "d0", "h18", "h1")
@@ -111,7 +122,7 @@ ARM_SPEC = {
     "h1":  dict(policy="k15d", phase="h1p2", layers_per_call=24, level="2"),
 }
 # Набор задач, в котором определены safety, confirm и dev.
-MODE_SUITE = dict(safety="10", dev="10", confirm="10")
+MODE_SUITE = dict(safety="10", dev="10", confirm="10", final="10")
 
 
 def check_arm_spec(d, arm):
@@ -265,8 +276,8 @@ def main():
     obs, meta = kb.load(a.arts)
     arms = parse_arms(a.expected_arms)
     tasks = [int(x) for x in a.tasks.split(",") if x.strip()]
-    if a.mode == "confirm":
-        problems = check_confirm_args(
+    if a.mode in RULES:
+        problems = check_confirm_args(rule=RULES[a.mode],
             allow_partial=a.allow_partial, boot=a.boot, arms=arms,
             tasks=tasks, kb_consts=dict(n_boot=kb.N_BOOT,
                                         boot_seed=kb.BOOT_SEED,
@@ -299,7 +310,7 @@ def main():
                                  f"{d_.get('suite')!r}, режим {a.mode} "
                                  f"определён на {want_suite}")
         technical += check_actions_npz(meta[nm]["files"])
-    if a.mode == "confirm" and not {CONFIRM["base"], CONFIRM["cand"]} \
+    if a.mode in RULES and not {CONFIRM["base"], CONFIRM["cand"]} \
             <= set(arms):
         technical.append(f"в confirm нет первичной пары {CONFIRM['base']}, "
                          f"{CONFIRM['cand']}")
@@ -345,7 +356,7 @@ def main():
             sr_cand=kb.point(sr[c], clusters), delta=kb.point(d, clusters),
             ci90_delta=ci["delta"], rescue=kb.point(res, clusters),
             harm=kb.point(hrm, clusters), per_task=per_task)
-    if a.mode == "confirm":
+    if a.mode in RULES:
         prim = pairs.get(f"{CONFIRM['cand']}_vs_{CONFIRM['base']}")
         if prim is None:
             verdict = dict(code=3, outcome="нет первичной пары")
@@ -393,7 +404,7 @@ def main():
                partial=bool(a.allow_partial),
                thresholds=dict(catastrophe=CATASTROPHE,
                                declared="план K-15d §13, до данных"),
-               confirm_rule=(CONFIRM if a.mode == "confirm" else None))
+               confirm_rule=RULES.get(a.mode))
     os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".",
                 exist_ok=True)
     tmp = a.out + f".tmp.{os.getpid()}"
@@ -414,7 +425,17 @@ def selftest():
     except SystemExit:
         pass
     assert len(expected_clusters("confirm")) == 200
+    assert len(expected_clusters("final")) == 250
+    assert set(expected_clusters("final")).isdisjoint(
+        expected_clusters("dev"))
+    assert FINAL["base"] == "q0" and FINAL["cand"] == "h18"
     kbc = dict(n_boot=10000, boot_seed=53, quantiles=[5, 95])
+    assert check_confirm_args(allow_partial=False, boot=10000,
+                              arms=["q0", "h18"], tasks=[], kb_consts=kbc,
+                              rule=FINAL) == []
+    assert check_confirm_args(allow_partial=True, boot=10000,
+                              arms=["q0", "h18"], tasks=[], kb_consts=kbc,
+                              rule=FINAL)
     ok_args = dict(allow_partial=False, boot=10000, arms=["q0", "h18"],
                    tasks=[], kb_consts=kbc)
     assert check_confirm_args(**ok_args) == []

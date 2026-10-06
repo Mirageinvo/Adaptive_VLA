@@ -25,7 +25,15 @@
 #   confirm ПОДТВЕРЖДЕНИЕ гипотезы «h18 лучше q0»: только руки q0 и h18,
 #           задачи 0-7 набора 10, 200 НЕ виденных кластеров. Правило
 #           зафиксировано в k15d_behavior.CONFIRM до роллаутов;
-#   dev     задачи 0-9 набора 10, 250 кластеров (абляции и описание).
+#   ablate  АБЛЯЦИИ: руки d0 и h1 на задачах 0-7 набора 10 (состояния
+#           0-24), затем СВОДНЫЙ dev-анализ четырёх рук на 250 кластерах из
+#           трёх каталогов: q0/h18 задач 0-7 — из confirm, все руки задач
+#           8-9 — из safety, d0/h1 задач 0-7 — отсюда. Раскатки
+#           детерминированы, старты и харнесс сверяет анализатор;
+#   final   ФИНАЛЬНАЯ проверка h18: руки q0 и h18, задачи 0-9, состояния
+#           25-49 (250 кластеров). Только после пройденного confirm с тем же
+#           исполнением h18; правило — k15d_behavior.FINAL;
+#   dev     задачи 0-9 набора 10, 250 кластеров (все руки заново).
 #
 # Один execution seed (101), порядок рук циклически сдвигается по задаче.
 # Каталог артефактов несёт отпечатки чекпойнтов, отчётов и харнесса.
@@ -36,7 +44,7 @@
 #   D0_OVERRIDE="..." SUITE=spatial TASKS="0" \
 #       bash experiments/k15d_rollout.sh target cuda:1
 set -euo pipefail
-MODE="${1:?нужен режим: infer, smoke, target, safety, confirm или dev}"
+MODE="${1:?нужен режим: infer, smoke, target, safety, confirm, ablate, final или dev}"
 DEV="${2:-cuda:1}"
 SEED=101
 SKIP="${SKIP:-}"
@@ -72,8 +80,12 @@ want () { case " $SKIP " in *" $1 "*) return 1;; esac; return 0; }
 K15D_ARMS=""
 for A in d0 h18 h1; do want "$A" && K15D_ARMS="$K15D_ARMS $A"; done
 K15D_ARMS="${K15D_ARMS# }"
-# В confirm состав фиксирован правилом: только первичная пара.
-[ "$MODE" = "confirm" ] && K15D_ARMS="h18"
+# В confirm и final состав фиксирован правилом: только первичная пара.
+# В ablate — только те руки, которых нет в confirm.
+case "$MODE" in
+  confirm|final) K15D_ARMS="h18" ;;
+  ablate)        K15D_ARMS="d0 h1" ;;
+esac
 [ -n "$K15D_ARMS" ] || { echo "ОТКАЗ: все руки K-15d исключены"; exit 1; }
 
 if [ "$MODE" = "infer" ]; then
@@ -93,6 +105,8 @@ case "$MODE" in
   smoke)  SUITE=10; TASKS="8"; STATES="0" ;;
   safety) SUITE=10; TASKS="8 9"; STATES="0 5 10 15 20" ;;
   confirm) SUITE=10; TASKS="0 1 2 3 4 5 6 7"; STATES="0 5 10 15 20" ;;
+  ablate)  SUITE=10; TASKS="0 1 2 3 4 5 6 7"; STATES="0 5 10 15 20" ;;
+  final)   SUITE=10; TASKS="0 1 2 3 4 5 6 7 8 9"; STATES="25 30 35 40 45" ;;
   dev)    SUITE=10; TASKS="0 1 2 3 4 5 6 7 8 9"; STATES="0 5 10 15 20" ;;
   target) TASKS="${TASKS:?для target нужны TASKS и SUITE}"
           STATES="0 5 10 15 20" ;;
@@ -105,18 +119,76 @@ for A in $K15D_ARMS; do
 done
 ARMS="q0 $K15D_ARMS"
 EXPECTED="$(echo "$ARMS" | tr ' ' ',')"
+# В ablate q0 не раскатывается: его задачи 0-7 уже есть в confirm.
+[ "$MODE" = "ablate" ] && ARMS="$K15D_ARMS"
 for m in k15d_depth_refine k15d_policy k15d_check_inference k15d_behavior \
          k9h_multiarm_gate; do
   python3 "experiments/${m}.py" --selftest >/dev/null \
     || { echo "ОТКАЗ: самопроверка ${m}"; exit 1; }
 done
 sha12 () { sha1sum "$1" | cut -c1-12; }
-TAG="k9h$(sha12 experiments/k9h_multiarm_gate.py)"
-for A in $K15D_ARMS; do
-  TAG="${TAG}_${A}$(sha12 "$(ck_of "$A")")$(sha12 "$(report_of "$A")")"
-done
+tag_for () {   # руки K-15d -> метка каталога (харнесс, чекпойнты, отчёты)
+  local t; t="k9h$(sha12 experiments/k9h_multiarm_gate.py)"
+  for A in $1; do
+    t="${t}_${A}$(sha12 "$(ck_of "$A")")$(sha12 "$(report_of "$A")")"
+  done
+  echo "$t"
+}
+TAG="$(tag_for "$K15D_ARMS")"
 
-if [ "$MODE" = "dev" ] || [ "$MODE" = "confirm" ]; then
+# Допуск по прошлой сводке: рука исполняется ТЕМ ЖЕ кодом и чекпойнтом,
+# что в пройденном прогоне-предпосылке. Для руки с исключением из фильтра
+# предпосылка — safety (и та же причина), для final — confirm.
+admitted_by () {   # рука, шаблон сводок, причина ("" — исключения нет)
+  python3 - "$1" "$(sha12 "$(ck_of "$1")")" "$3" \
+    "$(sha12 experiments/k9h_multiarm_gate.py)" \
+    "$(sha12 experiments/k15d_depth_refine.py)" \
+    "$(sha12 experiments/k15d_policy.py)" "$2" <<'PY'
+import glob, json, os, sys
+sys.path.insert(0, "experiments")
+from k15d_behavior import ARM_SPEC
+arm, cks, reason, harness, refine, policy, pattern = sys.argv[1:8]
+spec = ARM_SPEC[arm]
+want = dict(checkpoint_sha1=cks, phase=spec["phase"],
+            layers_per_call=spec["layers_per_call"], harness_sha1=harness,
+            refine_module_sha1=refine, policy_module_sha1=policy)
+ok = False
+for f in glob.glob(pattern):
+    d = json.load(open(f))
+    if d.get("verdict", {}).get("code") != 0 or d.get("partial"):
+        continue
+    for pv in (d.get("provenance") or {}).get(arm, []):
+        same = all(str(pv.get(k)) == str(v) for k, v in want.items())
+        ov = (pv.get("admission_override") or {}).get("reason") or ""
+        if same and ov == reason:
+            ok = True
+            print(f"    допуск {arm}: {os.path.basename(f)}")
+sys.exit(0 if ok else 1)
+PY
+}
+
+if [ "$MODE" = "final" ]; then
+  if ! admitted_by h18 "reports/k15d/rollout/behavior_confirm_s101_*.json" ""
+  then
+    echo "ОТКАЗ: final открывается только после пройденного confirm с тем же"
+    echo "  исполнением h18 (чекпойнт, фаза, слои, харнесс, модули)"
+    exit 1
+  fi
+fi
+
+if [ "$MODE" = "ablate" ]; then
+  # Предпосылки сводного анализа — готовые каталоги confirm и safety той же
+  # версии кода. Проверяются ДО раскаток, а не после четырёх часов.
+  CONF_DIR="reports/k15d/rollout/confirm_10/s101/$(tag_for h18)"
+  SAFE_DIR="reports/k15d/rollout/safety_10/s101/$(tag_for "d0 h18 h1")"
+  for d in "$CONF_DIR" "$SAFE_DIR"; do
+    [ -d "$d" ] || { echo "ОТКАЗ: нет каталога $d (сначала confirm и safety)"
+                     exit 1; }
+  done
+fi
+
+if [ "$MODE" = "dev" ] || [ "$MODE" = "confirm" ] || [ "$MODE" = "ablate" ]
+then
   # РУКА С ИСКЛЮЧЕНИЕМ ИДЁТ ДАЛЬШЕ ТОЛЬКО ПОСЛЕ ПРОЙДЕННОГО safety С ТЕМ ЖЕ
   # ИСПОЛНЕНИЕМ: чекпойнт, фаза и число слоёв (из спецификации метки),
   # версия харнесса, модули уточнения и руки — текущие, и та же причина.
@@ -124,31 +196,8 @@ if [ "$MODE" = "dev" ] || [ "$MODE" = "confirm" ]; then
   for A in $K15D_ARMS; do
     OV="$(override_of "$A")"
     [ -n "$OV" ] || continue
-    if ! python3 - "$A" "$(sha12 "$(ck_of "$A")")" "$OV" \
-         "$(sha12 experiments/k9h_multiarm_gate.py)" \
-         "$(sha12 experiments/k15d_depth_refine.py)" \
-         "$(sha12 experiments/k15d_policy.py)" <<'PY'
-import glob, json, os, sys
-sys.path.insert(0, "experiments")
-from k15d_behavior import ARM_SPEC
-arm, cks, reason, harness, refine, policy = sys.argv[1:7]
-spec = ARM_SPEC[arm]
-want = dict(checkpoint_sha1=cks, phase=spec["phase"],
-            layers_per_call=spec["layers_per_call"], harness_sha1=harness,
-            refine_module_sha1=refine, policy_module_sha1=policy)
-ok = False
-for f in glob.glob("reports/k15d/rollout/behavior_safety_s101_*.json"):
-    d = json.load(open(f))
-    if d.get("verdict", {}).get("code") != 0 or d.get("partial"):
-        continue
-    for pv in (d.get("provenance") or {}).get(arm, []):
-        same = all(str(pv.get(k)) == str(v) for k, v in want.items())
-        ov = pv.get("admission_override") or {}
-        if same and ov.get("reason") == reason:
-            ok = True
-            print(f"    допуск {arm}: safety {os.path.basename(f)}")
-sys.exit(0 if ok else 1)
-PY
+    if ! admitted_by "$A" \
+         "reports/k15d/rollout/behavior_safety_s101_*.json" "$OV"
     then
       echo "ОТКАЗ: рука $A с исключением из фильтра не прошла safety с тем"
       echo "  же исполнением (чекпойнт, фаза, слои, харнесс, модули) и той же"
@@ -272,6 +321,20 @@ if [ "$MODE" = "smoke" ]; then
     --out "$OUTD/behavior_smoke.json" --overwrite || CODE=$?
   [ "$CODE" = 4 ] && CODE=0     # на пяти эпизодах разность ничего не значит
   echo "=== СМОУК ЗАКОНЧЕН $(date), код $CODE. Это НЕ результат ==="
+  exit $CODE
+fi
+if [ "$MODE" = "ablate" ]; then
+  # СВОДНЫЙ dev: четыре руки, 250 кластеров, из трёх каталогов.
+  ARTS="$(ls "$CONF_DIR"/q0_t*_i*.json "$CONF_DIR"/h18_t*_i*.json \
+          "$SAFE_DIR"/q0_t*_i*.json "$SAFE_DIR"/d0_t*_i*.json \
+          "$SAFE_DIR"/h18_t*_i*.json "$SAFE_DIR"/h1_t*_i*.json \
+          "$OUTD"/d0_t*_i*.json "$OUTD"/h1_t*_i*.json 2>/dev/null \
+          | tr '\n' ' ' || true)"
+  python3 experiments/k15d_behavior.py --mode dev \
+    --expected-arms q0,d0,h18,h1 --arts $ARTS \
+    --out "reports/k15d/rollout/behavior_dev_s101_10_${TAG}.json" \
+    --overwrite || CODE=$?
+  echo "=== КОНЕЦ $(date), сводный dev: код $CODE ==="
   exit $CODE
 fi
 TARG=""
