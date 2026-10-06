@@ -53,7 +53,31 @@ MODES = dict(safety=dict(tasks=[8, 9], states=list(range(25))),
 # описательно. Менять правило после начала роллаутов confirm нельзя.
 CONFIRM = dict(base="q0", cand="h18", tasks=list(range(8)),
                states=list(range(25)), interval="two-sided 90%",
-               rule="ci90_lo > 0", registered="07.10.2026, до роллаутов")
+               rule="ci90_lo > 0", registered="07.10.2026, до роллаутов",
+               # параметры бутстрапа K-14q, сверяются с ним при анализе
+               n_boot=10000, boot_seed=53, quantiles=[5, 95])
+
+
+def check_confirm_args(*, allow_partial, boot, arms, tasks, kb_consts):
+    """confirm не допускает ни одного ручного отступления от правила."""
+    p = []
+    if allow_partial:
+        p.append("confirm запрещает --allow-partial")
+    if int(boot) != CONFIRM["n_boot"]:
+        p.append(f"confirm требует {CONFIRM['n_boot']} бутстрап-реплик, "
+                 f"дано {boot}")
+    if list(arms) != [CONFIRM["base"], CONFIRM["cand"]]:
+        p.append(f"confirm требует ровно {CONFIRM['base']},"
+                 f"{CONFIRM['cand']}, дано {list(arms)}")
+    if tasks:
+        p.append("--tasks в confirm запрещён: задачи фиксированы правилом")
+    for k, v in (("n_boot", kb_consts.get("n_boot")),
+                 ("boot_seed", kb_consts.get("boot_seed")),
+                 ("quantiles", kb_consts.get("quantiles"))):
+        if v != CONFIRM[k]:
+            p.append(f"бутстрап K-14q изменился: {k} {v!r}, правило "
+                     f"{CONFIRM[k]!r}")
+    return p
 SEEDS = [101]
 ARMS = ("q0", "d0", "h18", "h1")
 PAIRS = (("q0", "d0"), ("q0", "h18"), ("q0", "h1"), ("d0", "h18"),
@@ -241,6 +265,14 @@ def main():
     obs, meta = kb.load(a.arts)
     arms = parse_arms(a.expected_arms)
     tasks = [int(x) for x in a.tasks.split(",") if x.strip()]
+    if a.mode == "confirm":
+        problems = check_confirm_args(
+            allow_partial=a.allow_partial, boot=a.boot, arms=arms,
+            tasks=tasks, kb_consts=dict(n_boot=kb.N_BOOT,
+                                        boot_seed=kb.BOOT_SEED,
+                                        quantiles=[kb.Q_LO, kb.Q_HI]))
+        if problems:
+            raise SystemExit("; ".join(problems))
     want_cl = expected_clusters(a.mode, tasks)
     technical = []
     # СОСТАВ РУК — ТОЧНО ЗАЯВЛЕННЫЙ, в том числе в смоуке: лишняя или
@@ -382,6 +414,16 @@ def selftest():
     except SystemExit:
         pass
     assert len(expected_clusters("confirm")) == 200
+    kbc = dict(n_boot=10000, boot_seed=53, quantiles=[5, 95])
+    ok_args = dict(allow_partial=False, boot=10000, arms=["q0", "h18"],
+                   tasks=[], kb_consts=kbc)
+    assert check_confirm_args(**ok_args) == []
+    for mut in (dict(allow_partial=True), dict(boot=100),
+                dict(arms=["q0", "h18", "h1"]), dict(arms=["q0", "d0"]),
+                dict(tasks=[0, 1]),
+                dict(kb_consts=dict(kbc, boot_seed=1)),
+                dict(kb_consts=dict(kbc, quantiles=[10, 90]))):
+        assert check_confirm_args(**dict(ok_args, **mut)), mut
     assert confirm_verdict([], 0.01, 0.2, 0.1)["code"] == 0
     assert confirm_verdict([], 0.0, 0.2, 0.1)["code"] == 4     # строго > 0
     assert confirm_verdict(["x"], 0.1, 0.2, 0.1)["code"] == 3
