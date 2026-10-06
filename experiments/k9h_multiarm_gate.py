@@ -82,7 +82,8 @@ import time
 import numpy as np
 
 N_POS, N_LEVEL = 16, 3
-POLICIES = ("fullbar", "coarse24", "fast", "hicora", "depthrvq", "k15c")
+POLICIES = ("fullbar", "coarse24", "fast", "hicora", "depthrvq", "k15c",
+            "k15d")
 
 # Режимы depth-RVQ повторяют имена базового класса: сколько уровней успевает
 # выдать ОДИН сегментированный проход, остановившись на соответствующем
@@ -193,6 +194,19 @@ class Latent:
 
     def __init__(self, z):
         self.z = z
+class ActionChunk:
+    """Готовый нормированный чанк действий [B, T, 7] вместо кодов.
+
+    K-15d уточняет само действие, а не латент кодека: декодер к нему не
+    применяется. Отдельный тип — чтобы `decode` различал случай явно.
+    """
+
+    __slots__ = ("a",)
+
+    def __init__(self, a):
+        self.a = a
+
+
 # K-6h, опорные числа. ПО 200 ПАР НА ПРОТОКОЛ, а не 400: 400 — сумма двух.
 REFERENCE_K6H = {"on": dict(fullbar=88.0, coarse24=89.0),
                  "off": dict(fullbar=90.0, coarse24=89.5)}
@@ -315,6 +329,10 @@ def levels_of(policy, depth_rvq_mode=None):
     # не способ сборки.
     if policy == "k15c":
         return 2
+    # K-15d: дискретен только q0; уточнение непрерывное, и харнесс получает
+    # готовый чанк (`ActionChunk`). 1 — описание, а не способ сборки.
+    if policy == "k15d":
+        return 1
     return N_LEVEL if policy == "fullbar" else 1
 
 
@@ -432,6 +450,7 @@ def selftest():
     # умолчание режима не влияет на остальные политики
     assert levels_of("fast") == 1 and levels_of("fullbar", "medium") == N_LEVEL
     assert "k15c" in POLICIES and levels_of("k15c") == 2
+    assert "k15d" in POLICIES and levels_of("k15d") == 1
     # --- ПРОИСХОЖДЕНИЕ ГОЛОВЫ q1: КАЖДАЯ МУТАЦИЯ ОТВЕРГАЕТСЯ -------------
     # Прежняя версия требовала НАЛИЧИЯ q0_prov и нигде его не сверяла.
     # Наличие поля — не проверка поля, и голова другого сида, варианта или
@@ -639,6 +658,15 @@ def main() -> None:
                          "smoke-голове, smoke-кэше и smoke-отчёте проверки "
                          "вывода. Только в каталог с /preflight/ в пути; "
                          "настоящая голова этим путём не принимается")
+    ap.add_argument("--refiner", default=None,
+                    help="K-15d: завершённый чекпойнт фазы d0 или h1p2; "
+                         "только для --policy k15d")
+    ap.add_argument("--k15d-report", default=None,
+                    help="K-15d: отчёт проверки вывода ЭТОГО чекпойнта "
+                         "ЭТИМ кодом уточнения и руки")
+    ap.add_argument("--k15d-preflight", action="store_true",
+                    help="K-15d: предполётная проверка на smoke-чекпойнте; "
+                         "только в каталог с /preflight/ в пути")
     ap.add_argument("--arm-label", default=None,
                     help="ОБЯЗАТЕЛЕН. Различает руки внутри эксперимента, "
                          "например fullbar, coarse24_b10, coarse24_b5, "
@@ -740,6 +768,16 @@ def main() -> None:
     elif args.selector or args.inference_report or args.k15c_preflight:
         raise SystemExit("--selector, --inference-report и "
                          "--k15c-preflight осмысленны только с --policy k15c")
+    if args.policy == "k15d":
+        if not args.refiner or not args.k15d_report:
+            raise SystemExit("--policy k15d требует --refiner и "
+                             "--k15d-report")
+        if args.k15d_preflight and "/preflight/" not in str(args.out or ""):
+            raise SystemExit("--k15d-preflight пишет только в каталог с "
+                             "/preflight/ в пути")
+    elif args.refiner or args.k15d_report or args.k15d_preflight:
+        raise SystemExit("--refiner, --k15d-report и --k15d-preflight "
+                         "осмысленны только с --policy k15d")
     if args.policy == "fast" and not args.policy_ckpt:
         raise SystemExit("--policy fast требует --policy-ckpt")
     if args.policy not in ("fast", "hicora", "depthrvq") and args.policy_ckpt:
@@ -882,7 +920,16 @@ def main() -> None:
                                args.n_envs)
 
     k15c_arm = None
-    if args.policy == "k15c":
+    k15d_arm = None
+    if args.policy == "k15d":
+        # Как у k15c: каноническая модель K-15 со своими гейтами (K-15a и
+        # K-15d этой карты), собирается после сред.
+        import k15d_policy as _k15d
+        k15d_arm = _k15d.build_arm(args.device, args.refiner,
+                                   args.k15d_report, torch,
+                                   preflight=args.k15d_preflight)
+        model, proc = k15d_arm.model, k15d_arm.proc
+    elif args.policy == "k15c":
         # РУКА K-15c СОБИРАЕТ СВОЮ, КАНОНИЧЕСКУЮ МОДЕЛЬ — ту же, на которой
         # построены кэш и голова, со своими проверками и гейтом K-15a. Вторая
         # копия базовой модели здесь не создаётся. Среды уже подняты: порядок
@@ -961,6 +1008,16 @@ def main() -> None:
               f"веса sha {weights_sha}, source={obj.get('source')}, "
               f"ствол {dig}"
               + ("" if ck_dig is not None else " (в чекпойнте не записан)"))
+    elif args.policy == "k15d":
+        policy_meta = dict(k15d_arm.meta)
+        policy_meta["arm_fingerprint"] = hashlib.sha1("|".join(
+            [str(args.arm_label), policy_meta["model_fingerprint"]]
+        ).encode()).hexdigest()[:12]
+        print(f"  рука k15d: фаза {policy_meta['phase']}, уровень "
+              f"{policy_meta['level']}, точка {policy_meta['selected_tag']}, "
+              f"чекпойнт {policy_meta['checkpoint_sha1']}, проверка вывода "
+              f"{policy_meta['inference_report_sha1']}; отпечаток модели "
+              f"{policy_meta['model_fingerprint']}", flush=True)
     elif args.policy == "k15c":
         policy_meta = dict(k15c_arm.meta)
         policy_meta["arm_fingerprint"] = hashlib.sha1("|".join(
@@ -982,7 +1039,8 @@ def main() -> None:
 
     import contextlib
     autocast = (torch.autocast("cuda", dtype=torch.float16)
-                if args.policy in ("fast", "hicora", "depthrvq", "k15c")
+                if args.policy in ("fast", "hicora", "depthrvq", "k15c",
+                                   "k15d")
                 else contextlib.nullcontext())
 
     ac = proc.action_processor
@@ -1261,6 +1319,14 @@ def main() -> None:
         HiCoRA приходит сюда НЕПРЕРЫВНЫМ латентом: он собран как `z0 + dz` и
         в решётку кодов не ложится. Обёртка `Latent` различает случаи явно.
         """
+        if isinstance(codes, ActionChunk):
+            # K-15d: чанк уже в нормированной шкале кодека; рука проверила
+            # конечность и предел. Проверка конечности повторяется здесь,
+            # как у Latent.
+            a_ = np.asarray(codes.a, np.float32)
+            if not np.isfinite(a_).all():
+                raise SystemExit("рука k15d вернула nan/inf в действиях")
+            return a_
         if isinstance(codes, Latent):
             with torch.no_grad():
                 x, _ = codec._decode(codes.z, embodiment_ids=0)
@@ -1338,6 +1404,12 @@ def main() -> None:
                       f"|dz| макс {dz_max:.4f}, ||dz|| макс {nrm:.4f} при "
                       f"пределе {lim:.4f}", flush=True)
             return Latent(out["z"])
+
+        if args.policy == "k15d":
+            a_, q0c = k15d_arm.act(batch, pos_off, autocast, first)
+            if first:
+                check_assembly(np.concatenate([q0c] * N_LEVEL, axis=1))
+            return ActionChunk(a_)
 
         if args.policy == "k15c":
             # ОДИН ПРОХОД НА 24 СЛОЯ, ОДИН ДЕКОД. Выбор — функцией, которая
@@ -1584,6 +1656,10 @@ def main() -> None:
         # действий и посчитает блок сделанным. JSON публикуется последним и
         # несёт отпечаток npz — тогда наличие JSON означает наличие всего.
         act_meta = {}
+        # Уровни K-15d этого блока: сводка в JSON, массивы a0/a1/a2 — в npz
+        # действий. Журнал обнуляется на каждом блоке.
+        k15d_summ, k15d_arrays = (k15d_arm.log.take()
+                                  if k15d_arm is not None else (None, {}))
         if args.save_actions:
             ap_ = os.path.splitext(args.out)[0] + ".actions.npz"
             tmp_a = ap_ + f".tmp.{os.getpid()}"
@@ -1602,7 +1678,8 @@ def main() -> None:
                         rollout_seed=roll_seed, horizon=args.horizon,
                         script_sha1=file_sha12(__file__),
                         model_fingerprint=(policy_meta or {}).get(
-                            "model_fingerprint")), ensure_ascii=False))
+                            "model_fingerprint")), ensure_ascii=False),
+                    **k15d_arrays)
             with np.load(tmp_a, allow_pickle=True) as z_:
                 if "actions" not in z_.files:
                     raise SystemExit(f"{ap_}: массив actions не перечитался")
@@ -1634,6 +1711,7 @@ def main() -> None:
                        # ВЫБРАННЫЕ РАНГИ ЭТОГО БЛОКА; счётчик обнуляется.
                        k15c_picks=(k15c_arm.stats.take()
                                    if k15c_arm is not None else None),
+                       k15d_levels=k15d_summ,
                        **act_meta,
                        script_sha1=sha, argv=vars(args)),
                   open(tmp_out, "w"), ensure_ascii=False, indent=1)

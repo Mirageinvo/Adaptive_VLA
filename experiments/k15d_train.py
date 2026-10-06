@@ -902,7 +902,8 @@ def _fake_ctx(n_rows=200, seed=0):
         git_head="fake", dirty=False, q0_prov=dict(plan_sha1="fakeplan"),
         code_version=dict(fake=1), joint_sha="fakejoint",
         codec_fp=dict(fake=1),
-        k11a=types.SimpleNamespace(file_sha1=k15_context.sha12))
+        k11a=types.SimpleNamespace(file_sha1=k15_context.sha12),
+        proc=None, codec=None)
     return ns
 
 
@@ -978,6 +979,45 @@ def integration():
                     and f.endswith(".bak")]
             codes["rerun_archived"] = 0 if len(baks) >= 3 else 1
             rep2 = json.load(open(os.path.join(td, "h1p2_full.json")))
+            # --- проверка вывода и рука на чекпойнте h1p2 -----------------
+            import k15d_check_inference as ki
+            import k15d_policy as kp
+            saved_gp = kp.gate_paths
+            kp.gate_paths = lambda device: ("unused", gate)
+            try:
+                ck_path = os.path.join(td, "h1p2_full.pt")
+                inf_rep = os.path.join(td, "inference.json")
+                sys.argv = ["x", "--checkpoint", ck_path, "--device", "cpu",
+                            "--train-report",
+                            os.path.join(td, "h1p2_full.json"),
+                            "--out", inf_rep]
+                codes["inference"] = ki.main()
+                ir = json.load(open(inf_rep))
+                assert ir["verdict"]["passed"], ir["verdict"]
+                assert ir["rms_rel"] <= ki.RMS_REL
+                # рука собирается с этим отчётом и исполняет чанк
+                arm = kp.build_arm("cpu", ck_path, inf_rep, torch,
+                                   init_gate=gate, k15d_gate=gate)
+                po, sel = ctx.parts_full["val_sel"][0]
+                ac = torch.autocast(device_type="cpu", dtype=torch.bfloat16)
+                a_np, q0c = arm.act(ctx.build_batch(po, sel), po, ac, True)
+                assert a_np.shape == (len(sel), 20, 7)
+                assert np.array_equal(q0c, ctx.q0_can[np.asarray(sel)])
+                summ, arrs = arm.log.take()
+                assert summ["calls"] == 1 and "k15d_level_2" in arrs
+                # отчёт другого чекпойнта рука не принимает
+                bad_rep = os.path.join(td, "inference_bad.json")
+                json.dump(dict(ir, checkpoint_sha1="000000000000"),
+                          open(bad_rep, "w"))
+                try:
+                    kp.build_arm("cpu", ck_path, bad_rep, torch,
+                                 init_gate=gate, k15d_gate=gate)
+                    codes["arm_bad_report_refused"] = 1
+                except SystemExit as e:
+                    codes["arm_bad_report_refused"] = (
+                        0 if "другого файла" in str(e) else str(e))
+            finally:
+                kp.gate_paths = saved_gp
             dg = rep2["final"]["diagnostics"]
             assert {"normal", "zero", "far_batch",
                     "ground_truth_prev"} <= set(dg)
@@ -998,7 +1038,8 @@ def integration():
     for k in ("gate", "overfit_d0", "overfit_h1p1", "overfit_h1p2",
               "smoke_d0", "smoke_h1p1", "smoke_h1p2",
               "h1p2_from_smoke_refused", "seed_mismatch_refused",
-              "partial_phase1_refused", "rerun_d0", "rerun_archived"):
+              "partial_phase1_refused", "rerun_d0", "rerun_archived",
+              "inference", "arm_bad_report_refused"):
         assert codes[k] == 0, (k, codes[k])
     for k in ("full_h1p1", "full_h1p2"):
         assert codes[k] in (0, 4), (k, codes[k])

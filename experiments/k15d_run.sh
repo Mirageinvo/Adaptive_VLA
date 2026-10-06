@@ -61,6 +61,30 @@ gate_run_id() {   # [файл гейта K-15d]
 dev_tag() { echo "$1" | tr -d ':'; }   # cuda:0 -> cuda0
 gate15a_for() { echo "reports/k15a/init_identity_$(dev_tag "$1").json"; }
 gate15d_for() { echo "${REP}/init_identity_$(dev_tag "$1").json"; }
+# Маркер check принимается и от более раннего коммита, если с тех пор
+# изменился ТОЛЬКО сам раннер: модель, гейты и тренер — ровно те, что
+# прошли проверку. Любой другой изменённый файл требует нового check.
+RUNNER_ONLY="experiments/k15d_run.sh"
+marker_ok() {   # файл маркера, ожидаемая строка
+    local got want mc rest changed
+    got="$(cat "$1" 2>/dev/null)"
+    want="$2"
+    [ -n "$got" ] || return 1
+    [ "$got" = "$want" ] && return 0
+    mc="$(echo "$got" | sed -n 's/^commit=\([0-9a-f]*\) .*/\1/p')"
+    rest="${got#commit=$mc }"
+    [ -n "$mc" ] && [ "$rest" = "${want#commit=$HEAD_FULL }" ] || return 1
+    changed="$(git diff --name-only "$mc" HEAD 2>/dev/null)" || return 1
+    if [ -z "$changed" ] || [ "$changed" = "$RUNNER_ONLY" ]; then
+        echo "  маркер от коммита ${mc:0:7}: с тех пор изменён только" \
+             "${changed:-ничего} — принимается"
+        return 0
+    fi
+    echo "  маркер от коммита ${mc:0:7}, с тех пор изменены:" >&2
+    echo "$changed" | sed 's/^/    /' >&2
+    return 1
+}
+
 prep_marker() {   # карта
     printf 'commit=%s seed=%s device=%s gate_run_id=%s\n' \
         "$HEAD_FULL" "$SEED" "$1" "$(gate_run_id "$(gate15d_for "$1")")"
@@ -125,13 +149,10 @@ do_check() {
 }
 
 do_full() {
-    local want got
-    want="$(check_marker)"
-    got="$(cat "${CODES}/check_passed" 2>/dev/null)"
-    if [ "$got" != "$want" ]; then
+    if ! marker_ok "${CODES}/check_passed" "$(check_marker)"; then
         echo "ОТКАЗ: check не пройден в этой обстановке" >&2
-        echo "  маркер: ${got:-нет}" >&2
-        echo "  нужно:  $want" >&2
+        echo "  маркер: $(cat "${CODES}/check_passed" 2>/dev/null)" >&2
+        echo "  нужно:  $(check_marker)" >&2
         return 1
     fi
     stage "4. полная эпоха d0"
@@ -174,20 +195,19 @@ do_prep2() {   # подготовка второй карты $DEVICE
 }
 
 do_fullpar() {   # d0 на D0_DEVICE параллельно с h1p1 -> h1p2 на $DEVICE
-    local want got tag g15a g15d
-    want="$(check_marker)"
-    got="$(cat "${CODES}/check_passed" 2>/dev/null)"
-    if [ "$got" != "$want" ]; then
+    local tag g15a g15d
+    if ! marker_ok "${CODES}/check_passed" "$(check_marker)"; then
         echo "ОТКАЗ: check на $DEVICE не пройден в этой обстановке" >&2
+        echo "  маркер: $(cat "${CODES}/check_passed" 2>/dev/null)" >&2
+        echo "  нужно:  $(check_marker)" >&2
         return 1
     fi
     tag="$(dev_tag "$D0_DEVICE")"
-    want="$(prep_marker "$D0_DEVICE")"
-    got="$(cat "${CODES}/prep2_${tag}" 2>/dev/null)"
-    if [ "$got" != "$want" ]; then
+    if ! marker_ok "${CODES}/prep2_${tag}" "$(prep_marker "$D0_DEVICE")"
+    then
         echo "ОТКАЗ: prep2 на $D0_DEVICE не пройден в этой обстановке" >&2
-        echo "  маркер: ${got:-нет}" >&2
-        echo "  нужно:  $want" >&2
+        echo "  маркер: $(cat "${CODES}/prep2_${tag}" 2>/dev/null)" >&2
+        echo "  нужно:  $(prep_marker "$D0_DEVICE")" >&2
         return 1
     fi
     g15a="$(gate15a_for "$D0_DEVICE")"
