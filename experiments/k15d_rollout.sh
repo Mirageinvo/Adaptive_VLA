@@ -22,7 +22,10 @@
 #   target  прицельный пилот: SUITE=<набор> TASKS="<номера>", состояния
 #           0-24 — для задачи, где фильтр допуска нашёл риск;
 #   safety  задачи 8-9 набора 10, 50 кластеров — технический пилот;
-#   dev     задачи 0-9 набора 10, 250 кластеров.
+#   confirm ПОДТВЕРЖДЕНИЕ гипотезы «h18 лучше q0»: только руки q0 и h18,
+#           задачи 0-7 набора 10, 200 НЕ виденных кластеров. Правило
+#           зафиксировано в k15d_behavior.CONFIRM до роллаутов;
+#   dev     задачи 0-9 набора 10, 250 кластеров (абляции и описание).
 #
 # Один execution seed (101), порядок рук циклически сдвигается по задаче.
 # Каталог артефактов несёт отпечатки чекпойнтов, отчётов и харнесса.
@@ -33,7 +36,7 @@
 #   D0_OVERRIDE="..." SUITE=spatial TASKS="0" \
 #       bash experiments/k15d_rollout.sh target cuda:1
 set -euo pipefail
-MODE="${1:?нужен режим: infer, smoke, target, safety или dev}"
+MODE="${1:?нужен режим: infer, smoke, target, safety, confirm или dev}"
 DEV="${2:-cuda:1}"
 SEED=101
 SKIP="${SKIP:-}"
@@ -69,6 +72,8 @@ want () { case " $SKIP " in *" $1 "*) return 1;; esac; return 0; }
 K15D_ARMS=""
 for A in d0 h18 h1; do want "$A" && K15D_ARMS="$K15D_ARMS $A"; done
 K15D_ARMS="${K15D_ARMS# }"
+# В confirm состав фиксирован правилом: только первичная пара.
+[ "$MODE" = "confirm" ] && K15D_ARMS="h18"
 [ -n "$K15D_ARMS" ] || { echo "ОТКАЗ: все руки K-15d исключены"; exit 1; }
 
 if [ "$MODE" = "infer" ]; then
@@ -87,6 +92,7 @@ fi
 case "$MODE" in
   smoke)  SUITE=10; TASKS="8"; STATES="0" ;;
   safety) SUITE=10; TASKS="8 9"; STATES="0 5 10 15 20" ;;
+  confirm) SUITE=10; TASKS="0 1 2 3 4 5 6 7"; STATES="0 5 10 15 20" ;;
   dev)    SUITE=10; TASKS="0 1 2 3 4 5 6 7 8 9"; STATES="0 5 10 15 20" ;;
   target) TASKS="${TASKS:?для target нужны TASKS и SUITE}"
           STATES="0 5 10 15 20" ;;
@@ -110,30 +116,43 @@ for A in $K15D_ARMS; do
   TAG="${TAG}_${A}$(sha12 "$(ck_of "$A")")$(sha12 "$(report_of "$A")")"
 done
 
-if [ "$MODE" = "dev" ]; then
-  # РУКА С ИСКЛЮЧЕНИЕМ ИДЁТ В dev ТОЛЬКО ПОСЛЕ ПРОЙДЕННОГО safety с тем же
-  # чекпойнтом и той же причиной.
+if [ "$MODE" = "dev" ] || [ "$MODE" = "confirm" ]; then
+  # РУКА С ИСКЛЮЧЕНИЕМ ИДЁТ ДАЛЬШЕ ТОЛЬКО ПОСЛЕ ПРОЙДЕННОГО safety С ТЕМ ЖЕ
+  # ИСПОЛНЕНИЕМ: чекпойнт, фаза и число слоёв (из спецификации метки),
+  # версия харнесса, модули уточнения и руки — текущие, и та же причина.
+  # Safety, снятый другим кодом, dev не открывает.
   for A in $K15D_ARMS; do
     OV="$(override_of "$A")"
     [ -n "$OV" ] || continue
-    CKS="$(sha12 "$(ck_of "$A")")"
-    if ! python3 - "$A" "$CKS" "$OV" <<'PY'
-import glob, json, sys
-arm, cks, reason = sys.argv[1:4]
+    if ! python3 - "$A" "$(sha12 "$(ck_of "$A")")" "$OV" \
+         "$(sha12 experiments/k9h_multiarm_gate.py)" \
+         "$(sha12 experiments/k15d_depth_refine.py)" \
+         "$(sha12 experiments/k15d_policy.py)" <<'PY'
+import glob, json, os, sys
+sys.path.insert(0, "experiments")
+from k15d_behavior import ARM_SPEC
+arm, cks, reason, harness, refine, policy = sys.argv[1:7]
+spec = ARM_SPEC[arm]
+want = dict(checkpoint_sha1=cks, phase=spec["phase"],
+            layers_per_call=spec["layers_per_call"], harness_sha1=harness,
+            refine_module_sha1=refine, policy_module_sha1=policy)
 ok = False
 for f in glob.glob("reports/k15d/rollout/behavior_safety_s101_*.json"):
     d = json.load(open(f))
     if d.get("verdict", {}).get("code") != 0 or d.get("partial"):
         continue
     for pv in (d.get("provenance") or {}).get(arm, []):
+        same = all(str(pv.get(k)) == str(v) for k, v in want.items())
         ov = pv.get("admission_override") or {}
-        if str(pv.get("checkpoint_sha1")) == cks and ov.get("reason") == reason:
+        if same and ov.get("reason") == reason:
             ok = True
+            print(f"    допуск {arm}: safety {os.path.basename(f)}")
 sys.exit(0 if ok else 1)
 PY
     then
       echo "ОТКАЗ: рука $A с исключением из фильтра не прошла safety с тем"
-      echo "  же чекпойнтом ($CKS) и той же причиной — dev для неё закрыт"
+      echo "  же исполнением (чекпойнт, фаза, слои, харнесс, модули) и той же"
+      echo "  причиной — режим $MODE для неё закрыт"
       exit 1
     fi
   done
@@ -220,12 +239,19 @@ for arm in arms:
     for f in sorted(glob.glob(os.path.join(d, f"{arm}r_t*_i*.json"))):
         g = os.path.join(d, os.path.basename(f).replace(f"{arm}r_", f"{arm}_",
                                                          1))
-        a = [e["action_sha1"] for e in json.load(open(f))["episodes"]]
-        b = [e["action_sha1"] for e in json.load(open(g))["episodes"]]
-        same = sum(x == y for x, y in zip(a, b))
-        print(f"    детерминизм {os.path.basename(g)}: {same}/{len(a)} "
+        ea = json.load(open(f))["episodes"]
+        eb = json.load(open(g))["episodes"]
+        # ДЛИНА И СТАРТЫ СВЕРЯЮТСЯ ЯВНО: zip молча обрезал бы лишнее.
+        if [e["init_state_id"] for e in ea] != \
+                [e["init_state_id"] for e in eb]:
+            print(f"    {os.path.basename(g)}: состав эпизодов повтора иной")
+            bad += max(len(ea), len(eb))
+            continue
+        same = sum(x["action_sha1"] == y["action_sha1"]
+                   for x, y in zip(ea, eb))
+        print(f"    детерминизм {os.path.basename(g)}: {same}/{len(ea)} "
               f"эпизодов совпали")
-        bad += len(a) - same
+        bad += len(ea) - same
 sys.exit(1 if bad else 0)
 PY
   then

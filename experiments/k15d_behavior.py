@@ -41,7 +41,19 @@ import numpy as np
 CATASTROPHE = -0.15
 MODES = dict(safety=dict(tasks=[8, 9], states=list(range(25))),
              dev=dict(tasks=list(range(10)), states=list(range(25))),
+             confirm=dict(tasks=list(range(8)), states=list(range(25))),
              target=dict(tasks=None, states=list(range(25))))
+# ПОДТВЕРЖДАЮЩЕЕ ПРАВИЛО, ЗАФИКСИРОВАННОЕ ДО РОЛЛАУТОВ (07.10.2026).
+# Гипотеза «h18 лучше q0» родилась на safety (задачи 8-9, состояния 0-24),
+# поэтому подтверждается на НЕ ВИДЕННЫХ кластерах: задачи 0-7, состояния
+# 0-24, 200 кластеров. Единственная первичная пара — h18 против q0; равный
+# вес восьми задач, стратифицированный по задачам кластерный бутстрап
+# K-14q; успех — нижняя граница двустороннего 90 % интервала разности
+# строго выше нуля. Всё остальное (другие руки и пары, задачи 8-9) —
+# описательно. Менять правило после начала роллаутов confirm нельзя.
+CONFIRM = dict(base="q0", cand="h18", tasks=list(range(8)),
+               states=list(range(25)), interval="two-sided 90%",
+               rule="ci90_lo > 0", registered="07.10.2026, до роллаутов")
 SEEDS = [101]
 ARMS = ("q0", "d0", "h18", "h1")
 PAIRS = (("q0", "d0"), ("q0", "h18"), ("q0", "h1"), ("d0", "h18"),
@@ -65,17 +77,93 @@ def parse_arms(text):
     return [x for x in ARMS if x in arms]
 
 
+# ЧТО ИМЕННО ИСПОЛНЯЕТ КАЖДАЯ МЕТКА. Проверяется по КАЖДОМУ артефакту
+# fail-closed: артефакт h1p2 под меткой h18, h18 на 24 слоях или посторонняя
+# политика под меткой q0 — технический отказ, а не тихое сравнение.
+ARM_SPEC = {
+    "q0":  dict(policy="depthrvq", depth_rvq_mode="fast", levels=1),
+    "d0":  dict(policy="k15d", phase="d0", layers_per_call=24, level="d"),
+    "h18": dict(policy="k15d", phase="h1p1", layers_per_call=18, level="1"),
+    "h1":  dict(policy="k15d", phase="h1p2", layers_per_call=24, level="2"),
+}
+# Набор задач, в котором определены safety, confirm и dev.
+MODE_SUITE = dict(safety="10", dev="10", confirm="10")
+
+
+def check_arm_spec(d, arm):
+    """Артефакт d действительно исполняет то, что значит метка arm."""
+    spec = ARM_SPEC[arm]
+    j = d.get("joint") or {}
+    argv = d.get("argv") or {}
+    got = dict(policy=d.get("policy"))
+    if spec["policy"] == "depthrvq":
+        got.update(depth_rvq_mode=argv.get("depth_rvq_mode"),
+                   levels=d.get("levels"))
+    else:
+        got.update(phase=j.get("phase"),
+                   layers_per_call=j.get("layers_per_call"),
+                   level=j.get("level"))
+    bad = {k: (got.get(k), v) for k, v in spec.items() if got.get(k) != v}
+    return [f"метка {arm}: {k} = {g!r}, ожидалось {w!r}"
+            for k, (g, w) in sorted(bad.items())]
+
+
 def arm_provenance(paths, arm):
-    """Чекпойнт и исключение из фильтра у руки по её артефактам."""
+    """Чекпойнт, код и исключение из фильтра у руки по её артефактам.
+
+    Сюда же попадают отпечатки модели, модулей уточнения и руки и версия
+    харнесса: по ним раннер решает, открывает ли прошлый safety dev.
+    """
     seen = set()
     for p in paths:
-        j = (json.load(open(p)).get("joint") or {})
+        d = json.load(open(p))
+        j = d.get("joint") or {}
         seen.add(json.dumps(dict(
             checkpoint_sha1=j.get("checkpoint_sha1"), phase=j.get("phase"),
-            layers_per_call=j.get("layers_per_call"),
+            layers_per_call=j.get("layers_per_call"), level=j.get("level"),
+            model_fingerprint=j.get("model_fingerprint"),
+            refine_module_sha1=j.get("refine_module_sha1"),
+            policy_module_sha1=j.get("policy_module_sha1"),
+            harness_sha1=d.get("script_sha1"),
             admission_override=j.get("admission_override")),
             sort_keys=True, ensure_ascii=False))
     return [json.loads(x) for x in sorted(seen)]
+
+
+def check_actions_npz(paths):
+    """Отпечаток npz действий, записанный в JSON, пересчитывается."""
+    import hashlib
+    bad = []
+    for p in paths:
+        d = json.load(open(p))
+        npz, want = d.get("actions_npz"), d.get("actions_npz_sha1")
+        if not npz or not want:
+            bad.append(f"{os.path.basename(p)}: нет npz действий или его "
+                       f"отпечатка")
+            continue
+        f = os.path.join(os.path.dirname(p), npz)
+        if not os.path.exists(f):
+            bad.append(f"{os.path.basename(p)}: нет {npz}")
+            continue
+        h = hashlib.sha1()
+        with open(f, "rb") as fh:
+            for b in iter(lambda: fh.read(1 << 22), b""):
+                h.update(b)
+        if h.hexdigest()[:12] != want:
+            bad.append(f"{os.path.basename(p)}: отпечаток {npz} не совпал с "
+                       f"записанным")
+    return bad
+
+
+def confirm_verdict(technical, lo, hi, point_delta):
+    """Первичная пара h18 против q0 на задачах 0-7."""
+    if technical:
+        return dict(code=3, outcome=f"технический отказ: {technical}")
+    ok = lo > 0.0
+    return dict(code=0 if ok else 4, outcome=(
+        f"h18 против q0: разность {point_delta:+.4f}, 90 % [{lo:+.4f}, "
+        f"{hi:+.4f}] — {'ПОДТВЕРЖДЕНО' if ok else 'НЕ подтверждено'} "
+        f"(правило: нижняя граница > 0)"))
 
 
 def safety_verdict(technical, deltas, catastrophe=CATASTROPHE):
@@ -166,6 +254,23 @@ def main():
             technical.append(f"кластеров {len(clusters)} из {len(want_cl)}")
         if seeds != SEEDS:
             technical.append(f"сиды {seeds}, зарегистрирован {SEEDS}")
+    # ЧТО ИСПОЛНЯЛА КАЖДАЯ МЕТКА, НАБОР ЗАДАЧ И ОТПЕЧАТКИ npz — по КАЖДОМУ
+    # артефакту.
+    want_suite = MODE_SUITE.get(a.mode)
+    for nm in arms:
+        for p_ in meta[nm]["files"]:
+            d_ = json.load(open(p_))
+            technical += [f"{os.path.basename(p_)}: {x}"
+                          for x in check_arm_spec(d_, nm)]
+            if want_suite is not None and str(d_.get("suite")) != want_suite:
+                technical.append(f"{os.path.basename(p_)}: набор "
+                                 f"{d_.get('suite')!r}, режим {a.mode} "
+                                 f"определён на {want_suite}")
+        technical += check_actions_npz(meta[nm]["files"])
+    if a.mode == "confirm" and not {CONFIRM["base"], CONFIRM["cand"]} \
+            <= set(arms):
+        technical.append(f"в confirm нет первичной пары {CONFIRM['base']}, "
+                         f"{CONFIRM['cand']}")
     shas = set()
     for nm in arms:
         shas |= set(meta[nm]["script_shas"])
@@ -208,7 +313,14 @@ def main():
             sr_cand=kb.point(sr[c], clusters), delta=kb.point(d, clusters),
             ci90_delta=ci["delta"], rescue=kb.point(res, clusters),
             harm=kb.point(hrm, clusters), per_task=per_task)
-    if a.mode in ("safety", "target"):
+    if a.mode == "confirm":
+        prim = pairs.get(f"{CONFIRM['cand']}_vs_{CONFIRM['base']}")
+        if prim is None:
+            verdict = dict(code=3, outcome="нет первичной пары")
+        else:
+            verdict = confirm_verdict(technical, prim["ci90_delta"][0],
+                                      prim["ci90_delta"][1], prim["delta"])
+    elif a.mode in ("safety", "target"):
         verdict = safety_verdict(technical, {
             c: v["delta"] for k, v in pairs.items()
             for c in [v["cand"]] if v["base"] == "q0"})
@@ -235,7 +347,7 @@ def main():
     for nm, s in levels.items():
         if s:
             print(f"  {nm}: вызовов {s['calls']}, средняя |поправка| "
-                  f"последнего уровня " + ", ".join(
+                  f"последнего уровня по выданным чанкам " + ", ".join(
                       f"{x:.4f}" for x in s["mean_abs_delta_last"])
                   + "; max|a| " + ", ".join(f"{x:.3f}" for x in s["absmax"]))
     print(f"  ИСХОД ({a.mode}): {verdict['outcome']} (код {verdict['code']})")
@@ -248,7 +360,8 @@ def main():
                              for nm in arms},
                partial=bool(a.allow_partial),
                thresholds=dict(catastrophe=CATASTROPHE,
-                               declared="план K-15d §13, до данных"))
+                               declared="план K-15d §13, до данных"),
+               confirm_rule=(CONFIRM if a.mode == "confirm" else None))
     os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".",
                 exist_ok=True)
     tmp = a.out + f".tmp.{os.getpid()}"
@@ -268,6 +381,23 @@ def selftest():
         raise AssertionError("target без задач принят")
     except SystemExit:
         pass
+    assert len(expected_clusters("confirm")) == 200
+    assert confirm_verdict([], 0.01, 0.2, 0.1)["code"] == 0
+    assert confirm_verdict([], 0.0, 0.2, 0.1)["code"] == 4     # строго > 0
+    assert confirm_verdict(["x"], 0.1, 0.2, 0.1)["code"] == 3
+    # метка обязана исполнять своё
+    k = lambda ph, ly, lv: dict(policy="k15d", joint=dict(
+        phase=ph, layers_per_call=ly, level=lv))
+    assert check_arm_spec(k("h1p1", 18, "1"), "h18") == []
+    assert check_arm_spec(k("h1p2", 24, "2"), "h18")          # h1 под h18
+    assert check_arm_spec(k("h1p1", 24, "1"), "h18")          # не 18 слоёв
+    assert check_arm_spec(k("d0", 24, "d"), "d0") == []
+    assert check_arm_spec(k("h1p2", 24, "2"), "h1") == []
+    q0a = dict(policy="depthrvq", levels=1, argv=dict(depth_rvq_mode="fast"))
+    assert check_arm_spec(q0a, "q0") == []
+    assert check_arm_spec(dict(q0a, policy="fullbar"), "q0")
+    assert check_arm_spec(dict(q0a, argv=dict(depth_rvq_mode="full")), "q0")
+    assert check_arm_spec(k("d0", 24, "d"), "q0")
     assert parse_arms("q0,h1") == ["q0", "h1"]
     assert parse_arms("h1,q0,d0,h18") == ["q0", "d0", "h18", "h1"]
     for bad in ("h1", "q0", "q0,x", "q0,h1,h1"):
@@ -293,6 +423,18 @@ def selftest():
             < 1e-12
         assert s["absmax"][0] == 1.5 and s["finite"]
         assert level_summary(paths, "h1") is None
+        # отпечаток npz пересчитывается
+        np.savez(os.path.join(td, "a.actions.npz"), actions=np.zeros(3))
+        import hashlib
+        sha = hashlib.sha1(open(os.path.join(td, "a.actions.npz"),
+                                "rb").read()).hexdigest()[:12]
+        art = os.path.join(td, "a.json")
+        json.dump(dict(actions_npz="a.actions.npz", actions_npz_sha1=sha),
+                  open(art, "w"))
+        assert check_actions_npz([art]) == []
+        json.dump(dict(actions_npz="a.actions.npz",
+                       actions_npz_sha1="000000000000"), open(art, "w"))
+        assert check_actions_npz([art])
     print("самопроверка k15d_behavior пройдена")
     return 0
 
