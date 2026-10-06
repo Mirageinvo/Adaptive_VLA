@@ -139,23 +139,46 @@ TAG="$(tag_for "$K15D_ARMS")"
 # Допуск по прошлой сводке: рука исполняется ТЕМ ЖЕ кодом и чекпойнтом,
 # что в пройденном прогоне-предпосылке. Для руки с исключением из фильтра
 # предпосылка — safety (и та же причина), для final — confirm.
-admitted_by () {   # рука, шаблон сводок, причина ("" — исключения нет)
+admitted_by () {   # рука, режим сводки, причина ("" — исключения нет)
   python3 - "$1" "$(sha12 "$(ck_of "$1")")" "$3" \
     "$(sha12 experiments/k9h_multiarm_gate.py)" \
     "$(sha12 experiments/k15d_depth_refine.py)" \
     "$(sha12 experiments/k15d_policy.py)" "$2" <<'PY'
 import glob, json, os, sys
 sys.path.insert(0, "experiments")
-from k15d_behavior import ARM_SPEC
-arm, cks, reason, harness, refine, policy, pattern = sys.argv[1:8]
+from k15d_behavior import ARM_SPEC, RULES, SEEDS, expected_clusters
+arm, cks, reason, harness, refine, policy, mode = sys.argv[1:8]
 spec = ARM_SPEC[arm]
+
+
+def summary_ok(d):
+    """Сводка — ровно того режима, состава и правила, что требуются."""
+    if d.get("mode") != mode or d.get("partial"):
+        return False
+    if d.get("verdict", {}).get("code") != 0:
+        return False
+    if d.get("clusters") != len(expected_clusters(mode)):
+        return False
+    if d.get("seeds") != SEEDS or arm not in (d.get("arms") or []):
+        return False
+    if mode in RULES:
+        rule = json.loads(json.dumps(RULES[mode]))
+        if d.get("confirm_rule") != rule:
+            return False
+        if d.get("arms") != [rule["base"], rule["cand"]]:
+            return False
+        if d.get("tasks") != rule["tasks"]:
+            return False
+    return True
+
+
 want = dict(checkpoint_sha1=cks, phase=spec["phase"],
             layers_per_call=spec["layers_per_call"], harness_sha1=harness,
             refine_module_sha1=refine, policy_module_sha1=policy)
 ok = False
-for f in glob.glob(pattern):
+for f in glob.glob(f"reports/k15d/rollout/behavior_{mode}_s101_*.json"):
     d = json.load(open(f))
-    if d.get("verdict", {}).get("code") != 0 or d.get("partial"):
+    if not summary_ok(d):
         continue
     for pv in (d.get("provenance") or {}).get(arm, []):
         same = all(str(pv.get(k)) == str(v) for k, v in want.items())
@@ -168,7 +191,7 @@ PY
 }
 
 if [ "$MODE" = "final" ]; then
-  if ! admitted_by h18 "reports/k15d/rollout/behavior_confirm_s101_*.json" ""
+  if ! admitted_by h18 confirm ""
   then
     echo "ОТКАЗ: final открывается только после пройденного confirm с тем же"
     echo "  исполнением h18 (чекпойнт, фаза, слои, харнесс, модули)"
@@ -196,8 +219,7 @@ then
   for A in $K15D_ARMS; do
     OV="$(override_of "$A")"
     [ -n "$OV" ] || continue
-    if ! admitted_by "$A" \
-         "reports/k15d/rollout/behavior_safety_s101_*.json" "$OV"
+    if ! admitted_by "$A" safety "$OV"
     then
       echo "ОТКАЗ: рука $A с исключением из фильтра не прошла safety с тем"
       echo "  же исполнением (чекпойнт, фаза, слои, харнесс, модули) и той же"
@@ -332,7 +354,7 @@ if [ "$MODE" = "ablate" ]; then
           | tr '\n' ' ' || true)"
   python3 experiments/k15d_behavior.py --mode dev \
     --expected-arms q0,d0,h18,h1 --arts $ARTS \
-    --out "reports/k15d/rollout/behavior_dev_s101_10_${TAG}.json" \
+    --out "reports/k15d/rollout/behavior_dev_s101_10_$(tag_for "d0 h18 h1").json" \
     --overwrite || CODE=$?
   echo "=== КОНЕЦ $(date), сводный dev: код $CODE ==="
   exit $CODE
