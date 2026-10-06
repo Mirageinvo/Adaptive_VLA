@@ -71,6 +71,11 @@ def main():
     ap.add_argument("--allow-smoke", action="store_true",
                     help="smoke-чекпойнт: отчёт помечается smoke и годится "
                          "только для предполётной проверки роллаута")
+    ap.add_argument("--allow-failed-admission", default=None,
+                    metavar="ПРИЧИНА",
+                    help="чекпойнт, НЕ допущенный фильтром, проверяется и "
+                         "получает право на руку только с этой текстовой "
+                         "причиной; она и проваленные гейты пишутся в отчёт")
     ap.add_argument("--out", default=None)
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
@@ -100,7 +105,11 @@ def main():
     g15a, g15d = kp.gate_paths(a.device)
     ctx = k15_context.build(kp.context_namespace(a.device, g15a))
     torch_, model, dev = ctx.torch, ctx.model, ctx.dev
-    L = kp.load_refiner(ctx, a.checkpoint, k15d_gate=g15d, preflight=smoke)
+    L = kp.load_refiner(ctx, a.checkpoint, k15d_gate=g15d, preflight=smoke,
+                        override=a.allow_failed_admission)
+    if L.exception is not None:
+        print(f"  ИСКЛЮЧЕНИЕ ИЗ ФИЛЬТРА ДОПУСКА: {L.exception['reason']}; "
+              f"проваленные гейты {L.exception['failed']}")
     act = kp.make_act(ctx, L, verbose=True)
     lv = L.level
     val_all = list(ctx.parts_full["val_sel"])
@@ -164,7 +173,9 @@ def main():
         rows=int(len(errk)), checkpoint=os.path.abspath(a.checkpoint),
         checkpoint_sha1=kp.sha_file(a.checkpoint),
         checkpoint_run_id=ck0.get("run_id"), phase=ck0.get("phase"),
-        level=lv, device=str(dev), train_report=train_report,
+        level=lv, layers_per_call=L.layers,
+        admission_override=L.exception,
+        device=str(dev), train_report=train_report,
         train_report_sha1=kp.sha_file(train_report),
         refine_module_sha1=kp.sha_file(dr.__file__),
         policy_module_sha1=kp.sha_file(kp.__file__),

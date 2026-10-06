@@ -7,8 +7,14 @@
 средние, rescue/harm, стратифицированный по задачам кластерный бутстрап с
 равным весом задач.
 
-ПАРЫ: d0 против q0, h1 против q0, h1 против d0. Для каждой — успех обеих
-рук, разность с двусторонним 90 % интервалом, rescue, harm и по задачам.
+РУКИ: q0; d0 (a_d, 24 слоя); h18 (a1 чекпойнта h1p1, проход до 18-го
+слоя); h1 (a2 чекпойнта h1p2, 24 слоя). Состав задаётся --expected-arms и
+проверяется ТОЧНО: пропущенная рука — технический отказ, а не тихое
+сравнение оставшихся.
+
+ПАРЫ: каждая рука против q0; h1 и h18 против d0; h1 против h18. Для каждой
+— успех обеих рук, разность с двусторонним 90 % интервалом, rescue, harm и
+по задачам.
 
 РЕЖИМЫ (план §13):
     safety  задачи 8-9, 50 кластеров. Технический пилот: набор полон и
@@ -16,6 +22,9 @@
             конечны, и ни у D0, ни у H1 нет катастрофы — разность успеха
             против q0 не ниже CATASTROPHE (-0.15). Это НЕ вывод об
             эффективности.
+    target  прицельный пилот на задачах --tasks (состояния 0-24): та же
+            проверка катастрофы, что в safety, на задаче, где фильтр
+            допуска нашёл риск.
     dev     250 кластеров. Зарегистрированного порога успеха в плане нет:
             печатаются величины, решение — по ним человеком. Код 0 при
             технической исправности.
@@ -31,15 +40,42 @@ import numpy as np
 
 CATASTROPHE = -0.15
 MODES = dict(safety=dict(tasks=[8, 9], states=list(range(25))),
-             dev=dict(tasks=list(range(10)), states=list(range(25))))
+             dev=dict(tasks=list(range(10)), states=list(range(25))),
+             target=dict(tasks=None, states=list(range(25))))
 SEEDS = [101]
-ARMS = ("q0", "d0", "h1")
-PAIRS = (("q0", "d0"), ("q0", "h1"), ("d0", "h1"))
+ARMS = ("q0", "d0", "h18", "h1")
+PAIRS = (("q0", "d0"), ("q0", "h18"), ("q0", "h1"), ("d0", "h18"),
+         ("d0", "h1"), ("h18", "h1"))
 
 
-def expected_clusters(mode):
+def expected_clusters(mode, tasks=None):
     m = MODES[mode]
-    return sorted((t, s) for t in m["tasks"] for s in m["states"])
+    tasks = m["tasks"] if m["tasks"] is not None else tasks
+    if not tasks:
+        raise SystemExit(f"режим {mode} требует --tasks")
+    return sorted((t, s) for t in tasks for s in m["states"])
+
+
+def parse_arms(text):
+    arms = [x.strip() for x in str(text).split(",") if x.strip()]
+    bad = [x for x in arms if x not in ARMS]
+    if bad or "q0" not in arms or len(arms) < 2 or len(set(arms)) != len(arms):
+        raise SystemExit(f"--expected-arms {text!r}: нужен q0 и хотя бы одна "
+                         f"рука из {list(ARMS[1:])}, без повторов")
+    return [x for x in ARMS if x in arms]
+
+
+def arm_provenance(paths, arm):
+    """Чекпойнт и исключение из фильтра у руки по её артефактам."""
+    seen = set()
+    for p in paths:
+        j = (json.load(open(p)).get("joint") or {})
+        seen.add(json.dumps(dict(
+            checkpoint_sha1=j.get("checkpoint_sha1"), phase=j.get("phase"),
+            layers_per_call=j.get("layers_per_call"),
+            admission_override=j.get("admission_override")),
+            sort_keys=True, ensure_ascii=False))
+    return [json.loads(x) for x in sorted(seen)]
 
 
 def safety_verdict(technical, deltas, catastrophe=CATASTROPHE):
@@ -91,6 +127,10 @@ def main():
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--mode", choices=tuple(MODES), default=None)
     ap.add_argument("--arts", nargs="*", default=[])
+    ap.add_argument("--expected-arms", default=",".join(ARMS),
+                    help="точный состав рук через запятую, например q0,h1")
+    ap.add_argument("--tasks", default="",
+                    help="для --mode target: номера задач через запятую")
     ap.add_argument("--allow-partial", action="store_true",
                     help="только для смоука: неполный набор — не результат")
     ap.add_argument("--allow-preflight", action="store_true")
@@ -111,18 +151,19 @@ def main():
                 and not a.allow_preflight):
             raise SystemExit(f"{p_}: артефакт предполётной проверки")
     obs, meta = kb.load(a.arts)
-    arms = [x for x in ARMS if x in meta]
-    if "q0" not in arms or len(arms) < 2:
-        raise SystemExit(f"нужны q0 и хотя бы одна рука K-15d; есть "
-                         f"{sorted(meta)}")
-    clusters, seeds = kb.align(obs, arms)
+    arms = parse_arms(a.expected_arms)
+    tasks = [int(x) for x in a.tasks.split(",") if x.strip()]
+    want_cl = expected_clusters(a.mode, tasks)
     technical = []
+    # СОСТАВ РУК — ТОЧНО ЗАЯВЛЕННЫЙ, в том числе в смоуке: лишняя или
+    # пропавшая рука означает, что раннер и анализ говорят о разном.
+    if set(meta) != set(arms):
+        raise SystemExit(f"руки в артефактах {sorted(meta)}, заявлены "
+                         f"{arms}")
+    clusters, seeds = kb.align(obs, arms)
     if not a.allow_partial:
-        if set(arms) != set(ARMS):
-            technical.append(f"руки {arms}, нужны {list(ARMS)}")
-        if clusters != expected_clusters(a.mode):
-            technical.append(f"кластеров {len(clusters)} из "
-                             f"{len(expected_clusters(a.mode))}")
+        if clusters != want_cl:
+            technical.append(f"кластеров {len(clusters)} из {len(want_cl)}")
         if seeds != SEEDS:
             technical.append(f"сиды {seeds}, зарегистрирован {SEEDS}")
     shas = set()
@@ -134,8 +175,13 @@ def main():
     if len(shas) > 1:
         technical.append(f"артефакты сняты разными версиями k9h: "
                          f"{sorted(shas)}")
-    act_max, levels = {}, {}
+    act_max, levels, prov = {}, {}, {}
     for nm in arms:
+        if nm != "q0":
+            prov[nm] = arm_provenance(meta[nm]["files"], nm)
+            if len(prov[nm]) != 1:
+                technical.append(f"у руки {nm} разные чекпойнты или "
+                                 f"исключения по блокам: {prov[nm]}")
         bad, act_max[nm] = kc.finite_actions(meta[nm]["files"])
         technical += bad
         if nm != "q0":
@@ -162,7 +208,7 @@ def main():
             sr_cand=kb.point(sr[c], clusters), delta=kb.point(d, clusters),
             ci90_delta=ci["delta"], rescue=kb.point(res, clusters),
             harm=kb.point(hrm, clusters), per_task=per_task)
-    if a.mode == "safety":
+    if a.mode in ("safety", "target"):
         verdict = safety_verdict(technical, {
             c: v["delta"] for k, v in pairs.items()
             for c in [v["cand"]] if v["base"] == "q0"})
@@ -181,6 +227,11 @@ def main():
         print("    по задачам: " + "; ".join(
             f"{t}: {x['sr_base']:.2f}->{x['sr_cand']:.2f}"
             for t, x in v["per_task"].items()))
+    for nm, pv in prov.items():
+        for x in pv:
+            if x.get("admission_override"):
+                print(f"  ВНИМАНИЕ: рука {nm} НЕ допущена фильтром, "
+                      f"исключение: {x['admission_override']}")
     for nm, s in levels.items():
         if s:
             print(f"  {nm}: вызовов {s['calls']}, средняя |поправка| "
@@ -191,7 +242,8 @@ def main():
     out = dict(kind="k15d_behavior", mode=a.mode, verdict=verdict,
                technical=technical, pairs=pairs, levels=levels,
                action_absmax=act_max, clusters=len(clusters), seeds=seeds,
-               arms=arms, script_sha1=sorted(shas),
+               arms=arms, tasks=tasks or MODES[a.mode]["tasks"],
+               provenance=prov, script_sha1=sorted(shas),
                fingerprints={nm: sorted(meta[nm]["fingerprints"])
                              for nm in arms},
                partial=bool(a.allow_partial),
@@ -210,6 +262,20 @@ def main():
 def selftest():
     assert len(expected_clusters("safety")) == 50
     assert len(expected_clusters("dev")) == 250
+    assert len(expected_clusters("target", [3])) == 25
+    try:
+        expected_clusters("target")
+        raise AssertionError("target без задач принят")
+    except SystemExit:
+        pass
+    assert parse_arms("q0,h1") == ["q0", "h1"]
+    assert parse_arms("h1,q0,d0,h18") == ["q0", "d0", "h18", "h1"]
+    for bad in ("h1", "q0", "q0,x", "q0,h1,h1"):
+        try:
+            parse_arms(bad)
+            raise AssertionError(f"принят состав {bad!r}")
+        except SystemExit:
+            pass
     assert safety_verdict(["x"], {"d0": 0.0})["code"] == 3
     assert safety_verdict([], {"d0": 0.0, "h1": -0.2})["code"] == 4
     assert safety_verdict([], {"d0": -0.15, "h1": 0.1})["code"] == 0

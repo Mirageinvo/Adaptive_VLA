@@ -1016,6 +1016,58 @@ def integration():
                 except SystemExit as e:
                     codes["arm_bad_report_refused"] = (
                         0 if "другого файла" in str(e) else str(e))
+                # --- рука h18: чекпойнт h1p1, проход до 18-го слоя ------
+                p1_path = os.path.join(td, "h1p1_full.pt")
+                rep18 = os.path.join(td, "inference_h18.json")
+                sys.argv = ["x", "--checkpoint", p1_path, "--device", "cpu",
+                            "--train-report",
+                            os.path.join(td, "h1p1_full.json"),
+                            "--out", rep18]
+                codes["inference_h18"] = ki.main()
+                arm18 = kp.build_arm("cpu", p1_path, rep18, torch,
+                                     init_gate=gate, k15d_gate=gate)
+                assert arm18.meta["layers_per_call"] == 18
+                assert arm18.meta["levels"] == ["1"]
+                arm18.act(ctx.build_batch(po, sel), po, ac, True)
+                s18, a18 = arm18.log.take()
+                assert set(a18) == {"k15d_a0", "k15d_level_1"}, set(a18)
+                # --- исключение из фильтра допуска ------------------------
+                ck2 = torch.load(ck_path, map_location="cpu",
+                                 weights_only=False)
+                adm = dict(ck2["admission"], admissible=False, passed=False)
+                adm["gates"] = dict(adm["gates"], task_rms=dict(
+                    adm["gates"]["task_rms"], passed=False))
+                nad = os.path.join(td, "h1p2_notadmitted.pt")
+                torch.save(dict(ck2, admission=adm), nad)
+                rep_n = os.path.join(td, "inference_notadmitted.json")
+                base_argv = ["x", "--checkpoint", nad, "--device", "cpu",
+                             "--train-report",
+                             os.path.join(td, "h1p2_full.json"),
+                             "--out", rep_n]
+                sys.argv = list(base_argv)
+                try:
+                    ki.main()
+                    codes["notadmitted_refused"] = 1
+                except SystemExit as e:
+                    codes["notadmitted_refused"] = (
+                        0 if "причин" in str(e) else str(e))
+                sys.argv = base_argv + ["--allow-failed-admission",
+                                        "контроль"]
+                codes["override_inference"] = ki.main()
+                irn = json.load(open(rep_n))
+                assert irn["admission_override"]["reason"] == "контроль"
+                assert "task_rms" in irn["admission_override"]["failed"]
+                armn = kp.build_arm("cpu", nad, rep_n, torch, init_gate=gate,
+                                    k15d_gate=gate, override="контроль")
+                assert armn.meta["admission_override"]["reason"] == \
+                    "контроль"
+                try:
+                    kp.build_arm("cpu", nad, rep_n, torch, init_gate=gate,
+                                 k15d_gate=gate)
+                    codes["override_arm_needs_reason"] = 1
+                except SystemExit as e:
+                    codes["override_arm_needs_reason"] = (
+                        0 if "исключение" in str(e) else str(e))
             finally:
                 kp.gate_paths = saved_gp
             dg = rep2["final"]["diagnostics"]
@@ -1039,7 +1091,9 @@ def integration():
               "smoke_d0", "smoke_h1p1", "smoke_h1p2",
               "h1p2_from_smoke_refused", "seed_mismatch_refused",
               "partial_phase1_refused", "rerun_d0", "rerun_archived",
-              "inference", "arm_bad_report_refused"):
+              "inference", "arm_bad_report_refused", "inference_h18",
+              "notadmitted_refused", "override_inference",
+              "override_arm_needs_reason"):
         assert codes[k] == 0, (k, codes[k])
     for k in ("full_h1p1", "full_h1p2"):
         assert codes[k] in (0, 4), (k, codes[k])

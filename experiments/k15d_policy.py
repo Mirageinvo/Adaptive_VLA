@@ -4,16 +4,23 @@
 
 ЧТО ИСПОЛНЯЕТСЯ НА КАЖДОМ ВЫЗОВЕ ПОЛИТИКИ — ровно путь обучения и оценки:
 
-    один проход `DepthRefiner.run` (D0: 24 слоя; H1: 24 слоя, a1 на 18),
-    a0 = декод канонического q0, итоговое действие — последний уровень
-    (D0: a_d, H1: a2). Харнесс получает ГОТОВЫЙ нормированный чанк
-    (`ActionChunk`) и декодер кодека к нему не применяет.
+    один проход `DepthRefiner.run`, a0 = декод канонического q0, итоговое
+    действие — уровень фазы чекпойнта:
+      d0   -> a_d, 24 слоя;
+      h1p2 -> a2,  24 слоя (a1 снимается по пути на 18-м);
+      h1p1 -> a1,  ПРОХОД ОСТАНАВЛИВАЕТСЯ НА 18-м слое (stop_after="1"):
+              слои 19–24 не исполняются вовсе, ни VLM, ни action expert.
+    Харнесс получает ГОТОВЫЙ нормированный чанк (`ActionChunk`) и декодер
+    кодека к нему не применяет.
 
 ПРИВЯЗКА. Рука собирается только если:
   * чекпойнт — завершённый (`status == "complete"`, `final`,
-    `technical_ok`), фазы d0 или h1p2, режима full, допущен фильтром
+    `technical_ok`), фазы d0, h1p1 или h1p2, режима full, допущен фильтром
     (`admission.admissible`); в предполётном режиме — наоборот, только
-    smoke-чекпойнт;
+    smoke-чекпойнт. НЕ допущенный фильтром чекпойнт принимается только с
+    явной текстовой причиной исключения (`admission_override`); причина,
+    проваленные гейты и худшая задача пишутся в отчёт проверки вывода, в
+    метаданные руки и тем самым в каждый артефакт роллаута;
   * гейт K-15d ЭТОЙ карты пройден с тем же кодом уточнения, статистикой,
     замороженным и гиперпараметрами, что у чекпойнта;
   * отчёт проверки вывода снят для ЭТОГО файла чекпойнта, ЭТИМ модулем
@@ -37,7 +44,8 @@ from types import SimpleNamespace
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ARM_PHASES = {"d0": "d", "h1p2": "2"}
+ARM_PHASES = {"d0": "d", "h1p1": "1", "h1p2": "2"}
+LAYERS_PER_CALL = {"d0": 24, "h1p1": 18, "h1p2": 24}
 REPORT_KIND = "k15d_inference_check"
 ACTION_CLIP_BOUND = 1.5
 
@@ -60,8 +68,21 @@ def gate_paths(device):
             f"reports/k15d/init_identity_{tag}.json")
 
 
-def check_checkpoint(ck, *, preflight=False):
-    """Чекпойнт годен для руки. Чистая; список проблем."""
+def failed_admission(ck):
+    """Проваленные гейты допуска с их величинами — для записи исключения."""
+    gates = ((ck.get("admission") or {}).get("gates") or {})
+    return {k: {x: v for x, v in g.items() if x not in ("p99", "absmax",
+                                                          "ratio")}
+            for k, g in gates.items() if not g.get("passed")}
+
+
+def check_checkpoint(ck, *, preflight=False, override=None):
+    """Чекпойнт годен для руки. Чистая; список проблем.
+
+    override — текстовая причина исключения из фильтра допуска. Без неё не
+    допущенный чекпойнт отвергается; с ней — принимается, но только если он
+    в остальном исправен, а исключение затем записывается везде.
+    """
     p = []
 
     def need(cond, msg):
@@ -70,7 +91,7 @@ def check_checkpoint(ck, *, preflight=False):
 
     need(ck.get("kind") == "k15d_phase", f"kind {ck.get('kind')!r}")
     need(ck.get("phase") in ARM_PHASES,
-         f"фаза {ck.get('phase')!r}: рука — только d0 или h1p2")
+         f"фаза {ck.get('phase')!r}: рука — только {sorted(ARM_PHASES)}")
     need(ck.get("status") == "complete" and ck.get("final") is True,
          f"чекпойнт не завершён: status {ck.get('status')!r}")
     need(ck.get("technical_ok") is True, "технически не исправен")
@@ -78,10 +99,19 @@ def check_checkpoint(ck, *, preflight=False):
     if preflight:
         need(ck.get("mode") == "smoke",
              "предполётная проверка — только smoke-чекпойнт")
+        need(override is None,
+             "исключение из фильтра в предполётном режиме не нужно")
     else:
         need(ck.get("mode") == "full", f"режим {ck.get('mode')!r}, нужен full")
-        need((ck.get("admission") or {}).get("admissible") is True,
-             "фильтр допуска к роллауту не пройден")
+        admitted = (ck.get("admission") or {}).get("admissible") is True
+        if override is not None:
+            need(str(override).strip() != "",
+                 "исключение из фильтра без текстовой причины")
+            need(not admitted, "исключение задано для допущенного "
+                               "чекпойнта: оно ничего не исключает")
+        else:
+            need(admitted, "фильтр допуска к роллауту не пройден (нужна "
+                           "явная причина исключения)")
     return p
 
 
@@ -97,8 +127,13 @@ def check_gate_vs_ckpt(gate, ck, *, device):
     return p
 
 
-def check_report(report, *, ck_sha, refine_sha, policy_sha, preflight=False):
-    """Отчёт проверки вывода снят для этого чекпойнта этим кодом."""
+def check_report(report, *, ck_sha, refine_sha, policy_sha, preflight=False,
+                 override=None):
+    """Отчёт проверки вывода снят для этого чекпойнта этим кодом.
+
+    Исключение из фильтра обязано совпасть с тем, под которым снят отчёт:
+    рука не может «доопределить» причину задним числом.
+    """
     p = []
     if report is None:
         return ["нет отчёта проверки вывода"]
@@ -122,6 +157,9 @@ def check_report(report, *, ck_sha, refine_sha, policy_sha, preflight=False):
              "предполётная проверка — только со smoke-отчётом")
     else:
         need(report.get("smoke") is not True, "отчёт снят на smoke-чекпойнте")
+    got = (report.get("admission_override") or {}).get("reason")
+    need(got == override,
+         f"исключение из фильтра: в отчёте {got!r}, у руки {override!r}")
     return p
 
 
@@ -170,7 +208,8 @@ def context_namespace(device, init_gate, root="third_party/actioncodec"):
     return argparse.Namespace(**ns)
 
 
-def load_refiner(ctx, checkpoint, *, k15d_gate, preflight=False):
+def load_refiner(ctx, checkpoint, *, k15d_gate, preflight=False,
+                 override=None):
     """Контекст, чекпойнт и гейт K-15d → установленное уточнение.
 
     Общая часть руки и проверки вывода: обе обязаны собрать одно и то же.
@@ -191,7 +230,7 @@ def load_refiner(ctx, checkpoint, *, k15d_gate, preflight=False):
         joint_sha1=ctx.joint_sha, plan_sha1=ctx.q0_prov["plan_sha1"],
         frozen_sha1=frozen, stats_sha1=stats["sha1"], hp=dict(dr.HP)))
     ck = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    problems = check_checkpoint(ck, preflight=preflight)
+    problems = check_checkpoint(ck, preflight=preflight, override=override)
     problems += check_gate_vs_ckpt(gate, ck, device=dev)
     if problems:
         raise SystemExit(f"чекпойнт {checkpoint} не годится для руки: "
@@ -204,22 +243,35 @@ def load_refiner(ctx, checkpoint, *, k15d_gate, preflight=False):
     train_names = {n for n, _ in ref.phase_named_parameters(ck["phase"])}
     if dr.state_sha(ref, train_names) != ck.get("selected_level_sha1"):
         raise SystemExit("уточнение загрузилось не той точкой")
+    names = ref.level_names()
+    computed = names[:names.index(level) + 1]
+    exception = None
+    if override is not None:
+        exception = dict(reason=str(override), failed=failed_admission(ck))
     return SimpleNamespace(ref=ref, ck=ck, gate=gate, stats=stats,
-                           level=level, frozen=frozen, h_exec=int(H_EXEC))
+                           level=level, computed=computed,
+                           layers=LAYERS_PER_CALL[ck["phase"]],
+                           frozen=frozen, h_exec=int(H_EXEC),
+                           exception=exception)
 
 
 def make_act(ctx, L, *, log=None, verbose=True):
     """act(batch, pos_off, autocast, first) -> (чанк [B,T,7], коды q0)."""
     torch, model = ctx.torch, ctx.model
     ref, level = L.ref, L.level
-    names = ref.level_names()
+    names = L.computed       # только реально посчитанные уровни
 
     def act(batch, pos_off, autocast, first):
         with torch.no_grad(), autocast:
             v, p_ = model.build_inputs(position_offset=pos_off, **batch)
+            # stop_after: у h1p1 проход останавливается на 18-м слое.
             out = ref.run(model, vlm_inputs_embeds=v,
                           attention_mask=batch.get("attention_mask"),
-                          position_ids=p_, decode=ctx.decode_fp32)
+                          position_ids=p_, decode=ctx.decode_fp32,
+                          stop_after=level)
+        if sorted(out["actions"]) != sorted(names):
+            raise SystemExit(f"рука k15d: посчитаны уровни "
+                             f"{sorted(out['actions'])}, ожидались {names}")
         a = out["actions"][level]
         if not bool(torch.isfinite(a).all()):
             raise SystemExit("рука k15d: действие не конечно")
@@ -234,8 +286,8 @@ def make_act(ctx, L, *, log=None, verbose=True):
                                  "веса уточнения не встали")
             if verbose:
                 print(f"    проверка k15d: уровни {names}, исполняется "
-                      f"{level}; max|a-a0| {moved:.4f}, max|a| {amax:.3f}",
-                      flush=True)
+                      f"{level}, слоёв {L.layers}; max|a-a0| {moved:.4f}, "
+                      f"max|a| {amax:.3f}", flush=True)
         if log is not None:
             log.add(out["a0"].cpu().numpy(),
                     {n: out["actions"][n].cpu().numpy() for n in names})
@@ -245,7 +297,8 @@ def make_act(ctx, L, *, log=None, verbose=True):
 
 
 def build_arm(device, checkpoint, inference_report, torch, *,
-              preflight=False, init_gate=None, k15d_gate=None):
+              preflight=False, init_gate=None, k15d_gate=None,
+              override=None):
     """Рука целиком. Модель создаётся здесь — после сред харнесса."""
     import k15_context
     import k15d_depth_refine as dr
@@ -260,18 +313,19 @@ def build_arm(device, checkpoint, inference_report, torch, *,
     refine_sha = sha_file(dr.__file__)
     policy_sha = sha_file(os.path.abspath(__file__))
     problems = check_report(report, ck_sha=ck_sha, refine_sha=refine_sha,
-                            policy_sha=policy_sha, preflight=preflight)
+                            policy_sha=policy_sha, preflight=preflight,
+                            override=override)
     if problems:
         raise SystemExit("рука K-15d не собрана: " + "; ".join(problems))
     ctx = k15_context.build(context_namespace(device, init_gate))
     L = load_refiner(ctx, checkpoint, k15d_gate=k15d_gate,
-                     preflight=preflight)
-    log = LevelLog(L.ref.level_names(), L.h_exec)
+                     preflight=preflight, override=override)
+    log = LevelLog(L.computed, L.h_exec)
     act = make_act(ctx, L, log=log)
     ck = L.ck
     meta = dict(
         arm="k15d", phase=ck["phase"], variant=ck["variant"],
-        level=L.level, levels=L.ref.level_names(),
+        level=L.level, levels=L.computed,
         checkpoint=os.path.abspath(checkpoint), checkpoint_sha1=ck_sha,
         checkpoint_run_id=ck.get("run_id"),
         selected_tag=ck.get("selected_tag"),
@@ -285,7 +339,9 @@ def build_arm(device, checkpoint, inference_report, torch, *,
         k15a_gate=ctx.gate_info, code_version=ctx.code_version,
         joint_sha1=ctx.joint_sha, codec=ctx.codec_fp,
         admission=(ck.get("admission") or {}).get("admissible"),
-        preflight=bool(preflight), decodes_per_call=1, layers_per_call=24)
+        admission_override=L.exception,
+        preflight=bool(preflight), decodes_per_call=1,
+        layers_per_call=L.layers)
     import k15_train_depth_rvq as k15t
     try:
         meta = json.loads(json.dumps(meta, default=k15t.json_scalar))
@@ -306,7 +362,7 @@ def selftest():
                 admission=dict(admissible=True), stats_sha1="S",
                 frozen_sha1="F")
     assert check_checkpoint(good) == []
-    for why, mut in (("фаза h1p1", dict(phase="h1p1")),
+    for why, mut in (("неизвестная фаза", dict(phase="h1p3")),
                      ("partial", dict(status="partial", final=False)),
                      ("validating", dict(status="validating")),
                      ("технический отказ", dict(technical_ok=False)),
@@ -318,6 +374,18 @@ def selftest():
     assert check_checkpoint(sm, preflight=True) == []
     assert check_checkpoint(good, preflight=True)       # настоящий — нельзя
     assert check_checkpoint(dict(good, phase="h1p2")) == []
+    assert check_checkpoint(dict(good, phase="h1p1")) == []
+    # исключение из фильтра: только с причиной, только для не допущенного
+    bad_adm = dict(good, admission=dict(admissible=False, gates=dict(
+        task_rms=dict(passed=False, worst_ratio=1.11, worst_task="t"),
+        range=dict(passed=True))))
+    assert check_checkpoint(bad_adm)
+    assert check_checkpoint(bad_adm, override="контроль D0") == []
+    assert check_checkpoint(bad_adm, override="  ")
+    assert check_checkpoint(good, override="лишнее")
+    assert failed_admission(bad_adm) == {"task_rms": dict(
+        passed=False, worst_ratio=1.11, worst_task="t")}
+    assert LAYERS_PER_CALL["h1p1"] == 18
 
     gate = dict(device="cuda:0", stats_sha1="S", frozen_sha1="F")
     assert check_gate_vs_ckpt(gate, good, device="cuda:0") == []
@@ -338,6 +406,11 @@ def selftest():
                      ("другой kind", dict(kind="x"))):
         assert check_report(dict(rep, **mut), **kw), why
     assert check_report(None, **kw)
+    ov = dict(rep, admission_override=dict(reason="контроль D0"))
+    assert check_report(ov, override="контроль D0", **kw) == []
+    assert check_report(ov, **kw)                    # рука без исключения
+    assert check_report(rep, override="контроль D0", **kw)
+    assert check_report(ov, override="другая причина", **kw)
     assert check_report(dict(rep, smoke=True), preflight=True, **kw) == []
     assert check_report(rep, preflight=True, **kw)
 

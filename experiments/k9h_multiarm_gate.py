@@ -664,6 +664,11 @@ def main() -> None:
     ap.add_argument("--k15d-report", default=None,
                     help="K-15d: отчёт проверки вывода ЭТОГО чекпойнта "
                          "ЭТИМ кодом уточнения и руки")
+    ap.add_argument("--k15d-admission-override", default=None,
+                    metavar="ПРИЧИНА",
+                    help="K-15d: рука на чекпойнте, не допущенном фильтром; "
+                         "причина обязана совпасть с отчётом проверки "
+                         "вывода и пишется в каждый артефакт")
     ap.add_argument("--k15d-preflight", action="store_true",
                     help="K-15d: предполётная проверка на smoke-чекпойнте; "
                          "только в каталог с /preflight/ в пути")
@@ -775,9 +780,11 @@ def main() -> None:
         if args.k15d_preflight and "/preflight/" not in str(args.out or ""):
             raise SystemExit("--k15d-preflight пишет только в каталог с "
                              "/preflight/ в пути")
-    elif args.refiner or args.k15d_report or args.k15d_preflight:
-        raise SystemExit("--refiner, --k15d-report и --k15d-preflight "
-                         "осмысленны только с --policy k15d")
+    elif (args.refiner or args.k15d_report or args.k15d_preflight
+          or args.k15d_admission_override):
+        raise SystemExit("--refiner, --k15d-report, --k15d-preflight и "
+                         "--k15d-admission-override осмысленны только с "
+                         "--policy k15d")
     if args.policy == "fast" and not args.policy_ckpt:
         raise SystemExit("--policy fast требует --policy-ckpt")
     if args.policy not in ("fast", "hicora", "depthrvq") and args.policy_ckpt:
@@ -927,7 +934,8 @@ def main() -> None:
         import k15d_policy as _k15d
         k15d_arm = _k15d.build_arm(args.device, args.refiner,
                                    args.k15d_report, torch,
-                                   preflight=args.k15d_preflight)
+                                   preflight=args.k15d_preflight,
+                                   override=args.k15d_admission_override)
         model, proc = k15d_arm.model, k15d_arm.proc
     elif args.policy == "k15c":
         # РУКА K-15c СОБИРАЕТ СВОЮ, КАНОНИЧЕСКУЮ МОДЕЛЬ — ту же, на которой
@@ -1017,7 +1025,11 @@ def main() -> None:
               f"{policy_meta['level']}, точка {policy_meta['selected_tag']}, "
               f"чекпойнт {policy_meta['checkpoint_sha1']}, проверка вывода "
               f"{policy_meta['inference_report_sha1']}; отпечаток модели "
-              f"{policy_meta['model_fingerprint']}", flush=True)
+              f"{policy_meta['model_fingerprint']}; слоёв "
+              f"{policy_meta['layers_per_call']}", flush=True)
+        if policy_meta.get("admission_override"):
+            print(f"  ВНИМАНИЕ: рука НЕ допущена фильтром, исключение: "
+                  f"{policy_meta['admission_override']}", flush=True)
     elif args.policy == "k15c":
         policy_meta = dict(k15c_arm.meta)
         policy_meta["arm_fingerprint"] = hashlib.sha1("|".join(
