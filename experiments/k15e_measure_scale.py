@@ -43,6 +43,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 
 import numpy as np
@@ -72,6 +73,56 @@ H18_CONTRACT = ("checkpoint_sha1", "selected_level_sha1",
                 "frozen_content_sha", "joint_sha1", "k15d_gate_run_id",
                 "code_version", "codec", "k15a_gate")
 START_FIELDS = ("init_hash", "init_hash_full", "rollout_seed")
+ACTION_SHA_RE = re.compile(r"^[0-9a-f]{16}$")
+
+
+def present(v):
+    """Поле контракта задано: непустая строка, непустой словарь, не None."""
+    if v is None:
+        return False
+    if isinstance(v, str):
+        return bool(v.strip())
+    if isinstance(v, (dict, list)):
+        return len(v) > 0
+    return True
+
+
+def check_episodes(paths, seeds=EXPECTED_SEEDS):
+    """Каждый эпизод: хеш действий формата k9h, сид раскатки = сиду
+    заголовка = зарегистрированному; npz действий связан с JSON — тот же
+    порядок init_state_id и те же action_sha1."""
+    bad = []
+    for p in paths:
+        d = json.load(open(p))
+        name = os.path.basename(p)
+        if int(d.get("seed", -1)) not in seeds:
+            bad.append(f"{name}: сид заголовка {d.get('seed')}")
+        for e in d.get("episodes", []):
+            if not ACTION_SHA_RE.match(str(e.get("action_sha1") or "")):
+                bad.append(f"{name}: эпизод {e.get('init_state_id')} без "
+                           f"хеша действий формата k9h")
+            if e.get("rollout_seed") is None or \
+                    int(e["rollout_seed"]) != int(d.get("seed", -1)):
+                bad.append(f"{name}: эпизод {e.get('init_state_id')}: сид "
+                           f"раскатки {e.get('rollout_seed')} не равен "
+                           f"сиду заголовка {d.get('seed')}")
+        npz = d.get("actions_npz")
+        if not npz:
+            continue        # отсутствие npz ловит check_actions_npz
+        f = os.path.join(os.path.dirname(p), npz)
+        if not os.path.exists(f):
+            continue
+        try:
+            with np.load(f, allow_pickle=True) as z:
+                sha = [str(x) for x in z["action_sha1"]]
+                ids = [int(x) for x in z["init_state_id"]]
+        except Exception as ex:          # noqa: BLE001 — любой сбой = отказ
+            bad.append(f"{name}: npz не читается ({ex})")
+            continue
+        if sha != [str(e.get("action_sha1")) for e in d["episodes"]] or \
+                ids != [int(e["init_state_id"]) for e in d["episodes"]]:
+            bad.append(f"{name}: npz действий не совпадает с эпизодами JSON")
+    return bad
 
 
 def check_arm(d, arm):
@@ -104,7 +155,7 @@ def check_contracts(contracts, fields):
     p, seen = [], set()
     for arm, lst in contracts.items():
         for c in lst:
-            miss = [k for k in fields if c.get(k) is None]
+            miss = [k for k in fields if not present(c.get(k))]
             if miss:
                 p.append(f"{arm}: в контракте нет {miss}")
             seen.add(json.dumps(c, sort_keys=True, ensure_ascii=False))
@@ -224,6 +275,7 @@ def analyze(arts, h18_arts, tasks, states, allow_partial=False,
                 contracts.setdefault(nm, []).append(
                     contract_of(d, ALPHA_CONTRACT))
         technical += check_actions_npz(meta[nm]["files"])
+        technical += check_episodes(meta[nm]["files"])
         if len(meta[nm]["fingerprints"]) != 1:
             technical.append(f"у руки {nm} несколько моделей")
     technical += check_contracts(contracts, ALPHA_CONTRACT)
@@ -249,6 +301,9 @@ def analyze(arts, h18_arts, tasks, states, allow_partial=False,
         technical.append("нет руки a000 — тождество с q0 не проверено")
     if "a100" in meta:
         ref_ok = bool(h18_arts)
+        # ЭТАЛОН ПРОВЕРЯЕТСЯ ТАК ЖЕ, КАК ТЕКУЩИЕ РУКИ: npz, хеши, сиды.
+        technical += [f"эталон h18: {x}" for x in check_actions_npz(h18_arts)]
+        technical += [f"эталон h18: {x}" for x in check_episodes(h18_arts)]
         h18_contracts = []
         for p in h18_arts:
             d = json.load(open(p))
@@ -390,12 +445,9 @@ def _fake_set(td, tasks=(0, 8), mutate=None):
         for t in tasks:
             eps = []
             for s in range(5):
-                if arm in ("q0", "a000"):
-                    ah = f"q{t}{s}"
-                elif arm in ("a100", "h18"):
-                    ah = f"h{t}{s}"
-                else:
-                    ah = f"{arm}{t}{s}"
+                tag = ("q" if arm in ("q0", "a000") else
+                       "h" if arm in ("a100", "h18") else arm)
+                ah = hashlib.sha1(f"{tag}{t}{s}".encode()).hexdigest()[:16]
                 eps.append(dict(success=bool(rng.random() < 0.7),
                                 init_state_id=s, env_index=s,
                                 init_hash=f"i{t}{s}", init_hash_full=f"I{t}{s}",
@@ -419,7 +471,12 @@ def _fake_set(td, tasks=(0, 8), mutate=None):
             if mutate:
                 d = mutate(arm, t, d)
             base = os.path.join(td, f"{arm}_t{t}_i0")
-            np.savez(base + ".actions.npz", actions=np.zeros(2))
+            np.savez(base + ".actions.npz", actions=np.zeros(2),
+                     action_sha1=np.asarray(
+                         [str(e.get("action_sha1")) for e in d["episodes"]],
+                         dtype="U64"),
+                     init_state_id=np.asarray(
+                         [e["init_state_id"] for e in d["episodes"]]))
             d["actions_npz"] = os.path.basename(base) + ".actions.npz"
             d["actions_npz_sha1"] = hashlib.sha1(open(
                 base + ".actions.npz", "rb").read()).hexdigest()[:12]
@@ -475,7 +532,7 @@ def selftest():
         """Противоречивый дубликат эталона h18."""
         src = os.path.join(td, "h18_t0_i0.json")
         d = json.load(open(src))
-        d["episodes"][0]["action_sha1"] = "ДРУГОЕ"
+        d["episodes"][0]["action_sha1"] = "e" * 16
         p = os.path.join(td, "h18dup_t0_i0.json")
         json.dump(d, open(p, "w"))
         return [p]
@@ -483,8 +540,8 @@ def selftest():
     # мутация -> (аргументы, фрагмент ПРИЧИНЫ отказа): тест требует, чтобы
     # поймала именно нужная проверка, а не любая другая
     cases = {
-        "a000 != q0": (dict(mutate=sha("a000", "X")), "тождество a000"),
-        "a100 != h18": (dict(mutate=sha("a100", "X")), "тождество a100"),
+        "a000 != q0": (dict(mutate=sha("a000", "f" * 16)), "тождество a000"),
+        "a100 != h18": (dict(mutate=sha("a100", "f" * 16)), "тождество a100"),
         "другие старты у эталона h18": (dict(mutate=start("h18")),
                                         "другой старт"),
         "нет эталона h18": (dict(h18_drop=True), "не покрыт эталоном"),
@@ -508,6 +565,40 @@ def selftest():
             e["rollout_seed"] = 999
         return d
     cases["сид 999"] = (dict(mutate=all_seed), "сиды")
+
+    def no_sha(arms_):
+        def m(arm, t, d):
+            if arm in arms_:
+                for e in d["episodes"]:
+                    e.pop("action_sha1", None)
+            return d
+        return m
+
+    def ep_seed(arm, t, d):
+        for e in d["episodes"]:
+            e["rollout_seed"] = 999          # заголовок остаётся 101
+        return d
+
+    def empty_contract(arm, t, d):
+        if arm not in ("q0", "h18"):
+            d["joint"] = dict(d["joint"], k15e_policy_sha1="",
+                              candidates_module_sha1=" ",
+                              inference_report_sha1="")
+        return d
+
+    def empty_dict(arm, t, d):
+        if arm not in ("q0", "h18"):
+            d["joint"] = dict(d["joint"], codec={})
+        return d
+    cases["нет action_sha1 у q0/a000/a100/h18"] = (
+        dict(mutate=no_sha(("q0", "a000", "a100", "h18"))),
+        "без хеша действий")
+    cases["сид раскатки 999 при заголовке 101"] = (dict(mutate=ep_seed),
+                                                    "сид раскатки")
+    cases["пустые строки контракта"] = (dict(mutate=empty_contract),
+                                        "в контракте нет")
+    cases["пустой словарь кодека"] = (dict(mutate=empty_dict),
+                                      "в контракте нет")
     for why, (kw, reason) in cases.items():
         r = run(**kw)
         assert r["code"] == 3, f"мутация «{why}» не поймана"
@@ -522,13 +613,39 @@ def selftest():
         r = analyze(arts, h18, [0, 8], range(5), n_boot=200)
         assert r["code"] == 3, "подменённый npz не пойман"
         assert any("отпечаток" in x for x in r["technical"])
+    # повреждённый npz ЭТАЛОНА h18
+    with tempfile.TemporaryDirectory() as td:
+        arts, h18 = _fake_set(td)
+        np.savez(os.path.join(td, "h18_t0_i0.actions.npz"),
+                 actions=np.ones(3))
+        r = analyze(arts, h18, [0, 8], range(5), n_boot=200)
+        assert r["code"] == 3 and any("эталон h18" in x and "отпечаток" in x
+                                      for x in r["technical"]), \
+            "повреждённый npz эталона не пойман"
+    # npz с верным отпечатком, но другими хешами действий, чем в JSON
+    with tempfile.TemporaryDirectory() as td:
+        arts, h18 = _fake_set(td)
+        import hashlib
+        f = os.path.join(td, "a050_t8_i0.actions.npz")
+        np.savez(f, actions=np.zeros(2),
+                 action_sha1=np.asarray(["0" * 16] * 5),
+                 init_state_id=np.arange(5))
+        j = os.path.join(td, "a050_t8_i0.json")
+        d = json.load(open(j))
+        d["actions_npz_sha1"] = hashlib.sha1(open(f, "rb").read()
+                                             ).hexdigest()[:12]
+        json.dump(d, open(j, "w"))
+        r = analyze(arts, h18, [0, 8], range(5), n_boot=200)
+        assert r["code"] == 3 and any("не совпадает с эпизодами" in x
+                                      for x in r["technical"]), \
+            "npz, не связанный с JSON, не пойман"
     # --allow-partial не снимает сид и тождества
     with tempfile.TemporaryDirectory() as td:
         arts, h18 = _fake_set(td, mutate=all_seed)
         r = analyze(arts, h18, [0, 8], range(5), allow_partial=True,
                     n_boot=200)
         assert r["code"] == 3
-    print(f"самопроверка k15e_measure_scale пройдена: {len(cases) + 2} "
+    print(f"самопроверка k15e_measure_scale пройдена: {len(cases) + 4} "
           f"мутаций пойманы")
     return 0
 
