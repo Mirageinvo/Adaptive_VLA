@@ -83,7 +83,7 @@ import numpy as np
 
 N_POS, N_LEVEL = 16, 3
 POLICIES = ("fullbar", "coarse24", "fast", "hicora", "depthrvq", "k15c",
-            "k15d")
+            "k15d", "k15e")
 
 # Режимы depth-RVQ повторяют имена базового класса: сколько уровней успевает
 # выдать ОДИН сегментированный проход, остановившись на соответствующем
@@ -331,7 +331,7 @@ def levels_of(policy, depth_rvq_mode=None):
         return 2
     # K-15d: дискретен только q0; уточнение непрерывное, и харнесс получает
     # готовый чанк (`ActionChunk`). 1 — описание, а не способ сборки.
-    if policy == "k15d":
+    if policy in ("k15d", "k15e"):
         return 1
     return N_LEVEL if policy == "fullbar" else 1
 
@@ -451,6 +451,7 @@ def selftest():
     assert levels_of("fast") == 1 and levels_of("fullbar", "medium") == N_LEVEL
     assert "k15c" in POLICIES and levels_of("k15c") == 2
     assert "k15d" in POLICIES and levels_of("k15d") == 1
+    assert "k15e" in POLICIES and levels_of("k15e") == 1
     # --- ПРОИСХОЖДЕНИЕ ГОЛОВЫ q1: КАЖДАЯ МУТАЦИЯ ОТВЕРГАЕТСЯ -------------
     # Прежняя версия требовала НАЛИЧИЯ q0_prov и нигде его не сверяла.
     # Наличие поля — не проверка поля, и голова другого сида, варианта или
@@ -672,6 +673,9 @@ def main() -> None:
     ap.add_argument("--k15d-preflight", action="store_true",
                     help="K-15d: предполётная проверка на smoke-чекпойнте; "
                          "только в каталог с /preflight/ в пути")
+    ap.add_argument("--k15e-alpha", type=float, default=None,
+                    help="K-15e M0: масштаб поправки h18, a0 + α·δ; только "
+                         "для --policy k15e")
     ap.add_argument("--arm-label", default=None,
                     help="ОБЯЗАТЕЛЕН. Различает руки внутри эксперимента, "
                          "например fullbar, coarse24_b10, coarse24_b5, "
@@ -785,6 +789,11 @@ def main() -> None:
         raise SystemExit("--refiner, --k15d-report, --k15d-preflight и "
                          "--k15d-admission-override осмысленны только с "
                          "--policy k15d")
+    if args.policy == "k15e":
+        if args.k15e_alpha is None:
+            raise SystemExit("--policy k15e требует --k15e-alpha")
+    elif args.k15e_alpha is not None:
+        raise SystemExit("--k15e-alpha осмысленен только с --policy k15e")
     if args.policy == "fast" and not args.policy_ckpt:
         raise SystemExit("--policy fast требует --policy-ckpt")
     if args.policy not in ("fast", "hicora", "depthrvq") and args.policy_ckpt:
@@ -937,6 +946,13 @@ def main() -> None:
                                    preflight=args.k15d_preflight,
                                    override=args.k15d_admission_override)
         model, proc = k15d_arm.model, k15d_arm.proc
+    elif args.policy == "k15e":
+        # K-15e M0: тот же аттестованный путь h18 и масштаб α. Объект руки
+        # имеет интерфейс руки k15d (act, log, meta), и дальше харнесс
+        # обращается с ним так же.
+        import k15e_policy as _k15e
+        k15d_arm = _k15e.build_arm(args.device, args.k15e_alpha, torch)
+        model, proc = k15d_arm.model, k15d_arm.proc
     elif args.policy == "k15c":
         # РУКА K-15c СОБИРАЕТ СВОЮ, КАНОНИЧЕСКУЮ МОДЕЛЬ — ту же, на которой
         # построены кэш и голова, со своими проверками и гейтом K-15a. Вторая
@@ -1016,6 +1032,15 @@ def main() -> None:
               f"веса sha {weights_sha}, source={obj.get('source')}, "
               f"ствол {dig}"
               + ("" if ck_dig is not None else " (в чекпойнте не записан)"))
+    elif args.policy == "k15e":
+        policy_meta = dict(k15d_arm.meta)
+        policy_meta["arm_fingerprint"] = hashlib.sha1("|".join(
+            [str(args.arm_label), policy_meta["model_fingerprint"]]
+        ).encode()).hexdigest()[:12]
+        print(f"  рука k15e: α={policy_meta['alpha']}, чекпойнт h18 "
+              f"{policy_meta['checkpoint_sha1']}, кандидаты "
+              f"{policy_meta['candidates_module_sha1']}; отпечаток модели "
+              f"{policy_meta['model_fingerprint']}", flush=True)
     elif args.policy == "k15d":
         policy_meta = dict(k15d_arm.meta)
         policy_meta["arm_fingerprint"] = hashlib.sha1("|".join(
@@ -1052,7 +1077,7 @@ def main() -> None:
     import contextlib
     autocast = (torch.autocast("cuda", dtype=torch.float16)
                 if args.policy in ("fast", "hicora", "depthrvq", "k15c",
-                                   "k15d")
+                                   "k15d", "k15e")
                 else contextlib.nullcontext())
 
     ac = proc.action_processor
@@ -1417,7 +1442,7 @@ def main() -> None:
                       f"пределе {lim:.4f}", flush=True)
             return Latent(out["z"])
 
-        if args.policy == "k15d":
+        if args.policy in ("k15d", "k15e"):
             a_, q0c = k15d_arm.act(batch, pos_off, autocast, first)
             if first:
                 check_assembly(np.concatenate([q0c] * N_LEVEL, axis=1))
