@@ -4,7 +4,12 @@
 #   smoke  задачи 0 и 8, состояния 0-4: все руки, тождества a000 = q0 и
 #          a100 = h18 K-15d (по хешам действий), диапазон, конечность;
 #   probe  задачи 0-9, состояния 0-4 (50 кластеров), все руки — замер
-#          оракула и контроля направления (k15e_measure_scale.py).
+#          оракула и зеркального контроля направления.
+#
+# Анализ (k15e_measure_scale.py) — fail-closed: тождества a000 = q0 и
+# a100 = h18 обязаны выполняться на КАЖДОМ эпизоде, сид 101, один контракт
+# h18 у всех α. Любое нарушение — код 3; в цепочке smoke && probe он
+# останавливает probe.
 #
 # РУКИ: q0; a000 a025 a050 a075 a100 (масштабы поправки h18); am050 am100
 # (контроль: та же поправка против направления). Каждая рука на каждой
@@ -78,9 +83,17 @@ run_arm () {   # метка, задача
   local L="$1" T="$2" rc=0 NEED=""
   for I0 in $STATES; do
     local F="$OUTD/${L}_t${T}_i${I0}.json"
-    if [ -f "$F" ] && python3 -c "import json;json.load(open('$F'))" \
-         >/dev/null 2>&1; then continue; fi
-    rm -f "$F"
+    # ГОТОВ — только если JSON читается И его npz действий на месте с тем
+    # же отпечатком (харнесс публикует npz раньше JSON).
+    if [ -f "$F" ] && python3 - "$F" >/dev/null 2>&1 <<'PY'
+import hashlib, json, os, sys
+d = json.load(open(sys.argv[1]))
+f = os.path.join(os.path.dirname(sys.argv[1]), d["actions_npz"])
+h = hashlib.sha1(open(f, "rb").read()).hexdigest()[:12]
+sys.exit(0 if h == d["actions_npz_sha1"] else 1)
+PY
+    then continue; fi
+    rm -f "$F" "${F%.json}.actions.npz"
     NEED="$NEED${NEED:+,}$I0"
   done
   [ -z "$NEED" ] && { echo "    $L t$T: уже есть"; return 0; }

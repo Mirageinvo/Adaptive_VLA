@@ -108,6 +108,7 @@ def build_arm(device, alpha, torch, *, checkpoint=H18_CKPT,
         k15d_gate_run_id=L.gate.get("run_id"),
         stats_sha1=L.stats["sha1"], frozen_content_sha=L.frozen,
         k15a_gate=ctx.gate_info, joint_sha1=ctx.joint_sha,
+        code_version=ctx.code_version,
         codec=ctx.codec_fp, admission_override=None, preflight=False,
         decodes_per_call=1, layers_per_call=18)
     import k15_train_depth_rvq as k15t
