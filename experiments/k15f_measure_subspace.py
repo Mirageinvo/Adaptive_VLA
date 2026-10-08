@@ -18,7 +18,11 @@
             R_C — то же для контроля; парно: L-only и C-only.
             мощность:     F >= 12, иначе решения нет;
             перспективно: R_L >= ceil(F/3) И R_L − R_C >= 3;
-            закрыть:      R_L <= 2 ИЛИ R_L <= R_C;
+            не прошло:    R_L <= 2 ИЛИ R_L <= R_C — СЕМЕЙСТВО ПОСТОЯННЫХ
+                          поправок ±e_j (c фиксирован на весь эпизод) не
+                          прошло скрининг; комбинации направлений и
+                          переключение поправки между чанками этим НЕ
+                          исключены; текущий этап останавливается;
             иначе неясно (агент останавливается, без смены амплитуды,
             контроля и порогов).
           Это инженерный скрининг, а не доказательство улучшения SR.
@@ -188,7 +192,9 @@ def decide(F, RL, RC, rule=RULE):
     if F < rule["min_F"]:
         return "недостаточная мощность: решения нет"
     if RL <= rule["close_RL"] or RL <= RC:
-        return "закрыть данный rank-4 imitation-initialized базис"
+        return ("не прошло: семейство постоянных поправок ±e_j не прошло "
+                "скрининг (комбинации направлений и переключение между "
+                "чанками не исключены); текущий этап остановлен")
     if RL >= math.ceil(F * rule["promising_frac"]) and \
             RL - RC >= rule["promising_margin"]:
         return "перспективно: этап B (outcome-датасет, критик, actor)"
@@ -459,8 +465,8 @@ def selftest():
     assert decide(10, 9, 0).startswith("недостаточная")
     assert decide(15, 5, 2).startswith("перспективно")
     assert decide(15, 5, 3).startswith("неясно")
-    assert decide(15, 2, 0).startswith("закрыть")
-    assert decide(15, 4, 4).startswith("закрыть")
+    assert decide(15, 2, 0).startswith("не прошло")
+    assert decide(15, 4, 4).startswith("не прошло")
     cont = dict(basis_sha1="B", basis_state_sha1="S", stats_sha1="T",
                 amp_factor=1.0, control_seed=7, identity_report_sha1="I",
                 refine_module_sha1="R", k15f_policy_sha1="P",
@@ -563,7 +569,7 @@ def selftest():
         cand2 = {lab: [(p, json.load(open(p))) for p in
                        _fake(td, lab, TASKS, DESIGN_STATES, same,
                              joint=cont)] for lab in kp.all_labels()}
-        assert m1(cen, q0, cand2)["decision"].startswith("закрыть")
+        assert m1(cen, q0, cand2)["decision"].startswith("не прошло")
         # smoke: z = q0 обязателен
         zp = _fake(td, "z", [0, 8], range(5), q0_succ, joint=cont,
                    hash_fn=lambda l, t, s: __import__("hashlib").sha1(

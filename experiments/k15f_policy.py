@@ -53,6 +53,32 @@ def all_labels():
     return out
 
 
+def _level_log_cls():
+    import k15d_policy as kp
+    return kp.LevelLog
+
+
+class BasisLog:
+    """LevelLog K-15d плюс базис каждого вызова в массиве k15f_basis."""
+
+    def __init__(self, names, h_exec):
+        self._log = _level_log_cls()(names, h_exec)
+        self._basis = []
+
+    def add(self, a0, levels):
+        self._log.add(a0, levels)
+
+    def add_basis(self, b):
+        self._basis.append(np.asarray(b, np.float32))
+
+    def take(self):
+        summ, arrays = self._log.take()
+        if self._basis:
+            arrays = dict(arrays, k15f_basis=np.stack(self._basis))
+        self._basis = []
+        return summ, arrays
+
+
 def check_identity_report(rep, *, basis_sha, device, code,
                           gate_sha=None):
     p = []
@@ -109,7 +135,11 @@ def build_arm(device, basis, label, torch, *, identity_report=None):
     R = kf.rotation(int(ck["control_seed"])).to(dev)
     c = torch.tensor(c_list, device=dev)
     zero = not any(c_list)
-    log = kp.LevelLog([label], kf.H_EXEC)
+    # Журнал по вызовам: a0 и исполняемое действие (LevelLog) плюс базис
+    # δ(s_t) [B, 4, 56] — чтобы потом увидеть, ГДЕ поправка спасает или
+    # ломает. Оценка объёма: ~75 вызовов × 5 сред × 224 float32 ≈ 0.34 МБ
+    # на блок до сжатия.
+    log = BasisLog([label], kf.H_EXEC)
 
     def act(batch, pos_off, autocast, first):
         with torch.no_grad(), autocast:
@@ -153,6 +183,7 @@ def build_arm(device, basis, label, torch, *, identity_report=None):
                   f" слоёв 18, max|a-a0| {float((a - a0).abs().max()):.4f},"
                   f" max|a| {amax:.3f}", flush=True)
         log.add(a0.cpu().numpy(), {label: a.cpu().numpy()})
+        log.add_basis(basis_.float().cpu().numpy())
         return a.float().cpu().numpy(), q0.cpu().numpy()
 
     meta = dict(
@@ -206,6 +237,17 @@ def selftest():
                 dict(code_sha=dict(k15f_continuous_refine="Y")),
                 dict(code=4), dict(basis_state_dependent=False)):
         assert check_identity_report(dict(rep, **mut), **kw), mut
+    # журнал базиса: массив по вызовам, сбрасывается после take()
+    import sys as _s
+    if HERE not in _s.path:
+        _s.path.insert(0, HERE)
+    bl = BasisLog(["l0p"], 8)
+    a0 = np.zeros((5, 20, 7), np.float32)
+    bl.add(a0, {"l0p": a0 + 0.1})
+    bl.add_basis(np.ones((5, 4, 56)))
+    summ, arr = bl.take()
+    assert summ["calls"] == 1 and arr["k15f_basis"].shape == (1, 5, 4, 56)
+    assert "k15f_basis" not in bl.take()[1]
     assert np.isfinite(ACTION_CLIP_BOUND)
     print("самопроверка k15f_policy пройдена")
     return 0

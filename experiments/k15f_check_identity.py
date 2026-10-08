@@ -76,6 +76,9 @@ def check_basis_ckpt(ck):
         p.append("пределы геометрии в базисе не совпадают с текущими")
     if ck.get("control_seed") != kpb.CONTROL_SEED:
         p.append("сид контроля не зарегистрированный")
+    if ck.get("control_kind") != kf.CONTROL_KIND:
+        p.append(f"вид контроля {ck.get('control_kind')!r}, "
+                 f"зарегистрирован {kf.CONTROL_KIND!r}")
     if list(ck.get("amp_factors_considered") or []) != list(kpb.AMP_FACTORS):
         p.append("правило множителя амплитуды другое")
     if ck.get("kind") != "k15f_basis" or ck.get("status") != "complete":
@@ -372,7 +375,9 @@ def integration():
                 a_np, q0c = arm.act(ctx.build_batch(po, sel), po, ac, True)
                 assert np.array_equal(q0c, ctx.q0_can[np.asarray(sel)])
                 acts[lab] = a_np
-                assert arm.log.take()[0]["calls"] == 1
+                summ_, arr_ = arm.log.take()
+                assert summ_["calls"] == 1
+                assert arr_["k15f_basis"].shape[1:] == (len(sel), 4, 56)
             assert not np.array_equal(acts["l0p"], acts["z"])
             assert not np.array_equal(acts["r0p"], acts["l0p"])
             # рука отвергает отчёт гейта для другого файла базиса

@@ -34,9 +34,14 @@ train, ρ_j — p90 |<r*, U_j>|, w_j(s) — поправка от h18 (посл�
 a(s) = combine(a0, t(s)).
 
 КОНТРОЛЬ (M1). B_ctrl(s) = B(s)·R, R — фиксированная ортогональная
-матрица 56×56, блочная: отдельно для 48 координат руки и 8 координат
-схвата (вращение не смешивает руку со схватом). Сохраняет нормы
-направлений, их попарную геометрию и величину поправки при данном c.
+матрица 56×56: ОДНА случайная ортогональная Q (6×6) по каналам руки,
+одинаковая на каждом из 8 шагов, координаты схвата — без изменений.
+Сохраняет нормы направлений, их попарную геометрию, энергию каждого шага и
+всю временную структуру поправки руки (энергию каждой временной частоты в
+нормированных координатах), а поправка схвата у контроля та же, что у
+learned. Контроль отличается от learned только НАПРАВЛЕНИЕМ в пространстве
+каналов руки. Прежний вариант перемешивал все 48 координат руки и мог
+превращать плавную поправку в резко меняющуюся по времени.
 
 ПРЕДОБУЧЕНИЕ БАЗИСА — НЕ ПО УСПЕХУ. Для строки коэффициенты проекции
 остатка на текущий базис — ridge 4×4: c* = (ΔΔᵀ + λI)^{-1} Δ r*, потеря —
@@ -153,23 +158,26 @@ def stats_sha(st):
     return h.hexdigest()[:12]
 
 
+CONTROL_KIND = "arm6x6_same_per_step_grip_identity"
+
+
 def rotation(seed, dtype=torch.float32):
-    """Блочная ортогональная R [56, 56]: рука (48) и схват (8) отдельно.
+    """R [56, 56]: одна ортогональная Q 6×6 по каналам руки на каждом шаге,
+    схват — тождественно.
 
     Координаты t упорядочены как [шаг][канал]; индексы руки — каналы 0..5
     каждого шага, схвата — канал 6.
     """
     g = torch.Generator().manual_seed(int(seed))
+    q, r = torch.linalg.qr(torch.randn(6, 6, generator=g,
+                                       dtype=torch.float64))
+    q = q * torch.sign(torch.diagonal(r))[None]
     idx = torch.arange(D_T).view(H_EXEC, N_CH)
-    arm_idx = idx[:, :6].reshape(-1)
-    grip_idx = idx[:, 6].reshape(-1)
     R = torch.zeros(D_T, D_T, dtype=torch.float64)
-    for ids in (arm_idx, grip_idx):
-        n = len(ids)
-        q, r = torch.linalg.qr(torch.randn(n, n, generator=g,
-                                           dtype=torch.float64))
-        q = q * torch.sign(torch.diagonal(r))[None]
-        R[ids[:, None], ids[None, :]] = q
+    for k in range(H_EXEC):
+        a = idx[k, :6]
+        R[a[:, None], a[None, :]] = q
+        R[idx[k, 6], idx[k, 6]] = 1.0
     return R.to(dtype)
 
 
@@ -526,14 +534,32 @@ def selftest():
                                              * 0.5)
         assert bool(((a_x[:, :H_EXEC, 6] - off).abs() <= 1 + 1e-5).all())
         assert bool(torch.isfinite(a_x).all())
-    # 8. контроль: R ортогональна, блочная (рука/схват не смешиваются),
-    #    сохраняет нормы и попарную геометрию
+    # 8. контроль: R ортогональна, рука и схват не смешиваются, схват —
+    #    тождественно, одна и та же Q 6×6 на каждом шаге; сохраняет нормы,
+    #    попарную геометрию и ВРЕМЕННУЮ структуру руки
     R = rotation(7)
     assert torch.allclose(R @ R.T, torch.eye(D_T), atol=1e-5)
     idx = torch.arange(D_T).view(H_EXEC, N_CH)
     arm_i, grip_i = idx[:, :6].reshape(-1), idx[:, 6].reshape(-1)
     assert float(R[arm_i][:, grip_i].abs().max()) == 0.0
+    assert torch.equal(R[grip_i][:, grip_i], torch.eye(H_EXEC))
+    blocks = [R[idx[k, :6]][:, idx[k, :6]] for k in range(H_EXEC)]
+    assert all(torch.equal(b_, blocks[0]) for b_ in blocks)
+    for k in range(H_EXEC):                  # нет смешивания между шагами
+        for m in range(H_EXEC):
+            if k != m:
+                assert float(R[idx[k, :6]][:, idx[m, :6]].abs().max()) == 0
     bR = basis @ R
+    v = basis.view(B, K_BASIS, H_EXEC, N_CH)
+    vR = bR.view(B, K_BASIS, H_EXEC, N_CH)
+    # энергия каждого шага руки и энергия временных разностей сохранены,
+    # схват не изменён
+    assert torch.allclose(v[..., :6].pow(2).sum(-1),
+                          vR[..., :6].pow(2).sum(-1), atol=1e-5)
+    dv = (v[:, :, 1:, :6] - v[:, :, :-1, :6]).pow(2).sum((-1, -2))
+    dvR = (vR[:, :, 1:, :6] - vR[:, :, :-1, :6]).pow(2).sum((-1, -2))
+    assert torch.allclose(dv, dvR, atol=1e-5)
+    assert torch.equal(v[..., 6], vR[..., 6])
     assert torch.allclose(bR.norm(dim=-1), basis.norm(dim=-1), atol=1e-5)
     assert torch.allclose(bR @ bR.transpose(1, 2),
                           basis @ basis.transpose(1, 2), atol=1e-4)
