@@ -51,7 +51,16 @@ DESIGN_STATES = list(range(10))
 TASKS = list(range(10))
 DIAG_PER_TASK = 2
 RULE = dict(min_F=12, promising_frac=1.0 / 3.0, promising_margin=3,
-            close_RL=2, registered="08.10.2026, до роллаутов M1")
+            close_RL=2, grip_flip_ablation=0.10,
+            registered="08.10.2026, до роллаутов M1")
+# ЕСЛИ M1 ПЕРСПЕКТИВЕН, а хоть одно направление меняет решения схвата у
+# доли > grip_flip_ablation исполняемых шагов (отчёт предобучения), перед
+# архитектурным выводом ОБЯЗАТЕЛЬНА абляция arm-only против gripper-only.
+# Контракт раскатки, общий для q0 и всех кандидатов:
+SETUP = ("script_sha1", "suite", "horizon", "max_steps", "waiting_steps",
+         "ensemble", "rollout_seed_mode", "ckpt", "seed", "n_envs")
+CENSUS_FIELDS = ("kind", "code", "F", "fails", "diag", "blocks", "powered",
+                 "rule", "q0_files")
 CONTRACT = ("basis_sha1", "basis_state_sha1", "stats_sha1", "amp_factor",
             "control_seed", "identity_report_sha1", "refine_module_sha1",
             "k15f_policy_sha1", "frozen_content_sha", "joint_sha1",
@@ -177,13 +186,35 @@ def decide(F, RL, RC, rule=RULE):
     return "неясно: агент останавливается"
 
 
-def m1(cen, q0_arts, cand):
-    """cand: {метка: [(путь, артефакт)]} для 16 рук."""
+def check_setup(by_label):
+    """Один контракт раскатки у всех артефактов."""
+    seen = {}
+    for lab, arts in by_label.items():
+        for p, d in arts:
+            key = json.dumps({k: d.get(k) for k in SETUP}, sort_keys=True)
+            seen.setdefault(key, []).append(f"{lab}:{os.path.basename(p)}")
+    if len(seen) > 1:
+        return [f"разные контракты раскатки: {len(seen)} вариантов, "
+                f"например {[v[0] for v in seen.values()][:3]}"]
+    return []
+
+
+def m1(cen, q0_arts, cand, max_grip_flip=None):
+    """cand: {метка: [(путь, артефакт)]} для 16 рук.
+
+    Перепись ВЫЧИСЛЯЕТСЯ ЗАНОВО из q0-артефактов и обязана совпасть с
+    зарегистрированной во всех полях: иначе правленый JSON переписи мог бы
+    подменить популяцию кластеров при тех же q0.
+    """
     technical = list(cen.get("technical") or [])
-    for p, _d in q0_arts:
-        if cen["q0_files"].get(os.path.basename(p)) != _sha(p):
-            technical.append(f"{os.path.basename(p)}: q0 не тот, что в "
-                             f"переписи")
+    re_cen = census(q0_arts)
+    for k in CENSUS_FIELDS:
+        a_, b_ = (json.dumps(re_cen.get(k), sort_keys=True),
+                  json.dumps(cen.get(k), sort_keys=True))
+        if a_ != b_:
+            technical.append(f"перепись: поле {k} не совпало с "
+                             f"вычисленным заново по q0")
+    technical += check_setup(dict(cand, q0=q0_arts))
     labels = kp.all_labels()
     missing = [x for x in labels if x not in cand]
     if missing:
@@ -245,12 +276,24 @@ def m1(cen, q0_arts, cand):
     F = len(fails)
     decision = ("НЕ ПРИНИМАЕТСЯ: технический отказ" if technical
                 else decide(F, RL, RC))
+    ablation_required = bool(
+        decision.startswith("перспективно") and max_grip_flip is not None
+        and max_grip_flip > RULE["grip_flip_ablation"])
+    if decision.startswith("перспективно") and max_grip_flip is None:
+        technical.append("нет доли смены схвата из отчёта предобучения")
+    if ablation_required:
+        decision += ("; до архитектурного вывода обязательна абляция "
+                     "arm-only против gripper-only (смена схвата "
+                     f"{100 * max_grip_flip:.1f}% > "
+                     f"{100 * RULE['grip_flip_ablation']:.0f}%)")
     return dict(kind="k15f_m1", technical=technical,
                 code=3 if technical else 0, F=F, R_L=RL, R_C=RC,
                 L_only=l_only, C_only=c_only,
                 oracle_gain_pp=100.0 * RL / (len(TASKS) * len(DESIGN_STATES)),
                 per_arm=per_arm, per_task=per_task, decision=decision,
-                rule=RULE, n_diag=len(diag))
+                rule=RULE, n_diag=len(diag),
+                max_grip_flip_share=max_grip_flip,
+                ablation_required=ablation_required)
 
 
 def smoke(q0_arts, cand):
@@ -282,6 +325,8 @@ def main():
     ap.add_argument("--census", default="reports/k15f/m1_census.json")
     ap.add_argument("--out", default="")
     ap.add_argument("--overwrite-census", action="store_true")
+    ap.add_argument("--basis-report", default="reports/k15f/basis_s0.json",
+                    help="отчёт предобучения: доля смены схвата")
     a = ap.parse_args()
     if a.selftest:
         return selftest()
@@ -305,7 +350,11 @@ def main():
                   f"{ident.get('episodes')} эпизодов")
         else:
             cen = json.load(open(a.census))
-            res = m1(cen, q0, by)
+            flip = None
+            if os.path.exists(a.basis_report):
+                flip = json.load(open(a.basis_report)).get(
+                    "max_grip_flip_share")
+            res = m1(cen, q0, by, max_grip_flip=flip)
             print(f"  F = {res['F']}, R_L = {res['R_L']}, R_C = "
                   f"{res['R_C']}, только learned {res['L_only']}, только "
                   f"контроль {res['C_only']}; выигрыш оракула learned "
@@ -349,7 +398,9 @@ def _fake(td, label, tasks, states, succ_fn, joint=None, policy="k15f",
                                 rollout_seed=seed, action_sha1=h))
             d = dict(episodes=eps, arm_label=label, task_id=t,
                      init_start=blk, seed=seed, n_envs=5, suite="10",
-                     policy=policy, levels=1, script_sha1="K9H")
+                     policy=policy, levels=1, script_sha1="K9H",
+                     horizon=8, max_steps=600, waiting_steps=10,
+                     ensemble="off", rollout_seed_mode="fixed", ckpt="X")
             if policy == "depthrvq":
                 d.update(argv=dict(depth_rvq_mode="fast"),
                          joint=dict(model_fingerprint="q"))
@@ -405,10 +456,24 @@ def selftest():
         for lab in kp.all_labels():
             ps = _fake(td, lab, TASKS, DESIGN_STATES, cand_succ, joint=cont)
             cand[lab] = [(p, json.load(open(p))) for p in ps]
-        r = m1(cen, q0, cand)
+        r = m1(cen, q0, cand, max_grip_flip=0.05)
         assert r["code"] == 0, r["technical"]
         assert r["R_C"] == 0 and r["R_L"] >= 5, (r["R_L"], r["R_C"])
         assert r["decision"].startswith("перспективно"), r["decision"]
+        assert not r["ablation_required"]
+        r = m1(cen, q0, cand, max_grip_flip=0.3)
+        assert r["ablation_required"] and "абляция" in r["decision"]
+        # правленая перепись: другой состав провалов при тех же q0
+        cen_bad = dict(cen, fails=cen["fails"][1:], F=cen["F"] - 1)
+        assert any("перепись" in x for x in
+                   m1(cen_bad, q0, cand, 0.05)["technical"])
+        # другой контракт раскатки у одной руки
+        bad = dict(cand)
+        d = json.load(open(cand["l1p"][0][0]))
+        d["max_steps"] = 300
+        bad["l1p"] = [(cand["l1p"][0][0], d)] + cand["l1p"][1:]
+        assert any("контракты раскатки" in x for x in
+                   m1(cen, q0, bad, 0.05)["technical"])
         # мутации: метка не своя, другой контракт, другой старт, нет руки
         bad = dict(cand)
         d = json.load(open(cand["l0p"][0][0]))
@@ -433,7 +498,8 @@ def selftest():
         cen2 = dict(cen, q0_files=dict(cen["q0_files"]))
         k = next(iter(cen2["q0_files"]))
         cen2["q0_files"][k] = "000000000000"
-        assert any("переписи" in x for x in m1(cen2, q0, cand)["technical"])
+        assert any("перепись: поле q0_files" in x
+                   for x in m1(cen2, q0, cand)["technical"])
         # контроль спасает столько же -> закрыть
         def same(label, t, s):
             return True if (t, s) not in q0_fail else (s % 2 == 0)

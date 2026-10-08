@@ -61,19 +61,29 @@ if [ "$MODE" = "prep" ]; then
   python3 experiments/k15f_pretrain_basis.py --mode smoke --device "$DEV" \
     --cache "$CACHE"
   step "полный кэш h18"
-  if [ -f "$CACHE/COMPLETE" ]; then
-    echo "  кэш уже готов: $CACHE"
+  # ПРОПУСК — только если кэш проходит ПОЛНУЮ проверку (отпечатки всех
+  # файлов, формы, dtype, конечность, коды); одного COMPLETE мало
+  if python3 experiments/k15f_build_cache.py --verify "$CACHE"; then
+    echo "  кэш уже готов и цел: $CACHE"
   else
-    python3 experiments/k15f_build_cache.py --device "$DEV" --out "$CACHE"
+    python3 experiments/k15f_build_cache.py --device "$DEV" --out "$CACHE" \
+      --overwrite
   fi
   step "полное предобучение базиса"
   python3 experiments/k15f_pretrain_basis.py --mode full --device "$DEV" \
     --cache "$CACHE" --out "$BASIS"
   step "гейт тождества"
+  GC=0
   python3 experiments/k15f_check_identity.py --device "$DEV" \
-    --basis "$BASIS" --h18-cache "$CACHE" --out "$IDENT"
-  echo; echo "=== ПОДГОТОВКА ЗАКОНЧЕНА $(date)"
-  exit 0
+    --basis "$BASIS" --h18-cache "$CACHE" --out "$IDENT" || GC=$?
+  echo
+  case "$GC" in
+    0) echo "=== ПОДГОТОВКА ЗАКОНЧЕНА $(date): базис зависит от h18, можно M1" ;;
+    4) echo "=== ПОДГОТОВКА ЗАКОНЧЕНА $(date): базис — ГЛОБАЛЬНАЯ PCA (код 4)."
+       echo "    Это отдельный baseline, не иерархический K-15f; M1 не запускать" ;;
+    *) echo "=== ПОДГОТОВКА: ТЕХНИЧЕСКИЙ ОТКАЗ гейта (код $GC)" ;;
+  esac
+  exit "$GC"
 fi
 
 if [ "$MODE" = "rollouts" ]; then
@@ -84,6 +94,14 @@ fi
 for f in "$BASIS" "$IDENT"; do
   [ -f "$f" ] || { echo "ОТКАЗ: нет $f (сначала prep)"; exit 1; }
 done
+# РАСКАТКИ — только для базиса, зависящего от h18 (гейт с кодом 0)
+if ! python3 -c "import json,sys; r=json.load(open('$IDENT')); \
+sys.exit(0 if r.get('code') == 0 and r.get('basis_state_dependent') else 1)"
+then
+  echo "ОТКАЗ: гейт тождества не дал код 0 (базис не зависит от h18 или"
+  echo "  технический отказ) — M1 для иерархического K-15f не запускается"
+  exit 1
+fi
 sha12 () { sha1sum "$1" | cut -c1-12; }
 TAG="k9h$(sha12 experiments/k9h_multiarm_gate.py)_b$(sha12 \
 "$BASIS")_i$(sha12 "$IDENT")_p$(sha12 experiments/k15f_policy.py)"
@@ -185,6 +203,7 @@ print(' '.join(map(str, json.load(open('$CENSUS'))['blocks'].get('$T', []))))")"
     # shellcheck disable=SC2046
     python3 experiments/k15f_measure_subspace.py --mode m1 \
       --census "$CENSUS" --q0-arts $(arts_of q0) --arts $(arts_of $LABELS) \
+      --basis-report reports/k15f/basis_s0.json \
       --out "reports/k15f/m1_${TAG}.json" || CODE=$?
     ;;
   *) echo "режим $MODE неизвестен"; exit 2 ;;

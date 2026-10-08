@@ -53,6 +53,29 @@ def sha_file(p):
     return k15_context.sha12(p)
 
 
+def file_sha(p):
+    return k15_context.sha12(p)
+
+
+ENV_KEYS = ("joint_sha1", "plan_sha1", "q0_prov", "codec",
+            "architecture_code_version", "k15a_gate")
+
+
+def check_env(man, ctx, frozen):
+    """Кэш снят в той же обстановке, что текущий контекст. Проблемы."""
+    import k15_context as kc_
+    cur = json.loads(json.dumps(dict(
+        joint_sha1=ctx.joint_sha, plan_sha1=ctx.q0_prov["plan_sha1"],
+        q0_prov=ctx.q0_prov, codec=ctx.codec_fp,
+        architecture_code_version=ctx.code_version,
+        k15a_gate=dict(ctx.gate_info)), default=kc_.k15t.json_scalar))
+    p = [f"{k}: кэш {man.get(k)!r}, сейчас {cur[k]!r}"
+         for k in ENV_KEYS if man.get(k) != cur[k]]
+    if man.get("frozen_sha1") != frozen:
+        p.append("замороженное не то, что при построении кэша")
+    return p
+
+
 def strided(n, k):
     if k >= n:
         return list(range(n))
@@ -86,7 +109,8 @@ def main():
                   "forward_depth_aligned_rvq",
         feedback_mask=list(mask) if mask is not None else None,
         k15c_h18_includes_feedback=bool(mask is not None and mask[0]),
-        reuse_possible=not bool(mask is not None and mask[0]))
+        # неизвестная маска — переиспользование НЕ доказано, значит невозможно
+        reuse_possible=bool(mask is not None and not mask[0]))
     print(f"  кэш K-15c: маска feedback {mask} -> переиспользование "
           f"{'невозможно' if not k15c_check['reuse_possible'] else 'возможно'}")
 
@@ -172,6 +196,11 @@ def main():
                 np.save(os.path.join(tmp, f"{p}_{k}.npy"), mm[(p, k)])
         w, eps = kf.norm_of(model)
         np.savez(os.path.join(tmp, "norm.npz"), weight=w.numpy(), eps=eps)
+        # ОТПЕЧАТОК КАЖДОГО ФАЙЛА, включая h18: загрузчик пересчитывает их
+        arrays = {}
+        for fn in sorted(os.listdir(tmp)):
+            if fn.endswith((".npy", ".npz")):
+                arrays[fn] = file_sha(os.path.join(tmp, fn))
         frozen1, _n, _e = k15t.frozen_content_sha(model, torch, set())
         if frozen1 != frozen0:
             raise SystemExit("замороженное изменилось")
@@ -183,6 +212,7 @@ def main():
                                        .tobytes()).hexdigest()[:12]
                        for p in PARTS},
             d_model=d_model, n_pos=n_pos, h_exec=kf.H_EXEC,
+            vocab=int(ctx.vocab), array_sha1=arrays,
             h18_depth=kf.H18_DEPTH, fp16_lossy_values=int(lossy),
             duplicate_rows_skipped=int(dups), k15c_reuse_check=k15c_check,
             device=str(dev), compute_dtype=a.dtype,
@@ -214,8 +244,12 @@ def main():
     return 0
 
 
-def load_cache(path, *, allow_smoke=False):
-    """Кэш с проверкой COMPLETE, манифеста и форм; массивы h18 — memmap."""
+def load_cache(path, *, allow_smoke=False, verify_h18=True):
+    """Кэш со СТРОГОЙ проверкой; любое расхождение — отказ.
+
+    Пересчитываются отпечатки всех файлов (h18 — если verify_h18),
+    сверяются формы, dtype, конечность a0/act/h18 и диапазон кодов q0.
+    """
     if not os.path.exists(os.path.join(path, "COMPLETE")):
         raise SystemExit(f"{path}: нет COMPLETE")
     man = json.load(open(os.path.join(path, "manifest.json")))
@@ -223,23 +257,67 @@ def load_cache(path, *, allow_smoke=False):
         raise SystemExit(f"{path}: kind {man.get('kind')!r}")
     if man.get("smoke") and not allow_smoke:
         raise SystemExit(f"{path}: smoke-кэш")
+    arrays = man.get("array_sha1") or {}
+    want_files = {f"{p}_{k}.npy" for p in PARTS
+                  for k in ("rows", "h18", "q0", "a0", "act")} | {"norm.npz"}
+    if set(arrays) != want_files:
+        raise SystemExit(f"{path}: в манифесте не все отпечатки файлов")
+    for fn, sha in arrays.items():
+        if fn.endswith("_h18.npy") and not verify_h18:
+            continue
+        if file_sha(os.path.join(path, fn)) != sha:
+            raise SystemExit(f"{path}: {fn} изменён")
     out = dict(manifest=man)
+    npos, dm, he = man["n_pos"], man["d_model"], man["h_exec"]
     for p in PARTS:
+        n = man["rows"][p]
         rows = np.load(os.path.join(path, f"{p}_rows.npy"))
         h18 = np.load(os.path.join(path, f"{p}_h18.npy"), mmap_mode="r")
         arr = {k: np.load(os.path.join(path, f"{p}_{k}.npy"))
                for k in ("q0", "a0", "act")}
-        n = man["rows"][p]
-        if len(rows) != n or h18.shape != (n, man["n_pos"], man["d_model"]):
-            raise SystemExit(f"{path}: форма части {p}")
+        spec = dict(rows=((n,), np.int64), h18=((n, npos, dm), np.float16),
+                    q0=((n, npos), np.int64), a0=((n, he, 7), np.float32),
+                    act=((n, he, 7), np.float32))
+        for k, (shape, dt) in spec.items():
+            x = rows if k == "rows" else h18 if k == "h18" else arr[k]
+            if tuple(x.shape) != shape or x.dtype != dt:
+                raise SystemExit(f"{path}: {p}_{k} формы {x.shape} "
+                                 f"{x.dtype}, ожидалось {shape} {dt}")
         if hashlib.sha1(np.ascontiguousarray(rows).tobytes()
                         ).hexdigest()[:12] != man["rows_sha1"][p]:
             raise SystemExit(f"{path}: строки части {p} изменены")
+        if len(np.unique(rows)) != n:
+            raise SystemExit(f"{path}: повторяющиеся строки в {p}")
+        for k in ("a0", "act"):
+            if not np.isfinite(arr[k]).all():
+                raise SystemExit(f"{path}: {p}_{k} не конечен")
+        q = arr["q0"]
+        if q.min() < 0 or q.max() >= int(man["vocab"]):
+            raise SystemExit(f"{path}: коды q0 вне [0, {man['vocab']})")
+        if verify_h18:
+            for s0 in range(0, n, 4096):
+                if not np.isfinite(np.asarray(h18[s0:s0 + 4096],
+                                              np.float32)).all():
+                    raise SystemExit(f"{path}: {p}_h18 не конечен")
         out[p] = dict(rows=rows, h18=h18, **arr)
     nz = np.load(os.path.join(path, "norm.npz"))
     out["norm"] = (nz["weight"], float(nz["eps"]))
+    if out["norm"][0].shape != (dm,) or not np.isfinite(out["norm"][0]).all():
+        raise SystemExit(f"{path}: норма неверной формы")
     return out
 
 
+def verify_main(path):
+    """Для раннера: 0 — кэш цел и пригоден, 1 — нет."""
+    try:
+        load_cache(path)
+    except SystemExit as e:
+        print(f"кэш {path} не принят: {e}")
+        return 1
+    print(f"кэш {path} цел")
+    return 0
+
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--verify":
+        sys.exit(verify_main(sys.argv[2]))
     sys.exit(main())

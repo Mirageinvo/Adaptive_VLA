@@ -104,8 +104,9 @@ def main():
     for p in model.parameters():
         p.requires_grad_(False)
     frozen0, _n, _e = k15t.frozen_content_sha(model, torch, set())
-    if frozen0 != C["manifest"]["frozen_sha1"]:
-        raise SystemExit("замороженное не то, что при построении кэша")
+    env = kb.check_env(C["manifest"], ctx, frozen0)
+    if env:
+        raise SystemExit("кэш снят в другой обстановке: " + "; ".join(env))
     head = load_head(torch, ck, model, dev)
     f = float(ck["amp_factor"])
     R = kf.rotation(int(ck["control_seed"])).to(dev)
@@ -123,7 +124,7 @@ def main():
     slot = {int(r): i for i, r in enumerate(C["val_sel"]["rows"])}
     q0_dev = torch.as_tensor(np.asarray(ctx.q0_can), device=dev)
     ac16 = torch.autocast(device_type=dev.type, dtype=ctx.dt)
-    state_dep = None
+    rels = []
     for bi, (po, sel) in enumerate(batches):
         b = ctx.build_batch(po, sel)
         with torch.no_grad(), ac16:
@@ -139,6 +140,9 @@ def main():
         ok("q0_three_paths", torch.equal(q0, ref_out["pred_codes"][0])
            and torch.equal(q0, q0_dev[sel_t]))
         idx = [slot.get(int(r)) for r in sel]
+        # ОТСУТСТВИЕ СТРОКИ — ОТКАЗ, а не пропуск проверки
+        ok("rows_in_cache", all(i is not None for i in idx),
+           f"нет {sum(i is None for i in idx)} строк")
         if all(i is not None for i in idx):
             cached = torch.from_numpy(np.asarray(
                 C["val_sel"]["h18"][np.array(idx)])).to(dev)
@@ -169,9 +173,21 @@ def main():
             ok("control_differs", not torch.allclose(basis @ R, basis))
             ok("control_keeps_norms", torch.allclose(
                 (basis @ R).norm(dim=-1), basis.norm(dim=-1), atol=1e-4))
+            # ЗАВИСИМОСТЬ ОТ h18: относительный RMS изменения базиса при
+            # перестановке h18 между строками (a0 — свой)
             b_roll, _ = head(h18.roll(1, 0), a0)
-            dep = not torch.allclose(b_roll * f, basis)
-            state_dep = dep if state_dep is None else (state_dep or dep)
+            rel = float((b_roll * f - basis).pow(2).mean().sqrt()
+                        / basis.pow(2).mean().sqrt().clamp_min(1e-12))
+            rels.append(rel)
+            act_b = torch.from_numpy(np.asarray(ctx.ACT[sel], np.float32)
+                                     [:, :a0.shape[1], :7]).to(dev)
+            rr = kf.to_tangent(act_b, a0, head.sigma_arm, head.sigma_g
+                               ).reshape(len(sel), -1)
+            _bb, uu = head(h18, a0)
+            geo = kf.basis_diagnostics(head, basis, uu, rr)
+            ok("geometry", kf.geometry_ok(geo),
+               f"обусловленность {geo['cond_max']:.2f}, попарный косинус "
+               f"{geo['pair_cos_max']:.3f}")
     # градиенты головы (на копии, требующей градиента)
     head_g = load_head(torch, ck, model, dev)
     for p in head_g.parameters():
@@ -216,11 +232,20 @@ def main():
     frozen1, _n, _e = k15t.frozen_content_sha(model, torch, set())
     ok("frozen_unchanged", frozen1 == frozen0)
     passed = all(c["passed"] for c in checks.values())
-    print(f"  базис зависит от h18: {state_dep} (выбрана точка "
-          f"{ck.get('selected')})")
+    rel_med = float(np.median(rels)) if rels else 0.0
+    state_dep = rel_med >= kf.STATE_DEP_MIN_REL
+    # ИСХОД: 0 — иерархический базис (зависит от h18); 4 — технически
+    # исправен, но фактически глобальная PCA: отдельный baseline, M1 для
+    # иерархии не запускается; 3 — технический отказ
+    code = 3 if not passed else (0 if state_dep else 4)
+    print(f"  базис зависит от h18: {state_dep} — относительный RMS "
+          f"изменения при перестановке h18 {rel_med:.4f} (порог "
+          f"{kf.STATE_DEP_MIN_REL}); выбрана точка {ck.get('selected')}")
     tag = str(dev).replace(":", "")
     out = a.out or f"reports/k15f/identity_{tag}.json"
-    rep = dict(kind=KIND, passed=bool(passed), checks=checks,
+    rep = dict(kind=KIND, passed=bool(passed), code=code, checks=checks,
+               state_dep_rel_rms=rel_med,
+               state_dep_threshold=kf.STATE_DEP_MIN_REL,
                basis=os.path.abspath(a.basis),
                basis_sha1=kb.sha_file(a.basis),
                basis_state_sha1=ck["state_sha1"],
@@ -228,7 +253,7 @@ def main():
                basis_state_dependent=bool(state_dep),
                amp_factor=f, control_seed=int(ck["control_seed"]),
                device=str(dev), compute_dtype=a.dtype,
-               code=dict(k15f_continuous_refine=kb.sha_file(kf.__file__),
+               code_sha=dict(k15f_continuous_refine=kb.sha_file(kf.__file__),
                          k15f_check_identity=kb.sha_file(
                              os.path.abspath(__file__))),
                frozen_sha1=frozen0, joint_sha1=ctx.joint_sha,
@@ -240,10 +265,19 @@ def main():
         json.dump(rep, fh, indent=1, ensure_ascii=False,
                   default=k15t.json_scalar)
     os.replace(out + ".tmp", out)
-    print(f"ГЕЙТ K-15f: {'ПРОЙДЕН' if passed else 'НЕ ПРОЙДЕН'}; {out}")
-    return 0 if passed else 3
+    verdict = {0: "ПРОЙДЕН: базис зависит от h18",
+               4: "технически исправен, но базис — ГЛОБАЛЬНАЯ PCA (код 4): "
+                  "не иерархия, M1 для K-15f не запускается",
+               3: "НЕ ПРОЙДЕН"}[code]
+    print(f"ГЕЙТ K-15f: {verdict}; {out}")
+    return code
 
 
+
+
+def C_norm(ck):
+    """(вес, eps) нормы из состояния чекпойнта базиса."""
+    return ck["state"]["norm.weight"].float(), float(ck["norm_eps"])
 
 
 def integration():
@@ -258,6 +292,7 @@ def integration():
     saved = (k15_context.build, sys.argv, kpd.gate_paths)
     ctx = kt._fake_ctx()
     ctx.model.action_expert.norm.variance_epsilon = 1e-6
+    ctx.vocab = int(ctx.model.book0.shape[0])
     k15_context.build = lambda a: ctx
     try:
         with tempfile.TemporaryDirectory() as td:
@@ -275,7 +310,45 @@ def integration():
             sys.argv = ["x", "--device", "cpu", "--basis", basis,
                         "--h18-cache", cache, "--out", ident,
                         "--gate-batches", "2"]
-            assert main() == 0, "гейт тождества не пройден"
+            code = main()
+            assert code in (0, 4), f"гейт тождества: код {code}"
+            # БАЗИС, ЗАВИСЯЩИЙ ОТ h18 (как после обучения): норма — буфер,
+            # не меняется, и гейт обязан пройти с кодом 0
+            ckb = torch.load(basis, map_location="cpu", weights_only=False)
+            st_ = dict(ckb["state"])
+            g_ = torch.Generator().manual_seed(1)
+            st_["out.weight"] = torch.randn(st_["out.weight"].shape,
+                                            generator=g_) * 0.05
+            head_t = kf.BasisHead(*C_norm(ckb), ckb["d_model"], ckb["n_pos"],
+                                  ckb["stats"], hp=ckb["hp"])
+            head_t.load_state_dict(st_)
+            basis_dep = os.path.join(td, "basis_dep.pt")
+            torch.save(dict(ckb, state=st_, state_sha1=kf.state_sha(head_t),
+                            selected="epoch1"), basis_dep)
+            ident_dep = os.path.join(td, "identity_dep.json")
+            sys.argv = ["x", "--device", "cpu", "--basis", basis_dep,
+                        "--h18-cache", cache, "--out", ident_dep,
+                        "--gate-batches", "2"]
+            assert main() == 0, "гейт на зависящем от h18 базисе не прошёл"
+            rd = json.load(open(ident_dep))
+            assert rd["basis_state_dependent"] and rd["checks"][
+                "frozen_unchanged"]["passed"]
+            rep0 = json.load(open(ident))
+            assert rep0["code"] == code
+            if code == 4:
+                # рука обязана отказать на базисе без зависимости от h18;
+                # для проверки механики руки дальше — отчёт с кодом 0
+                gate4 = os.path.join(td, "k15a4.json")
+                open(gate4, "w").write("{}")
+                kpd.gate_paths = lambda device: (gate4, gate4)
+                try:
+                    kpf.build_arm("cpu", basis, "z", torch,
+                                  identity_report=ident)
+                    raise AssertionError("рука приняла глобальную PCA")
+                except SystemExit as e:
+                    assert "h18" in str(e), e
+                json.dump(dict(rep0, code=0, basis_state_dependent=True),
+                          open(ident, "w"))
             gate = os.path.join(td, "k15a.json")
             open(gate, "w").write("{}")
             kpd.gate_paths = lambda device: (gate, gate)

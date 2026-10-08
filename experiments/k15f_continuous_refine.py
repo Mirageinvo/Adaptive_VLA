@@ -60,6 +60,21 @@ D_T = H_EXEC * N_CH                 # 56 координат касательно
 GRIP_EPS = 1e-3                     # как в K-15d
 HP = dict(proj=64, hidden=512, ridge=1e-3, w_ortho=0.1, w_norm=0.1,
           w_anchor=0.1, smooth_l1_beta=1.0, amp_quantile=90.0, kappa=1.0)
+# ПРЕДЕЛЫ ГЕОМЕТРИИ БАЗИСА — зарегистрированы до данных (08.10.2026).
+# Якорь не мешает двум направлениям схлопнуться к общему вектору (оба
+# могут быть пропорциональны U_1 + U_2 при косинусе 0.707 со своими
+# якорями). Поэтому на val_sel для выбранной точки обязательны:
+GEOMETRY = dict(cond_max=10.0, pair_cos_max=0.9)
+# ЗАВИСИМОСТЬ ОТ h18 (гейт): относительный RMS изменения базиса при
+# перестановке h18 между строками батча не ниже этого порога. Ниже —
+# базис фактически глобальная PCA: отдельный baseline, а не иерархия.
+STATE_DEP_MIN_REL = 0.01
+
+
+def geometry_ok(diag, limits=None):
+    lim = dict(GEOMETRY if limits is None else limits)
+    return bool(diag["cond_max"] <= lim["cond_max"]
+                and diag["pair_cos_max"] <= lim["pair_cos_max"])
 
 
 def grip_logit(g):
@@ -208,7 +223,11 @@ class RMSNorm(nn.Module):
 
     def __init__(self, weight, eps):
         super().__init__()
-        self.weight = nn.Parameter(torch.as_tensor(weight).float().clone())
+        # БУФЕР, А НЕ ПАРАМЕТР: норма заморожена. Как параметр она попадала
+        # в оптимизатор, менялась при обучении, и гейт (требующий побитового
+        # равенства с нормой модели) отказывал бы на любой обученной эпохе.
+        self.register_buffer("weight", torch.as_tensor(weight).float()
+                             .clone())
         self.eps = float(eps)
 
     def forward(self, x):
@@ -463,6 +482,28 @@ def selftest():
     assert not torch.allclose(b1, b2)
     a_z, _ = head.act(h64, a0[:64], torch.zeros(K_BASIS))
     assert torch.equal(a_z, a0[:64].float())
+    # 11. норма заморожена: после обучения побитово прежняя, в оптимизатор
+    #     не попадает
+    a0b, actb, stb, headb, _h = _toy(seed=5)
+    w0 = headb.norm.weight.clone()
+    names = [n for n, _p in headb.named_parameters()]
+    assert "norm.weight" not in names, names
+    optb = torch.optim.Adam(headb.parameters(), lr=1e-2)
+    rb = to_tangent(actb[:32], a0b[:32], stb["sigma_arm"], stb["sigma_g"]
+                    ).reshape(32, -1)
+    hb = torch.randn(32, 4, 16)
+    for _ in range(5):
+        bb, ub = headb(hb, a0b[:32])
+        lb, _ = basis_loss(headb, bb, ub, rb)
+        lb.backward()
+        optb.step()
+        optb.zero_grad()
+    assert torch.equal(headb.norm.weight, w0), "норма изменилась"
+    assert "norm.weight" in headb.state_dict()
+    # 12. пределы геометрии ловят схлопывание
+    assert geometry_ok(dict(cond_max=2.0, pair_cos_max=0.3))
+    assert not geometry_ok(dict(cond_max=50.0, pair_cos_max=0.3))
+    assert not geometry_ok(dict(cond_max=2.0, pair_cos_max=0.95))
     print("самопроверка k15f_continuous_refine пройдена: касательное "
           "пространство, PCA-якоря, состав, контроль, ridge, обучаемость")
     return 0

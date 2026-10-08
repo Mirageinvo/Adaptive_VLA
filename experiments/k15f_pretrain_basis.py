@@ -261,13 +261,22 @@ def main():
                 opt.step()
                 opt.zero_grad()
             snap(ep)
-        best = min(history, key=lambda x: (x["val"]["rec"], x["epoch"]))
+        # ОТБОР — только среди точек с допустимой геометрией базиса
+        # (kf.GEOMETRY, зарегистрировано до данных)
+        allowed = [h for h in history if kf.geometry_ok(h["val"])]
+        technical["geometry_any_epoch"] = bool(allowed)
+        best = min(allowed or history,
+                   key=lambda x: (x["val"]["rec"], x["epoch"]))
         sel_tag = best["tag"]
         head.load_state_dict({k: v.to(dev) for k, v in
                               states[sel_tag].items()})
-        print(f"  выбрана {sel_tag} по реконструкции val_sel")
+        print(f"  выбрана {sel_tag} по реконструкции val_sel среди точек с "
+              f"допустимой геометрией ({len(allowed)} из {len(history)}): "
+              f"обусловленность макс {best['val']['cond_max']:.2f}, "
+              f"попарный косинус макс {best['val']['pair_cos_max']:.3f}")
         technical["anchor_sign"] = bool(
             best["val"]["anchor_cos_nonpos"] == 0)
+        technical["geometry"] = kf.geometry_ok(best["val"])
         rep = dict(history=history, selected=sel_tag)
 
     # --- 3-4. амплитуда и множитель ----------------------------------------
@@ -299,6 +308,9 @@ def main():
                   f"{np.mean(v['p90'][:6]):.4f}, max|a| {v['absmax']:.3f}")
     technical_ok = all(technical.values())
     code = 0 if technical_ok else 3
+    max_flip = (max(v["grip_flip_share"] for v in
+                    amp_reports[str(amp_choice)].values())
+                if amp_choice is not None else None)
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     obj = dict(
         kind=KIND, mode=a.mode, seed=int(a.seed),
@@ -309,6 +321,7 @@ def main():
         stats={k: (v.cpu() if hasattr(v, "cpu") else v)
                for k, v in st.items()},
         stats_sha1=kf.stats_sha(st), amp_factor=amp_choice,
+        max_grip_flip_share=max_flip, geometry_limits=dict(kf.GEOMETRY),
         amp_factors_considered=list(AMP_FACTORS),
         control_seed=CONTROL_SEED, selected=sel_tag,
         d_model=man["d_model"], n_pos=man["n_pos"],
@@ -322,9 +335,10 @@ def main():
                   k15f_pretrain_basis=kb.sha_file(os.path.abspath(
                       __file__))),
         created=datetime.datetime.now().isoformat(timespec="seconds"))
+    # ПОРЯДОК ПУБЛИКАЦИИ: чекпойнт во временный файл -> отчёт ->
+    # канонический чекпойнт последним (его наличие — маркер завершения).
     tmp = out + ".tmp"
     torch.save(obj, tmp)
-    os.replace(tmp, out)
     rep.update(kind=KIND + "_report", mode=a.mode, technical=technical,
                technical_ok=technical_ok, code=code,
                stats=dict(sigma_arm=[float(x) for x in st["sigma_arm"]],
@@ -333,6 +347,8 @@ def main():
                           eigvals=[float(x) for x in st["eigvals"]],
                           energy_k=st["energy_k"], rows=st["rows"]),
                stats_sha1=obj["stats_sha1"], amp_factor=amp_choice,
+               max_grip_flip_share=max_flip,
+               geometry_limits=dict(kf.GEOMETRY),
                amplitude=amp_reports, control_seed=CONTROL_SEED,
                out=out, state_sha1=obj["state_sha1"],
                seconds=round(time.time() - t0, 1))
@@ -340,6 +356,7 @@ def main():
     with open(report + ".tmp", "w") as f:
         json.dump(rep, f, indent=1, ensure_ascii=False, default=float)
     os.replace(report + ".tmp", report)
+    os.replace(tmp, out)
     print(f"ИТОГ базис {a.mode}: {'исправно' if technical_ok else 'ОТКАЗ'} "
           f"{technical}; f={amp_choice}; {out}")
     return code
@@ -355,7 +372,8 @@ def selftest():
         os.makedirs(path)
         rows = {"train": 300, "val_sel": 80}
         for p, n in rows.items():
-            r = np.arange(n) + (0 if p == "train" else 10_000)
+            r = (np.arange(n) + (0 if p == "train" else 10_000)).astype(
+                np.int64)
             np.save(os.path.join(path, f"{p}_rows.npy"), r)
             h = np.lib.format.open_memmap(os.path.join(path, f"{p}_h18.npy"),
                                           mode="w+", dtype=np.float16,
@@ -366,12 +384,16 @@ def selftest():
             act = a0.copy()
             act[..., :6] += 0.05 * rng.standard_normal((n, 8, 6))
             act[..., 6] = np.sign(a0[..., 6])
-            np.save(os.path.join(path, f"{p}_q0.npy"), np.zeros((n, 4)))
+            np.save(os.path.join(path, f"{p}_q0.npy"),
+                    np.zeros((n, 4), np.int64))
             np.save(os.path.join(path, f"{p}_a0.npy"), a0)
             np.save(os.path.join(path, f"{p}_act.npy"), act.astype(
                 np.float32))
         np.savez(os.path.join(path, "norm.npz"), weight=np.ones(16), eps=1e-6)
+        arrays = {fn: kb.file_sha(os.path.join(path, fn))
+                  for fn in os.listdir(path) if fn.endswith((".npy", ".npz"))}
         man = dict(kind=kb.KIND, smoke=True, rows=rows, n_pos=4, d_model=16,
+                   h_exec=8, vocab=2048, array_sha1=arrays,
                    rows_sha1={p: hashlib.sha1(np.ascontiguousarray(
                        np.load(os.path.join(path, f"{p}_rows.npy")))
                        .tobytes()).hexdigest()[:12] for p in rows},

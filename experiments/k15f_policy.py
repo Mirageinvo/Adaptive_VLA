@@ -57,11 +57,14 @@ def check_identity_report(rep, *, basis_sha, device, code):
     p = []
     if rep.get("kind") != "k15f_identity" or rep.get("passed") is not True:
         p.append("гейт тождества k15f не пройден")
+    if rep.get("code") != 0 or rep.get("basis_state_dependent") is not True:
+        p.append("базис не зависит от h18 (глобальная PCA, код гейта "
+                 f"{rep.get('code')}): это не иерархический K-15f")
     if rep.get("basis_sha1") != basis_sha:
         p.append("гейт снят для другого файла базиса")
     if rep.get("device") != str(device):
         p.append(f"гейт снят на {rep.get('device')}, рука на {device}")
-    if (rep.get("code") or {}).get("k15f_continuous_refine") != code:
+    if (rep.get("code_sha") or {}).get("k15f_continuous_refine") != code:
         p.append("гейт снят другой версией k15f_continuous_refine")
     return p
 
@@ -168,13 +171,16 @@ def selftest():
             pass
     labs = all_labels()
     assert len(labs) == 16 and len(set(labs)) == 16
-    rep = dict(kind="k15f_identity", passed=True, basis_sha1="B",
-               device="cuda:1", code=dict(k15f_continuous_refine="K"))
+    # поле code отчёта — код исхода гейта; отпечатки кода — в code_sha
+    rep = dict(kind="k15f_identity", passed=True, code=0,
+               basis_state_dependent=True, basis_sha1="B", device="cuda:1",
+               code_sha=dict(k15f_continuous_refine="K"))
     kw = dict(basis_sha="B", device="cuda:1", code="K")
     assert check_identity_report(rep, **kw) == []
     for mut in (dict(passed=False), dict(basis_sha1="X"),
                 dict(device="cuda:0"),
-                dict(code=dict(k15f_continuous_refine="Y"))):
+                dict(code_sha=dict(k15f_continuous_refine="Y")),
+                dict(code=4), dict(basis_state_dependent=False)):
         assert check_identity_report(dict(rep, **mut), **kw), mut
     assert np.isfinite(ACTION_CLIP_BOUND)
     print("самопроверка k15f_policy пройдена")
