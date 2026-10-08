@@ -352,6 +352,105 @@ def basis_diagnostics(head, basis, u, r):
                            torch.quantile(c.abs(), 0.9, dim=0)])
 
 
+def diag_rows(head, basis, u, r):
+    """Построчные величины диагностики (для агрегирования по всей части)."""
+    with torch.no_grad():
+        c = ridge_coeffs(basis, r, head.hp["ridge"])
+        rec = torch.einsum("bk,bkd->bd", c, basis)
+        sv = torch.linalg.svdvals(basis)
+        un = u / u.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        gram = un @ un.transpose(1, 2)
+        iu = torch.triu_indices(K_BASIS, K_BASIS, 1)
+        return dict(
+            res2=(r - rec).pow(2).sum(-1).cpu(), r2=r.pow(2).sum(-1).cpu(),
+            cond=(sv[:, 0] / sv[:, -1].clamp_min(1e-12)).cpu(),
+            pair=gram[:, iu[0], iu[1]].abs().max(-1).values.cpu(),
+            anchor=(un * head.U[None]).sum(-1).cpu(),
+            norms=basis.norm(dim=-1).cpu(),
+            du2=(u - head.U[None]).pow(2).mean(dim=(1, 2)).cpu(),
+            coef=c.abs().cpu())
+
+
+def aggregate_diag(rows):
+    """Диагностика по ВСЕЙ части из списка diag_rows."""
+    cat = {k: torch.cat([x[k] for x in rows]) for k in rows[0]}
+    anc = cat["anchor"]
+    return dict(
+        rows=int(len(cat["cond"])),
+        explained_energy=1.0 - float(cat["res2"].sum()
+                                     / cat["r2"].sum().clamp_min(1e-12)),
+        cond_median=float(cat["cond"].median()),
+        cond_max=float(cat["cond"].max()),
+        norm_min=float(cat["norms"].min()), norm_max=float(cat["norms"].max()),
+        pair_cos_mean=float(cat["pair"].mean()),
+        pair_cos_max=float(cat["pair"].max()),
+        anchor_cos_min=[float(x) for x in anc.min(0).values],
+        anchor_cos_p05=[float(x) for x in torch.quantile(anc, 0.05, dim=0)],
+        anchor_cos_nonpos=int((anc <= 0).sum()),
+        delta_u_rms=float(cat["du2"].mean().sqrt()),
+        coeff_abs_p90=[float(x) for x in
+                       torch.quantile(cat["coef"], 0.9, dim=0)])
+
+
+def far_pairs(epi, k):
+    """k равномерных строк и для каждой — дальняя строка ДРУГОГО эпизода.
+
+    Партнёр — строка на полсписка дальше; если эпизод тот же, берётся
+    следующая по списку строка другого эпизода. Возвращает (idx, partner,
+    доля пар с тем же эпизодом — обязана быть 0).
+    """
+    import numpy as np
+    n = len(epi)
+    k = min(int(k), n)
+    idx = np.unique(np.round(np.linspace(0, n - 1, k)).astype(np.int64))
+    k = len(idx)
+    partner = np.empty(k, np.int64)
+    for i in range(k):
+        j = (i + k // 2) % k
+        for step in range(k):
+            cand = idx[(j + step) % k]
+            if epi[cand] != epi[idx[i]]:
+                break
+        partner[i] = cand
+    same = float(np.mean(epi[partner] == epi[idx]))
+    return idx, partner, same
+
+
+def state_dependence(head, part, device, k=1024, factor=1.0, chunk=256):
+    """Относительный RMS изменения базиса при подмене h18 ДАЛЬНЕЙ строкой.
+
+    a0 — свой, заменяется только h18. Перестановка внутри батча плана
+    сравнивала бы соседние кадры одного эпизода и занижала бы зависимость.
+    """
+    import hashlib
+    import numpy as np
+    idx, partner, same = far_pairs(np.asarray(part["epi"]), k)
+    num = den = 0.0
+    with torch.no_grad():
+        for s0 in range(0, len(idx), chunk):
+            i_, p_ = idx[s0:s0 + chunk], partner[s0:s0 + chunk]
+
+            def rows_h18(ii):
+                order = np.argsort(ii)
+                h = np.asarray(part["h18"][ii[order]])
+                back = np.argsort(order)
+                return torch.from_numpy(h[back]).to(device)
+            a0 = torch.from_numpy(part["a0"][i_]).to(device)
+            a0f = torch.cat([a0, a0[:, -1:].expand(-1, 12, -1)], dim=1)
+            b_self, _ = head(rows_h18(i_), a0f)
+            b_far, _ = head(rows_h18(p_), a0f)
+            num += float((b_far - b_self).pow(2).sum()) * factor ** 2
+            den += float(b_self.pow(2).sum()) * factor ** 2
+    rel = math.sqrt(num / max(den, 1e-12))
+    sha = lambda x: hashlib.sha1(np.ascontiguousarray(x).tobytes()
+                                 ).hexdigest()[:12]
+    return dict(rel_rms=rel, rows=int(len(idx)), same_episode_share=same,
+                idx_sha1=sha(idx), partner_sha1=sha(partner),
+                threshold=STATE_DEP_MIN_REL,
+                state_dependent=bool(rel >= STATE_DEP_MIN_REL
+                                     and same == 0.0))
+
+
 def state_sha(module):
     h = hashlib.sha1()
     for k, v in sorted(module.state_dict().items()):
@@ -500,6 +599,30 @@ def selftest():
         optb.zero_grad()
     assert torch.equal(headb.norm.weight, w0), "норма изменилась"
     assert "norm.weight" in headb.state_dict()
+    # 13. дальняя парность: другой эпизод у каждой пары
+    import numpy as np
+    epi = np.repeat(np.arange(30), 10)          # соседние строки — один эпизод
+    idx, partner, same = far_pairs(epi, 64)
+    assert same == 0.0 and len(idx) == len(partner)
+    assert bool((epi[idx] != epi[partner]).all())
+    # КОНТРОЛЬ: соседняя пара (roll на 1) почти всегда тот же эпизод
+    assert float(np.mean(epi[idx] == epi[np.roll(idx, 1)])) < 1.0
+    _i2, _p2, same1 = far_pairs(np.zeros(50, np.int64), 16)
+    assert same1 == 1.0                          # один эпизод — нет пар
+    # 14. агрегирование по всей части равно диагностике целиком
+    a0c, actc, stc, headc, _h = _toy(seed=6)
+    rc = to_tangent(actc[:64], a0c[:64], stc["sigma_arm"], stc["sigma_g"]
+                    ).reshape(64, -1)
+    hc = torch.randn(64, 4, 16, generator=torch.Generator().manual_seed(9))
+    with torch.no_grad():
+        headc.out.weight.normal_(0, 0.05)
+        bc, uc = headc(hc, a0c[:64])
+        whole = basis_diagnostics(headc, bc, uc, rc)
+        parts_ = aggregate_diag([diag_rows(headc, bc[:20], uc[:20], rc[:20]),
+                                 diag_rows(headc, bc[20:], uc[20:], rc[20:])])
+    assert abs(whole["explained_energy"] - parts_["explained_energy"]) < 1e-5
+    assert abs(whole["cond_max"] - parts_["cond_max"]) < 1e-4
+    assert abs(whole["pair_cos_max"] - parts_["pair_cos_max"]) < 1e-5
     # 12. пределы геометрии ловят схлопывание
     assert geometry_ok(dict(cond_max=2.0, pair_cos_max=0.3))
     assert not geometry_ok(dict(cond_max=50.0, pair_cos_max=0.3))

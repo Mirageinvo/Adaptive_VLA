@@ -53,8 +53,12 @@ def all_labels():
     return out
 
 
-def check_identity_report(rep, *, basis_sha, device, code):
+def check_identity_report(rep, *, basis_sha, device, code,
+                          gate_sha=None):
     p = []
+    if gate_sha is not None and (rep.get("code_sha") or {}).get(
+            "k15f_check_identity") != gate_sha:
+        p.append("гейт снят другой версией k15f_check_identity")
     if rep.get("kind") != "k15f_identity" or rep.get("passed") is not True:
         p.append("гейт тождества k15f не пройден")
     if rep.get("code") != 0 or rep.get("basis_state_dependent") is not True:
@@ -85,7 +89,8 @@ def build_arm(device, basis, label, torch, *, identity_report=None):
     basis_sha = kb.sha_file(basis)
     rep = json.load(open(identity_report))
     prob = check_identity_report(rep, basis_sha=basis_sha, device=device,
-                                 code=kb.sha_file(kf.__file__))
+                                 code=kb.sha_file(kf.__file__),
+                                 gate_sha=kb.sha_file(ki.__file__))
     ck = torch.load(basis, map_location="cpu", weights_only=False)
     prob += ki.check_basis_ckpt(ck)
     if prob:
@@ -120,6 +125,21 @@ def build_arm(device, basis, label, torch, *, identity_report=None):
                 basis_ = basis_ @ R
             a = kf.combine(a0, kf.compose(basis_, c), head.sigma_arm,
                            head.sigma_g)
+        # ГЕОМЕТРИЯ ЖИВОГО БАЗИСА на каждом вызове (вращение контроля её
+        # сохраняет, поэтому достаточно learned): SVD 4×56 почти бесплатна
+        with torch.no_grad():
+            sv = torch.linalg.svdvals(basis_ if not control
+                                      else basis_ @ R.T)
+            cond = float((sv[:, 0] / sv[:, -1].clamp_min(1e-12)).max())
+            un = basis_ / basis_.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+            gram = (un @ un.transpose(1, 2)).abs()
+            gram = gram - torch.diag_embed(torch.diagonal(gram, dim1=1,
+                                                          dim2=2))
+            pc = float(gram.max())
+        if cond > kf.GEOMETRY["cond_max"] or pc > kf.GEOMETRY["pair_cos_max"]:
+            raise SystemExit(f"рука k15f: геометрия базиса вне пределов "
+                             f"(обусловленность {cond:.2f}, попарный "
+                             f"косинус {pc:.3f})")
         if zero and not torch.equal(a, a0):
             raise SystemExit("рука k15f z: c = 0, но действие не равно a0")
         if not bool(torch.isfinite(a).all()):
@@ -177,6 +197,10 @@ def selftest():
                code_sha=dict(k15f_continuous_refine="K"))
     kw = dict(basis_sha="B", device="cuda:1", code="K")
     assert check_identity_report(rep, **kw) == []
+    rep_g = dict(rep, code_sha=dict(k15f_continuous_refine="K",
+                                    k15f_check_identity="G"))
+    assert check_identity_report(rep_g, gate_sha="G", **kw) == []
+    assert check_identity_report(rep_g, gate_sha="ИНОЙ", **kw)
     for mut in (dict(passed=False), dict(basis_sha1="X"),
                 dict(device="cuda:0"),
                 dict(code_sha=dict(k15f_continuous_refine="Y")),

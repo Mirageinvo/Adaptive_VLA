@@ -59,6 +59,14 @@ RULE = dict(min_F=12, promising_frac=1.0 / 3.0, promising_margin=3,
 # Контракт раскатки, общий для q0 и всех кандидатов:
 SETUP = ("script_sha1", "suite", "horizon", "max_steps", "waiting_steps",
          "ensemble", "rollout_seed_mode", "ckpt", "seed", "n_envs")
+# ОЖИДАЕМЫЙ контракт (зарегистрирован): одинаковость значений мало —
+# согласованно неверное или отсутствующее у всех поле прошло бы.
+# script_sha1 — отпечаток ТЕКУЩЕГО k9h_multiarm_gate.py, подставляется при
+# анализе.
+SETUP_EXPECTED = dict(suite="10", horizon=8, max_steps=600, waiting_steps=10,
+                      ensemble="off", rollout_seed_mode="fixed", seed=101,
+                      n_envs=5,
+                      ckpt="ZibinDong/SmolVLM2-2.2B-ActionCodec-BAR-LIBERO")
 CENSUS_FIELDS = ("kind", "code", "F", "fails", "diag", "blocks", "powered",
                  "rule", "q0_files")
 CONTRACT = ("basis_sha1", "basis_state_sha1", "stats_sha1", "amp_factor",
@@ -135,9 +143,10 @@ def pair_check(q0_ep, arm_ep, keys, label):
     return bad
 
 
-def census(q0_arts):
+def census(q0_arts, expected_setup=None):
     """Провалы q0, диагностические успехи и нужные блоки."""
     technical = check_q0(q0_arts) + technical_common({"q0": q0_arts})
+    technical += check_setup({"q0": q0_arts}, expected_setup)
     ep, dup = episodes(q0_arts)
     if dup:
         technical.append(f"повторяющиеся эпизоды q0: {dup[:3]}")
@@ -186,8 +195,18 @@ def decide(F, RL, RC, rule=RULE):
     return "неясно: агент останавливается"
 
 
-def check_setup(by_label):
-    """Один контракт раскатки у всех артефактов."""
+def check_setup(by_label, expected=None):
+    """Один контракт раскатки у всех артефактов И он равен ожидаемому."""
+    bad = []
+    if expected is not None:
+        for lab, arts in by_label.items():
+            for p, d in arts:
+                for k, v in expected.items():
+                    if d.get(k) != v:
+                        bad.append(f"{lab}:{os.path.basename(p)}: {k} = "
+                                   f"{d.get(k)!r}, ожидалось {v!r}")
+        if bad:
+            return bad[:10]
     seen = {}
     for lab, arts in by_label.items():
         for p, d in arts:
@@ -199,7 +218,8 @@ def check_setup(by_label):
     return []
 
 
-def m1(cen, q0_arts, cand, max_grip_flip=None):
+def m1(cen, q0_arts, cand, max_grip_flip=None, expected_setup=None,
+       basis_report=None):
     """cand: {метка: [(путь, артефакт)]} для 16 рук.
 
     Перепись ВЫЧИСЛЯЕТСЯ ЗАНОВО из q0-артефактов и обязана совпасть с
@@ -207,14 +227,14 @@ def m1(cen, q0_arts, cand, max_grip_flip=None):
     подменить популяцию кластеров при тех же q0.
     """
     technical = list(cen.get("technical") or [])
-    re_cen = census(q0_arts)
+    re_cen = census(q0_arts, expected_setup)
     for k in CENSUS_FIELDS:
         a_, b_ = (json.dumps(re_cen.get(k), sort_keys=True),
                   json.dumps(cen.get(k), sort_keys=True))
         if a_ != b_:
             technical.append(f"перепись: поле {k} не совпало с "
                              f"вычисленным заново по q0")
-    technical += check_setup(dict(cand, q0=q0_arts))
+    technical += check_setup(dict(cand, q0=q0_arts), expected_setup)
     labels = kp.all_labels()
     missing = [x for x in labels if x not in cand]
     if missing:
@@ -274,13 +294,23 @@ def m1(cen, q0_arts, cand, max_grip_flip=None):
         per_task[str(t)] = dict(F=len(ft), RL=sum(L[k] for k in ft),
                                 RC=sum(Cc[k] for k in ft))
     F = len(fails)
-    decision = ("НЕ ПРИНИМАЕТСЯ: технический отказ" if technical
-                else decide(F, RL, RC))
+    # ОТЧЁТ ПРЕДОБУЧЕНИЯ СВЯЗАН С ИСПОЛНЯЕМЫМ ЧЕКПОЙНТОМ: его
+    # checkpoint_sha1 обязан совпасть с basis_sha1 рук
+    basis_shas = {c.get("basis_sha1") for c in contracts}
+    if basis_report is not None:
+        if {basis_report.get("checkpoint_sha1")} != basis_shas:
+            technical.append(f"отчёт предобучения от чекпойнта "
+                             f"{basis_report.get('checkpoint_sha1')}, руки "
+                             f"исполняли {sorted(map(str, basis_shas))}")
+            max_grip_flip = None
+    pre = decide(F, RL, RC)
+    if pre.startswith("перспективно") and max_grip_flip is None:
+        technical.append("нет доли смены схвата из отчёта предобучения, "
+                         "связанного с этим чекпойнтом")
+    decision = ("НЕ ПРИНИМАЕТСЯ: технический отказ" if technical else pre)
     ablation_required = bool(
         decision.startswith("перспективно") and max_grip_flip is not None
         and max_grip_flip > RULE["grip_flip_ablation"])
-    if decision.startswith("перспективно") and max_grip_flip is None:
-        technical.append("нет доли смены схвата из отчёта предобучения")
     if ablation_required:
         decision += ("; до архитектурного вывода обязательна абляция "
                      "arm-only против gripper-only (смена схвата "
@@ -296,9 +326,10 @@ def m1(cen, q0_arts, cand, max_grip_flip=None):
                 ablation_required=ablation_required)
 
 
-def smoke(q0_arts, cand):
+def smoke(q0_arts, cand, expected_setup=None):
     technical = check_q0(q0_arts) + technical_common(
         dict(cand, q0=q0_arts))
+    technical += check_setup(dict(cand, q0=q0_arts), expected_setup)
     for lab, arts in cand.items():
         b, _c = check_k15f(arts, lab)
         technical += b
@@ -331,10 +362,12 @@ def main():
     if a.selftest:
         return selftest()
     q0 = [(p, json.load(open(p))) for p in a.q0_arts]
+    exp = dict(SETUP_EXPECTED, script_sha1=_sha(os.path.join(
+        HERE, "k9h_multiarm_gate.py")))
     if a.mode == "census":
         if os.path.exists(a.census) and not a.overwrite_census:
             raise SystemExit(f"{a.census} уже зарегистрирована")
-        res = census(q0)
+        res = census(q0, exp)
         out = a.census
         print(f"  перепись q0: F = {res['F']} провалов из 100; диагностика "
               f"{len(res['diag'])}; блоки {res['blocks']}; мощность "
@@ -344,17 +377,18 @@ def main():
     else:
         by = load_arts(a.arts)
         if a.mode == "smoke":
-            res = smoke(q0, by)
+            res = smoke(q0, by, exp)
             ident = res["identity_z_q0"] or {}
             print(f"  тождество z = q0: {ident.get('identical')}/"
                   f"{ident.get('episodes')} эпизодов")
         else:
             cen = json.load(open(a.census))
-            flip = None
+            flip, brep = None, None
             if os.path.exists(a.basis_report):
-                flip = json.load(open(a.basis_report)).get(
-                    "max_grip_flip_share")
-            res = m1(cen, q0, by, max_grip_flip=flip)
+                brep = json.load(open(a.basis_report))
+                flip = brep.get("max_grip_flip_share")
+            res = m1(cen, q0, by, max_grip_flip=flip, expected_setup=exp,
+                     basis_report=brep)
             print(f"  F = {res['F']}, R_L = {res['R_L']}, R_C = "
                   f"{res['R_C']}, только learned {res['L_only']}, только "
                   f"контроль {res['C_only']}; выигрыш оракула learned "
@@ -463,6 +497,29 @@ def selftest():
         assert not r["ablation_required"]
         r = m1(cen, q0, cand, max_grip_flip=0.3)
         assert r["ablation_required"] and "абляция" in r["decision"]
+        exp = dict(SETUP_EXPECTED, script_sha1="K9H", ckpt="X")
+        r = m1(cen, q0, cand, 0.05, expected_setup=exp,
+               basis_report=dict(checkpoint_sha1="B"))
+        assert r["code"] == 0, r["technical"]
+        # поле удалено СРАЗУ У ВСЕХ рук и у q0 — одинаковость не спасает
+        def drop(arts):
+            out = []
+            for p_, d_ in arts:
+                d2 = dict(d_)
+                d2.pop("horizon")
+                out.append((p_, d2))
+            return out
+        cand_nh = {k: drop(v) for k, v in cand.items()}
+        r = m1(cen, drop(q0), cand_nh, 0.05, expected_setup=exp)
+        assert any("horizon" in x for x in r["technical"]), r["technical"]
+        # отчёт предобучения от другого чекпойнта
+        r = m1(cen, q0, cand, 0.05, expected_setup=exp,
+               basis_report=dict(checkpoint_sha1="ДРУГОЙ"))
+        assert any("отчёт предобучения" in x for x in r["technical"])
+        assert r["decision"].startswith("НЕ ПРИНИМАЕТСЯ")
+        # перспективно, но доли смены схвата нет -> не принимается
+        r = m1(cen, q0, cand, None, expected_setup=exp)
+        assert r["decision"].startswith("НЕ ПРИНИМАЕТСЯ"), r["decision"]
         # правленая перепись: другой состав провалов при тех же q0
         cen_bad = dict(cen, fails=cen["fails"][1:], F=cen["F"] - 1)
         assert any("перепись" in x for x in

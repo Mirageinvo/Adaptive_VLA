@@ -187,11 +187,14 @@ def main():
                     print(f"  батч {done}/{total}, {el / 60:.0f} мин, "
                           f"осталось ~{el / done * (total - done) / 60:.0f} "
                           f"мин", flush=True)
+        epi_all = np.asarray(ctx.epi, np.int64)
         for p in PARTS:
             if not bool(mm[(p, "filled")].all()):
                 raise SystemExit(f"часть {p}: не все строки заполнены")
             mm[(p, "h18")].flush()
             np.save(os.path.join(tmp, f"{p}_rows.npy"), rows[p])
+            # эпизод строки: дальняя парность для замера зависимости от h18
+            np.save(os.path.join(tmp, f"{p}_epi.npy"), epi_all[rows[p]])
             for k in ("q0", "a0", "act"):
                 np.save(os.path.join(tmp, f"{p}_{k}.npy"), mm[(p, k)])
         w, eps = kf.norm_of(model)
@@ -216,8 +219,7 @@ def main():
             h18_depth=kf.H18_DEPTH, fp16_lossy_values=int(lossy),
             duplicate_rows_skipped=int(dups), k15c_reuse_check=k15c_check,
             device=str(dev), compute_dtype=a.dtype,
-            code=dict(k15f_continuous_refine=sha_file(kf.__file__),
-                      k15f_build_cache=sha_file(os.path.abspath(__file__))),
+            code=code_shas(),
             architecture_code_version=ctx.code_version,
             joint_sha1=ctx.joint_sha, plan_sha1=ctx.q0_prov["plan_sha1"],
             q0_prov=ctx.q0_prov, codec=ctx.codec_fp,
@@ -259,7 +261,8 @@ def load_cache(path, *, allow_smoke=False, verify_h18=True):
         raise SystemExit(f"{path}: smoke-кэш")
     arrays = man.get("array_sha1") or {}
     want_files = {f"{p}_{k}.npy" for p in PARTS
-                  for k in ("rows", "h18", "q0", "a0", "act")} | {"norm.npz"}
+                  for k in ("rows", "epi", "h18", "q0", "a0",
+                            "act")} | {"norm.npz"}
     if set(arrays) != want_files:
         raise SystemExit(f"{path}: в манифесте не все отпечатки файлов")
     for fn, sha in arrays.items():
@@ -274,8 +277,9 @@ def load_cache(path, *, allow_smoke=False, verify_h18=True):
         rows = np.load(os.path.join(path, f"{p}_rows.npy"))
         h18 = np.load(os.path.join(path, f"{p}_h18.npy"), mmap_mode="r")
         arr = {k: np.load(os.path.join(path, f"{p}_{k}.npy"))
-               for k in ("q0", "a0", "act")}
-        spec = dict(rows=((n,), np.int64), h18=((n, npos, dm), np.float16),
+               for k in ("q0", "a0", "act", "epi")}
+        spec = dict(rows=((n,), np.int64), epi=((n,), np.int64),
+                    h18=((n, npos, dm), np.float16),
                     q0=((n, npos), np.int64), a0=((n, he, 7), np.float32),
                     act=((n, he, 7), np.float32))
         for k, (shape, dt) in spec.items():
@@ -307,14 +311,23 @@ def load_cache(path, *, allow_smoke=False, verify_h18=True):
     return out
 
 
+def code_shas():
+    return dict(k15f_continuous_refine=sha_file(kf.__file__),
+                k15f_build_cache=sha_file(os.path.abspath(__file__)))
+
+
 def verify_main(path):
-    """Для раннера: 0 — кэш цел и пригоден, 1 — нет."""
+    """Для раннера: 0 — кэш цел, пригоден и построен ТЕКУЩИМ кодом."""
     try:
-        load_cache(path)
+        C = load_cache(path)
     except SystemExit as e:
         print(f"кэш {path} не принят: {e}")
         return 1
-    print(f"кэш {path} цел")
+    if C["manifest"].get("code") != code_shas():
+        print(f"кэш {path} построен другой версией кода: "
+              f"{C['manifest'].get('code')} против {code_shas()}")
+        return 1
+    print(f"кэш {path} цел и построен текущим кодом")
     return 0
 
 if __name__ == "__main__":

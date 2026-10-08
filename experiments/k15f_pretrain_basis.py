@@ -149,6 +149,8 @@ def main():
     man = C["manifest"]
     dev = torch.device(a.device)
     tag = f"basis_s{a.seed}" + ("" if a.mode == "full" else f"_{a.mode}")
+    run_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + \
+        f"-{os.getpid()}"
     out = a.out or f"data/k15f/{tag}.pt"
     report = a.report or f"reports/k15f/{tag}.json"
     tr, va = C["train"], C["val_sel"]
@@ -174,10 +176,10 @@ def main():
         return h[torch.as_tensor(order, device=dev)], a0f, r.reshape(
             len(idx), -1)
 
-    def evaluate(part, n_max=None):
-        n = len(part["rows"]) if n_max is None else min(n_max,
-                                                         len(part["rows"]))
-        tot, cnt, diag_rows = 0.0, 0, []
+    def evaluate(part):
+        """Реконструкция и геометрия по ВСЕЙ части (потоково)."""
+        n = len(part["rows"])
+        tot, cnt, rows_d = 0.0, 0, []
         with torch.no_grad():
             for s in range(0, n, 512):
                 idx = np.arange(s, min(n, s + 512))
@@ -186,13 +188,12 @@ def main():
                 loss, parts = kf.basis_loss(head, b, u, r)
                 tot += float(parts["rec"]) * len(idx)
                 cnt += len(idx)
-                if len(diag_rows) < 8:
-                    diag_rows.append((b, u, r))
-            b = torch.cat([x[0] for x in diag_rows])
-            u = torch.cat([x[1] for x in diag_rows])
-            r = torch.cat([x[2] for x in diag_rows])
-            d = kf.basis_diagnostics(head, b, u, r)
+                rows_d.append(kf.diag_rows(head, b, u, r))
+        d = kf.aggregate_diag(rows_d)
         d["rec"] = tot / max(cnt, 1)
+        if "epi" in part:
+            sd = kf.state_dependence(head, part, dev)
+            d["state_dep_far"] = sd
         return d
 
     technical = {}
@@ -242,11 +243,15 @@ def main():
                             for k, v in head.state_dict().items()}
             history.append(dict(tag=tagx, epoch=ep, val=d,
                                 state_sha1=kf.state_sha(head)))
-            print(f"  [{tagx}] val: реконструкция {d['rec']:.5f}, энергия "
-                  f"{d['explained_energy']:.3f}, обусловленность "
-                  f"{d['cond_median']:.2f}, мин. косинус якоря "
+            sd = d.get("state_dep_far") or {}
+            print(f"  [{tagx}] val ({d['rows']} строк): реконструкция "
+                  f"{d['rec']:.5f}, энергия {d['explained_energy']:.3f}, "
+                  f"обусловленность медиана {d['cond_median']:.2f} / макс "
+                  f"{d['cond_max']:.2f}, попарный косинус макс "
+                  f"{d['pair_cos_max']:.3f}, мин. косинус якоря "
                   f"{min(d['anchor_cos_min']):.3f}, |ΔU| "
-                  f"{d['delta_u_rms']:.4f}", flush=True)
+                  f"{d['delta_u_rms']:.4f}, зависимость от h18 (дальние "
+                  f"пары) {sd.get('rel_rms', float('nan')):.4f}", flush=True)
         snap(0)
         for ep in range(1, epochs + 1):
             perm = rng.permutation(n)
@@ -313,7 +318,7 @@ def main():
                 if amp_choice is not None else None)
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     obj = dict(
-        kind=KIND, mode=a.mode, seed=int(a.seed),
+        kind=KIND, mode=a.mode, seed=int(a.seed), run_id=run_id,
         status="complete", technical_ok=technical_ok,
         state={k: v.detach().cpu().clone()
                for k, v in head.state_dict().items()},
@@ -331,15 +336,17 @@ def main():
                                                       "manifest.json")),
         cache_frozen_sha1=man["frozen_sha1"], joint_sha1=man["joint_sha1"],
         plan_sha1=man["plan_sha1"],
-        code=dict(k15f_continuous_refine=kb.sha_file(kf.__file__),
-                  k15f_pretrain_basis=kb.sha_file(os.path.abspath(
-                      __file__))),
+        code=code_shas(),
         created=datetime.datetime.now().isoformat(timespec="seconds"))
-    # ПОРЯДОК ПУБЛИКАЦИИ: чекпойнт во временный файл -> отчёт ->
-    # канонический чекпойнт последним (его наличие — маркер завершения).
+    # ПОРЯДОК ПУБЛИКАЦИИ: чекпойнт во временный файл -> прежняя пара
+    # (чекпойнт, отчёт) в архив -> отчёт -> канонический чекпойнт последним.
+    # Отчёт и чекпойнт несут общий run_id, отчёт — отпечаток чекпойнта.
     tmp = out + ".tmp"
     torch.save(obj, tmp)
-    rep.update(kind=KIND + "_report", mode=a.mode, technical=technical,
+    for f_ in (out, report):
+        if os.path.exists(f_):
+            os.replace(f_, f"{f_}.{run_id}.bak")
+    rep.update(run_id=run_id, checkpoint_sha1=kb.sha_file(tmp),kind=KIND + "_report", mode=a.mode, technical=technical,
                technical_ok=technical_ok, code=code,
                stats=dict(sigma_arm=[float(x) for x in st["sigma_arm"]],
                           sigma_g=st["sigma_g"],
@@ -360,6 +367,11 @@ def main():
     print(f"ИТОГ базис {a.mode}: {'исправно' if technical_ok else 'ОТКАЗ'} "
           f"{technical}; f={amp_choice}; {out}")
     return code
+
+
+def code_shas():
+    return dict(k15f_continuous_refine=kb.sha_file(kf.__file__),
+                k15f_pretrain_basis=kb.sha_file(os.path.abspath(__file__)))
 
 
 def selftest():
@@ -386,6 +398,8 @@ def selftest():
             act[..., 6] = np.sign(a0[..., 6])
             np.save(os.path.join(path, f"{p}_q0.npy"),
                     np.zeros((n, 4), np.int64))
+            np.save(os.path.join(path, f"{p}_epi.npy"),
+                    (np.arange(n) // 10).astype(np.int64))
             np.save(os.path.join(path, f"{p}_a0.npy"), a0)
             np.save(os.path.join(path, f"{p}_act.npy"), act.astype(
                 np.float32))

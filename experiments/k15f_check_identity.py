@@ -65,7 +65,19 @@ def load_head(torch, ck, model, dev):
 
 
 def check_basis_ckpt(ck):
+    """Чекпойнт базиса: завершён, исправен, снят ТЕКУЩИМ кодом обучения, с
+    текущими пределами геометрии, сидом контроля и правилом амплитуды."""
+    import k15f_pretrain_basis as kpb
     p = []
+    if ck.get("code") != kpb.code_shas():
+        p.append(f"базис обучен другой версией кода: {ck.get('code')} "
+                 f"против {kpb.code_shas()}")
+    if ck.get("geometry_limits") != dict(kf.GEOMETRY):
+        p.append("пределы геометрии в базисе не совпадают с текущими")
+    if ck.get("control_seed") != kpb.CONTROL_SEED:
+        p.append("сид контроля не зарегистрированный")
+    if list(ck.get("amp_factors_considered") or []) != list(kpb.AMP_FACTORS):
+        p.append("правило множителя амплитуды другое")
     if ck.get("kind") != "k15f_basis" or ck.get("status") != "complete":
         p.append(f"kind/status {ck.get('kind')}/{ck.get('status')}")
     if ck.get("technical_ok") is not True:
@@ -124,7 +136,6 @@ def main():
     slot = {int(r): i for i, r in enumerate(C["val_sel"]["rows"])}
     q0_dev = torch.as_tensor(np.asarray(ctx.q0_can), device=dev)
     ac16 = torch.autocast(device_type=dev.type, dtype=ctx.dt)
-    rels = []
     for bi, (po, sel) in enumerate(batches):
         b = ctx.build_batch(po, sel)
         with torch.no_grad(), ac16:
@@ -173,12 +184,6 @@ def main():
             ok("control_differs", not torch.allclose(basis @ R, basis))
             ok("control_keeps_norms", torch.allclose(
                 (basis @ R).norm(dim=-1), basis.norm(dim=-1), atol=1e-4))
-            # ЗАВИСИМОСТЬ ОТ h18: относительный RMS изменения базиса при
-            # перестановке h18 между строками (a0 — свой)
-            b_roll, _ = head(h18.roll(1, 0), a0)
-            rel = float((b_roll * f - basis).pow(2).mean().sqrt()
-                        / basis.pow(2).mean().sqrt().clamp_min(1e-12))
-            rels.append(rel)
             act_b = torch.from_numpy(np.asarray(ctx.ACT[sel], np.float32)
                                      [:, :a0.shape[1], :7]).to(dev)
             rr = kf.to_tangent(act_b, a0, head.sigma_arm, head.sigma_g
@@ -231,20 +236,29 @@ def main():
     ok("save_load", torch.equal(b1, b2))
     frozen1, _n, _e = k15t.frozen_content_sha(model, torch, set())
     ok("frozen_unchanged", frozen1 == frozen0)
+    # ЗАВИСИМОСТЬ ОТ h18 — по ~1024 равномерным строкам val_sel кэша, h18
+    # каждой подменяется h18 ДАЛЬНЕЙ строки ДРУГОГО эпизода (a0 свой).
+    # Перестановка внутри батча плана сравнивала бы соседние кадры одного
+    # эпизода и занижала бы зависимость. Кэш h18 сверен с живой моделью
+    # выше (h18_equals_cache), так что замер по кэшу законен.
+    sd = kf.state_dependence(head, C["val_sel"], dev, factor=f)
+    ok("far_pairs_other_episode", sd["same_episode_share"] == 0.0,
+       f"доля пар с тем же эпизодом {sd['same_episode_share']:.3f}")
     passed = all(c["passed"] for c in checks.values())
-    rel_med = float(np.median(rels)) if rels else 0.0
-    state_dep = rel_med >= kf.STATE_DEP_MIN_REL
+    rel_med = sd["rel_rms"]
+    state_dep = bool(sd["state_dependent"])
     # ИСХОД: 0 — иерархический базис (зависит от h18); 4 — технически
     # исправен, но фактически глобальная PCA: отдельный baseline, M1 для
     # иерархии не запускается; 3 — технический отказ
     code = 3 if not passed else (0 if state_dep else 4)
     print(f"  базис зависит от h18: {state_dep} — относительный RMS "
-          f"изменения при перестановке h18 {rel_med:.4f} (порог "
+          f"изменения при подмене h18 дальней строкой другого эпизода "
+          f"{rel_med:.4f} по {sd['rows']} строкам (порог "
           f"{kf.STATE_DEP_MIN_REL}); выбрана точка {ck.get('selected')}")
     tag = str(dev).replace(":", "")
     out = a.out or f"reports/k15f/identity_{tag}.json"
     rep = dict(kind=KIND, passed=bool(passed), code=code, checks=checks,
-               state_dep_rel_rms=rel_med,
+               state_dep_rel_rms=rel_med, state_dep_far=sd,
                state_dep_threshold=kf.STATE_DEP_MIN_REL,
                basis=os.path.abspath(a.basis),
                basis_sha1=kb.sha_file(a.basis),
@@ -335,23 +349,20 @@ def integration():
                 "frozen_unchanged"]["passed"]
             rep0 = json.load(open(ident))
             assert rep0["code"] == code
+            gate = os.path.join(td, "k15a.json")
+            open(gate, "w").write("{}")
+            kpd.gate_paths = lambda device: (gate, gate)
             if code == 4:
-                # рука обязана отказать на базисе без зависимости от h18;
-                # для проверки механики руки дальше — отчёт с кодом 0
-                gate4 = os.path.join(td, "k15a4.json")
-                open(gate4, "w").write("{}")
-                kpd.gate_paths = lambda device: (gate4, gate4)
+                # рука обязана отказать на глобальной PCA
                 try:
                     kpf.build_arm("cpu", basis, "z", torch,
                                   identity_report=ident)
                     raise AssertionError("рука приняла глобальную PCA")
                 except SystemExit as e:
                     assert "h18" in str(e), e
-                json.dump(dict(rep0, code=0, basis_state_dependent=True),
-                          open(ident, "w"))
-            gate = os.path.join(td, "k15a.json")
-            open(gate, "w").write("{}")
-            kpd.gate_paths = lambda device: (gate, gate)
+            # дальше рука собирается из НАСТОЯЩЕЙ пары basis_dep +
+            # identity_dep, без подменённых отчётов
+            basis, ident = basis_dep, ident_dep
             po, sel = ctx.parts_full["val_sel"][0]
             ac = torch.autocast(device_type="cpu", dtype=torch.bfloat16)
             acts = {}
