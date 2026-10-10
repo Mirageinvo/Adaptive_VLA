@@ -72,6 +72,28 @@ SMOKE = dict(tasks=[0, 8], blocks={"0": [0], "8": [0]},
              candidates=["q0ref", "p2l0p", "p2r0p", "p4l0p", "p4r0p"])
 
 
+def require_m1_cold(cen, census_path, m1):
+    """Основной план — только после ТЕХНИЧЕСКИ КОРРЕКТНОГО итога M1-cold на
+    ПРОВЕРЕННОЙ переписи. Наличия файла результата недостаточно."""
+    import k15f_m1_cold as mc
+    p = []
+    if cen.get("code") != 0 or cen.get("technical"):
+        p.append(f"перепись технически не корректна: {cen.get('technical')}")
+    if m1.get("kind") != "k15f_m1" or m1.get("code") != 0 \
+            or m1.get("technical"):
+        p.append(f"итог M1-cold: код {m1.get('code')}, "
+                 f"{(m1.get('technical') or [])[:3]}")
+    if m1.get("F") != cen.get("F"):
+        p.append(f"F итога M1 {m1.get('F')} не равно F переписи {cen.get('F')}")
+    if not p:
+        mplan = mc.verify_plan()        # SystemExit при любом расхождении
+        if os.path.abspath(mplan["new_census"]) != os.path.abspath(
+                census_path):
+            p.append("перепись не та, что зафиксирована планом M1-cold")
+    if p:
+        raise SystemExit("ОТКАЗ плана K-15g: " + "; ".join(p))
+
+
 def make_plan(*, basis, identity, census_path, m1_report, census_q0_dir,
               device, dtype, tasks=None, smoke=False):
     cen = json.load(open(census_path))
@@ -84,6 +106,7 @@ def make_plan(*, basis, identity, census_path, m1_report, census_q0_dir,
         blocks = dict(SMOKE["blocks"])
     else:
         m1 = json.load(open(m1_report))
+        require_m1_cold(cen, census_path, m1)
         blocks = {str(t): cen["blocks"][str(t)] for t in tasks}
     fails = [x for x in cen["fails"] if x[0] in tasks]
     diag = [x for x in cen["diag"] if x[0] in tasks]
@@ -145,11 +168,31 @@ def expected_contract(basis, identity):
         code_version=rep.get("code_version"))
 
 
-def validate_block(path, label=None, task=None, block=None):
-    """Пара JSON+npz одного блока цела и согласована. Список проблем.
+def expected_setup():
+    """Ожидаемый контракт раскатки: SETUP_EXPECTED + отпечаток харнесса."""
+    import k15f_measure_subspace as kms
+    return dict(kms.SETUP_EXPECTED, script_sha1=sha(os.path.join(
+        HERE, "k9h_multiarm_gate.py")))
 
-    Используется и проверкой протокола, и возобновлением раннера: блок
-    считается готовым, только если проблем нет.
+
+def episode_action_sha(A, i, done_step):
+    """Хеш исполненных действий среды i — формула харнесса (_ahash)."""
+    end = int(done_step) + 1 if int(done_step) >= 0 else len(A)
+    return hashlib.sha1(np.ascontiguousarray(A[:end, i]).tobytes()
+                        ).hexdigest()[:16], end
+
+
+def validate_block(path, label=None, task=None, block=None, *,
+                   require_single=False, setup=None):
+    """ПОЛНАЯ проверка пары JSON+npz одного блока. Список проблем.
+
+    Обязательные массивы npz (actions [T, B, 7] float32 конечный,
+    done_step, init_state_id, action_sha1), согласие с эпизодами JSON,
+    own_steps, хеш действий КАЖДОГО эпизода, пересчитанный из исполненной
+    части actions, заголовок блока (init_start, состояния). Строгий режим:
+    одиночный процесс (argv.init_starts == блок) и ожидаемый контракт
+    раскатки. Используется и перед пропуском готового блока, и сразу после
+    нового прогона.
     """
     p = []
     name = os.path.basename(path)
@@ -162,27 +205,61 @@ def validate_block(path, label=None, task=None, block=None):
         zz = {k: z[k] for k in z.files}
     except Exception as e:                  # noqa: BLE001 — любой сбой = отказ
         return [f"{name}: не читается ({type(e).__name__})"]
+    for k in ("actions", "done_step", "init_state_id", "action_sha1"):
+        if k not in zz:
+            p.append(f"{name}: в npz нет {k}")
+    if p:
+        return p
     eps = d.get("episodes") or []
+    B = len(eps)
+    A = zz["actions"]
+    if A.ndim != 3 or A.shape[1] != B or A.shape[2] != 7 \
+            or A.dtype != np.float32:
+        p.append(f"{name}: actions формы {A.shape} {A.dtype}, ожидалось "
+                 f"[T, {B}, 7] float32")
+    elif not np.isfinite(A).all():
+        p.append(f"{name}: actions не конечны")
     ids = [int(e["init_state_id"]) for e in eps]
     if label is not None and d.get("arm_label") != label:
         p.append(f"{name}: метка {d.get('arm_label')!r}")
     if task is not None and int(d.get("task_id", -1)) != int(task):
         p.append(f"{name}: задача {d.get('task_id')}")
-    if block is not None and ids != list(range(int(block), int(block) + 5)):
-        p.append(f"{name}: состояния {ids}, ожидался блок {block}")
-    if [str(x) for x in zz.get("action_sha1", [])] != \
+    if block is not None:
+        if ids != list(range(int(block), int(block) + B)) or B != 5:
+            p.append(f"{name}: состояния {ids}, ожидался блок {block}")
+        if int(d.get("init_start", -1)) != int(block):
+            p.append(f"{name}: заголовок init_start {d.get('init_start')}"
+                     f", ожидался {block}")
+    ds = [int(x) for x in zz["done_step"]]
+    if [str(x) for x in zz["action_sha1"]] != \
             [str(e.get("action_sha1")) for e in eps]:
         p.append(f"{name}: action_sha1 в npz не совпадает с JSON")
-    if [int(x) for x in zz.get("init_state_id", [])] != ids:
+    if [int(x) for x in zz["init_state_id"]] != ids:
         p.append(f"{name}: init_state_id в npz не совпадает с JSON")
-    if [int(x) for x in zz.get("done_step", [])] != \
-            [int(e.get("done_step", -2)) for e in eps]:
+    if ds != [int(e.get("done_step", -2)) for e in eps]:
         p.append(f"{name}: done_step в npz не совпадает с JSON")
+    if not p and A.ndim == 3:
+        for i, e in enumerate(eps):
+            h, end = episode_action_sha(A, i, ds[i])
+            if int(e.get("own_steps", -1)) != end:
+                p.append(f"{name}: эпизод {ids[i]}: own_steps "
+                         f"{e.get('own_steps')} против {end}")
+            if h != str(e.get("action_sha1")):
+                p.append(f"{name}: эпизод {ids[i]}: хеш действий не "
+                         f"совпал с исполненными actions")
     if int(d.get("seed", -1)) != 101 or any(
             int(e.get("rollout_seed", -1)) != 101 for e in eps):
         p.append(f"{name}: сид не 101")
+    if require_single:
+        starts = str((d.get("argv") or {}).get("init_starts") or "")
+        if starts.replace(",", " ").split() != [str(block)]:
+            p.append(f"{name}: не одиночный процесс (init_starts "
+                     f"{starts!r})")
+    if setup:
+        for k, v in setup.items():
+            if d.get(k) != v:
+                p.append(f"{name}: {k} = {d.get(k)!r}, ожидалось {v!r}")
     return p
-
 
 def active_amplitude(z, label):
     """(сумма квадратов по каналам, число шагов, переключений схвата) —
@@ -484,6 +561,9 @@ def main():
     ap.add_argument("--dtype", default="float16")
     ap.add_argument("--out", default="reports/k15g/local_analysis.json")
     ap.add_argument("--overwrite-plan", action="store_true")
+    ap.add_argument("--strict", action="store_true",
+                    help="с --validate-block: одиночный процесс и ожидаемый "
+                         "контракт раскатки")
     ap.add_argument("--validate-block", nargs=4, default=None,
                     metavar=("JSON", "МЕТКА", "ЗАДАЧА", "БЛОК"),
                     help="для раннера: 0 — блок цел, 2 — повреждён")
@@ -494,7 +574,9 @@ def main():
         return selftest()
     if a.validate_block:
         path, lab, t, b = a.validate_block
-        prob = validate_block(path, lab, int(t), int(b))
+        prob = validate_block(path, lab, int(t), int(b),
+                              require_single=a.strict,
+                              setup=expected_setup() if a.strict else None)
         if prob:
             print("; ".join(prob))
         return 2 if prob else 0
@@ -599,19 +681,27 @@ def selftest():
     # целостность пары JSON+npz для возобновления
     import tempfile
     with tempfile.TemporaryDirectory() as td:
-        eps = [dict(init_state_id=5 + k, action_sha1=f"{k:016x}",
-                    done_step=20 + k, rollout_seed=101, success=True)
-               for k in range(5)]
+        A0 = np.random.default_rng(1).standard_normal((30, 5, 7)).astype(
+            np.float32)
+        eps = []
+        for k in range(5):
+            h_, end_ = episode_action_sha(A0, k, 20 + k)
+            eps.append(dict(init_state_id=5 + k, action_sha1=h_,
+                            done_step=20 + k, own_steps=end_,
+                            rollout_seed=101, success=True))
 
-        def write(eps_, npz_kw):
+        def write(eps_, npz_kw, header=None):
             np.savez(os.path.join(td, "a.actions.npz"), **npz_kw)
             dd = dict(arm_label="p2l0p", task_id=8, init_start=5, seed=101,
+                      argv=dict(init_starts="5"),
                       episodes=eps_, actions_npz="a.actions.npz",
                       actions_npz_sha1=sha(os.path.join(td,
                                                         "a.actions.npz")))
+            dd.update(header or {})
             json.dump(dd, open(os.path.join(td, "a.json"), "w"))
             return os.path.join(td, "a.json")
-        good = dict(action_sha1=np.asarray([e["action_sha1"] for e in eps]),
+        good = dict(actions=A0,
+                    action_sha1=np.asarray([e["action_sha1"] for e in eps]),
                     init_state_id=np.arange(5, 10),
                     done_step=np.arange(20, 25))
         pth = write(eps, good)
@@ -622,12 +712,71 @@ def selftest():
         assert any("done_step" in x for x in validate_block(pth))
         pth = write(eps, dict(good, action_sha1=np.asarray(["0" * 16] * 5)))
         assert any("action_sha1" in x for x in validate_block(pth))
+        # три случая из ревью: нет actions; действие изменено при
+        # обновлённом SHA npz; заголовок другого блока в многоблочном
+        # процессе
+        pth = write(eps, {k: v for k, v in good.items() if k != "actions"})
+        assert any("нет actions" in x for x in validate_block(pth))
+        A1 = A0.copy()
+        A1[3, 2, 0] += 1.0
+        pth = write(eps, dict(good, actions=A1))
+        assert any("хеш действий" in x for x in validate_block(pth))
+        pth = write(eps, good, header=dict(init_start=0,
+                                           argv=dict(init_starts="0,5")))
+        prob_ = validate_block(pth, "p2l0p", 8, 5, require_single=True)
+        assert any("заголовок" in x for x in prob_)
+        assert any("одиночный" in x for x in prob_)
+        A2 = A0.copy()
+        A2[0, 0, 0] = np.nan
+        pth = write(eps, dict(good, actions=A2))
+        assert any("не конечны" in x for x in validate_block(pth))
+        pth = write(eps, dict(good, actions=A0.astype(np.float64)))
+        assert any("формы" in x for x in validate_block(pth))
+        eps_bad = [dict(e) for e in eps]
+        eps_bad[0]["own_steps"] = 999
+        pth = write(eps_bad, good)
+        assert any("own_steps" in x for x in validate_block(pth))
+        pth = write(eps, good, header=dict(horizon=4))
+        assert any("horizon" in x for x in validate_block(
+            pth, setup=dict(horizon=8)))
         pth = write(eps, good)
+        assert validate_block(pth, "p2l0p", 8, 5, require_single=True) == []
         np.savez(os.path.join(td, "a.actions.npz"), x=np.ones(1))
         assert any("отпечаток" in x for x in validate_block(pth))
         open(os.path.join(td, "a.json"), "w").write("{обрыв")
         assert any("не читается" in x for x in validate_block(pth))
     assert len(lp.all_labels()) == 32
+    # основной план: наличие файла итога M1 недостаточно
+    import k15f_m1_cold as mc
+    good_c = dict(code=0, technical=[], F=13)
+    good_m = dict(kind="k15f_m1", code=0, technical=[], F=13)
+    orig_vp = mc.verify_plan
+    mc.verify_plan = lambda: dict(new_census="/x/cen.json")
+    try:
+        require_m1_cold(good_c, "/x/cen.json", good_m)
+        for cen_, m_, path_ in (
+                (good_c, dict(good_m, code=3, technical=["t"]), "/x/cen.json"),
+                (good_c, dict(good_m, technical=["t"]), "/x/cen.json"),
+                (dict(good_c, code=3), good_m, "/x/cen.json"),
+                (good_c, dict(good_m, F=12), "/x/cen.json"),
+                (good_c, dict(good_m, kind="k15f_census"), "/x/cen.json"),
+                (good_c, good_m, "/x/other.json")):
+            try:
+                require_m1_cold(cen_, path_, m_)
+                raise AssertionError("принят негодный итог M1-cold")
+            except SystemExit:
+                pass
+
+        def bad_vp():
+            raise SystemExit("план M1-cold не прошёл проверку")
+        mc.verify_plan = bad_vp
+        try:
+            require_m1_cold(good_c, "/x/cen.json", good_m)
+            raise AssertionError("принят непроверенный план M1-cold")
+        except SystemExit:
+            pass
+    finally:
+        mc.verify_plan = orig_vp
     print("самопроверка k15g_local_probe пройдена: момент достигнут/нет, "
           "один импульс, префикс, возврат к a0, метка")
     return 0

@@ -310,6 +310,12 @@ def analyze(m1_dir, census, basis_ckpt=None, kappa=1.0,
                                   code=off["code"], R_L=off["R_L"],
                                   R_C=off["R_C"],
                                   technical=off["technical"][:5])
+        # ТЕХНИЧЕСКИЙ СТАТУС ОФИЦИАЛЬНОГО АНАЛИЗА — наверх: иначе отказ
+        # штатного анализатора терялся бы за кодом 0 этой диагностики
+        if off["code"] != 0 or off["technical"]:
+            res["technical"] = res["technical"] + [
+                f"официальный M1: код {off['code']}: "
+                f"{off['technical'][:3]}"]
     else:
         res["official_m1"] = None
     return res
@@ -378,7 +384,7 @@ def main():
                   else str(x))
     os.replace(a.out + ".tmp", a.out)
     print(f"  сводка: {a.out}")
-    return 0
+    return 3 if res["technical"] else 0
 
 
 def selftest():
@@ -473,7 +479,15 @@ def selftest():
             # синтетике q0 покрывает не все задачи — это не дефект анализа
             warnings.simplefilter("ignore", RuntimeWarning)
             res = analyze(td, census)
-        assert res["complete"] and not res["technical"], res["technical"]
+        # РЕГРЕССИЯ: синтетическая перепись неполна, официальный анализ
+        # отказывает — и этот отказ обязан подняться наверх, а не
+        # потеряться за кодом 0 диагностики
+        assert res["complete"]
+        assert res["official_m1"]["code"] == 3
+        assert [x for x in res["technical"]
+                if not x.startswith("официальный M1")] == [], \
+            res["technical"]
+        assert any(x.startswith("официальный M1") for x in res["technical"])
         r = res["rescue"]
         assert r["learned"] == 1 and r["control"] == 0
         assert r["learned_only"] == 1 and r["both"] == 0

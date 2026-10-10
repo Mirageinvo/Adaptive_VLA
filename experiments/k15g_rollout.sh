@@ -54,6 +54,8 @@ fi
 if [ "$MODE" = "plan" ]; then
   M1REP="reports/k15f/m1cold_result.json"
   [ -f "$M1REP" ] || { echo "ОТКАЗ: нет итогового отчёта M1-cold"; exit 1; }
+  # код 0, пустой technical, проверенная перепись и план M1-cold —
+  # проверяет make_plan (require_m1_cold)
   python3 experiments/k15g_local_probe.py --mode plan --plan "$PLAN" \
     --basis "$BASIS" --identity "$IDENT" --census "$CENSUS" \
     --m1-report "$M1REP" --census-q0-dir "$M1DIR" --device "$DEV"
@@ -109,8 +111,8 @@ block_state () {   # путь метка задача блок -> 0 цел, 1 н
   # метка, задача, состояния блока, action_sha1/init_state_id/done_step
   # npz = JSON, сид 101 (k15g_local_probe.validate_block)
   [ -f "$1" ] || return 1
-  python3 experiments/k15g_local_probe.py --validate-block "$1" "$2" "$3" \
-    "$4" >/dev/null 2>&1 && return 0
+  python3 experiments/k15g_local_probe.py --strict --validate-block "$1" \
+    "$2" "$3" "$4" >/dev/null 2>&1 && return 0
   return 2
 }
 
@@ -139,7 +141,20 @@ run_arm () {   # метка, задача, блоки
       --init-starts "$NEED" --arm-label "$L" \
       --out "$OUTD/${L}_t${T}_i{i0}.json" > "$OUT" 2>&1 || rc=$?
     cat "$OUT"
-    if [ $rc -eq 0 ]; then rm -f "$OUT"; sleep 5; return 0; fi
+    if [ $rc -eq 0 ]; then
+      rm -f "$OUT"
+      # проверка СРАЗУ ПОСЛЕ прогона той же строгой функцией
+      for I0 in ${NEED//,/ }; do
+        local F="$OUTD/${L}_t${T}_i${I0}.json"
+        if ! block_state "$F" "$L" "$T" "$I0"; then
+          python3 experiments/k15g_local_probe.py --strict --validate-block \
+            "$F" "$L" "$T" "$I0" || true
+          echo "ОСТАНОВ: $L t$T i$I0 — новый результат не прошёл проверку"
+          return 3
+        fi
+      done
+      sleep 5; return 0
+    fi
     if grep -q "No CUDA GPUs are available" "$OUT" && [ "$try" -lt 3 ]; then
       echo "    инфраструктурный сбой (нет GPU) — пауза 120 с и повтор"
       rm -f "$OUT"; sleep 120; continue

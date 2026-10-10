@@ -61,10 +61,12 @@ def m1_dir():
 
 
 def first_in_process(d):
-    """Блок шёл ПЕРВЫМ в своём процессе (по argv харнесса)."""
-    starts = str((d.get("argv") or {}).get("init_starts") or
-                 d.get("init_start"))
-    first = starts.replace(",", " ").split()[0]
+    """Блок шёл ПЕРВЫМ в своём процессе — ТОЛЬКО по явному argv харнесса.
+    Отсутствие argv подтверждением не считается."""
+    starts = (d.get("argv") or {}).get("init_starts")
+    if not starts:
+        return False
+    first = str(starts).replace(",", " ").split()[0]
     return int(first) == int(d["init_start"])
 
 
@@ -88,6 +90,10 @@ def copy_pair(src_json, dst_dir):
 
 def census_mode():
     import k15f_measure_subspace as kms
+    # ПЕРЕПИСЬ, НА КОТОРУЮ УЖЕ ССЫЛАЕТСЯ ПЛАН, НЕ ПЕРЕЗАПИСЫВАЕТСЯ
+    if os.path.exists(PLAN):
+        raise SystemExit(f"{PLAN} уже зафиксирован и ссылается на "
+                         f"{CENSUS_NEW}: перепись не пересобирается")
     src = m1_dir()
     os.makedirs(COLD_DIR, exist_ok=True)
     prov, problems = [], []
@@ -151,6 +157,9 @@ def plan_mode(basis, identity, basis_report):
         raise SystemExit(f"{PLAN} уже зафиксирован")
     src = m1_dir()
     new = json.load(open(CENSUS_NEW))
+    if new.get("code") != 0 or new.get("technical"):
+        raise SystemExit(f"перепись технически не корректна: "
+                         f"{new.get('technical')}")
     reuse, jobs, problems = [], [], []
     for t_s, blocks in new["blocks"].items():
         t = int(t_s)
@@ -168,8 +177,7 @@ def plan_mode(basis, identity, basis_report):
                                       json_sha1=sha(p),
                                       npz_sha1=sha(os.path.join(
                                           src, d["actions_npz"]))))
-                else:
-                    jobs.append(dict(arm=lab, task=t, block=int(b)))
+    jobs = derive_jobs(new)
     if problems:
         raise SystemExit("план не собран: " + "; ".join(problems[:6]))
     import k15f_measure_subspace as kms
@@ -193,23 +201,103 @@ def plan_mode(basis, identity, basis_report):
     with open(PLAN + ".tmp", "w", encoding="utf-8") as fh:
         json.dump(plan, fh, ensure_ascii=False, indent=1)
     os.replace(PLAN + ".tmp", PLAN)
+    verify_plan()
     print(f"  план M1-cold: переиспользуется блоков 0 — {len(reuse)}, "
           f"заданий на холодные вторые блоки — {len(jobs)}; {PLAN}")
     return 0
 
 
 def assemble_mode():
-    plan = json.load(open(PLAN))
+    import k15g_local_probe as pr
+    plan = verify_plan()
     for r in plan["reused_blocks"]:
-        if sha(r["source"]) != r["json_sha1"]:
-            raise SystemExit(f"{r['source']} изменился после плана")
-        copy_pair(r["source"], plan["cold_dir"])
-    print(f"  скопировано блоков 0 рук: {len(plan['reused_blocks'])}")
+        d = json.load(open(r["source"]))
+        npz = os.path.join(os.path.dirname(r["source"]), d["actions_npz"])
+        if sha(r["source"]) != r["json_sha1"] or sha(npz) != r["npz_sha1"]:
+            raise SystemExit(f"{r['source']} или его npz изменились после "
+                             f"плана")
+        got = copy_pair(r["source"], plan["cold_dir"])
+        if got["json_sha1"] != r["json_sha1"] or \
+                got["npz_sha1"] != r["npz_sha1"]:
+            raise SystemExit(f"копия {r['source']} не совпала с планом")
+        dst = os.path.join(plan["cold_dir"], os.path.basename(r["source"]))
+        prob = pr.validate_block(dst, r["arm"], r["task"], 0,
+                                 setup=pr.expected_setup())
+        if prob:
+            raise SystemExit(f"собранная пара не прошла проверку: {prob[:3]}")
+    print(f"  скопировано и проверено блоков 0 рук: "
+          f"{len(plan['reused_blocks'])}")
     return 0
 
 
-def jobs_mode():
+def derive_jobs(census):
+    jobs = []
+    for t_s, blocks in sorted(census["blocks"].items(), key=lambda x:
+                              int(x[0])):
+        for b in blocks:
+            if int(b) != 0:
+                for lab in LABELS:
+                    jobs.append(dict(arm=lab, task=int(t_s), block=int(b)))
+    return jobs
+
+
+def verify_plan():
+    """Перед assemble/run/analyze: все входы и код совпадают с планом,
+    перепись технически корректна и воспроизводится штатной census() по
+    q0 каталога M1-cold, задания получены из неё. Иначе — отказ."""
+    import k15f_measure_subspace as kms
+    import k15g_local_probe as pr
     plan = json.load(open(PLAN))
+    p = []
+    u = plan["unchanged"]
+    for path, key in ((plan["new_census"], plan["new_census_sha1"]),
+                      (u["basis"], u["basis_sha1"]),
+                      (u["identity_report"], u["identity_report_sha1"]),
+                      (u["basis_report"], u["basis_report_sha1"])):
+        if not os.path.exists(path) or sha(path) != key:
+            p.append(f"{path}: изменён или отсутствует")
+    if sha(os.path.join(HERE, "k9h_multiarm_gate.py")) != u["harness_sha1"]:
+        p.append("харнесс изменён после плана")
+    if u["setup"] != kms.SETUP_EXPECTED or u["rule"] != kms.RULE:
+        p.append("контракт раскатки или правило изменились после плана")
+    cen = json.load(open(plan["new_census"]))
+    if cen.get("code") != 0 or cen.get("technical"):
+        p.append(f"перепись технически не корректна: {cen.get('technical')}")
+    q0 = [(f, json.load(open(f))) for f in sorted(glob.glob(os.path.join(
+        plan["cold_dir"], "q0_t*_i*.json")))]
+    for f, d in q0:
+        cold = (first_in_process(d) if int(d["init_start"]) == 0
+                else single_block(d))
+        if not cold:
+            p.append(f"{os.path.basename(f)}: не холодный старт")
+        p += pr.validate_block(f, "q0", d["task_id"], d["init_start"],
+                               require_single=int(d["init_start"]) != 0,
+                               setup=pr.expected_setup())
+    re_ = kms.census(q0, pr.expected_setup())
+    for k in ("F", "fails", "diag", "blocks", "q0_files", "code"):
+        if json.dumps(re_.get(k), sort_keys=True) != json.dumps(
+                cen.get(k), sort_keys=True):
+            p.append(f"перепись не воспроизводится по q0: поле {k}")
+    if plan["jobs"] != derive_jobs(cen):
+        p.append("задания не совпадают с выведенными из переписи")
+    if p:
+        raise SystemExit("план M1-cold не прошёл проверку: " + "; ".join(
+            p[:6]))
+    return plan
+
+
+def common_args():
+    """Аргументы раскатки — из ЗАФИКСИРОВАННОГО плана."""
+    st = verify_plan()["unchanged"]["setup"]
+    return (f"--ckpt {st['ckpt']} --task-suite {st['suite']} --n-envs "
+            f"{st['n_envs']} --seed {st['seed']} --rollout-seed-mode "
+            f"{st['rollout_seed_mode']} --ensemble {st['ensemble']} "
+            f"--horizon {st['horizon']} --max-steps {st['max_steps']} "
+            f"--waiting-steps {st['waiting_steps']}")
+
+
+def jobs_mode():
+    plan = verify_plan()
     for j in plan["jobs"]:
         print(j["task"], j["arm"], j["block"])
     return 0
@@ -217,19 +305,130 @@ def jobs_mode():
 
 def selftest():
     assert first_in_process(dict(init_start=0, argv=dict(init_starts="0,5")))
+    assert not first_in_process(dict(init_start=0))      # нет argv — нет
+    cen = dict(blocks={"0": [0], "8": [0, 5], "2": [0, 5]})
+    jb = derive_jobs(cen)
+    assert len(jb) == 32 and {j["task"] for j in jb} == {2, 8}
+    assert all(j["block"] == 5 for j in jb)
     assert not first_in_process(dict(init_start=5,
                                      argv=dict(init_starts="0,5")))
     assert single_block(dict(init_start=5, argv=dict(init_starts="5")))
     assert not single_block(dict(init_start=5, argv=dict(init_starts="0,5")))
     assert len(LABELS) == 16
-    print("самопроверка k15f_m1_cold пройдена")
+    _chain_test()
+    print("самопроверка k15f_m1_cold пройдена: холодность по argv, задания, "
+          "сквозная цепочка перепись -> план -> проверка -> сборка, "
+          "мутации")
     return 0
+
+
+def _fake_art(dirpath, label, t, blk, starts, succ, policy="depthrvq"):
+    """Синтетическая пара JSON+npz в формате харнесса."""
+    import numpy as np
+    import k15f_measure_subspace as kms
+    import k15g_local_probe as pr
+    rng = np.random.default_rng(hash((label, t, blk)) % 2**32)
+    A = rng.standard_normal((16, 5, 7)).astype(np.float32)
+    ds = np.full(5, 12)
+    eps = []
+    for k in range(5):
+        h, end = pr.episode_action_sha(A, k, ds[k])
+        eps.append(dict(success=bool(succ(t, blk + k)),
+                        init_state_id=blk + k, env_index=k,
+                        init_hash=f"i{t}{blk + k}",
+                        init_hash_full=f"I{t}{blk + k}", rollout_seed=101,
+                        done_step=int(ds[k]), own_steps=end,
+                        action_sha1=h))
+    base = os.path.join(dirpath, f"{label}_t{t}_i{blk}")
+    np.savez(base + ".actions.npz", actions=A, done_step=ds,
+             init_state_id=np.arange(blk, blk + 5),
+             action_sha1=np.asarray([e["action_sha1"] for e in eps]))
+    d = dict(kms.SETUP_EXPECTED, script_sha1=sha(os.path.join(
+        HERE, "k9h_multiarm_gate.py")), episodes=eps, arm_label=label,
+        task_id=t, init_start=blk, policy=policy, levels=1,
+        argv=dict(init_starts=starts, depth_rvq_mode="fast"),
+        actions_npz=os.path.basename(base) + ".actions.npz",
+        joint=dict(model_fingerprint=f"fp{label}"))
+    d["actions_npz_sha1"] = sha(base + ".actions.npz")
+    json.dump(d, open(base + ".json", "w"))
+    return base + ".json"
+
+
+def _chain_test():
+    import tempfile
+    g = globals()
+    keep = {k: g[k] for k in ("COLD_DIR", "DIAG", "CENSUS_OLD",
+                              "CENSUS_NEW", "PLAN", "m1_dir")}
+    fails = {(8, 0), (8, 6), (9, 7), (2, 9)}
+
+    def succ(t, s_):
+        return (t, s_) not in fails
+
+    def cold_succ(t, s_):                   # холодный блок 5: другой исход
+        return succ(t, s_) if (t, s_) != (2, 8) else False
+    with tempfile.TemporaryDirectory() as td:
+        m1 = os.path.join(td, "m1") + os.sep
+        os.makedirs(m1)
+        diag = os.path.join(td, "diag")
+        os.makedirs(diag)
+        for t in TASKS:
+            _fake_art(m1, "q0", t, 0, "0,5", succ)
+            _fake_art(m1, "q0", t, 5, "0,5", succ)
+            _fake_art(diag, "q0", t, 5, "5", cold_succ)
+            for lab in LABELS:
+                _fake_art(m1, lab, t, 0, "0,5", succ, policy="k15f")
+        old = dict(F=len(fails), fails=sorted(map(list, fails)), diag=[],
+                   blocks={})
+        oldp = os.path.join(td, "old.json")
+        json.dump(old, open(oldp, "w"))
+        for f in ("basis.pt", "ident.json", "brep.json"):
+            open(os.path.join(td, f), "w").write(f)
+        g.update(COLD_DIR=os.path.join(td, "cold"), DIAG=diag,
+                 CENSUS_OLD=oldp, CENSUS_NEW=os.path.join(td, "new.json"),
+                 PLAN=os.path.join(td, "plan.json"), m1_dir=lambda: m1)
+        try:
+            assert census_mode() == 0
+            new = json.load(open(g["CENSUS_NEW"]))
+            assert [2, 8] in new["m1cold"]["diff"]["fails_added"]
+            assert plan_mode(os.path.join(td, "basis.pt"),
+                             os.path.join(td, "ident.json"),
+                             os.path.join(td, "brep.json")) == 0
+            pl = json.load(open(g["PLAN"]))
+            assert {j["task"] for j in pl["jobs"]} == {2, 8, 9}
+            assert assemble_mode() == 0
+            # повторная перепись при зафиксированном плане — отказ
+            try:
+                census_mode()
+                raise AssertionError("перепись перезаписана при плане")
+            except SystemExit as e:
+                assert "не пересобирается" in str(e)
+            # подменённый npz блока 0 руки после плана — отказ сборки
+            src = pl["reused_blocks"][0]["source"]
+            dd = json.load(open(src))
+            import numpy as np
+            np.savez(os.path.join(m1, dd["actions_npz"]), x=np.ones(1))
+            try:
+                assemble_mode()
+                raise AssertionError("сборка приняла изменённый npz")
+            except SystemExit as e:
+                assert "изменились" in str(e)
+            # правка переписи после плана — проверка плана отказывает
+            cen = json.load(open(g["CENSUS_NEW"]))
+            cen["F"] += 1
+            json.dump(cen, open(g["CENSUS_NEW"], "w"))
+            try:
+                verify_plan()
+                raise AssertionError("правка переписи прошла проверку")
+            except SystemExit as e:
+                assert "изменён" in str(e)
+        finally:
+            g.update(keep)
 
 
 def main():
     ap = argparse.ArgumentParser(description="K-15f M1-cold")
     ap.add_argument("mode", choices=("census", "plan", "assemble", "jobs",
-                                     "selftest"))
+                                     "verify", "common-args", "selftest"))
     ap.add_argument("--basis", default="data/k15f/basis_s0.pt")
     ap.add_argument("--identity", default="reports/k15f/identity_cuda1.json")
     ap.add_argument("--basis-report", default="reports/k15f/basis_s0.json")
@@ -242,6 +441,13 @@ def main():
         return plan_mode(a.basis, a.identity, a.basis_report)
     if a.mode == "assemble":
         return assemble_mode()
+    if a.mode == "verify":
+        verify_plan()
+        print("  план M1-cold проверен")
+        return 0
+    if a.mode == "common-args":
+        print(common_args())
+        return 0
     return jobs_mode()
 
 

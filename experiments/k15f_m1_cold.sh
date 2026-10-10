@@ -28,17 +28,25 @@ for m in k15f_m1_cold k15f_measure_subspace k15f_policy k9h_multiarm_gate; do
     || echo --selftest ) >/dev/null || { echo "ОТКАЗ: самопроверка $m"; exit 1; }
 done
 
+# До плана (cold-q0) — зарегистрированные значения; проверка после прогона
+# сверяет их с ожидаемым контрактом. После плана — ТОЛЬКО из плана.
 COMMON="--ckpt ZibinDong/SmolVLM2-2.2B-ActionCodec-BAR-LIBERO \
   --task-suite 10 --n-envs 5 --seed 101 --rollout-seed-mode fixed \
-  --ensemble off --horizon 8 --max-steps 600 --device $DEV --save-actions"
+  --ensemble off --horizon 8 --max-steps 600 --waiting-steps 10 \
+  --device $DEV --save-actions"
+if [ -f reports/k15f/m1cold_plan.json ] && [ "$MODE" != cold-q0 ]; then
+  COMMON="$(python3 experiments/k15f_m1_cold.py common-args) --device $DEV \
+    --save-actions" || { echo "ОТКАЗ: план M1-cold не прошёл проверку"; exit 1; }
+fi
 DRVQ="--policy depthrvq --policy-ckpt data/k9d_ep3.pt \
   --q1-ckpt data/k14c/q1_main_s0.pt --expect-q1-variant main \
   --expect-q1-seed 0 --expect-q0-manifest data/k14d/q0_b8_e0.manifest.json \
   --depth-rvq-mode fast"
 
-valid () {   # путь метка задача блок -> 0 цел
-  [ -f "$1" ] && python3 experiments/k15g_local_probe.py --validate-block \
-    "$1" "$2" "$3" "$4" >/dev/null 2>&1
+valid () {   # путь метка задача блок -> 0 цел (СТРОГО: одиночный процесс,
+             # ожидаемый контракт, хеши из исполненных actions)
+  [ -f "$1" ] && python3 experiments/k15g_local_probe.py --strict \
+    --validate-block "$1" "$2" "$3" "$4" >/dev/null 2>&1
 }
 
 run_one () {   # метка задача блок выходной-каталог [аргументы руки...]
@@ -58,7 +66,17 @@ run_one () {   # метка задача блок выходной-катало�
       --init-starts "$B" --arm-label "$L" --out "$OUT/${L}_t${T}_i{i0}.json" \
       > "$TMP" 2>&1 || rc=$?
     cat "$TMP"
-    if [ $rc -eq 0 ]; then rm -f "$TMP"; sleep 3; return 0; fi
+    if [ $rc -eq 0 ]; then
+      rm -f "$TMP"
+      # проверка СРАЗУ ПОСЛЕ прогона, той же строгой функцией
+      if ! valid "$F" "$L" "$T" "$B"; then
+        python3 experiments/k15g_local_probe.py --strict --validate-block \
+          "$F" "$L" "$T" "$B" || true
+        echo "ОСТАНОВ: $L t$T i$B — новый результат не прошёл проверку"
+        return 3
+      fi
+      sleep 3; return 0
+    fi
     if grep -q "No CUDA GPUs are available" "$TMP" && [ "$try" -lt 3 ]; then
       echo "    нет GPU — пауза 120 с и повтор"; rm -f "$TMP"; sleep 120
       continue
@@ -88,6 +106,8 @@ case "$MODE" in
     done
     MODE=analyze ;&
   analyze)
+    python3 experiments/k15f_m1_cold.py verify \
+      || { echo "ОТКАЗ: план M1-cold не прошёл проверку"; exit 1; }
     LABS="$(python3 -c "import sys; sys.path.insert(0,'experiments'); \
 import k15f_policy as k; print(' '.join(k.all_labels()))")"
     ARTS=""
