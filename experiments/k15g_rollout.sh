@@ -102,26 +102,21 @@ COMMON="--ckpt ZibinDong/SmolVLM2-2.2B-ActionCodec-BAR-LIBERO \
   --run-tag k15g_local_s${SEED} --device $DEV --save-actions \
   --policy k15f --k15f-basis $BASIS"
 
-block_state () {   # 0 — готов и цел, 1 — нет, 2 — повреждён (в карантин)
+block_state () {   # путь метка задача блок -> 0 цел, 1 нет, 2 повреждён
+  # ГОТОВ — только если пара JSON+npz полностью согласована: отпечаток npz,
+  # метка, задача, состояния блока, action_sha1/init_state_id/done_step
+  # npz = JSON, сид 101 (k15g_local_probe.validate_block)
   [ -f "$1" ] || return 1
-  python3 - "$1" >/dev/null 2>&1 <<'PY'
-import hashlib, json, os, sys
-try:
-    d = json.load(open(sys.argv[1]))
-    f = os.path.join(os.path.dirname(sys.argv[1]), d["actions_npz"])
-    ok = hashlib.sha1(open(f, "rb").read()).hexdigest()[:12] \
-        == d["actions_npz_sha1"]
-except Exception:
-    ok = False
-sys.exit(0 if ok else 2)
-PY
+  python3 experiments/k15g_local_probe.py --validate-block "$1" "$2" "$3" \
+    "$4" >/dev/null 2>&1 && return 0
+  return 2
 }
 
 run_arm () {   # метка, задача, блоки
   local L="$1" T="$2" NEED="" st
   for I0 in $3; do
     local F="$OUTD/${L}_t${T}_i${I0}.json"
-    st=0; block_state "$F" || st=$?
+    st=0; block_state "$F" "$L" "$T" "$I0" || st=$?
     if [ "$st" -eq 0 ]; then continue; fi
     if [ "$st" -eq 2 ]; then
       local Q="$OUTD/quarantine/$(date +%Y%m%dT%H%M%S)"

@@ -126,8 +126,24 @@ def block_stats(d, z, label, U=None, rho_f=None):
     return out
 
 
-def analyze(m1_dir, census, basis_ckpt=None, kappa=1.0):
+def official_m1(census, q0, cand, basis_report_path):
+    """Официальный анализатор M1 с ТЕМИ ЖЕ входами, что у раннера K-15f:
+    доля смены схвата и привязка отчёта предобучения, ожидаемый контракт
+    раскатки с отпечатком текущего харнесса."""
     import k15f_measure_subspace as kms
+    brep = flip = None
+    if basis_report_path and os.path.exists(basis_report_path):
+        brep = json.load(open(basis_report_path))
+        flip = brep.get("max_grip_flip_share")
+    exp = dict(kms.SETUP_EXPECTED,
+               script_sha1=kms._sha(os.path.join(HERE,
+                                                 "k9h_multiarm_gate.py")))
+    return kms.m1(census, q0, cand, max_grip_flip=flip, expected_setup=exp,
+                  basis_report=brep)
+
+
+def analyze(m1_dir, census, basis_ckpt=None, kappa=1.0,
+            basis_report="reports/k15f/basis_s0.json"):
     import k15f_policy as kp
     from k15d_behavior import check_actions_npz
     import k15e_measure_scale as ms
@@ -289,7 +305,7 @@ def analyze(m1_dir, census, basis_ckpt=None, kappa=1.0):
         q0 = [(p, json.load(open(p))) for p in q0_files]
         cand = {lab: [(p, json.load(open(p))) for p in by[lab]]
                 for lab in labels}
-        off = kms.m1(census, q0, cand)
+        off = official_m1(census, q0, cand, basis_report)
         res["official_m1"] = dict(decision=off["decision"],
                                   code=off["code"], R_L=off["R_L"],
                                   R_C=off["R_C"],
@@ -467,6 +483,29 @@ def selftest():
         os.remove(os.path.join(td, "l3m_t9_i5.json"))
         res2 = analyze(td, census)
         assert not res2["complete"] and res2["official_m1"] is None
+    # РЕГРЕССИЯ: официальный M1 получает отчёт предобучения (доля смены
+    # схвата, checkpoint_sha1) и ожидаемый контракт — иначе положительный
+    # M1 получил бы ложный технический отказ
+    import k15f_measure_subspace as kms
+    seen = {}
+    orig = kms.m1
+
+    def spy(cen, q0, cand, **kw):
+        seen.update(kw)
+        return dict(decision="x", code=0, R_L=0, R_C=0, technical=[])
+    kms.m1 = spy
+    try:
+        with tempfile.TemporaryDirectory() as td2:
+            br = os.path.join(td2, "b.json")
+            json.dump(dict(max_grip_flip_share=0.0, checkpoint_sha1="B"),
+                      open(br, "w"))
+            official_m1({}, [], {}, br)
+    finally:
+        kms.m1 = orig
+    assert seen.get("max_grip_flip") == 0.0
+    assert seen.get("basis_report", {}).get("checkpoint_sha1") == "B"
+    assert seen.get("expected_setup", {}).get("seed") == 101
+    assert len(seen["expected_setup"]["script_sha1"]) == 12
     print("самопроверка k15g_analyze_m1 пройдена: DCT, маска исполнения с "
           "done_step, спектральная проверка контроля, поправки и схват")
     return 0

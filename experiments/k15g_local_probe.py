@@ -90,6 +90,7 @@ def make_plan(*, basis, identity, census_path, m1_report, census_q0_dir,
         "k15f_check_identity.py", "k15g_local_probe.py")}
     import k15f_measure_subspace as kms
     return dict(
+        expected_contract=expected_contract(basis, identity),
         kind=KIND, created=datetime.datetime.now().isoformat(
             timespec="seconds"),
         basis=os.path.abspath(basis), basis_sha1=sha(basis),
@@ -120,6 +121,85 @@ def make_plan(*, basis, identity, census_path, m1_report, census_q0_dir,
                         "сбоев (No CUDA GPUs are available)"))
 
 
+def expected_contract(basis, identity):
+    """Ожидаемые значения контракта базиса — из файлов на момент плана."""
+    import torch
+    ck = torch.load(basis, map_location="cpu", weights_only=False)
+    rep = json.load(open(identity))
+    return dict(
+        basis_sha1=sha(basis), basis_state_sha1=ck["state_sha1"],
+        stats_sha1=ck["stats_sha1"], amp_factor=float(ck["amp_factor"]),
+        control_seed=int(ck["control_seed"]),
+        control_kind=ck.get("control_kind"),
+        identity_report_sha1=sha(identity),
+        refine_module_sha1=sha(os.path.join(HERE,
+                                            "k15f_continuous_refine.py")),
+        k15f_policy_sha1=sha(os.path.join(HERE, "k15f_policy.py")),
+        k15g_policy_sha1=sha(os.path.join(HERE, "k15g_local_policy.py")),
+        harness_adapter_sha1=sha(os.path.join(HERE, "k15g_harness.py")),
+        frozen_content_sha=rep.get("frozen_sha1"),
+        joint_sha1=rep.get("joint_sha1"),
+        code_version=rep.get("code_version"))
+
+
+def validate_block(path, label=None, task=None, block=None):
+    """Пара JSON+npz одного блока цела и согласована. Список проблем.
+
+    Используется и проверкой протокола, и возобновлением раннера: блок
+    считается готовым, только если проблем нет.
+    """
+    p = []
+    name = os.path.basename(path)
+    try:
+        d = json.load(open(path))
+        f = os.path.join(os.path.dirname(path), d["actions_npz"])
+        if sha(f) != d["actions_npz_sha1"]:
+            return [f"{name}: отпечаток npz не совпал"]
+        z = np.load(f, allow_pickle=True)
+        zz = {k: z[k] for k in z.files}
+    except Exception as e:                  # noqa: BLE001 — любой сбой = отказ
+        return [f"{name}: не читается ({type(e).__name__})"]
+    eps = d.get("episodes") or []
+    ids = [int(e["init_state_id"]) for e in eps]
+    if label is not None and d.get("arm_label") != label:
+        p.append(f"{name}: метка {d.get('arm_label')!r}")
+    if task is not None and int(d.get("task_id", -1)) != int(task):
+        p.append(f"{name}: задача {d.get('task_id')}")
+    if block is not None and ids != list(range(int(block), int(block) + 5)):
+        p.append(f"{name}: состояния {ids}, ожидался блок {block}")
+    if [str(x) for x in zz.get("action_sha1", [])] != \
+            [str(e.get("action_sha1")) for e in eps]:
+        p.append(f"{name}: action_sha1 в npz не совпадает с JSON")
+    if [int(x) for x in zz.get("init_state_id", [])] != ids:
+        p.append(f"{name}: init_state_id в npz не совпадает с JSON")
+    if [int(x) for x in zz.get("done_step", [])] != \
+            [int(e.get("done_step", -2)) for e in eps]:
+        p.append(f"{name}: done_step в npz не совпадает с JSON")
+    if int(d.get("seed", -1)) != 101 or any(
+            int(e.get("rollout_seed", -1)) != 101 for e in eps):
+        p.append(f"{name}: сид не 101")
+    return p
+
+
+def active_amplitude(z, label):
+    """(сумма квадратов по каналам, число шагов, переключений схвата) —
+    ТОЛЬКО по исполненным шагам активного чанка: среда могла завершиться
+    внутри него или раньше."""
+    act = np.asarray(z.get("k15g_active", []), bool)
+    if not act.any():
+        return np.zeros(7), 0, 0
+    ci = np.where(act)[0]
+    ds = np.asarray(z["done_step"])
+    t = ci[:, None] * H + np.arange(H)[None, :]                  # [A, 8]
+    end = np.where(ds >= 0, ds, len(z["actions"]) - 1)            # [B]
+    mask = t[:, None, :] <= end[None, :, None]                   # [A, B, 8]
+    a0 = z["k15d_a0"][ci]
+    lv = z[f"k15d_level_{label}"][ci]
+    dlt = (lv - a0)[mask]                                         # [N, 7]
+    gs = int((((lv[..., 6] > 0) != (a0[..., 6] > 0)) & mask).sum())
+    return (dlt ** 2).sum(0), int(len(dlt)), gs
+
+
 def check_plan_inputs(plan):
     """Входные артефакты на месте и совпадают с планом."""
     p = []
@@ -131,9 +211,9 @@ def check_plan_inputs(plan):
             continue
         if not os.path.exists(f) or sha(f) != plan[k]:
             p.append(f"{k}: файл изменён или отсутствует ({f})")
+    # ВКЛЮЧАЯ сам протокол: правка проверок после плана делает план
+    # недействительным
     for f, s_ in plan["code"].items():
-        if f == "k15g_local_probe.py":
-            continue
         if sha(os.path.join(HERE, f)) != s_:
             p.append(f"код {f} изменён после плана")
     return p
@@ -161,6 +241,7 @@ def reached(done_step, moment):
 
 
 def check_arm_block(d, z, label, ref_z, ref_d):
+    """ref_d — JSON блока q0ref (эпизоды с исходом и шагом завершения)."""
     """Проверки протокола одного блока руки импульса против q0ref."""
     bad = []
     moment, c, control = lp.label_spec(label)
@@ -188,11 +269,19 @@ def check_arm_block(d, z, label, ref_z, ref_d):
         n_pre = H * (moment - 1)
         A, Ar = z["actions"], ref_z["actions"]
         ds, dr = np.asarray(z["done_step"]), np.asarray(ref_z["done_step"])
+        ref_eps = (ref_d or {}).get("episodes") or []
+        own_eps = d.get("episodes") or []
         for b in range(A.shape[1]):
             end = n_pre if reached(int(dr[b]), moment) else int(dr[b]) + 1
-            if int(ds[b]) != int(dr[b]) and not reached(int(dr[b]), moment):
-                bad.append(f"{label}: среда {b} завершилась до импульса не "
-                           f"так, как q0ref")
+            if not reached(int(dr[b]), moment):
+                # импульса не было: исход и завершение обязаны совпасть
+                if int(ds[b]) != int(dr[b]):
+                    bad.append(f"{label}: среда {b} завершилась до импульса "
+                               f"не так, как q0ref")
+                if ref_eps and own_eps and \
+                        own_eps[b].get("success") != ref_eps[b].get("success"):
+                    bad.append(f"{label}: среда {b} без импульса изменила "
+                               f"исход")
             if not np.array_equal(A[:end, b], Ar[:end, b]):
                 bad.append(f"{label}: префикс среды {b} до импульса не "
                            f"совпал с q0ref")
@@ -219,6 +308,26 @@ def check(plan, run_dir):
         if extra:
             technical.append(f"{lab}: блоки вне плана {sorted(extra)}")
     all_files = [p for fl in files.values() for p in fl]
+    for lab, fl in files.items():
+        keys = []
+        for p in fl:
+            d_ = json.load(open(p))
+            technical += validate_block(p, lab, d_["task_id"],
+                                        d_["init_start"])
+            keys += [(d_["task_id"], e["init_state_id"])
+                     for e in d_["episodes"]]
+        if len(keys) != len(set(keys)):
+            technical.append(f"{lab}: повторяющиеся эпизоды")
+    exp_c = plan.get("expected_contract") or {}
+    if not exp_c:
+        technical.append("в плане нет ожидаемого контракта базиса")
+    for p in all_files:
+        j_ = json.load(open(p)).get("joint") or {}
+        for k, v in exp_c.items():
+            if json.dumps(j_.get(k), sort_keys=True) != json.dumps(
+                    v, sort_keys=True):
+                technical.append(f"{os.path.basename(p)}: {k} = "
+                                 f"{j_.get(k)!r}, план {v!r}")
     technical += check_actions_npz(all_files)
     technical += ms.check_episodes(all_files, seeds=[101])
     technical += kms.check_setup(
@@ -272,7 +381,7 @@ def check(plan, run_dir):
     return technical, cover
 
 
-def analyze(plan, run_dir):
+def analyze(plan, run_dir, require_complete=True):
     technical, cover = check(plan, run_dir)
     labels = [x for x in plan["candidates"] if x != "q0ref"]
     fails = [tuple(x) for x in plan["fails"]]
@@ -302,6 +411,8 @@ def analyze(plan, run_dir):
                     harmed.setdefault(k, []).append(lab)
         return rescued, harmed, reached_n, tested
 
+    if require_complete and not complete:
+        technical = technical + [f"набор неполный: {cover}"]
     out = dict(complete=complete, coverage=cover, technical=technical,
                moments={})
     for m in lp.MOMENTS + (None,):
@@ -343,15 +454,10 @@ def analyze(plan, run_dir):
         for p in sorted(glob.glob(os.path.join(run_dir,
                                                f"{lab}_t*_i*.json"))):
             d, z = load(p)
-            act = np.asarray(z.get("k15g_active", []), bool)
-            if not act.any():
-                continue
-            a0 = z["k15d_a0"][act]
-            lv = z[f"k15d_level_{lab}"][act]
-            dlt = (lv - a0).reshape(-1, 7)
-            sq += (dlt ** 2).sum(0)
-            n += len(dlt)
-            gs += int(((lv[..., 6] > 0) != (a0[..., 6] > 0)).sum())
+            q_, n_, g_ = active_amplitude(z, lab)
+            sq += q_
+            n += n_
+            gs += g_
         if n:
             amp[lab] = dict(rms_arm=float(np.sqrt(sq[:6].sum() / (6 * n))),
                             grip_switch_share=gs / n, steps=n)
@@ -375,11 +481,20 @@ def main():
     ap.add_argument("--dtype", default="float16")
     ap.add_argument("--out", default="reports/k15g/local_analysis.json")
     ap.add_argument("--overwrite-plan", action="store_true")
+    ap.add_argument("--validate-block", nargs=4, default=None,
+                    metavar=("JSON", "МЕТКА", "ЗАДАЧА", "БЛОК"),
+                    help="для раннера: 0 — блок цел, 2 — повреждён")
     ap.add_argument("--smoke", action="store_true",
                     help="малый план smoke: задачи 0 и 8, блок 0, пять рук")
     a = ap.parse_args()
     if a.selftest:
         return selftest()
+    if a.validate_block:
+        path, lab, t, b = a.validate_block
+        prob = validate_block(path, lab, int(t), int(b))
+        if prob:
+            print("; ".join(prob))
+        return 2 if prob else 0
     if a.mode == "plan":
         if os.path.exists(a.plan) and not a.overwrite_plan:
             raise SystemExit(f"{a.plan} уже зафиксирован")
@@ -465,6 +580,50 @@ def selftest():
     rz5 = dict(actions=Ar, done_step=np.array([3, 20]))
     z5 = dict(z, done_step=np.array([3, 20]))
     assert check_arm_block(d, z5, "p2l0p", rz5, {}) == []
+    # без импульса (среда завершилась раньше) исход обязан совпасть
+    ref_d = dict(episodes=[dict(success=True), dict(success=False)])
+    own_d = dict(d, episodes=[dict(success=False), dict(success=False)])
+    assert any("изменила исход" in x for x in check_arm_block(
+        own_d, z5, "p2l0p", rz5, ref_d))
+    assert check_arm_block(dict(d, episodes=ref_d["episodes"]), z5,
+                           "p2l0p", rz5, ref_d) == []
+    # амплитуда — только исполненные шаги: среда 0 завершилась на шаге 10,
+    # то есть внутри активного чанка 2 (шаги 8..15) исполнены 8, 9, 10
+    za = dict(z, done_step=np.array([10, -1]))
+    sq_, n_, _g = active_amplitude(za, "p2l0p")
+    assert n_ == 3 + 8, n_
+    assert abs(sq_[0] - 0.01 * 11) < 1e-6
+    # целостность пары JSON+npz для возобновления
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        eps = [dict(init_state_id=5 + k, action_sha1=f"{k:016x}",
+                    done_step=20 + k, rollout_seed=101, success=True)
+               for k in range(5)]
+
+        def write(eps_, npz_kw):
+            np.savez(os.path.join(td, "a.actions.npz"), **npz_kw)
+            dd = dict(arm_label="p2l0p", task_id=8, init_start=5, seed=101,
+                      episodes=eps_, actions_npz="a.actions.npz",
+                      actions_npz_sha1=sha(os.path.join(td,
+                                                        "a.actions.npz")))
+            json.dump(dd, open(os.path.join(td, "a.json"), "w"))
+            return os.path.join(td, "a.json")
+        good = dict(action_sha1=np.asarray([e["action_sha1"] for e in eps]),
+                    init_state_id=np.arange(5, 10),
+                    done_step=np.arange(20, 25))
+        pth = write(eps, good)
+        assert validate_block(pth, "p2l0p", 8, 5) == []
+        assert validate_block(pth, "p2l0p", 8, 0)          # не тот блок
+        assert validate_block(pth, "p4l0p", 8, 5)          # не та метка
+        pth = write(eps, dict(good, done_step=np.arange(21, 26)))
+        assert any("done_step" in x for x in validate_block(pth))
+        pth = write(eps, dict(good, action_sha1=np.asarray(["0" * 16] * 5)))
+        assert any("action_sha1" in x for x in validate_block(pth))
+        pth = write(eps, good)
+        np.savez(os.path.join(td, "a.actions.npz"), x=np.ones(1))
+        assert any("отпечаток" in x for x in validate_block(pth))
+        open(os.path.join(td, "a.json"), "w").write("{обрыв")
+        assert any("не читается" in x for x in validate_block(pth))
     assert len(lp.all_labels()) == 32
     print("самопроверка k15g_local_probe пройдена: момент достигнут/нет, "
           "один импульс, префикс, возврат к a0, метка")
