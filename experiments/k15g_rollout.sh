@@ -37,19 +37,35 @@ export PYTHONPATH="${LIBERO_PATH:-$HOME/LIBERO}"
 export MUJOCO_GL=egl
 export PYTHONUNBUFFERED=1
 mkdir -p logs/k15g reports/k15g
+# ЛОГ — С САМОГО НАЧАЛА, включая отказы самопроверок и проверок входов
+# (в терминал тоже: tee)
+LOGF="logs/k15g/local_${MODE}_s${SEED}.log"
+exec > >(tee -a "$LOGF") 2>&1
+echo "=== СТАРТ $(date) === режим $MODE, карта $DEV, коммит" \
+     "$(git rev-parse --short HEAD 2>/dev/null)"
 TRACKED="$(git ls-files reports/k15g logs/k15g 2>/dev/null | head -3)"
 [ -z "$TRACKED" ] || { echo "ОТКАЗ: reports/k15g отслеживается git"; exit 1; }
 for m in k15g_analyze_m1 k15g_local_policy k15g_local_probe k15g_harness \
-         k15f_policy k9h_multiarm_gate; do
+         k15f_policy k9h_multiarm_gate k15f_m1cold_snapshot; do
+  [ "$m" = k15f_m1cold_snapshot ] && {
+    python3 "experiments/${m}.py" selftest >/dev/null \
+      || { echo "ОТКАЗ: самопроверка ${m}"; exit 1; }; continue; }
   python3 "experiments/${m}.py" --selftest >/dev/null \
     || { echo "ОТКАЗ: самопроверка ${m}"; exit 1; }
 done
 M1DIR="reports/k15f/m1cold"
+# ВХОДЫ СВЯЗАНЫ СО СНИМКОМ ЗАВЕРШЁННОГО M1-cold (k15f_m1cold_snapshot.py)
+SNAP="reports/k15f/m1cold_snapshot.json"
+[ -f "$SNAP" ] || { echo "ОТКАЗ: нет снимка M1-cold $SNAP"; exit 1; }
+python3 experiments/k15f_m1cold_snapshot.py verify --snapshot "$SNAP" \
+  || { echo "ОТКАЗ: снимок M1-cold не прошёл проверку"; exit 1; }
 
 if [ "$MODE" = "analyze-m1" ]; then
   python3 experiments/k15g_analyze_m1.py --m1-dir "$M1DIR" \
-    --census "$CENSUS" --basis "$BASIS" --out reports/k15g/m1_analysis.json
-  exit $?
+    --census "$CENSUS" --basis "$BASIS" --snapshot "$SNAP" \
+    --out reports/k15g/m1_analysis.json && CODE=0 || CODE=$?
+  echo "=== КОНЕЦ $(date), код $CODE ==="
+  exit $CODE
 fi
 if [ "$MODE" = "plan" ]; then
   M1REP="reports/k15f/m1cold_result.json"
@@ -58,8 +74,10 @@ if [ "$MODE" = "plan" ]; then
   # проверяет make_plan (require_m1_cold)
   python3 experiments/k15g_local_probe.py --mode plan --plan "$PLAN" \
     --basis "$BASIS" --identity "$IDENT" --census "$CENSUS" \
-    --m1-report "$M1REP" --census-q0-dir "$M1DIR" --device "$DEV"
-  exit $?
+    --m1-report "$M1REP" --census-q0-dir "$M1DIR" --device "$DEV" \
+    --m1-snapshot "$SNAP" && CODE=0 || CODE=$?
+  echo "=== КОНЕЦ $(date), код $CODE ==="
+  exit $CODE
 fi
 
 case "$MODE" in
@@ -67,7 +85,8 @@ case "$MODE" in
     if [ ! -f "$SPLAN" ]; then
       python3 experiments/k15g_local_probe.py --mode plan --smoke \
         --plan "$SPLAN" --basis "$BASIS" --identity "$IDENT" \
-        --census "$CENSUS" --census-q0-dir "$M1DIR" --device "$DEV"
+        --census "$CENSUS" --census-q0-dir "$M1DIR" --device "$DEV" \
+        --m1-snapshot "$SNAP"
     fi
     P="$SPLAN" ;;
   run|analyze) P="$PLAN" ;;
@@ -78,16 +97,15 @@ sha12 () { sha1sum "$1" | cut -c1-12; }
 TAG="p$(sha12 "$P")_k9h$(sha12 experiments/k9h_multiarm_gate.py)_a$(sha12 \
 experiments/k15g_harness.py)_g$(sha12 experiments/k15g_local_policy.py)"
 OUTD="reports/k15g/local/${MODE/analyze/run}/${TAG}"
-LOGF="logs/k15g/local_${MODE}_s${SEED}.log"
 mkdir -p "$OUTD" "$OUTD/quarantine"
-exec >> "$LOGF" 2>&1
-echo "=== СТАРТ $(date) === режим $MODE, план $P, каталог $OUTD"
-echo "    коммит $(git rev-parse --short HEAD 2>/dev/null)"
+echo "    план $P, каталог $OUTD"
 
 if [ "$MODE" = "analyze" ]; then
   python3 experiments/k15g_local_probe.py --mode analyze --plan "$P" \
-    --run-dir "$OUTD" --out reports/k15g/local_analysis.json
-  exit $?
+    --run-dir "$OUTD" --out reports/k15g/local_analysis.json \
+    && CODE=0 || CODE=$?
+  echo "=== КОНЕЦ $(date), код $CODE ==="
+  exit $CODE
 fi
 
 # входы плана совпадают с файлами на диске — до первой раскатки

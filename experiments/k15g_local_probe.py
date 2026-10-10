@@ -72,30 +72,44 @@ SMOKE = dict(tasks=[0, 8], blocks={"0": [0], "8": [0]},
              candidates=["q0ref", "p2l0p", "p2r0p", "p4l0p", "p4r0p"])
 
 
-def require_m1_cold(cen, census_path, m1):
-    """Основной план — только после ТЕХНИЧЕСКИ КОРРЕКТНОГО итога M1-cold на
-    ПРОВЕРЕННОЙ переписи. Наличия файла результата недостаточно."""
-    import k15f_m1_cold as mc
+def require_m1_cold(snapshot, *, census_path, census_q0_dir, basis,
+                    identity, m1_report=None):
+    """Входы K-15g связаны со СНИМКОМ завершённого M1-cold, а не с текущими
+    исходниками: снимок цел (каждый артефакт и каждая пара JSON+npz не
+    изменены, итог технически корректен), перепись, каталог эталонных q0,
+    базис, отчёт тождества и (кроме smoke) итог M1 — те же, что в снимке.
+    Текущий код K-15g фиксирует уже его собственный план. Возвращает
+    (снимок, итог M1 или None)."""
+    import k15f_m1cold_snapshot as ms
+    s = ms.verify(snapshot)                 # SystemExit при любом изменении
+
+    def same(a_, b_):
+        return os.path.abspath(a_) == os.path.abspath(b_)
     p = []
-    if cen.get("code") != 0 or cen.get("technical"):
-        p.append(f"перепись технически не корректна: {cen.get('technical')}")
-    if m1.get("kind") != "k15f_m1" or m1.get("code") != 0 \
-            or m1.get("technical"):
-        p.append(f"итог M1-cold: код {m1.get('code')}, "
-                 f"{(m1.get('technical') or [])[:3]}")
-    if m1.get("F") != cen.get("F"):
-        p.append(f"F итога M1 {m1.get('F')} не равно F переписи {cen.get('F')}")
-    if not p:
-        mplan = mc.verify_plan()        # SystemExit при любом расхождении
-        if os.path.abspath(mplan["new_census"]) != os.path.abspath(
-                census_path):
-            p.append("перепись не та, что зафиксирована планом M1-cold")
+    for name, mine, theirs in (
+            ("перепись", census_path, s["census"]),
+            ("каталог q0", census_q0_dir, s["cold_dir"]),
+            ("базис", basis, s["basis"]),
+            ("отчёт тождества", identity, s["identity_report"])):
+        if not same(mine, theirs):
+            p.append(f"{name} {mine} не из снимка M1-cold ({theirs})")
+    m1 = None
+    if m1_report is not None:
+        if not same(m1_report, s["result"]):
+            p.append(f"итог M1 {m1_report} не из снимка ({s['result']})")
     if p:
         raise SystemExit("ОТКАЗ плана K-15g: " + "; ".join(p))
+    if m1_report is not None:
+        m1 = json.load(open(m1_report))
+    return s, m1
 
 
 def make_plan(*, basis, identity, census_path, m1_report, census_q0_dir,
-              device, dtype, tasks=None, smoke=False):
+              device, dtype, m1_snapshot, tasks=None, smoke=False):
+    snap, m1_ = require_m1_cold(
+        m1_snapshot, census_path=census_path, census_q0_dir=census_q0_dir,
+        basis=basis, identity=identity,
+        m1_report=None if smoke else m1_report)
     cen = json.load(open(census_path))
     if tasks is None:
         tasks = sorted({int(t) for t, _s in cen["fails"]})
@@ -105,15 +119,15 @@ def make_plan(*, basis, identity, census_path, m1_report, census_q0_dir,
         m1 = dict(decision="M1 не учитывается: smoke-план", code=None)
         blocks = dict(SMOKE["blocks"])
     else:
-        m1 = json.load(open(m1_report))
-        require_m1_cold(cen, census_path, m1)
+        m1 = m1_
         blocks = {str(t): cen["blocks"][str(t)] for t in tasks}
     fails = [x for x in cen["fails"] if x[0] in tasks]
     diag = [x for x in cen["diag"] if x[0] in tasks]
     code = {f: sha(os.path.join(HERE, f)) for f in (
         "k15g_local_policy.py", "k15g_harness.py", "k9h_multiarm_gate.py",
         "k15f_policy.py", "k15f_continuous_refine.py",
-        "k15f_check_identity.py", "k15g_local_probe.py")}
+        "k15f_check_identity.py", "k15g_local_probe.py",
+        "k15f_m1cold_snapshot.py")}
     import k15f_measure_subspace as kms
     return dict(
         expected_contract=expected_contract(basis, identity),
@@ -125,6 +139,9 @@ def make_plan(*, basis, identity, census_path, m1_report, census_q0_dir,
         census=os.path.abspath(census_path), census_sha1=sha(census_path),
         census_q0_dir=os.path.abspath(census_q0_dir),
         smoke=bool(smoke),
+        m1_snapshot=os.path.abspath(m1_snapshot),
+        m1_snapshot_sha1=sha(m1_snapshot),
+        m1_snapshot_run_commit=snap.get("run_commit"),
         m1_report=(None if smoke else os.path.abspath(m1_report)),
         m1_report_sha1=(None if smoke else sha(m1_report)),
         m1_verdict=dict(decision=m1.get("decision"), code=m1.get("code"),
@@ -308,6 +325,20 @@ def check_plan_inputs(plan):
             continue
         if not os.path.exists(f) or sha(f) != plan[k]:
             p.append(f"{k}: файл изменён или отсутствует ({f})")
+    # снимок M1-cold не изменён и по-прежнему цел, входы — из него
+    snp = plan.get("m1_snapshot")
+    if not snp or not os.path.exists(snp) \
+            or sha(snp) != plan.get("m1_snapshot_sha1"):
+        p.append(f"снимок M1-cold изменён или отсутствует ({snp})")
+    else:
+        try:
+            require_m1_cold(snp, census_path=plan["census"],
+                            census_q0_dir=plan["census_q0_dir"],
+                            basis=plan["basis"],
+                            identity=plan["identity_report"],
+                            m1_report=plan["m1_report"])
+        except SystemExit as e:
+            p.append(str(e))
     # ВКЛЮЧАЯ сам протокол: правка проверок после плана делает план
     # недействительным
     for f, s_ in plan["code"].items():
@@ -574,6 +605,7 @@ def main():
     ap.add_argument("--census", default="reports/k15f/m1_census.json")
     ap.add_argument("--m1-report", default=None)
     ap.add_argument("--census-q0-dir", default=None)
+    ap.add_argument("--m1-snapshot", default="reports/k15f/m1cold_snapshot.json")
     ap.add_argument("--device", default="cuda:1")
     ap.add_argument("--dtype", default="float16")
     ap.add_argument("--out", default="reports/k15g/local_analysis.json")
@@ -606,7 +638,8 @@ def main():
         plan = make_plan(basis=a.basis, identity=a.identity,
                          census_path=a.census, m1_report=a.m1_report,
                          census_q0_dir=a.census_q0_dir, device=a.device,
-                         dtype=a.dtype, smoke=a.smoke)
+                         dtype=a.dtype, m1_snapshot=a.m1_snapshot,
+                         smoke=a.smoke)
         os.makedirs(os.path.dirname(os.path.abspath(a.plan)), exist_ok=True)
         with open(a.plan + ".tmp", "w", encoding="utf-8") as fh:
             json.dump(plan, fh, ensure_ascii=False, indent=1)
@@ -787,37 +820,41 @@ def selftest():
         open(os.path.join(td, "a.json"), "w").write("{обрыв")
         assert any("не читается" in x for x in validate_block(pth))
     assert len(lp.all_labels()) == 32
-    # основной план: наличие файла итога M1 недостаточно
-    import k15f_m1_cold as mc
-    good_c = dict(code=0, technical=[], F=13)
-    good_m = dict(kind="k15f_m1", code=0, technical=[], F=13)
-    orig_vp = mc.verify_plan
-    mc.verify_plan = lambda: dict(new_census="/x/cen.json")
+    # входы K-15g связаны со снимком M1-cold, а не с текущим кодом
+    import k15f_m1cold_snapshot as msn
+    snap_ = dict(census="r/cen.json", cold_dir="r/m1cold",
+                 basis="d/basis.pt", identity_report="r/ident.json",
+                 result="r/res.json")
+    good_kw = dict(census_path="r/cen.json", census_q0_dir="r/m1cold",
+                   basis="d/basis.pt", identity="r/ident.json")
+    orig_v = msn.verify
+    msn.verify = lambda _p: dict(snap_)
     try:
-        require_m1_cold(good_c, "/x/cen.json", good_m)
-        for cen_, m_, path_ in (
-                (good_c, dict(good_m, code=3, technical=["t"]), "/x/cen.json"),
-                (good_c, dict(good_m, technical=["t"]), "/x/cen.json"),
-                (dict(good_c, code=3), good_m, "/x/cen.json"),
-                (good_c, dict(good_m, F=12), "/x/cen.json"),
-                (good_c, dict(good_m, kind="k15f_census"), "/x/cen.json"),
-                (good_c, good_m, "/x/other.json")):
+        assert require_m1_cold("s.json", **good_kw)[1] is None
+        for k, v in (("census_path", "r/other.json"),
+                     ("census_q0_dir", "r/m1"), ("basis", "d/b2.pt"),
+                     ("identity", "r/ident_cuda0.json")):
             try:
-                require_m1_cold(cen_, path_, m_)
-                raise AssertionError("принят негодный итог M1-cold")
+                require_m1_cold("s.json", **dict(good_kw, **{k: v}))
+                raise AssertionError(f"принят вход {k} не из снимка")
             except SystemExit:
                 pass
-
-        def bad_vp():
-            raise SystemExit("план M1-cold не прошёл проверку")
-        mc.verify_plan = bad_vp
         try:
-            require_m1_cold(good_c, "/x/cen.json", good_m)
-            raise AssertionError("принят непроверенный план M1-cold")
+            require_m1_cold("s.json", m1_report="r/old.json", **good_kw)
+            raise AssertionError("принят итог M1 не из снимка")
+        except SystemExit:
+            pass
+
+        def bad_v(_p):
+            raise SystemExit("снимок M1-cold не прошёл проверку")
+        msn.verify = bad_v
+        try:
+            require_m1_cold("s.json", **good_kw)
+            raise AssertionError("принят повреждённый снимок")
         except SystemExit:
             pass
     finally:
-        mc.verify_plan = orig_vp
+        msn.verify = orig_v
     print("самопроверка k15g_local_probe пройдена: момент достигнут/нет, "
           "один импульс, префикс, возврат к a0, метка")
     return 0

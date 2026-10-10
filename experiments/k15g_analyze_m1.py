@@ -92,8 +92,15 @@ def block_stats(d, z, label, U=None, rho_f=None):
     n_exec = int(m.sum())
     out = dict(calls=int(C), envs=int(B), exec_steps=n_exec)
     out["sq_by_ch"] = (delta ** 2 * me).sum(axis=(0, 1, 2))
-    out["grip_switch"] = int((((lvl[..., 6] > 0) != (a0[..., 6] > 0)) & m)
-                             .sum())
+    sw = ((lvl[..., 6] > 0) != (a0[..., 6] > 0)) & m        # [C, B, 8]
+    out["grip_switch"] = int(sw.sum())
+    # ПО СРЕДАМ — для разбивки по исходам эпизодов; первый вызов (одно и то
+    # же начальное состояние у всех рук) отдельно от поздних
+    out["env_sq"] = (delta ** 2 * me).sum(axis=(0, 2))       # [B, 7]
+    out["env_n"] = m.sum(axis=(0, 2))                        # [B]
+    out["env_gs"] = sw.sum(axis=(0, 2))                      # [B]
+    out["env_sq_first"] = (delta[0] ** 2 * me[0]).sum(axis=1)  # [B, 7]
+    out["env_n_first"] = m[0].sum(axis=1)                    # [B]
     D = dct_matrix()
     # спектр фактических поправок: только полностью исполненные чанки
     full = m.all(axis=-1)                                  # [C, B]
@@ -124,6 +131,57 @@ def block_stats(d, z, label, U=None, rho_f=None):
             proj = un @ U.T                                # [N, 4, 4]
             out["outside_pca4"] = 1.0 - (proj ** 2).sum(-1)
     return out
+
+
+def sign_flip_p(d):
+    """Точный двусторонний тест перестановкой знаков по КЛАСТЕРАМ
+    (начальным состояниям): d — разности learned − control по состояниям.
+    Нулевые разности не влияют. Для > 20 ненулевых — Монте-Карло 2e5."""
+    d = np.asarray([x for x in d if x != 0], np.float64)
+    n = len(d)
+    if n == 0:
+        return 1.0
+    obs = abs(d.sum())
+    if n <= 20:
+        signs = ((np.arange(2 ** n)[:, None] >> np.arange(n)) & 1) * 2 - 1
+    else:
+        signs = np.random.default_rng(0).choice([-1, 1], size=(200000, n))
+    return float((np.abs(signs @ d) >= obs - 1e-9).mean())
+
+
+def state_matrix(fails, diag, ep_arm, learned, control):
+    """Матрица «начальное состояние × направление» и кластерное сравнение
+    learned − control: одно состояние проверяется 8 + 8 руками, поэтому
+    единица сравнения — состояние, а не отдельная проверка."""
+    def row(k, want_success):
+        L = [x for x in learned
+             if ep_arm[x].get(k, {}).get("success") is want_success]
+        C = [x for x in control
+             if ep_arm[x].get(k, {}).get("success") is want_success]
+        return dict(task=k[0], state=k[1], learned=L, control=C,
+                    n_learned=len(L), n_control=len(C),
+                    learned_only=bool(L and not C),
+                    control_only=bool(C and not L))
+    rf = [row(k, True) for k in fails]
+    rd = [row(k, False) for k in diag]
+
+    def cmp_(rows, what):
+        d = [r["n_learned"] - r["n_control"] for r in rows]
+        return dict(
+            what=what, states=len(rows),
+            learned_total=sum(r["n_learned"] for r in rows),
+            control_total=sum(r["n_control"] for r in rows),
+            checks_per_family=len(rows) * len(learned),
+            states_L_gt_C=sum(x > 0 for x in d),
+            states_L_lt_C=sum(x < 0 for x in d),
+            states_equal=sum(x == 0 for x in d),
+            sign_flip_p=sign_flip_p(d),
+            note="разведочно: не предрегистрированная метрика")
+    return dict(fails=rf, diag=rd,
+                rescue_cmp=cmp_(rf, "спасения провалов q0"),
+                harm_cmp=cmp_(rd, "повреждения диагностических успехов"),
+                learned_only_rescues=[[r["task"], r["state"], r["learned"]]
+                                      for r in rf if r["learned_only"]])
 
 
 def official_m1(census, q0, cand, basis_report_path):
@@ -192,7 +250,8 @@ def analyze(m1_dir, census, basis_ckpt=None, kappa=1.0,
                    "различаться: разность learned − control не является "
                    "изолированным эффектом руки"))
     per_arm, ep_arm = {}, {}
-    agg = {}
+    agg, outc = {}, {}
+    fset, dset = set(fails), set(diag)
     for lab in labels:
         ep_arm[lab] = episodes_of(by[lab])
         e = ep_arm[lab]
@@ -214,6 +273,21 @@ def analyze(m1_dir, census, basis_ckpt=None, kappa=1.0,
                 technical.append(f"{os.path.basename(p)}: нет журнала "
                                  f"уровней")
                 continue
+            fam = "learned" if lab.startswith("l") else "control"
+            for i, e in enumerate(d["episodes"]):
+                k = (int(d["task_id"]), int(e["init_state_id"]))
+                cls = (("rescue" if e["success"] else "not_rescued")
+                       if k in fset else ("kept" if e["success"] else "harm")
+                       if k in dset else "other")
+                o_ = outc.setdefault((fam, cls), dict(
+                    sq=np.zeros(7), n=0, gs=0, sq1=np.zeros(7), n1=0,
+                    episodes=0))
+                o_["sq"] += st["env_sq"][i]
+                o_["n"] += int(st["env_n"][i])
+                o_["gs"] += int(st["env_gs"][i])
+                o_["sq1"] += st["env_sq_first"][i]
+                o_["n1"] += int(st["env_n_first"][i])
+                o_["episodes"] += 1
             a["sq"] += st["sq_by_ch"]
             a["n"] += st["exec_steps"]
             a["gs"] += st["grip_switch"]
@@ -280,6 +354,22 @@ def analyze(m1_dir, census, basis_ckpt=None, kappa=1.0,
             learned=sum(L[k] for k in fails if k[0] == t),
             control=sum(Cc[k] for k in fails if k[0] == t))
             for t in sorted({k[0] for k in fails})})
+    res["state_matrix"] = state_matrix(fails, diag, ep_arm, learned,
+                                       control)
+    # поправки относительно СОБСТВЕННОГО a0 по исходам эпизода. Первый вызов
+    # — одно и то же начальное состояние; всё позже — после расхождения
+    # траекторий, только описательно
+    res["by_outcome"] = {
+        f"{fam}/{cls}": dict(
+            episodes=v["episodes"], exec_steps=v["n"],
+            rms_arm=float(np.sqrt(v["sq"][:6].sum() / (6 * max(v["n"], 1)))),
+            rms_grip=float(np.sqrt(v["sq"][6] / max(v["n"], 1))),
+            grip_switch_share=v["gs"] / max(v["n"], 1),
+            first_call_rms_arm=float(np.sqrt(v["sq1"][:6].sum()
+                                             / (6 * max(v["n1"], 1)))),
+            first_call_rms_grip=float(np.sqrt(v["sq1"][6]
+                                              / max(v["n1"], 1))))
+        for (fam, cls), v in sorted(outc.items())}
     res["per_direction"] = {
         f"{j}{s}": dict(
             learned_rescues=len(per_arm[f"l{j}{s}"]["rescued"]),
@@ -352,6 +442,33 @@ def report(res):
                   f", вне PCA4 (медиана) "
                   f"{[round(x, 3) for x in v['outside_pca4_energy']['median']]}")
         print(s)
+    sm = res["state_matrix"]
+    print("  матрица «состояние × направление» (провалы q0): "
+          "задача/состояние: спасли learned | контроль")
+    for r in sm["fails"]:
+        print(f"    {r['task']}/{r['state']}: {r['n_learned']}/8 "
+              f"{','.join(r['learned']) or '—'} | {r['n_control']}/8 "
+              f"{','.join(r['control']) or '—'}"
+              + ("  ← только learned" if r["learned_only"] else "")
+              + ("  ← только контроль" if r["control_only"] else ""))
+    print("  повреждения диагностики: задача/состояние: learned | контроль")
+    for r in sm["diag"]:
+        print(f"    {r['task']}/{r['state']}: {r['n_learned']}/8 | "
+              f"{r['n_control']}/8")
+    for c in (sm["rescue_cmp"], sm["harm_cmp"]):
+        print(f"  {c['what']} (кластеры = состояния, {c['states']}): L "
+              f"{c['learned_total']} / C {c['control_total']} из "
+              f"{c['checks_per_family']}; состояний L>C {c['states_L_gt_C']},"
+              f" L<C {c['states_L_lt_C']}, поровну {c['states_equal']}; "
+              f"перестановка знаков p = {c['sign_flip_p']:.3f} (разведочно)")
+    print("  поправки по исходам (RMS руки / схвата, смена схвата; первый "
+          "вызов — RMS руки / схвата):")
+    for k, v in res["by_outcome"].items():
+        print(f"    {k}: эпизодов {v['episodes']}, RMS {v['rms_arm']:.4f} / "
+              f"{v['rms_grip']:.4f}, смена схвата "
+              f"{100 * v['grip_switch_share']:.2f}%; первый вызов "
+              f"{v['first_call_rms_arm']:.4f} / "
+              f"{v['first_call_rms_grip']:.4f}")
     cc = res["control_spectrum_check"]
     print(f"  проверка контроля по спектру (первый вызов): блоков "
           f"{cc['blocks']}, макс. отн. расхождение {cc['max_rel_gap']}")
@@ -368,14 +485,34 @@ def main():
     ap.add_argument("--census", default="reports/k15f/m1_census.json")
     ap.add_argument("--basis", default="data/k15f/basis_s0.pt")
     ap.add_argument("--out", default="reports/k15g/m1_analysis.json")
+    ap.add_argument("--snapshot", default=None,
+                    help="снимок M1-cold: каталог и перепись обязаны "
+                         "совпасть с ним, сам снимок — пройти проверку")
     a = ap.parse_args()
     if a.selftest:
         return selftest()
     d = a.m1_dir or sorted(glob.glob("reports/k15f/m1/s101/*/"),
                            key=os.path.getmtime)[-1]
+    snap = None
+    if a.snapshot:
+        import k15f_m1cold_snapshot as msn
+        snap = msn.verify(a.snapshot)
+        if os.path.abspath(d) != os.path.abspath(snap["cold_dir"]) or \
+                os.path.abspath(a.census) != os.path.abspath(snap["census"]):
+            raise SystemExit("каталог или перепись не из снимка M1-cold")
     res = analyze(d, json.load(open(a.census)),
                   a.basis if os.path.exists(a.basis) else None)
     res["m1_dir"] = d
+    if snap:
+        res["snapshot"] = dict(path=a.snapshot, verdict=snap["verdict"],
+                               run_commit=snap["run_commit"])
+        # официальный итог — из снимка; пересчёт текущим кодом должен
+        # совпасть с ним
+        off = res.get("official_m1") or {}
+        if any(off.get(k) != snap["verdict"][k]
+               for k in ("code", "R_L", "R_C", "decision")):
+            res["technical"].append("пересчёт официального M1 текущим кодом "
+                                    "разошёлся со снимком")
     report(res)
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     with open(a.out + ".tmp", "w", encoding="utf-8") as fh:
@@ -423,6 +560,10 @@ def selftest():
     assert st["exec_steps"] == 11 + 20
     assert st["grip_switch"] == 1, st["grip_switch"]
     assert abs(st["sq_by_ch"][0] - 0.01 * 31) < 1e-5
+    # кластерный тест перестановкой знаков: точные значения
+    assert abs(sign_flip_p([1] * 5) - 2 / 32) < 1e-12
+    assert sign_flip_p([1, -1]) == 1.0 and sign_flip_p([0, 0]) == 1.0
+    assert abs(sign_flip_p([3, 0, 1]) - 0.5) < 1e-12
     # СКВОЗНОЙ analyze() на синтетическом каталоге M1
     import tempfile
     import hashlib
@@ -493,6 +634,23 @@ def selftest():
         assert r["learned_only"] == 1 and r["both"] == 0
         assert res["per_direction"]["1m"]["control_harms"] == 1
         assert abs(res["per_arm"]["l0p"]["rms_by_channel"][0] - 0.05) < 1e-4
+        # матрица «состояние × направление» и кластерное сравнение
+        sm = res["state_matrix"]
+        f80 = [x for x in sm["fails"] if (x["task"], x["state"]) == (8, 0)][0]
+        assert f80["learned"] == ["l0p"] and f80["learned_only"]
+        assert sm["learned_only_rescues"] == [[8, 0, ["l0p"]]]
+        d82 = [x for x in sm["diag"] if (x["task"], x["state"]) == (8, 2)][0]
+        assert d82["control"] == ["r1m"] and d82["n_learned"] == 0
+        assert sm["rescue_cmp"]["learned_total"] == 1
+        assert sm["rescue_cmp"]["states_L_gt_C"] == 1
+        assert sm["harm_cmp"]["control_total"] == 1
+        assert sm["rescue_cmp"]["checks_per_family"] == 3 * 8
+        bo = res["by_outcome"]
+        assert bo["learned/rescue"]["episodes"] == 1
+        assert abs(bo["learned/rescue"]["rms_arm"] - 0.05) < 1e-4
+        assert abs(bo["learned/rescue"]["first_call_rms_arm"] - 0.05) < 1e-4
+        assert bo["control/harm"]["episodes"] == 1
+        assert sum(v["episodes"] for v in bo.values()) == 16 * 3 * 5
         # частичный набор: покрытие видно, вердикта нет
         os.remove(os.path.join(td, "l3m_t9_i5.json"))
         res2 = analyze(td, census)
