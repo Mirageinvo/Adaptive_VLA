@@ -155,13 +155,19 @@ run_arm () {   # метка, задача, блоки
 
 LABELS="$(python3 -c "import json; print(' '.join(json.load(open('$P'))['candidates']))")"
 TASKS="$(python3 -c "import json; print(' '.join(map(str, json.load(open('$P'))['tasks'])))")"
+# КАЖДЫЙ БЛОК — В ОТДЕЛЬНОМ ПРОЦЕССЕ. В K-15f M1 на задаче 8 reset между
+# блоками одного процесса восстанавливал среду не полностью: старт блока 5
+# зависел от того, что рука сделала в блоке 0 (14 из 16 рук разошлись с
+# переписью; одиночный прогон совпал). Поэтому блоки не объединяются.
 for T in $TASKS; do
   BLK="$(python3 -c "import json; print(' '.join(map(str, json.load(open('$P'))['blocks']['$T'])))")"
   echo "--- задача $T, блоки $BLK, $(date)"
-  run_arm q0ref "$T" "$BLK"                  # эталон — первым
-  for L in $LABELS; do
-    [ "$L" = q0ref ] && continue
-    run_arm "$L" "$T" "$BLK"
+  for B in $BLK; do
+    run_arm q0ref "$T" "$B"                  # эталон — первым
+    for L in $LABELS; do
+      [ "$L" = q0ref ] && continue
+      run_arm "$L" "$T" "$B"
+    done
   done
 done
 echo "=== раскатки закончены $(date)"

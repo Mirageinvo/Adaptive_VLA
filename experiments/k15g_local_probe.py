@@ -242,6 +242,18 @@ def check(plan, run_dir):
         for f in ("action_sha1", "success", "done_step"):
             if str(e.get(f)) != str(c_e.get(f)):
                 technical.append(f"q0ref {k}: {f} не совпал с q0 M1")
+    # 1б. СТАРТ КАЖДОГО ЭПИЗОДА КАЖДОЙ РУКИ равен старту q0 переписи M1
+    # (init_hash, init_hash_full, rollout_seed): в многоблочном процессе
+    # reset на задаче 8 восстанавливал среду не полностью
+    for lab in labels:
+        for k, (e, _p, _i) in episodes(files[lab]).items():
+            if k not in cen_q0:
+                continue
+            c_e = cen_q0[k][0]
+            if any(str(e.get(f)) != str(c_e.get(f)) for f in
+                   ("init_hash", "init_hash_full", "rollout_seed")):
+                technical.append(f"{lab} {k}: старт не равен старту q0 "
+                                 f"переписи")
     # 2-4. блоки рук импульса против q0ref того же блока
     ref_blocks = {(json.load(open(p))["task_id"],
                    json.load(open(p))["init_start"]): p
