@@ -39,6 +39,7 @@ RESULT = "reports/k15f/m1cold_result.json"
 BASIS_REPORT = "reports/k15f/basis_s0.json"
 RUN_LOG = "logs/k15f/m1cold_run.log"
 KIND = "k15f_m1cold_snapshot"
+DRIFT_ALLOWED = ("k15g_local_probe.py", "k15f_m1_cold.sh")
 
 
 def sha_full(p):
@@ -46,9 +47,10 @@ def sha_full(p):
 
 
 def git(*args):
-    """ТОЛЬКО чтение git."""
-    return subprocess.run(["git", *args], capture_output=True, text=True,
-                          check=False)
+    """ТОЛЬКО чтение git — в checkout, ГДЕ ЛЕЖИТ ЭТОТ СКРИПТ (worktree на
+    коммите прогона), а не в текущем каталоге с артефактами."""
+    return subprocess.run(["git", "-C", HERE, *args], capture_output=True,
+                          text=True, check=False)
 
 
 def run_commit(log=RUN_LOG):
@@ -97,18 +99,35 @@ def make(skip_git=False):
     import k15g_local_probe as pr
     if os.path.exists(SNAP):
         raise SystemExit(f"{SNAP} уже записан: снимок не перезаписывается")
-    plan = mc.verify_plan()        # SystemExit, если исходники изменились
+    # ДОПУСТИМЫЙ ДРЕЙФ: после прогона менялись только потребитель K-15g
+    # (k15g_local_probe.py) и оболочка раннера — анализа M1 они не задают.
+    # Харнесс, рука, официальный анализатор и k15f_m1_cold.py обязаны
+    # совпасть с планом; расхождение записывается в снимок.
+    pinned = json.load(open(mc.PLAN))["unchanged"].get("code_sha1") or {}
+    now = mc.code_sha1()
+    drift = sorted(f for f in mc.CODE_FILES if now[f] != pinned.get(f))
+    bad = sorted(set(drift) - set(DRIFT_ALLOWED))
+    if bad:
+        raise SystemExit(f"после прогона изменены исходники анализа M1: "
+                         f"{bad}")
+    orig = mc.code_sha1
+    mc.code_sha1 = lambda: dict(now, **{f: pinned[f] for f in drift})
+    try:
+        plan = mc.verify_plan()    # всё остальное — штатно
+    finally:
+        mc.code_sha1 = orig
     p = []
     commit = head = None
     if not skip_git:
         commit = run_commit()
         head = git("rev-parse", "HEAD").stdout.strip()
-        files = [os.path.join("experiments", f) for f in mc.CODE_FILES]
+        files = [os.path.join(HERE, f) for f in mc.CODE_FILES
+                 if f not in drift]
         if git("diff", "--quiet", commit, "HEAD", "--", *files).returncode:
-            p.append(f"зафиксированные исходники HEAD отличаются от "
-                     f"коммита прогона {commit}")
+            p.append(f"исходники анализа M1 в HEAD отличаются от коммита "
+                     f"прогона {commit}")
         if git("diff", "--quiet", "HEAD", "--", *files).returncode:
-            p.append("зафиксированные исходники изменены в рабочем дереве")
+            p.append("исходники анализа M1 изменены в рабочем дереве")
     cen = json.load(open(plan["new_census"]))
     res = json.load(open(RESULT))
     if res.get("code") != 0 or res.get("technical"):
@@ -117,6 +136,12 @@ def make(skip_git=False):
     if res.get("F") != cen.get("F"):
         p.append("F итога не равно F переписи")
     q0, arts = cold_jsons(plan["cold_dir"], mc.LABELS)
+    # в каталоге M1-cold — ТОЛЬКО блоки, входящие в анализ
+    extra = sorted({os.path.normpath(f) for f in glob.glob(os.path.join(
+        plan["cold_dir"], "*_t*_i*.json"))} - {os.path.normpath(f)
+                                              for f in q0 + arts})
+    if extra:
+        p.append(f"в {plan['cold_dir']} посторонние блоки: {extra[:3]}")
     for f in q0 + arts:
         d = json.load(open(f))
         blk = int(d["init_start"])
@@ -148,6 +173,10 @@ def make(skip_git=False):
         basis_report=u["basis_report"],
         basis_report_sha1=sha_full(u["basis_report"]),
         cold_dir=plan["cold_dir"], code_sha1_at_run=u.get("code_sha1"),
+        snapshot_code_dir=HERE,
+        code_drift_after_run={f: dict(at_run=pinned.get(f), now=now[f])
+                              for f in drift},
+        snapshot_script_sha1=sha_full(os.path.abspath(__file__)),
         pairs=[pair_entry(f) for f in q0 + arts],
         verdict=dict(code=res["code"], F=res["F"], R_L=res["R_L"],
                      R_C=res["R_C"], L_only=res["L_only"],
@@ -158,14 +187,27 @@ def make(skip_git=False):
                   "--mode", "m1", "--census", plan["new_census"],
                   "--q0-arts", *q0, "--arts", *arts, "--basis-report",
                   u["basis_report"], "--out", "<новый путь>"]))
-    os.makedirs(os.path.dirname(SNAP), exist_ok=True)
-    with open(SNAP + ".tmp", "w", encoding="utf-8") as fh:
-        json.dump(snap, fh, ensure_ascii=False, indent=1)
-    os.replace(SNAP + ".tmp", SNAP)
+    commit_snapshot(snap, SNAP)
     print(f"  снимок M1-cold: пар {len(snap['pairs'])}, коммит прогона "
           f"{commit}, итог {snap['verdict']}")
     print(f"  {SNAP} sha1 {sha_full(SNAP)}")
     return 0
+
+
+def commit_snapshot(snap, path):
+    """Кандидат проверяется ТОЙ ЖЕ verify ДО публикации: при отказе
+    окончательный файл не создаётся (повторный make иначе был бы закрыт
+    непроходящим снимком)."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(snap, fh, ensure_ascii=False, indent=1)
+    p = problems(tmp)
+    if p:
+        os.remove(tmp)
+        raise SystemExit("кандидат снимка не прошёл проверку, снимок не "
+                         "записан: " + "; ".join(p[:6]))
+    os.replace(tmp, path)
 
 
 def problems(path=SNAP):
@@ -270,6 +312,7 @@ def selftest():
         json.dump(bad, open(sp, "w"))
         assert any("технически" in x for x in problems(sp))
         assert problems(os.path.join(td, "нет.json"))
+    _make_test()
     # коммит прогона — однозначно из лога
     with tempfile.TemporaryDirectory() as td:
         lg = os.path.join(td, "run.log")
@@ -287,6 +330,110 @@ def selftest():
     print("самопроверка k15f_m1cold_snapshot пройдена: изменение каждого "
           "артефакта, состав каталога, технический отказ, коммит прогона")
     return 0
+
+
+def _make_test():
+    """make() целиком (без git и без настоящего анализатора): посторонний
+    блок в каталоге — ненулевой исход, окончательного снимка нет; кандидат,
+    не прошедший verify, не публикуется; чистый каталог — снимок цел."""
+    import tempfile
+    import k15f_m1_cold as mc
+    import k15g_local_probe as pr
+    g = globals()
+    keep_g = {k: g[k] for k in ("SNAP", "RESULT", "official")}
+    keep_mc = {k: getattr(mc, k) for k in ("verify_plan", "PLAN",
+                                           "CENSUS_OLD")}
+    keep_vb = pr.validate_block
+    with tempfile.TemporaryDirectory() as td:
+        cold = os.path.join(td, "cold")
+        os.makedirs(cold)
+
+        def pair(lab, blk, starts):
+            js = os.path.join(cold, f"{lab}_t8_i{blk}.json")
+            npz = js[:-5] + ".actions.npz"
+            open(npz, "wb").write(f"{lab}{blk}".encode())
+            json.dump(dict(arm_label=lab, task_id=8, init_start=blk,
+                           actions_npz=os.path.basename(npz),
+                           argv=dict(init_starts=starts)), open(js, "w"))
+            return js
+        for lab in ("q0", "l0p"):
+            pair(lab, 0, "0,5")
+            pair(lab, 5, "5")
+        res = dict(kind="k15f_m1", code=0, technical=[], F=14, R_L=12,
+                   R_C=11, L_only=1, C_only=0, decision="неясно")
+        f = {}
+        for k, obj in (("plan", {}), ("census", dict(code=0, technical=[],
+                                                     F=14)),
+                       ("old", {}), ("result", res), ("brep", {}),
+                       ("ident", {})):
+            f[k] = os.path.join(td, f"{k}.json")
+            json.dump(obj, open(f[k], "w"))
+        f["basis"] = os.path.join(td, "basis.pt")
+        open(f["basis"], "wb").write(b"B")
+        plan = dict(new_census=f["census"], cold_dir=cold, unchanged=dict(
+            basis=f["basis"], identity_report=f["ident"],
+            basis_report=f["brep"], code_sha1=mc.code_sha1()))
+        json.dump(plan, open(f["plan"], "w"))
+        g.update(SNAP=os.path.join(td, "snap.json"), RESULT=f["result"],
+                 official=lambda *a_: dict(res))
+        mc.verify_plan = lambda: plan
+        mc.PLAN, mc.CENSUS_OLD = f["plan"], f["old"]
+        pr.validate_block = lambda *a_, **k_: []
+        try:
+            foreign = pair("foreign", 0, "0")
+            try:
+                make(skip_git=True)
+                raise AssertionError("make принял посторонний блок")
+            except SystemExit as e:
+                assert "посторонние" in str(e), str(e)
+            assert not os.path.exists(g["SNAP"])
+            assert not os.path.exists(g["SNAP"] + ".tmp")
+            # кандидат, который verify отвергает, не публикуется
+            bad = dict(kind=KIND, cold_dir=cold, pairs=[], verdict={})
+            for k in ("plan", "census", "old_census", "result", "basis",
+                      "identity_report", "basis_report"):
+                bad[k], bad[k + "_sha1"] = f["plan"], "0"
+            try:
+                commit_snapshot(bad, g["SNAP"])
+                raise AssertionError("опубликован отвергнутый кандидат")
+            except SystemExit:
+                pass
+            assert not os.path.exists(g["SNAP"])
+            assert not os.path.exists(g["SNAP"] + ".tmp")
+            os.remove(foreign)
+            os.remove(foreign[:-5] + ".actions.npz")
+            # дрейф исходника анализа — отказ; допустимый дрейф — записан
+            orig_cs = mc.code_sha1
+            try:
+                mc.code_sha1 = lambda: dict(orig_cs(), **{
+                    "k15f_measure_subspace.py": "x"})
+                try:
+                    make(skip_git=True)
+                    raise AssertionError("принят дрейф анализатора")
+                except SystemExit as e:
+                    assert "k15f_measure_subspace.py" in str(e)
+                assert not os.path.exists(g["SNAP"])
+                mc.code_sha1 = lambda: dict(orig_cs(), **{
+                    "k15g_local_probe.py": "y"})
+                assert make(skip_git=True) == 0
+            finally:
+                mc.code_sha1 = orig_cs
+            assert list(json.load(open(g["SNAP"]))[
+                "code_drift_after_run"]) == ["k15g_local_probe.py"]
+            os.remove(g["SNAP"])
+            assert make(skip_git=True) == 0
+            assert problems(g["SNAP"]) == []
+            assert len(json.load(open(g["SNAP"]))["pairs"]) == 4
+            try:
+                make(skip_git=True)
+                raise AssertionError("снимок перезаписан")
+            except SystemExit:
+                pass
+        finally:
+            g.update(keep_g)
+            for k, v in keep_mc.items():
+                setattr(mc, k, v)
+            pr.validate_block = keep_vb
 
 
 def main():
