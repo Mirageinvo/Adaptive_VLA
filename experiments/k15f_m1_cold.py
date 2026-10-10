@@ -38,6 +38,19 @@ import shutil
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+CODE_DIR = HERE
+# ИСХОДНИКИ, фиксируемые планом: харнесс, рука и её зависимости,
+# официальный анализатор, валидатор, оба файла восстановления
+CODE_FILES = ("k9h_multiarm_gate.py", "k15f_policy.py", "k15d_policy.py",
+              "k15_context.py", "k15f_build_cache.py",
+              "k15f_check_identity.py", "k15f_continuous_refine.py",
+              "k15f_measure_subspace.py", "k15e_measure_scale.py",
+              "k15d_behavior.py", "k15g_local_probe.py", "k15f_m1_cold.py",
+              "k15f_m1_cold.sh")
+
+
+def code_sha1():
+    return {f: sha(os.path.join(CODE_DIR, f)) for f in CODE_FILES}
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
@@ -194,7 +207,8 @@ def plan_mode(basis, identity, basis_report):
                        basis_report_sha1=sha(basis_report), seed=101,
                        rule=kms.RULE, setup=kms.SETUP_EXPECTED,
                        harness_sha1=sha(os.path.join(
-                           HERE, "k9h_multiarm_gate.py"))),
+                           CODE_DIR, "k9h_multiarm_gate.py")),
+                       code_sha1=code_sha1()),
         note=("старые вторые блоки рук в анализ M1-cold не входят; выбор "
               "блоков — по правилу новой переписи, без учёта прежних "
               "результатов кандидатов"))
@@ -256,8 +270,13 @@ def verify_plan():
                       (u["basis_report"], u["basis_report_sha1"])):
         if not os.path.exists(path) or sha(path) != key:
             p.append(f"{path}: изменён или отсутствует")
-    if sha(os.path.join(HERE, "k9h_multiarm_gate.py")) != u["harness_sha1"]:
+    if sha(os.path.join(CODE_DIR, "k9h_multiarm_gate.py")) != \
+            u["harness_sha1"]:
         p.append("харнесс изменён после плана")
+    now = code_sha1()
+    for f in CODE_FILES:
+        if now[f] != (u.get("code_sha1") or {}).get(f):
+            p.append(f"исходник {f} изменён после плана")
     if u["setup"] != kms.SETUP_EXPECTED or u["rule"] != kms.RULE:
         p.append("контракт раскатки или правило изменились после плана")
     cen = json.load(open(plan["new_census"]))
@@ -358,7 +377,7 @@ def _chain_test():
     import tempfile
     g = globals()
     keep = {k: g[k] for k in ("COLD_DIR", "DIAG", "CENSUS_OLD",
-                              "CENSUS_NEW", "PLAN", "m1_dir")}
+                              "CENSUS_NEW", "PLAN", "m1_dir", "CODE_DIR")}
     fails = {(8, 0), (8, 6), (9, 7), (2, 9)}
 
     def succ(t, s_):
@@ -383,7 +402,11 @@ def _chain_test():
         json.dump(old, open(oldp, "w"))
         for f in ("basis.pt", "ident.json", "brep.json"):
             open(os.path.join(td, f), "w").write(f)
-        g.update(COLD_DIR=os.path.join(td, "cold"), DIAG=diag,
+        code = os.path.join(td, "code")
+        os.makedirs(code)
+        for f in CODE_FILES:
+            shutil.copy(os.path.join(HERE, f), code)
+        g.update(COLD_DIR=os.path.join(td, "cold"), DIAG=diag, CODE_DIR=code,
                  CENSUS_OLD=oldp, CENSUS_NEW=os.path.join(td, "new.json"),
                  PLAN=os.path.join(td, "plan.json"), m1_dir=lambda: m1)
         try:
@@ -412,6 +435,20 @@ def _chain_test():
                 raise AssertionError("сборка приняла изменённый npz")
             except SystemExit as e:
                 assert "изменились" in str(e)
+            # правка ЛЮБОГО зафиксированного исходника после плана — отказ
+            verify_plan()
+            for f in CODE_FILES:
+                fp = os.path.join(g["CODE_DIR"], f)
+                orig = open(fp, "rb").read()
+                open(fp, "ab").write(b"\n# x\n")
+                try:
+                    verify_plan()
+                    raise AssertionError(f"правка {f} прошла проверку")
+                except SystemExit as e:
+                    assert f"исходник {f} изменён" in str(e), str(e)
+                finally:
+                    open(fp, "wb").write(orig)
+            verify_plan()
             # правка переписи после плана — проверка плана отказывает
             cen = json.load(open(g["CENSUS_NEW"]))
             cen["F"] += 1

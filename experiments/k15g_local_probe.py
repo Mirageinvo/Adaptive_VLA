@@ -219,6 +219,23 @@ def validate_block(path, label=None, task=None, block=None, *,
                  f"[T, {B}, 7] float32")
     elif not np.isfinite(A).all():
         p.append(f"{name}: actions не конечны")
+    if p:
+        return p
+    # ГРАНИЦЫ ИСПОЛНЕННОЙ ТРАЕКТОРИИ: T > 0, done_step формы [B], целые,
+    # каждое -1 либо в [0, T-1] — иначе own_steps и хеш не определены
+    T = A.shape[0]
+    dz = zz["done_step"]
+    if T <= 0:
+        return [f"{name}: пустой actions (T={T})"]
+    if dz.shape != (B,) or not np.issubdtype(dz.dtype, np.integer):
+        return [f"{name}: done_step формы {dz.shape} {dz.dtype}, "
+                f"ожидалось [{B}] целое"]
+    for i, x in enumerate(dz.tolist()):
+        if not (x == -1 or 0 <= x <= T - 1):
+            p.append(f"{name}: эпизод {i}: done_step {x} вне -1 и "
+                     f"[0, {T - 1}]")
+    if p:
+        return p
     ids = [int(e["init_state_id"]) for e in eps]
     if label is not None and d.get("arm_label") != label:
         p.append(f"{name}: метка {d.get('arm_label')!r}")
@@ -739,6 +756,30 @@ def selftest():
         pth = write(eps, good, header=dict(horizon=4))
         assert any("horizon" in x for x in validate_block(
             pth, setup=dict(horizon=8)))
+        # границы траектории (ревью c0d3620): JSON и npz согласованы между
+        # собой, но done_step вне траектории или actions пуст
+        def consistent(A_, ds_):
+            e_ = []
+            for k, x in enumerate(ds_):
+                h_, end_ = episode_action_sha(A_, k, x)
+                e_.append(dict(eps[k], done_step=int(x), action_sha1=h_,
+                               own_steps=end_))
+            return write(e_, dict(good, actions=A_, done_step=np.asarray(
+                ds_, np.int64), action_sha1=np.asarray(
+                    [x["action_sha1"] for x in e_])))
+        A8 = A0[:8]
+        for ds_, msg in (([800, -1, -1, -1, -1], "вне"),
+                         ([-2, -1, -1, -1, -1], "вне"),
+                         ([8, -1, -1, -1, -1], "вне")):
+            assert any(msg in x for x in validate_block(
+                consistent(A8, ds_))), ds_
+        assert any("пустой" in x for x in validate_block(
+            consistent(A0[:0], [-1] * 5)))
+        assert validate_block(consistent(A8, [7, -1, 0, 3, -1])) == []
+        pth = write(eps, dict(good, done_step=np.arange(20, 25) + 0.0))
+        assert any("целое" in x for x in validate_block(pth))
+        pth = write(eps, dict(good, done_step=np.arange(20, 24)))
+        assert any("формы" in x for x in validate_block(pth))
         pth = write(eps, good)
         assert validate_block(pth, "p2l0p", 8, 5, require_single=True) == []
         np.savez(os.path.join(td, "a.actions.npz"), x=np.ones(1))
