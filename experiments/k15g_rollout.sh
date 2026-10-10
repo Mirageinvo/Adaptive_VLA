@@ -5,8 +5,9 @@
 #   smoke       задачи 0 и 8, блок 0: q0ref, p2l0p, p2r0p, p4l0p, p4r0p
 #               через адаптер k15g_harness.py; затем проверка протокола
 #               (smoke-план, без вердикта M1);
-#   plan        фиксация неизменяемого плана (нужен итоговый отчёт M1):
-#               задачи 2, 8, 9, блоки из переписи M1, q0ref + 32 руки;
+#   plan        фиксация неизменяемого плана (нужен итоговый отчёт
+#               M1-cold): задачи — все с провалами q0 по ХОЛОДНОЙ
+#               переписи, блоки из неё, q0ref + 32 руки;
 #   run         раскатки по плану: q0ref, затем 32 руки (2 момента × 16);
 #   analyze     проверки протокола и агрегация.
 #
@@ -25,7 +26,8 @@ SEED=101
 BASIS="data/k15f/basis_s0.pt"
 DTAG="$(echo "$DEV" | tr -d ':')"
 IDENT="reports/k15f/identity_${DTAG}.json"
-CENSUS="reports/k15f/m1_census.json"
+# ЭТАЛОН — холодная перепись M1-cold (после восстановления M1)
+CENSUS="reports/k15f/m1cold_census.json"
 PLAN="reports/k15g/local_plan.json"
 SPLAN="reports/k15g/smoke_plan.json"
 
@@ -42,7 +44,7 @@ for m in k15g_analyze_m1 k15g_local_policy k15g_local_probe k15g_harness \
   python3 "experiments/${m}.py" --selftest >/dev/null \
     || { echo "ОТКАЗ: самопроверка ${m}"; exit 1; }
 done
-M1DIR="$(ls -td reports/k15f/m1/s101/*/ 2>/dev/null | head -1)"
+M1DIR="reports/k15f/m1cold"
 
 if [ "$MODE" = "analyze-m1" ]; then
   python3 experiments/k15g_analyze_m1.py --m1-dir "$M1DIR" \
@@ -50,8 +52,8 @@ if [ "$MODE" = "analyze-m1" ]; then
   exit $?
 fi
 if [ "$MODE" = "plan" ]; then
-  M1REP="$(ls -t reports/k15f/m1_k9h*.json 2>/dev/null | head -1)"
-  [ -n "$M1REP" ] || { echo "ОТКАЗ: нет итогового отчёта M1"; exit 1; }
+  M1REP="reports/k15f/m1cold_result.json"
+  [ -f "$M1REP" ] || { echo "ОТКАЗ: нет итогового отчёта M1-cold"; exit 1; }
   python3 experiments/k15g_local_probe.py --mode plan --plan "$PLAN" \
     --basis "$BASIS" --identity "$IDENT" --census "$CENSUS" \
     --m1-report "$M1REP" --census-q0-dir "$M1DIR" --device "$DEV"

@@ -54,7 +54,8 @@ import k15g_local_policy as lp  # noqa: E402
 
 KIND = "k15g_local_plan"
 H = 8
-TASKS = [2, 8, 9]                      # задачи с провалами q0 в M1
+# Задачи — НЕ фиксированный список: все задачи с провалами q0 по переписи,
+# на которой зафиксирован план (после восстановления — холодная M1-cold).
 BASIS_CONTRACT = ("basis_sha1", "basis_state_sha1", "stats_sha1",
                   "amp_factor", "control_seed", "control_kind",
                   "identity_report_sha1", "refine_module_sha1",
@@ -72,8 +73,10 @@ SMOKE = dict(tasks=[0, 8], blocks={"0": [0], "8": [0]},
 
 
 def make_plan(*, basis, identity, census_path, m1_report, census_q0_dir,
-              device, dtype, tasks=TASKS, smoke=False):
+              device, dtype, tasks=None, smoke=False):
     cen = json.load(open(census_path))
+    if tasks is None:
+        tasks = sorted({int(t) for t, _s in cen["fails"]})
     if smoke:
         # SMOKE: техническая цепочка до завершения M1; вердикта M1 нет
         tasks = SMOKE["tasks"]
