@@ -182,6 +182,7 @@ def scan(roots, exclude=("reports/k15h",)):
     восстановлены), блоки с принятым размером, каталоги без истории."""
     used, per_file, other_suite = {}, {}, set()
     problems, unresolved, assumed = [], [], []
+    by_dir, assumed_dirs = {}, set()
     dirs_seen, dirs_found = {}, set()
     for root in roots:
         for dp, _dn, fn in os.walk(root):
@@ -207,7 +208,10 @@ def scan(roots, exclude=("reports/k15h",)):
                 try:
                     if f.endswith(".json"):
                         obj = json.load(open(p))
+                        n_asm = len(assumed)
                         states_from_json(obj, add, assumed=assumed)
+                        if len(assumed) > n_asm:
+                            assumed_dirs.add(top)
                     elif f.endswith(".log"):
                         states_from_log(open(p, errors="replace").read(),
                                         add)
@@ -221,6 +225,7 @@ def scan(roots, exclude=("reports/k15h",)):
                     dirs_found.add(top)
                     for k in got:
                         used[k] = used.get(k, 0) + 1
+                    by_dir.setdefault(top, set()).update(got)
                 elif rollout_like(p, obj):
                     unresolved.append(p)
     # npz без собственных стартов, но с JSON-парой, где старты есть, —
@@ -231,7 +236,8 @@ def scan(roots, exclude=("reports/k15h",)):
     unrecovered = sorted(d for d in dirs_seen if d not in dirs_found)
     return dict(used=used, per_file=per_file, unrecovered=unrecovered,
                 other_suite=sorted(other_suite), problems=problems,
-                unresolved=sorted(unresolved), assumed_blocks=assumed)
+                unresolved=sorted(unresolved), assumed_blocks=assumed,
+                by_dir=by_dir, assumed_dirs=sorted(assumed_dirs))
 
 
 def libero_bank():
@@ -290,7 +296,30 @@ def inventory_mode(out=INVENTORY):
     used, per_file, unrec = sc["used"], sc["per_file"], sc["unrecovered"]
     bank_info = libero_bank()
     n_states = {int(t): v["n_states"] for t, v in bank_info.items()}
-    bank, k, free = select_bank(set(used), n_states)
+    try:
+        bank, k, free = select_bank(set(used), n_states)
+    except SystemExit as e:
+        # ДИАГНОСТИКА: что заняло состояния; окончательный отчёт не пишется
+        free = {t: [b for b in range(0, n_states[t] - N_ENVS + 1, N_ENVS)
+                    if not any((t, s_) in used
+                               for s_ in range(b, b + N_ENVS))]
+                for t in TASKS}
+        print(f"  ОТКАЗ ВЫБОРА: {e}")
+        print_usage(sc, n_states, free)
+        diag = out[:-len(".json")] + ".failed.json"
+        with open(diag, "w", encoding="utf-8") as fh:
+            json.dump(dict(
+                used={str(t): sorted(s_ for (t_, s_) in used if t_ == t)
+                      for t in TASKS},
+                by_dir={d: sorted(map(list, v))
+                        for d, v in sc["by_dir"].items()},
+                assumed_dirs=sc["assumed_dirs"],
+                free_blocks={str(t): v for t, v in free.items()},
+                problem_files=sc["problems"],
+                unresolved_files=sc["unresolved"]), fh,
+                ensure_ascii=False, indent=1)
+        print(f"  диагностика: {diag}")
+        return 3
     res = dict(
         kind="k15h_inventory", created=datetime.datetime.now().isoformat(
             timespec="seconds"),
@@ -341,6 +370,23 @@ def inventory_mode(out=INVENTORY):
     for x in sc["unresolved"][:30]:
         print(f"    старты не восстановлены: {x}")
     return res["code"]
+
+
+def print_usage(sc, n_states, free):
+    """Какой каталог какие состояния занял (по задачам)."""
+    for t in TASKS:
+        u = sorted(s for (t_, s) in sc["used"] if t_ == t)
+        print(f"    задача {t}: банк {n_states[t]}, использовано {len(u)} "
+              f"({_ranges(u)}); свободные блоки {free[t]}")
+    print("  источники по каталогам (состояния — объединение по задачам; "
+          "* — план с неизвестным размером блока, принято "
+          f"{ASSUMED_BLOCK}):")
+    for d, st in sorted(sc["by_dir"].items(),
+                        key=lambda kv: -len(kv[1])):
+        tasks = sorted({t for t, _ in st})
+        print(f"    {d}{' *' if d in sc['assumed_dirs'] else ''}: "
+              f"{len(st)} пар, задачи {_ranges(tasks)}, состояния "
+              f"{_ranges(sorted({s for _, s in st}))}")
 
 
 def _ranges(xs):
