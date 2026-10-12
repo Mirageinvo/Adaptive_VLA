@@ -65,6 +65,7 @@ def mcnemar_p(gain, loss):
 def candidate_row(outc, q0, states, moment=None, ref_done=None):
     """outc {(t, s): успех}, q0 {(t, s): успех}. Строка таблицы."""
     per_task = collections.defaultdict(lambda: [0, 0])
+    pt_gl = collections.defaultdict(lambda: [0, 0])
     gain = loss = missing = unreached = 0
     succ = 0
     for k in states:
@@ -77,6 +78,8 @@ def candidate_row(outc, q0, states, moment=None, ref_done=None):
         succ += o
         gain += (o and not b)
         loss += (b and not o)
+        pt_gl[k[0]][0] += (o and not b)
+        pt_gl[k[0]][1] += (b and not o)
         if moment is not None and ref_done is not None and \
                 not reached(int(ref_done[k]), moment):
             unreached += 1
@@ -86,6 +89,8 @@ def candidate_row(outc, q0, states, moment=None, ref_done=None):
                 q0_sr=base / max(n, 1), d_sr=(succ - base) / max(n, 1),
                 gain=gain, loss=loss, mcnemar_p=mcnemar_p(gain, loss),
                 per_task={str(t): v for t, v in sorted(per_task.items())},
+                per_task_gain_loss={str(t): v for t, v in
+                                    sorted(pt_gl.items())},
                 missing=missing, pulse_unreached=unreached)
 
 
@@ -141,10 +146,38 @@ def build(pulse, const, q0, ref_done, states, fails, diag):
     bad = []
     for lab, r in list(rows.items()) + [("q0", q0row)]:
         if sum(v[0] for v in r["per_task"].values()) != r["successes"] or \
-                sum(v[1] for v in r["per_task"].values()) != r["n"]:
+                sum(v[1] for v in r["per_task"].values()) != r["n"] or \
+                sum(v[0] for v in r["per_task_gain_loss"].values()) \
+                != r["gain"] or \
+                sum(v[1] for v in r["per_task_gain_loss"].values()) \
+                != r["loss"]:
             bad.append(lab)
     return dict(states=len(states), q0=q0row, rows=rows, uniform=uni,
                 fail_diag_cross=cross, sum_check_failed=bad)
+
+
+def completeness(pulse, const, q0, states, gaps, want_pulse, want_const):
+    """Полный набор: все кандидаты, ровно все состояния плана у каждого,
+    проверенный q0ref на каждом состоянии, нет непригодных блоков.
+    Список проблем (пусто — полный)."""
+    p = []
+    st = set(states)
+    if gaps:
+        p.append(f"непроверенных или отсутствующих блоков {len(gaps)}: "
+                 f"{[(g['label'], g['task'], g['block']) for g in gaps[:4]]}")
+    if set(q0) != st:
+        p.append(f"q0ref: {len(set(q0) & st)}/{len(st)} состояний")
+    for name, have, want in (("импульсов", pulse, want_pulse),
+                             ("постоянных рук", const, want_const)):
+        if sorted(have) != sorted(want):
+            p.append(f"{name} {len(have)} из {len(want)}: нет "
+                     f"{sorted(set(want) - set(have))[:4]}")
+        for lab, o in have.items():
+            if set(o) != st:
+                p.append(f"{lab}: {len(set(o) & st)}/{len(st)} состояний"
+                         + (f", лишние {sorted(set(o) - st)[:2]}"
+                            if set(o) - st else ""))
+    return p
 
 
 # --- перестановочные тесты ---------------------------------------------------
@@ -193,12 +226,14 @@ def permutation_tests(pulse, states_sel, n_perm=20000):
 
 
 # --- загрузка и отчёт --------------------------------------------------------
-def run(snapshot, plan_path, run_dir):
+def run(snapshot, plan_path, run_dir, compare_path,
+        allow_incomplete=False):
     import k15f_m1cold_snapshot as msn
     import k15g_compare_m1 as cm
     import k15g_local_probe as pr
     snap = msn.verify(snapshot)
     plan = json.load(open(plan_path))
+    cm.bind_snapshot(plan, snapshot)
     if plan.get("kind") != pr.KIND or plan.get("smoke"):
         raise SystemExit("нужен основной план K-15g")
     prob = pr.check_plan_inputs(plan)
@@ -222,9 +257,18 @@ def run(snapshot, plan_path, run_dir):
         ep = cm.episodes_of(fl)
         const[lab] = {k: v["success"] for k, v in ep.items()
                       if k[0] in tasks and k in set(states)}
+    want_pulse = [x for x in plan["candidates"] if x != "q0ref"]
+    want_const = [f"{f}{d}" for f in FAMS for d in DIRS]
+    inc = completeness(pulse, const, q0, states, gaps, want_pulse,
+                       want_const)
+    if inc and not allow_incomplete:
+        # НЕПОЛНЫЙ НАБОР: рейтинг и равномерные смеси не считаются
+        return dict(complete=False, incomplete=inc, states=len(states))
     fails = [tuple(x) for x in plan["fails"]]
     diag = [tuple(x) for x in plan["diag"]]
     res = build(pulse, const, q0, ref_done, states, fails, diag)
+    res["complete"] = not inc
+    res["incomplete"] = inc
     q0_fail = [k for k in states if not q0[k]]
     q0_succ = [k for k in states if q0[k]]
     res["permutation"] = permutation_tests(pulse, {
@@ -233,9 +277,24 @@ def run(snapshot, plan_path, run_dir):
     res["note"] = ("кандидат, выделенный после просмотра 32+16, требует "
                    "проверки на новых стартах; тесты Мак-Немара разведочные, "
                    "без поправки на множественность")
-    cmp_path = os.path.join(os.path.dirname(plan_path), "compare_m1.json")
-    if os.path.exists(cmp_path):
-        res["cross_check"] = cross_check(res, json.load(open(cmp_path)))
+    # ВНЕШНЯЯ СВЕРКА ОБЯЗАТЕЛЬНА: без неё статус «сверка не выполнена»
+    if not compare_path or not os.path.exists(compare_path):
+        res["cross_check"] = dict(done=False, mismatches=[
+            f"сверка не выполнена: нет {compare_path}"])
+    else:
+        cmp_ = json.load(open(compare_path))
+        same = (os.path.abspath(cmp_.get("run_dir", "")) ==
+                os.path.abspath(run_dir) and
+                os.path.abspath(cmp_.get("plan", "")) ==
+                os.path.abspath(plan_path) and
+                os.path.abspath((cmp_.get("snapshot") or {}).get("path", ""))
+                == os.path.abspath(snapshot))
+        if not same:
+            res["cross_check"] = dict(done=False, mismatches=[
+                "сверка не выполнена: compare_m1.json построен по другим "
+                "плану, каталогу или снимку"])
+        else:
+            res["cross_check"] = dict(done=True, **cross_check(res, cmp_))
     return res
 
 
@@ -268,6 +327,13 @@ def cross_check(res, cmp_):
 
 
 def report(res):
+    if res.get("incomplete"):
+        print("  НАБОР НЕПОЛНЫЙ" + ("" if res.get("rows") else
+                                    " — рейтинг и смеси не считаются") + ":")
+        for x in res["incomplete"][:10]:
+            print(f"    {x}")
+        if not res.get("rows"):
+            return
     q = res["q0"]
     print(f"  состояний {res['states']}; q0: {q['successes']}/{q['n']} = "
           f"{100 * q['sr']:.1f}%; по задачам " + ", ".join(
@@ -276,17 +342,22 @@ def report(res):
         print(f"  ВНИМАНИЕ: непроверенных блоков {len(res['gaps'])}")
     print(f"  проверка сумм по задачам: "
           f"{'сходится' if not res['sum_check_failed'] else res['sum_check_failed']}")
-    cc = res.get("cross_check")
-    if cc:
-        print(f"  сверка с compare_m1.json (спасения на 14 / вред на 8): "
+    cc = res.get("cross_check") or {}
+    if not cc.get("done"):
+        print(f"  СВЕРКА НЕ ВЫПОЛНЕНА: {cc.get('mismatches')}")
+    else:
+        print(f"  сверка с compare_m1.json (спасения на 14 / вред на 8), "
+              f"{len(cc['table'])} сверок: "
               f"{'совпадает' if not cc['mismatches'] else cc['mismatches']}; "
               + ", ".join(f"{k} {v['here'][0]}/{v['here'][1]}"
                           for k, v in cc["table"].items()))
     print("  кандидаты по ΔSR (SR, ΔSR, выигрыш/потеря, Мак-Немар p "
-          "разведочно, по задачам 2/3/8/9):")
+          "разведочно; по задачам: успехи/состояния +выигрыш−потеря):")
     rows = sorted(res["rows"].items(), key=lambda kv: -kv[1]["d_sr"])
     for lab, r in rows:
-        pt = " ".join(f"{v[0]}/{v[1]}" for v in r["per_task"].values())
+        gl = r["per_task_gain_loss"]
+        pt = " ".join(f"t{t} {v[0]}/{v[1]} +{gl[t][0]}−{gl[t][1]}"
+                      for t, v in r["per_task"].items())
         extra = (f", импульс не исполнен в {r['pulse_unreached']}"
                  if r["pulse_unreached"] else "")
         print(f"    {lab:6} {r['kind']:8} SR {100 * r['sr']:5.1f}% "
@@ -342,6 +413,37 @@ def selftest():
     rd = {**ref_done, (8, 9): 10}
     assert build(pulse, const, q0, rd, states, fails, diag)["rows"][
         "p4l0p"]["pulse_unreached"] == 1
+    assert r["per_task_gain_loss"]["8"] == [2, 0]
+    assert res["rows"]["p2l0p"]["per_task_gain_loss"]["8"] == [0, 1]
+    # ПОЛНОТА: пропущенный целый блок руки -> неполный набор, код 3
+    st2 = states + [(2, s) for s in range(5)]
+    add = {(2, s): True for s in range(5)}
+    q2 = {**q0, **add}
+    p2 = {k: {**v, **add} for k, v in pulse.items()}
+    c2 = {k: {**v, **add} for k, v in const.items()}
+    c2["l0p"][(8, 3)] = False
+    wp, wc = list(p2), list(c2)
+    assert completeness(p2, c2, q2, st2, [], wp, wc) == []
+    p3 = dict(p2, p4r3p={k: v for k, v in p2["p4r3p"].items()
+                         if k[0] != 2})
+    inc = completeness(p3, c2, q2, st2, [], wp, wc)
+    assert any("p4r3p: 10/15" in x for x in inc), inc
+    p4 = {k: v for k, v in p2.items() if k != "p4r3p"}
+    assert any("импульсов 31 из 32" in x for x in completeness(
+        p4, c2, q2, st2, [], wp, wc))
+    q3 = {k: v for k, v in q2.items() if k != (2, 0)}
+    assert any("q0ref" in x for x in completeness(p2, c2, q3, st2, [],
+                                                  wp, wc))
+    assert completeness(p2, c2, q2, st2, [dict(label="x", task=2, block=0,
+                                                why="не готов")], wp, wc)
+    assert exit_code(dict(complete=False, incomplete=["x"])) == 3
+    good = dict(complete=True, incomplete=[], sum_check_failed=[],
+                cross_check=dict(done=True, mismatches=[]))
+    assert exit_code(good) == 0
+    assert exit_code(dict(good, cross_check=dict(
+        done=False, mismatches=["сверка не выполнена"]))) == 3
+    assert exit_code(dict(good, cross_check=dict(done=True,
+                                                 mismatches=["ч2"]))) == 3
     assert mcnemar_p(0, 0) == 1.0 and abs(mcnemar_p(5, 0) - 2 / 32) < 1e-12
     assert abs(mcnemar_p(3, 3) - 1.0) < 1e-12
     # перестановочный тест: полная согласованность — малое p; одинаковые
@@ -364,6 +466,11 @@ def main():
     ap.add_argument("--plan", default="reports/k15g/local_plan.json")
     ap.add_argument("--run-dir", default=None)
     ap.add_argument("--out", default="reports/k15g/full_table.json")
+    ap.add_argument("--compare", default="reports/k15g/compare_m1.json",
+                    help="вывод k15g_compare_m1 по тем же плану, каталогу и "
+                         "снимку — обязательная сверка")
+    ap.add_argument("--allow-incomplete", action="store_true",
+                    help="промежуточный просмотр неполного набора (код 3)")
     a = ap.parse_args()
     if a.selftest:
         return selftest()
@@ -374,7 +481,7 @@ def main():
         if len(cand) != 1:
             raise SystemExit(f"укажите --run-dir: найдено {cand}")
         rd = cand[0]
-    res = run(a.snapshot, a.plan, rd)
+    res = run(a.snapshot, a.plan, rd, a.compare, a.allow_incomplete)
     report(res)
     with open(a.out + ".tmp", "w", encoding="utf-8") as fh:
         json.dump(res, fh, ensure_ascii=False, indent=1,
@@ -382,8 +489,17 @@ def main():
                       x, (set, tuple)) else str(x))
     os.replace(a.out + ".tmp", a.out)
     print(f"  сводка: {a.out}")
+    return exit_code(res)
+
+
+def exit_code(res):
+    """0 — только полный набор, суммы сходятся, сверка выполнена и
+    совпала."""
     cc = res.get("cross_check") or {}
-    return 3 if (res["sum_check_failed"] or cc.get("mismatches")) else 0
+    ok = (res.get("complete") and not res.get("incomplete")
+          and not res.get("sum_check_failed") and cc.get("done")
+          and not cc.get("mismatches"))
+    return 0 if ok else 3
 
 
 if __name__ == "__main__":

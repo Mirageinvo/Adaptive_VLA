@@ -209,7 +209,17 @@ def load_pulse(plan, run_dir):
     cen_q0 = pr.episodes(sorted(glob.glob(os.path.join(
         plan["census_q0_dir"], "q0_t*_i*.json"))))
     setup = pr.expected_setup()
+    exp_c = plan.get("expected_contract") or {}
+    if not exp_c:
+        raise SystemExit("в плане нет ожидаемого контракта базиса")
     ok, gaps, refs = {}, [], {}
+
+    def contract_bad(p):
+        """joint блока против ожидаемого контракта плана."""
+        j_ = json.load(open(p)).get("joint") or {}
+        return [f"{k} = {j_.get(k)!r}, план {v!r}" for k, v in exp_c.items()
+                if json.dumps(j_.get(k), sort_keys=True)
+                != json.dumps(v, sort_keys=True)]
     blocks = [(int(t), int(b)) for t, bl in plan["blocks"].items()
               for b in bl]
 
@@ -231,6 +241,8 @@ def load_pulse(plan, run_dir):
             continue
         prob = pr.validate_block(rp, "q0ref", t, b, require_single=True,
                                  setup=setup)
+        if not prob:
+            prob = contract_bad(rp)
         if not prob and not start_ok(rp):
             prob = ["старт не равен q0 переписи"]
         if not prob:
@@ -261,6 +273,8 @@ def load_pulse(plan, run_dir):
             prob = pr.validate_block(p, lab, t, b, require_single=True,
                                      setup=setup)
             if not prob:
+                prob = contract_bad(p)
+            if not prob:
                 d, z = pr.load(p)
                 rd, rz = pr.load(refs[(t, b)])
                 prob = pr.check_arm_block(d, z, lab, rz, rd)
@@ -274,11 +288,22 @@ def load_pulse(plan, run_dir):
     return ok, list(refs.values()), gaps
 
 
+def bind_snapshot(plan, snapshot):
+    """Переданный снимок — тот, на котором зафиксирован план K-15g."""
+    import k15g_local_probe as pr
+    if os.path.abspath(snapshot) != os.path.abspath(
+            plan.get("m1_snapshot") or "") or \
+            pr.sha(snapshot) != plan.get("m1_snapshot_sha1"):
+        raise SystemExit(f"снимок {snapshot} не тот, что в плане K-15g "
+                         f"({plan.get('m1_snapshot')})")
+
+
 def run(snapshot, plan_path, run_dir):
     import k15f_m1cold_snapshot as msn
     import k15g_local_probe as pr
     snap = msn.verify(snapshot)
     plan = json.load(open(plan_path))
+    bind_snapshot(plan, snapshot)
     if plan.get("kind") != pr.KIND or plan.get("smoke"):
         raise SystemExit("нужен основной план K-15g")
     prob = pr.check_plan_inputs(plan)
@@ -451,12 +476,13 @@ def _loader_test():
         os.makedirs(q0d)
         os.makedirs(run_d)
 
-        def put(dirn, lab, t, b, succ=False):
+        def put(dirn, lab, t, b, succ=False, basis="B"):
             eps = [dict(init_state_id=s, init_hash=f"h{t}{s}",
                         init_hash_full=f"H{t}{s}", rollout_seed=101,
                         action_sha1=f"a{t}{s}", success=succ, done_step=-1)
                    for s in range(b, b + 5)]
-            json.dump(dict(task_id=t, init_start=b, episodes=eps),
+            json.dump(dict(task_id=t, init_start=b, episodes=eps,
+                           joint=dict(basis_sha1=basis)),
                       open(os.path.join(dirn, f"{lab}_t{t}_i{b}.json"), "w"))
         put(q0d, "q0", 8, 0)
         put(q0d, "q0", 9, 0)
@@ -464,8 +490,10 @@ def _loader_test():
         put(run_d, "p2l0p", 8, 0, succ=True)
         put(run_d, "p2l0m", 8, 0)
         put(run_d, "p2l0p", 9, 0)              # нет q0ref блока 9/0
+        put(run_d, "p2r0p", 8, 0, basis="ИНОЙ")  # чужой контракт базиса
         plan = dict(census_q0_dir=q0d, blocks={"8": [0], "9": [0]},
-                    candidates=["q0ref", "p2l0p", "p2l0m", "p4l0p"])
+                    candidates=["q0ref", "p2l0p", "p2l0m", "p4l0p", "p2r0p"],
+                    expected_contract=dict(basis_sha1="B"))
         pr.expected_setup = lambda: {}
         pr.validate_block = lambda p, *a, **k: (
             ["повреждён"] if "p2l0m" in p else [])
@@ -482,6 +510,25 @@ def _loader_test():
         assert why[("p2l0p", 9)] == "нет проверенного q0ref блока"
         assert why[("q0ref", 9)] == "нет блока q0ref"
         assert why[("p4l0p", 8)] == "не готов"
+        assert "basis_sha1" in why[("p2r0p", 8)]
+        try:
+            load_pulse(dict(plan, expected_contract={}), run_d)
+            raise AssertionError("принят план без контракта")
+        except SystemExit:
+            pass
+    # снимок привязан к плану
+    with tempfile.TemporaryDirectory() as td:
+        sp = os.path.join(td, "snap.json")
+        open(sp, "w").write("{}")
+        plan = dict(m1_snapshot=sp, m1_snapshot_sha1=pr.sha(sp))
+        bind_snapshot(plan, sp)
+        for bad in (dict(plan, m1_snapshot_sha1="0"),
+                    dict(plan, m1_snapshot=os.path.join(td, "x.json"))):
+            try:
+                bind_snapshot(bad, sp)
+                raise AssertionError("принят чужой снимок")
+            except SystemExit:
+                pass
         assert len(refs) == 1
 
 
