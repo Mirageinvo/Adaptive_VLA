@@ -153,35 +153,45 @@ def summarize(outc, done, states, plan):
                 .split("ПРИЗНАКИ")[0].strip())
 
 
-def export_features(plan, ok, outc, out):
-    """Признаки по q0ref + исходы пяти политик."""
+def export_features(plan, ok, outc, out, n_calls=4):
+    """Признаки по q0ref + исходы пяти политик. Фиксированные n_calls
+    позиций вызовов: отсутствующий вызов (блок закончился раньше) и вызов,
+    до которого среда не дошла (done_step), — NaN и маска False."""
     import k15h_protocol as pc
     H18, A0, LB, MASK, T, S, DIR, Y = [], [], [], [], [], [], [], []
     for (lab, t, b), pth in sorted(ok.items()):
         if lab != "q0ref":
             continue
         d, z = pc.load(pth)
-        h = z["k15h_h18"]                                 # [k, B, n, D]
+        h = np.asarray(z["k15h_h18"], np.float32)          # [k, B, n, D]
+        k_have = min(h.shape[0], n_calls)
         for i, e in enumerate(d["episodes"]):
-            s = int(e["init_state_id"])
+            s_ = int(e["init_state_id"])
             ds = int(z["done_step"][i])
-            mask = [pc.reached(ds, k + 1) for k in range(h.shape[0])]
-            hh = np.where(np.asarray(mask)[:, None, None], h[:, i],
-                          np.nan).astype(np.float32)
+            mask = np.array([k < k_have and pc.reached(ds, k + 1)
+                             for k in range(n_calls)])
+            hh = np.full((n_calls,) + h.shape[2:], np.nan, np.float32)
+            a0 = np.full((n_calls,) + z["k15d_a0"].shape[2:], np.nan,
+                         np.float32)
+            lb = np.full((n_calls,) + z["k15f_basis"].shape[2:], np.nan,
+                         np.float32)
+            for k in np.nonzero(mask)[0]:
+                hh[k] = h[k, i]
+                a0[k] = z["k15d_a0"][k, i]
+                lb[k] = z["k15f_basis"][k, i]
             H18.append(hh)
-            A0.append(np.where(np.asarray(mask)[:, None, None],
-                               z["k15d_a0"][:h.shape[0], i], np.nan))
-            LB.append(np.where(np.asarray(mask)[:, None, None],
-                               z["k15f_basis"][:h.shape[0], i], np.nan))
+            A0.append(a0)
+            LB.append(lb)
             MASK.append(mask)
             T.append(t)
-            S.append(s)
-            DIR.append(plan["directions"][str(t)][str(s)])
-            Y.append([bool(outc[x][(t, s)]) for x in plan["labels"]])
+            S.append(s_)
+            DIR.append(plan["directions"][str(t)][str(s_)])
+            Y.append([bool(outc[x][(t, s_)]) for x in plan["labels"]])
     np.savez_compressed(out, h18=np.stack(H18), a0=np.stack(A0),
-                        learned_basis=np.stack(LB), call_reached=np.asarray(
-                            MASK), task=np.asarray(T), state=np.asarray(S),
-                        direction=np.asarray(DIR), outcomes=np.asarray(Y),
+                        learned_basis=np.stack(LB),
+                        call_reached=np.stack(MASK), task=np.asarray(T),
+                        state=np.asarray(S), direction=np.asarray(DIR),
+                        outcomes=np.asarray(Y),
                         labels=np.asarray(plan["labels"]))
     return len(T)
 
@@ -284,9 +294,51 @@ def selftest():
     assert r["primary"][0]["gain"] == 4 and r["primary"][1]["gain"] == 0
     assert r["primary"][0]["holm_p"] >= r["primary"][0]["mcnemar_p"]
     assert r["secondary_reached_only"]["p4r3p"]["states"] == 18
+    _export_test()
     print("самопроверка k15h_analyze пройдена: Мак-Немар, Holm, равные веса "
           "задач, парный бутстрэп внутри задач, недостигнутые импульсы")
     return 0
+
+
+def _export_test():
+    """Смесь блоков с 2 и 4 вызовами и завершение сред внутри чанка."""
+    import tempfile
+    import k15h_policy as hp
+    with tempfile.TemporaryDirectory() as td:
+        ok, outc = {}, {lab: {} for lab in hp.LABELS}
+        dirs = {}
+        for t, k, ds in ((0, 2, [10, 12, 15, 9, 8]),
+                         (1, 4, [-1, 20, 30, 7, -1])):
+            npz = os.path.join(td, f"q0ref_t{t}_i0.actions.npz")
+            np.savez(npz, k15h_h18=np.ones((k, 5, 3, 4), np.float32),
+                     k15d_a0=np.ones((k + 2, 5, 8, 7), np.float32),
+                     k15f_basis=np.ones((k + 2, 5, 4, 56), np.float32),
+                     done_step=np.asarray(ds))
+            js = os.path.join(td, f"q0ref_t{t}_i0.json")
+            json.dump(dict(episodes=[dict(init_state_id=s) for s in
+                                     range(5)],
+                           actions_npz=os.path.basename(npz)), open(js, "w"))
+            ok[("q0ref", t, 0)] = js
+            dirs[str(t)] = {str(s): "0p" for s in range(5)}
+            for lab in hp.LABELS:
+                for s in range(5):
+                    outc[lab][(t, s)] = bool(s % 2)
+        out = os.path.join(td, "f.npz")
+        n = export_features(dict(directions=dirs, labels=list(hp.LABELS)),
+                            ok, outc, out)
+        z = np.load(out)
+        assert n == 10 and z["h18"].shape == (10, 4, 3, 4)
+        m = z["call_reached"]
+        # задача 0: два вызова в блоке; среды 0..4 с done 10,12,15,9,8:
+        # вызов 2 (шаг 8) достигнут всеми, вызовы 3–4 отсутствуют
+        assert m[:5, :2].all() and not m[:5, 2:].any()
+        assert np.isnan(z["h18"][0, 2]).all() and not np.isnan(
+            z["h18"][0, 1]).any()
+        # задача 1: среда 3 завершилась на шаге 7 — вызовы 2–4 не её
+        assert m[8].tolist() == [True, False, False, False]
+        assert m[5].all() and m[7].tolist() == [True] * 4
+        assert np.isnan(z["a0"][8, 1]).all()
+        assert z["outcomes"].shape == (10, 5)
 
 
 def main():

@@ -52,9 +52,20 @@ SMOKE_BANK = {0: [0], 8: [0]}
 SMOKE_DIRS = {0: ["0p", "1m", "2p", "3m", "0m"],
               8: ["1p", "2m", "3p", "0m", "3m"]}
 CODE = ("k15h_policy.py", "k15h_harness.py", "k15h_protocol.py",
-        "k15h_static_basis.py", "k15h_analyze.py", "k9h_multiarm_gate.py",
-        "k15f_policy.py", "k15f_continuous_refine.py",
-        "k15f_check_identity.py", "k15g_local_probe.py")
+        "k15h_static_basis.py", "k15h_analyze.py", "k15h_rollout.sh",
+        "k9h_multiarm_gate.py", "k15f_policy.py",
+        "k15f_continuous_refine.py", "k15f_check_identity.py",
+        "k15g_local_probe.py")
+# масштабирование харнесса (только чтение; third_party не меняется)
+HARNESS_UTILS = os.path.join(os.path.dirname(HERE), "third_party",
+                             "actioncodec", "scripts", "utils.py")
+SNAPSHOT = "reports/k15f/m1cold_snapshot.json"
+SMOKE_REPORT = "reports/k15h/smoke_check.json"
+INV_ROOTS = ("reports", "logs", "data")
+# блоки плана без известного числа сред: консервативно (больше — безопаснее,
+# свежий банк только сужается)
+ASSUMED_BLOCK = 10
+ROLLOUT_NAME = re.compile(r"_t\d+_i\d+")
 ANALYSIS = dict(
     unit="начальное состояние", main="среднее SR по 10 задачам с равными "
     "весами", primary=[["p4r3p", "q0ref"],
@@ -82,14 +93,24 @@ LOG_TASK = re.compile(r"suite (\S+), задача (\d+)")
 LOG_BLOCK = re.compile(r"--- блок (\d+)-(\d+)")
 
 
-def states_from_json(obj, add, suite_default=SUITE):
-    """Рекурсивно: эпизоды с init_state_id, заголовки блоков, планы."""
+def states_from_json(obj, add, suite_default=SUITE, n_default=None,
+                     assumed=None):
+    """Рекурсивно: эпизоды с init_state_id, заголовки блоков, планы.
+    Размер блока плана — фактический n_envs (из самого объекта, его setup
+    или объемлющего); неизвестный — ASSUMED_BLOCK с отметкой."""
     if isinstance(obj, list):
         for x in obj:
-            states_from_json(x, add, suite_default)
+            states_from_json(x, add, suite_default, n_default, assumed)
         return
     if not isinstance(obj, dict):
         return
+    n_here = obj.get("n_envs")
+    if n_here is None and isinstance(obj.get("setup"), dict):
+        n_here = obj["setup"].get("n_envs")
+    try:
+        n_here = int(n_here) if n_here is not None else n_default
+    except (TypeError, ValueError):
+        n_here = n_default
     suite = str(obj.get("suite", obj.get("task_suite", suite_default)))
     t = obj.get("task_id")
     if t is not None and isinstance(obj.get("episodes"), list):
@@ -105,15 +126,31 @@ def states_from_json(obj, add, suite_default=SUITE):
             pass
     bl = obj.get("blocks")
     if isinstance(bl, dict):
+        size = n_here
+        if size is None:
+            size = ASSUMED_BLOCK
+            if assumed is not None:
+                assumed.append(sorted(bl))
         for tk, bs in bl.items():
             if str(tk).isdigit() and isinstance(bs, list):
                 for b in bs:
                     if isinstance(b, int):
-                        for s in range(b, b + N_ENVS):
+                        for s in range(b, b + size):
                             add(suite, int(tk), s)
     for v in obj.values():
         if isinstance(v, (dict, list)):
-            states_from_json(v, add, suite)
+            states_from_json(v, add, suite, n_here, assumed)
+
+
+def states_from_npz(path, add):
+    """npz действий харнесса: init_state_id и meta (task_id, suite)."""
+    with np.load(path, allow_pickle=True) as z:
+        if "init_state_id" not in z.files or "meta" not in z.files:
+            return False
+        meta = json.loads(str(z["meta"]))
+        for s in np.asarray(z["init_state_id"]).tolist():
+            add(str(meta.get("suite", SUITE)), int(meta["task_id"]), int(s))
+    return True
 
 
 def states_from_log(text, add):
@@ -129,10 +166,22 @@ def states_from_log(text, add):
                 add(suite, task, s)
 
 
+def rollout_like(path, obj=None):
+    """Похоже ли на результат раскатки (тогда без восстановленных стартов —
+    нерешённый вопрос, а не обычный отчёт)."""
+    f = os.path.basename(path)
+    if f.endswith(".actions.npz") or ROLLOUT_NAME.search(f):
+        return True
+    return isinstance(obj, dict) and any(
+        k in obj for k in ("episodes", "init_start", "actions_npz"))
+
+
 def scan(roots, exclude=("reports/k15h",)):
-    """{(задача, состояние): число источников}, сводка по файлам,
-    каталоги без восстановленной истории."""
+    """Использованные (задача, состояние), файлы-источники, проблемные
+    файлы (не читаются), нерешённые (похожи на раскатки, старты не
+    восстановлены), блоки с принятым размером, каталоги без истории."""
     used, per_file, other_suite = {}, {}, set()
+    problems, unresolved, assumed = [], [], []
     dirs_seen, dirs_found = {}, set()
     for root in roots:
         for dp, _dn, fn in os.walk(root):
@@ -140,13 +189,15 @@ def scan(roots, exclude=("reports/k15h",)):
                    for x in exclude):
                 continue
             for f in fn:
+                if not f.endswith((".json", ".log", ".npz")):
+                    continue
                 p = os.path.join(dp, f)
                 # каталог эксперимента: первый уровень под корнем
                 top = os.path.join(root, os.path.relpath(p, root).split(
                     os.sep)[0])
                 dirs_seen.setdefault(top, 0)
                 dirs_seen[top] += 1
-                got = set()
+                got, obj = set(), None
 
                 def add(suite, t, s):
                     if str(suite) != SUITE:
@@ -155,19 +206,32 @@ def scan(roots, exclude=("reports/k15h",)):
                     got.add((t, s))
                 try:
                     if f.endswith(".json"):
-                        states_from_json(json.load(open(p)), add)
+                        obj = json.load(open(p))
+                        states_from_json(obj, add, assumed=assumed)
                     elif f.endswith(".log"):
                         states_from_log(open(p, errors="replace").read(),
                                         add)
-                except (ValueError, OSError, UnicodeDecodeError):
+                    else:
+                        states_from_npz(p, add)
+                except Exception as e:      # noqa: BLE001 — перечисляется
+                    problems.append(dict(file=p, why=type(e).__name__))
                     continue
                 if got:
                     per_file[p] = len(got)
                     dirs_found.add(top)
                     for k in got:
                         used[k] = used.get(k, 0) + 1
+                elif rollout_like(p, obj):
+                    unresolved.append(p)
+    # npz без собственных стартов, но с JSON-парой, где старты есть, —
+    # решены парой
+    unresolved = [p for p in unresolved if not (
+        p.endswith(".actions.npz") and
+        p[:-len(".actions.npz")] + ".json" in per_file)]
     unrecovered = sorted(d for d in dirs_seen if d not in dirs_found)
-    return used, per_file, unrecovered, sorted(other_suite)
+    return dict(used=used, per_file=per_file, unrecovered=unrecovered,
+                other_suite=sorted(other_suite), problems=problems,
+                unresolved=sorted(unresolved), assumed_blocks=assumed)
 
 
 def libero_bank():
@@ -221,8 +285,9 @@ def inventory_mode(out=INVENTORY):
         raise SystemExit(f"{out} уже есть: инвентаризация не перезаписывается")
     if glob.glob("reports/k15h/run/*/*.json"):
         raise SystemExit("раскатки K-15h уже есть: банк выбирается ДО них")
-    roots = [r for r in ("reports", "logs") if os.path.isdir(r)]
-    used, per_file, unrec, other = scan(roots)
+    roots = [r for r in INV_ROOTS if os.path.isdir(r)]
+    sc = scan(roots)
+    used, per_file, unrec = sc["used"], sc["per_file"], sc["unrecovered"]
     bank_info = libero_bank()
     n_states = {int(t): v["n_states"] for t, v in bank_info.items()}
     bank, k, free = select_bank(set(used), n_states)
@@ -234,8 +299,11 @@ def inventory_mode(out=INVENTORY):
               for t in TASKS},
         used_sources_files=len(per_file),
         files=dict(sorted(per_file.items())),
-        other_suites=len(other),
+        other_suites=len(sc["other_suite"]),
         unrecovered_dirs=unrec,
+        problem_files=sc["problems"], unresolved_files=sc["unresolved"],
+        assumed_block_size=dict(size=ASSUMED_BLOCK,
+                                plans=len(sc["assumed_blocks"])),
         free_blocks={str(t): v for t, v in free.items()},
         rule=(f"по возрастанию ID первые {BLOCKS_WANT} полностью "
               f"неиспользованных блока по {N_ENVS}; запасной — "
@@ -246,7 +314,9 @@ def inventory_mode(out=INVENTORY):
             "история восстановлена по JSON и логам в reports/ и logs/ на "
             "кластере; прогоны, не оставившие ни JSON с эпизодами, ни лога "
             "харнесса, не учтены; каталоги без восстановленных состояний — "
-            "unrecovered_dirs"))
+            "unrecovered_dirs; нечитаемые файлы — problem_files; похожие на "
+            "раскатки без восстановленных стартов — unresolved_files"),
+        code=(3 if (sc["problems"] or sc["unresolved"]) else 0))
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out + ".tmp", "w", encoding="utf-8") as fh:
         json.dump(res, fh, ensure_ascii=False, indent=1)
@@ -259,7 +329,18 @@ def inventory_mode(out=INVENTORY):
               f"({_ranges(u)}); свободные блоки {free[t]}; выбрано "
               f"{bank[t]}")
     print(f"  блоков на задачу: {k}; сводка: {out}")
-    return 0
+    print(f"  каталоги без восстановленных стартов ({len(unrec)}): "
+          + (", ".join(unrec) or "—"))
+    if sc["assumed_blocks"]:
+        print(f"  планов с неизвестным размером блока (принято "
+              f"{ASSUMED_BLOCK}): {len(sc['assumed_blocks'])}")
+    print(f"  НЕРЕШЁННЫЕ ВОПРОСЫ: нечитаемых файлов {len(sc['problems'])}, "
+          f"похожих на раскатки без стартов {len(sc['unresolved'])}")
+    for x in sc["problems"][:30]:
+        print(f"    не читается: {x['file']} ({x['why']})")
+    for x in sc["unresolved"][:30]:
+        print(f"    старты не восстановлены: {x}")
+    return res["code"]
 
 
 def _ranges(xs):
@@ -294,18 +375,92 @@ def expected_contract(basis, identity):
         joint_sha1=rep.get("joint_sha1"), code_version=rep.get("code_version"))
 
 
+def bank_from_inventory(inv):
+    """Банк, механически выведенный из инвентаризации (тем же правилом)."""
+    used = {(int(t), int(s)) for t, ss in inv["used"].items() for s in ss}
+    n_states = {int(t): int(v["n_states"])
+                for t, v in inv["libero_bank"].items()}
+    bank, _k, _f = select_bank(used, n_states)
+    return {str(t): sorted(v) for t, v in bank.items()}
+
+
+def inventory_problems(inv, plan_blocks=None):
+    """Банк плана = выбор из инвентаризации; файлы начальных состояний —
+    те же, что при инвентаризации."""
+    p = []
+    want = bank_from_inventory(inv)
+    if want != inv["bank"]:
+        p.append("банк инвентаризации не совпадает с правилом выбора")
+    if plan_blocks is not None and \
+            {str(t): sorted(v) for t, v in plan_blocks.items()} != want:
+        p.append("банк плана не равен выбору из инвентаризации")
+    for t, v in inv["libero_bank"].items():
+        f = v["path"]
+        if not os.path.exists(f) or hashlib.sha1(open(f, "rb").read()) \
+                .hexdigest() != v["sha1"]:
+            p.append(f"файл начальных состояний задачи {t} изменён или "
+                     f"отсутствует ({f})")
+    return p
+
+
+def snapshot_problems(snapshot, basis, identity):
+    """Базис и отчёт тождества — те же, что в снимке M1-cold."""
+    s = json.load(open(snapshot))
+
+    def full(f):
+        return hashlib.sha1(open(f, "rb").read()).hexdigest()
+    p = []
+    if full(basis) != s.get("basis_sha1"):
+        p.append("базис не тот, что в снимке M1-cold")
+    if full(identity) != s.get("identity_report_sha1"):
+        p.append("отчёт тождества не тот, что в снимке M1-cold")
+    return p
+
+
+def smoke_link_problems(rep, smoke_plan_path, basis, identity,
+                        recheck=None):
+    """Основной план — только после ЭТОГО чистого smoke: тот же план smoke
+    (SHA), все его блоки проверены, проблем нет, те же базис и отчёт
+    тождества; десять блоков повторно проверяются без GPU."""
+    p = []
+    if not os.path.exists(smoke_plan_path):
+        return ["нет плана smoke"]
+    sp = json.load(open(smoke_plan_path))
+    n = sum(len(v) for v in sp["blocks"].values()) * len(sp["labels"])
+    if rep.get("code") != 0 or rep.get("problems"):
+        p.append(f"smoke не чистый: код {rep.get('code')}, проблем "
+                 f"{len(rep.get('problems') or [])}")
+    if rep.get("plan_sha1") != sha(smoke_plan_path):
+        p.append("отчёт smoke относится к другому плану smoke")
+    if rep.get("verified") != n:
+        p.append(f"в smoke проверено {rep.get('verified')} блоков из {n}")
+    if sp["inputs_sha1"].get("basis") != sha(basis) or \
+            sp["inputs_sha1"].get("identity_report") != sha(identity):
+        p.append("smoke шёл на другом базисе или отчёте тождества")
+    if not p:
+        p += check_plan_inputs(sp, smoke_plan_path)
+    if not p and recheck is not None:
+        p += recheck(sp, smoke_plan_path, rep.get("run_dir"))
+    return p
+
+
 def make_plan(*, basis, identity, device, smoke, inventory=INVENTORY,
-              snapshot="reports/k15f/m1cold_snapshot.json",
-              k15g_run=None):
+              snapshot=SNAPSHOT, k15g_run=None, smoke_report=SMOKE_REPORT,
+              smoke_plan=SMOKE_PLAN, accept_unresolved=False):
     import k15g_local_probe as pr
     import k15h_policy as hp
-    inputs = dict(basis=basis, identity_report=identity)
+    import k15f_m1cold_snapshot as msn
+    msn.verify(snapshot)
+    prob = snapshot_problems(snapshot, basis, identity)
+    if prob:
+        raise SystemExit("; ".join(prob))
+    inputs = dict(basis=basis, identity_report=identity, snapshot=snapshot,
+                  harness_utils=HARNESS_UTILS)
     if smoke:
         bank = {t: list(v) for t, v in SMOKE_BANK.items()}
         dirs = {str(t): {str(b + i): SMOKE_DIRS[t][i] for b in bl
                          for i in range(N_ENVS)} for t, bl in bank.items()}
-        import k15f_m1cold_snapshot as msn
-        snap = msn.verify(snapshot)
+        snap = json.load(open(snapshot))
         refs = dict(q0={str(t): os.path.join(snap["cold_dir"],
                                              f"q0_t{t}_i{b}.json")
                         for t, bl in bank.items() for b in bl})
@@ -319,16 +474,27 @@ def make_plan(*, basis, identity, device, smoke, inventory=INVENTORY,
             for p in grp.values():
                 if not os.path.exists(p):
                     raise SystemExit(f"нет эталона {p}")
-        inputs["snapshot"] = snapshot
         ref_sha = {k: {t: sha(p) for t, p in v.items()}
                    for k, v in refs.items()}
     else:
         if not os.path.exists(inventory):
             raise SystemExit("нет инвентаризации (inventory)")
         inv = json.load(open(inventory))
+        if inv.get("code") != 0 and not accept_unresolved:
+            raise SystemExit("инвентаризация с нерешёнными вопросами (код "
+                             f"{inv.get('code')}): нужен явный "
+                             "--accept-unresolved после разбора")
+        prob = inventory_problems(inv)
+        rep_ = (json.load(open(smoke_report))
+                if os.path.exists(smoke_report) else {})
+        prob += smoke_link_problems(rep_, smoke_plan, basis, identity,
+                                    recheck=smoke_recheck)
+        if prob:
+            raise SystemExit("план K-15h не собран: " + "; ".join(prob[:6]))
         bank = {int(t): v for t, v in inv["bank"].items()}
         dirs = directions_table(bank)
-        inputs["inventory"] = inventory
+        inputs.update(inventory=inventory, smoke_plan=smoke_plan,
+                      smoke_report=smoke_report)
         refs, ref_sha = None, None
     return dict(
         kind=KIND, smoke=bool(smoke), created=datetime.datetime.now()
@@ -343,7 +509,16 @@ def make_plan(*, basis, identity, device, smoke, inventory=INVENTORY,
         inputs={k: os.path.abspath(v) for k, v in inputs.items()},
         inputs_sha1={k: sha(v) for k, v in inputs.items()},
         code={f: sha(os.path.join(HERE, f)) for f in CODE},
-        refs=refs, refs_sha1=ref_sha, analysis=ANALYSIS)
+        refs=refs, refs_sha1=ref_sha, analysis=ANALYSIS,
+        accept_unresolved=bool(accept_unresolved and not smoke))
+
+
+def smoke_recheck(sp, sp_path, run_dir):
+    """Повторная проверка smoke без GPU."""
+    if not run_dir or not os.path.isdir(run_dir):
+        return [f"каталог smoke {run_dir} недоступен"]
+    prob, _ok = smoke_check(sp, sp_path, run_dir)
+    return prob
 
 
 def check_plan_inputs(plan, plan_path=None):
@@ -360,8 +535,17 @@ def check_plan_inputs(plan, plan_path=None):
         for t, f in d.items():
             if not os.path.exists(f) or sha(f) != plan["refs_sha1"][grp][t]:
                 p.append(f"эталон {grp} t{t} изменён ({f})")
-    # таблица направлений основного плана воспроизводится по сиду
+    if p:
+        return p
+    # базис и отчёт тождества — из снимка M1-cold
+    p += snapshot_problems(plan["inputs"]["snapshot"],
+                           plan["inputs"]["basis"],
+                           plan["inputs"]["identity_report"])
+    # банк — выбор из инвентаризации; таблица — по сиду из этого банка;
+    # файлы начальных состояний не изменились
     if not plan.get("smoke"):
+        inv = json.load(open(plan["inputs"]["inventory"]))
+        p += inventory_problems(inv, plan["blocks"])
         bank = {int(t): v for t, v in plan["blocks"].items()}
         if directions_table(bank, plan["choice_seed"]) != plan["directions"]:
             p.append("таблица направлений не воспроизводится по сиду")
@@ -383,6 +567,7 @@ class Basis:
         self.f = float(ck["amp_factor"])
         self.R = kf.rotation(int(ck["control_seed"])).numpy().astype(
             np.float64)
+        self.scale = harness_scale()
 
 
 def combine_exec(a0, t, sigma, sigma_g, eps=1e-3):
@@ -394,6 +579,46 @@ def combine_exec(a0, t, sigma, sigma_g, eps=1e-3):
     lg = lg0 + sigma_g * t[..., 6]
     g = a0[..., 6] + (np.tanh(lg * 0.5) - np.tanh(lg0 * 0.5))
     return np.concatenate([arm, g[..., None]], axis=-1)
+
+
+def harness_scale(path=HARNESS_UTILS):
+    """max(|Q99|, |Q01|) из utils харнесса — чтением исходника (ast), без
+    импорта."""
+    import ast
+    vals = {}
+    for node in ast.parse(open(path).read()).body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and \
+                getattr(node.targets[0], "id", None) in ("ACTION_Q99",
+                                                         "ACTION_Q01"):
+            vals[node.targets[0].id] = ast.literal_eval(node.value.args[0])
+    return np.maximum(np.abs(np.asarray(vals["ACTION_Q99"])),
+                      np.abs(np.asarray(vals["ACTION_Q01"])))
+
+
+def executed_from_journal(lv, scale):
+    """Ожидаемые исполненные действия [C·8, B, 7] из журнала руки: то же
+    масштабирование руки и знак схвата, что в харнессе."""
+    act = np.array(lv, np.float32, copy=True)              # [C, B, 8, 7]
+    act[..., :-1] = act[..., :-1] * scale[:-1]
+    act[..., -1] = -act[..., -1]
+    C, B = act.shape[:2]
+    return act.transpose(0, 2, 1, 3).reshape(C * H, B, 7).astype(np.float32)
+
+
+def actions_problems(label, z, scale, tol=1e-6):
+    """Исполненные actions = журнал руки на исполненных шагах каждой
+    среды (до её завершения)."""
+    A = np.asarray(z["actions"])
+    exp = executed_from_journal(z[f"k15d_level_{label}"], scale)
+    ds = np.asarray(z["done_step"])
+    p = []
+    for b in range(A.shape[1]):
+        end = int(ds[b]) + 1 if int(ds[b]) >= 0 else len(A)
+        if end > len(exp) or not np.allclose(A[:end, b], exp[:end, b],
+                                             rtol=0, atol=tol):
+            p.append(f"{label}: исполненные действия среды {b} не равны "
+                     f"журналу руки")
+    return p
 
 
 def check_arrays(label, z, dirs, bs, tol=1e-4):
@@ -525,6 +750,8 @@ def check_block(plan, plan_path, path, label, task, block, ref_path=None,
         p.append(f"{label}: метка, направления или план руки не из плана")
     bs = bs or Basis(plan["inputs"]["basis"])
     p += check_arrays(label, z, dirs, bs)
+    if not p:
+        p += actions_problems(label, z, bs.scale)
     if label != "q0ref":
         if not ref_path or not os.path.exists(ref_path):
             return p + [f"{label}: нет q0ref блока"]
@@ -631,9 +858,9 @@ def selftest():
                   open(os.path.join(td, "reports", "a", "x.json"), "w"))
         open(os.path.join(td, "reports", "empty", "y.npz"), "w").write("z")
         open(os.path.join(td, "reports", "a", "bad.json"), "w").write("{")
-        used, per_file, unrec, _o = scan([os.path.join(td, "reports")])
-        assert (1, 3) in used and len(per_file) == 1
-        assert any("empty" in u for u in unrec)
+        sc = scan([os.path.join(td, "reports")])
+        assert (1, 3) in sc["used"] and len(sc["per_file"]) == 1
+        assert any("empty" in u for u in sc["unrecovered"])
     # выбор банка: первые свободные блоки, запасной вариант, отказ
     n = {t: 50 for t in TASKS}
     used = {(t, s) for t in TASKS for s in range(25)}
@@ -761,11 +988,140 @@ def selftest():
     h2 = np.ones((4, B, 3))
     h2[3, 1] = 2           # среда 1 завершилась на шаге 10: вызов 4 не её
     assert check_vs_ref("x", d, dict(z, k15h_h18=h2), rd, rz) == []
+    _selftest_inventory()
+    _selftest_links()
+    _selftest_actions()
     print("самопроверка k15h_protocol пройдена: инвентаризация, банк и "
           "запасной вариант, таблица направлений, формулы вариантов, одно "
           "направление на батч, повторный выбор, амплитуда, нормировка, "
           "схват, чанк, префикс, хвост без импульса, h18 до импульса")
     return 0
+
+
+def _selftest_inventory():
+    import tempfile
+    got = set()
+
+    def add(suite, t, s):
+        got.add((t, s))
+    # фактический n_envs плана: блок 25 при n_envs=10 — состояния 25..34
+    states_from_json(dict(n_envs=10, blocks={"4": [25]}), add)
+    assert all((4, s) in got for s in range(25, 35))
+    got.clear()
+    states_from_json(dict(setup=dict(n_envs=10), blocks={"4": [25]}), add)
+    assert (4, 34) in got
+    got.clear()
+    asm = []
+    states_from_json(dict(blocks={"4": [25]}), add, assumed=asm)
+    assert (4, 34) in got and asm                    # консервативно
+    with tempfile.TemporaryDirectory() as td:
+        for d_ in ("reports/a", "reports/b", "data/k9h_x", "logs"):
+            os.makedirs(os.path.join(td, d_))
+        json.dump(dict(task_id=1, episodes=[dict(init_state_id=3)]),
+                  open(os.path.join(td, "reports/a/ok.json"), "w"))
+        # повреждённый JSON рядом с читаемым — в проблемных файлах
+        open(os.path.join(td, "reports/a/q0_t2_i5.json"), "w").write("{")
+        # отчёт без стартов — не вопрос; похожий на раскатку — вопрос
+        json.dump(dict(note="x"), open(os.path.join(td, "reports/b/r.json"),
+                                       "w"))
+        json.dump(dict(task_id=7, episodes=[]),
+                  open(os.path.join(td, "reports/b/l0p_t7_i0.json"), "w"))
+        # npz старого харнесса в data/ — старты из init_state_id и meta
+        np.savez(os.path.join(td, "data/k9h_x/a_t6_i40.actions.npz"),
+                 init_state_id=np.arange(40, 45),
+                 meta=json.dumps(dict(task_id=6, suite="10")))
+        roots = [os.path.join(td, r) for r in INV_ROOTS]
+        sc = scan(roots)
+        assert (1, 3) in sc["used"] and (6, 44) in sc["used"]
+        assert any("q0_t2_i5.json" in x["file"] for x in sc["problems"])
+        assert any("l0p_t7_i0.json" in x for x in sc["unresolved"])
+        assert not any("r.json" in x for x in sc["unresolved"])
+
+
+def _fake_inventory(td):
+    f = os.path.join(td, "init_t0.pruned_init")
+    open(f, "wb").write(b"states")
+    used = {str(t): list(range(25)) for t in TASKS}
+    inv = dict(used=used, libero_bank={
+        str(t): dict(n_states=50, path=f, sha1=hashlib.sha1(
+            b"states").hexdigest()) for t in TASKS})
+    inv["bank"] = bank_from_inventory(inv)
+    return inv, f
+
+
+def _selftest_links():
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        inv, f = _fake_inventory(td)
+        assert inventory_problems(inv, inv["bank"]) == []
+        assert inv["bank"]["0"] == [25, 30, 35]
+        # замена банка (даже с пересчитанной таблицей) — отказ
+        bad = dict(inv["bank"], **{"0": [40, 45, 30]})
+        assert any("банк плана" in x for x in inventory_problems(inv, bad))
+        # изменённый файл начальных состояний — отказ
+        open(f, "ab").write(b"!")
+        assert any("начальных состояний" in x
+                   for x in inventory_problems(inv, inv["bank"]))
+        # smoke: устаревший, неполный, с проблемами, на другом базисе
+        basis = os.path.join(td, "b.pt")
+        ident = os.path.join(td, "i.json")
+        open(basis, "w").write("B")
+        open(ident, "w").write("I")
+        snap = os.path.join(td, "snap.json")
+        json.dump(dict(basis_sha1=hashlib.sha1(b"B").hexdigest(),
+                       identity_report_sha1=hashlib.sha1(b"I").hexdigest()),
+                  open(snap, "w"))
+        sp = os.path.join(td, "smoke_plan.json")
+        ins = dict(basis=basis, identity_report=ident, snapshot=snap)
+        json.dump(dict(kind=KIND, smoke=True, blocks={"0": [0], "8": [0]},
+                       labels=["a"] * 5, inputs=ins, code={},
+                       inputs_sha1={k: sha(v) for k, v in ins.items()}),
+                  open(sp, "w"))
+        good = dict(code=0, problems=[], plan_sha1=sha(sp), verified=10,
+                    run_dir=td)
+        ok = lambda *a_: []                           # noqa: E731
+        assert smoke_link_problems(good, sp, basis, ident, ok) == []
+        for mut, word in ((dict(verified=0), "проверено"),
+                          (dict(plan_sha1="x"), "другому плану"),
+                          (dict(problems=["p"]), "не чистый"),
+                          (dict(code=3), "не чистый")):
+            pr_ = smoke_link_problems(dict(good, **mut), sp, basis, ident,
+                                      ok)
+            assert any(word in x for x in pr_), (mut, pr_)
+        other = os.path.join(td, "b2.pt")
+        open(other, "w").write("B2")
+        assert any("другом базисе" in x for x in smoke_link_problems(
+            good, sp, other, ident, ok))
+        # повторная проверка блоков smoke без GPU участвует
+        assert smoke_link_problems(good, sp, basis, ident,
+                                   lambda *a_: ["блок"]) == ["блок"]
+        # базис и отчёт тождества — из снимка M1-cold
+        assert snapshot_problems(snap, basis, ident) == []
+        assert snapshot_problems(snap, other, ident)
+
+
+def _selftest_actions():
+    scale = harness_scale()
+    assert scale.shape == (7,) and np.isclose(scale[0], 0.9375)
+    rng = np.random.default_rng(1)
+    C, B = 6, 5
+    lv = rng.uniform(-0.5, 0.5, (C, B, H, 7)).astype(np.float32)
+    A = executed_from_journal(lv, scale)
+    ds = np.array([-1, 30, -1, 5, 47])
+    z = {"k15d_level_x": lv, "actions": A.copy(), "done_step": ds}
+    assert actions_problems("x", z, scale) == []
+    # импульс удалён из actions, журнал сохранён — отказ
+    z2 = dict(z, actions=A.copy())
+    z2["actions"][24:32, 0] = executed_from_journal(
+        lv * 0, scale)[24:32, 0]
+    assert actions_problems("x", z2, scale)
+    # после завершения среды шаги не исполнялись и не сверяются
+    z3 = dict(z, actions=A.copy())
+    z3["actions"][10:, 3] = 0
+    assert actions_problems("x", z3, scale) == []
+    z4 = dict(z, actions=A.copy())
+    z4["actions"][5, 3] += 1                           # последний исполненный
+    assert actions_problems("x", z4, scale)
 
 
 def main():
@@ -780,7 +1136,10 @@ def main():
     ap.add_argument("--run-dir", default=None)
     ap.add_argument("--block", nargs=4, default=None,
                     metavar=("JSON", "МЕТКА", "ЗАДАЧА", "БЛОК"))
-    ap.add_argument("--smoke-report", default="reports/k15h/smoke_check.json")
+    ap.add_argument("--smoke-report", default=SMOKE_REPORT)
+    ap.add_argument("--accept-unresolved", action="store_true",
+                    help="план при нерешённых вопросах инвентаризации — "
+                         "только после их разбора; записывается в план")
     a = ap.parse_args()
     if a.mode == "selftest":
         return selftest()
@@ -791,14 +1150,10 @@ def main():
         out = a.plan or (SMOKE_PLAN if smoke else PLAN)
         if os.path.exists(out):
             raise SystemExit(f"{out} уже зафиксирован")
-        if not smoke:
-            rep = (json.load(open(a.smoke_report))
-                   if os.path.exists(a.smoke_report) else {})
-            if rep.get("code") != 0:
-                raise SystemExit("окончательный план — только после чистого "
-                                 "smoke (smoke_check.json с кодом 0)")
         plan = make_plan(basis=a.basis, identity=a.identity,
-                         device=a.device, smoke=smoke)
+                         device=a.device, smoke=smoke,
+                         smoke_report=a.smoke_report,
+                         accept_unresolved=a.accept_unresolved)
         os.makedirs(os.path.dirname(out), exist_ok=True)
         with open(out + ".tmp", "w", encoding="utf-8") as fh:
             json.dump(plan, fh, ensure_ascii=False, indent=1)
