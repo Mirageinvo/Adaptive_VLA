@@ -27,6 +27,7 @@
 import argparse
 import collections
 import glob
+import hashlib
 import json
 import os
 import sys
@@ -52,38 +53,47 @@ def sign_seq(x, prev=0):
     return np.asarray(out)
 
 
-def stable_switches(grip, k=STABLE):
+def stable_switches(grip, k=STABLE, steps=None):
     """Индексы, где знак команды меняется и новый знак держится ≥ k
-    отсчётов подряд."""
+    ПОСЛЕДОВАТЕЛЬНЫХ отсчётов. Первый ненулевой знак задаёт начальный
+    режим (начальный ноль переключения не создаёт). Если даны шаги
+    (steps), устойчивость требует подряд идущих шагов; иначе — строк."""
     s = sign_seq(grip)
-    idx = []
-    cur = s[0] if len(s) else 0
-    for t in range(1, len(s)):
-        if s[t] != cur and s[t] != 0 and len(s) - t >= k and \
-                (s[t:t + k] == s[t]).all():
-            idx.append(t)
-            cur = s[t]
+    nz = np.nonzero(s)[0]
+    if not len(nz):
+        return []
+    idx, cur = [], s[nz[0]]
+    st = None if steps is None else np.asarray(steps)
+    for t in range(nz[0] + 1, len(s)):
+        if s[t] == cur or len(s) - t < k or not (s[t:t + k] == s[t]).all():
+            continue
+        if st is not None and not (np.diff(st[t - 1:t + k]) == 1).all():
+            continue                     # пробел в шагах: момент не известен
+        idx.append(t)
+        cur = s[t]
     return idx
 
 
-def first_event_call(a0_grip, executed_grip, done_step, n_calls):
+def first_event_call(a0_grip, executed_grip, n_calls, n_exec):
     """a0_grip [C, 8] (команды схвата в единицах исполнения), executed_grip
-    [T] — исполненные команды. Номер первого вызова (с 1) с событием или
-    None."""
-    T = len(executed_grip)
-    end = done_step + 1 if done_step >= 0 else T
+    [T] — исполненные команды, n_exec — число исполненных шагов (до
+    завершения среды). Решение причинное: смотрится весь чанк a0
+    достигнутого вызова. Возвращает (вызов с 1 или None, исполнилась ли
+    смена знака в этом вызове)."""
     for c in range(n_calls):
         t0 = c * H
-        if t0 >= end:
-            return None
+        if t0 >= n_exec:
+            return None, False
         if c == 0:
-            ref = sign_seq(a0_grip[0])[0]
+            ref = sign_seq(a0_grip[0])
+            ref = ref[np.nonzero(ref)[0][0]] if ref.any() else 0
         else:
             ref = sign_seq(executed_grip[:t0])[-1]
         chunk = sign_seq(a0_grip[c], prev=ref)
         if ref != 0 and (chunk != ref).any():
-            return c + 1
-    return None
+            ex = sign_seq(executed_grip[t0:min(t0 + H, n_exec)], prev=ref)
+            return c + 1, bool((ex != ref).any())
+    return None, False
 
 
 def passport_data(a):
@@ -93,7 +103,8 @@ def passport_data(a):
     d = np.load(src, allow_pickle=True)
     N = int(meta["n_obs"])
     epi = np.asarray(d["episode"])[:N].astype(np.int64)
-    stp = np.asarray(d["step"])[:N].astype(np.int64)
+    stp_raw = np.asarray(d["step"])[:N]           # для keys_sha1 — как есть
+    stp = stp_raw.astype(np.int64)
     tsk = np.asarray(d["task"])[:N]
     act = np.asarray(d["action"])[:N]
     out["source"] = dict(meta=f"{a.cache}.meta.json", cache=src,
@@ -109,7 +120,9 @@ def passport_data(a):
     e_s, s_s = epi[order], stp[order]
     same = e_s[1:] == e_s[:-1]
     diffs = (s_s[1:] - s_s[:-1])[same]
+    contiguous = bool(len(diffs) and (diffs == 1).all())
     out["step_grid"] = dict(
+        contiguous=contiguous,
         diff_counts={str(k): int(v) for k, v in collections.Counter(
             diffs.tolist()).most_common(6)},
         steps_per_episode=dict(
@@ -130,11 +143,35 @@ def passport_data(a):
     except Exception as e:                      # noqa: BLE001
         out["dataset"]["fps_error"] = type(e).__name__
     out["dataset"]["fps"] = fps
+    out["timing"] = dict(
+        demo_fps=fps,
+        actioncodec_loader="delta_timestamps actions = i/10 (scripts/utils.py)",
+        env_control_hz=("не задано в коде репозитория; robosuite/LIBERO по "
+                        "умолчанию 20 Гц — проверить в обёртке среды"),
+        note=("при 20 Гц восемь исполняемых команд = 0.4 с, восемь отсчётов "
+              "демонстрации при 10 fps = 0.8 с; историю собирать по времени "
+              "вызовов, контракт q0 не меняется"))
+    out["state_channels"] = dict(
+        process_state="utils.process_state: [pos 3, axis-angle 3, пальцы 2]"
+                      " из сырого [пальцы 2, pos 3, quat 4]",
+        dataset="соответствие порядку датасета подтвердить по диапазонам "
+                "(min/max ниже)")
     # состояния
     st_p = src + ".state.npy"
+    keys_sha = hashlib.sha1(np.ascontiguousarray(
+        np.stack([epi, stp_raw])).tobytes()).hexdigest()[:12]
     if os.path.exists(st_p):
         st = np.load(st_p, mmap_mode="r")
         sm = json.load(open(src + ".state.json"))
+        # ПРОИСХОЖДЕНИЕ состояний: те же наблюдения, датасет и ревизия
+        for k_, want in (("keys_sha1", keys_sha), ("n_obs", N),
+                         ("dataset_repo", out["dataset"]["repo"]),
+                         ("dataset_revision", out["dataset"]["revision"])):
+            if str(sm.get(k_)) != str(want):
+                p.append(f"состояния: {k_} = {sm.get(k_)!r}, ожидалось "
+                         f"{want!r}")
+        if len(st) < N:
+            p.append(f"состояний {len(st)} меньше наблюдений {N}")
         X = np.asarray(st[:min(len(st), 200000)], np.float64)
         out["state"] = dict(path=st_p, shape=list(st.shape),
                             meta={k: sm.get(k) for k in sm if k not in (
@@ -176,7 +213,7 @@ def passport_data(a):
     for e in np.unique(e_s)[:2000]:
         m = order[epi[order] == e]
         g = act[m, 0, 6]
-        sw = stable_switches(g)
+        sw = stable_switches(g, steps=stp[m])
         sw_n.append(len(sw))
         if sw:
             first.append(int(stp[m][sw[0]]))
@@ -189,7 +226,11 @@ def passport_data(a):
                                  signs=[int(sign_seq(g)[i]) for i in sw]))
     out["grip_switch_labels"] = dict(
         rule=f"смена знака команды схвата, новый знак держится ≥ {STABLE} "
-             f"отсчётов; ноль сохраняет знак",
+             f"ПОСЛЕДОВАТЕЛЬНЫХ шагов; первый ненулевой знак — начальный "
+             f"режим; ноль сохраняет знак",
+        diagnostic_only=not contiguous,
+        note_end=("последняя строка кэша не обязательно конец демонстрации"
+                  if not contiguous else None),
         per_episode=dict(collections.Counter(sw_n).most_common(8)),
         episodes_without=none_ep,
         first_switch_step=dict(
@@ -201,31 +242,43 @@ def passport_data(a):
     return out, p
 
 
-def passport_marker(globs):
+def passport_marker(globs, expect):
     """Событийный маркер по журналам q0ref (единицы исполнения: схват
-    харнесс инвертирует, исполняемая команда = −a0)."""
-    calls, none_, total = [], 0, 0
+    харнесс инвертирует, исполняемая команда = −a0). Каждое (задача,
+    состояние) — один раз; пропущенные файлы перечисляются."""
+    calls, executed, none_, seen, skipped = [], 0, 0, set(), []
     for g in globs:
         for pth in sorted(glob.glob(g)):
             d = json.load(open(pth))
             z = np.load(os.path.join(os.path.dirname(pth), d["actions_npz"]))
             if "k15d_a0" not in z.files:
+                skipped.append(pth)
                 continue
             a0 = np.asarray(z["k15d_a0"])            # [C, B, 8, 7]
             A = np.asarray(z["actions"])
-            for b in range(a0.shape[1]):
-                total += 1
-                ev = first_event_call(-a0[:, b, :, 6], A[:, b, 6],
-                                      int(z["done_step"][b]), a0.shape[0])
+            for b, e in enumerate(d["episodes"]):
+                key = (int(d["task_id"]), int(e["init_state_id"]))
+                if key in seen:
+                    continue
+                seen.add(key)
+                ds = int(z["done_step"][b])
+                n_exec = ds + 1 if ds >= 0 else len(A)
+                ev, ex = first_event_call(-a0[:, b, :, 6], A[:, b, 6],
+                                          a0.shape[0], n_exec)
                 if ev is None:
                     none_ += 1
                 else:
                     calls.append(ev)
+                    executed += ex
     cnt = collections.Counter(calls)
-    return dict(episodes=total, with_event=len(calls), without=none_,
+    return dict(states=len(seen), expected_states=expect,
+                complete=len(seen) == expect, skipped_files=skipped,
+                predicted_event_in_reached_call=len(calls),
+                executed_switch_in_that_call=executed, without=none_,
                 call_counts={str(k): v for k, v in sorted(cnt.items())[:15]},
                 median_call=float(np.median(calls)) if calls else None,
-                share_call1=(cnt.get(1, 0) / len(calls)) if calls else None)
+                share_call1=(cnt.get(1, 0) / len(calls)) if calls else None,
+                note="момент решения причинный: done_step в выбор не входит")
 
 
 def selftest():
@@ -234,23 +287,37 @@ def selftest():
     assert stable_switches([-1, -1, 1, 1, 1, -1, -1, 1]) == [2, 5]
     assert stable_switches([-1, 1, -1, -1]) == []    # одиночный скачок — нет
     assert stable_switches([1, 1, 1]) == []
-    # маркер: вызов 1 без внутренней смены; вызов 3 содержит смену
+    assert stable_switches([0, 1, 1]) == []            # начальный ноль
+    assert stable_switches([0, 0, -1, -1, 1, 1]) == [4]
+    # прореженные шаги: устойчивость не подтверждена
+    assert stable_switches([-1, 1, 1], steps=[0, 20, 40]) == []
+    assert stable_switches([-1, 1, 1], steps=[0, 1, 2]) == [1]
+    # маркер: вызов 3 содержит смену; исполнилась ли она
     a0g = np.full((5, 8), -1.0)
     a0g[2, 5:] = 1.0
     ex = np.full(40, -1.0)
-    assert first_event_call(a0g, ex, -1, 5) == 3
-    # смена внутри первого чанка — событие в вызове 1
+    assert first_event_call(a0g, ex, 5, 40) == (3, False)
+    ex2 = ex.copy()
+    ex2[21:24] = 1.0
+    assert first_event_call(a0g, ex2, 5, 40) == (3, True)
+    # хвост чанка за завершением: событие предсказано, смена не исполнена
+    assert first_event_call(a0g, ex2, 5, 20) == (3, False)
+    # смена внутри первого чанка — вызов 1
     b = a0g.copy()
     b[0, 4:] = 1.0
-    assert first_event_call(b, ex, -1, 5) == 1
+    assert first_event_call(b, ex, 5, 40)[0] == 1
     # среда завершилась до вызова 3 — события нет
-    assert first_event_call(a0g, ex, 10, 5) is None
-    # ноль не меняет знак
+    assert first_event_call(a0g, ex, 5, 11) == (None, False)
+    # ноль не меняет знак; начальный ноль в первом чанке
     c = np.full((3, 8), -1.0)
     c[1, :] = 0.0
-    assert first_event_call(c, np.full(24, -1.0), -1, 3) is None
-    print("самопроверка k16_passport пройдена: устойчивое переключение, "
-          "маркер по a0 и исполненной команде, завершение, ноль")
+    assert first_event_call(c, np.full(24, -1.0), 3, 24) == (None, False)
+    d0 = np.full((2, 8), 1.0)
+    d0[0, :2] = 0.0
+    assert first_event_call(d0, np.full(16, 1.0), 2, 16) == (None, False)
+    print("самопроверка k16_passport пройдена: устойчивое переключение по "
+          "последовательным шагам, начальный ноль, маркер: предсказано и "
+          "исполнено, хвост за завершением, ноль")
     return 0
 
 
@@ -265,8 +332,14 @@ def main():
         return selftest()
     data, prob = passport_data(a)
     marker = dict(
-        k15h=passport_marker(["reports/k15h/run/p*/q0ref_t*_i*.json"]),
-        k15g=passport_marker(["reports/k15g/local/run/p*/q0ref_t*_i*.json"]))
+        k15h=passport_marker(["reports/k15h/run/p*/q0ref_t*_i*.json"], 150),
+        k15g=passport_marker(["reports/k15g/local/run/p*/q0ref_t*_i*.json"],
+                             40))
+    for k, v in marker.items():
+        if not v["complete"] or v["skipped_files"]:
+            prob.append(f"маркер {k}: состояний {v['states']} из "
+                        f"{v['expected_states']}, пропущено файлов "
+                        f"{len(v['skipped_files'])}")
     res = dict(data=data, marker=marker, problems=prob)
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
     with open(a.out, "w", encoding="utf-8") as fh:
