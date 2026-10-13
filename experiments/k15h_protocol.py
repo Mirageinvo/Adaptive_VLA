@@ -129,16 +129,26 @@ def states_from_json(obj, add, suite_default=SUITE, n_default=None,
     except (TypeError, ValueError):
         n_here = n_default
     suite = str(obj.get("suite", obj.get("task_suite", suite_default)))
-    t = obj.get("task_id")
-    if t is not None and isinstance(obj.get("episodes"), list):
+    t = _int_or_none(obj.get("task_id", obj.get("task")))
+    if isinstance(obj.get("episodes"), list):
         for e in obj["episodes"]:
-            if isinstance(e, dict) and "init_state_id" in e:
-                add(suite, int(t), int(e["init_state_id"]))
-    if t is not None and "init_start" in obj and "n_envs" in obj:
+            if not isinstance(e, dict):
+                continue
+            # старые форматы: state_id вместо init_state_id, задача — в
+            # самом эпизоде
+            sid = _int_or_none(e.get("init_state_id", e.get("state_id")))
+            te = _int_or_none(e.get("task_id", t))
+            if sid is not None and te is not None:
+                add(str(e.get("suite", suite)), te, sid)
+    if "init_start" in obj and "n_envs" in obj:
         try:
-            for s in range(int(obj["init_start"]),
-                           int(obj["init_start"]) + int(obj["n_envs"])):
-                add(suite, int(t), s)
+            i0, n_ = int(obj["init_start"]), int(obj["n_envs"])
+            tasks = ([t] if t is not None else
+                     [x for x in (obj.get("tasks") or [])
+                      if _int_or_none(x) is not None])
+            for tk in tasks:
+                for s in range(i0, i0 + n_):
+                    add(suite, int(tk), s)
         except (TypeError, ValueError):
             pass
     bl = obj.get("blocks")
@@ -183,14 +193,45 @@ def states_from_log(text, add):
                 add(suite, task, s)
 
 
+def _int_or_none(x):
+    try:
+        return int(x) if x is not None and not isinstance(x, bool) else None
+    except (TypeError, ValueError):
+        return None
+
+
+# имя файла ячейки старых харнессов: <набор>_t<задача>_i<начало>[..._b<n>]
+FNAME = re.compile(r"^(10|goal|spatial|object)_t(\d+)_i(\d+)"
+                   r"(?:.*?_b(\d+))?")
+
+
+def states_from_name(path, add, assumed=None):
+    """Старты из имени файла ячейки; без _b<n> — ASSUMED_BLOCK."""
+    m = FNAME.match(os.path.basename(path))
+    if not m:
+        return False
+    n = int(m.group(4)) if m.group(4) else ASSUMED_BLOCK
+    if not m.group(4) and assumed is not None:
+        assumed.append([path])
+    for s in range(int(m.group(3)), int(m.group(3)) + n):
+        add(m.group(1), int(m.group(2)), s)
+    return True
+
+
 def rollout_like(path, obj=None):
     """Похоже ли на результат раскатки (тогда без восстановленных стартов —
-    нерешённый вопрос, а не обычный отчёт)."""
+    нерешённый вопрос, а не обычный отчёт). Манифесты демонстраций (эпизоды
+    без исхода) — не раскатки."""
     f = os.path.basename(path)
     if f.endswith(".actions.npz") or ROLLOUT_NAME.search(f):
         return True
-    return isinstance(obj, dict) and any(
-        k in obj for k in ("episodes", "init_start", "actions_npz"))
+    if not isinstance(obj, dict):
+        return False
+    if any(k in obj for k in ("init_start", "actions_npz")):
+        return True
+    eps = obj.get("episodes")
+    return isinstance(eps, list) and any(
+        isinstance(e, dict) and "success" in e for e in eps)
 
 
 def scan(roots, exclude=("reports/k15h",)):
@@ -199,7 +240,7 @@ def scan(roots, exclude=("reports/k15h",)):
     восстановлены), блоки с принятым размером, каталоги без истории."""
     used, per_file, other_suite = {}, {}, set()
     problems, unresolved, assumed = [], [], []
-    by_dir, assumed_dirs = {}, set()
+    by_dir, assumed_dirs, other_files = {}, set(), []
     dirs_seen, dirs_found = {}, set()
     for root in roots:
         for dp, _dn, fn in os.walk(root):
@@ -215,11 +256,12 @@ def scan(roots, exclude=("reports/k15h",)):
                     os.sep)[0])
                 dirs_seen.setdefault(top, 0)
                 dirs_seen[top] += 1
-                got, obj = set(), None
+                got, obj, other_here = set(), None, []
 
                 def add(suite, t, s):
                     if str(suite) != SUITE:
                         other_suite.add((str(suite), t, s))
+                        other_here.append(str(suite))
                         return
                     got.add((t, s))
                 try:
@@ -237,12 +279,16 @@ def scan(roots, exclude=("reports/k15h",)):
                 except Exception as e:      # noqa: BLE001 — перечисляется
                     problems.append(dict(file=p, why=type(e).__name__))
                     continue
+                if not got and not other_here:
+                    states_from_name(p, add, assumed)
                 if got:
                     per_file[p] = len(got)
                     dirs_found.add(top)
                     for k in got:
                         used[k] = used.get(k, 0) + 1
                     by_dir.setdefault(top, set()).update(got)
+                elif other_here:
+                    other_files.append(p)       # другой набор LIBERO
                 elif rollout_like(p, obj):
                     unresolved.append(p)
     # npz без собственных стартов, но с JSON-парой, где старты есть, —
@@ -254,7 +300,8 @@ def scan(roots, exclude=("reports/k15h",)):
     return dict(used=used, per_file=per_file, unrecovered=unrecovered,
                 other_suite=sorted(other_suite), problems=problems,
                 unresolved=sorted(unresolved), assumed_blocks=assumed,
-                by_dir=by_dir, assumed_dirs=sorted(assumed_dirs))
+                by_dir=by_dir, assumed_dirs=sorted(assumed_dirs),
+                other_suite_files=sorted(other_files))
 
 
 def libero_bank():
@@ -368,6 +415,7 @@ def inventory_mode(out=INVENTORY):
         used_sources_files=len(per_file),
         files=dict(sorted(per_file.items())),
         other_suites=len(sc["other_suite"]),
+        other_suite_files=sc["other_suite_files"],
         unrecovered_dirs=unrec,
         problem_files=sc["problems"], unresolved_files=sc["unresolved"],
         assumed_block_size=dict(size=ASSUMED_BLOCK,
@@ -416,6 +464,8 @@ def inventory_mode(out=INVENTORY):
         print(f"  планов с неизвестным размером блока (принято "
               f"{ASSUMED_BLOCK}): {len(sc['assumed_blocks'])} в "
               f"{sc['assumed_dirs']}")
+    print(f"  файлов только другого набора LIBERO (не {SUITE}): "
+          f"{len(sc['other_suite_files'])}")
     print(f"  НЕРЕШЁННЫЕ ВОПРОСЫ: нечитаемых файлов {len(sc['problems'])}, "
           f"похожих на раскатки без стартов {len(sc['unresolved'])}")
     for x in sc["problems"][:30]:
@@ -1138,8 +1188,37 @@ def _selftest_inventory():
         np.savez(os.path.join(td, "data/k9h_x/a_t6_i40.actions.npz"),
                  init_state_id=np.arange(40, 45),
                  meta=json.dumps(dict(task_id=6, suite="10")))
+        # форматы, найденные на кластере
+        os.makedirs(os.path.join(td, "logs/k9h_d"))
+        open(os.path.join(td, "logs/k9h_d/10_t2_i30_coarse24_b10_enson.log"),
+             "w").write("лог без заголовков\n")
+        open(os.path.join(td, "logs/k9h_d/10_t4_i0_coarse24_enson.log"),
+             "w").write("x\n")
+        os.makedirs(os.path.join(td, "data/k12g"))
+        json.dump(dict(suite="goal", task_id=0, init_start=0, n_envs=5,
+                       episodes=[dict(init_state_id=0, success=True)]),
+                  open(os.path.join(td, "data/k12g/goal_d10_t0_s0.json"),
+                       "w"))
+        os.makedirs(os.path.join(td, "data/k12j"))
+        json.dump(dict(suite="10", init_start=35, n_envs=5, episodes=[
+            dict(task_id=6, state_id=s, success=False)
+            for s in range(35, 40)]),
+            open(os.path.join(td, "data/k12j/t6_s35.pt.meta.json"), "w"))
+        json.dump(dict(suite="10", init_start=40, n_envs=5, tasks=[1, 9],
+                       sigmas=[0.1]),
+                  open(os.path.join(td, "data/protocol.json"), "w"))
+        json.dump(dict(episodes=[dict(path="x", n=3)], splits=[1]),
+                  open(os.path.join(td, "data/k9_manifest.json"), "w"))
         roots = [os.path.join(td, r) for r in INV_ROOTS]
         sc = scan(roots)
+        assert all((2, s) in sc["used"] for s in range(30, 40))
+        assert (4, 9) in sc["used"]                   # без _b — 10
+        assert all((6, s) in sc["used"] for s in range(35, 40))
+        assert (1, 44) in sc["used"] and (9, 40) in sc["used"]
+        assert any("goal_d10" in x for x in sc["other_suite_files"])
+        assert not any("goal_d10" in x or "manifest" in x or "k9h_d" in x
+                       or "k12j" in x for x in sc["unresolved"]), \
+            sc["unresolved"]
         assert (1, 3) in sc["used"] and (6, 44) in sc["used"]
         assert any("q0_t2_i5.json" in x["file"] for x in sc["problems"])
         assert any("l0p_t7_i0.json" in x for x in sc["unresolved"])
