@@ -599,7 +599,7 @@ def smoke_link_problems(rep, smoke_plan_path, basis, identity,
 
 def make_plan(*, basis, identity, device, smoke, inventory=INVENTORY,
               snapshot=SNAPSHOT, k15g_run=None, smoke_report=SMOKE_REPORT,
-              smoke_plan=SMOKE_PLAN, accept_unresolved=False):
+              smoke_plan=SMOKE_PLAN, accepted=()):
     import k15g_local_probe as pr
     import k15h_policy as hp
     import k15f_m1cold_snapshot as msn
@@ -633,10 +633,7 @@ def make_plan(*, basis, identity, device, smoke, inventory=INVENTORY,
         if not os.path.exists(inventory):
             raise SystemExit("нет инвентаризации (inventory)")
         inv = json.load(open(inventory))
-        if inv.get("code") != 0 and not accept_unresolved:
-            raise SystemExit("инвентаризация с нерешёнными вопросами (код "
-                             f"{inv.get('code')}): нужен явный "
-                             "--accept-unresolved после разбора")
+        acc = accepted_entries(inv, accepted)
         prob = inventory_problems(inv)
         rep_ = (json.load(open(smoke_report))
                 if os.path.exists(smoke_report) else {})
@@ -663,7 +660,67 @@ def make_plan(*, basis, identity, device, smoke, inventory=INVENTORY,
         inputs_sha1={k: sha(v) for k, v in inputs.items()},
         code={f: sha(os.path.join(HERE, f)) for f in CODE},
         refs=refs, refs_sha1=ref_sha, analysis=ANALYSIS,
-        accept_unresolved=bool(accept_unresolved and not smoke))
+        accepted_unresolved=([] if smoke else acc))
+
+
+def accepted_entries(inv, accepted):
+    """Нерешённые вопросы инвентаризации закрываются ТОЛЬКО поимённо:
+    каждый нечитаемый и каждый нерешённый файл — в списке принятых с
+    обоснованием; файл сохраняется, его SHA фиксируется. Лишние записи
+    (не из инвентаризации) — отказ."""
+    open_ = [x["file"] for x in inv.get("problem_files") or []] + list(
+        inv.get("unresolved_files") or [])
+    acc = {os.path.normpath(f): r for f, r in accepted}
+    p = []
+    for f in open_:
+        if os.path.normpath(f) not in acc:
+            p.append(f"не принят: {f}")
+    for f in acc:
+        if f not in {os.path.normpath(x) for x in open_}:
+            p.append(f"принят файл не из инвентаризации: {f}")
+        elif not os.path.exists(f):
+            p.append(f"принятый файл отсутствует: {f}")
+    for f, r in acc.items():
+        if not str(r).strip():
+            p.append(f"нет обоснования для {f}")
+    if p:
+        raise SystemExit("нерешённые вопросы инвентаризации: " + "; ".join(
+            p[:6]))
+    return [dict(file=f, sha1=hashlib.sha1(open(f, "rb").read())
+                 .hexdigest(), reason=r) for f, r in sorted(acc.items())]
+
+
+def provenance(files, script):
+    """script_sha1 в метриках против версий скрипта в истории git (только
+    чтение) и есть ли в этих версиях симулятор."""
+    import subprocess
+    want = {}
+    for f in files:
+        try:
+            v = json.load(open(f)).get("script_sha1")
+        except (ValueError, OSError):
+            continue
+        if v:
+            want.setdefault(v, []).append(f)
+    root = os.path.dirname(HERE)
+    rel = os.path.relpath(os.path.abspath(script), root)
+    revs = subprocess.run(["git", "-C", root, "log", "--format=%h", "--",
+                           rel], capture_output=True, text=True).stdout.split()
+    found = {}
+    sim = re.compile(r"get_envs|envs\.reset|init_state_id|AsyncVectorEnv|"
+                     r"gym\.make")
+    for r in revs:
+        src = subprocess.run(["git", "-C", root, "show", f"{r}:{rel}"],
+                             capture_output=True).stdout
+        h = hashlib.sha1(src).hexdigest()[:12]
+        if h in want and h not in found:
+            hits = sorted(set(sim.findall(src.decode(errors="replace"))))
+            found[h] = dict(revision=r, simulator_calls=hits)
+    cur = hashlib.sha1(open(script, "rb").read()).hexdigest()[:12]
+    return dict(script=rel, current_sha1=cur,
+                in_metrics={k: len(v) for k, v in want.items()},
+                matched=found,
+                unmatched=sorted(set(want) - set(found)))
 
 
 def smoke_recheck(sp, sp_path, run_dir):
@@ -699,6 +756,11 @@ def check_plan_inputs(plan, plan_path=None):
     if not plan.get("smoke"):
         inv = json.load(open(plan["inputs"]["inventory"]))
         p += inventory_problems(inv, plan["blocks"])
+        for e in plan.get("accepted_unresolved") or []:
+            f = e["file"]
+            if not os.path.exists(f) or hashlib.sha1(open(f, "rb").read()) \
+                    .hexdigest() != e["sha1"]:
+                p.append(f"принятый файл {f} изменён или удалён")
         bank = {int(t): v for t, v in plan["blocks"].items()}
         if directions_table(bank, plan["choice_seed"]) != plan["directions"]:
             p.append("таблица направлений не воспроизводится по сиду")
@@ -1144,6 +1206,7 @@ def selftest():
     _selftest_inventory()
     _selftest_links()
     _selftest_actions()
+    _selftest_accept()
     print("самопроверка k15h_protocol пройдена: инвентаризация, банк и "
           "запасной вариант, таблица направлений, формулы вариантов, одно "
           "направление на батч, повторный выбор, амплитуда, нормировка, "
@@ -1299,6 +1362,34 @@ def _selftest_links():
         assert snapshot_problems(snap, other, ident)
 
 
+def _selftest_accept():
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        f = os.path.join(td, "table.json")
+        open(f, "w").write('{\n "guard": {')
+        g = os.path.join(td, "other.json")
+        open(g, "w").write("{")
+        inv = dict(code=3, problem_files=[dict(file=f, why="JSONDecodeError")],
+                   unresolved_files=[])
+        e = accepted_entries(inv, [(f, "оборванная сводка K-11i")])
+        assert e[0]["file"] == os.path.normpath(f) and len(e[0]["sha1"]) == 40
+        for bad in ([], [(f, " ")], [(f, "x"), (g, "y")]):
+            try:
+                accepted_entries(inv, bad)
+                raise AssertionError(f"принято {bad}")
+            except SystemExit:
+                pass
+        # второй нерешённый файл решением по первому не покрывается
+        inv2 = dict(inv, problem_files=inv["problem_files"] + [
+            dict(file=g, why="JSONDecodeError")])
+        try:
+            accepted_entries(inv2, [(f, "оборванная сводка")])
+            raise AssertionError("покрыт чужой файл")
+        except SystemExit:
+            pass
+        assert accepted_entries(dict(code=0), []) == []
+
+
 def _selftest_actions():
     scale = harness_scale()
     assert scale.shape == (7,) and np.isclose(scale[0], 0.9375)
@@ -1327,7 +1418,8 @@ def main():
     ap = argparse.ArgumentParser(description="K-15h: протокол")
     ap.add_argument("mode", choices=("inventory", "smoke-plan", "plan",
                                      "check-block", "smoke-check",
-                                     "check-plan", "selftest"))
+                                     "check-plan", "provenance",
+                                     "selftest"))
     ap.add_argument("--plan", default=None)
     ap.add_argument("--basis", default="data/k15f/basis_s0.pt")
     ap.add_argument("--identity", default="reports/k15f/identity_cuda1.json")
@@ -1336,14 +1428,21 @@ def main():
     ap.add_argument("--block", nargs=4, default=None,
                     metavar=("JSON", "МЕТКА", "ЗАДАЧА", "БЛОК"))
     ap.add_argument("--smoke-report", default=SMOKE_REPORT)
-    ap.add_argument("--accept-unresolved", action="store_true",
-                    help="план при нерешённых вопросах инвентаризации — "
-                         "только после их разбора; записывается в план")
+    ap.add_argument("--accept", nargs=2, action="append", default=[],
+                    metavar=("ФАЙЛ", "ОБОСНОВАНИЕ"),
+                    help="закрыть поимённо нерешённый файл инвентаризации; "
+                         "путь, SHA и обоснование пишутся в план")
+    ap.add_argument("--files", nargs="*", default=[])
+    ap.add_argument("--script", default=None)
     a = ap.parse_args()
     if a.mode == "selftest":
         return selftest()
     if a.mode == "inventory":
         return inventory_mode()
+    if a.mode == "provenance":
+        r = provenance(a.files, a.script)
+        print(json.dumps(r, ensure_ascii=False, indent=1))
+        return 0 if (r["matched"] and not r["unmatched"]) else 3
     if a.mode in ("smoke-plan", "plan"):
         smoke = a.mode == "smoke-plan"
         out = a.plan or (SMOKE_PLAN if smoke else PLAN)
@@ -1352,7 +1451,7 @@ def main():
         plan = make_plan(basis=a.basis, identity=a.identity,
                          device=a.device, smoke=smoke,
                          smoke_report=a.smoke_report,
-                         accept_unresolved=a.accept_unresolved)
+                         accepted=a.accept)
         os.makedirs(os.path.dirname(out), exist_ok=True)
         with open(out + ".tmp", "w", encoding="utf-8") as fh:
             json.dump(plan, fh, ensure_ascii=False, indent=1)

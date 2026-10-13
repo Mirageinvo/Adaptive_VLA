@@ -53,8 +53,11 @@ case "$MODE" in
     finish $CODE ;;
   plan)
     CODE=0
+    # дополнительные аргументы (например, --accept ФАЙЛ ОБОСНОВАНИЕ) — после
+    # режима и карты
     python3 experiments/k15h_protocol.py plan --plan "$PLAN" \
-      --basis "$BASIS" --identity "$IDENT" --device "$DEV" || CODE=$?
+      --basis "$BASIS" --identity "$IDENT" --device "$DEV" "${@:3}" \
+      || CODE=$?
     finish $CODE ;;
   smoke)
     if [ ! -f "$SPLAN" ]; then
