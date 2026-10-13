@@ -261,7 +261,17 @@ def dataset_problems(D, meta, here=HERE, check_inputs=True):
                                        "k15i_benefit_probe.py"}:
         p.append("в наборе нет отпечатков обоих файлов K-15i")
     if check_inputs:
-        for k, v in (meta.get("inputs") or {}).items():
+        # раздел inputs обязателен и полон: иначе изменённую выгрузку
+        # нечем было бы поймать
+        ins = meta.get("inputs")
+        need = {"plan", "features", "analysis"}
+        if not isinstance(ins, dict):
+            p.append("в наборе нет раздела inputs")
+            ins = {}
+        elif set(ins) != need:
+            p.append(f"inputs: нет {sorted(need - set(ins))}, лишние "
+                     f"{sorted(set(ins) - need)}")
+        for k, v in ins.items():
             if not os.path.exists(v["path"]) or _sha(v["path"]) != v["sha1"]:
                 p.append(f"вход {k} изменён или отсутствует")
     if (D["state"] >= 45).any():
@@ -443,6 +453,25 @@ def selftest():
                                             D["state"])), "резерва")):
         pr_ = dataset_problems(dict(D, **mutD), meta, check_inputs=False)
         assert any(word in x for x in pr_), (word, pr_)
+    # отпечатки входов обязательны и полны
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        ins = {}
+        for k in ("plan", "features", "analysis"):
+            f = os.path.join(td, k)
+            open(f, "w").write(k)
+            ins[k] = dict(path=f, sha1=_sha(f))
+        mi = dict(meta, inputs=ins)
+        assert dataset_problems(D, mi) == []
+        open(ins["features"]["path"], "a").write("!")
+        assert any("features" in x for x in dataset_problems(D, mi))
+        open(ins["features"]["path"], "w").write("features")
+        one = dict(mi, inputs={k: v for k, v in ins.items()
+                               if k != "features"})
+        assert any("features" in x for x in dataset_problems(D, one))
+        none = {k: v for k, v in mi.items() if k != "inputs"}
+        assert any("нет раздела inputs" in x
+                   for x in dataset_problems(D, none))
     # без сигнала модель не обязана выигрывать; оценка определена
     Dz = _synth(seed=3, signal=False)
     rz, _ = evaluate(Dz, block_folds(Dz))
