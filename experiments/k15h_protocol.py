@@ -43,6 +43,23 @@ KIND = "k15h_plan"
 CHOICE_SEED = 20261013
 N_ENVS = 5
 BLOCKS_WANT, BLOCKS_FALLBACK = 3, 2
+# ПРАВИЛО K-15h (изменено ДО любых раскаток K-15h, 13.10.2026): исходное
+# правило «первые свободные глобально» невыполнимо — на всех задачах
+# глобально свободен только блок 45. Банк — блоки 25, 30, 35 на всех
+# задачах: «не использованные для подбора K-14/K-15» (ни одно их состояние
+# не встречается в источниках линии K-14/K-15). Блок 45 зарезервирован для
+# проверки следующей архитектуры: в банк не входит, исходы на нём не
+# собираются. Прежняя диагностика inventory.failed.json — часть истории.
+BANK_BLOCKS = (25, 30, 35)
+RESERVED_BLOCKS = (45,)
+LINEAGE = re.compile(r"^k1[45]")
+RULE_CHANGE = (
+    "исходное правило (первые 3, запасное — 2 глобально неиспользованных "
+    "блока) невыполнимо: глобально свободен только блок 45 на всех задачах "
+    "(состояния 0–44 использованы K-6h, K-9d, K-9h, K-11e, K-11g, K-12j, "
+    "K-13c, K-14, K-15). Новое правило принято до раскаток K-15h: блоки 25, "
+    "30, 35, не использованные для подбора K-14/K-15; блок 45 "
+    "зарезервирован")
 TASKS = list(range(10))
 SUITE = "10"
 INVENTORY = "reports/k15h/inventory.json"
@@ -286,6 +303,35 @@ def directions_table(bank, seed=CHOICE_SEED):
     return out
 
 
+def is_lineage(d):
+    """Каталог-источник линии K-14/K-15."""
+    return bool(LINEAGE.match(os.path.basename(os.path.normpath(d))))
+
+
+def select_bank_k15(used_lineage, used_all, n_states, tasks=TASKS):
+    """Блоки BANK_BLOCKS на всех задачах: ни одно состояние не встречается
+    в линии K-14/K-15; резерв не пересекается с банком и глобально не
+    использован."""
+    p = []
+    for t in tasks:
+        for b in BANK_BLOCKS + RESERVED_BLOCKS:
+            if b + N_ENVS > int(n_states[t]):
+                p.append(f"задача {t}: блок {b} вне банка {n_states[t]}")
+        for b in BANK_BLOCKS:
+            hit = [s_ for s_ in range(b, b + N_ENVS)
+                   if (t, s_) in used_lineage]
+            if hit:
+                p.append(f"задача {t}: состояния {hit} использованы в "
+                         f"K-14/K-15")
+        for b in RESERVED_BLOCKS:
+            hit = [s_ for s_ in range(b, b + N_ENVS) if (t, s_) in used_all]
+            if hit:
+                p.append(f"задача {t}: резерв {hit} уже использован")
+    if p:
+        raise SystemExit("банк K-15h не выбран: " + "; ".join(p[:6]))
+    return {t: list(BANK_BLOCKS) for t in tasks}
+
+
 def inventory_mode(out=INVENTORY):
     if os.path.exists(out):
         raise SystemExit(f"{out} уже есть: инвентаризация не перезаписывается")
@@ -294,81 +340,89 @@ def inventory_mode(out=INVENTORY):
     roots = [r for r in INV_ROOTS if os.path.isdir(r)]
     sc = scan(roots)
     used, per_file, unrec = sc["used"], sc["per_file"], sc["unrecovered"]
+    lineage = {k for d, st in sc["by_dir"].items() if is_lineage(d)
+               for k in st}
     bank_info = libero_bank()
     n_states = {int(t): v["n_states"] for t, v in bank_info.items()}
-    try:
-        bank, k, free = select_bank(set(used), n_states)
-    except SystemExit as e:
-        # ДИАГНОСТИКА: что заняло состояния; окончательный отчёт не пишется
-        free = {t: [b for b in range(0, n_states[t] - N_ENVS + 1, N_ENVS)
-                    if not any((t, s_) in used
-                               for s_ in range(b, b + N_ENVS))]
-                for t in TASKS}
-        print(f"  ОТКАЗ ВЫБОРА: {e}")
-        print_usage(sc, n_states, free)
-        diag = out[:-len(".json")] + ".failed.json"
-        with open(diag, "w", encoding="utf-8") as fh:
-            json.dump(dict(
-                used={str(t): sorted(s_ for (t_, s_) in used if t_ == t)
-                      for t in TASKS},
-                by_dir={d: sorted(map(list, v))
-                        for d, v in sc["by_dir"].items()},
-                assumed_dirs=sc["assumed_dirs"],
-                free_blocks={str(t): v for t, v in free.items()},
-                problem_files=sc["problems"],
-                unresolved_files=sc["unresolved"]), fh,
-                ensure_ascii=False, indent=1)
-        print(f"  диагностика: {diag}")
-        return 3
+    bank = select_bank_k15(lineage, set(used), n_states)
+    bank_states = {(t, s_) for t, bl in bank.items() for b in bl
+                   for s_ in range(b, b + N_ENVS)}
+    # ПАСПОРТ БАНКА: какие прежние источники касались его состояний
+    history = {}
+    for d, st in sorted(sc["by_dir"].items()):
+        hit = st & bank_states
+        if hit:
+            history[d] = dict(
+                pairs=len(hit), tasks=sorted({t for t, _ in hit}),
+                states=sorted({s_ for _, s_ in hit}), lineage=is_lineage(d))
+    failed = out[:-len(".json")] + ".failed.json"
     res = dict(
         kind="k15h_inventory", created=datetime.datetime.now().isoformat(
             timespec="seconds"),
         roots=roots, suite=SUITE, libero_bank=bank_info,
-        used={str(t): sorted(s for (t_, s) in used if t_ == t)
+        used={str(t): sorted(s_ for (t_, s_) in used if t_ == t)
               for t in TASKS},
+        used_lineage={str(t): sorted(s_ for (t_, s_) in lineage if t_ == t)
+                      for t in TASKS},
+        lineage_dirs=sorted(d for d in sc["by_dir"] if is_lineage(d)),
         used_sources_files=len(per_file),
         files=dict(sorted(per_file.items())),
         other_suites=len(sc["other_suite"]),
         unrecovered_dirs=unrec,
         problem_files=sc["problems"], unresolved_files=sc["unresolved"],
         assumed_block_size=dict(size=ASSUMED_BLOCK,
-                                plans=len(sc["assumed_blocks"])),
-        free_blocks={str(t): v for t, v in free.items()},
-        rule=(f"по возрастанию ID первые {BLOCKS_WANT} полностью "
-              f"неиспользованных блока по {N_ENVS}; запасной — "
-              f"{BLOCKS_FALLBACK} на всех задачах"),
-        blocks_per_task=k,
+                                plans=len(sc["assumed_blocks"]),
+                                dirs=sc["assumed_dirs"]),
+        bank_name="банк, не использованный для подбора K-14/K-15",
+        rule=(f"блоки {list(BANK_BLOCKS)} на всех задачах; ни одно "
+              f"состояние не встречается в источниках линии K-14/K-15; "
+              f"резерв {list(RESERVED_BLOCKS)} глобально не использован и "
+              f"в банк не входит"),
+        rule_change=RULE_CHANGE,
+        previous_attempt=(dict(path=failed, sha1=sha(failed))
+                          if os.path.exists(failed) else None),
+        reserved_blocks=list(RESERVED_BLOCKS),
+        bank_history=history,
         bank={str(t): sorted(v) for t, v in bank.items()},
         limitations=(
-            "история восстановлена по JSON и логам в reports/ и logs/ на "
-            "кластере; прогоны, не оставившие ни JSON с эпизодами, ни лога "
-            "харнесса, не учтены; каталоги без восстановленных состояний — "
-            "unrecovered_dirs; нечитаемые файлы — problem_files; похожие на "
-            "раскатки без восстановленных стартов — unresolved_files"),
+            "история восстановлена по JSON, npz и логам в reports/, logs/, "
+            "data/ на кластере; прогоны, не оставившие ни JSON с эпизодами, "
+            "ни npz харнесса, ни лога, не учтены; каталоги без "
+            "восстановленных состояний — unrecovered_dirs; нечитаемые "
+            "файлы — problem_files; похожие на раскатки без стартов — "
+            "unresolved_files. Банк не «никогда не использованный»: см. "
+            "bank_history"),
         code=(3 if (sc["problems"] or sc["unresolved"]) else 0))
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out + ".tmp", "w", encoding="utf-8") as fh:
         json.dump(res, fh, ensure_ascii=False, indent=1)
     os.replace(out + ".tmp", out)
-    print(f"  источников с состояниями LIBERO-{SUITE}: {len(per_file)}; "
-          f"каталогов без истории: {len(unrec)}")
-    for t in TASKS:
-        u = res["used"][str(t)]
-        print(f"    задача {t}: банк {n_states[t]}, использовано {len(u)} "
-              f"({_ranges(u)}); свободные блоки {free[t]}; выбрано "
-              f"{bank[t]}")
-    print(f"  блоков на задачу: {k}; сводка: {out}")
+    free = {t: [b for b in range(0, n_states[t] - N_ENVS + 1, N_ENVS)
+                if not any((t, s_) in used for s_ in range(b, b + N_ENVS))]
+            for t in TASKS}
+    print(f"  источников с состояниями LIBERO-{SUITE}: {len(per_file)}")
+    print_usage(sc, n_states, free)
+    print(f"  БАНК ({res['bank_name']}): блоки {list(BANK_BLOCKS)} на всех "
+          f"задачах, 150 состояний; резерв {list(RESERVED_BLOCKS)}")
+    print("  паспорт банка — прежние источники его состояний:")
+    for d, v in history.items():
+        print(f"    {d}{' (ЛИНИЯ K-14/K-15!)' if v['lineage'] else ''}: "
+              f"{v['pairs']} пар, задачи {_ranges(v['tasks'])}, состояния "
+              f"{_ranges(v['states'])}")
+    print(f"  каталоги линии K-14/K-15: {', '.join(res['lineage_dirs'])}")
     print(f"  каталоги без восстановленных стартов ({len(unrec)}): "
           + (", ".join(unrec) or "—"))
     if sc["assumed_blocks"]:
         print(f"  планов с неизвестным размером блока (принято "
-              f"{ASSUMED_BLOCK}): {len(sc['assumed_blocks'])}")
+              f"{ASSUMED_BLOCK}): {len(sc['assumed_blocks'])} в "
+              f"{sc['assumed_dirs']}")
     print(f"  НЕРЕШЁННЫЕ ВОПРОСЫ: нечитаемых файлов {len(sc['problems'])}, "
           f"похожих на раскатки без стартов {len(sc['unresolved'])}")
     for x in sc["problems"][:30]:
         print(f"    не читается: {x['file']} ({x['why']})")
     for x in sc["unresolved"][:30]:
         print(f"    старты не восстановлены: {x}")
+    print(f"  сводка: {out}; код {res['code']}")
     return res["code"]
 
 
@@ -422,11 +476,14 @@ def expected_contract(basis, identity):
 
 
 def bank_from_inventory(inv):
-    """Банк, механически выведенный из инвентаризации (тем же правилом)."""
+    """Банк, механически выведенный из инвентаризации (правилом K-15h:
+    без пересечения с линией K-14/K-15, резерв не тронут)."""
     used = {(int(t), int(s)) for t, ss in inv["used"].items() for s in ss}
+    lin = {(int(t), int(s)) for t, ss in inv["used_lineage"].items()
+           for s in ss}
     n_states = {int(t): int(v["n_states"])
                 for t, v in inv["libero_bank"].items()}
-    bank, _k, _f = select_bank(used, n_states)
+    bank = select_bank_k15(lin, used, n_states)
     return {str(t): sorted(v) for t, v in bank.items()}
 
 
@@ -1046,6 +1103,11 @@ def selftest():
 
 def _selftest_inventory():
     import tempfile
+    for d_, want in (("reports/k14q", True), ("logs/k14q_dev_s101.log", True),
+                     ("data/k15f", True), ("logs/k15g", True),
+                     ("data/k11e", False), ("data/k9h_noise_fde580e3", False),
+                     ("data/k12j", False), ("reports/k6h", False)):
+        assert is_lineage(d_) == want, d_
     got = set()
 
     def add(suite, t, s):
@@ -1087,8 +1149,9 @@ def _selftest_inventory():
 def _fake_inventory(td):
     f = os.path.join(td, "init_t0.pruned_init")
     open(f, "wb").write(b"states")
-    used = {str(t): list(range(25)) for t in TASKS}
-    inv = dict(used=used, libero_bank={
+    used = {str(t): list(range(45)) for t in TASKS}
+    lin = {str(t): list(range(25)) for t in TASKS}
+    inv = dict(used=used, used_lineage=lin, libero_bank={
         str(t): dict(n_states=50, path=f, sha1=hashlib.sha1(
             b"states").hexdigest()) for t in TASKS})
     inv["bank"] = bank_from_inventory(inv)
@@ -1101,6 +1164,17 @@ def _selftest_links():
         inv, f = _fake_inventory(td)
         assert inventory_problems(inv, inv["bank"]) == []
         assert inv["bank"]["0"] == [25, 30, 35]
+        # линия K-14/K-15 на состоянии банка — отказ; резерв тронут — отказ
+        for mut in (dict(used_lineage=dict(inv["used_lineage"],
+                                           **{"3": list(range(25)) + [31]})),
+                    dict(used=dict(inv["used"], **{"7": list(range(47))}))):
+            try:
+                bank_from_inventory(dict(inv, **mut))
+                raise AssertionError(f"принят банк при {list(mut)}")
+            except SystemExit:
+                pass
+        # прежнее использование другими головами (0–44) банк не запрещает
+        assert bank_from_inventory(inv)["5"] == [25, 30, 35]
         # замена банка (даже с пересчитанной таблицей) — отказ
         bad = dict(inv["bank"], **{"0": [40, 45, 30]})
         assert any("банк плана" in x for x in inventory_problems(inv, bad))
