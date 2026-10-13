@@ -93,13 +93,17 @@ def utility(y, choose):
     return float(np.sum(np.asarray(y)[np.asarray(choose, bool)]))
 
 
+def fit(D, rows, lam, use_h18, target):
+    """Модель на строках rows с фиксированным λ -> функция прогноза."""
+    F = Features(D["h18"][rows], D["a0"][rows], use_h18)
+    w, b = ridge(F(D["h18"][rows], D["a0"][rows]), target[rows], lam)
+    return lambda idx: F(D["h18"][idx], D["a0"][idx]) @ w + b
+
+
 def fit_predict(D, tr, te, use_h18, target, inner_groups):
     """Обучить на tr (только достигнутые), предсказать te. λ — внутренней
-    проверкой по группам inner_groups (обучающая часть) по пользе."""
-    def fit(rows, lam):
-        F = Features(D["h18"][rows], D["a0"][rows], use_h18)
-        w, b = ridge(F(D["h18"][rows], D["a0"][rows]), target[rows], lam)
-        return lambda idx: F(D["h18"][idx], D["a0"][idx]) @ w + b
+    проверкой по группам inner_groups (обучающая часть) по пользе
+    правила «прогноз > 0»."""
     best, best_u = LAMBDAS[-1], -np.inf
     groups = sorted(set(inner_groups[tr].tolist()))
     for lam in sorted(LAMBDAS, reverse=True):     # равенство — сильнее λ
@@ -109,37 +113,44 @@ def fit_predict(D, tr, te, use_h18, target, inner_groups):
             iva = tr[inner_groups[tr] == g]
             if len(itr) < 3 or len(iva) == 0:
                 continue
-            pred = fit(itr, lam)(iva)
+            pred = fit(D, itr, lam, use_h18, target)(iva)
             u += utility(D["y"][iva], pred > 0)
         if u > best_u + 1e-12:
             best, best_u = lam, u
-    return fit(tr, best)(te), best
+    return fit(D, tr, best, use_h18, target)(te), best
 
 
 def fail_detector(D, tr, te, inner_groups):
-    """Прогноз провала q0; порог — внутренней проверкой по пользе выбора
-    (не фиксированный 0.5)."""
+    """Прогноз провала q0; λ и порог выбираются СОВМЕСТНО внутренней
+    проверкой по пользе того же правила «прогноз провала > порог», среди
+    порогов — «всегда» (−∞) и «никогда» (+∞). При равенстве пользы — меньше
+    вмешательств, затем сильнее λ. Затем модель с выбранным λ обучается
+    на всей внешней обучающей части, порог применяется к te."""
     fail = 1.0 - D["succ_q0"].astype(np.float64)
     groups = sorted(set(inner_groups[tr].tolist()))
-    inner_scores, inner_y = [], []
-    for g in groups:
-        itr = tr[inner_groups[tr] != g]
-        iva = tr[inner_groups[tr] == g]
-        if len(itr) < 3 or len(iva) == 0:
+    best = None                                  # (польза, −вмеш., λ, порог)
+    for lam in LAMBDAS:
+        sc, yy = [], []
+        for g in groups:
+            itr = tr[inner_groups[tr] != g]
+            iva = tr[inner_groups[tr] == g]
+            if len(itr) < 3 or len(iva) == 0:
+                continue
+            sc.append(fit(D, itr, lam, True, fail)(iva))
+            yy.append(D["y"][iva])
+        if not sc:
             continue
-        p, _l = fit_predict(D, itr, iva, True, fail, inner_groups)
-        inner_scores.append(p)
-        inner_y.append(D["y"][iva])
-    s = np.concatenate(inner_scores) if inner_scores else np.zeros(0)
-    yy = np.concatenate(inner_y) if inner_y else np.zeros(0)
-    cands = np.unique(np.concatenate([s, [np.inf]]))
-    thr, best_u = np.inf, -np.inf
-    for c in cands[::-1]:                          # равенство — меньше вмешательств
-        u = utility(yy, s > c)
-        if u > best_u + 1e-12:
-            thr, best_u = c, u
-    p_te, lam = fit_predict(D, tr, te, True, fail, inner_groups)
-    return p_te > thr, dict(threshold=float(thr), lam=lam)
+        s_, y_ = np.concatenate(sc), np.concatenate(yy)
+        for thr in np.concatenate([[-np.inf, np.inf], np.unique(s_)]):
+            ch = s_ > thr
+            key = (utility(y_, ch), -int(ch.sum()), lam)
+            if best is None or key > best[0]:
+                best = (key, float(thr))
+    if best is None:
+        return np.zeros(len(te), bool), dict(threshold=None, lam=None)
+    (_u, _n, lam), thr = best
+    p_te = fit(D, tr, lam, True, fail)(te)
+    return p_te > thr, dict(threshold=thr, lam=lam)
 
 
 def choose_all(D, tr, te, inner_groups, task_fallback_global=False):
@@ -232,14 +243,52 @@ def task_folds(D):
             for t in sorted(set(D["task"].tolist()))]
 
 
+def _sha(p):
+    return hashlib.sha1(open(p, "rb").read()).hexdigest()
+
+
+def dataset_problems(D, meta, here=HERE, check_inputs=True):
+    """Смысл и отпечатки набора перед обучением."""
+    p = []
+    want = dict(kind="k15i_dataset", target="p4r3p", base="q0ref", call=4)
+    for k, v in want.items():
+        if meta.get(k) != v:
+            p.append(f"{k} = {meta.get(k)!r}, ожидалось {v!r}")
+    for f, s_ in (meta.get("code") or {}).items():
+        if _sha(os.path.join(here, f)) != s_:
+            p.append(f"код {f} изменён после подготовки")
+    if set(meta.get("code") or {}) != {"k15i_prepare.py",
+                                       "k15i_benefit_probe.py"}:
+        p.append("в наборе нет отпечатков обоих файлов K-15i")
+    if check_inputs:
+        for k, v in (meta.get("inputs") or {}).items():
+            if not os.path.exists(v["path"]) or _sha(v["path"]) != v["sha1"]:
+                p.append(f"вход {k} изменён или отсутствует")
+    if (D["state"] >= 45).any():
+        p.append("в наборе состояния резерва 45–49")
+    y = D["succ_target"].astype(int) - D["succ_q0"].astype(int)
+    if not np.array_equal(D["y"], y):
+        p.append("y не равен succ_target − succ_q0")
+    r = D["reached4"].astype(bool)
+    if r.any() and not (np.isfinite(D["h18"][r]).all() and
+                        np.isfinite(D["a0"][r]).all()):
+        p.append("у достигнутых признаки не конечны")
+    if (~r).any() and not (np.isnan(D["h18"][~r]).all() and
+                           np.isnan(D["a0"][~r]).all()):
+        p.append("у недостигнутых признаки не пусты")
+    if (D["succ_target"][~r] != D["succ_q0"][~r]).any():
+        p.append("импульс не достигнут, но исходы различаются")
+    return p
+
+
 def load(path):
     D = dict(np.load(path))
     meta = json.load(open(path[:-4] + ".json"))
-    if hashlib.sha1(open(path, "rb").read()).hexdigest() != \
-            meta["dataset"]["sha1"]:
+    if _sha(path) != (meta.get("dataset") or {}).get("sha1"):
         raise SystemExit("набор K-15i изменён после подготовки")
-    if (D["state"] >= 45).any():
-        raise SystemExit("в наборе состояния резерва 45–49")
+    p = dataset_problems(D, meta)
+    if p:
+        raise SystemExit("набор K-15i непригоден: " + "; ".join(p[:6]))
     return D, meta
 
 
@@ -275,7 +324,13 @@ def main():
             f"t{t} {100 * v['sr']:.0f}%/{v['interventions']}"
             for t, v in pt.items()))
     report("исключение целой задачи (перенос)", res_t)
-    out = dict(dataset=meta["dataset"], blocks=res_b, blocks_info=inf_b,
+    out = dict(dataset=meta["dataset"],
+               code={f: _sha(os.path.join(HERE, f)) for f in (
+                   "k15i_prepare.py", "k15i_benefit_probe.py")},
+               model=dict(n_pca=N_PCA, lambdas=list(LAMBDAS),
+                          features="h18 вызова 4 (PCA) + a0 вызова 4",
+                          rule="прогноз пользы > 0 -> p4r3p"),
+               blocks=res_b, blocks_info=inf_b,
                tasks=res_t, tasks_info=inf_t,
                note=("разведочная оценка выбора по записанным траекториям; "
                      "успех иерархии подтверждается раскатками"))
@@ -362,6 +417,32 @@ def selftest():
     # исключение задачи: каждая задача проверяется ровно раз
     rt, _ = evaluate(D, task_folds(D))
     assert rt["always_q0"]["sr"] == res["always_q0"]["sr"]
+    # детектор: q0 проваливается всегда, импульс спасает всегда ->
+    # вмешиваться во всех достигнутых (порог «всегда» доступен)
+    Da = _synth(seed=5)
+    Da["succ_q0"] = np.zeros_like(Da["succ_q0"])
+    Da["succ_target"] = Da["reached4"].copy()
+    Da["y"] = Da["succ_target"].astype(int)
+    ra, _ = evaluate(Da, block_folds(Da))
+    assert ra["fail_detector"]["sr"] == ra["always_p4r3p"]["sr"] == \
+        Da["reached4"].mean()
+    # проверка набора перед обучением
+    meta = dict(kind="k15i_dataset", target="p4r3p", base="q0ref", call=4,
+                code={f: _sha(os.path.join(HERE, f)) for f in (
+                    "k15i_prepare.py", "k15i_benefit_probe.py")})
+    assert dataset_problems(D, meta, check_inputs=False) == []
+    for mut, word in ((dict(target="learned_uniform"), "target"),
+                      (dict(call=2), "call"),
+                      (dict(code=dict(meta["code"], **{
+                          "k15i_prepare.py": "0"})), "изменён"),
+                      (dict(code={"k15i_prepare.py": "x"}), "обоих")):
+        pr_ = dataset_problems(D, dict(meta, **mut), check_inputs=False)
+        assert any(word in x for x in pr_), (mut, pr_)
+    for mutD, word in ((dict(y=-D["y"]), "y не равен"),
+                       (dict(state=np.where(np.arange(len(D["y"])) == 0, 47,
+                                            D["state"])), "резерва")):
+        pr_ = dataset_problems(dict(D, **mutD), meta, check_inputs=False)
+        assert any(word in x for x in pr_), (word, pr_)
     # без сигнала модель не обязана выигрывать; оценка определена
     Dz = _synth(seed=3, signal=False)
     rz, _ = evaluate(Dz, block_folds(Dz))

@@ -106,13 +106,21 @@ def build(feat, plan, json_outcomes=None, q0_blocks=None):
                 p.append(f"нет q0ref для {k}")
                 continue
             h_ref, a_ref, m_ref = ref
-            for c in range(min(CALL, len(m_ref))):
-                if m_ref[c] != bool(reached[i, c]):
+            # ЭТАЛОННАЯ МАСКА РОВНО ИЗ 4 ПОЗИЦИЙ: вызова, которого в q0ref
+            # не было, — False; сверяются все четыре позиции
+            m4 = [c < len(m_ref) and bool(m_ref[c]) for c in range(CALL)]
+            for c in range(CALL):
+                if m4[c] != bool(reached[i, c]):
                     p.append(f"{k}: маска вызова {c + 1} не равна q0ref")
-                elif m_ref[c] and not (
-                        np.array_equal(feat["h18"][i, c], h_ref[c]) and
-                        np.array_equal(feat["a0"][i, c], a_ref[c])):
-                    p.append(f"{k}: h18/a0 вызова {c + 1} не равны q0ref")
+                elif m4[c]:
+                    if not (np.array_equal(feat["h18"][i, c], h_ref[c]) and
+                            np.array_equal(feat["a0"][i, c], a_ref[c])):
+                        p.append(f"{k}: h18/a0 вызова {c + 1} не равны "
+                                 f"q0ref")
+                elif not (np.isnan(feat["h18"][i, c]).all() and
+                          np.isnan(feat["a0"][i, c]).all()):
+                    p.append(f"{k}: у недостигнутого вызова {c + 1} "
+                             f"признаки не NaN")
     if p:
         raise SystemExit("выгрузка K-15h непригодна: " + "; ".join(p[:6]))
     y = y_t.astype(np.int64) - y_b.astype(np.int64)
@@ -283,6 +291,20 @@ def selftest():
     def h_bad(f, j, q):
         f["h18"][5, 2, 0, 0] += 1
     bad(h_bad, "не равны q0ref")
+    # исходный q0ref содержит два вызова, выгрузка приписывает 3-й и 4-й
+    def two_calls(f, j, q):
+        k = (1, 30)
+        i = [tuple(x) for x in zip(f["task"].tolist(),
+                                   f["state"].tolist())].index(k)
+        h, a_, _m = q[k]
+        q[k] = (h[:2], a_[:2], [True, True])
+        f["call_reached"][i] = [True, True, True, True]
+    bad(two_calls, "маска вызова 3")
+    # недостигнутый вызов с непустыми признаками
+    def ghost(f, j, q):
+        h, a_, _m = q[(0, 25)]
+        f["h18"][0, 3] = 0.0
+    bad(ghost, "не пусты")
     # дублированная политика
     def dup(f, j, q):
         lab = list(f["labels"])
