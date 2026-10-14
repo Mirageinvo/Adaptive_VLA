@@ -124,7 +124,8 @@ def fit(torch, model, train, val, step_fn, dev, epochs=EPOCHS, seed=SEED):
 def train_all(torch, data, dev, epochs=EPOCHS, log=print):
     """data: A, B, V — словари массивов (+ sf_hist, sf_now). Возвращает
     модели и отчёт."""
-    C = km.build(torch)
+    C = km.build(torch, d_model=int(data["A"]["h18"].shape[2]),
+                 n_pos=int(data["A"]["h18"].shape[1]))
     rep = {}
     A, B, V = data["A"], data["B"], data["V"]
     dpos_sigma = torch.tensor(np.maximum(A["dpos"].std(0), 1e-4),
@@ -347,6 +348,8 @@ def main():
                for k, (m, gk, sfk) in heads.items()},
         norms=norms, clip_env_norm=clip, clip_q=CLIP_Q, alpha=ALPHA,
         n_low=km.N_LOW, seed=SEED, units=km.UNITS,
+        d_model=int(data["A"]["h18"].shape[2]),
+        n_pos=int(data["A"]["h18"].shape[1]),
         scale_arm=np.asarray(scale[:6]).tolist(),
         provenance=dict(labels=os.path.abspath(a.labels),
                         labels_sha1=sha(a.labels),

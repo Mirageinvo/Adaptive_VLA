@@ -124,12 +124,12 @@ def dct_matrix(n=H):
 
 
 # --- модели ------------------------------------------------------------------
-def build(torch):
+def build(torch, d_model=768, n_pos=16):
     nn = torch.nn
     D = torch.tensor(dct_matrix(), dtype=torch.float32)
 
     class H18Enc(nn.Module):
-        def __init__(self, d_model=768, proj=32, n_pos=16):
+        def __init__(self, proj=32):
             super().__init__()
             self.norm = nn.LayerNorm(d_model)
             self.proj = nn.Linear(d_model, proj)
