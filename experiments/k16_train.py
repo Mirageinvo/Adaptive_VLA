@@ -79,10 +79,15 @@ def to_t(torch, d, idx, dev, keys):
             for k in keys}
 
 
-def fit(torch, model, train, val, step_fn, dev, epochs=EPOCHS, seed=SEED):
-    """Обучение с выбором эпохи по ошибке на val; возвращает (лучшая
-    эпоха, история)."""
+def new_model(torch, ctor, *args, seed=SEED, **kw):
+    """Сид — ДО конструктора: инициализация воспроизводима по сиду."""
     torch.manual_seed(seed)
+    return ctor(*args, **kw)
+
+
+def fit(torch, model, train, val, step_fn, dev, epochs=EPOCHS, seed=SEED):
+    """Обучение с выбором эпохи по ошибке на val (взвешенной по строкам);
+    нечисловая ошибка — технический отказ."""
     rng = np.random.default_rng(seed)
     opt = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WD)
     n = len(train["age"])
@@ -92,14 +97,21 @@ def fit(torch, model, train, val, step_fn, dev, epochs=EPOCHS, seed=SEED):
         perm = rng.permutation(n)
         for s in range(0, n, BATCH):
             loss = step_fn(model, train, perm[s:s + BATCH])
+            if not bool(torch.isfinite(loss)):
+                raise SystemExit(f"нечисловая ошибка обучения на эпохе {ep}")
             opt.zero_grad()
             loss.backward()
             opt.step()
         model.eval()
+        nv = len(val["age"])
         with torch.no_grad():
-            vl = float(np.mean([float(step_fn(model, val, np.arange(
-                s, min(s + 1024, len(val["age"])))))
-                for s in range(0, len(val["age"]), 1024)]))
+            tot = 0.0
+            for s in range(0, nv, 1024):
+                i = np.arange(s, min(s + 1024, nv))
+                tot += float(step_fn(model, val, i)) * len(i)
+            vl = tot / nv
+        if not np.isfinite(vl):
+            raise SystemExit(f"нечисловая ошибка проверки на эпохе {ep}")
         hist.append(vl)
         if best is None or vl < best[1]:
             best = (ep, vl)
@@ -131,7 +143,7 @@ def train_all(torch, data, dev, epochs=EPOCHS, log=print):
         return f
     goals = {}
     for name, sfk in (("goal_now", "sf_now"), ("goal_hist", "sf_hist")):
-        m = C["GoalNet"]().to(dev)
+        m = new_model(torch, C["GoalNet"]).to(dev)
         best, h = fit(torch, m, A, V, goal_step(sfk), dev, epochs)
         for p in m.parameters():
             p.requires_grad_(False)
@@ -143,17 +155,20 @@ def train_all(torch, data, dev, epochs=EPOCHS, log=print):
     # СОБСТВЕННЫЕ ПРОГНОЗЫ замороженных предсказателей — вход голов
     for name, (m, sfk) in goals.items():
         for D_ in (B, V):
-            outs = []
+            outs, feats = [], []
             with torch.no_grad():
                 for s in range(0, len(D_["age"]), 1024):
                     i = np.arange(s, min(s + 1024, len(D_["age"])))
                     b = to_t(torch, D_, i, dev, ("h18", "a0", sfk))
-                    outs.append(m(b["h18"], b["a0"].float(),
-                                  b[sfk].float()).cpu().numpy())
+                    hid = m.hidden(b["h18"], b["a0"].float(),
+                                   b[sfk].float())
+                    feats.append(hid.cpu().numpy())
+                    outs.append(m.body[-1](hid).cpu().numpy())
             D_[f"pred_{name}"] = np.concatenate(outs)
+            D_[f"feat_{name}"] = np.concatenate(feats)
     target, widths = km.matched_widths(torch, C)
     specs = dict(
-        direct=("Direct", 256, None, "sf_hist"),
+        direct=("Direct", widths["Direct"], "feat_goal_hist", "sf_hist"),
         goal_flat=("GoalFlat", widths["GoalFlat"], "pred_goal_hist",
                    "sf_hist"),
         goal_band=("GoalBand", widths["GoalBand"], "pred_goal_hist",
@@ -162,13 +177,14 @@ def train_all(torch, data, dev, epochs=EPOCHS, log=print):
                        "sf_now"))
     heads = {}
     for name, (cls, hid, gk, sfk) in specs.items():
-        m = C[cls](hid).to(dev)
+        m = new_model(torch, C[cls], hid).to(dev)
 
         def step(model, d, idx, gk=gk, sfk=sfk, name=name):
-            ks = ("h18", "a0", "rstar", sfk) + ((gk,) if gk else keys_g[2:])
+            ks = ("h18", "a0", "rstar", sfk, gk) + (
+                keys_g[2:] if name == "direct" else ())
             b = to_t(torch, d, idx, dev, ks)
-            goal = b[gk].float() if gk else None
-            r, aux = model(b["h18"], b["a0"].float(), b[sfk].float(), goal)
+            r, aux = model(b["h18"], b["a0"].float(), b[sfk].float(),
+                           b[gk].float())
             loss = (((r - b["rstar"].float() / r_sigma) ** 2).mean())
             if name == "direct" and model.training:
                 loss = loss + km.AUX * goal_loss(
@@ -206,27 +222,29 @@ def evaluate(torch, goals, heads, norms, V, A, scale, clip, dev):
                 mean=float(ang.mean()), median=float(np.median(ang))),
             grip_acc=float(((g[:, 9] > 0) == (V["grip"] > 0.5)).mean()),
             type_acc=float((g[:, 10:13].argmax(1) == V["etype"]).mean()))
-    # базовый прогноз: среднее Δpos по (задача, корзина возраста) на A
+    # базовый прогноз: среднее АБСОЛЮТНОЕ положение цели по (задача,
+    # корзина возраста) на A минус текущее положение руки
     bins = lambda a: (np.asarray(a) // 40).astype(int)   # noqa: E731
     tab = {}
-    for t, b_, d_ in zip(A["task"], bins(A["age"]), A["dpos"]):
-        tab.setdefault((t, b_), []).append(d_)
-    glob_ = A["dpos"].mean(0)
-    pred = np.stack([np.mean(tab[(t, b_)], 0) if (t, b_) in tab else glob_
+    absA = A["state"][:, :3] + A["dpos"]
+    for t, b_, g_ in zip(A["task"], bins(A["age"]), absA):
+        tab.setdefault((t, b_), []).append(g_)
+    glob_ = absA.mean(0)
+    absP = np.stack([np.mean(tab[(t, b_)], 0) if (t, b_) in tab else glob_
                      for t, b_ in zip(V["task"], bins(V["age"]))])
-    pe = np.linalg.norm(pred - V["dpos"], axis=1)
+    pe = np.linalg.norm(absP - V["state"][:, :3] - V["dpos"], axis=1)
     out["baseline_task_age"] = dict(pos_err_m=dict(
         mean=float(pe.mean()), median=float(np.median(pe))))
     rs = norms["r_sigma"]
-    var = float((V["rstar"] ** 2).mean())
+    var0 = float((V["rstar"] ** 2).mean())
+    varc = float(((V["rstar"] - V["rstar"].mean(0)) ** 2).mean())
     for name, (m, gk, sfk) in heads.items():
         rr, lo_n, hi_n = [], [], []
         with torch.no_grad():
             for s in range(0, len(V["age"]), 1024):
                 i = np.arange(s, min(s + 1024, len(V["age"])))
-                b = to_t(torch, V, i, dev, ("h18", "a0", sfk) + (
-                    (gk,) if gk else ()))
-                goal = b[gk].float() if gk else None
+                b = to_t(torch, V, i, dev, ("h18", "a0", sfk, gk))
+                goal = b[gk].float()
                 r, _ = m(b["h18"], b["a0"].float(), b[sfk].float(), goal)
                 rr.append(r.cpu().numpy() * rs)
                 if hasattr(m, "parts"):
@@ -238,10 +256,12 @@ def evaluate(torch, goals, heads, norms, V, A, scale, clip, dev):
                                                .reshape(len(i), -1), axis=1))
         r = np.concatenate(rr)
         mse = float(((r - V["rstar"]) ** 2).mean())
-        env = np.linalg.norm((ALPHA * r * scale[:6]).reshape(len(r), -1),
-                             axis=1)
-        e = dict(r_mse=mse, r2=1.0 - mse / max(var, 1e-12),
-                 clip_rate=float((env > clip).mean()))
+        _a, info = km.apply_correction(V["a0"], r / rs, rs, scale, ALPHA,
+                                       clip)
+        e = dict(r_mse=mse, skill_vs_zero=1.0 - mse / max(var0, 1e-12),
+                 r2=1.0 - mse / max(varc, 1e-12),
+                 clip_rate=float(info["clipped"].mean()),
+                 applied_norm_median=float(np.median(info["norm_applied"])))
         if lo_n:
             e["low_norm_median"] = float(np.median(np.concatenate(lo_n)))
             e["high_norm_median"] = float(np.median(np.concatenate(hi_n)))
@@ -253,12 +273,21 @@ def load_inputs(labels, cache, verify=True):
     import k15f_build_cache as kb
     L = dict(np.load(labels, allow_pickle=False))
     meta = json.load(open(labels[:-4] + ".json"))
+    if meta.get("kind") != "k16_labels" or meta.get("problems"):
+        raise SystemExit("разметка K-16 не того вида или с проблемами")
     if sha(labels) != meta["out"]["sha1"]:
         raise SystemExit("разметка K-16 изменена после подготовки")
+    if sha(os.path.join(cache, "manifest.json")) != \
+            meta["h18_manifest_sha1"]:
+        raise SystemExit("кэш h18 не тот, по которому построена разметка")
     c = kb.load_cache(cache, verify_h18=verify)
     for p in kb.PARTS:
         if not np.array_equal(L[f"{p}__rows"], c[p]["rows"]):
             raise SystemExit(f"строки разметки {p} не равны кэшу h18")
+        rs_ = (c[p]["act"][:, :8, :6].astype(np.float64)
+               - c[p]["a0"][:, :8, :6].astype(np.float64))
+        if not np.allclose(L[f"{p}__rstar"], rs_, atol=1e-6):
+            raise SystemExit(f"rstar разметки {p} не равен act − a0 кэша")
     data = {}
     for name, part, key in (("A", "train", "selA"), ("B", "train", "selB"),
                             ("V", "val_sel", "selV")):
@@ -294,7 +323,13 @@ def main():
             return 3
         raise
     dev = torch.device(a.device)
-    goals, heads, rep, norms = train_all(torch, data, dev)
+    try:
+        goals, heads, rep, norms = train_all(torch, data, dev)
+    except SystemExit as e:              # нечисловая ошибка — без чекпойнта
+        if isinstance(e.code, str):
+            print(f"  ОТКАЗ: {e.code}")
+            return 3
+        raise
     scale = pc.harness_scale()
     B = data["B"]
     clip = float(np.percentile(np.linalg.norm(
@@ -311,7 +346,8 @@ def main():
                        cls=type(m).__name__, hidden=rep[k]["hidden"])
                for k, (m, gk, sfk) in heads.items()},
         norms=norms, clip_env_norm=clip, clip_q=CLIP_Q, alpha=ALPHA,
-        n_low=km.N_LOW, seed=SEED,
+        n_low=km.N_LOW, seed=SEED, units=km.UNITS,
+        scale_arm=np.asarray(scale[:6]).tolist(),
         provenance=dict(labels=os.path.abspath(a.labels),
                         labels_sha1=sha(a.labels),
                         h18_manifest_sha1=meta["h18_manifest_sha1"],
@@ -394,7 +430,7 @@ def selftest():
         gb.low[-1].bias += 1.0                             # меняем низкую ветку
     lo2, hi2, _ = gb.parts(None, a0, sf, g)
     assert not torch.allclose(hi, hi2)                     # высокая её видит
-    # параметры голов выровнены
+    # параметры корректоров выровнены (direct — с вектором цели)
     t_, w_ = km.matched_widths(torch, C)
     for k, h in w_.items():
         assert abs(km.n_params(C[k](h)) - t_) <= 0.1 * t_
@@ -413,7 +449,38 @@ def selftest():
     assert heads["goal_band_now"][1] == "pred_goal_now"
     assert heads["goal_flat"][1] == heads["goal_band"][1] == \
         "pred_goal_hist"
-    assert heads["direct"][1] is None and heads["direct"][2] == "sf_hist"
+    assert heads["direct"][1] == "feat_goal_hist" and \
+        heads["direct"][2] == "sf_hist"
+    assert data["B"]["feat_goal_hist"].shape[1] == km.GOAL_HIDDEN
+    # сид до конструктора: одинаковая инициализация при одинаковом сиде
+    m1 = new_model(torch, C["GoalNet"])
+    m2 = new_model(torch, C["GoalNet"])
+    assert all(torch.equal(p1, p2) for p1, p2 in zip(m1.parameters(),
+                                                     m2.parameters()))
+    # нечисловая ошибка — отказ
+    bad = dict(data["A"], dpos=data["A"]["dpos"] * np.nan)
+    try:
+        train_all(torch, dict(A=bad, B=data["B"], V=data["V"]),
+                  torch.device("cpu"), epochs=1, log=lambda *x: None)
+        raise AssertionError("принята нечисловая ошибка")
+    except SystemExit:
+        pass
+    # единицы выхода и предел: один множитель, схват и хвост из a0
+    a0x = np.random.default_rng(1).uniform(-.5, .5, (3, 20, 7)).astype(
+        np.float32)
+    outx = np.ones((3, 8, 6))
+    ax, inf = km.apply_correction(a0x, outx, np.full(6, 0.1),
+                                  np.full(7, 2.0), 0.5, 0.5)
+    raw = 0.5 * 0.1 * 2.0 * np.sqrt(48)
+    assert np.allclose(inf["norm_raw"], raw) and inf["clipped"].all()
+    assert np.allclose(inf["norm_applied"], 0.5)
+    assert np.array_equal(ax[:, :, 6], a0x[:, :, 6])
+    assert np.array_equal(ax[:, 8:], a0x[:, 8:])
+    assert np.allclose(ax[:, :8, :6] - a0x[:, :8, :6],
+                       0.05 * 0.5 / raw * np.ones((3, 8, 6)), atol=1e-6)
+    a0z, _ = km.apply_correction(a0x, np.zeros((3, 8, 6)), np.ones(6),
+                                 np.ones(7), 0.5, 1.0)
+    assert np.array_equal(a0z, a0x)                       # ноль -> a0
     for m, _s in goals.values():
         assert not any(p_.requires_grad for p_ in m.parameters())
     ev = evaluate(torch, goals, heads, norms, data["V"], data["A"],

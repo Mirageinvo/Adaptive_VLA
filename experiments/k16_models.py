@@ -20,13 +20,27 @@ MLP вместе с a0, состоянием, возрастом и истори
 
 КОРРЕКТИРУЮЩИЕ ГОЛОВЫ (поправка руки r [8, 6], единицы кодека):
   direct    те же входы, что у goal_hist (h18, a0, состояние, история),
-            -> r; вспомогательный выход цели (та же разметка, вес AUX);
+            ПЛЮС скрытый вектор замороженного goal_hist (обученного на A;
+            вектор перед последним выходным слоем) -> r; вспомогательный
+            выход цели (та же разметка, вес AUX). Так все варианты имеют
+            доступ к обучению на A: явный геометрический интерфейс цели
+            сравнивается с богатым скрытым представлением того же
+            кодировщика;
   goal_flat ПРЕДСКАЗАННАЯ цель + текущее состояние + a0 -> r;
   goal_band те же входы -> плавная часть (первые 2 коэффициента
             ортонормированного DCT-II по 8 шагам на канал) -> оставшиеся 6
             коэффициентов с учётом ПРЕДСКАЗАНИЯ первой ветки -> обратное
             DCT, сумма частей.
-Число параметров голов выравнивается шириной скрытого слоя (±10%).
+Число параметров корректоров выравнивается шириной скрытого слоя (±10%).
+
+ЕДИНИЦЫ ВЫХОДА КОРРЕКТОРА (одинаково в обучении, анализе и руке):
+  r_codec     = выход × r_sigma            (поправка руки, единицы кодека)
+  delta_codec = α · r_codec                (α = 0.5)
+  delta_exec  = delta_codec × scale_arm    (исполняемые команды)
+  предел: ||delta_exec|| (8 × 6) <= clip; при превышении весь массив
+  умножается на один множитель f = clip / ||delta_exec||, тот же f
+  переносится на delta_codec; a[:8, :6] = a0[:8, :6] + delta_codec,
+  схват и хвост чанка — из a0 (apply_correction).
 """
 import math
 
@@ -37,6 +51,27 @@ HIST_OFFSETS = (8, 16, 24)
 N_LOW = 2
 GOAL_DIM = 3 + 6 + 1 + 3
 AUX = 0.5
+GOAL_HIDDEN = 256
+UNITS = ("r_codec = out*r_sigma; delta_codec = alpha*r_codec; delta_exec = "
+         "delta_codec*scale_arm; clip ||delta_exec||, one factor carried to "
+         "delta_codec; a[:8,:6] = a0[:8,:6] + delta_codec; grip/tail = a0")
+
+
+def apply_correction(a0, out, r_sigma, scale, alpha, clip):
+    """a0 [B, T, 7] (кодек), out [B, 8, 6] (выход корректора) -> (a,
+    сведения). Схват и хвост — из a0."""
+    a0 = np.asarray(a0, np.float32)
+    r_codec = np.asarray(out, np.float64) * np.asarray(r_sigma, np.float64)
+    d_codec = alpha * r_codec
+    d_exec = d_codec * np.asarray(scale, np.float64)[:6]
+    n_raw = np.linalg.norm(d_exec.reshape(len(d_exec), -1), axis=1)
+    f = np.minimum(1.0, clip / np.maximum(n_raw, 1e-12))
+    d_codec = d_codec * f[:, None, None]
+    a = a0.copy()
+    a[:, :H, :6] = (a0[:, :H, :6].astype(np.float64) + d_codec).astype(
+        np.float32)
+    return a, dict(norm_raw=n_raw, norm_applied=n_raw * f, factor=f,
+                   clipped=f < 1.0, d_codec=d_codec.astype(np.float32))
 
 
 # --- геометрия (numpy и torch) ---------------------------------------------
@@ -112,31 +147,40 @@ def build(torch):
         return nn.Sequential(*layers)
 
     class GoalNet(nn.Module):
-        """h18, a0, признаки состояния -> цель (GOAL_DIM)."""
+        """h18, a0, признаки состояния -> цель (GOAL_DIM); hidden() —
+        вектор перед последним выходным слоем."""
 
-        def __init__(self, hidden=256):
+        def __init__(self, hidden=GOAL_HIDDEN):
             super().__init__()
             self.enc = H18Enc()
             self.body = mlp(self.enc.out_dim + H * 7 + STATE_FEAT, hidden,
                             GOAL_DIM)
 
-        def forward(self, h18, a0, sf):
+        def hidden(self, h18, a0, sf):
             x = torch.cat([self.enc(h18), a0.flatten(1), sf], 1)
-            return self.body(x)
+            return self.body[:-1](x)
+
+        def forward(self, h18, a0, sf):
+            return self.body[-1](self.hidden(h18, a0, sf))
 
     class Direct(nn.Module):
-        """Прямая голова: богатые входы -> r [8, 6]; вспомогательная цель."""
+        """Прямая голова: богатые входы + скрытый вектор замороженного
+        goal_hist (goal = этот вектор) -> r [8, 6]; вспомогательная цель."""
 
-        def __init__(self, hidden=256):
+        def __init__(self, hidden=256, gfeat=GOAL_HIDDEN):
             super().__init__()
             self.enc = H18Enc()
-            d = self.enc.out_dim + H * 7 + STATE_FEAT
+            self.gfeat = gfeat
+            d = self.enc.out_dim + H * 7 + STATE_FEAT + gfeat
             self.trunk = mlp(d, hidden, hidden, depth=1)
             self.r = nn.Sequential(nn.GELU(), nn.Linear(hidden, H * N_ARM))
             self.aux = nn.Sequential(nn.GELU(), nn.Linear(hidden, GOAL_DIM))
 
         def forward(self, h18, a0, sf, goal=None):
-            z = self.trunk(torch.cat([self.enc(h18), a0.flatten(1), sf], 1))
+            parts = [self.enc(h18), a0.flatten(1), sf]
+            if self.gfeat:
+                parts.append(goal)
+            z = self.trunk(torch.cat(parts, 1))
             return self.r(z).view(-1, H, N_ARM), self.aux(z)
 
     def goal_in(goal, sf, a0):
@@ -190,12 +234,13 @@ def n_params(m):
     return sum(p.numel() for p in m.parameters())
 
 
-def matched_widths(torch, cls, direct_hidden=256, tol=0.10):
-    """Ширины goal_flat / goal_band, при которых число параметров в
-    пределах tol от прямой головы."""
-    target = n_params(cls["Direct"](direct_hidden))
+def matched_widths(torch, cls, tol=0.10):
+    """Бюджет корректора — прежняя прямая голова (ширина 256, без вектора
+    цели). Ширины goal_flat, goal_band и direct (с вектором goal_hist)
+    подбираются под него в пределах tol."""
+    target = n_params(cls["Direct"](256, gfeat=0))
     out = {}
-    for name in ("GoalFlat", "GoalBand"):
+    for name in ("GoalFlat", "GoalBand", "Direct"):
         best = None
         for h in range(64, 2049, 8):
             n = n_params(cls[name](h))
