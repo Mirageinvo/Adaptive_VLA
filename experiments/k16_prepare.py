@@ -19,13 +19,16 @@ val_confirm не открывается.
 инвертирован, обрезка [-1, 1]) воспроизводит act кэша h18.
 
 РАЗМЕТКА строки (эпизод e, индекс полного эпизода t):
-  событие   ближайшее УСТОЙЧИВОЕ переключение команды схвата после t
-            (новый знак держится ≥ 2 последовательных команд; первый
-            ненулевой знак — начальный режим; ноль сохраняет знак); если
-            дальше переключений нет — настоящий конец демонстрации;
-  цель      Δpos = pos[s] − pos[t] (мировые оси), Δrot = R_t^T R_s в
-            axis-angle (через матрицы вращения), команда схвата после
-            события, тип: закрыть / открыть / конец; шагов до события;
+  событие   наблюдение t записано ДО исполнения команды t; ближайшее
+            УСТОЙЧИВОЕ переключение команды схвата j >= t (новый знак
+            держится ≥ 2 последовательных команд; первый ненулевой знак —
+            начальный режим; ноль сохраняет знак); состояние цели —
+            state[j + 1]; без переключений — последнее записанное
+            состояние; индексы команды и состояния хранятся отдельно;
+  цель      Δpos = pos[цель] − pos[t] (мировые оси), относительное
+            вращение R_t^T R_цель в непрерывном 6D (два первых столбца;
+            axis-angle — только диагностика), команда схвата после
+            события, тип: закрыть / открыть / конец; команд до события;
   поправка  r* = act[:8, :6] − a0[:8, :6] (единицы кодека), только если у
             строки 8 настоящих будущих действий (t + 8 <= длина);
   история   состояния в t, t−8, t−16, t−24 (шаг — 8 команд = один вызов
@@ -98,14 +101,45 @@ def mat_to_aa(R):
             for j_ in range(3):
                 if j_ != i0:
                     a[j_] = (Rf[n_, i0, j_] + Rf[n_, j_, i0]) / (4 * a[i0])
-            out[n_] = a / np.linalg.norm(a) * t_
+            a = a / np.linalg.norm(a)
+            if a @ w[n_] < 0:             # знак оси — по антисимметричной части
+                a = -a
+            out[n_] = a * t_
     return out.reshape(shp + (3,))
 
 
-def rel_rot(aa_from, aa_to):
-    """Относительное вращение R_from^T R_to в axis-angle."""
+def rel_mat(aa_from, aa_to):
+    """Относительное вращение R_from^T R_to (матрица)."""
     Rf, Rt = aa_to_mat(aa_from), aa_to_mat(aa_to)
-    return mat_to_aa(np.swapaxes(Rf, -1, -2) @ Rt)
+    return np.swapaxes(Rf, -1, -2) @ Rt
+
+
+def rel_rot(aa_from, aa_to):
+    """Относительное вращение в axis-angle (только диагностика)."""
+    return mat_to_aa(rel_mat(aa_from, aa_to))
+
+
+def mat_to_6d(R):
+    """Непрерывное 6D: первые два СТОЛБЦА матрицы, [c0 (3), c1 (3)]."""
+    R = np.asarray(R, np.float64)
+    return np.concatenate([R[..., :, 0], R[..., :, 1]], -1)
+
+
+def sixd_to_mat(x):
+    """6D -> матрица (Грам — Шмидт)."""
+    x = np.asarray(x, np.float64)
+    a, b = x[..., :3], x[..., 3:]
+    c0 = a / np.linalg.norm(a, axis=-1, keepdims=True)
+    b = b - (c0 * b).sum(-1, keepdims=True) * c0
+    c1 = b / np.linalg.norm(b, axis=-1, keepdims=True)
+    return np.stack([c0, c1, np.cross(c0, c1)], -1)
+
+
+def rot_angle(Ra, Rb):
+    """Угол между вращениями (рад)."""
+    M = np.swapaxes(Ra, -1, -2) @ Rb
+    return np.arccos(np.clip((np.trace(M, axis1=-2, axis2=-1) - 1) / 2,
+                             -1, 1))
 
 
 # --- переключения и события ------------------------------------------------------
@@ -133,12 +167,17 @@ def stable_switches(grip, k=STABLE):
 
 
 def next_event(switches, grip, t, L):
-    """(индекс события, тип, команда схвата после) для строки t."""
+    """Для наблюдения t (записано ДО исполнения команды t): (индекс команды
+    события j, индекс состояния цели, тип, команда схвата после).
+    Ближайшее переключение j >= t; цель — state[j + 1] (после команды
+    события; устойчивость гарантирует j + 1 < L). Нет переключений —
+    последнее записанное состояние, команда — последняя."""
     s = sign_seq(grip)
-    for i in switches:
-        if i > t:
-            return i, (EVENT_CLOSE if s[i] > 0 else EVENT_OPEN), int(s[i])
-    return L - 1, EVENT_END, int(s[L - 1])
+    for j in switches:
+        if j >= t:
+            return (j, j + 1, (EVENT_CLOSE if s[j] > 0 else EVENT_OPEN),
+                    int(s[j]))
+    return L - 1, L - 1, EVENT_END, int(s[L - 1])
 
 
 def codec_norm(actions, scale):
@@ -156,13 +195,16 @@ def label_episode(S, A, rows_t, scale):
     sw = stable_switches(A[:, 6])
     out = collections.defaultdict(list)
     for t in rows_t:
-        s, typ, g = next_event(sw, A[:, 6], int(t), L)
-        out["event_idx"].append(s)
+        j, s, typ, g = next_event(sw, A[:, 6], int(t), L)
+        out["event_cmd_idx"].append(j)
+        out["event_state_idx"].append(s)
         out["event_type"].append(typ)
         out["event_grip"].append(g)
-        out["steps_to_event"].append(s - int(t))
+        out["steps_to_event"].append(j - int(t))
         out["dpos"].append(S[s, :3] - S[t, :3])
-        out["drot"].append(rel_rot(S[t, 3:6], S[s, 3:6]))
+        Rm = rel_mat(S[t, 3:6], S[s, 3:6])
+        out["drot6d"].append(mat_to_6d(Rm))
+        out["drot_aa"].append(mat_to_aa(Rm))
         hist, mask = [], []
         for d in HIST:
             if t - d >= 0:
@@ -227,6 +269,33 @@ def read_episode(repo, rev, e):
                 ts=np.asarray(t.column("timestamp").to_pylist(), np.float64))
 
 
+def episode_problems(ep, need_idx, e):
+    """Полный эпизод пригоден: формы, индексы кадров 0..L-1, конечность,
+    возрастающее время, запрошенные индексы внутри эпизода."""
+    p = []
+    S, A_ = ep["S"], ep["A"]
+    frame = np.asarray(ep["frame"]).reshape(-1)
+    ts = np.asarray(ep["ts"], np.float64).reshape(-1)
+    L = len(S)
+    if S.ndim != 2 or S.shape[1] != 8:
+        p.append(f"эпизод {e}: состояния формы {S.shape}")
+    if A_.shape != (L, 7):
+        p.append(f"эпизод {e}: действия формы {A_.shape}, ожидалось "
+                 f"({L}, 7)")
+    if not np.issubdtype(frame.dtype, np.integer) or \
+            not np.array_equal(frame, np.arange(L)):
+        p.append(f"эпизод {e}: frame_index не равен 0..{L - 1}")
+    if len(ts) != L or not (np.isfinite(S).all() and np.isfinite(A_).all()
+                            and np.isfinite(ts).all()):
+        p.append(f"эпизод {e}: нет конечных состояний/действий/времени")
+    elif L > 1 and not (np.diff(ts) > 0).all():
+        p.append(f"эпизод {e}: время не возрастает")
+    need = np.asarray(need_idx).reshape(-1)
+    if len(need) and (need.min() < 0 or need.max() >= L):
+        p.append(f"эпизод {e}: запрошенные индексы вне [0, {L - 1}]")
+    return p
+
+
 def pilot_tasks():
     """Формулировки 10 задач LIBERO-10 (пилот)."""
     from libero.libero import benchmark
@@ -268,8 +337,12 @@ def main_prepare(a):
     for j, e in enumerate(eps_all):
         ep = read_episode(repo, rev, e)
         L = len(ep["S"])
-        if not (np.diff(ep["frame"]) == 1).all() or ep["frame"][0] != 0:
-            problems.append(f"эпизод {e}: frame_index не непрерывен")
+        need = np.concatenate([parts[p]["step"][parts[p]["epi"] == e]
+                               for p in kb.PARTS])
+        pe = episode_problems(ep, need, e)
+        if pe:
+            problems += pe
+            continue
         for p in kb.PARTS:
             m = np.nonzero(parts[p]["epi"] == e)[0]
             if not len(m):
@@ -288,9 +361,10 @@ def main_prepare(a):
                     break
             lab, sw = label_episode(ep["S"], ep["A"], ts_, scale)
             labels.setdefault(p, []).append((m, lab))
-        ep_info[e] = dict(len=L, ts0=float(ep["ts"][0]),
-                          dt=float(np.median(np.diff(ep["ts"]))) if L > 1
-                          else None)
+        dts = np.diff(np.asarray(ep["ts"]).reshape(-1))
+        ep_info[e] = dict(len=L, dt=float(np.median(dts)) if L > 1 else None,
+                          dt_min=float(dts.min()) if L > 1 else None,
+                          dt_max=float(dts.max()) if L > 1 else None)
         if j % 200 == 0:
             print(f"  эпизодов {j}/{len(eps_all)}", flush=True)
     if problems:
@@ -333,6 +407,7 @@ def main_prepare(a):
     for p in kb.PARTS:
         for k, v in out[p].items():
             arrays[f"{p}__{k}"] = v
+        arrays[f"{p}__rows"] = parts[p]["rows"]
         arrays[f"{p}__epi"] = parts[p]["epi"]
         arrays[f"{p}__step"] = parts[p]["step"]
         arrays[f"{p}__task"] = parts[p]["task"]
@@ -355,8 +430,23 @@ def main_prepare(a):
             val_sel=int((~out["val_sel"]["full8"].astype(bool)).sum())),
         events_A={["закрыть", "открыть", "конец"][k]: int(v)
                   for k, v in sorted(ev.items())},
-        timestamp_step=dict(collections.Counter(
-            round(v["dt"], 4) for v in ep_info.values() if v["dt"])),
+        timestamp_step=dict(
+            median_counts=dict(collections.Counter(
+                round(v["dt"], 4) for v in ep_info.values() if v["dt"])),
+            min=min(v["dt_min"] for v in ep_info.values() if v["dt_min"]),
+            max=max(v["dt_max"] for v in ep_info.values() if v["dt_max"])),
+        conventions=dict(
+            observation="наблюдение t записано ДО исполнения команды t",
+            event="ближайшее устойчивое переключение команды j >= t",
+            goal_state="state[j + 1] (после команды события); без "
+                       "переключений — последнее записанное состояние",
+            rotation="относительное R_t^T R_goal в 6D (два первых "
+                     "столбца); axis-angle — только диагностика; ошибка "
+                     "ориентации — угол между матрицами"),
+        inputs=["h18", "a0", "hist", "hist_mask", "age"],
+        labels_not_inputs=["event_cmd_idx", "event_state_idx",
+                           "steps_to_event", "ep_len", "dpos", "drot6d",
+                           "drot_aa", "event_type", "event_grip"],
         problems=problems,
         out=dict(path=os.path.abspath(a.out),
                  sha1=hashlib.sha1(open(a.out, "rb").read()).hexdigest()),
@@ -391,6 +481,14 @@ def selftest():
     r = rel_rot(a1, a2)
     assert np.allclose(aa_to_mat(a1) @ aa_to_mat(r), aa_to_mat(a2),
                        atol=1e-6)
+    # около π с отрицательной осью: восстановление матрицы точное
+    vn = np.array([0.0, -1.0, 0.0]) * (np.pi - 9e-5)
+    assert np.abs(aa_to_mat(mat_to_aa(aa_to_mat(vn))) - aa_to_mat(vn)
+                  ).max() < 1e-7
+    # 6D: туда-обратно и угол между матрицами
+    Rr = aa_to_mat(rng.standard_normal((10, 3)))
+    assert np.allclose(sixd_to_mat(mat_to_6d(Rr)), Rr, atol=1e-9)
+    assert np.allclose(rot_angle(Rr, Rr), 0, atol=1e-6)
     # углы, разные по знаку около π, — близкие вращения
     p1, p2 = np.array([3.1, 0, 0]), np.array([-3.1, 0, 0])
     assert np.linalg.norm(rel_rot(p1, p2)) < 0.1
@@ -399,9 +497,11 @@ def selftest():
     g = np.array([0, -1, -1, -1, 1, 1, 1, -1, 1, 1, -1, -1])
     sw = stable_switches(g)
     assert sw == [4, 10], sw                     # 7 — одиночный всплеск
-    assert next_event(sw, g, 2, 12) == (4, EVENT_CLOSE, 1)
-    assert next_event(sw, g, 4, 12) == (10, EVENT_OPEN, -1)
-    assert next_event(sw, g, 10, 12) == (11, EVENT_END, -1)
+    # перед переключением, на нём, после
+    assert next_event(sw, g, 3, 12) == (4, 5, EVENT_CLOSE, 1)
+    assert next_event(sw, g, 4, 12) == (4, 5, EVENT_CLOSE, 1)
+    assert next_event(sw, g, 5, 12) == (10, 11, EVENT_OPEN, -1)
+    assert next_event(sw, g, 11, 12) == (11, 11, EVENT_END, -1)
     # разметка эпизода: цель, история, хвост
     L = 30
     S = np.zeros((L, 8))
@@ -411,13 +511,29 @@ def selftest():
     A[:, 6] = -1
     A[12:, 6] = 1
     lab, _sw = label_episode(S, A, np.array([5, 20, 25]), np.ones(7))
-    assert lab["event_idx"].tolist() == [12, 29, 29]
-    assert np.isclose(lab["dpos"][0, 0], 0.07)
+    assert lab["event_cmd_idx"].tolist() == [12, 29, 29]
+    assert lab["event_state_idx"].tolist() == [13, 29, 29]
+    assert np.isclose(lab["dpos"][0, 0], 0.08)
+    assert lab["drot6d"].shape == (3, 6)
     assert lab["hist_mask"].tolist() == [[True, False, False, False],
                                          [True, True, True, False],
                                          [True, True, True, True]]
     assert np.allclose(lab["hist"][1, 1], S[12])
     assert lab["full8"].tolist() == [True, True, False]
+    # проверка полного эпизода
+    good = dict(S=np.zeros((5, 8)), A=np.zeros((5, 7)),
+                frame=np.arange(5).reshape(5, 1),
+                ts=np.arange(5) * 0.1)
+    assert episode_problems(good, [0, 4], 0) == []
+    for mut, word in ((dict(frame=np.array([[0], [2], [4], [6], [8]])),
+                       "frame_index"),
+                      (dict(frame=np.arange(5) * 1.0), "frame_index"),
+                      (dict(A=np.zeros((5, 6))), "действия"),
+                      (dict(ts=np.array([0, .1, .1, .3, .4])), "время"),
+                      (dict(S=np.full((5, 8), np.nan)), "конечных")):
+        pr_ = episode_problems(dict(good, **mut), [0], 0)
+        assert any(word in x for x in pr_), (mut, pr_)
+    assert episode_problems(good, [5], 0)          # индекс вне эпизода
     # нормировка кодека
     sc = np.array([0.5] * 6 + [1.0])
     x = codec_norm(np.array([[0.25, 0, 0, 0, 0, 1.0, -1.0]]), sc)
@@ -457,7 +573,13 @@ def main():
     a = ap.parse_args()
     if a.selftest:
         return selftest()
-    return main_prepare(a)
+    try:
+        return main_prepare(a)
+    except SystemExit as e:               # технический отказ — код 3
+        if isinstance(e.code, str):
+            print(f"  ОТКАЗ: {e.code}")
+            return 3
+        raise
 
 
 if __name__ == "__main__":
