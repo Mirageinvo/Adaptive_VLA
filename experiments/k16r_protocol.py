@@ -61,9 +61,20 @@ def make_plan(device):
         for lab in ("q0", BASE):
             refs[f"{lab}_t{t}"] = os.path.join(
                 run16, f"{lab}_t{t}_i{plan16['block']}.json")
-    for v in refs.values():
+    import k15g_local_probe as pr
+    for key, v in list(refs.items()):
         if not os.path.exists(v):
             raise SystemExit(f"нет блока K-16 {v}")
+        lab, t = key.rsplit("_t", 1)
+        prob = p16.check_block(plan16, PLAN16, v, lab, int(t), os.path.join(
+            run16, f"q0_t{t}_i{plan16['block']}.json"))
+        prob += pr.validate_block(v, lab, int(t), plan16["block"],
+                                  require_single=True, setup=plan16["setup"])
+        if prob:
+            raise SystemExit(f"блок K-16 {v} не прошёл проверку: {prob[:2]}")
+        d = json.load(open(v))
+        refs[key + "__npz"] = os.path.join(os.path.dirname(v),
+                                           d["actions_npz"])
     contract = dict(plan16["expected_contract"])
     contract["harness_adapter_sha1"] = sha(os.path.join(HERE,
                                                         "k16r_harness.py"))
@@ -98,6 +109,9 @@ def check_plan_inputs(plan):
         for k, f in plan[grp].items():
             if not os.path.exists(f) or sha(f) != plan[f"{grp}_sha1"][k]:
                 p.append(f"{grp} {k} изменён или отсутствует ({f})")
+    want = {k + "__npz" for k in plan["refs"] if not k.endswith("__npz")}
+    if not want <= set(plan["refs"]):
+        p.append("в плане не зафиксированы npz эталонных блоков")
     for f, s_ in plan["code"].items():
         if sha(os.path.join(HERE, f)) != s_:
             p.append(f"код {f} изменён после плана")
@@ -118,8 +132,15 @@ def rotation_problems(label, z, plan, task, zb, scale):
             p.append(f"{label}: матрицы среды {b} не по сиду")
     imp, impb = np.asarray(z["k16_impulse"], bool), \
         np.asarray(zb["k16_impulse"], bool)
-    if not np.array_equal(imp, impb):
-        p.append(f"{label}: места импульсов не равны learned K-16")
+    # номера вызовов импульса ПО СРЕДЕ (длина журналов может различаться:
+    # после вмешательства среды завершаются в разные вызовы)
+    for b in range(imp.shape[1]):
+        c1 = np.nonzero(imp[:, b])[0].tolist()
+        c2 = np.nonzero(impb[:, b])[0].tolist()
+        if c1 != c2:
+            p.append(f"{label}: среда {b}: импульсы {[c + 1 for c in c1]}, "
+                     f"у learned K-16 {[c + 1 for c in c2]}")
+    if p:
         return p
     for k, b in zip(*np.nonzero(imp)):
         if not np.allclose(z["k16_d_codec_orig"][k, b],
@@ -213,6 +234,43 @@ def selftest():
     imp2[1, 0] = True
     assert rotation_problems(lab, z, plan, 3, dict(zb, k16_impulse=imp2),
                              scale)
+    # более длинный хвост у любой стороны — допустимо
+    def pad(zz, n):
+        out = dict(zz)
+        for k in ("k16_impulse", "k16_d_codec", "k16_d_codec_orig"):
+            if k in zz:
+                x = np.asarray(zz[k])
+                fill = False if x.dtype == bool else np.nan
+                out[k] = np.concatenate([x, np.full((n,) + x.shape[1:], fill,
+                                                    x.dtype)])
+        return out
+    assert rotation_problems(lab, pad(z, 2), plan, 3, zb, scale) == []
+    assert rotation_problems(lab, z, plan, 3, pad(zb, 3), scale) == []
+    # перенос импульса, пропуск, второй импульс — отказ
+    for mut in ("move", "drop", "second"):
+        ib = imp.copy()
+        if mut == "move":
+            ib[2, 1], ib[1, 1] = False, True
+        elif mut == "drop":
+            ib[2, 1] = False
+        else:
+            ib[3, 1] = True
+        assert rotation_problems(lab, z, plan, 3, dict(zb, k16_impulse=ib),
+                                 scale), mut
+    # npz эталона изменён при неизменном JSON — check_plan_inputs отвергает
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        js, nz = os.path.join(td, "a.json"), os.path.join(td, "a.npz")
+        open(js, "w").write("{}")
+        open(nz, "wb").write(b"1")
+        pl = dict(kind=KIND, inputs={}, inputs_sha1={}, code={},
+                  refs={"q0_t0": js, "q0_t0__npz": nz},
+                  refs_sha1={"q0_t0": sha(js), "q0_t0__npz": sha(nz)})
+        assert check_plan_inputs(pl) == []
+        open(nz, "wb").write(b"2")
+        assert check_plan_inputs(pl)
+        pl2 = dict(pl, refs={"q0_t0": js}, refs_sha1={"q0_t0": sha(js)})
+        assert any("npz" in x for x in check_plan_inputs(pl2))
     print("самопроверка k16r_protocol пройдена: матрицы по сиду, исходная "
           "δ и места = learned K-16, применённая = повёрнутая")
     return 0

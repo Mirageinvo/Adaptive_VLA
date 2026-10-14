@@ -72,6 +72,7 @@ def build_arm(device, basis, label, torch, *, models_path, plan_sha1,
     ck = torch.load(models_path, map_location="cpu", weights_only=False)
     scale = np.asarray(ck["scale_arm"], np.float64)
     inner, log = arm.act, arm.log
+    kp_bound = kp.ACTION_CLIP_BOUND
     log.label = label
 
     def act(batch, pos_off, autocast, first):
@@ -93,6 +94,13 @@ def build_arm(device, basis, label, torch, *, models_path, plan_sha1,
         log.rows["d_codec_orig"].append(d_orig)
         if (~imp).any() and not np.array_equal(a[~imp][:, :H], a0[~imp]):
             raise SystemExit("рука k16r: без импульса действие не равно a0")
+        # после поворота — те же проверки допустимого действия, что у K-16
+        # (обрезание изменило бы задуманный контроль: технический отказ)
+        if not np.isfinite(a).all():
+            raise SystemExit("рука k16r: действие не конечно после поворота")
+        if float(np.abs(a[:, :H]).max()) > kp_bound:
+            raise SystemExit(f"рука k16r: |действие| выше {kp_bound} после "
+                             f"поворота")
         for b in np.nonzero(imp)[0]:          # нормы шагов сохранены
             e0, e1 = d_orig[b] * scale, d_rot[b] * scale
             for g in (slice(0, 3), slice(3, 6)):
@@ -201,6 +209,35 @@ def _wrapper_test():
     assert np.array_equal(lv[..., 6], a0[..., 6])
     assert np.array_equal(outs[1][:, :H], lv[1])
     assert z["k16_rot_pos"].shape == (3, 3, 3)
+    # после поворота действие вне предела — технический отказ
+    big = (np.ones((H, 6)) * 5.0).astype(np.float32)
+    log2 = kp.K16Log(BASE)
+
+    def fake2(batch, pos_off, autocast, first):
+        a0 = a0s[0]
+        imp = np.array([True, False, False])
+        dc = np.full((B, H, 6), np.nan, np.float32)
+        dc[0] = big
+        a = a0.copy()
+        log2.add(a0=a0[:, :H], act=a[:, :H], chunk=1, impulse=imp,
+                 d_codec=dc)
+        return a, np.zeros((B, 4))
+    kp.build_arm = lambda *a_, **k_: SimpleNamespace(
+        act=fake2, log=log2, meta=dict(model_fingerprint="x"))
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            mp = os.path.join(td, "m.pt")
+            torch.save(dict(scale_arm=[0.9] * 6), mp)
+            arm = build_arm("cpu", "b", "goal_band_rot_s1", torch,
+                            models_path=mp, plan_sha1="P", task=3,
+                            states=[25, 26, 27])
+            try:
+                arm.act(None, 0, None, True)
+                raise AssertionError("принято действие вне предела")
+            except SystemExit as e:
+                assert "выше" in str(e)
+    finally:
+        kp.build_arm = saved
 
 
 if __name__ == "__main__":
