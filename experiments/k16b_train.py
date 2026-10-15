@@ -60,11 +60,12 @@ def build_heads(torch, d_model=768, n_pos=16):
             self.enc = C["GoalNet"]().enc.__class__()
             d = (self.enc.out_dim + km.H * 7 + km.STATE_FEAT
                  + km.GOAL_HIDDEN + (km.GOAL_DIM if use_goal else 0))
-            self.trunk = nn.Sequential(nn.Linear(d, hidden), nn.GELU())
-            self.r = nn.Sequential(nn.GELU(), nn.Linear(hidden,
-                                                        km.H * km.N_ARM))
-            self.aux = nn.Sequential(nn.GELU(), nn.Linear(hidden,
-                                                          km.GOAL_DIM))
+            # как у Direct K-16: Linear -> GELU -> Linear -> GELU, затем
+            # отдельные линейные выходы поправки и вспомогательной цели
+            self.trunk = nn.Sequential(nn.Linear(d, hidden), nn.GELU(),
+                                       nn.Linear(hidden, hidden), nn.GELU())
+            self.r = nn.Linear(hidden, km.H * km.N_ARM)
+            self.aux = nn.Linear(hidden, km.GOAL_DIM)
 
         def forward(self, h18, a0, sf, goal):
             """goal: [feat (GOAL_HIDDEN) | предсказанная цель (GOAL_DIM)]."""
@@ -98,11 +99,15 @@ def add_goal_inputs(torch, goal_hist, D, dev):
                                 1).astype(np.float32)
 
 
-def train_heads(torch, B, V, dev, d_model, n_pos, epochs=None, log=print):
+def train_heads(torch, B, V, dev, d_model, n_pos, dpos_sigma_k16,
+                epochs=None, log=print):
+    """dpos_sigma_k16 — масштаб положения цели из K-16 (половина A): в нём
+    обучен замороженный goal_hist; вспомогательная ошибка, оценка и
+    сохранение используют его же."""
     import k16_train as kt
     epochs = epochs or kt.EPOCHS
     _C, CtxHead = build_heads(torch, d_model, n_pos)
-    dpos_sigma = torch.tensor(np.maximum(B["dpos"].std(0), 1e-4),
+    dpos_sigma = torch.tensor(np.asarray(dpos_sigma_k16, np.float64),
                               dtype=torch.float32, device=dev)
     r_sigma = torch.tensor(np.maximum(B["rstar"].reshape(-1, 6).std(0),
                                       1e-5), dtype=torch.float32, device=dev)
@@ -162,12 +167,17 @@ def main():
         for D in (B, V):
             add_goal_inputs(torch, gh, D, dev)
         d_model, n_pos = int(B["h18"].shape[2]), int(B["h18"].shape[1])
-        heads, rep, norms = train_heads(torch, B, V, dev, d_model, n_pos)
+        heads, rep, norms = train_heads(torch, B, V, dev, d_model, n_pos,
+                                        ck16["norms"]["dpos_sigma"])
     except SystemExit as e:
         if isinstance(e.code, str):
             print(f"  ОТКАЗ: {e.code}")
             return 3
         raise
+    if not np.allclose(norms["dpos_sigma"], ck16["norms"]["dpos_sigma"],
+                       rtol=1e-6):
+        print("  ОТКАЗ: масштаб положения цели не равен K-16")
+        return 3
     if not np.allclose(norms["r_sigma"], ck16["norms"]["r_sigma"],
                        rtol=1e-5):
         print("  ОТКАЗ: нормировка поправки не равна K-16 (другая B?)")
@@ -220,10 +230,19 @@ def selftest():
     for D in (B, V):
         add_goal_inputs(torch, gh, D, torch.device("cpu"))
         assert D["ctxin"].shape[1] == km.GOAL_HIDDEN + km.GOAL_DIM
-    heads, rep, _n = train_heads(torch, B, V, torch.device("cpu"), 768, 16,
-                                 epochs=2, log=lambda *x: None)
+    # масштаб A намеренно отличается от B: сохраняется именно масштаб K-16
+    sig_a = np.array([0.3, 0.05, 0.02])
+    heads, rep, nrm = train_heads(torch, B, V, torch.device("cpu"), 768, 16,
+                                  sig_a, epochs=2, log=lambda *x: None)
+    assert np.allclose(nrm["dpos_sigma"], sig_a)
+    assert not np.allclose(nrm["dpos_sigma"], B["dpos"].std(0))
+    g = B["pred_goal_hist"][:3, :3]
+    assert np.allclose(g * nrm["dpos_sigma"], g * sig_a)   # метры как в K-16
     pc, pg = rep["ctx"]["params"], rep["ctx_goal"]["params"]
     assert pg > pc and (pg - pc) / pc < 0.02
+    Cd = km.build(torch)
+    nd = km.n_params(Cd["Direct"](HIDDEN))
+    assert pc == nd, (pc, nd)                     # = Direct K-16 (208)
     # ctx не видит явную цель: изменение её части входа не меняет выход
     m = heads["ctx"][0]
     x = torch.tensor(B["ctxin"][:4])
