@@ -48,6 +48,38 @@ def sha(p):
     return hashlib.sha1(open(p, "rb").read()).hexdigest()[:12]
 
 
+def full_sha(p):
+    return hashlib.sha1(open(p, "rb").read()).hexdigest()
+
+
+def provenance_problems(prov):
+    """Происхождение весов: разметка, исходный K-16 и файлы обучения —
+    те же, что записаны в чекпойнте K-16u."""
+    p = []
+    for k in ("labels", "k16_models"):
+        f = prov.get(k)
+        if not f or not os.path.exists(f) or full_sha(f) != prov.get(
+                k + "_sha1"):
+            p.append(f"происхождение: {k} не совпадает с обучением ({f})")
+    code = prov.get("code") or {}
+    if not code:
+        p.append("происхождение: нет отпечатков кода обучения")
+    for f, s_ in code.items():
+        fp = os.path.join(HERE, f)
+        if not os.path.exists(fp) or full_sha(fp) != s_:
+            p.append(f"происхождение: код обучения {f} изменён")
+    return p
+
+
+def reserve_problems(inv):
+    """Резерв 45–49 не использован ни в одной задаче (по инвентаризации
+    на момент её создания — не полный аудит последующих запусков)."""
+    bad = {t: sorted(int(x) for x in v if 45 <= int(x) <= 49)
+           for t, v in inv["used"].items()}
+    bad = {t: v for t, v in bad.items() if v}
+    return [f"резерв 45–49 использован: {bad}"] if bad else []
+
+
 def make_plan(*, models, train_report, basis, identity, device):
     import k15g_local_probe as pr
     import k15h_protocol as hpc
@@ -58,6 +90,9 @@ def make_plan(*, models, train_report, basis, identity, device):
     if rep["models"]["sha1"] != hashlib.sha1(open(models, "rb").read()
                                              ).hexdigest():
         raise SystemExit("отчёт обучения не от этого чекпойнта")
+    prob = provenance_problems(ck["provenance"])
+    if prob:
+        raise SystemExit("; ".join(prob[:4]))
     # файлы стартов LIBERO — по инвентаризации K-15h (полный SHA1)
     inv = json.load(open("reports/k15h/inventory.json"))
     refs = {}
@@ -67,9 +102,9 @@ def make_plan(*, models, train_report, basis, identity, device):
                 .hexdigest() != v["sha1"]:
             raise SystemExit(f"файл стартов задачи {t} изменён: {f}")
         refs[f"init_t{t}"] = f
-    used = {int(s_) for s_ in inv["used"]["0"]}
-    if any(s_ in used for s_ in range(45, 50)):
-        raise SystemExit("резерв 45–49 уже использован")
+    prob = reserve_problems(inv)
+    if prob:
+        raise SystemExit(prob[0])
     contract = hpc.expected_contract(basis, identity)
     contract.pop("k15h_policy_sha1", None)
     contract.update(
@@ -96,6 +131,7 @@ def make_plan(*, models, train_report, basis, identity, device):
         refs={k: os.path.abspath(v) for k, v in refs.items()},
         refs_sha1={k: sha(v) for k, v in refs.items()},
         code={f: sha(os.path.join(HERE, f)) for f in CODE},
+        training_provenance=ck["provenance"],
         note=("K-16u: режим обучения пары G+C; блок 40 не участвовал в "
               "K-16, но использовался в старых ветках проекта"))
 
@@ -111,6 +147,11 @@ def check_plan_inputs(plan):
     for f, s_ in plan["code"].items():
         if sha(os.path.join(HERE, f)) != s_:
             p.append(f"код {f} изменён после плана")
+    prov = plan.get("training_provenance")
+    if not prov:
+        p.append("в плане нет происхождения весов")
+    else:
+        p += provenance_problems(prov)
     return p
 
 
@@ -176,6 +217,25 @@ def selftest():
     import k16u_policy as up
     assert set(MAP) == set(up.LABELS)
     assert all(MAP[k] == "goal_band_hist_event" for k in MAP if k != "q0")
+    # резерв: состояние 45 только в задаче 7 — отказ
+    inv = dict(used={str(t): list(range(45)) for t in range(10)})
+    assert reserve_problems(inv) == []
+    inv["used"]["7"] = list(range(46))
+    assert reserve_problems(inv)
+    # происхождение весов: несовпадающие отпечатки — отказ
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        lab, k16 = os.path.join(td, "l.npz"), os.path.join(td, "m.pt")
+        open(lab, "w").write("L")
+        open(k16, "w").write("M")
+        f0 = "k16u_models.py"
+        good = dict(labels=lab, labels_sha1=full_sha(lab), k16_models=k16,
+                    k16_models_sha1=full_sha(k16),
+                    code={f0: full_sha(os.path.join(HERE, f0))})
+        assert provenance_problems(good) == []
+        for mut in (dict(labels_sha1="0"), dict(k16_models_sha1="0"),
+                    dict(code={f0: "0"}), dict(code={})):
+            assert provenance_problems(dict(good, **mut)), mut
     import k16_policy as kp
     for v in MAP.values():
         assert v in kp.POLICIES

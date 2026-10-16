@@ -72,9 +72,14 @@ run_one () {   # метка задача блок
   local F="$OUTD/${L}_t${T}_i${B}.json"
   if valid "$F" "$L" "$T" "$B"; then echo "    $L t$T i$B: уже есть"; return 0; fi
   if [ -f "$F" ]; then
+    # существующий блок не прошёл проверку: останов с причиной (без
+    # автоматического пересчёта); блок переносится в карантин для разбора
+    python3 experiments/k16u_protocol.py check-block --plan "$PLAN" \
+      --block "$F" "$L" "$T" "$B" || true
     local Q="$OUTD/quarantine/$(date +%Y%m%dT%H%M%S)"; mkdir -p "$Q"
     mv "$F" "${F%.json}.actions.npz" "$Q/" 2>/dev/null || true
-    echo "    $L t$T i$B: повреждённый результат -> $Q"
+    echo "ОСТАНОВ: $L t$T i$B — существующий блок не прошёл проверку -> $Q"
+    return 3
   fi
   for try in 1 2 3; do
     echo "    $L t$T i$B — попытка $try, $(date '+%H:%M:%S')"
