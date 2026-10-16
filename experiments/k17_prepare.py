@@ -217,7 +217,9 @@ def main_prepare(a):
         pp[sp] = dict(
             windows=len(ws), episodes=len({w["episode"] for w in ws}),
             corrector_examples=3 * len(ws),
-            anchors=int(anchors[sp]), excluded=dict(why[sp]),
+            anchors=int(anchors[sp]), excluded={k: int(why[sp].get(k, 0))
+                                for k in ("tail", "cache_gap",
+                                          "tail_and_gap")},
             tasks=len(tc), missing_tasks=[t for t in all_tasks if not tc[t]],
             pilot_missing=[t for t in pilot if not tc[t]],
             pilot_windows={t: int(tc[t]) for t in pilot},
