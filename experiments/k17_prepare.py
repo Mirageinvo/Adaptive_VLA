@@ -80,6 +80,39 @@ def episode_windows(S, A, step_to_row, L):
     return wins, why
 
 
+SPLITS = ("A", "B", "V")
+
+
+def k16_link_problems(rep, L16, labels_sha, man_sha, cache_rows, train_eps,
+                      val_eps):
+    """Связь разметки K-16 с текущим кэшем: kind, проблемы, SHA разметки и
+    манифеста h18, строки частей, покрытие обучающих эпизодов A/B."""
+    p = []
+    if rep.get("kind") != "k16_labels":
+        p.append(f"labels.json: kind {rep.get('kind')!r}")
+    if rep.get("problems"):
+        p.append(f"labels.json: проблемы разметки {rep['problems'][:3]}")
+    if (rep.get("out") or {}).get("sha1") != labels_sha:
+        p.append("labels.npz не совпадает с SHA из labels.json")
+    if rep.get("h18_manifest_sha1") != man_sha:
+        p.append("манифест h18 не совпадает с сохранённым в разметке K-16")
+    for part, rows in cache_rows.items():
+        k = f"{part}__rows"
+        if k not in L16 or not np.array_equal(np.asarray(L16[k]),
+                                              np.asarray(rows)):
+            p.append(f"{k} разметки K-16 не равны строкам текущего кэша")
+    eA = set(np.asarray(L16.get("epA", [])).tolist())
+    eB = set(np.asarray(L16.get("epB", [])).tolist())
+    if eA & eB:
+        p.append("половины A и B пересекаются")
+    if (eA | eB) != set(train_eps):
+        p.append(f"A ∪ B ≠ обучающие эпизоды кэша "
+                 f"({len(eA | eB)} против {len(set(train_eps))})")
+    if (eA | eB) & set(val_eps):
+        p.append("A/B пересекаются с val_sel")
+    return p
+
+
 def main_prepare(a):
     import k15f_build_cache as kb
     import k15h_protocol as pc
@@ -101,6 +134,16 @@ def main_prepare(a):
     for p in kb.PARTS:
         rows = c[p]["rows"]
         parts[p] = dict(epi=epi[rows], step=stp[rows], task=task[rows])
+    lj = a.k16_labels[:-4] + ".json"
+    link = k16_link_problems(
+        json.load(open(lj)), L16,
+        hashlib.sha1(open(a.k16_labels, "rb").read()).hexdigest(),
+        hashlib.sha1(open(os.path.join(a.h18_cache, "manifest.json"),
+                          "rb").read()).hexdigest(),
+        {p: c[p]["rows"] for p in kb.PARTS},
+        parts["train"]["epi"].tolist(), parts["val_sel"]["epi"].tolist())
+    if link:
+        raise SystemExit("; ".join(link))
     for e in set(parts["train"]["epi"].tolist()):
         split_of[e] = "A" if e in epA else "B" if e in epB else None
     for e in set(parts["val_sel"]["epi"].tolist()):
@@ -162,7 +205,8 @@ def main_prepare(a):
               f"PYTHONPATH=$HOME/LIBERO")
         return 3
     all_tasks = sorted(set(task.tolist()))
-    for sp, ws in W.items():
+    for sp in SPLITS:
+        ws = W.get(sp, [])
         for k in ("t", "rows", "dpos", "drot6d", "angle_deg", "dist_m",
                   "grip_switch", "states", "hist", "hist_mask", "age",
                   "episode", "task", "rstar", "cache_rows"):
@@ -177,6 +221,9 @@ def main_prepare(a):
             tasks=len(tc), missing_tasks=[t for t in all_tasks if not tc[t]],
             pilot_missing=[t for t in pilot if not tc[t]],
             pilot_windows={t: int(tc[t]) for t in pilot},
+            task_windows={t: int(tc[t]) for t in all_tasks},
+            task_episodes={t: len({w["episode"] for w in ws
+                                   if w["task"] == t}) for t in all_tasks},
             dist_m=dict(p10=float(np.percentile(dist, 10)),
                         median=float(np.median(dist)),
                         p90=float(np.percentile(dist, 90))) if len(dist)
@@ -187,7 +234,8 @@ def main_prepare(a):
             else None,
             grip_switch_share=float(np.mean([w["grip_switch"]
                                              for w in ws])) if ws else None)
-    eps = {sp: {w["episode"] for w in ws} for sp, ws in W.items()}
+    empty = [sp for sp in SPLITS if not pp[sp]["windows"]]
+    eps = {sp: {w["episode"] for w in W.get(sp, [])} for sp in SPLITS}
     disjoint = not (eps.get("A", set()) & eps.get("B", set())
                     or eps.get("A", set()) & eps.get("V", set())
                     or eps.get("B", set()) & eps.get("V", set()))
@@ -195,7 +243,8 @@ def main_prepare(a):
     np.savez_compressed(a.out, **arrays)
     rep = dict(kind="k17_windows", goal_horizon_commands=GOAL,
                positions=list(POS), history_offsets=list(HIST),
-               splits=pp, episodes_disjoint=disjoint,
+               splits=pp, episodes_disjoint=disjoint, empty_splits=empty,
+               ready=not empty and disjoint,
                conventions=dict(
                    rows=("<split>__rows — строки части кэша K-15f (train для "
                          "A/B, val_sel для V) на позициях t, t+8, t+16; "
@@ -217,10 +266,15 @@ def main_prepare(a):
     with open(a.out[:-4] + ".json", "w", encoding="utf-8") as fh:
         json.dump(rep, fh, ensure_ascii=False, indent=1)
     print(json.dumps(dict(splits={k: {kk: vv for kk, vv in v.items()
-                                      if kk != "pilot_windows"}
+                                      if kk not in ("pilot_windows", "task_windows",
+                                                    "task_episodes")}
                                   for k, v in pp.items()},
-                          episodes_disjoint=disjoint),
+                          episodes_disjoint=disjoint, empty_splits=empty),
                      ensure_ascii=False, indent=1))
+    if empty or not disjoint:
+        print(f"  НЕ ГОТОВО: пустые части {empty}, эпизоды "
+              f"{'не пересекаются' if disjoint else 'ПЕРЕСЕКАЮТСЯ'}")
+        return 3
     return 0
 
 
@@ -256,9 +310,28 @@ def selftest():
     s3 = {s: i for i, s in enumerate([35, 43, 51, 36, 44, 52])}
     w3, why3 = episode_windows(S, A, s3, L)
     assert [w["t"] for w in w3] == [35] and why3["tail"] == 1
+    # связь с разметкой K-16
+    L16 = dict(epA=np.array([1, 2]), epB=np.array([3]),
+               train__rows=np.array([0, 1, 2]), val_sel__rows=np.array([5]))
+    rep = dict(kind="k16_labels", problems=[], out=dict(sha1="x"),
+               h18_manifest_sha1="m")
+    cr = dict(train=np.array([0, 1, 2]), val_sel=np.array([5]))
+    ok = k16_link_problems(rep, L16, "x", "m", cr, [1, 2, 3], [9])
+    assert ok == [], ok
+    assert k16_link_problems(dict(rep, kind="z"), L16, "x", "m", cr,
+                             [1, 2, 3], [9])
+    assert k16_link_problems(dict(rep, problems=["p"]), L16, "x", "m", cr,
+                             [1, 2, 3], [9])
+    assert k16_link_problems(rep, L16, "y", "m", cr, [1, 2, 3], [9])
+    assert k16_link_problems(rep, L16, "x", "n", cr, [1, 2, 3], [9])
+    assert k16_link_problems(rep, L16, "x", "m",
+                             dict(cr, train=np.array([0, 1, 3])),
+                             [1, 2, 3], [9])
+    assert k16_link_problems(rep, L16, "x", "m", cr, [1, 2, 3, 4], [9])
+    assert k16_link_problems(rep, L16, "x", "m", cr, [1, 2, 3], [3])
     print("самопроверка k17_prepare пройдена: точные позиции t/t+8/t+16, "
           "пропуск кэша, хвост без подстановки, цель t+24, история, "
-          "переключение схвата в окне")
+          "переключение схвата в окне, связь с разметкой K-16")
     return 0
 
 
