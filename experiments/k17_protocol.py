@@ -142,6 +142,7 @@ def make_plan(*, models, train_report, basis, identity, device):
         model_rules=dict(alpha=ck["alpha"], clip_env_norm=ck["clip_env_norm"],
                          units=ck.get("units"),
                          scale_arm=list(ck["scale_arm"]),
+                         r_sigma=np.asarray(ck["norms"]["r_sigma"]).tolist(),
                          dpos_sigma=np.asarray(ck["norms"]["dpos_sigma"])
                          .tolist(), window_calls=3),
         inputs={k: os.path.abspath(v) for k, v in inputs.items()},
@@ -185,8 +186,9 @@ def check_arrays(label, z, rules):
     p = []
     need = ("k15d_a0", f"k15d_level_{label}", "k15g_chunk", "k17_corrected",
             "k17_event", "k17_first_event", "k17_window_start",
-            "k17_win_pos", "k17_d_codec", "k17_norm_applied", "k17_state",
-            "k17_p_star", "k17_R_star", "k17_geo", "k17_h18")
+            "k17_win_pos", "k17_d_codec", "k17_norm_applied",
+            "k17_norm_raw", "k17_clipped", "k17_out", "k17_goal",
+            "k17_state", "k17_p_star", "k17_R_star", "k17_geo", "k17_h18")
     miss = [k for k in need if k not in z]
     if miss:
         return [f"{label}: в журнале нет {miss}"]
@@ -224,6 +226,17 @@ def check_arrays(label, z, rules):
                 p.append(f"{label}: среда {b}: мировая цель не сохранена "
                          f"неизменной с начала окна")
             ds = np.asarray(rules["dpos_sigma"], np.float64)
+            gl = z["k17_goal"][:, b]
+            st0 = z["k17_state"][c0, b].astype(np.float64)
+            pe, Re = m17.world_goal_np(gl[c0][None].astype(np.float64),
+                                       st0[None, :3],
+                                       km.aa_to_mat_np(st0[None, 3:6]), ds)
+            if not np.isfinite(gl[c0]).all() or \
+                    not (gl[c0:] == gl[c0]).all() or \
+                    not np.allclose(ps[c0], pe[0], atol=1e-4) or \
+                    not np.allclose(Rs[c0], Re[0], atol=1e-4):
+                p.append(f"{label}: среда {b}: мировая цель не равна "
+                         f"p_start + Δp̂, R_start · R̂_rel выхода G")
             for c in want:
                 st = z["k17_state"][c - 1, b].astype(np.float64)
                 g = z["k17_geo"][c - 1, b]
@@ -244,18 +257,30 @@ def check_arrays(label, z, rules):
     if not np.array_equal(lv[..., 6], a0[..., 6]):
         p.append(f"{label}: схват изменён")
     if cor.any():
-        d = lv[cor][..., :6].astype(np.float64) - a0[cor][..., :6]
-        if not np.allclose(d, z["k17_d_codec"][cor], atol=2e-6):
-            p.append(f"{label}: действие в окне ≠ a0 + δ журнала")
+        # пересчёт по выходу C общей apply_correction (α, r_sigma, масштаб,
+        # предел из плана): действие, δ, нормы до/после, признак предела
         clip = float(rules["clip_env_norm"])
-        na = z["k17_norm_applied"][cor].astype(np.float64)
-        if (na > clip * (1 + 1e-6)).any():
+        sc = np.asarray(list(rules["scale_arm"])[:6] + [1.0], np.float64)
+        a_, inf = km.apply_correction(
+            a0[cor], z["k17_out"][cor], np.asarray(rules["r_sigma"]), sc,
+            float(rules["alpha"]), clip)
+        if not np.isfinite(z["k17_out"][cor]).all():
+            p.append(f"{label}: выход C в окне не записан")
+        elif not np.allclose(lv[cor], a_, rtol=0, atol=1e-6):
+            p.append(f"{label}: действие в окне ≠ apply_correction(выход C)")
+        if not np.allclose(z["k17_d_codec"][cor], inf["d_codec"], rtol=0,
+                           atol=1e-6):
+            p.append(f"{label}: δ журнала ≠ apply_correction(выход C)")
+        if not (np.allclose(z["k17_norm_raw"][cor], inf["norm_raw"],
+                            rtol=1e-5, atol=1e-7) and
+                np.allclose(z["k17_norm_applied"][cor], inf["norm_applied"],
+                            rtol=1e-5, atol=1e-7) and
+                np.array_equal(np.asarray(z["k17_clipped"][cor], bool),
+                               inf["clipped"])):
+            p.append(f"{label}: нормы или признак ограничения ≠ "
+                     f"apply_correction(выход C)")
+        if (z["k17_norm_applied"][cor] > clip * (1 + 1e-6)).any():
             p.append(f"{label}: норма поправки выше предела")
-        sc = np.asarray(rules["scale_arm"], np.float64)[:6]
-        n2 = np.linalg.norm((z["k17_d_codec"][cor].astype(np.float64)
-                             * sc).reshape(int(cor.sum()), -1), axis=1)
-        if not np.allclose(n2, na, rtol=1e-4, atol=1e-7):
-            p.append(f"{label}: ограничение применено не один раз на чанк")
     return p
 
 
@@ -373,8 +398,10 @@ def check_run(plan, plan_path, run_dir, pairs=None):
 
 
 # --- самопроверка ------------------------------------------------------------
-def _journal(label, rng, fe_calls, C=6, B=3, clip=0.5):
-    """Синтетический журнал руки с окнами от заданных первых событий."""
+def _journal(label, rng, fe_calls, C=6, B=3, clip=0.5, order_bug=False,
+             extra_factor=1.0):
+    """Синтетический журнал руки с окнами от заданных первых событий;
+    формулы — как в руке (order_bug и extra_factor — для регрессий)."""
     import k16_models as km
     import k17_models as m17
     a0 = rng.uniform(-0.5, 0.5, (C, B, H, 7)).astype(np.float32)
@@ -384,51 +411,68 @@ def _journal(label, rng, fe_calls, C=6, B=3, clip=0.5):
         a0[c:, b, :, 6] = -1.0
     ds = np.full(3, 0.1)
     sc = np.full(6, 0.9)
+    rsig = np.full(6, .05)
     lv = a0.copy()
     cor = np.zeros((C, B), bool)
     wp = np.full((C, B), -1)
     ws = np.full(B, -1)
     st = rng.standard_normal((C, B, 8)).astype(np.float32) * 0.1
     nan = lambda *s: np.full(s, np.nan, np.float32)   # noqa: E731
-    dc, na = nan(C, B, H, 6), nan(C, B)
+    dc, na, nr = nan(C, B, H, 6), nan(C, B), nan(C, B)
+    out, clp = nan(C, B, H, 6), np.zeros((C, B), bool)
     ps, Rs, geo = nan(C, B, 3), nan(C, B, 3, 3), nan(C, B, 9)
+    gl = nan(C, B, 9)
     for b, c in fe_calls.items():
         if label == "q0":
             continue
         calls = window_calls(c, C)
         ws[b] = calls[0]
-        p_ = rng.standard_normal(3).astype(np.float32)
-        R_ = km.aa_to_mat_np(rng.standard_normal(3) * .3).astype(np.float32)
+        g = rng.standard_normal(9).astype(np.float32)
+        s0 = st[calls[0] - 1, b].astype(np.float64)
+        R0 = km.aa_to_mat_np(s0[None, 3:6])
+        p_, R_ = m17.world_goal_np(g[None], s0[None, :3], R0, ds)
+        if order_bug:
+            R_ = m17.sixd_to_mat_np(g[None, 3:9]) @ R0
+        p_, R_ = p_[0].astype(np.float32), R_[0].astype(np.float32)
         for k, cc in enumerate(calls):
             cor[cc - 1, b] = True
             wp[cc - 1, b] = k
-            ps[cc - 1:, b], Rs[cc - 1:, b] = p_, R_
+            ps[cc - 1:, b], Rs[cc - 1:, b], gl[cc - 1:, b] = p_, R_, g
             s_ = st[cc - 1, b].astype(np.float64)
             geo[cc - 1, b] = (np.zeros(9) if label == "ctx_memory" else
                               m17.geo_error_np(p_[None], R_[None],
                                                s_[None, :3],
                                                km.aa_to_mat_np(
                                                    s_[None, 3:6]), ds)[0])
+            o_ = rng.standard_normal((1, H, 6)).astype(np.float32) * (
+                3.0 if k == 1 else 0.3)            # позиция 1 — с пределом
             _a, inf = km.apply_correction(a0[cc - 1, b:b + 1],
-                                          np.ones((1, H, 6)),
-                                          np.full(6, .05),
+                                          o_ * extra_factor, rsig,
                                           np.r_[sc, 1.0], .5, clip)
             lv[cc - 1, b] = _a[0]
+            out[cc - 1, b] = o_[0]
             dc[cc - 1, b] = inf["d_codec"][0]
             na[cc - 1, b] = inf["norm_applied"][0]
+            nr[cc - 1, b] = inf["norm_raw"][0]
+            clp[cc - 1, b] = inf["clipped"][0]
     import k16_protocol as p16
     ev, fe = p16.replay_events(a0, lv)
     z = {"k15d_a0": a0, f"k15d_level_{label}": lv,
          "k15g_chunk": np.arange(1, C + 1), "k17_corrected": cor,
          "k17_event": ev, "k17_first_event": fe, "k17_window_start": ws,
          "k17_win_pos": wp, "k17_d_codec": dc, "k17_norm_applied": na,
-         "k17_state": st, "k17_p_star": ps, "k17_R_star": Rs,
-         "k17_geo": geo, "k17_h18": np.zeros((C, B, 1), np.float16)}
-    rules = dict(clip_env_norm=clip, scale_arm=list(sc), dpos_sigma=list(ds))
+         "k17_norm_raw": nr, "k17_clipped": clp, "k17_out": out,
+         "k17_goal": gl, "k17_state": st, "k17_p_star": ps,
+         "k17_R_star": Rs, "k17_geo": geo,
+         "k17_h18": np.zeros((C, B, 1), np.float16)}
+    rules = dict(clip_env_norm=clip, scale_arm=list(sc), dpos_sigma=list(ds),
+                 r_sigma=list(rsig), alpha=.5)
     return z, rules
 
 
 def selftest():
+    import k16_models as km
+    import k17_models as m17
     import k17_policy as kp17
     assert set(kp17.LABELS) == {"q0", "ctx_memory", "held_goal"}
     assert window_calls(5, 6) == [5, 6] and window_calls(-1, 6) == []
@@ -455,6 +499,27 @@ def selftest():
     lv = z["k15d_level_held_goal"].copy()
     lv[0, 2, :, :6] += 0.01
     muts.append(dict(z, k15d_level_held_goal=lv))
+    # согласованно сдвинутая цель: p*, геометрия пересчитаны, выход G тот же
+    z6 = dict(z, k17_p_star=z["k17_p_star"] + 0.05,
+              k17_geo=z["k17_geo"].copy())
+    for b in range(3):
+        for c in np.nonzero(z["k17_corrected"][:, b])[0]:
+            s_ = z["k17_state"][c, b].astype(np.float64)
+            z6["k17_geo"][c, b] = m17.geo_error_np(
+                z6["k17_p_star"][c, b][None], z["k17_R_star"][c, b][None],
+                s_[None, :3], km.aa_to_mat_np(s_[None, 3:6]),
+                np.asarray(rules["dpos_sigma"]))[0]
+    muts.append(z6)
+    # неправильный порядок умножения вращений (R̂_rel · R_start)
+    muts.append(_journal("held_goal", np.random.default_rng(3), {0: 2, 1: 5},
+                         order_bug=True)[0])
+    # лишний множитель 0.5 в действии и журнале при прежнем выходе C
+    zx, _r = _journal("held_goal", np.random.default_rng(4), {0: 2, 1: 5},
+                      extra_factor=0.5)
+    muts.append(zx)
+    # обязательные поля
+    for k in ("k17_out", "k17_goal", "k17_norm_raw", "k17_clipped"):
+        muts.append({kk: v for kk, v in z.items() if kk != k})
     for i, m in enumerate(muts):
         assert check_arrays("held_goal", m, rules), i
     zc, rc = _journal("ctx_memory", rng, {0: 2})
@@ -485,8 +550,10 @@ def selftest():
                     dict(code={})):
             assert provenance_problems(dict(good, **mut)), mut
     print("самопроверка k17_protocol пройдена: окно из трёх вызовов от "
-          "события, сохранённая цель, геометрия, нули ctx_memory, предел "
-          "один раз, вне окна = a0, у q0 окна нет, резерв, происхождение")
+          "события, мировая цель из выхода G (сдвиг и порядок вращений), "
+          "сохранение цели, геометрия, нули ctx_memory, пересчёт поправки "
+          "apply_correction (лишний множитель), вне окна = a0, у q0 окна "
+          "нет, обязательные поля, резерв, происхождение")
     return 0
 
 

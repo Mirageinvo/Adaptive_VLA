@@ -423,6 +423,14 @@ def integration():
                                        a["k17_d_codec"][k, b], atol=1e-6)
                 if lab == "q0":
                     assert not cor.any()
+                # валидатор протокола принимает журнал правильной руки
+                import k17_protocol as pc17
+                rules = dict(clip_env_norm=ck["clip_env_norm"],
+                             scale_arm=ck["scale_arm"], dpos_sigma=list(ds),
+                             r_sigma=list(ck["norms"]["r_sigma"]),
+                             alpha=ck["alpha"])
+                pr_ = pc17.check_arrays(lab, a, rules)
+                assert pr_ == [], (lab, pr_)
     finally:
         k15_context.build, sys.argv, kdp.gate_paths = saved
     print(f"интеграция k17_policy пройдена: q0 = a0, окно из трёх вызовов "
