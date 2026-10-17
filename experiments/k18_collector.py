@@ -167,6 +167,13 @@ def action_sha(A, i, done_step):
                         ).hexdigest()[:16]
 
 
+def build_id(meta):
+    """Идентификатор сборки q0 по её отпечаткам."""
+    import json
+    return hashlib.sha1(json.dumps(meta, sort_keys=True).encode()
+                        ).hexdigest()[:12]
+
+
 def reached(done_step, call):
     return bool(done_step < 0 or done_step >= H * (call - 1))
 
@@ -232,7 +239,13 @@ class VLA:
                          joint_sha1=ctx.joint_sha,
                          code_version=ctx.code_version, codec=ctx.codec_fp,
                          basis_sha1=basis_sha,
-                         identity_report_sha1=kb.sha_file(identity_report))
+                         identity_report_sha1=kb.sha_file(identity_report),
+                         k15a_gate_sha1=kb.sha_file(g15a),
+                         offset_table_sha1=kb.sha_file(offset_table),
+                         cfg_sha1=kb.sha_file(os.path.join(r, cfg_path)),
+                         refine_module_sha1=kb.sha_file(kf.__file__))
+        self.meta = json.loads(json.dumps(self.meta, default=str))
+        self.build_id = build_id(self.meta)
 
     def task_desc(self, task):
         from libero.libero import benchmark
@@ -479,8 +492,10 @@ class FakeSim:
 
 
 class FakeVLA:
-    def __init__(self):
+    def __init__(self, tag="toy"):
         self.max_act_q = np.array([.9375, .91, .9375, .2036, .2636, .375, 1.])
+        self.meta = dict(toy=tag)
+        self.build_id = build_id(self.meta)
 
     def seed(self, s):
         pass

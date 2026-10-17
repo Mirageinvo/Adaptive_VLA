@@ -28,6 +28,15 @@ PRIMARY = ("basis4_rl", "pca4_rl")
 SECONDARY = (("basis4_rl", "full48_rl"), ("pca4_rl", "full48_rl"))
 
 
+BANKS = dict(final=tuple(range(30, 45)), mid=tuple(range(25, 30)))
+TASKS = tuple(range(10))
+
+
+def sha(p):
+    import hashlib
+    return hashlib.sha1(open(p, "rb").read()).hexdigest()
+
+
 def load_eval(d, label, mark, bank):
     p = os.path.join(d, f"{label}_{mark}_{bank}.json")
     if not os.path.exists(p):
@@ -38,6 +47,46 @@ def load_eval(d, label, mark, bank):
 def outcomes(ev):
     return {(int(e["task"]), int(e["init_state_id"])): bool(e["success"])
             for e in ev["episodes"]}
+
+
+def eval_problems(ev, label, mark, bank, config_sha, ckpt_check=True):
+    """Банк ровно {задачи 0–9} × {старты банка}, без повторов; метка,
+    отметка, конфигурация; для вариантов — чекпойнт (файл, SHA, вариант,
+    отметка, конфигурация, отпечаток весов)."""
+    p = []
+    if (ev.get("label"), ev.get("mark"), ev.get("bank")) != (label, mark,
+                                                           bank):
+        p.append(f"{label}/{mark}/{bank}: метка, отметка или банк в файле "
+                 f"{(ev.get('label'), ev.get('mark'), ev.get('bank'))}")
+    if ev.get("config_sha1") != config_sha:
+        p.append(f"{label}/{mark}/{bank}: другая конфигурация")
+    keys = [(int(e["task"]), int(e["init_state_id"]))
+            for e in ev["episodes"]]
+    if len(keys) != len(set(keys)):
+        p.append(f"{label}/{mark}/{bank}: повтор состояния")
+    want = {(t, s) for t in TASKS for s in BANKS[bank]}
+    if set(keys) != want:
+        p.append(f"{label}/{mark}/{bank}: набор состояний не равен банку "
+                 f"{bank}")
+    if label != "q0" and ckpt_check:
+        import torch
+        import k18_prepare as kp
+        ck = ev.get("ckpt") or {}
+        f = ck.get("path")
+        if not f or not os.path.exists(f) or sha(f) != ck.get("sha1"):
+            p.append(f"{label}/{mark}: чекпойнт отсутствует или изменён")
+        else:
+            c = torch.load(f, map_location="cpu", weights_only=False)
+            if (c.get("variant"), c.get("mark"), c.get("config_sha1")) != \
+                    (label, mark, config_sha):
+                p.append(f"{label}/{mark}: чекпойнт другого варианта, "
+                         f"отметки или конфигурации")
+            if not (kp.state_sha(c["actor"]) == c.get("actor_sha1")
+                    == ck.get("actor_sha1")):
+                p.append(f"{label}/{mark}: отпечаток весов не совпадает")
+            if c.get("vla_build") != ev.get("vla_build"):
+                p.append(f"{label}/{mark}: сборка q0 чекпойнта другая")
+    return p
 
 
 def diag_summary(ev):
@@ -67,7 +116,7 @@ def diag_summary(ev):
     return out
 
 
-def run(eval_dir, waves_log):
+def run(eval_dir, state_path, config_path):
     import k15h_analyze as ha
     need = [("q0", "q0", "final")] + [(v, "300k", "final")
                                       for v in VARIANTS]
@@ -76,13 +125,29 @@ def run(eval_dir, waves_log):
     res = dict(eval_dir=eval_dir, missing=miss, complete=not miss)
     if miss:
         return res
+    if not os.path.exists(config_path):
+        res.update(complete=False, why="нет конфигурации")
+        return res
+    cs = sha(config_path)
+    prob = []
+    for lab, m, b in need:
+        prob += eval_problems(evs[lab], lab, m, b, cs)
+    mids = {}
+    for lab, m in [("q0", "q0")] + [(v, mk) for v in VARIANTS
+                                    for mk in ("100k", "300k")]:
+        ev = load_eval(eval_dir, lab, m, "mid")
+        if ev is not None:
+            prob += eval_problems(ev, lab, m, "mid", cs)
+            mids[(lab, m)] = ev
+    builds = {e.get("vla_build") for e in list(evs.values())
+              + list(mids.values())}
+    if len(builds) != 1:
+        prob.append(f"оценки разных сборок q0: {sorted(map(str, builds))}")
+    if prob:
+        res.update(complete=False, why="; ".join(prob[:6]))
+        return res
     outc = {k: outcomes(v) for k, v in evs.items()}
     states = sorted(outc["q0"])
-    if len(states) != 150 or any(sorted(o) != states for o in
-                                 outc.values()):
-        res.update(complete=False, why="состояния оценок не совпадают или "
-                   "их не 150")
-        return res
     rows = {}
     for lab, o in outc.items():
         pt = {}
@@ -103,20 +168,22 @@ def run(eval_dir, waves_log):
     vs_q0 = {v: ha.compare(outc[v], outc["q0"], states, BOOT_N, BOOT_SEED)
              for v in VARIANTS}
     mid = {}
-    for mark in ("100k", "300k"):
-        for lab in VARIANTS:
-            ev = load_eval(eval_dir, lab, mark, "mid")
-            if ev:
-                o = outcomes(ev)
-                mid[f"{lab}@{mark}"] = ha.equal_weight(o, sorted(o))
-    q0m = load_eval(eval_dir, "q0", "q0", "mid")
-    if q0m:
-        o = outcomes(q0m)
-        mid["q0"] = ha.equal_weight(o, sorted(o))
+    for (lab, m), ev in mids.items():
+        o = outcomes(ev)
+        mid["q0" if lab == "q0" else f"{lab}@{m}"] = ha.equal_weight(
+            o, sorted(o))
     tr = {}
-    if os.path.exists(waves_log):
-        for ln in open(waves_log):
-            r = json.loads(ln)
+    wlog = []
+    if state_path and os.path.exists(state_path):
+        import torch
+        wlog = torch.load(state_path, map_location="cpu",
+                          weights_only=False).get("wave_log", [])
+    ids = [r["wave_id"] for r in wlog]
+    if len(ids) != len(set(ids)):
+        res.update(complete=False, why="повтор записи волны в состоянии")
+        return res
+    if True:
+        for r in wlog:
             t = tr.setdefault(r["variant"], dict(waves=0, transitions=0,
                                                  td=[], q=[], tasks={},
                                                  train_success=0, eps=0))
@@ -186,30 +253,88 @@ def report(res):
 
 
 def selftest():
+    import shutil
     import tempfile
+    import torch
+    import k18_prepare as kp
     rng = np.random.default_rng(0)
     with tempfile.TemporaryDirectory() as td:
+        cfgp = os.path.join(td, "config.json")
+        json.dump(dict(kind="k18_config"), open(cfgp, "w"))
+        cs = sha(cfgp)
         base = {(t, s): bool(rng.random() < .8) for t in range(10)
                 for s in range(30, 45)}
-        for lab, m in [("q0", "q0")] + [(v, "300k") for v in VARIANTS]:
-            o = dict(base)
-            if lab == "basis4_rl":
-                for k in [k for k in base if not base[k]][:6]:
-                    o[k] = True
-            json.dump(dict(episodes=[dict(task=t, init_state_id=s,
+
+        def write(lab, m, bank, o, ck=None, cfg_sha=cs, build="B"):
+            json.dump(dict(label=lab, mark=m, bank=bank, config_sha1=cfg_sha,
+                           vla_build=build, ckpt=ck,
+                           episodes=[dict(task=t, init_state_id=s,
                                           success=v, decisions=3,
                                           decisions_executed=3)
-                                     for (t, s), v in o.items()],
+                                     for (t, s), v in o],
                            diag=[dict(pos=0, coef=[.1] * 4, norm=.1, f=1.0,
                                       angles=[1, 2, 3, 4])]),
-                      open(os.path.join(td, f"{lab}_{m}_final.json"), "w"))
-        r = run(td, os.path.join(td, "none.jsonl"))
-        assert r["complete"] and r["primary"]["gain"] == 6
-        assert r["primary"]["loss"] == 0 and r["vs_q0"]["pca4_rl"]["gain"] == 0
-        os.remove(os.path.join(td, "pca4_rl_300k_final.json"))
-        assert not run(td, "x")["complete"]
-    print("самопроверка k18_analyze пройдена: основное сравнение, вторичные, "
-          "неполный набор — без вывода")
+                      open(os.path.join(td, "ev", f"{lab}_{m}_{bank}.json"),
+                           "w"))
+
+        def ckpt(v, mark="300k", cfg_sha=cs):
+            st = {"w": torch.full((2,), float(len(v)))}
+            p = os.path.join(td, f"{v}_{mark}.pt")
+            torch.save(dict(actor=st, variant=v, mark=mark,
+                            config_sha1=cfg_sha, vla_build="B",
+                            actor_sha1=kp.state_sha(st)), p)
+            return dict(path=p, sha1=sha(p), actor_sha1=kp.state_sha(st))
+
+        def full():
+            os.makedirs(os.path.join(td, "ev"), exist_ok=True)
+            write("q0", "q0", "final", list(base.items()))
+            for v in VARIANTS:
+                o = dict(base)
+                if v == "basis4_rl":
+                    for k in [k for k in base if not base[k]][:6]:
+                        o[k] = True
+                write(v, "300k", "final", list(o.items()), ckpt(v))
+        ev_dir = os.path.join(td, "ev")
+        full()
+        r = run(ev_dir, None, cfgp)
+        assert r["complete"], r.get("why")
+        assert r["primary"]["gain"] == 6 and r["primary"]["loss"] == 0
+        assert r["vs_q0"]["pca4_rl"]["gain"] == 0
+        # регрессии: каждая даёт неполный набор (код 3)
+        wrong = {(t, s): True for t in range(10) for s in range(0, 15)}
+        cases = []
+        cases.append(lambda: write("pca4_rl", "300k", "final",
+                                   list(wrong.items()), ckpt("pca4_rl")))
+        cases.append(lambda: write("pca4_rl", "300k", "final",
+                                   list(base.items())
+                                   + [((0, 30), True)], ckpt("pca4_rl")))
+        cases.append(lambda: write("pca4_rl", "300k", "final",
+                                   list(base.items()), ckpt("basis4_rl")))
+        cases.append(lambda: write("pca4_rl", "300k", "final",
+                                   list(base.items()), ckpt("pca4_rl"),
+                                   cfg_sha="x"))
+        cases.append(lambda: write("pca4_rl", "300k", "final",
+                                   list(base.items()),
+                                   ckpt("pca4_rl", cfg_sha="x")))
+        cases.append(lambda: write("pca4_rl", "300k", "final",
+                                   list(base.items()), ckpt("pca4_rl"),
+                                   build="C"))
+        cases.append(lambda: write("pca4_rl", "100k", "mid",
+                                   [((t, s), True) for t in range(10)
+                                    for s in range(0, 5)], ckpt("pca4_rl",
+                                                                "100k")))
+        cases.append(lambda: os.remove(os.path.join(ev_dir,
+                                                    "pca4_rl_300k_final.json")))
+        for i, mk in enumerate(cases):
+            shutil.rmtree(ev_dir)
+            full()
+            mk()
+            rr = run(ev_dir, None, cfgp)
+            assert not rr["complete"], (i, rr.get("why"))
+    print("самопроверка k18_analyze пройдена: основное и вторичные "
+          "сравнения; неправильный банк, повтор, чужой чекпойнт, другая "
+          "конфигурация (оценки и чекпойнта), другая сборка q0, неверный "
+          "промежуточный банк, отсутствие оценки — без вывода")
     return 0
 
 
@@ -217,12 +342,13 @@ def main():
     ap = argparse.ArgumentParser(description="K-18: анализ")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--eval-dir", default="reports/k18/eval")
-    ap.add_argument("--waves-log", default="logs/k18/waves.jsonl")
+    ap.add_argument("--state", default="data/k18/run/state.pt")
+    ap.add_argument("--config", default="data/k18/config.json")
     ap.add_argument("--out", default="reports/k18/analysis.json")
     a = ap.parse_args()
     if a.selftest:
         return selftest()
-    res = run(a.eval_dir, a.waves_log)
+    res = run(a.eval_dir, a.state, a.config)
     report(res)
     with open(a.out, "w", encoding="utf-8") as fh:
         json.dump(res, fh, ensure_ascii=False, indent=1, default=str)

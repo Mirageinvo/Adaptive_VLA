@@ -116,9 +116,18 @@ def build(torch):
                                        nn.Linear(HID, HID), nn.ReLU())
             self.V = nn.Linear(HID, D_EXEC * RANK)
             self.coef = nn.Linear(HID + D_EXEC * RANK, self.k)
-            for m in (self.V, self.coef):
-                nn.init.zeros_(m.weight)
-                nn.init.zeros_(m.bias)
+            # V(x) = 0 и столбцы головы, читающие z, = 0 -> начальный выход
+            # нулевой; столбцы, читающие V(x), — ненулевые (иначе у pca4 и
+            # full48 V и читающие её веса не получали бы градиент никогда)
+            nn.init.zeros_(self.V.weight)
+            nn.init.zeros_(self.V.bias)
+            nn.init.zeros_(self.coef.weight)
+            nn.init.zeros_(self.coef.bias)
+            g = torch.Generator().manual_seed(seed + 7)
+            bound = 1.0 / np.sqrt(HID + D_EXEC * RANK)
+            with torch.no_grad():
+                self.coef.weight[:, HID:] = (torch.rand(
+                    self.k, D_EXEC * RANK, generator=g) * 2 - 1) * bound
             self.register_buffer("U", torch.as_tensor(np.asarray(
                 U, np.float32)))
             self.register_buffer("rho", torch.tensor(float(rho)))
@@ -236,6 +245,20 @@ def selftest():
     dt, ft = M["shrink"](torch.as_tensor(a0e), torch.as_tensor(d),
                          torch.as_tensor(lo), torch.as_tensor(hi))
     assert np.allclose(dt.numpy(), ds) and np.allclose(ft.numpy(), f)
+    # настоящая инициализация: градиент критика доходит до V у всех
+    # вариантов (у pca4 и full48 — через голову коэффициентов)
+    for v in VARIANTS:
+        A0 = M["Actor"](v, U, 0.7068, scale, lo, hi, seed=0)
+        assert not A0.coef.weight[:, :HID].any() and not A0.coef.bias.any()
+        assert A0.coef.weight[:, HID:].abs().sum() > 0
+        assert not A0(obs)["delta"].any()
+        M["Critic"](1)(obs, A0(obs)["delta"]).mean().backward()
+        assert float(A0.V.weight.grad.abs().sum()) > 0, v
+        assert float(A0.coef.weight.grad[:, :HID].abs().sum()) > 0, v
+    a4, b4 = (M["Actor"](v, U, .7, scale, lo, hi, seed=0)
+              for v in ("pca4_rl", "basis4_rl"))
+    assert all(torch.equal(p, q) for p, q in zip(a4.parameters(),
+                                                 b4.parameters()))
     # градиент от критика достигает базиса basis4 при ненулевых коэфф.
     A = acts["basis4_rl"]
     with torch.no_grad():

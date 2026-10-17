@@ -323,6 +323,19 @@ def selftest():
         torch.save(dict(a=ag3.state(), r=rp3.state()), td + "/s.pt")
         z = torch.load(td + "/s.pt", weights_only=False)
         assert z["r"]["n"] == rp3.n
+    # настоящая инициализация pca4: начальная политика = q0 побитово, после
+    # обычных обновлений ветка V обучается
+    ag = Agent(torch, "pca4_rl", U, .7068, scale, lo, hi, cfg, "cpu")
+    rp = Replay(1000)
+    rr = np.random.default_rng(5)
+    tr0, _p = toy_episode(rr, ag, np.zeros(48), False, U)
+    assert not tr0["delta"].any()
+    a0 = rr.uniform(-.5, .5, (3, 10, 7)).astype(np.float32)
+    assert m18.apply_exec(a0, tr0["delta"], scale).tobytes() == a0.tobytes()
+    for _ in range(60):
+        rp.add(**toy_episode(rr, ag, U[:, 0], True, U)[0])
+    ag.update(rp, 40, True)
+    assert ag.n_actor > 0 and float(ag.actor.V.weight.abs().sum()) > 0
     # игрушечная задача: полный цикл сбора и обновлений повышает успех
     w_star = U @ np.array([1.0, -1.0, .5, 0]) / 1.5
     for variant in ("pca4_rl", "basis4_rl", "full48_rl"):

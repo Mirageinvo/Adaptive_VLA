@@ -110,6 +110,7 @@ class Runner:
         self.scale = np.asarray(cfg["scale"])
         self.rho = float(cfg["rho"])
         self.state = None
+        self.pending = []
 
     # --- состояние --------------------------------------------------------------
     def new_state(self):
@@ -127,6 +128,14 @@ class Runner:
         os.makedirs(os.path.dirname(self.a.state), exist_ok=True)
         self.torch.save(st, self.a.state + ".tmp")
         os.replace(self.a.state + ".tmp", self.a.state)
+        # зеркало журнала волн — только после фиксации состояния; анализ
+        # берёт записи из состояния (wave_log), не из зеркала
+        for rec in self.pending:
+            os.makedirs(os.path.dirname(WAVES_LOG), exist_ok=True)
+            with open(WAVES_LOG, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False, default=float)
+                         + "\n")
+        self.pending = []
 
     def load_or_new(self):
         import k18_td3 as td
@@ -160,6 +169,24 @@ class Runner:
         return self.kc.run_wave(self.sim, self.vla, self.enc, task, starts,
                                 decide, scale=self.scale, rho=self.rho,
                                 env=self.env, visits=visits)
+
+    def check_build(self):
+        """Сборка q0 закрепляется при первом запуске и сверяется при каждом
+        возобновлении до новой волны."""
+        meta = dict(self.vla.meta)
+        got = self.state.get("vla_meta")
+        if got is None:
+            self.state["vla_meta"] = meta
+            self.state["vla_build"] = self.vla.build_id
+            self.save()
+            print(f"  сборка q0 закреплена: {self.vla.build_id}", flush=True)
+        elif got != meta or self.state["vla_build"] != self.vla.build_id:
+            diff = sorted(k for k in set(got) | set(meta)
+                          if got.get(k) != meta.get(k))
+            raise SystemExit(f"сборка q0 изменилась после начала обучения: "
+                             f"{diff}")
+        else:
+            print(f"  сборка q0 сверена: {self.vla.build_id}", flush=True)
 
     def zero_decide(self, ob, keys):
         m = len(ob)
@@ -196,10 +223,10 @@ class Runner:
         return f
 
     def log_wave(self, rec):
-        os.makedirs(os.path.dirname(WAVES_LOG), exist_ok=True)
-        with open(WAVES_LOG, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec, ensure_ascii=False, default=float)
-                     + "\n")
+        """Запись волны с устойчивым идентификатором; фиксируется вместе с
+        состоянием (save)."""
+        self.state.setdefault("wave_log", []).append(rec)
+        self.pending.append(rec)
 
     def add_transitions(self, v, trs, version):
         import k18_models as m18
@@ -347,6 +374,7 @@ class Runner:
         s["updates"].append(upd)
         nrm = [float(np.linalg.norm(t["delta"])) for t in trs]
         self.log_wave(dict(
+            wave_id=f"{v}:{s['waves']}", vla_build=self.vla.build_id,
             variant=v, wave=s["waves"], ptr=s["ptr"] - 1, task=wv["task"],
             starts=wv["starts"], version=ag.version - 1,
             success=[e["success"] for e in eps],
@@ -436,6 +464,11 @@ class Runner:
                 if tag in ev["done"]:
                     continue
                 diag = []
+                if label != "q0":
+                    pin = self.state["ckpts"][f"{label}@{mark}"]
+                    if self.actor_sha(label) != pin["actor_sha1"]:
+                        raise SystemExit(f"оцениваемые веса {label} ≠ "
+                                         f"закреплённому чекпойнту {mark}")
                 dcd = None if label == "q0" else self.agent_decide(
                     label, t, False, diag)
                 eps, dec, _l, c = self.wave(t, blk, dcd)
@@ -462,23 +495,57 @@ class Runner:
         with open(os.path.join(EVAL_DIR, f"{label}_{mark}_{bank}.json"),
                   "w", encoding="utf-8") as fh:
             json.dump(dict(label=label, mark=mark, bank=bank,
+                           config_sha1=sha(self.a.config),
+                           vla_build=self.vla.build_id,
+                           ckpt=None if label == "q0" else
+                           self.state["ckpts"][f"{label}@{mark}"],
                            episodes=ev["eps"], diag=ev["diag"],
                            version=None if label == "q0" else
                            self.agents[label].version), fh,
                       ensure_ascii=False, default=float)
         return ev
 
+    def actor_sha(self, v):
+        import k18_prepare as kp
+        return kp.state_sha(self.agents[v].actor.state_dict())
+
     def checkpoint(self, mark):
-        os.makedirs("data/k18/ckpt", exist_ok=True)
+        """Чекпойнт оцениваемых весов: временный файл + os.replace;
+        существующий загружается и сверяется (вариант, отметка,
+        конфигурация, сборка q0, содержимое весов = текущим)."""
+        import k18_prepare as kp
+        cdir = getattr(self.a, "ckpt_dir", None) or "data/k18/ckpt"
+        os.makedirs(cdir, exist_ok=True)
+        cs = sha(self.a.config)
         for v, ag in self.agents.items():
-            p = f"data/k18/ckpt/{v}_{mark}.pt"
-            if not os.path.exists(p):
+            p = os.path.join(cdir, f"{v}_{mark}.pt")
+            cur = self.actor_sha(v)
+            if os.path.exists(p):
+                try:
+                    ck = self.torch.load(p, map_location="cpu",
+                                         weights_only=False)
+                except Exception as e:                       # noqa: BLE001
+                    raise SystemExit(f"чекпойнт {p} не читается: {e}")
+                prob = [k for k, want in (
+                    ("variant", v), ("mark", mark), ("config_sha1", cs),
+                    ("vla_build", self.vla.build_id), ("actor_sha1", cur))
+                    if ck.get(k) != want]
+                if kp.state_sha(ck.get("actor", {})) != cur:
+                    prob.append("содержимое весов")
+                if prob:
+                    raise SystemExit(f"чекпойнт {p} не совпадает: {prob}")
+            else:
                 self.torch.save(dict(actor=ag.actor.state_dict(),
                                      version=ag.version, variant=v,
+                                     mark=mark, config_sha1=cs,
+                                     vla_build=self.vla.build_id,
+                                     actor_sha1=cur,
                                      commands=self.state["variants"][v][
-                                         "commands"]), p)
+                                         "commands"]), p + ".tmp")
+                os.replace(p + ".tmp", p)
             self.state.setdefault("ckpts", {})[f"{v}@{mark}"] = dict(
-                path=os.path.abspath(p), sha1=sha(p))
+                path=os.path.abspath(p), sha1=sha(p), actor_sha1=cur)
+        self.save()
 
     def report(self, mark, banks):
         rows = {}
@@ -545,6 +612,7 @@ class Runner:
         self.vla = kc.VLA(self.a.vla_device)
         self.enc = kc.Encoder(self.cfg["enc"]["path"], self.rl_dev,
                               self.cfg["enc"]["state_sha1"])
+        self.check_build()
         if self.state["stage"] == "precheck":
             self.precheck()
         if self.state["stage"] == "q0set":
@@ -570,6 +638,7 @@ def main():
     ap.add_argument("--state", default=STATE)
     ap.add_argument("--vla-device", default="cuda:1")
     ap.add_argument("--rl-device", default="cuda:0")
+    ap.add_argument("--ckpt-dir", default="data/k18/ckpt")
     ap.add_argument("--stop-after", default=None, choices=STAGES)
     a = ap.parse_args()
     if a.mode == "selftest":
@@ -621,7 +690,8 @@ def selftest():
         cfgp = os.path.join(td, "config.json")
         json.dump(cfg, open(cfgp, "w"))
         a = argparse.Namespace(config=cfgp, state=os.path.join(td, "s.pt"),
-                               rl_device="cpu", vla_device="cpu")
+                               rl_device="cpu", vla_device="cpu",
+                               ckpt_dir=os.path.join(td, "ckpt"))
         global WAVES_LOG, EVAL_DIR
         WAVES_LOG = os.path.join(td, "waves.jsonl")
         EVAL_DIR = os.path.join(td, "eval")
@@ -629,6 +699,7 @@ def selftest():
         r.sim, r.vla, r.rl_dev = kc.FakeSim(5), kc.FakeVLA(), "cpu"
         r.enc = lambda h: np.zeros((len(h), 512), np.float32)
         r.load_or_new()
+        r.check_build()
         r.state["stage"] = "q0set"
         r.q0set()
         n0 = {v: rr.n for v, rr in r.replays.items()}
@@ -646,6 +717,10 @@ def selftest():
         r2.sim, r2.vla, r2.rl_dev = kc.FakeSim(5), kc.FakeVLA(), "cpu"
         r2.enc = r.enc
         r2.load_or_new()
+        r2.check_build()
+        # журнал волн: записи только зафиксированных волн, id уникальны
+        ids = [w["wave_id"] for w in r2.state["wave_log"]]
+        assert len(ids) == len(set(ids))
         assert r2.state["variants"]["basis4_rl"]["ptr"] == \
             st_before["basis4_rl"]["ptr"]
         eps2, _c2 = r2.train_wave("basis4_rl")
@@ -657,7 +732,37 @@ def selftest():
         ver = r2.agents["pca4_rl"].version
         r2.cfg = dict(cfg, starts=dict(cfg["starts"], mid=[25, 26, 27, 28,
                                                            29]))
+        r2.checkpoint("t")
+        # прерванная запись: неполный файл не принимается
+        bad = os.path.join(td, "ckpt", "full48_rl_t.pt")
+        open(bad, "wb").write(open(bad, "rb").read()[:100])
+        try:
+            r2.checkpoint("t")
+            raise AssertionError("принят неполный чекпойнт")
+        except SystemExit:
+            pass
+        os.remove(bad)
+        r2.checkpoint("t")
+        # другая сборка q0 при возобновлении — отказ
+        r3 = Runner(a, cfg, torch)
+        r3.vla = kc.FakeVLA("other")
+        r3.rl_dev = "cpu"
+        r3.load_or_new()
+        try:
+            r3.check_build()
+            raise AssertionError("принята другая сборка q0")
+        except SystemExit:
+            pass
         r2.eval_bank("pca4_rl", "t", "mid")
+        # веса изменились после закрепления — оценка отказывает
+        with torch.no_grad():
+            r2.agents["basis4_rl"].actor.coef.bias.add_(1.0)
+        try:
+            r2.eval_bank("basis4_rl", "t", "mid")
+            raise AssertionError("оценены незакреплённые веса")
+        except SystemExit:
+            pass
+        assert len(os.listdir(os.path.join(td, "ckpt"))) == 3
         assert r2.replays["pca4_rl"].n == n_before
         assert r2.agents["pca4_rl"].version == ver
         ev = r2.state["evals"]["pca4_rl@t@mid"]
@@ -674,8 +779,10 @@ def selftest():
         assert ref_problems([dict(e, done_step=6)], p)
     print("самопроверка k18_train пройдена: q0-набор в три replay, smoke, "
           "бюджет по командам, возобновление воспроизводит волну и "
-          "обновления, оценка без шума/обновлений/replay, сверка с "
-          "эталоном")
+          "обновления, журнал только зафиксированных волн, атомарный "
+          "сверяемый чекпойнт (неполный — отказ), закреплённая сборка q0, "
+          "оценка только закреплённых весов, без шума/обновлений/replay, "
+          "сверка с эталоном")
     return 0
 
 
