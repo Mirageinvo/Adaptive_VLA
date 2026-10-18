@@ -82,6 +82,7 @@ def run(a):
     if bad:
         raise SystemExit(f"чекпойнт не совпадает: {bad}")
     r.agents[LABEL].actor.load_state_dict(ck["actor"])
+    r.agents[LABEL].version = int(ck["version"])        # версия чекпойнта
     if r.actor_sha(LABEL) != pin["actor_sha1"]:
         raise SystemExit("загруженные веса ≠ закреплённым")
     r.eval_bank(LABEL, MARK, "final")
