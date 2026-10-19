@@ -294,6 +294,21 @@ def losses(torch, o, A, std, Pf):
                 total=l_arm + l_c + l_g + o["vq"])
 
 
+# --- веса строк ---------------------------------------------------------------------
+def row_weights(task, episode):
+    """Равные задачи -> равные эпизоды внутри задачи -> равные строки
+    внутри эпизода; нормировано к среднему 1."""
+    task, episode = np.asarray(task), np.asarray(episode)
+    w = np.zeros(len(task))
+    for t in np.unique(task):
+        mt = task == t
+        eps = np.unique(episode[mt])
+        for e in eps:
+            me = mt & (episode == e)
+            w[me] = 1.0 / (len(eps) * me.sum())
+    return w * len(w) / max(w.sum(), 1e-300)
+
+
 # --- оценка ------------------------------------------------------------------------
 def first_switch(g):
     s = np.sign(g)
@@ -301,12 +316,54 @@ def first_switch(g):
     return int(d[0]) + 1 if len(d) else -1
 
 
+def chunk_metrics(act, gl, A, std, w):
+    """Метрики чанков: взвешенные (основные) и обычные средние.
+    gl — логиты схвата или None (тогда BCE не считается)."""
+    s_ = np.asarray(std)
+    w = np.asarray(w, np.float64)
+
+    def wm(x):
+        return float((x * w).sum() / w.sum())
+    e = ((act[..., :6] - A[..., :6]) / s_) ** 2
+    Pa, Pt = P_np(act[..., :6]), P_np(A[..., :6])
+    gt = A[..., 6] > 0
+    gp = act[..., 6] > 0
+    res = dict(
+        mse_arm_20=wm(e.mean((1, 2))), mse_arm_8=wm(e[:, :8].mean((1, 2))),
+        mse_coarse=wm((((Pa - Pt) / s_) ** 2).mean((1, 2))),
+        mse_fine=wm(((((act[..., :6] - Pa) - (A[..., :6] - Pt)) / s_) ** 2)
+                    .mean((1, 2))),
+        grip_acc_20=wm((gp == gt).mean(1)),
+        grip_acc_8=wm((gp[:, :8] == gt[:, :8]).mean(1)),
+        rows=dict(mse_arm_20=float(e.mean()), mse_arm_8=float(
+            e[:, :8].mean()), grip_acc_20=float((gp == gt).mean())))
+    if gl is not None:
+        z = np.clip(gl, -50, 50)
+        bce = np.logaddexp(0, z) - z * gt
+        res["grip_bce"] = wm(bce.mean(1))
+        res["rows"]["grip_bce"] = float(bce.mean())
+    sw_t = np.array([first_switch(np.where(g, 1, -1)) for g in gt])
+    sw_p = np.array([first_switch(np.where(g, 1, -1)) for g in gp])
+    has = sw_t >= 0
+    ok = has & (sw_p >= 0)
+    res["switch"] = dict(
+        chunks_with_switch=int(has.sum()),
+        detected=float((w[has] * (sw_p[has] >= 0)).sum() / w[has].sum())
+        if has.any() else None,
+        exact=float((w[has] * (sw_p[has] == sw_t[has])).sum()
+                    / w[has].sum()) if has.any() else None,
+        mean_abs_err=float((w[ok] * np.abs(sw_p[ok] - sw_t[ok])).sum()
+                           / w[ok].sum()) if ok.any() else None,
+        false_switch=float((w[~has] * (sw_p[~has] >= 0)).sum()
+                           / w[~has].sum()) if (~has).any() else None)
+    return res
+
+
 def evaluate(torch, model, A, std, dev, weights=None, bs=1024):
-    """Hard-реконструкция на истинных кодах: ошибки 20 / 8 шагов, части,
-    схват, переключения, использование словарей, β."""
-    M = build(torch)
+    """Hard-реконструкция на истинных кодах: взвешенные метрики (+ обычные),
+    использование словарей, β."""
     model.eval()
-    outs, codes = [], {}
+    acts, gls, betas, codes = [], [], [], {}
     with torch.no_grad():
         for s in range(0, len(A), bs):
             a = torch.as_tensor(A[s:s + bs], dtype=torch.float32, device=dev)
@@ -315,51 +372,22 @@ def evaluate(torch, model, A, std, dev, weights=None, bs=1024):
                 o = model.decode(kc, kf)
                 codes.setdefault("c", []).append(kc.cpu().numpy())
                 codes.setdefault("f", []).append(kf.cpu().numpy())
+                betas.append(o["beta"].cpu().numpy())
             else:
                 k = model.encode(a)
                 o = model.decode(k)
                 codes.setdefault("flat", []).append(k.cpu().numpy())
-            act = action_out(o).cpu().numpy()
-            outs.append(dict(act=act, gl=o["grip_logit"].cpu().numpy(),
-                             beta=(o["beta"].cpu().numpy() if "beta" in o
-                                   else None)))
-    act = np.concatenate([x["act"] for x in outs])
-    gl = np.concatenate([x["gl"] for x in outs])
-    s_ = np.asarray(std)
-    e = ((act[..., :6] - A[..., :6]) / s_) ** 2
-    Pa, Pt = P_np(act[..., :6]), P_np(A[..., :6])
-    w = np.ones(len(A)) if weights is None else np.asarray(weights)
-
-    def wm(x):
-        return float((x * w).sum() / w.sum())
-    gt = A[..., 6] > 0
-    gp = gl > 0
-    sw_t = np.array([first_switch(np.where(g, 1, -1)) for g in gt])
-    sw_p = np.array([first_switch(np.where(g, 1, -1)) for g in gp])
-    has = sw_t >= 0
-    res = dict(
-        mse_arm_20=wm(e.mean((1, 2))), mse_arm_8=wm(e[:, :8].mean((1, 2))),
-        mse_arm_20_rows=float(e.mean()),
-        mse_coarse=wm((((Pa - Pt) / s_) ** 2).mean((1, 2))),
-        mse_fine=wm(((((act[..., :6] - Pa) - (A[..., :6] - Pt)) / s_) ** 2)
-                    .mean((1, 2))),
-        grip_acc_20=float((gp == gt).mean()),
-        grip_acc_8=float((gp[:, :8] == gt[:, :8]).mean()),
-        switch=dict(chunks_with_switch=int(has.sum()),
-                    detected=float((sw_p[has] >= 0).mean()) if has.any()
-                    else None,
-                    exact=float((sw_p[has] == sw_t[has]).mean())
-                    if has.any() else None,
-                    mean_abs_err=float(np.abs(sw_p[has] - sw_t[has])[
-                        sw_p[has] >= 0].mean()) if (has & (sw_p >= 0)).any()
-                    else None,
-                    false_switch=float((sw_p[~has] >= 0).mean())
-                    if (~has).any() else None))
-    if outs[0]["beta"] is not None:
-        b = np.concatenate([x["beta"] for x in outs])
+            acts.append(action_out(o).cpu().numpy())
+            gls.append(o["grip_logit"].cpu().numpy())
+    act, gl = np.concatenate(acts), np.concatenate(gls)
+    if not (np.isfinite(act).all() and np.isfinite(gl).all()):
+        raise SystemExit(f"кодек {model.kind}: нечисловая реконструкция")
+    w = np.ones(len(A)) if weights is None else weights
+    res = chunk_metrics(act, gl, A, std, w)
+    if betas:
+        b = np.concatenate(betas)
         res["beta_lt1_rate"] = float((b < 1).mean())
         res["beta_min"] = float(b.min())
-        # средние блоков сохранены: P(итог) = C
     for k, v in codes.items():
         c = np.concatenate(v).reshape(-1)
         cnt = np.bincount(c, minlength=VOCAB)
@@ -368,56 +396,92 @@ def evaluate(torch, model, A, std, dev, weights=None, bs=1024):
                                  frac=float((cnt > 0).mean()),
                                  perplexity=float(np.exp(-(p[p > 0] * np.log(
                                      p[p > 0])).sum())))
-    _ = M
     return res, act, codes
 
 
 def select_metric(r):
-    return r["mse_arm_20"] + (1.0 - r["grip_acc_20"])
+    """Выбор шага: взвешенная MSE руки (20) + взвешенная BCE схвата."""
+    return r["mse_arm_20"] + r["grip_bce"]
 
 
 # --- обучение -------------------------------------------------------------------
-def cos_lr(step, total):
+RESTART_END = int(0.75 * STEPS)       # граница перезапусков не зависит от добора
+LR_EXT_END = 3e-6
+
+
+def cos_lr(step):
+    """Основное расписание до STEPS; в доборе — продолжение снижения от LR1
+    к LR_EXT_END без скачка."""
     if step < WARM:
         return LR0 * (step + 1) / WARM
-    t = (step - WARM) / max(total - WARM, 1)
-    return LR1 + 0.5 * (LR0 - LR1) * (1 + math.cos(math.pi * min(t, 1.0)))
+    if step < STEPS:
+        t = (step - WARM) / max(STEPS - WARM, 1)
+        return LR1 + 0.5 * (LR0 - LR1) * (1 + math.cos(math.pi * t))
+    t = (step - STEPS) / max(STEPS_MAX - STEPS, 1)
+    return LR_EXT_END + 0.5 * (LR1 - LR_EXT_END) * (1 + math.cos(
+        math.pi * min(t, 1.0)))
 
 
 def train(torch, kind, data, dev, steps=STEPS, steps_max=STEPS_MAX,
-          eval_every=EVAL_EVERY, batch=BATCH, log=print, seed=0):
+          eval_every=EVAL_EVERY, batch=BATCH, log=print, seed=0,
+          resume=None, restart_end=RESTART_END, save_every=2000):
     M = build(torch)
     torch.manual_seed(seed)
     cls = M["HierCodec"] if kind == "hier" else M["FlatCodec"]
     model = cls(data["L"], data["U"]).to(dev)
     std = torch.as_tensor(data["std"], dtype=torch.float32, device=dev)
     Xe = torch.as_tensor(data["train"], dtype=torch.float32, device=dev)
+    we = torch.as_tensor(data["train_w"], dtype=torch.float64)
     Xt = torch.as_tensor(data["teacher"], dtype=torch.float32, device=dev) \
         if data.get("teacher") is not None and len(data["teacher"]) else None
+    wt = torch.as_tensor(data["teacher_w"], dtype=torch.float64) \
+        if Xt is not None else None
     opt = torch.optim.AdamW(model.parameters(), lr=LR0, weight_decay=0.0)
     g = torch.Generator(device="cpu").manual_seed(seed)
-    curve, best = [], None
-    total = steps
+    vw = data.get("val_w")
+    # фиксированная обучающая панель (взвешенная выборка 2048 строк)
+    pr = np.random.default_rng(seed + 7)
+    pw = np.asarray(data["train_w"], np.float64)
+    panel = np.sort(pr.choice(len(data["train"]), min(2048, len(
+        data["train"])), replace=False, p=pw / pw.sum()))
+    curve, best, total, step = [], None, steps, 0
+    acc = {"expert": {}, "teacher": {}}
 
     def pool():
-        i = torch.randint(0, len(Xe), (4096,), generator=g).to(dev)
+        i = torch.multinomial(we, 4096, replacement=True, generator=g).to(dev)
         with torch.no_grad():
             if kind == "hier":
                 zc, zf = model.encode_latent(Xe[i])
                 return dict(c=zc, f=zf)
             return dict(flat=model.enc(Xe[i]))
-    for nm, z in pool().items():
-        model.vqs()[nm].restart(z, init=True)
-    init, _a, _c = evaluate(torch, model, data["val"], data["std"], dev)
-    curve.append(dict(step=0, train=None, val=init, dead=None, seconds=0.0))
+    if resume and os.path.exists(resume):
+        st = torch.load(resume, map_location="cpu", weights_only=False)
+        if st["kind"] != kind or st["config"] != dict(steps=steps,
+                                                       steps_max=steps_max,
+                                                       batch=batch,
+                                                       seed=seed):
+            raise SystemExit(f"состояние {resume} от другой конфигурации")
+        model.load_state_dict(st["model"])
+        opt.load_state_dict(st["opt"])
+        g.set_state(st["gen"])
+        curve, total, step = st["curve"], st["total"], st["step"]
+        best = st["best"]
+        log(f"  {kind}: продолжение с шага {step}", flush=True)
+    else:
+        for nm, z in pool().items():
+            model.vqs()[nm].restart(z, init=True)
+        init, _a, _c = evaluate(torch, model, data["val"], data["std"], dev,
+                                vw)
+        curve.append(dict(step=0, train=None, val=init, dead=None,
+                          seconds=0.0))
     t0 = time.time()
-    step = 0
     while step < total:
         model.train()
         for gr in opt.param_groups:
-            gr["lr"] = cos_lr(step, total)
-        src = Xt if (Xt is not None and step % 4 == 3) else Xe
-        i = torch.randint(0, len(src), (batch,), generator=g).to(dev)
+            gr["lr"] = cos_lr(step)
+        is_t = Xt is not None and step % 4 == 3
+        src, sw = (Xt, wt) if is_t else (Xe, we)
+        i = torch.multinomial(sw, batch, replacement=True, generator=g).to(dev)
         A = src[i]
         o = model(A)
         L_ = losses(torch, o, A, std, M["P"])
@@ -428,31 +492,51 @@ def train(torch, kind, data, dev, steps=STEPS, steps_max=STEPS_MAX,
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         step += 1
-        if step % 500 == 0 and step <= 0.75 * total:
+        a_ = acc["teacher" if is_t else "expert"]
+        for k, v in L_.items():
+            a_[k] = a_.get(k, 0.0) + float(v.detach())
+        a_["n"] = a_.get("n", 0) + 1
+        dead = None
+        if step % 500 == 0 and step <= restart_end:
             dead = {nm: model.vqs()[nm].restart(z) for nm, z in pool().items()}
-        else:
-            dead = None
         if step % eval_every == 0 or step == total:
-            r, _a, _c = evaluate(torch, model, data["val"], data["std"], dev)
-            tr = {k: float(v.detach()) for k, v in L_.items()}
-            curve.append(dict(step=step, train=tr, val=r, dead=dead,
+            r, _a, _c = evaluate(torch, model, data["val"], data["std"], dev,
+                                 vw)
+            rp, _a, _c = evaluate(torch, model, data["train"][panel],
+                                  data["std"], dev,
+                                  np.asarray(data["train_w"])[panel])
+            tr = {src_: {k: v / a_["n"] for k, v in a_.items() if k != "n"}
+                  for src_, a_ in acc.items() if a_.get("n")}
+            acc = {"expert": {}, "teacher": {}}
+            curve.append(dict(step=step, train=tr, train_panel=rp, val=r,
+                              dead=dead, lr=cos_lr(step - 1),
                               seconds=time.time() - t0))
             m = select_metric(r)
+            if not np.isfinite(m):
+                raise SystemExit(f"кодек {kind}: нечисловая проверка")
             if best is None or m < best[1]:
-                best = (step, m, {k: v.detach().clone() for k, v in
+                best = (step, m, {k: v.detach().cpu().clone() for k, v in
                                   model.state_dict().items()})
-            log(f"  {kind} шаг {step}: train {tr['total']:.4f} (рука "
-                f"{tr['arm']:.4f}, coarse {tr['coarse']:.4f}, схват "
-                f"{tr['grip']:.4f}, vq {tr['vq']:.4f}); val рука-20 "
-                f"{r['mse_arm_20']:.4f}, -8 {r['mse_arm_8']:.4f}, схват "
-                f"{100 * r['grip_acc_20']:.1f}%, {time.time() - t0:.0f} с",
-                flush=True)
+            te = tr.get("expert", {})
+            log(f"  {kind} шаг {step}: эксперт {te.get('total', float('nan')):.4f}"
+                f", учитель {tr.get('teacher', {}).get('total', float('nan')):.4f}"
+                f"; панель train рука-20 {rp['mse_arm_20']:.4f}; val рука-20 "
+                f"{r['mse_arm_20']:.4f}, -8 {r['mse_arm_8']:.4f}, BCE схвата "
+                f"{r['grip_bce']:.4f}, {time.time() - t0:.0f} с", flush=True)
             if step == total and total < steps_max and best[0] == step and \
                     len(curve) >= 3 and curve[-1]["val"]["mse_arm_20"] < \
                     curve[-3]["val"]["mse_arm_20"]:
                 total = steps_max
                 log(f"  {kind}: лучший шаг последний и ошибка падает — "
                     f"заранее заданный добор до {steps_max}", flush=True)
+        if resume and (step % save_every == 0 or step == total):
+            torch.save(dict(kind=kind, model=model.state_dict(),
+                            opt=opt.state_dict(), gen=g.get_state(),
+                            curve=curve, total=total, step=step, best=best,
+                            config=dict(steps=steps, steps_max=steps_max,
+                                        batch=batch, seed=seed)),
+                       resume + ".tmp")
+            os.replace(resume + ".tmp", resume)
     model.load_state_dict(best[2])
     return model, dict(best_step=best[0], best_metric=best[1],
                        best_is_last=best[0] == total, steps=total,
@@ -460,111 +544,157 @@ def train(torch, kind, data, dev, steps=STEPS, steps_max=STEPS_MAX,
                                                model.parameters()))
 
 
-def load_data(index, cache_meta, teacher, orig):
+def load_data(index, cache_meta, teacher, orig, prepare_report):
+    """Строгая загрузка: завершённый prepare, совпадение отпечатков,
+    учитель и исходные реконструкции обязательны."""
+    for f in (index, teacher, orig, prepare_report):
+        if not os.path.exists(f):
+            raise SystemExit(f"нет {f}: prepare не завершён")
+    rep = json.load(open(prepare_report))
+    if rep.get("kind") != "k20_prepare" or not rep.get("complete"):
+        raise SystemExit("prepare не завершён")
+    for f, k in ((index, "index_sha1"), (teacher, "teacher_sha1"),
+                 (orig, "orig_codec_val_sha1")):
+        if sha(f) != rep.get(k):
+            raise SystemExit(f"{f} не совпадает с отпечатком prepare")
     meta = json.load(open(f"{cache_meta}.meta.json"))
     d = np.load(meta["cache"], allow_pickle=True)
     act = np.asarray(d["action"], np.float32)
     ix = dict(np.load(index, allow_pickle=False))
-    out = dict(L=ix["L"], U=ix["U"], std=ix["std_arm"],
-               train=act[ix["train"]], val=act[ix["val_sel"]],
-               val_rows=ix["val_sel"], train_rows=ix["train"], act=act,
-               ix=ix)
-    if os.path.exists(teacher):
-        t = np.load(teacher)
-        if not np.isin(t["rows"], ix["train_fit"]).all():
-            raise SystemExit("строки учителя вне train_fit")
-        out["teacher"] = np.asarray(t["target"], np.float32)
-    out["orig"] = dict(np.load(orig)) if os.path.exists(orig) else None
-    return out
+    t = dict(np.load(teacher))
+    o = dict(np.load(orig))
+    n = len(ix["teacher"])
+    if not (np.array_equal(t["rows"], ix["teacher"])
+            and len(np.unique(t["rows"])) == n
+            and t["raw"].shape == (n, T, 7) and t["target"].shape == (n, T, 7)
+            and np.isfinite(t["raw"]).all()
+            and np.isfinite(t["target"]).all()):
+        raise SystemExit("учитель: строки, уникальность, формы или "
+                         "конечность не совпадают")
+    if not np.isin(t["rows"], ix["train_fit"]).all():
+        raise SystemExit("строки учителя вне train_fit")
+    want = t["raw"].copy()
+    want[..., :6] = np.clip(t["raw"][..., :6], ix["L"], ix["U"])
+    if not np.array_equal(want, t["target"]):
+        raise SystemExit("цель учителя ≠ clip(raw, L, U) по руке")
+    nv = len(ix["val_sel"])
+    if not (np.array_equal(o["rows"], ix["val_sel"])
+            and o["recon3"].shape == (nv, T, 7)
+            and o["recon1"].shape == (nv, T, 7)
+            and np.isfinite(o["recon3"]).all()
+            and np.isfinite(o["recon1"]).all()):
+        raise SystemExit("реконструкции исходного кодека не совпадают с "
+                         "val_sel или не конечны")
+    tr, va = ix["train"], ix["val_sel"]
+    return dict(L=ix["L"], U=ix["U"], std=ix["std_arm"],
+                train=act[tr], val=act[va],
+                train_w=row_weights(ix["task"][tr], ix["episode"][tr]),
+                val_w=row_weights(ix["task"][va], ix["episode"][va]),
+                teacher=np.asarray(t["target"], np.float32),
+                teacher_w=row_weights(ix["task"][t["rows"]],
+                                      ix["episode"][t["rows"]]),
+                orig=o, ix=ix, prepare=rep)
+
+
+FIT_RATIO, FIT_GRIP = 0.25, 0.95
+
+
+def fit_ok(r, X, std):
+    """Подгонка 512: ошибка руки < FIT_RATIO · min(нулевое, среднее
+    предсказание) и точность схвата ≥ FIT_GRIP; всё конечно."""
+    s_ = np.asarray(std)
+    zero = float(((X[..., :6] / s_) ** 2).mean())
+    mean = float((((X[..., :6] - X[..., :6].mean(0)) / s_) ** 2).mean())
+    fin = r["rows"]["mse_arm_20"]
+    ok = (np.isfinite(fin) and fin < FIT_RATIO * min(zero, mean)
+          and r["rows"]["grip_acc_20"] >= FIT_GRIP)
+    return bool(ok), dict(zero=zero, mean=mean, final=fin,
+                          grip=r["rows"]["grip_acc_20"],
+                          threshold=FIT_RATIO * min(zero, mean))
 
 
 def main_fitcheck(a):
-    """Подгонка 512 фиксированных train-чанков (проверка оптимизации)."""
+    """Подгонка 512 фиксированных train-чанков (проверка оптимизации);
+    провал критерия останавливает основной запуск."""
     import torch
     dev = torch.device(a.device)
-    data = load_data(a.index, a.cache, a.teacher, a.orig)
+    data = load_data(a.index, a.cache, a.teacher, a.orig, a.prepare)
     rng = np.random.default_rng(20261019)
-    X = data["train"][np.sort(rng.choice(len(data["train"]), 512,
-                                         replace=False))]
-    d = dict(data, train=X, val=X, teacher=None)
-    rep = {}
+    sel = np.sort(rng.choice(len(data["train"]), 512, replace=False))
+    X = data["train"][sel]
+    d = dict(data, train=X, val=X, teacher=None, train_w=np.ones(512),
+             val_w=np.ones(512))
+    rep, bad = {}, []
     for kind in a.kinds:
         _m, r = train(torch, kind, d, dev, steps=a.fit_steps,
                       steps_max=a.fit_steps, eval_every=500, batch=128,
-                      log=lambda *x, **k: None)
-        c0, c1 = r["curve"][0]["val"], r["curve"][-1]["val"]
-        rep[kind] = dict(steps=a.fit_steps, init=c0["mse_arm_20"],
-                         final=c1["mse_arm_20"], grip=c1["grip_acc_20"])
-        print(f"  подгонка 512 чанков {kind}: рука-20 {c0['mse_arm_20']:.4f}"
-              f" -> {c1['mse_arm_20']:.4f}, схват "
-              f"{100 * c1['grip_acc_20']:.1f}%", flush=True)
+                      log=lambda *x, **k: None, restart_end=a.fit_steps // 2)
+        ok, info = fit_ok(r["curve"][-1]["val"], X, data["std"])
+        rep[kind] = dict(steps=a.fit_steps, ok=ok, **info)
+        print(f"  подгонка 512 чанков {kind}: рука-20 {info['final']:.4f} "
+              f"(нулевое {info['zero']:.4f}, среднее {info['mean']:.4f}, "
+              f"порог {info['threshold']:.4f}), схват "
+              f"{100 * info['grip']:.1f}% — "
+              + ("ПРОЙДЕНА" if ok else "НЕ ПРОЙДЕНА"), flush=True)
+        if not ok:
+            bad.append(kind)
     os.makedirs("reports/k20", exist_ok=True)
     json.dump(rep, open("reports/k20/codec_fitcheck.json", "w"), indent=1)
+    if bad:
+        print(f"  ОТКАЗ: подгонка не пройдена: {bad}")
+        return 3
     return 0
 
 
 def main_train(a):
     import torch
     dev = torch.device(a.device)
-    data = load_data(a.index, a.cache, a.teacher, a.orig)
-    ix = data["ix"]
+    data = load_data(a.index, a.cache, a.teacher, a.orig, a.prepare)
     rep = {}
     for kind in a.kinds:
         out = os.path.join("data/k20", f"codec_{kind}.pt")
         if os.path.exists(out):
             raise SystemExit(f"{out} уже есть")
         model, r = train(torch, kind, data, dev, steps=a.steps,
-                         steps_max=a.steps_max)
-        # итоговые проверки на val_sel и учителе
-        task = ix["task"][ix["val_sel"]]
-        epi = ix["episode"][ix["val_sel"]]
-        w = np.zeros(len(task))
-        for t in np.unique(task):
-            mt = task == t
-            for e in np.unique(epi[mt]):
-                me = mt & (epi == e)
-                w[me] = 1.0 / (len(np.unique(epi[mt])) * me.sum())
-        ev, act_v, codes = evaluate(torch, model, data["val"], data["std"],
-                                    dev, weights=w)
+                         steps_max=a.steps_max,
+                         resume=os.path.join("data/k20",
+                                             f"codec_{kind}.resume.pt"))
+        ev, _act, _codes = evaluate(torch, model, data["val"], data["std"],
+                                    dev, data["val_w"])
         r["val_sel"] = ev
-        r["val_sel_rows_mean"], _x, _y = evaluate(torch, model, data["val"],
-                                                  data["std"], dev)
-        if data.get("teacher") is not None:
-            r["teacher_fit"], _x, _y = evaluate(torch, model, data["teacher"],
-                                                data["std"], dev)
-        if data["orig"] is not None:
-            o = data["orig"]
-            if not np.array_equal(o["rows"], ix["val_sel"]):
-                raise SystemExit("строки исходного кодека ≠ val_sel")
-            s_ = np.asarray(data["std"])
-            for lv in ("recon3", "recon1"):
-                e = ((o[lv][..., :6] - data["val"][..., :6]) / s_) ** 2
-                r[f"orig_{lv}"] = dict(mse_arm_20=float(e.mean()),
-                                       mse_arm_8=float(e[:, :8].mean()),
-                                       grip_acc_20=float(((o[lv][..., 6] > 0)
-                                                          == (data["val"][
-                                                              ..., 6] > 0))
-                                                         .mean()))
+        r["teacher_fit"], _x, _y = evaluate(torch, model, data["teacher"],
+                                            data["std"], dev,
+                                            data["teacher_w"])
+        o = data["orig"]
+        for lv in ("recon3", "recon1"):
+            r[f"orig_{lv}"] = chunk_metrics(o[lv], None, data["val"],
+                                            data["std"], data["val_w"])
         state = {k: v.cpu() for k, v in model.state_dict().items()}
         torch.save(dict(kind=kind, state=state, L=data["L"], U=data["U"],
                         std=data["std"], best_step=r["best_step"],
                         index_sha1=sha(a.index),
+                        prepare_sha1=sha(a.prepare),
                         code_sha1=sha(os.path.abspath(__file__))),
                    out + ".tmp")
         os.replace(out + ".tmp", out)
+        rs = os.path.join("data/k20", f"codec_{kind}.resume.pt")
+        if os.path.exists(rs):
+            os.remove(rs)
         r["path"], r["sha1"] = os.path.abspath(out), sha(out)
         rep[kind] = r
-        e8 = ev["mse_arm_8"]
         print(f"  {kind}: шаг {r['best_step']}"
               + (" (последний)" if r["best_is_last"] else "")
-              + f", параметров {r['params']}; val_sel (истинные коды): "
-              f"рука-20 {ev['mse_arm_20']:.4f}, рука-8 {e8:.4f}, coarse "
-              f"{ev['mse_coarse']:.4f}, fine {ev['mse_fine']:.4f}, схват "
-              f"{100 * ev['grip_acc_20']:.1f}%, переключения "
-              f"{ev['switch']}", flush=True)
-        if "orig_recon3" in r:
-            print(f"    исходный ActionCodec: 3 уровня {r['orig_recon3']}, "
-                  f"1 уровень {r['orig_recon1']}")
+              + f", параметров {r['params']}; val_sel (истинные коды, "
+              f"равные задачи/эпизоды): рука-20 {ev['mse_arm_20']:.4f}, "
+              f"рука-8 {ev['mse_arm_8']:.4f}, coarse {ev['mse_coarse']:.4f},"
+              f" fine {ev['mse_fine']:.4f}, схват {100 * ev['grip_acc_20']:.1f}"
+              f"%, BCE {ev['grip_bce']:.4f}; переключения {ev['switch']}",
+              flush=True)
+        for lv in ("recon3", "recon1"):
+            x = r[f"orig_{lv}"]
+            print(f"    исходный ActionCodec {lv}: рука-20 "
+                  f"{x['mse_arm_20']:.4f}, рука-8 {x['mse_arm_8']:.4f}, "
+                  f"схват {100 * x['grip_acc_20']:.1f}%", flush=True)
     os.makedirs("reports/k20", exist_ok=True)
     p = "reports/k20/codec.json"
     old = json.load(open(p)) if os.path.exists(p) else {}
@@ -619,13 +749,18 @@ def selftest():
     X[..., :6] = np.cumsum(X[..., :6] * .1, axis=1).clip(-1, 1)
     X[..., 6] = np.where(np.arange(T) < rng.integers(0, T, (512, 1)), -1., 1.)
     data = dict(L=L, U=U, std=np.full(6, .3), train=X, val=X[:128],
-                teacher=X[:64])
+                teacher=X[:64], train_w=np.ones(512), val_w=np.ones(128),
+                teacher_w=np.ones(64))
     for kind in ("hier", "flat"):
-        m, r = train(torch, kind, data, "cpu", steps=300, steps_max=300,
-                     eval_every=150, batch=64, log=lambda *x, **k: None)
+        m, r = train(torch, kind, data, "cpu", steps=240, steps_max=240,
+                     eval_every=120, batch=32, log=lambda *x, **k: None)
         c = r["curve"]
         assert c[-1]["val"]["mse_arm_20"] < 0.6 * c[0]["val"]["mse_arm_20"], \
             (kind, c[0]["val"]["mse_arm_20"], c[-1]["val"]["mse_arm_20"])
+        assert all(c_["train"] is None or set(c_["train"]) <= {"expert",
+                                                                "teacher"}
+                   for c_ in c)
+        assert "expert" in c[-1]["train"] and "teacher" in c[-1]["train"]
         ev, act, codes = evaluate(torch, m, X[:128], np.full(6, .3), "cpu")
         ev2, act2, _ = evaluate(torch, m, X[:128], np.full(6, .3), "cpu")
         assert np.array_equal(act, act2)                    # детерминизм
@@ -637,10 +772,91 @@ def selftest():
             ev3, act3, _ = evaluate(torch, m2, X[:128], np.full(6, .3),
                                     "cpu")
             assert np.array_equal(act, act3)
+    # строгая загрузка: отказы на повторах, формах, NaN, нарушении clip,
+    # неполном prepare и изменённых файлах
+    with tempfile.TemporaryDirectory() as td:
+        N = 60
+        act = rng.uniform(-1, 1, (N, T, 7)).astype(np.float32)
+        np.savez(td + "/cache.npz", action=act)
+        json.dump(dict(cache=td + "/cache.npz"), open(td + "/c.meta.json",
+                                                      "w"))
+        L6, U6 = -np.ones(6) * 1.1, np.ones(6) * 1.1
+        ix = dict(train=np.arange(40), val_sel=np.arange(40, 60),
+                  train_fit=np.arange(30), teacher=np.arange(0, 30, 3),
+                  task=np.array(["a", "b"] * 30), episode=np.arange(N) // 5,
+                  L=L6, U=U6, std_arm=np.ones(6))
+        raw = rng.uniform(-1.5, 1.5, (10, T, 7)).astype(np.float32)
+        tgt = raw.copy()
+        tgt[..., :6] = np.clip(raw[..., :6], L6, U6)
+
+        def files(ixd=ix, tr=None, oo=None, complete=True):
+            np.savez(td + "/index.npz", **ixd)
+            np.savez(td + "/teacher.npz", **(tr or dict(
+                rows=ixd["teacher"], raw=raw, target=tgt)))
+            np.savez(td + "/orig.npz", **(oo or dict(
+                rows=ixd["val_sel"], recon3=act[40:], recon1=act[40:])))
+            json.dump(dict(kind="k20_prepare", complete=complete,
+                           index_sha1=sha(td + "/index.npz"),
+                           teacher_sha1=sha(td + "/teacher.npz"),
+                           orig_codec_val_sha1=sha(td + "/orig.npz")),
+                      open(td + "/prep.json", "w"))
+
+        def ld():
+            return load_data(td + "/index.npz", td + "/c", td + "/teacher.npz",
+                             td + "/orig.npz", td + "/prep.json")
+        files()
+        dd = ld()
+        assert dd["train"].shape == (40, T, 7) and len(dd["teacher"]) == 10
+        bad = [lambda: files(tr=dict(rows=np.r_[ix["teacher"][:-1], 0],
+                                     raw=raw, target=tgt)),
+               lambda: files(tr=dict(rows=ix["teacher"], raw=raw,
+                                     target=tgt[:9])),
+               lambda: files(tr=dict(rows=ix["teacher"], raw=raw * np.nan,
+                                     target=tgt)),
+               lambda: files(tr=dict(rows=ix["teacher"], raw=raw,
+                                     target=raw)),
+               lambda: files(oo=dict(rows=ix["val_sel"], recon3=act[40:] *
+                                     np.nan, recon1=act[40:])),
+               lambda: files(complete=False)]
+        for i_, mk in enumerate(bad):
+            mk()
+            try:
+                ld()
+                raise AssertionError(f"принят повреждённый вход {i_}")
+            except SystemExit:
+                pass
+        files()
+        np.savez(td + "/teacher.npz", rows=ix["teacher"], raw=raw,
+                 target=tgt * 1.0)               # другой файл -> другой sha
+        open(td + "/teacher.npz", "ab").write(b"x")
+        try:
+            ld()
+            raise AssertionError("принят изменённый файл учителя")
+        except SystemExit:
+            pass
+    # веса: равные задачи, эпизоды, строки
+    w = row_weights(["a", "a", "a", "b"], [1, 1, 2, 3])
+    assert np.allclose(w / w.sum(), [.125, .125, .25, .5])
+    # расписание: без скачка LR в доборе, перезапуски не возобновляются
+    assert abs(cos_lr(STEPS) - LR1) < 1e-9 and cos_lr(STEPS + 1) <= LR1
+    assert cos_lr(STEPS_MAX) <= LR_EXT_END * 1.01
+    lrs = [cos_lr(k) for k in range(WARM, STEPS_MAX)]
+    assert all(b <= a + 1e-15 for a, b in zip(lrs, lrs[1:]))
+    assert RESTART_END == 15000
+    # критерий подгонки: среднее предсказание не проходит
+    Xf = rng.uniform(-1, 1, (64, T, 7))
+    rr = dict(rows=dict(mse_arm_20=float((((Xf[..., :6] - Xf[..., :6].mean(0))
+                                           / .3) ** 2).mean()),
+                        grip_acc_20=1.0))
+    assert not fit_ok(rr, Xf, np.full(6, .3))[0]
+    rr["rows"]["mse_arm_20"] = 1e-4
+    assert fit_ok(rr, Xf, np.full(6, .3))[0]
     print("самопроверка k20_codec пройдена: точная сборка P, β (границы, "
           "средние, нули, насыщение), схват вне усреднения, допустимые "
           "команды, подгонка 512 чанков (иерархия и плоский), "
-          "детерминизм, сохранение")
+          "детерминизм, сохранение, раздельные ошибки эксперта и учителя, "
+          "веса задач/эпизодов, расписание добора, критерий подгонки, "
+          "строгая загрузка входов")
     return 0
 
 
@@ -651,6 +867,7 @@ def main():
     ap.add_argument("--cache", default="data/k11a_joint12")
     ap.add_argument("--teacher", default="data/k20/teacher.npz")
     ap.add_argument("--orig", default="data/k20/orig_codec_val.npz")
+    ap.add_argument("--prepare", default="reports/k20/prepare.json")
     ap.add_argument("--kinds", nargs="+", default=["hier", "flat"])
     ap.add_argument("--steps", type=int, default=STEPS)
     ap.add_argument("--steps-max", type=int, default=STEPS_MAX)

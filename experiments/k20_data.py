@@ -128,6 +128,15 @@ def make_index(a):
     for p in kb.PARTS:
         if not np.array_equal(L16[f"{p}__rows"], c[p]["rows"]):
             raise SystemExit(f"строки {p} кэша K-15f ≠ разметке K-16")
+    act_all = np.asarray(d["action"])
+    for p in kb.PARTS:
+        r = rows[p]
+        if not np.array_equal(epi[r], np.asarray(c[p]["epi"])):
+            raise SystemExit(f"{p}: эпизоды кэша K-9a ≠ эпизодам K-15f")
+        if not np.allclose(act_all[r][:, :H_EXEC], np.asarray(c[p]["act"]),
+                           atol=1e-5):
+            raise SystemExit(f"{p}: первые 8 экспертных действий кэша K-9a "
+                             f"≠ K-15f")
     tr_eps = set(epi[rows["train"]].tolist())
     if tr_eps != set(L16["epA"].tolist()) | set(L16["epB"].tolist()):
         raise SystemExit("train ≠ A ∪ B K-16")
@@ -331,13 +340,22 @@ def main_prepare(a):
     except ImportError:
         rep["peft"] = None
     import torch
+    rep["torch"] = torch.__version__
     if torch.cuda.is_available():
-        rep["gpus"] = [dict(name=torch.cuda.get_device_name(i),
-                            memory_gb=round(torch.cuda.get_device_properties(i)
-                                            .total_memory / 2 ** 30, 1),
-                            bf16=bool(torch.cuda.is_bf16_supported())
-                            if i == 0 else None)
-                       for i in range(torch.cuda.device_count())]
+        gp = []
+        for i in range(torch.cuda.device_count()):
+            pr = torch.cuda.get_device_properties(i)
+            with torch.cuda.device(i):
+                bf = bool(torch.cuda.is_bf16_supported())
+            gp.append(dict(index=i, name=pr.name,
+                           memory_gb=round(pr.total_memory / 2 ** 30, 1),
+                           capability=f"{pr.major}.{pr.minor}",
+                           bf16_reported=bf,
+                           bf16_native=pr.major >= 8))
+        rep["gpus"] = gp
+    print(json.dumps(dict(torch=rep["torch"], peft=rep["peft"],
+                          gpus=rep.get("gpus")), ensure_ascii=False),
+          flush=True)
     if a.no_gpu:
         rep["teacher"] = "пропущен (--no-gpu)"
     else:
@@ -373,6 +391,10 @@ def main_prepare(a):
                                      mse_norm_1lvl_8=float(e1[:, :8].mean()))
     np.savez(os.path.join(OUT, "index.npz"), **arrays)
     rep["index_sha1"] = sha(os.path.join(OUT, "index.npz"))
+    for nm in ("teacher", "orig_codec_val"):
+        f = os.path.join(OUT, f"{nm}.npz")
+        rep[f"{nm}_sha1"] = sha(f) if os.path.exists(f) else None
+    rep["complete"] = not a.no_gpu
     json.dump(rep, open(REPORT, "w"), ensure_ascii=False, indent=1,
               default=float)
     print(json.dumps({k: rep[k] for k in ("coverage", "val_sel_missing_tasks",
