@@ -88,14 +88,31 @@ def build(torch):
     F = nn.functional
     T = kt.build(torch)
 
+    def uniform_(t, bound, gen):
+        with torch.no_grad():
+            t.copy_((torch.rand(t.shape, generator=gen) * 2 - 1) * bound)
+
+    def reinit_linears(mod, gen):
+        """Linear: U(±1/√fan_in) из заданного генератора; LayerNorm: 1/0."""
+        for m in mod.modules():
+            if isinstance(m, nn.Linear):
+                b = 1.0 / math.sqrt(m.in_features)
+                uniform_(m.weight, b, gen)
+                if m.bias is not None:
+                    uniform_(m.bias, b, gen)
+            elif isinstance(m, nn.LayerNorm):
+                with torch.no_grad():
+                    m.weight.fill_(1.0)
+                    m.bias.zero_()
+
     class LoRALinear(nn.Module):
-        def __init__(self, base, r=LORA_R, alpha=LORA_ALPHA):
+        def __init__(self, base, r=LORA_R, alpha=LORA_ALPHA, gen=None):
             super().__init__()
             self.base = base
             for p in self.base.parameters():
                 p.requires_grad_(False)
             self.A = nn.Parameter(torch.empty(r, base.in_features))
-            nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
+            uniform_(self.A, 1.0 / math.sqrt(base.in_features), gen)
             self.B = nn.Parameter(torch.zeros(base.out_features, r))
             self.scale = alpha / r
 
@@ -128,33 +145,48 @@ def build(torch):
                 p.requires_grad_(False)
             for p in bar.action_expert.parameters():
                 p.requires_grad_(True)
+            # ИНИЦИАЛИЗАЦИЯ: у каждого общего модуля свой генератор — одинаково
+            # у flat и tree независимо от числа слотов и модулей дерева
             self.lora_names = []
             if lora:
                 for i, layer in enumerate(tm.layers):
-                    for nm in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                    for j, nm in enumerate(("q_proj", "k_proj", "v_proj",
+                                            "o_proj")):
                         base = getattr(layer.self_attn, nm)
-                        setattr(layer.self_attn, nm, LoRALinear(base))
+                        gl = torch.Generator().manual_seed(
+                            seed * 100003 + 1000 + 4 * i + j)
+                        setattr(layer.self_attn, nm, LoRALinear(base, gen=gl))
                         self.lora_names.append(f"text.{i}.{nm}")
-            g = torch.Generator().manual_seed(seed + 11)
             n0 = 16 if mode == "flat24" else 4
             self.q0 = nn.Parameter(bar.bos_embedding.detach().float()
                                    .reshape(1, 1, -1).repeat(1, n0, 1)
                                    .clone())
-            self.slot = nn.Parameter(torch.randn(1, n0, self.H, generator=g)
+            gs = torch.Generator().manual_seed(seed * 100003 + 11)
+            self.slot = nn.Parameter(torch.randn(1, n0, self.H, generator=gs)
                                      * 0.02)
             self.state_proj = nn.Linear(STATE_DIM, self.H)
+            gp = torch.Generator().manual_seed(seed * 100003 + 21)
             with torch.no_grad():
                 self.state_proj.weight.copy_(torch.randn(
-                    self.H, STATE_DIM, generator=g) * 0.02)
+                    self.H, STATE_DIM, generator=gp) * 0.02)
                 self.state_proj.bias.zero_()
-            torch.manual_seed(seed + 13)
             if mode != "flat24":
                 self.dur = T["Head"](self.H)
                 self.split1 = T["Head"](self.H)
                 self.split2 = T["Head"](self.H)
                 self.exp1 = T["Expand"](self.H)
                 self.exp2 = T["Expand"](self.H)
+                gt = torch.Generator().manual_seed(seed * 100003 + 41)
+                with torch.no_grad():
+                    for ex in (self.exp1, self.exp2):
+                        ex.e_side.copy_(torch.randn(ex.e_side.shape,
+                                                    generator=gt) * 1e-3)
+                        ex.W.weight.copy_(torch.randn(ex.W.weight.shape,
+                                                      generator=gt) * 1e-3)
+                        ex.W.bias.zero_()
             self.readout = T["Readout"](self.H, L, U)
+            reinit_linears(self.readout, torch.Generator().manual_seed(
+                seed * 100003 + 31))
             self.T = T
             sm = np.zeros(5) if state_mean is None else state_mean
             ss = np.ones(5) if state_std is None else state_std
@@ -469,6 +501,20 @@ def selftest():
         assert (o["arm"] >= -1.1 - 1e-5).all() and (o["arm"] <= 4 + 1e-5).all()
         assert torch.allclose(o["weights"].sum(-1), torch.ones(3, 20),
                               atol=1e-5)
+    # общие модули инициализированы одинаково у всех режимов (побитово)
+    ref = models["flat24"]
+    for m_, mod in models.items():
+        for nm in ("state_proj", "readout"):
+            for p1, p2 in zip(getattr(ref, nm).parameters(),
+                              getattr(mod, nm).parameters()):
+                assert torch.equal(p1, p2), (m_, nm)
+        l1 = [p for n, p in ref.named_parameters() if n.endswith((".A",
+                                                                  ".B"))]
+        l2 = [p for n, p in mod.named_parameters() if n.endswith((".A",
+                                                                  ".B"))]
+        assert len(l1) == len(l2) == 192 and all(torch.equal(x, y) for x, y
+                                                 in zip(l1, l2)), m_
+        assert torch.equal(ref.q0[:, :1], mod.q0[:, :1])
     assert query_layer_ops("tree_adapt24") == 224
     assert query_layer_ops("flat24") == 384
     # префикс не зависит от action-query: одинаков у всех вариантов на
@@ -560,84 +606,150 @@ def selftest():
 
 
 # --- проверка на настоящем BAR -------------------------------------------------------
+REL_TOL_BAR = 1e-3          # допуск сверки собственного слоя с BAR (до проверки)
+
+
 def real_check(a):
-    """Настоящие изображения -> forward/backward flat и tree; формы,
-    счётчики, градиенты, допустимость, память и скорость по microbatch."""
+    """Один режим в отдельном процессе: настоящие кадры -> forward/backward
+    + шаг AdamW (lr = 0) по microbatch; сверка собственного слоя с
+    _shared_attention_forward BAR; код 3 при любой технической ошибке."""
     import torch
-    import k20_data as kd
     import k21_data as d21
     dev = torch.device(a.device)
-    D = d21.load_prepared(a.prep)
+    D = d21.load_prepared(require_teacher=False)
+    pin = D["prep_report"]["bar_pin"]
+    bar = d21.load_bar(dev, pin)
+    model = bar["model"]
+    extra = [n for n, _m in model.named_modules()
+             if "lora" in n.lower() or "adapter" in n.lower()]
+    prob = []
+    if extra:
+        prob.append(f"в исходном BAR есть адаптеры: {extra[:3]}")
+    print(f"  {a.mode}: класс {type(model).__name__}, ревизия "
+          f"{bar['revision']}; блоков BAR {model.num_blocks}, токенов на блок "
+          f"{model.block_size}", flush=True)
+    model.action_expert.float()
     M = build(torch)
-    rep = {}
+    mod = M["K21"](model, a.mode, D["L"], D["U"], D["state_mean"],
+                   D["state_std"], checkpoint=True).to(dev)
+    r = mod.report()
+    print(f"  отчёт модели: {json.dumps(r, ensure_ascii=False)}", flush=True)
+    dt = getattr(torch, a.dtype)
     rows = D["train_rows"][:: max(1, len(D["train_rows"]) // 64)][:64]
-    for mode in ("tree_adapt24", "flat24"):
-        bar = kd.load_bar(dev)                 # свежие исходные веса
-        model = bar["model"]
-        extra = [n for n, _m in model.named_modules()
-                 if "lora" in n.lower() or "adapter" in n.lower()]
-        if extra:
-            raise SystemExit(f"в исходном BAR есть адаптеры: {extra[:3]}")
-        print(f"  {mode}: класс {type(model).__name__}, ревизия "
-              f"{bar['revision']}; блоков BAR {model.num_blocks}, токенов на "
-              f"блок {model.block_size}", flush=True)
-        model.action_expert.float()
-        mod = M["K21"](model, mode, D["L"], D["U"], D["state_mean"],
-                       D["state_std"], checkpoint=True).to(dev)
-        r = mod.report()
-        print(f"  {mode}: {json.dumps(r, ensure_ascii=False)}", flush=True)
-        sizes = {}
-        for mb in a.microbatches:
-            sel = rows[:mb]
-            batch, po, st, tgt, val = d21.make_batch(D, sel, bar, dev)
-            torch.cuda.reset_peak_memory_stats(dev)
-            torch.cuda.synchronize(dev)
-            t0 = time.time()
-            try:
-                mod.train()
-                with torch.autocast("cuda", dtype=getattr(torch, a.dtype)):
-                    out = mod(batch, po, st)
-                    loss, l1, bce = loss_fn(torch, out, tgt, val)
-                loss.mean().backward()
-                torch.cuda.synchronize(dev)
-                ok = True
-            except torch.cuda.OutOfMemoryError:
-                ok = False
-            el = time.time() - t0
-            mem = torch.cuda.max_memory_allocated(dev) / 2 ** 30
-            sizes[mb] = dict(ok=ok, seconds=el, peak_gb=mem)
-            if ok:
-                c = mod.counters
-                gr = mod.groups()
-                gnorm = {k: float(torch.sqrt(sum((p.grad.float() ** 2).sum()
-                                                 for p in v
-                                                 if p.grad is not None)))
-                         for k, v in gr.items()}
-                ae = mod.bar.action_expert.layers
-                ge = [float(ae[i].self_attn.q_proj.weight.grad.norm())
-                      for i in (0, 23)]
-                fin = bool(torch.isfinite(out["arm"]).all())
-                inb = bool(((out["arm"] >= torch.as_tensor(D["L"], device=dev)
-                             - 1e-4) & (out["arm"] <= torch.as_tensor(
-                                 D["U"], device=dev) + 1e-4)).all())
-                sizes[mb].update(loss=float(loss.mean()), grad=gnorm,
-                                 grad_expert_first_last=ge, finite=fin,
-                                 in_bounds=inb, active=c["active"][::8],
-                                 vision_calls=c["vision"],
-                                 layers_once=all(x == 1 for x in c["text"])
-                                 and all(x == 1 for x in c["expert"]))
-            mod.zero_grad(set_to_none=True)
-            print(f"    microbatch {mb}: {sizes[mb]}", flush=True)
-            if not ok:
-                break
-        rep[mode] = dict(report=r, microbatch=sizes,
-                         query_layer_ops=query_layer_ops(mode))
-        del mod, model, bar
+    # сверка собственного слоя с BAR на настоящем входе
+    batch, po, st, tgt, val = d21.make_batch(D, rows[:2], bar, dev)
+    with torch.no_grad(), torch.autocast("cuda", dtype=dt):
+        img = model.vlm.get_image_features(batch["pixel_values"],
+                                           batch.get("pixel_attention_mask"))
+        _b, _l, hv, _i = model._build_vlm_inputs_embeds(
+            input_ids=batch["input_ids"], inputs_embeds=None,
+            pixel_values=None, pixel_attention_mask=None,
+            image_hidden_states=img)
+        B, V = hv.shape[:2]
+        ha = (mod.q0 + mod.slot).expand(B, -1, -1) + mod.state_proj(st)[:, None]
+        A = ha.shape[1]
+        mask = mod._mask(batch["attention_mask"], V, A, dev)
+        pos = mod._pos(B, V, list(range(A)), po, dev)
+        cos, sin = model.vlm.text_model.rotary_emb(
+            hv[:, :1].expand(B, V + A, hv.shape[-1]), position_ids=pos)
+        cmp = {}
+        for li in (0, 23):
+            ov, oa = mod._layer(li, hv, ha, mask, cos, sin)
+            rv, ra = model._shared_attention_forward(
+                vlm_hidden_states=hv, action_hidden_states=ha, layer_idx=li,
+                attention_mask=mask, position_ids=pos)
+            keep = batch["attention_mask"].bool()
+            dv = float((ov - rv).float()[keep].abs().max() / rv.float()[keep]
+                       .abs().max().clamp_min(1e-6))
+            da = float((oa - ra).float().abs().max() / ra.float().abs().max()
+                       .clamp_min(1e-6))
+            cmp[li] = dict(prefix_rel=dv, action_rel=da)
+            if not (dv <= REL_TOL_BAR and da <= REL_TOL_BAR):
+                prob.append(f"слой {li}: расхождение с BAR {cmp[li]}")
+    print(f"  сверка слоя с _shared_attention_forward BAR: {cmp}", flush=True)
+    opt = torch.optim.AdamW([p for g in mod.groups().values() for p in g],
+                            lr=0.0, weight_decay=0.0)
+    sizes, any_ok = {}, False
+    for mb in a.microbatches:
+        out = loss = None
+        batch, po, st, tgt, val = d21.make_batch(D, rows[:mb], bar, dev)
         torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(dev)
+        torch.cuda.synchronize(dev)
+        t0 = time.time()
+        try:
+            mod.train()
+            with torch.autocast("cuda", dtype=dt):
+                out = mod(batch, po, st)
+                loss, l1, bce = loss_fn(torch, out, tgt, val)
+            loss.mean().backward()
+            torch.cuda.synchronize(dev)
+            t_fb = time.time() - t0
+            opt.step()
+            torch.cuda.synchronize(dev)
+            ok = True
+        except torch.cuda.OutOfMemoryError:
+            ok = False
+        el = time.time() - t0
+        mem = torch.cuda.max_memory_allocated(dev) / 2 ** 30
+        res = dict(ok=ok, seconds=el, peak_gb_with_adamw=mem)
+        if ok:
+            any_ok = True
+            c = mod.counters
+            gr = mod.groups()
+            gnorm = {}
+            for k, v in gr.items():
+                gs = [p.grad.float() for p in v if p.grad is not None]
+                gnorm[k] = float(torch.sqrt(sum((g ** 2).sum() for g in gs))) \
+                    if gs else 0.0
+            ael = mod.bar.action_expert.layers
+            ge = [float(ael[i].self_attn.q_proj.weight.grad.norm())
+                  for i in (0, 23)]
+            Lt = torch.as_tensor(D["L"], device=dev)
+            Ut = torch.as_tensor(D["U"], device=dev)
+            want = [16] * 24 if a.mode == "flat24" else \
+                [4] * 8 + [8] * 8 + [16] * 8
+            checks = dict(
+                shapes=tuple(out["arm"].shape) == (mb, 20, 6) and
+                tuple(out["grip_logit"].shape) == (mb, 20),
+                finite=bool(torch.isfinite(out["arm"]).all()
+                            and torch.isfinite(out["grip_logit"]).all()
+                            and torch.isfinite(loss).all()),
+                grads_finite=all(np.isfinite(v) for v in gnorm.values()),
+                grads_nonzero=all(gnorm[k] > 0 for k in ("expert", "lora",
+                                                         "new"))
+                and all(x > 0 for x in ge),
+                in_bounds=bool(((out["arm"] >= Lt - 1e-4)
+                                & (out["arm"] <= Ut + 1e-4)).all()),
+                counters=c["vision"] == 1 and all(x == 1 for x in c["text"])
+                and all(x == 1 for x in c["expert"]) and c["active"] == want)
+            res.update(seconds_forward_backward=t_fb, loss=float(loss.mean()),
+                       grad_norms=gnorm, grad_expert_first_last=ge,
+                       checks=checks)
+            bad = [k for k, v in checks.items() if not v]
+            if bad:
+                prob.append(f"microbatch {mb}: не пройдено {bad}")
+        mod.zero_grad(set_to_none=True)
+        del out, loss, batch, tgt, val
+        torch.cuda.empty_cache()
+        sizes[mb] = res
+        print(f"    microbatch {mb}: {res}", flush=True)
+        if not ok:
+            break
+    if not any_ok:
+        prob.append("нет ни одного пригодного microbatch (OOM на 1)")
+    rep = dict(mode=a.mode, report=r, bar_layer_check=cmp, microbatch=sizes,
+               query_layer_ops=query_layer_ops(a.mode), problems=prob,
+               dtype=a.dtype,
+               note="память включает состояния AdamW (шаг с lr = 0)")
     os.makedirs("reports/k21", exist_ok=True)
-    json.dump(rep, open("reports/k21/real_check.json", "w"),
+    json.dump(rep, open(f"reports/k21/real_check_{a.mode}.json", "w"),
               ensure_ascii=False, indent=1, default=float)
-    print("  отчёт: reports/k21/real_check.json")
+    if prob:
+        print("  ОТКАЗ: " + "; ".join(prob[:6]), flush=True)
+        return 3
+    print(f"  {a.mode}: проверка пройдена; отчёт "
+          f"reports/k21/real_check_{a.mode}.json", flush=True)
     return 0
 
 
@@ -645,7 +757,7 @@ def main():
     ap = argparse.ArgumentParser(description="K-21: модель")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--real-check", action="store_true")
-    ap.add_argument("--prep", default="data/k21/prep.npz")
+    ap.add_argument("--mode", default="tree_adapt24", choices=MODES)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--dtype", default="float16")
     ap.add_argument("--microbatches", type=int, nargs="+",
@@ -654,7 +766,13 @@ def main():
     if a.selftest:
         return selftest()
     if a.real_check:
-        return real_check(a)
+        try:
+            return real_check(a)
+        except SystemExit as e:
+            if isinstance(e.code, str):
+                print(f"  ОТКАЗ: {e.code}")
+                return 3
+            raise
     raise SystemExit("режим: --selftest или --real-check")
 
 
