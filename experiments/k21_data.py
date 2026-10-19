@@ -15,9 +15,10 @@ prep.npz (SHA в паспорте); кадры — манифест (разме�
 SHA фиксированной выборки 512 строк — сверяется при каждой загрузке);
 исходный кэш — SHA. Чекпойнт BAR — ревизия (снимок HF) и отпечатки файлов
 (имена LFS-blob = их SHA256); модель и процессор грузятся из этого снимка.
-УЧИТЕЛЬ (отдельный этап после real-check): K-20, если его паспорт завершён,
-ревизия BAR, источник кадров/кэша и разметка K-16 те же и строки равны
-выбору; иначе — сбор заново (k20_data.run_teacher) из закреплённого снимка.
+УЧИТЕЛЬ (отдельный этап после real-check): всегда собирается заново
+(collect_teacher) на закреплённых входах подготовки из закреплённого снимка
+с проверкой содержимого файлов; учитель K-20 не используется — нельзя
+подтвердить, какие состояния он читал.
 ВЫХОД: data/k21/prep.npz, reports/k21/prepare.json, data/k21/teacher.npz,
 reports/k21/teacher.json.
 """
@@ -118,18 +119,49 @@ def snapshot_pin(revision=None):
     return dict(checkpoint=CKPT, revision=rev, path=path, files=files)
 
 
-def check_pin(pin):
+def blob_ok(path, blob):
+    """Содержимое = адресу: LFS-blob — SHA256 файла (64 hex), обычный
+    git-blob — SHA1("blob <size>\\0" + данные) (40 hex)."""
+    if len(blob) == 64:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for c in iter(lambda: f.read(1 << 24), b""):
+                h.update(c)
+        return h.hexdigest() == blob
+    if len(blob) == 40:
+        h = hashlib.sha1()
+        h.update(f"blob {os.path.getsize(path)}\0".encode())
+        with open(path, "rb") as f:
+            for c in iter(lambda: f.read(1 << 24), b""):
+                h.update(c)
+        return h.hexdigest() == blob
+    return False
+
+
+def verify_snapshot(path, files):
+    bad = []
+    for rel, v in files.items():
+        if not blob_ok(os.path.realpath(os.path.join(path, rel)), v["blob"]):
+            bad.append(rel)
+    return bad
+
+
+def check_pin(pin, verify_content=False):
     cur = snapshot_pin(pin["revision"])
     if cur["revision"] != pin["revision"] or cur["files"] != pin["files"]:
         raise SystemExit("снимок BAR не совпадает с закреплённым")
+    if verify_content:
+        bad = verify_snapshot(cur["path"], pin["files"])
+        if bad:
+            raise SystemExit(f"содержимое файлов BAR ≠ адресу: {bad[:3]}")
     return cur["path"]
 
 
 def load_bar(device, pin, root="third_party/actioncodec",
-             cfg_path="config/eval/bar.yaml"):
+             cfg_path="config/eval/bar.yaml", verify_content=False):
     """Исходный полный BAR и процессор из закреплённого снимка."""
     import torch
-    path = check_pin(pin)
+    path = check_pin(pin, verify_content)
     r = os.path.abspath(root)
     if r not in sys.path:
         sys.path.insert(0, r)
@@ -206,36 +238,6 @@ def device_passport():
     return rep
 
 
-def teacher_k20(sel_rows, prep_rep, k20_prep="reports/k20/prepare.json",
-                k20_teacher="data/k20/teacher.npz"):
-    """Учитель K-20 при строгом совпадении происхождения или (None, причина)."""
-    if not (os.path.exists(k20_prep) and os.path.exists(k20_teacher)):
-        return None, "нет готового учителя K-20"
-    r = json.load(open(k20_prep))
-    why = []
-    if not r.get("complete") or sha(k20_teacher) != r.get("teacher_sha1"):
-        why.append("не завершён или файл изменён")
-    bar = r.get("bar") or {}
-    if bar.get("class_name") != "SmolVLABlockwiseAR" or \
-            bar.get("checkpoint") != CKPT or \
-            bar.get("revision") != prep_rep["bar_pin"]["revision"]:
-        why.append("другая модель или ревизия BAR")
-    src = r.get("source") or {}
-    if os.path.abspath(src.get("cache", "")) != os.path.abspath(
-            prep_rep["inputs"]["cache"]["path"]) or \
-            os.path.abspath(src.get("images", "")) != \
-            prep_rep["inputs"]["images"]["path"] or \
-            src.get("k16_labels_sha1") != prep_rep["inputs"]["k16_labels_sha1"]:
-        why.append("другой источник кадров, кэша или разметки")
-    t = dict(np.load(k20_teacher))
-    if not np.array_equal(t["rows"], sel_rows):
-        why.append("строки ≠ текущему выбору")
-    if why:
-        return None, "учитель K-20 не принят: " + "; ".join(why)
-    return t, dict(source="K-20", revision=bar["revision"],
-                   k20_teacher_sha1=r["teacher_sha1"])
-
-
 def check_teacher(t, rows_train, L, U):
     n = len(t["rows"])
     p = []
@@ -262,8 +264,11 @@ def main_prepare(a):
     rep = dict(kind="k21_prepare", device=device_passport())
     print(json.dumps(rep["device"], ensure_ascii=False), flush=True)
     pin = snapshot_pin()
+    bad = verify_snapshot(pin["path"], pin["files"])
+    if bad:
+        raise SystemExit(f"содержимое файлов BAR ≠ адресу: {bad[:3]}")
     print(f"  снимок BAR: ревизия {pin['revision']}, файлов "
-          f"{len(pin['files'])}", flush=True)
+          f"{len(pin['files'])}, содержимое сверено с адресами", flush=True)
     ix = kd.make_index(argparse.Namespace(cache=a.cache, h18_cache=a.h18_cache,
                                           k16_labels=a.k16_labels))
     d, N = ix["d"], ix["N"]
@@ -339,6 +344,7 @@ def main_prepare(a):
         volume=dict(updates=1000 + 8000, max_updates=1000 + 16000,
                     effective_batch=32),
         out=dict(path=os.path.abspath(OUT), sha1=sha(OUT)))
+    rep["prep_id"] = prep_id(rep)
     json.dump(rep, open(REPORT, "w"), ensure_ascii=False, indent=1,
               default=float)
     print(json.dumps({k: rep[k] for k in ("rows", "episodes", "tasks",
@@ -352,29 +358,89 @@ def main_prepare(a):
     return 0
 
 
+def collect_teacher(bar, D, L, U, batch=8, log=print, fns=None):
+    """Полный BAR на закреплённых входах подготовки (кадры по манифесту,
+    D["state8"], задачи, смещения) -> сырой и допустимый чанк."""
+    import k20_data as kd
+    f = dict(prompt=kd.prompt_batch, norm=kd.norm_states,
+             generate=_generate, decode=kd.decode_codes)
+    f.update(fns or {})
+    rows = np.asarray(D["teacher_rows"])
+    offs = np.asarray(D["pos_offset"])
+    raw = np.zeros((len(rows), T, 7), np.float32)
+    codes = np.zeros((len(rows), 48), np.int64)
+    order = np.lexsort((rows, offs[rows]))
+    import time as _time
+    t0 = _time.time()
+    done = 0
+    for po in sorted(set(offs[rows].tolist())):
+        sel = order[offs[rows][order] == po]
+        for s0 in range(0, len(sel), batch):
+            j = sel[s0:s0 + batch]
+            r = rows[j]
+            b = f["prompt"](bar, [np.asarray(D["IMG"][i]) for i in r],
+                            f["norm"](np.asarray(D["state8"][r])),
+                            D["task"][r].tolist())
+            k = f["generate"](bar, b, int(po)).reshape(len(r), 3, 16)
+            codes[j] = k.reshape(len(r), -1)
+            raw[j] = f["decode"](bar, k)[:, :T]
+            done += len(r)
+            if done == len(r) or done % (batch * 64) < batch:
+                el = _time.time() - t0
+                log(f"  учитель: {done}/{len(rows)}, {el / done:.3f} с на "
+                    f"наблюдение, осталось ~"
+                    f"{el / done * (len(rows) - done) / 60:.1f} мин",
+                    flush=True)
+    if not np.isfinite(raw).all():
+        raise SystemExit("выход учителя не конечен")
+    feas = raw.copy()
+    feas[..., :6] = np.clip(raw[..., :6], L, U)
+    rate = float((np.abs(feas - raw) > 0).any(axis=(1, 2)).mean())
+    return raw, feas, codes, rate, (_time.time() - t0) / max(done, 1)
+
+
+def _generate(bar, b, po):
+    import torch
+    with torch.no_grad():
+        tk = bar["model"].generate(**b, position_offset=po, do_sample=False,
+                                   initial_position_shift=1)
+    return tk.cpu().numpy()
+
+
+def prep_id(rep):
+    """Общий отпечаток подготовки: prep.npz, снимок BAR, манифест кадров,
+    исходный кэш и состояния."""
+    core = dict(prep=rep["out"]["sha1"], bar=dict(
+        revision=rep["bar_pin"]["revision"], files=rep["bar_pin"]["files"]),
+        images={k: rep["inputs"]["images"][k] for k in
+                ("size", "shape", "dtype", "sample_sha1", "sha1")},
+        cache=rep["inputs"]["cache"]["sha1"],
+        state=rep["inputs"]["state"]["sha1"])
+    return hashlib.sha1(json.dumps(core, sort_keys=True).encode()
+                        ).hexdigest()
+
+
 def main_teacher(a):
     """Учитель: K-20 при строгом совпадении происхождения или сбор заново."""
-    import k20_data as kd
     D = load_prepared(require_teacher=False)
     prep = D["prep_report"]
-    t, src = teacher_k20(D["teacher_rows"], prep)
-    if t is None:
-        print(f"  {src} — сбор заново из закреплённого снимка", flush=True)
-        bar = load_bar(a.device, prep["bar_pin"])
-        ix = dict(d=dict(pos_offset=D["pos_offset"]), src=D["cache_path"],
-                  img=prep["inputs"]["images"]["path"], task=D["task"],
-                  teacher=D["teacher_rows"])
-        raw, feas, codes, rate, spd = kd.run_teacher(bar, ix, D["L"], D["U"],
-                                                     batch=a.batch)
-        t = dict(rows=D["teacher_rows"], raw=raw, target=feas, codes=codes)
-        src = dict(source="K-21", revision=bar["revision"],
-                   out_of_bounds_rate=rate, seconds_per_obs=spd)
+    # всегда собирается заново на закреплённых входах: у учителя K-20 нельзя
+    # подтвердить, какие состояния он читал
+    bar = load_bar(a.device, prep["bar_pin"], verify_content=True)
+    raw, feas, codes, rate, spd = collect_teacher(bar, D, D["L"], D["U"],
+                                                  batch=a.batch)
+    t = dict(rows=D["teacher_rows"], raw=raw, target=feas, codes=codes)
+    src = dict(source="K-21", revision=bar["revision"],
+               out_of_bounds_rate=rate, seconds_per_obs=spd)
     prob = check_teacher(t, D["train_rows"], D["L"], D["U"])
     if prob:
         raise SystemExit("; ".join(prob))
     np.savez(TEACHER, rows=t["rows"], raw=t["raw"], target=t["target"])
+    if src.get("revision") != prep["bar_pin"]["revision"]:
+        raise SystemExit("ревизия учителя ≠ ревизии подготовки")
     rep = dict(kind="k21_teacher", provenance=src,
-               prep_sha1=prep["out"]["sha1"], n=int(len(t["rows"])),
+               prep_sha1=prep["out"]["sha1"], prep_id=prep_id(prep),
+               n=int(len(t["rows"])),
                out=dict(path=os.path.abspath(TEACHER), sha1=sha(TEACHER)))
     json.dump(rep, open(TEACHER_REPORT, "w"), ensure_ascii=False, indent=1,
               default=float)
@@ -403,8 +469,11 @@ def load_prepared(path=OUT, report=REPORT, require_teacher=True,
             raise SystemExit("учитель K-21 не подготовлен")
         tr = json.load(open(TEACHER_REPORT))
         if tr["out"]["sha1"] != sha(TEACHER) or \
-                tr["prep_sha1"] != r["out"]["sha1"]:
-            raise SystemExit("учитель изменён или от другой подготовки")
+                tr["prep_sha1"] != r["out"]["sha1"] or \
+                tr.get("prep_id") != prep_id(r) or \
+                tr["provenance"].get("revision") != r["bar_pin"]["revision"]:
+            raise SystemExit("учитель изменён или от другой подготовки "
+                             "(массивы, снимок BAR или кадры)")
         t = dict(np.load(TEACHER))
         if not np.array_equal(t["rows"], z["teacher_rows"]):
             raise SystemExit("строки учителя ≠ выбору подготовки")
@@ -471,8 +540,51 @@ def selftest():
         _t.sleep(0.01)
         np.save(f, X)
         assert check_images(man)
+    # сборщик учителя берёт закреплённые состояния, а не внешний файл
+    with tempfile.TemporaryDirectory() as td:
+        np.save(td + "/ext.state.npy", np.ones((6, 8)))     # «заменённый»
+        D = dict(teacher_rows=np.array([1, 3, 4]), pos_offset=np.zeros(6, int),
+                 IMG=np.zeros((6, 3, 2, 2), np.uint8), state8=np.zeros((6, 8)),
+                 task=np.array(["t"] * 6), cache_path=td + "/ext")
+        seen = []
+
+        def fake_prompt(bar, imgs, states, tasks):
+            seen.append(np.asarray(states))
+            return {}
+        out = collect_teacher(None, D, -np.ones(6), np.ones(6), batch=2,
+                              log=lambda *x, **k: None, fns=dict(
+                                  prompt=fake_prompt, norm=lambda x: x,
+                                  generate=lambda b, bb, po: np.zeros(
+                                      (2 if len(seen[-1]) == 2 else 1, 48),
+                                      np.int64),
+                                  decode=lambda b, k: np.zeros(
+                                      (len(k), T, 7), np.float32)))
+        assert all((x == 0).all() for x in seen) and out[0].shape == (3, T, 7)
+    # общий отпечаток подготовки чувствителен к ревизии BAR и кадрам
+    base = dict(out=dict(sha1="a"), bar_pin=dict(revision="r1", files={}),
+                inputs=dict(images=dict(size=1, shape=[1], dtype="u1",
+                                        sample_sha1="s", sha1="f"),
+                            cache=dict(sha1="c"), state=dict(sha1="t")))
+    import copy as _c
+    b2 = _c.deepcopy(base)
+    b2["bar_pin"]["revision"] = "r2"
+    b3 = _c.deepcopy(base)
+    b3["inputs"]["images"]["sample_sha1"] = "x"
+    assert prep_id(base) != prep_id(b2) and prep_id(base) != prep_id(b3)
+    # содержимое файла снимка сверяется с адресом
+    with tempfile.TemporaryDirectory() as td:
+        f = td + "/w.bin"
+        open(f, "wb").write(b"abc")
+        good = hashlib.sha256(b"abc").hexdigest()
+        assert blob_ok(f, good)
+        open(f, "wb").write(b"abd")                      # тот же размер
+        assert not blob_ok(f, good)
+        g1 = hashlib.sha1(b"blob 3\0abd").hexdigest()
+        assert blob_ok(f, g1)
     print("самопроверка k21_data пройдена: маска хвоста, проверки учителя "
-          "(повтор, clip, вне train, NaN), состояние 6D, манифест кадров")
+          "(повтор, clip, вне train, NaN), состояние 6D, манифест кадров, "
+          "учитель на закреплённых состояниях, общий отпечаток подготовки, "
+          "содержимое файлов снимка")
     return 0
 
 
