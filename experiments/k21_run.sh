@@ -3,10 +3,14 @@
 #   bash experiments/k21_run.sh selftest cpu
 #   bash experiments/k21_run.sh prepare cuda:0      # индексы, маски, закрепление
 #   bash experiments/k21_run.sh real-check cuda:0   # forward/backward, 3 режима
-#   bash experiments/k21_run.sh teacher cuda:0      # учитель (K-20 или заново)
+#   bash experiments/k21_run.sh teacher cuda:0      # учитель (сбор заново)
+#   MICRO=4 DTYPE=float16 bash experiments/k21_run.sh fitcheck cuda:0
+#   MICRO=4 DTYPE=float16 bash experiments/k21_run.sh train cuda:0
 # Обучение (fitcheck, train), latency, plan и pilot добавляются в пакетах 2–3.
 set -euo pipefail
-MODE="${1:?нужен режим: selftest, prepare, real-check или teacher}"
+MODE="${1:?нужен режим: selftest, prepare, real-check, teacher, fitcheck или train}"
+MICRO="${MICRO:-4}"
+DTYPE="${DTYPE:-float16}"
 DEV="${2:-cuda:0}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 1
@@ -21,6 +25,8 @@ echo "=== СТАРТ $(date) === режим $MODE, карта $DEV, коммит
 finish () { echo "=== КОНЕЦ $(date), код $1 ==="; exit "$1"; }
 case "$MODE" in
   selftest)
+    python3 experiments/k21_train.py selftest \
+      || { echo "ОТКАЗ: самопроверка k21_train"; finish 1; }
     for m in k21_data k21_model; do
       python3 "experiments/${m}.py" --selftest \
         || { echo "ОТКАЗ: самопроверка ${m}"; finish 1; }
@@ -43,6 +49,11 @@ case "$MODE" in
   teacher)
     CODE=0
     python3 experiments/k21_data.py --teacher --device "$DEV" || CODE=$?
+    finish $CODE ;;
+  fitcheck|train)
+    CODE=0
+    python3 experiments/k21_train.py "$MODE" --device "$DEV" \
+      --micro "$MICRO" --dtype "$DTYPE" || CODE=$?
     finish $CODE ;;
   *) echo "режим $MODE неизвестен"; finish 2 ;;
 esac

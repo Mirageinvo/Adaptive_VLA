@@ -84,7 +84,8 @@ def state11(state8, mean=None, std=None):
 
 
 def build(torch):
-    nn = torch.nn
+    import torch.utils.checkpoint as tuc        # явно: в старых torch не
+    nn = torch.nn                               # подгружается автоматически
     F = nn.functional
     T = kt.build(torch)
 
@@ -323,7 +324,7 @@ def build(torch):
                     hv[:, :1].expand(B, V + A, hv.shape[-1]), position_ids=pos)
                 for l in range(l0, l1):
                     if self.checkpoint and self.training:
-                        hv, ha = torch.utils.checkpoint.checkpoint(
+                        hv, ha = tuc.checkpoint(
                             self._layer, l, hv, ha, mask, cos, sin,
                             use_reentrant=False)
                     else:
@@ -537,12 +538,14 @@ def selftest():
         o2 = m(b2, 1, st)
     assert torch.allclose(o2["arm"][0], outs["tree_adapt24"]["arm"][0],
                           atol=1e-5)
-    # math и sdpa совпадают
-    ms = copy.deepcopy(m)
-    ms.backend = "sdpa"
-    with torch.no_grad():
-        o3 = ms(b, 1, st)
-    assert torch.allclose(o3["arm"], outs["tree_adapt24"]["arm"], atol=1e-4)
+    # math и sdpa совпадают (если sdpa есть в этой версии torch)
+    if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
+        ms = copy.deepcopy(m)
+        ms.backend = "sdpa"
+        with torch.no_grad():
+            o3 = ms(b, 1, st)
+        assert torch.allclose(o3["arm"], outs["tree_adapt24"]["arm"],
+                              atol=1e-4)
     # backward: градиенты в ранних и поздних слоях эксперта, LoRA (B),
     # головы границ, расширения, readout; vision и базовый текст заморожены
     for mname in ("tree_adapt24", "flat24"):
