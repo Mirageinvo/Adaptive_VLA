@@ -59,6 +59,26 @@ def sha(p):
     return hashlib.sha1(open(p, "rb").read()).hexdigest()
 
 
+CODE_DEPS = ("k21_train.py", "k21_model.py", "k21_tree.py", "k21_data.py",
+             "k20_data.py", "k16_models.py")
+
+
+def run_contract(mode, a, D):
+    """Всё, что определяет обучение: сверяется при каждом возобновлении."""
+    import k21_data as d21
+    tj = json.load(open(d21.TEACHER_REPORT))
+    return dict(
+        mode=mode, micro=a.micro, dtype=a.dtype, seed=SEED,
+        prep_id=D["prep_report"]["prep_id"],
+        teacher_sha1=tj["out"]["sha1"], teacher_prep_id=tj.get("prep_id"),
+        eff_batch=EFF_BATCH, wd=WD, clip=CLIP, teacher_every=TEACHER_EVERY,
+        warm_updates=WARM_UPDATES, warm_lr=WARM_LR, lr=LR,
+        main_updates=MAIN_UPDATES, main_max=MAIN_MAX, main_warm=MAIN_WARM,
+        lr_floor=LR_FLOOR, eval_every=EVAL_EVERY, panel_n=PANEL_N,
+        checkpoint=True, backend="math",
+        code={f: sha(os.path.join(HERE, f)) for f in CODE_DEPS})
+
+
 def row_weights(task, episode):
     task, episode = np.asarray(task), np.asarray(episode)
     w = np.zeros(len(task))
@@ -300,10 +320,7 @@ class Trainer:
         os.replace(self.state_path + ".tmp", self.state_path)
 
     def config(self):
-        return dict(mode=self.mode, micro=self.a.micro, dtype=self.a.dtype,
-                    prep_id=self.D["prep_report"]["prep_id"], seed=SEED,
-                    eff_batch=EFF_BATCH, lr=LR, warm=WARM_UPDATES,
-                    main_max=MAIN_MAX)
+        return run_contract(self.mode, self.a, self.D)
 
     def load(self):
         torch = self.torch
@@ -574,9 +591,33 @@ def selftest():
     assert not extension_rule(dict(a=worse))
     w = row_weights(["a", "a", "a", "b"], [1, 1, 2, 3])
     assert np.allclose(w / w.sum(), [.125, .125, .25, .5])
+    # контракт возобновления чувствителен к параметрам обучения
+    import tempfile
+    import k21_data as d21
+    g = globals()
+    with tempfile.TemporaryDirectory() as td:
+        old = d21.TEACHER_REPORT
+        d21.TEACHER_REPORT = td + "/t.json"
+        json.dump(dict(out=dict(sha1="t"), prep_id="p"), open(
+            d21.TEACHER_REPORT, "w"))
+        aa = argparse.Namespace(micro=32, dtype="float16")
+        DD = dict(prep_report=dict(prep_id="p"))
+        c0 = run_contract("flat24", aa, DD)
+        for nm, val in (("WD", 0.02), ("CLIP", 2.0), ("TEACHER_EVERY", 3),
+                        ("MAIN_WARM", 100), ("LR_FLOOR", 0.2)):
+            keep = g[nm]
+            g[nm] = val
+            assert run_contract("flat24", aa, DD) != c0, nm
+            g[nm] = keep
+        assert run_contract("flat24", aa, DD) == c0
+        json.dump(dict(out=dict(sha1="t2"), prep_id="p"), open(
+            d21.TEACHER_REPORT, "w"))
+        assert run_contract("flat24", aa, DD) != c0
+        d21.TEACHER_REPORT = old
     print("самопроверка k21_train пройдена: расписание индексов (повторяемо, "
           "3:1, не зависит от microbatch и возобновления), LR без скачка до "
-          "пола 0.1, правило добора, веса строк")
+          "пола 0.1, правило добора, веса строк, контракт возобновления "
+          "(параметры обучения, scheduler, учитель, код)")
     return 0
 
 
