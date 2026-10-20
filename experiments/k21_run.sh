@@ -6,6 +6,7 @@
 #   bash experiments/k21_run.sh teacher cuda:0      # учитель (сбор заново)
 #   MICRO=4 DTYPE=float16 bash experiments/k21_run.sh fitcheck cuda:0
 #   MICRO=4 DTYPE=float16 bash experiments/k21_run.sh train cuda:0
+#   MICRO=32 DTYPE=float16 bash experiments/k21_run.sh train-fast cuda:0
 # Обучение (fitcheck, train), latency, plan и pilot добавляются в пакетах 2–3.
 set -euo pipefail
 MODE="${1:?нужен режим: selftest, prepare, real-check, teacher, fitcheck или train}"
@@ -53,6 +54,15 @@ case "$MODE" in
   fitcheck|train)
     CODE=0
     python3 experiments/k21_train.py "$MODE" --device "$DEV" \
+      --micro "$MICRO" --dtype "$DTYPE" || CODE=$?
+    finish $CODE ;;
+  train-fast)
+    # тот же k21_train, загрузка батчей — k21_fastload (pread + предзагрузка);
+    # продолжает тот же resume.pt; первые батчи сверяются побитово
+    python3 experiments/k21_fastload.py >/dev/null \
+      || { echo "ОТКАЗ: самопроверка k21_fastload"; finish 1; }
+    CODE=0
+    python3 experiments/k21_train_fast.py train --device "$DEV" \
       --micro "$MICRO" --dtype "$DTYPE" || CODE=$?
     finish $CODE ;;
   *) echo "режим $MODE неизвестен"; finish 2 ;;
