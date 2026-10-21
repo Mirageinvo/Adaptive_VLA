@@ -7,6 +7,8 @@
 #   MICRO=4 DTYPE=float16 bash experiments/k21_run.sh fitcheck cuda:0
 #   MICRO=4 DTYPE=float16 bash experiments/k21_run.sh train cuda:0
 #   MICRO=32 DTYPE=float16 bash experiments/k21_run.sh train-fast cuda:0
+#   bash experiments/k21_run.sh latency cuda:0
+# Пилот SR — отдельным раннером: experiments/k21_rollout.sh plan|run|analyze
 # Обучение (fitcheck, train), latency, plan и pilot добавляются в пакетах 2–3.
 set -euo pipefail
 MODE="${1:?нужен режим: selftest, prepare, real-check, teacher, fitcheck или train}"
@@ -55,6 +57,10 @@ case "$MODE" in
     CODE=0
     python3 experiments/k21_train.py "$MODE" --device "$DEV" \
       --micro "$MICRO" --dtype "$DTYPE" || CODE=$?
+    finish $CODE ;;
+  latency)
+    CODE=0
+    python3 experiments/k21_latency.py --device "$DEV" || CODE=$?
     finish $CODE ;;
   train-fast)
     # тот же k21_train, загрузка батчей — k21_fastload (pread + предзагрузка);

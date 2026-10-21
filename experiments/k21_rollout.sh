@@ -1,0 +1,144 @@
+#!/bin/bash
+# K-21: пилот SR — fullbar (штатный харнесс), flat24, tree_adapt24;
+# задачи 0–9, блок 25 (старты 25–29), 30 процессов. Режимы: selftest, plan,
+# smoke (задачи 0 и 8, 6 процессов), run (smoke или его перепроверка, затем
+# при техническом успехе остальные 24 процесса и анализ), analyze.
+# Лог с первой строки; каждый блок — отдельный холодный процесс; проверка
+# сразу после; любой ненулевой код — останов; повтор только при потере GPU.
+# Карта по умолчанию cuda:0 (cuda:1 занята другим пользователем).
+set -euo pipefail
+MODE="${1:?нужен режим: selftest, plan, smoke, run или analyze}"
+DEV="${2:-cuda:0}"
+SEED=101
+BASIS="data/k15f/basis_s0.pt"
+DTAG="$(echo "$DEV" | tr -d ':')"
+PLAN="reports/k21/plan_pilot.json"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT" || exit 1
+export PYTHONPATH="${LIBERO_PATH:-$HOME/LIBERO}"
+export MUJOCO_GL=egl
+export PYTHONUNBUFFERED=1
+export HF_HUB_OFFLINE=1        # снимок BAR — только из локального кэша (закреплённая ревизия)
+mkdir -p logs/k21 reports/k21 reports/k21/run
+LOGF="logs/k21/pilot_${MODE}_s${SEED}.log"
+exec > >(tee -a "$LOGF") 2>&1
+echo "=== СТАРТ $(date) === режим $MODE, карта $DEV, коммит" \
+     "$(git rev-parse --short HEAD 2>/dev/null)"
+finish () { echo "=== КОНЕЦ $(date), код $1 ==="; exit "$1"; }
+for m in k21_policy k21_analyze k16_policy k16_harness k9h_multiarm_gate; do
+  python3 "experiments/${m}.py" --selftest >/dev/null \
+    || { echo "ОТКАЗ: самопроверка ${m}"; finish 1; }
+done
+python3 experiments/k21_harness.py --selftest >/dev/null \
+  || { echo "ОТКАЗ: самопроверка k21_harness"; finish 1; }
+python3 experiments/k21_protocol.py selftest >/dev/null \
+  || { echo "ОТКАЗ: самопроверка k21_protocol"; finish 1; }
+if [ "$MODE" = selftest ]; then
+  echo "    все самопроверки пройдены"; finish 0
+fi
+
+if [ "$MODE" = plan ]; then
+  CODE=0
+  python3 experiments/k21_protocol.py plan --plan "$PLAN" --device "$DEV" \
+    || CODE=$?
+  finish $CODE
+fi
+[ -f "$PLAN" ] || { echo "ОТКАЗ: нет плана $PLAN"; finish 1; }
+python3 experiments/k21_protocol.py check-plan --plan "$PLAN" \
+  || { echo "ОТКАЗ: входы или код не совпадают с планом"; finish 1; }
+sha12 () { sha1sum "$1" | cut -c1-12; }
+OUTD="reports/k21/run/p$(sha12 "$PLAN")"
+mkdir -p "$OUTD/quarantine"
+echo "    план $PLAN, каталог $OUTD"
+if [ "$MODE" = analyze ]; then
+  CODE=0
+  python3 experiments/k21_analyze.py --plan "$PLAN" --run-dir "$OUTD" \
+    || CODE=$?
+  finish $CODE
+fi
+COMMON="--ckpt ZibinDong/SmolVLM2-2.2B-ActionCodec-BAR-LIBERO \
+  --task-suite 10 --n-envs 5 --seed $SEED --rollout-seed-mode fixed \
+  --ensemble off --horizon 8 --max-steps 600 --waiting-steps 10 \
+  --run-tag k21_s${SEED} --device $DEV --save-actions"
+polargs () {   # метка -> аргументы политики
+  if [ "$1" = fullbar ]; then echo "--policy fullbar"
+  else echo "--policy k15f --k15f-basis $BASIS"; fi
+}
+
+valid () {
+  [ -f "$1" ] && python3 experiments/k21_protocol.py check-block \
+    --plan "$PLAN" --block "$1" "$2" "$3" "$4" >/dev/null 2>&1
+}
+
+run_one () {   # метка задача блок
+  local L="$1" T="$2" B="$3" try rc TMP
+  local F="$OUTD/${L}_t${T}_i${B}.json"
+  if valid "$F" "$L" "$T" "$B"; then echo "    $L t$T i$B: уже есть"; return 0; fi
+  if [ -f "$F" ]; then
+    # существующий блок не прошёл проверку: останов с причиной (без
+    # автоматического пересчёта); блок переносится в карантин для разбора
+    python3 experiments/k21_protocol.py check-block --plan "$PLAN" \
+      --block "$F" "$L" "$T" "$B" || true
+    local Q="$OUTD/quarantine/$(date +%Y%m%dT%H%M%S)"; mkdir -p "$Q"
+    mv "$F" "${F%.json}.actions.npz" "$Q/" 2>/dev/null || true
+    echo "ОСТАНОВ: $L t$T i$B — существующий блок не прошёл проверку -> $Q"
+    return 3
+  fi
+  for try in 1 2 3; do
+    echo "    $L t$T i$B — попытка $try, $(date '+%H:%M:%S')"
+    TMP="$(mktemp)"; rc=0
+    # shellcheck disable=SC2086
+    python3 experiments/k21_harness.py --k21-plan "$PLAN" $COMMON \
+      $(polargs "$L") \
+      --arm-label "$L" --task-id "$T" --init-starts "$B" \
+      --out "$OUTD/${L}_t${T}_i{i0}.json" > "$TMP" 2>&1 || rc=$?
+    cat "$TMP"
+    if [ $rc -eq 0 ]; then
+      rm -f "$TMP"
+      if ! valid "$F" "$L" "$T" "$B"; then
+        python3 experiments/k21_protocol.py check-block --plan "$PLAN" \
+          --block "$F" "$L" "$T" "$B" || true
+        echo "ОСТАНОВ: $L t$T i$B — новый результат не прошёл проверку"
+        return 3
+      fi
+      sleep 3; return 0
+    fi
+    if grep -q "No CUDA GPUs are available" "$TMP" && [ "$try" -lt 3 ]; then
+      echo "    нет GPU — пауза 120 с и повтор"; rm -f "$TMP"; sleep 120
+      continue
+    fi
+    rm -f "$TMP"; echo "ОСТАНОВ: $L t$T i$B — код $rc"; return $rc
+  done
+}
+
+LABELS="$(python3 -c "import json; print(' '.join(json.load(open('$PLAN'))['labels']))")"
+SMOKE_PAIRS="$(python3 -c "import json; print(' '.join(f'{t}:{b}' for t, b in json.load(open('$PLAN'))['smoke']))")"
+ALL_PAIRS="$(python3 -c "import json; p=json.load(open('$PLAN')); print(' '.join(f'{t}:{b}' for t in p['tasks'] for b in p['blocks']))")"
+run_pairs () {
+  for PT in $1; do
+    T="${PT%%:*}"; B="${PT##*:}"
+    echo "--- задача $T, блок $B, $(date)"
+    for L in $LABELS; do               # fullbar первым
+      run_one "$L" "$T" "$B" || finish $?
+    done
+  done
+}
+case "$MODE" in
+  smoke|run) ;;
+  *) echo "режим $MODE неизвестен"; finish 2 ;;
+esac
+# smoke (или перепроверка готовых блоков smoke) — всегда первым
+run_pairs "$SMOKE_PAIRS"
+CODE=0
+python3 experiments/k21_protocol.py smoke-check --plan "$PLAN" \
+  --run-dir "$OUTD" || CODE=$?
+if [ "$MODE" = smoke ] || [ $CODE -ne 0 ]; then
+  [ $CODE -ne 0 ] && echo "ОСТАНОВ: smoke не прошёл технические проверки"
+  finish $CODE
+fi
+# технический успех smoke -> остальные блоки (продолжение не зависит от SR)
+run_pairs "$ALL_PAIRS"
+echo "=== раскатки закончены $(date)"
+python3 experiments/k21_analyze.py --plan "$PLAN" --run-dir "$OUTD" \
+  || CODE=$?
+finish $CODE
