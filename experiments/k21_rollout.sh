@@ -56,7 +56,10 @@ if [ "$MODE" = analyze ]; then
     || CODE=$?
   finish $CODE
 fi
-COMMON="--ckpt ZibinDong/SmolVLM2-2.2B-ActionCodec-BAR-LIBERO \
+CKPT="$(python3 -c "import json; print(json.load(open('$PLAN'))['setup']['ckpt'])")"
+[ -d "$CKPT" ] || { echo "ОТКАЗ: нет закреплённого снимка BAR $CKPT"; finish 1; }
+echo "    снимок BAR: $CKPT"
+COMMON="--ckpt $CKPT \
   --task-suite 10 --n-envs 5 --seed $SEED --rollout-seed-mode fixed \
   --ensemble off --horizon 8 --max-steps 600 --waiting-steps 10 \
   --run-tag k21_s${SEED} --device $DEV --save-actions"

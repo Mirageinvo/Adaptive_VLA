@@ -35,7 +35,8 @@ CODE = ("k21_policy.py", "k21_harness.py", "k21_protocol.py",
         "k21_analyze.py", "k21_rollout.sh", "k21_model.py", "k21_tree.py",
         "k21_data.py", "k21_train.py", "k20_data.py", "k16_models.py",
         "k16_harness.py", "k16_policy.py", "k9h_multiarm_gate.py",
-        "k15g_local_probe.py", "k15h_protocol.py", "k15f_policy.py")
+        "k15g_local_probe.py", "k15h_protocol.py", "k15f_policy.py",
+        "k21_fastload.py", "k21_train_fast.py")
 
 
 def sha(p):
@@ -53,7 +54,12 @@ def make_plan(device):
     import torch
     tr = json.load(open("reports/k21/train.json"))
     prep = json.load(open(d21.REPORT))
-    d21.check_pin(prep["bar_pin"])
+    # эталон full BAR и новые руки — из ОДНОГО закреплённого локального
+    # снимка (путь содержит ревизию); содержимое файлов сверено с адресами
+    snap = d21.check_pin(prep["bar_pin"], verify_content=True)
+    if os.path.basename(os.path.normpath(snap)) != \
+            prep["bar_pin"]["revision"]:
+        raise SystemExit("путь снимка не соответствует ревизии")
     inputs = dict(train_report="reports/k21/train.json", prepare=d21.REPORT,
                   teacher=d21.TEACHER_REPORT, harness_utils=hpc.HARNESS_UTILS,
                   inventory="reports/k15h/inventory.json")
@@ -81,7 +87,22 @@ def make_plan(device):
             timespec="seconds"),
         labels=list(LABELS), policy=POLICY, tasks=list(range(10)),
         blocks=list(BLOCKS), n_envs=5, smoke=SMOKE, device=str(device),
-        setup=pr.expected_setup(), prep_id=prep["prep_id"],
+        setup=dict(pr.expected_setup(), ckpt=snap),
+        snapshot_path=snap, prep_id=prep["prep_id"],
+        training_execution=dict(
+            loader=dict(k21_fastload_sha1=full_sha(os.path.join(
+                HERE, "k21_fastload.py")),
+                k21_train_fast_sha1=full_sha(os.path.join(
+                    HERE, "k21_train_fast.py"))),
+            prefetch=dict(ahead=3, workers=6, bitwise_check_batches=4,
+                          read="pread строки целиком"),
+            used=dict(flat24="основная фаза с обновления 2500 (до этого — "
+                             "штатная загрузка k21_data.make_batch)",
+                      tree_adapt24="весь прогон (warmup и основная фаза)"),
+            equivalence=("первые 4 батча каждого запуска совпали с "
+                         "k21_data.make_batch побитово"),
+            note=("загрузчик вне закреплённого контракта обучения; "
+                  "согласовано агентом")),
         bar_revision=prep["bar_pin"]["revision"],
         bounds=prep["bounds_codec"],
         best=dict(flat24=tr["flat24"]["best"],
@@ -138,6 +159,9 @@ def check_block(plan, plan_path, path, label, task, block):
     if p:
         return p
     d, z = p16.load(path)
+    if os.path.basename(os.path.normpath(str(d.get("ckpt")))) != \
+            plan["bar_revision"]:
+        p.append(f"{label}: снимок BAR блока не закреплённой ревизии")
     if label == "fullbar":
         return p
     j = d.get("joint") or {}
