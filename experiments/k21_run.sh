@@ -8,6 +8,7 @@
 #   MICRO=4 DTYPE=float16 bash experiments/k21_run.sh train cuda:0
 #   MICRO=32 DTYPE=float16 bash experiments/k21_run.sh train-fast cuda:0
 #   bash experiments/k21_run.sh latency cuda:0
+#   MICRO=32 DTYPE=float16 bash experiments/k21_run.sh train-fixed cuda:0
 # Пилот SR — отдельным раннером: experiments/k21_rollout.sh plan|run|analyze
 # Обучение (fitcheck, train), latency, plan и pilot добавляются в пакетах 2–3.
 set -euo pipefail
@@ -57,6 +58,15 @@ case "$MODE" in
     CODE=0
     python3 experiments/k21_train.py "$MODE" --device "$DEV" \
       --micro "$MICRO" --dtype "$DTYPE" || CODE=$?
+    finish $CODE ;;
+  train-fixed)
+    # tree_fixed24: тот же k21_train и контракт, ускоренная загрузка,
+    # отчёт — reports/k21/train_fixed.json
+    python3 experiments/k21_fastload.py >/dev/null \
+      || { echo "ОТКАЗ: самопроверка k21_fastload"; finish 1; }
+    CODE=0
+    python3 experiments/k21_train_fixed.py train --device "$DEV" \
+      --micro "$MICRO" --dtype "$DTYPE" --modes tree_fixed24 || CODE=$?
     finish $CODE ;;
   latency)
     CODE=0
