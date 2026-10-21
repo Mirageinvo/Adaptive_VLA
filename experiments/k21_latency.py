@@ -104,11 +104,14 @@ def main():
     ac = torch.autocast("cuda", dtype=torch.float16)
     va = np.asarray(D["val_rows"])
 
+    cache = {}
+
     def run(lab, rows):
-        """Наблюдение -> готовый чанк [B, 20, 7] на CPU (как отдаёт харнессу)."""
+        """Наблюдение -> готовый чанк [B, 20, 7] на CPU (как отдаёт харнессу).
+        Кадры — из заранее заполненного кэша в памяти (вне таймера)."""
         torch.cuda.synchronize(dev)
         t0 = time.perf_counter()
-        batch = kd.prompt_batch(bar, [np.asarray(D["IMG"][i]) for i in rows],
+        batch = kd.prompt_batch(bar, [cache[int(i)] for i in rows],
                                 kd.norm_states(np.asarray(D["state8"][rows])),
                                 D["task"][rows].tolist())
         pos = np.unique(D["pos_offset"][rows])
@@ -148,6 +151,14 @@ def main():
     res = {}
     for bs in a.batches:
         queue = make_queue(D["task"], va, bs, max(WARM, a.n))
+        # все уникальные кадры очереди — в RAM до любых измерений, чтобы ни
+        # одна политика не платила за первое чтение с диска
+        for r in np.unique(np.concatenate(queue)):
+            if int(r) not in cache:
+                cache[int(r)] = np.array(D["IMG"][int(r)], copy=True)
+        print(f"  batch {bs}: кадров в памяти {len(cache)} "
+              f"({sum(x.nbytes for x in cache.values()) / 2 ** 20:.0f} МБ)",
+              flush=True)
         for lab in labs:
             for j in range(WARM):
                 run(lab, queue[j % len(queue)])
@@ -189,7 +200,8 @@ def main():
             print(f"    {lab} против fullbar: {100 * (1 - x / fb):+.1f}% "
                   f"медианы полного пути", flush=True)
     res["note"] = ("полный путь: подготовка входа -> готовый чанк [B, 20, 7] "
-                   "на CPU; vision — внутри единственного вызова политики; "
+                   "на CPU; кадры заранее в RAM (вне таймера); vision — внутри "
+                   "единственного вызова политики; "
                    "очередь входов одинакова для всех политик, батч — из одной "
                    "задачи; fullbar — штатный generate трёх уровней + сборка "
                    "ActionCodec; flat24/tree_adapt24 — один проход, fp16 "
