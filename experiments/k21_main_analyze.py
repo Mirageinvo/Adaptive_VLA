@@ -109,10 +109,16 @@ def analyze(outc, extra):
     out["engineering_flat"] = cmp("flat24", "fullbar")
     out["engineering_flat"]["non_inferior_margin_3pp"] = \
         out["engineering_flat"]["ni_lower_conservative"] > -MARGIN
+    # семейство Holm — ВСЕГДА три запланированных сравнения; недоступные
+    # (без плана B) входят с p = 1, поэтому поправка не зависит от B
     fam = [cmp("tree_adapt24", "flat24")]
+    for a_, b_ in (("tree_fixed24", "flat24"),
+                   ("tree_adapt24", "tree_fixed24")):
+        if "tree_fixed24" in outc:
+            fam.append(cmp(a_, b_))
+        else:
+            fam.append(dict(a=a_, b=b_, mcnemar_p=1.0, available=False))
     if "tree_fixed24" in outc:
-        fam += [cmp("tree_fixed24", "flat24"),
-                cmp("tree_adapt24", "tree_fixed24")]
         out["fixed_vs_fullbar"] = cmp("tree_fixed24", "fullbar")
     for c, h in zip(fam, ha.holm([c["mcnemar_p"] for c in fam])):
         c["holm_p"] = h
@@ -144,6 +150,9 @@ def report(res, out):
                  if c["non_inferior_margin_3pp"] else
                  "не-хужесть НЕ установлена"))
     for c in out["superiority_family"]:
+        if c.get("available") is False:
+            print(f"  {c['a']} − {c['b']}: нет плана B (в Holm с p = 1)")
+            continue
         print(f"  {c['a']} − {c['b']}: ΔSR {100 * c['d_sr_equal_weight']:+.1f}"
               f" п.п. [{100 * c['ci95'][0]:+.1f}; {100 * c['ci95'][1]:+.1f}],"
               f" +{c['gain']}/−{c['loss']}, Мак-Немар p {c['mcnemar_p']:.4f},"
@@ -175,6 +184,14 @@ def selftest():
     assert pa.ni_lower(0, 0, 50) < -MARGIN
     assert len(r["superiority_family"]) == 3
     assert all(c["holm_p"] >= c["mcnemar_p"] for c in r["superiority_family"])
+    # без плана B семейство всё равно из трёх: tree − flat получает Holm
+    # с множителем 3 (два недоступных сравнения с p = 1)
+    o2 = {k: dict(v) for k, v in outc.items() if k != "tree_fixed24"}
+    for k in [k for k in states if not base[k]][:8]:
+        o2["tree_adapt24"][k] = True
+    f2 = analyze(o2, {})["superiority_family"]
+    assert len(f2) == 3 and f2[1]["available"] is False
+    assert abs(f2[0]["holm_p"] - min(1.0, 3 * f2[0]["mcnemar_p"])) < 1e-12
     print("самопроверка k21_main_analyze пройдена: покрытие консервативной "
           "границы ≥ 95% (симуляция), семейство и Holm, граница при нуле "
           "расхождений (150 и 50 пар)")
