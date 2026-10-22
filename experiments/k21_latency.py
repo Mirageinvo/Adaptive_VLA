@@ -93,6 +93,13 @@ def main():
     dev = torch.device(a.device)
     D = d21.load_prepared(require_teacher=False)
     prep = D["prep_report"]
+    if a.with_cached:
+        import k21_barcache as bc
+        try:
+            bc.require_verified(D)
+        except SystemExit as e:
+            print(f"  ОТКАЗ: {e.code}", flush=True)
+            return 3
     bar = d21.load_bar(dev, prep["bar_pin"])
     models = dict(fullbar=bar["model"])
     for lab in ("flat24", "tree_adapt24"):

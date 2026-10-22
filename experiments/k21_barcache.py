@@ -150,6 +150,44 @@ def decode(torch, E, codec, toks, B):
     return x[..., :7].float()
 
 
+VERIFY_REPORT = "reports/k21/barcache_verify.json"
+
+
+def counters_ok(cnt, n_blocks=3):
+    """vision 1, каждый слой VLM 1 (префикс один раз), эксперт n_blocks."""
+    return (cnt["vision"] == 1 and len(cnt["text"]) == 24
+            and all(x == 1 for x in cnt["text"])
+            and all(x == n_blocks for x in cnt["expert"]))
+
+
+def sha(p):
+    import hashlib
+    return hashlib.sha1(open(p, "rb").read()).hexdigest()
+
+
+def verify_identity(D):
+    """Чем определяется эквивалентность: ревизия BAR, подготовка, код кэша."""
+    return dict(revision=D["prep_report"]["bar_pin"]["revision"],
+                prep_id=D["prep_report"]["prep_id"],
+                barcache_sha1=sha(os.path.join(HERE, "k21_barcache.py")))
+
+
+def require_verified(D, path=VERIFY_REPORT):
+    """Отказ (SystemExit), если нет успешной проверки для этой же ревизии,
+    подготовки и кода k21_barcache.py."""
+    if not os.path.exists(path):
+        raise SystemExit(f"нет {path}: сначала k21_barcache.py --verify")
+    r = json.load(open(path))
+    want = verify_identity(D)
+    got = {k: r.get(k) for k in want}
+    if got != want:
+        raise SystemExit(f"проверка кэша сделана для другого состояния: "
+                         f"{got} != {want}")
+    if r.get("ok") is not True or r.get("equivalent") is not True:
+        raise SystemExit(f"проверка кэша не пройдена: {r.get('problems')}")
+    return r
+
+
 def verify(a):
     import torch
     import k20_data as kd
@@ -160,7 +198,7 @@ def verify(a):
     bar = d21.load_bar(dev, D["prep_report"]["bar_pin"])
     model = bar["model"]
     va = np.asarray(D["val_rows"])
-    res = {}
+    res, prob = {}, []
     for bs in (1, 5):
         queue = kl.make_queue(D["task"], va, bs, a.n // bs)
         tok_eq = chunk_eq = 0
@@ -186,6 +224,8 @@ def verify(a):
             got = generate_cached(torch, model, batch, po, cnt)
             torch.cuda.synchronize(dev)
             t_cache.append(time.perf_counter() - t0)
+            if not counters_ok(cnt, model.num_blocks):
+                prob.append(f"batch {bs}: счётчики {cnt}")
             tok_eq += int((ref == got).sum())
             n_tok += ref.numel()
             chunk_eq += int((ref == got).all(1).sum())
@@ -193,6 +233,8 @@ def verify(a):
             with torch.no_grad():
                 d = (decode(torch, bar["E"], bar["codec"], ref, len(rows))
                      - decode(torch, bar["E"], bar["codec"], got, len(rows)))
+            if not bool(torch.isfinite(d).all()):
+                prob.append(f"batch {bs}: нечисловые действия")
             maxd = max(maxd, float(d.abs().max()))
         res[f"batch{bs}"] = dict(
             observations=int(n_chunk), token_match=tok_eq / n_tok,
@@ -210,15 +252,20 @@ def verify(a):
               f"прогрева)", flush=True)
     res["equivalent"] = all(res[f"batch{b}"]["chunk_match"] == 1.0
                             for b in (1, 5))
-    res["revision"] = D["prep_report"]["bar_pin"]["revision"]
+    if not res["equivalent"]:
+        prob.append("коды не совпали полностью")
+    prob = sorted(set(prob))
+    res.update(verify_identity(D), problems=prob, ok=not prob)
     os.makedirs("reports/k21", exist_ok=True)
-    json.dump(res, open("reports/k21/barcache_verify.json", "w"),
-              ensure_ascii=False, indent=1)
+    json.dump(res, open(VERIFY_REPORT, "w"), ensure_ascii=False, indent=1)
     print("  " + ("коды совпали полностью: версия с кэшем эквивалентна "
                   "штатной" if res["equivalent"] else
                   "коды НЕ совпали полностью: версия с кэшем — отдельный "
                   "эталон со своим статусом") + "; отчёт "
           "reports/k21/barcache_verify.json")
+    if prob:
+        print("  ОТКАЗ: " + "; ".join(prob), flush=True)
+        return 3
     return 0
 
 
@@ -277,9 +324,30 @@ def selftest():
         ref = m.action_lm_head(m.action_expert.norm(ha))
     assert torch.allclose(lg, ref, atol=1e-5), float((lg - ref).abs().max())
     _ = Fake
+    good = dict(vision=1, text=[1] * 24, expert=[3] * 24)
+    assert counters_ok(good)
+    for bad in (dict(good, vision=2), dict(good, text=[1] * 23 + [3]),
+                dict(good, expert=[3] * 23 + [2])):
+        assert not counters_ok(bad)
+    import tempfile
+    DD = dict(prep_report=dict(bar_pin=dict(revision="r"), prep_id="p"))
+    with tempfile.TemporaryDirectory() as td:
+        fp = os.path.join(td, "v.json")
+        base = dict(verify_identity(DD), ok=True, equivalent=True)
+        json.dump(base, open(fp, "w"))
+        require_verified(DD, fp)
+        for bad in (dict(base, ok=False), dict(base, equivalent=False),
+                    dict(base, prep_id="q"), dict(base, barcache_sha1="x"),
+                    dict(base, revision="s")):
+            json.dump(bad, open(fp, "w"))
+            try:
+                require_verified(DD, fp)
+                raise AssertionError(bad)
+            except SystemExit:
+                pass
     print("самопроверка k21_barcache пройдена: кэш префикса = совместному "
           "проходу BAR-подобной схемы (блочная маска, padding, strided "
-          "позиции)")
+          "позиции); счётчики и допуск латентности по отчёту проверки")
     return 0
 
 

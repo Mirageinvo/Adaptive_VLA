@@ -27,6 +27,7 @@ import k21_main_protocol as mp  # noqa: E402
 import k21_protocol as pp  # noqa: E402
 
 KIND = "k21_suite_plan"
+PRIMARY = ("tree_adapt24", "flat24")
 PLAN = "reports/k21/plan_suites.json"
 SUITES = ("spatial", "object", "goal")
 LABELS = ("fullbar", "flat24", "tree_adapt24")
@@ -105,6 +106,10 @@ def make_plan(device, blocks):
         inputs_sha1={k: sha(v) for k, v in inputs.items()},
         code={f: sha(os.path.join(HERE, f)) for f in CODE
               if os.path.exists(os.path.join(HERE, f))},
+        primary=dict(comparison=list(PRIMARY), scope="pooled",
+                     note="главный архитектурный результат — tree − flat "
+                          "по объединению трёх наборов; разбивка по наборам "
+                          "и сравнения с fullbar — описательные"),
         note=("расширение оценки на наборы, чьи задачи входят в обучение; "
               "старты этих наборов в проекте не использовались"))
 

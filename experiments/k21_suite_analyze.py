@@ -83,6 +83,11 @@ def run(plan_path, run_dir):
         st = [k for k in states if k[0].startswith(s + "/")]
         res["by_suite"][s] = summarize({lab: {k: o[k] for k in st}
                                         for lab, o in outc.items()}, st)
+    if plan.get("primary", {}).get("comparison") != list(sp.PRIMARY):
+        raise SystemExit("в плане не закреплён главный результат")
+    pc = [c for c in res["pooled"]["comparisons"]
+          if (c["a"], c["b"]) == sp.PRIMARY]
+    res["primary"] = dict(plan["primary"], result=pc[0])
     res["note"] = plan.get("note")
     return res
 
@@ -95,8 +100,14 @@ def report(res):
     if not res["complete"]:
         print("  НАБОР НЕПОЛНЫЙ: вывода нет")
         return
+    c = res["primary"]["result"]
+    print(f"  ГЛАВНЫЙ РЕЗУЛЬТАТ (закреплён в плане): {c['a']} − {c['b']} по "
+          f"объединению трёх наборов: ΔSR {100 * c['d_sr_equal_weight']:+.1f} "
+          f"п.п. [{100 * c['ci95'][0]:+.1f}; {100 * c['ci95'][1]:+.1f}], "
+          f"+{c['gain']}/−{c['loss']}, p {c['mcnemar_p']:.4f}")
+    print("  ниже — описательно:")
     for name, blk in [("ВСЕ ТРИ НАБОРА", res["pooled"])] + \
-            list(res["by_suite"].items()):
+            [(f"{k} (описательно)", v) for k, v in res["by_suite"].items()]:
         print(f"  {name}:")
         for lab, r in blk["rows"].items():
             print(f"    {lab:13} SR {100 * r['sr_equal_weight']:5.1f}% "
