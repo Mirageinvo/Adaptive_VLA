@@ -269,6 +269,117 @@ def verify(a):
     return 0
 
 
+def noise_floor(a):
+    """Описательно (критерий --verify не меняет): уровень шума самого
+    эталона и близость к ничьей в местах расхождения.
+      1) generate на батче 5 против generate по одному наблюдению — насколько
+         штатный путь согласован сам с собой при другом составе батча;
+      2) то же для пути с кэшем;
+      3) на первом расходящемся блоке (история — коды эталона) разрыв
+         логитов пути с кэшем между его argmax и токеном эталона, рядом —
+         распределение разрыва top1 − top2 на всех токенах."""
+    import torch
+    import k20_data as kd
+    import k21_data as d21
+    import k21_latency as kl
+    dev = torch.device(a.device)
+    D = d21.load_prepared(require_teacher=False)
+    bar = d21.load_bar(dev, D["prep_report"]["bar_pin"])
+    model = bar["model"]
+    n = model.block_size
+    va = np.asarray(D["val_rows"])
+    queue = kl.make_queue(D["task"], va, 5, a.n // 5)
+    agree = dict(std_b5_vs_b1=[0, 0, 0, 0], cached_b5_vs_b1=[0, 0, 0, 0],
+                 cached_vs_std_b5=[0, 0, 0, 0], cached_vs_std_b1=[0, 0, 0, 0])
+    gaps_mis, gaps_all = [], []
+
+    def acc(key, x, y):
+        v = agree[key]
+        v[0] += int((x == y).sum())
+        v[1] += x.numel()
+        v[2] += int((x == y).all(1).sum())
+        v[3] += x.shape[0]
+
+    def std(b, po):
+        with torch.no_grad():
+            return model.generate(**b, position_offset=po, do_sample=False,
+                                  initial_position_shift=1)
+
+    for rows in queue:
+        imgs = [np.asarray(D["IMG"][i]) for i in rows]
+        st8 = kd.norm_states(np.asarray(D["state8"][rows]))
+        tasks = D["task"][rows].tolist()
+        po = int(D["pos_offset"][rows[0]])
+        b5 = kd.prompt_batch(bar, imgs, st8, tasks)
+        s5 = std(b5, po)
+        c5 = generate_cached(torch, model, b5, po)
+        s1, c1 = [], []
+        for j in range(len(rows)):
+            b1 = kd.prompt_batch(bar, imgs[j:j + 1], st8[j:j + 1],
+                                 tasks[j:j + 1])
+            s1.append(std(b1, po))
+            c1.append(generate_cached(torch, model, b1, po))
+        s1, c1 = torch.cat(s1), torch.cat(c1)
+        acc("std_b5_vs_b1", s5, s1)
+        acc("cached_b5_vs_b1", c5, c1)
+        acc("cached_vs_std_b5", c5, s5)
+        acc("cached_vs_std_b1", c1, s1)
+        # разрыв логитов на первом расходящемся блоке (батч 5)
+        with torch.no_grad():
+            img = model.vlm.get_image_features(
+                b5["pixel_values"], b5.get("pixel_attention_mask"))
+            _b, _l, vemb, _i = model._build_vlm_inputs_embeds(
+                input_ids=b5["input_ids"], inputs_embeds=None,
+                pixel_values=None, pixel_attention_mask=None,
+                image_hidden_states=img)
+            am = b5["attention_mask"]
+            kv, heads = prefix_kv(torch, model, vemb, am)
+            for blk in range(model.num_blocks):
+                lg = action_logits(torch, model, kv, heads, am,
+                                   vemb.shape[1], s5[:, :blk * n], po).float()
+                s_ = 0 if blk == 0 else n + (blk - 1) * n
+                lg = lg[:, s_:s_ + n]
+                top2 = lg.topk(2, -1).values
+                gaps_all.append((top2[..., 0] - top2[..., 1]).flatten()
+                                .cpu().numpy())
+                ref = s5[:, blk * n:(blk + 1) * n]
+                mis = lg.argmax(-1) != ref
+                if mis.any():
+                    g = (lg.max(-1).values - lg.gather(-1, ref[..., None])
+                         [..., 0])[mis]
+                    gaps_mis.append(g.cpu().numpy())
+    out = {k: dict(token_match=v[0] / v[1], chunk_match=v[2] / v[3],
+                   chunks=v[3]) for k, v in agree.items()}
+    ga = np.concatenate(gaps_all)
+    gm = np.concatenate(gaps_mis) if gaps_mis else np.zeros(0)
+    out["logit_gap"] = dict(
+        mismatch_n=int(gm.size),
+        mismatch_gap_quantiles=(np.percentile(gm, [50, 90, 100]).tolist()
+                                if gm.size else None),
+        all_top1_top2_quantiles=np.percentile(ga, [1, 5, 50]).tolist(),
+        share_all_below_max_mismatch_gap=(float((ga <= gm.max()).mean())
+                                          if gm.size else None))
+    out["note"] = ("описательно; критерий эквивалентности --verify не "
+                   "меняется")
+    out.update(verify_identity(D))
+    for k in agree:
+        r = out[k]
+        print(f"  {k:18}: совпало токенов {100 * r['token_match']:.2f}%, "
+              f"чанков {100 * r['chunk_match']:.1f}% ({r['chunks']})")
+    lgp = out["logit_gap"]
+    print(f"  расхождений на первом блоке с историей эталона: "
+          f"{lgp['mismatch_n']}; разрыв логитов (медиана, 90%, макс) "
+          f"{lgp['mismatch_gap_quantiles']}; top1−top2 по всем токенам "
+          f"(1%, 5%, 50%) {lgp['all_top1_top2_quantiles']}; доля токенов с "
+          f"разрывом ≤ максимального у расхождений "
+          f"{lgp['share_all_below_max_mismatch_gap']}", flush=True)
+    os.makedirs("reports/k21", exist_ok=True)
+    json.dump(out, open("reports/k21/barcache_noise.json", "w"),
+              ensure_ascii=False, indent=1)
+    print("  отчёт reports/k21/barcache_noise.json")
+    return 0
+
+
 def selftest():
     """Игрушечная модель: кэш префикса = совместный проход BAR-подобной
     схемы (префикс не видит действий) на всех трёх блоках."""
@@ -355,6 +466,7 @@ def main():
     ap = argparse.ArgumentParser(description="K-21: BAR с кэшем префикса")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--verify", action="store_true")
+    ap.add_argument("--noise-floor", action="store_true")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--n", type=int, default=60)
     a = ap.parse_args()
@@ -362,7 +474,9 @@ def main():
         return selftest()
     if a.verify:
         return verify(a)
-    raise SystemExit("--selftest или --verify")
+    if a.noise_floor:
+        return noise_floor(a)
+    raise SystemExit("--selftest, --verify или --noise-floor")
 
 
 if __name__ == "__main__":

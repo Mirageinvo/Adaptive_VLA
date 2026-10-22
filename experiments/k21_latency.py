@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """K-21: честный замер времени — fullbar (штатный путь харнесса: generate
-трёх уровней + сборка ActionCodec), flat24, tree_adapt24 (один проход).
+трёх уровней + сборка ActionCodec), flat24, tree_adapt24 (один проход);
+с --with-cached — fullbar с кэшем префикса, с --with-parents24 — K-22
+parents24 (тот же один проход, та же панель и очередь; отчёт по умолчанию
+reports/k22/latency.json).
 
 Фиксированная панель настоящих наблюдений val_sel (кадры, подсказка,
 состояние), батчи 1 и 5, одна карта, политики загружены одновременно;
@@ -84,7 +87,13 @@ def main():
     ap.add_argument("--out", default="reports/k21/latency.json")
     ap.add_argument("--with-cached", action="store_true",
                     help="добавить fullbar с кэшем префикса (k21_barcache)")
+    ap.add_argument("--with-parents24", action="store_true",
+                    help="добавить K-22 parents24 (data/k22/runs, сверка с "
+                         "reports/k22/train.json)")
     a = ap.parse_args()
+    if a.with_parents24 and a.out == "reports/k21/latency.json":
+        a.out = "reports/k22/latency.json"     # отчёт K-21 не перезаписывается
+    os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     import torch
     import k20_data as kd
     import k21_data as d21
@@ -106,6 +115,18 @@ def main():
         mod, _b2, _ck, _p = kp21.load_policy(
             torch, lab, f"data/k21/runs/{lab}/best.pt", a.device)
         models[lab] = mod
+    if a.with_parents24:
+        import k21_protocol as pp
+        import k22_policy as kp22
+        ck22 = "data/k22/runs/parents24/best.pt"
+        tr22 = json.load(open("reports/k22/train.json"))
+        if pp.full_sha(ck22) != tr22["parents24"]["best_sha1"]:
+            print(f"  ОТКАЗ: {ck22} не совпадает с отчётом обучения K-22",
+                  flush=True)
+            return 3
+        mod, _b2, _ck, _p = kp22.load_policy(torch, "parents24", ck22,
+                                             a.device)
+        models["parents24"] = mod
     if a.with_cached:
         models["fullbar_cached"] = bar["model"]
     vt = {}
@@ -167,6 +188,7 @@ def main():
                     shape=list(a_np.shape),
                     finite=bool(np.isfinite(a_np).all()))
     labs = ["fullbar", "flat24", "tree_adapt24"] + (
+        ["parents24"] if a.with_parents24 else []) + (
         ["fullbar_cached"] if a.with_cached else [])
     res = {}
     for bs in a.batches:
@@ -227,8 +249,9 @@ def main():
                    "единственного вызова политики; "
                    "очередь входов одинакова для всех политик, батч — из одной "
                    "задачи; fullbar — штатный generate трёх уровней + сборка "
-                   "ActionCodec; flat24/tree_adapt24 — один проход, fp16 "
-                   "autocast, LoRA не слита")
+                   "ActionCodec; flat24/tree_adapt24/parents24 — один проход, "
+                   "fp16 autocast, LoRA не слита")
+    res["labels"] = labs
     res["device"] = torch.cuda.get_device_name(dev)
     json.dump(res, open(a.out, "w"), ensure_ascii=False, indent=1)
     print(f"  отчёт: {a.out}")
