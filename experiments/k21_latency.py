@@ -82,6 +82,8 @@ def main():
     ap.add_argument("--batches", type=int, nargs="+", default=[1, 5])
     ap.add_argument("--n", type=int, default=N_MEAS)
     ap.add_argument("--out", default="reports/k21/latency.json")
+    ap.add_argument("--with-cached", action="store_true",
+                    help="добавить fullbar с кэшем префикса (k21_barcache)")
     a = ap.parse_args()
     import torch
     import k20_data as kd
@@ -97,9 +99,15 @@ def main():
         mod, _b2, _ck, _p = kp21.load_policy(
             torch, lab, f"data/k21/runs/{lab}/best.pt", a.device)
         models[lab] = mod
-    timers = {lab: VisionTimer(torch, (m.vlm if lab == "fullbar"
-                                       else m.bar.vlm))
-              for lab, m in models.items()}
+    if a.with_cached:
+        models["fullbar_cached"] = bar["model"]
+    vt = {}
+    timers = {}
+    for lab, m in models.items():           # общий vlm — один таймер
+        vlm = m.vlm if lab.startswith("fullbar") else m.bar.vlm
+        if id(vlm) not in vt:
+            vt[id(vlm)] = VisionTimer(torch, vlm)
+        timers[lab] = vt[id(vlm)]
     E, codec = bar["E"], bar["codec"]
     ac = torch.autocast("cuda", dtype=torch.float16)
     va = np.asarray(D["val_rows"])
@@ -126,10 +134,14 @@ def main():
         g1 = torch.cuda.Event(enable_timing=True)
         with torch.no_grad():
             g0.record()
+            if lab == "fullbar_cached":
+                import k21_barcache as bc
+                tk = bc.generate_cached(torch, models[lab], batch, po)
             if lab == "fullbar":
                 tk = models[lab].generate(**batch, position_offset=po,
                                           do_sample=False,
                                           initial_position_shift=1)
+            if lab.startswith("fullbar"):
                 K = tk.reshape(len(rows), 3, 16)
                 z = sum(E[j][K[:, j, :].long()] for j in range(3))
                 x, _ = codec._decode(z, embodiment_ids=0)
@@ -147,7 +159,8 @@ def main():
                     policy_gpu=g0.elapsed_time(g1), total=t_total * 1e3,
                     shape=list(a_np.shape),
                     finite=bool(np.isfinite(a_np).all()))
-    labs = ["fullbar", "flat24", "tree_adapt24"]
+    labs = ["fullbar", "flat24", "tree_adapt24"] + (
+        ["fullbar_cached"] if a.with_cached else [])
     res = {}
     for bs in a.batches:
         queue = make_queue(D["task"], va, bs, max(WARM, a.n))
@@ -195,10 +208,13 @@ def main():
                   f"{r['prep']['median']:.1f} мс; "
                   f"{r['throughput_obs_s']:.1f} набл./с", flush=True)
         fb = res[f"batch{bs}"]["fullbar"]["total"]["median"]
-        for lab in ("flat24", "tree_adapt24"):
-            x = res[f"batch{bs}"][lab]["total"]["median"]
-            print(f"    {lab} против fullbar: {100 * (1 - x / fb):+.1f}% "
-                  f"медианы полного пути", flush=True)
+        refs = ["fullbar"] + (["fullbar_cached"] if a.with_cached else [])
+        for ref in refs:
+            fb = res[f"batch{bs}"][ref]["total"]["median"]
+            for lab in [x for x in labs if x not in ("fullbar", ref)]:
+                x = res[f"batch{bs}"][lab]["total"]["median"]
+                print(f"    {lab} против {ref}: {100 * (1 - x / fb):+.1f}% "
+                      f"медианы полного пути", flush=True)
     res["note"] = ("полный путь: подготовка входа -> готовый чанк [B, 20, 7] "
                    "на CPU; кадры заранее в RAM (вне таймера); vision — внутри "
                    "единственного вызова политики; "
