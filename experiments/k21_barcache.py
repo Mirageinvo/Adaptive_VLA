@@ -188,6 +188,89 @@ def require_verified(D, path=VERIFY_REPORT):
     return r
 
 
+ADMIT_REPORT = "reports/k21/barcache_admit.json"
+NOT_CONFIRMED = "эквивалентность штатному пути не подтверждена"
+
+
+def admit(a):
+    """Допуск fullbar_cached как САМОСТОЯТЕЛЬНОГО эталона (строгий --verify
+    не заменяет и не ослабляет): на той же очереди val_sel, батч 1 и 5 —
+    конечность действий, форма чанка, счётчики на каждом батче (vision 1,
+    каждый слой VLM 1, эксперт num_blocks), закреплённые ревизия, подготовка
+    и SHA кода. Статус эквивалентности берётся только из строгой проверки
+    той же версии кода; иначе — «не подтверждена». Код 3 при проблемах."""
+    import torch
+    import k20_data as kd
+    import k21_data as d21
+    import k21_latency as kl
+    dev = torch.device(a.device)
+    D = d21.load_prepared(require_teacher=False)
+    bar = d21.load_bar(dev, D["prep_report"]["bar_pin"])
+    model = bar["model"]
+    va = np.asarray(D["val_rows"])
+    prob, res = [], {}
+    for bs in (1, 5):
+        queue = kl.make_queue(D["task"], va, bs, a.n // bs)
+        n_ok = 0
+        for rows in queue:
+            batch = kd.prompt_batch(
+                bar, [np.asarray(D["IMG"][i]) for i in rows],
+                kd.norm_states(np.asarray(D["state8"][rows])),
+                D["task"][rows].tolist())
+            po = int(D["pos_offset"][rows[0]])
+            cnt = dict(vision=0, text=[0] * 24, expert=[0] * 24)
+            got = generate_cached(torch, model, batch, po, cnt)
+            if not counters_ok(cnt, model.num_blocks):
+                prob.append(f"batch {bs}: счётчики {cnt}")
+            if tuple(got.shape) != (len(rows), model.num_blocks *
+                                    model.block_size):
+                prob.append(f"batch {bs}: коды формы {tuple(got.shape)}")
+            with torch.no_grad():
+                x = decode(torch, bar["E"], bar["codec"], got, len(rows))
+            if not bool(torch.isfinite(x).all()):
+                prob.append(f"batch {bs}: нечисловые действия")
+            if x.shape[0] != len(rows) or x.shape[-1] != 7:
+                prob.append(f"batch {bs}: чанк формы {tuple(x.shape)}")
+            n_ok += 1
+        res[f"batch{bs}"] = dict(batches=n_ok)
+    prob = sorted(set(prob))
+    ident = verify_identity(D)
+    eq = False
+    if os.path.exists(VERIFY_REPORT):
+        v = json.load(open(VERIFY_REPORT))
+        eq = all(v.get(k) == x for k, x in ident.items()) and \
+            v.get("ok") is True and v.get("equivalent") is True
+    res.update(ident, problems=prob, ok=not prob, kind="standalone",
+               equivalence_confirmed=eq,
+               equivalence=("подтверждена строгой проверкой" if eq
+                            else NOT_CONFIRMED))
+    os.makedirs("reports/k21", exist_ok=True)
+    json.dump(res, open(ADMIT_REPORT, "w"), ensure_ascii=False, indent=1)
+    print(f"  допуск самостоятельного эталона: "
+          f"{'пройден' if not prob else 'НЕ пройден'}; {res['equivalence']}; "
+          f"отчёт {ADMIT_REPORT}", flush=True)
+    if prob:
+        print("  ОТКАЗ: " + "; ".join(prob[:6]), flush=True)
+        return 3
+    return 0
+
+
+def require_admitted(D, path=ADMIT_REPORT):
+    """Отказ, если нет пройденного допуска самостоятельного эталона для этой
+    же ревизии, подготовки и кода. Возвращает отчёт допуска."""
+    if not os.path.exists(path):
+        raise SystemExit(f"нет {path}: сначала k21_barcache.py --admit")
+    r = json.load(open(path))
+    want = verify_identity(D)
+    got = {k: r.get(k) for k in want}
+    if got != want:
+        raise SystemExit(f"допуск сделан для другого состояния: {got} != "
+                         f"{want}")
+    if r.get("ok") is not True or r.get("kind") != "standalone":
+        raise SystemExit(f"допуск не пройден: {r.get('problems')}")
+    return r
+
+
 def verify(a):
     import torch
     import k20_data as kd
@@ -456,6 +539,18 @@ def selftest():
                 raise AssertionError(bad)
             except SystemExit:
                 pass
+        ap_ = os.path.join(td, "a.json")
+        okr = dict(verify_identity(DD), ok=True, kind="standalone")
+        json.dump(okr, open(ap_, "w"))
+        require_admitted(DD, ap_)
+        for bad in (dict(okr, ok=False), dict(okr, kind="strict"),
+                    dict(okr, barcache_sha1="x"), dict(okr, prep_id="q")):
+            json.dump(bad, open(ap_, "w"))
+            try:
+                require_admitted(DD, ap_)
+                raise AssertionError(bad)
+            except SystemExit:
+                pass
     print("самопроверка k21_barcache пройдена: кэш префикса = совместному "
           "проходу BAR-подобной схемы (блочная маска, padding, strided "
           "позиции); счётчики и допуск латентности по отчёту проверки")
@@ -467,6 +562,7 @@ def main():
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--noise-floor", action="store_true")
+    ap.add_argument("--admit", action="store_true")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--n", type=int, default=60)
     a = ap.parse_args()
@@ -476,7 +572,9 @@ def main():
         return verify(a)
     if a.noise_floor:
         return noise_floor(a)
-    raise SystemExit("--selftest, --verify или --noise-floor")
+    if a.admit:
+        return admit(a)
+    raise SystemExit("--selftest, --verify, --admit или --noise-floor")
 
 
 if __name__ == "__main__":

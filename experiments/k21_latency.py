@@ -91,8 +91,11 @@ def main():
                     help="добавить K-22 parents24 (data/k22/runs, сверка с "
                          "reports/k22/train.json)")
     a = ap.parse_args()
-    if a.with_parents24 and a.out == "reports/k21/latency.json":
-        a.out = "reports/k22/latency.json"     # отчёт K-21 не перезаписывается
+    if a.out == "reports/k21/latency.json":    # отчёт K-21 не перезаписывается
+        if a.with_parents24:
+            a.out = "reports/k22/latency.json"
+        elif a.with_cached:
+            a.out = "reports/k21/latency_cached.json"
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     import torch
     import k20_data as kd
@@ -105,10 +108,12 @@ def main():
     if a.with_cached:
         import k21_barcache as bc
         try:
-            bc.require_verified(D)
+            adm = bc.require_admitted(D)
         except SystemExit as e:
             print(f"  ОТКАЗ: {e.code}", flush=True)
             return 3
+        print(f"  fullbar_cached — самостоятельный эталон: "
+              f"{adm['equivalence']}", flush=True)
     bar = d21.load_bar(dev, prep["bar_pin"])
     models = dict(fullbar=bar["model"])
     for lab in ("flat24", "tree_adapt24"):
@@ -252,6 +257,11 @@ def main():
                    "ActionCodec; flat24/tree_adapt24/parents24 — один проход, "
                    "fp16 autocast, LoRA не слита")
     res["labels"] = labs
+    if a.with_cached:
+        res["fullbar_cached_status"] = dict(
+            kind="standalone", equivalence=adm["equivalence"],
+            equivalence_confirmed=adm["equivalence_confirmed"],
+            barcache_sha1=adm["barcache_sha1"])
     res["device"] = torch.cuda.get_device_name(dev)
     json.dump(res, open(a.out, "w"), ensure_ascii=False, indent=1)
     print(f"  отчёт: {a.out}")
