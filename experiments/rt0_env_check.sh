@@ -15,7 +15,9 @@ mkdir -p reports/rt0
 exec > >(tee reports/rt0/env_check.txt) 2>&1
 sec () { echo; echo "=== $1"; }
 PROB=()
+SOFT=()
 bad () { echo "  ВНИМАНИЕ: $1"; PROB+=("$1"); }
+soft () { echo "  ВНИМАНИЕ (не решающее): $1"; SOFT+=("$1"); }
 have () { command -v "$1" >/dev/null 2>&1; }
 
 sec "дата и машина"; date; hostname; uname -r
@@ -49,16 +51,33 @@ fi
 
 sec "Vulkan"
 icd=""
-for f in /usr/share/vulkan/icd.d/nvidia_icd.json /etc/vulkan/icd.d/nvidia_icd.json; do
-  [ -f "$f" ] && icd="$f" && echo "ICD: $f"
+# VK_ICD_FILENAMES / VK_DRIVER_FILES (без root, напр. в домашнем каталоге)
+# имеют приоритет над системными каталогами
+for f in $(echo "${VK_ICD_FILENAMES:-} ${VK_DRIVER_FILES:-}" | tr ':' ' ') \
+         /usr/share/vulkan/icd.d/nvidia_icd.json /etc/vulkan/icd.d/nvidia_icd.json; do
+  if [ -f "$f" ]; then
+    echo "ICD: $f"; grep -o '"library_path"[^,}]*' "$f" || true
+    icd="$f"; break
+  fi
 done
-[ -z "$icd" ] && bad "nvidia_icd.json не найден"
+[ -z "$icd" ] && bad "ICD NVIDIA не найден (ни VK_ICD_FILENAMES, ни системные каталоги)"
+ls /usr/lib/x86_64-linux-gnu 2>/dev/null | grep -q "libnvidia-glvkspirv" \
+  || bad "нет libnvidia-glvkspirv: Vulkan-часть драйвера не проброшена в контейнер"
 if ! have vulkaninfo; then bad "vulkaninfo не установлен (пакет vulkan-tools)"
 else
   out="$(vulkaninfo --summary 2>&1)"; rc=$?
   echo "$out" | grep -E "deviceName|driverName|apiVersion|ERROR" | head -20
-  [ $rc -ne 0 ] && bad "vulkaninfo завершился с кодом $rc"
-  echo "$out" | grep -qi "nvidia" || bad "vulkaninfo не видит NVIDIA"
+  if echo "$out" | grep -q "Found no drivers\|ERROR_INCOMPATIBLE_DRIVER"; then
+    bad "загрузчик Vulkan не нашёл рабочего драйвера (ICD)"
+  elif [ $rc -ne 0 ] && echo "$out" | grep -q "VK_KHR_display"; then
+    # в безголовом контейнере vulkaninfo падает на перечислении мониторов,
+    # не дойдя до списка устройств: решает rt0_render_check.py
+    soft "vulkaninfo упал (код $rc) на VK_KHR_display без монитора; решающая проверка — rt0_render_check.py"
+  elif [ $rc -ne 0 ]; then
+    bad "vulkaninfo завершился с кодом $rc"
+  elif ! echo "$out" | grep -qi "nvidia"; then
+    bad "vulkaninfo не видит NVIDIA"
+  fi
 fi
 ldconfig -p 2>/dev/null | grep -E "libvulkan|libGLX_nvidia|libEGL_nvidia" | head || true
 
@@ -89,6 +108,9 @@ if [ -n "$RT" ]; then
 fi
 
 echo
+if [ ${#SOFT[@]} -gt 0 ]; then
+  echo "не решающие замечания ${#SOFT[@]}:"; printf '  - %s\n' "${SOFT[@]}"
+fi
 if [ ${#PROB[@]} -eq 0 ]; then
   echo "ИТОГ: явных препятствий не найдено"; CODE=0
 else
