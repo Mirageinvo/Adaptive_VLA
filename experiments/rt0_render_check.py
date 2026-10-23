@@ -73,6 +73,19 @@ def build_scene(sapien, device):
     return major, v, shot
 
 
+def render_devices(sapien):
+    """Перечень устройств рендера SAPIEN (строка) или None, если API нет:
+    отличает GPU NVIDIA от программного рендера (llvmpipe/lavapipe)."""
+    for mod in (getattr(sapien, "render", None), sapien):
+        fn = getattr(mod, "get_device_summary", None) if mod else None
+        if fn is not None:
+            try:
+                return str(fn())
+            except Exception as e:  # noqa: BLE001
+                return f"ошибка get_device_summary: {e}"
+    return None
+
+
 def checks(rgba, depth):
     rgb = np.asarray(rgba, np.float64)[..., :3]
     if rgb.max() > 1.5:
@@ -138,6 +151,10 @@ def main():
         import sapien
         major, ver, shot = build_scene(sapien, a.device)
         rep.update(sapien_version=str(ver), api_major=major)
+        dev = render_devices(sapien)
+        rep["render_devices"] = dev
+        if dev is not None and "nvidia" not in dev.lower():
+            raise RuntimeError(f"рендер не на NVIDIA (устройства: {dev})")
         t0 = time.perf_counter()
         rgba, depth = shot()
         rep["first_frame_s"] = time.perf_counter() - t0
@@ -155,6 +172,7 @@ def main():
     json.dump(rep, open("reports/rt0/render_check.json", "w"),
               ensure_ascii=False, indent=1)
     print(json.dumps(rep, ensure_ascii=False, indent=1))
+    print(f"  устройства рендера: {rep.get('render_devices')}")
     print("  " + ("рендер SAPIEN работает" if rep["ok"] else
                   "ОТКАЗ: " + "; ".join(rep["problems"])))
     return 0 if rep["ok"] else 3
