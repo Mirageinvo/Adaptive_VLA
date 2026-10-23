@@ -271,6 +271,7 @@ def run(a):
     res = dict(task=a.task, task_config=a.task_config,
                action_type=a.action_type, chunk=a.chunk, seed=a.seed,
                expert_check=a.expert_check, episodes_total=episodes,
+               frequency=a.frequency,
                mode=mode, note="технический замер стоимости цикла с "
                "удерживающей политикой: не SR модели и не время успешного "
                "выполнения задачи")
@@ -345,7 +346,8 @@ def run(a):
                    xpolicylab_root=os.path.join(root, "XPolicyLab"),
                    eval_batch=False, test_num=episodes,
                    expert_check=a.expert_check, ckpt_name="hold",
-                   ckpt_setting="hold", action_type=a.action_type)
+                   ckpt_setting="hold", action_type=a.action_type,
+                   frequency=int(a.frequency))
         evx.main(usr)
     except BaseException as e:  # noqa: BLE001 — записать и завершить
         err = f"{type(e).__name__}: {e}"
@@ -572,6 +574,10 @@ def main():
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device-id", default="0")
+    ap.add_argument("--frequency", type=int, default=15,
+                    help="additional_info.frequency наблюдения; данные "
+                         "demo_clean aloha_agilex — 15 Гц (у цикла без "
+                         "параметра — 30)")
     ap.add_argument("--expert-check", default="true",
                     choices=("true", "false"))
     ap.add_argument("--debug", action="store_true")
