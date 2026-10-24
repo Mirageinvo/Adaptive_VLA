@@ -11,7 +11,9 @@ get_obs, take_action, close_env) и вызовы клиента политики
 prepare_case, update_obs, get_action, trial_end — время туда-обратно).
 Политика — техническое удержание текущей конфигурации, поднятое сервером
 XPolicyLab (client_server.ws.PolicyServer) в отдельном процессе; XPolicyLab
-не меняется (у demo_policy на закреплённой ревизии нет model.py). Удержание
+не меняется. Официальный demo_policy возвращает нулевые действия: при
+абсолютных суставных целях это команда «в нулевую конфигурацию», а не
+удержание, поэтому для замера — собственная модель. Удержание
 — в выбранном пространстве действий: joint — текущие суставы и схваты из
 state наблюдения; ee — текущие позы концевиков и схваты. Нулей, выданных за
 удержание, нет: при отсутствии нужного поля — отказ.
@@ -479,9 +481,10 @@ def passport(a):
     if not rep["xpolicylab"]["matches_pin"]:
         lim.append("XPolicyLab не на закреплённой ревизии RoboTwin")
     if not rep["xpolicylab"]["demo_policy_has_model_py"]:
-        lim.append("demo_policy закреплённой ревизии без model.py: "
-                   "официальная нулевая политика не запускается как есть; "
-                   "для замера — собственная удерживающая модель")
+        lim.append("demo_policy закреплённой ревизии без model.py")
+    lim.append("замер — собственная удерживающая модель: официальный "
+               "demo_policy отдаёт нулевые действия, что при абсолютных "
+               "суставных целях не удержание")
     lim += a.note or []
     rep["limitations"] = lim
     json.dump(rep, open(READY, "w", encoding="utf-8"), ensure_ascii=False, indent=1,
