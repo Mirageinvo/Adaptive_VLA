@@ -13,8 +13,9 @@ expert — все параметры bar.action_expert, включая табл�
 сравнения инициализации и очереди):
   - все существующие градиенты конечны;
   - норма градиента каждой группы (expert, lora, new) > 0 и конечна;
-  - параметры без градиента перечисляются; допустимы только неиспользуемые
-    эмбеддинги/выходная голова эксперта (UNUSED_OK), иначе — отказ.
+  - параметры без градиента перечисляются; допустимы только структурно не
+    влияющие на выход: эмбеддинги/выходная голова эксперта и LoRA o_proj
+    последнего слоя VLM (unused_ok), иначе — отказ.
 k23_train.py и k23_run.sh не меняются (закреплены в плане пакета A).
 Отчёт: reports/k23/smoke_s<S>_grads.json (прежний smoke_s<S>.json
 сохраняется как есть).
@@ -38,7 +39,17 @@ import k23_train as t  # noqa: E402
 UNUSED_OK = re.compile(r"^bar\.action_expert\.(embed_tokens|lm_head)\.")
 
 
-def grad_problems(named, groups_named):
+def unused_ok(n, last_layer):
+    """Структурно не влияющие на выход параметры: эмбеддинги/голова
+    эксперта и LoRA o_proj ПОСЛЕДНЕГО слоя VLM (его выход обновляет только
+    состояния префикса, которые дальше никуда не идут: query действий читают
+    префикс через K/V, посчитанные из входа слоя)."""
+    return bool(UNUSED_OK.match(n)) or n in (
+        f"bar.vlm.text_model.layers.{last_layer}.self_attn.o_proj.A",
+        f"bar.vlm.text_model.layers.{last_layer}.self_attn.o_proj.B")
+
+
+def grad_problems(named, groups_named, last_layer=23):
     """named [(имя, параметр)] обучаемых; groups_named {группа: [имена]}."""
     p, none, norms = [], [], {}
     by = dict(named)
@@ -47,7 +58,7 @@ def grad_problems(named, groups_named):
             none.append(n)
         elif not bool(prm.grad.isfinite().all()):
             p.append(f"нечисловой градиент {n}")
-    bad_none = [n for n in none if not UNUSED_OK.match(n)]
+    bad_none = [n for n in none if not unused_ok(n, last_layer)]
     if bad_none:
         p.append(f"нет градиента у используемых параметров: {bad_none[:6]}")
     for g, names in groups_named.items():
@@ -106,7 +117,8 @@ def smoke(a):
                 out = mod(batch, po, st_)
                 loss, _l1, _b = km.loss_fn(torch, out, tgt, val)
             loss.mean().backward()
-            gp, none, norms = grad_problems(named, gn)
+            last = len(mod.bar.vlm.text_model.layers) - 1
+            gp, none, norms = grad_problems(named, gn, last)
             opt.step()
             torch.cuda.synchronize(dev)
             c = mod.counters
@@ -194,11 +206,19 @@ def selftest():
     assert grad_problems(named2, gn2)[0]                # используемый без grad
     named3 = [named[0], named[1], ("bar.vlm.l.A", P(None)), named[3]]
     assert any("lora" in x for x in grad_problems(named3, gn)[0])
+    named5 = named + [("bar.vlm.text_model.layers.23.self_attn.o_proj.B",
+                       P(None)),
+                      ("bar.vlm.text_model.layers.22.self_attn.o_proj.B",
+                       P(None))]
+    gn5 = dict(gn, lora=gn["lora"] + [named5[-2][0], named5[-1][0]])
+    pr5 = grad_problems(named5, gn5, 23)[0]
+    assert pr5 and "layers.22" in pr5[0] and "layers.23" not in pr5[0], pr5
     named4 = [("bar.action_expert.layers.0.w",
                P(torch.tensor([float("inf")])))] + named[1:]
     assert grad_problems(named4, gn)[0]
     print("самопроверка k23_smoke пройдена: неиспользуемые эмбеддинги "
-          "эксперта без градиента допустимы, используемые — нет, нулевая "
+          "эксперта и LoRA o_proj последнего слоя без градиента допустимы, "
+          "предпоследнего и прочие используемые — нет, нулевая "
           "группа и нечисловой градиент — отказ")
     return 0
 
