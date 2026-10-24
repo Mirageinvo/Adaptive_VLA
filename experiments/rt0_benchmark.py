@@ -62,7 +62,7 @@ class HoldModel:
 
     def _log(self, ev, t0):
         if self.log:
-            with open(self.log, "a") as f:
+            with open(self.log, "a", encoding="utf-8") as f:
                 f.write(json.dumps(dict(ev=ev, ep=self.ep, dt=time.perf_counter()
                                         - t0)) + "\n")
 
@@ -223,7 +223,7 @@ def server_times(log):
     out = {}
     if not os.path.exists(log):
         return out
-    for line in open(log):
+    for line in open(log, encoding="utf-8"):
         r = json.loads(line)
         d = out.setdefault(int(r["ep"]), {})
         d[r["ev"]] = d.get(r["ev"], 0.0) + float(r["dt"])
@@ -265,7 +265,7 @@ def run(a):
         [sys.executable, os.path.abspath(__file__), "serve", "--port",
          str(port), "--chunk", str(a.chunk), "--action-type", a.action_type,
          "--log", slog, "--robotwin-root", root],
-        stdout=open(f"reports/rt0/server_{a.task}_{mode}.log", "w"),
+        stdout=open(f"reports/rt0/server_{a.task}_{mode}.log", "w", encoding="utf-8"),
         stderr=subprocess.STDOUT)
     rec = Recorder()
     res = dict(task=a.task, task_config=a.task_config,
@@ -390,9 +390,9 @@ def run(a):
         res["debug"] = dbg
     res["problems"] = prob
     res["ok"] = not prob
-    allr = json.load(open(OUT)) if os.path.exists(OUT) else {}
+    allr = json.load(open(OUT, encoding="utf-8")) if os.path.exists(OUT) else {}
     allr[key] = res
-    json.dump(allr, open(OUT, "w"), ensure_ascii=False, indent=1,
+    json.dump(allr, open(OUT, "w", encoding="utf-8"), ensure_ascii=False, indent=1,
               default=str)
     s = res["summary"] or {}
     print(f"  {key}: эпизодов {len(rec.episodes)}/{episodes}, причины "
@@ -456,9 +456,9 @@ def passport(a):
         if not os.path.exists(f):
             rep[nm] = None
         elif f.endswith(".txt"):
-            rep[nm] = open(f).read()[-3000:]
+            rep[nm] = open(f, encoding="utf-8").read()[-3000:]
         else:
-            rep[nm] = json.load(open(f))
+            rep[nm] = json.load(open(f, encoding="utf-8"))
     try:
         st = os.statvfs(a.data_root)
         rep["disk_free_gb"] = st.f_bavail * st.f_frsize / 2 ** 30
@@ -484,7 +484,7 @@ def passport(a):
                    "для замера — собственная удерживающая модель")
     lim += a.note or []
     rep["limitations"] = lim
-    json.dump(rep, open(READY, "w"), ensure_ascii=False, indent=1,
+    json.dump(rep, open(READY, "w", encoding="utf-8"), ensure_ascii=False, indent=1,
               default=str)
     print(json.dumps({k: rep[k] for k in ("robotwin", "xpolicylab",
                                           "packages", "limitations")},

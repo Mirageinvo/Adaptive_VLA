@@ -92,7 +92,7 @@ def decode_size(buf):
     try:
         import io
         from PIL import Image
-        im = Image.open(io.BytesIO(buf))
+        im = Image.open(io.BytesIO(buf), encoding="utf-8")
         return [im.size[1], im.size[0], len(im.getbands())]
     except Exception:  # noqa: BLE001
         pass
@@ -351,7 +351,7 @@ def main():
         raise
     report(res)
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
-    json.dump(dict(root=os.path.abspath(a.root), tasks=res), open(a.out, "w"),
+    json.dump(dict(root=os.path.abspath(a.root), tasks=res), open(a.out, "w", encoding="utf-8"),
               ensure_ascii=False, indent=1)
     print(f"\n  отчёт: {a.out}")
     return 0

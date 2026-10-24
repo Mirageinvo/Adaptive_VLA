@@ -169,7 +169,7 @@ def main():
     except Exception as e:  # noqa: BLE001
         rep["problems"] = [f"{type(e).__name__}: {e}"]
     rep["ok"] = not rep["problems"]
-    json.dump(rep, open("reports/rt0/render_check.json", "w"),
+    json.dump(rep, open("reports/rt0/render_check.json", "w", encoding="utf-8"),
               ensure_ascii=False, indent=1)
     print(json.dumps(rep, ensure_ascii=False, indent=1))
     print(f"  устройства рендера: {rep.get('render_devices')}")
