@@ -167,6 +167,15 @@ def seed_entry(seed, path=None):
     return e
 
 
+def val_coverage(task, val_rows, train_rows):
+    """Задачи val_sel и задачи обучения без строк в val_sel. Метки задач —
+    как в подготовке K-21 (текстовые описания), без приведения типов."""
+    task = np.asarray(task)
+    vt = sorted({str(x) for x in task[np.asarray(val_rows)]})
+    tr = sorted({str(x) for x in task[np.asarray(train_rows)]})
+    return vt, [t for t in tr if t not in vt], tr
+
+
 def prepare():
     import k21_data as d21
     old = json.load(open(PREPARE, encoding="utf-8")) \
@@ -174,9 +183,8 @@ def prepare():
     prep = json.load(open(d21.REPORT, encoding="utf-8"))
     tj = json.load(open(d21.TEACHER_REPORT, encoding="utf-8"))
     D = d21.load_prepared(require_teacher=False)
-    vt = sorted({int(x) for x in np.asarray(D["task"])[np.asarray(
-        D["val_rows"])]})
-    alltasks = sorted({int(x) for x in np.asarray(D["task"])})
+    vt, missing, alltasks = val_coverage(D["task"], D["val_rows"],
+                                         D["train_rows"])
     rep = dict(created=(old or {}).get("created") or datetime.datetime.now()
                .isoformat(timespec="seconds"),
                prep_id=prep["prep_id"], prepare_sha1=full_sha(d21.REPORT),
@@ -186,8 +194,8 @@ def prepare():
                bounds=prep["bounds_codec"],
                train_rows=int(len(D["train_rows"])),
                val_rows=int(len(D["val_rows"])),
-               val_tasks=len(vt), val_tasks_missing=[t for t in alltasks
-                                                      if t not in vt],
+               train_tasks=len(alltasks), val_tasks=len(vt),
+               val_tasks_missing=missing,
                readout=dict(version=kr.VERSION, formula=kr.FORMULA,
                             rank_tol=kr.RANK_TOL),
                seeds=dict((old or {}).get("seeds") or {}))
@@ -583,13 +591,18 @@ def selftest():
             assert entry_problems(e2, common), e2
         open(ck, "wb").write(b"v")
         assert any("чекпойнт" in x for x in entry_problems(e, common))
+    tk = np.array(["put the mug", "open the drawer", "put the mug", "x"])
+    vt, miss, tr = val_coverage(tk, [0, 1], [0, 1, 2, 3])
+    assert vt == ["open the drawer", "put the mug"] and miss == ["x"] and \
+        len(tr) == 3
     assert parse_label("parents_mr24_s1") == ("parents_mr24", 1)
     assert len(set(CODE)) == len(CODE)
     print("самопроверка k24_protocol пройдена: W0/W1/W2 из геометрии, "
           "пересборка Z/G по записанным W, тождества, tanh и схват против "
           "журнала; порча Z, геометрии и схвата, NaN/±Inf в любом массиве "
           "и неверная форма — отказ; отпечаток записи сида ловит смену "
-          "чекпойнта, init_hash, SHA, бюджета, источников и файла")
+          "чекпойнта, init_hash, SHA, бюджета, источников и файла; "
+          "покрытие val_sel по текстовым меткам задач")
     return 0
 
 
