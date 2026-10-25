@@ -95,7 +95,8 @@ def check_contract(kind, a):
              bar_files=hashlib.sha1(json.dumps(
                  prep["bar_pin"]["files"], sort_keys=True).encode())
              .hexdigest(),
-             precision="float16 autocast + GradScaler",
+             precision=f"{a.dtype} autocast" + (
+                 " + GradScaler" if a.dtype == "float16" else ""),
              device=torch.cuda.get_device_name(torch.device(a.device)),
              seed_entry_fp_s0=seed_entry(0)["fingerprint"])
     if kind == "real-check":
@@ -329,6 +330,9 @@ def real_check(a):
     prob, rep = [], dict(seed=a.seed, micros=a.micros)
     if TRAIN_MICRO not in a.micros:
         prob.append(f"microbatch обучения {TRAIN_MICRO} не проверяется")
+    if a.dtype != "float16":
+        prob.append(f"real-check реализован для float16 + GradScaler, "
+                    f"запрошен {a.dtype}")
     rows = D["train_rows"][:: max(1, len(D["train_rows"]) // 64)][:64]
 
     def fresh(cls, seed, **kw):
