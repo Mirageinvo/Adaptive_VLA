@@ -49,7 +49,12 @@ def main():
     if prob:
         print("  ОТКАЗ: " + "; ".join(prob[:3]))
         return 3
-    pr = json.load(open(pc.PREPARE, encoding="utf-8"))["seeds"]["0"]
+    # контроли — из записи сида, закреплённой в плане (её отпечаток сверен
+    # check_plan_inputs с prepare.json), а не из изменяемого prepare.json
+    pr = plan["seed_entry"]
+    if pc.entry_fp(pr) != plan["seed_entry_fp"]:
+        print("  ОТКАЗ: запись сида в плане не совпадает с отпечатком")
+        return 3
     lab = "parents_mr24_s0"
     models, src = {}, {}
     mod, _b, _c, _p = kp24.load_policy(torch, lab, plan["specs"][lab],
@@ -103,11 +108,17 @@ def main():
                     shape=list(a_np.shape),
                     finite=bool(np.isfinite(a_np).all()))
     labs = list(models)
-    res = dict(sources=src, note=("полный путь: подготовка входа -> чанк "
+    import hashlib
+    res = dict(sources=src, seed_entry_fp=plan["seed_entry_fp"],
+               plan_sha1=pc.sha(pc.plan_path(0)), queues={}, note=("полный путь: подготовка входа -> чанк "
                "[B, 20, 7] на CPU; у parents_mr24 QR и гейт ранга внутри "
                "forward; fp16 autocast; checkpointing off; LoRA не слита"))
     for bs in a.batches:
         queue = kl.make_queue(D["task"], va, bs, max(kl.WARM, a.n))
+        qa = np.stack(queue).astype(np.int64)
+        res["queues"][f"batch{bs}"] = dict(
+            n=len(queue), sha1=hashlib.sha1(qa.tobytes()).hexdigest(),
+            first=qa[:3].tolist())
         for r in np.unique(np.concatenate(queue)):
             if int(r) not in cache:
                 cache[int(r)] = np.array(D["IMG"][int(r)], copy=True)

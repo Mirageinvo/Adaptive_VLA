@@ -74,25 +74,15 @@ selftests () {
     || { echo "ОТКАЗ: самопроверка k24_train"; return 1; }
   echo "    самопроверки K-24 пройдены"
 }
-code_fresh () {   # отчёт -> 0, если пройден и код K-24 тот же
-  $PY - "$1" <<'PY'
-import hashlib, json, os, sys
-p = sys.argv[1]
-if not os.path.exists(p): sys.exit(1)
-r = json.load(open(p, encoding="utf-8"))
-ok = (r.get("problems") == [] if "problems" in r else r.get("ok") and r.get("exit") == 0)
-code = r.get("code") or {}
-same = code and all(hashlib.sha1(open(os.path.join("experiments", f), "rb").read()).hexdigest() == s for f, s in code.items())
-sys.exit(0 if ok and same else 1)
-PY
-}
-real_check () {
-  if code_fresh reports/k24/real_check.json; then echo "    real-check: пройден тем же кодом"; return 0; fi
+real_check () {   # готовый отчёт — только при совпадении полного контракта
+  if $PY experiments/k24_train.py check-fresh --kind real-check --seed 0 \
+       --device "$DEV" --micros 8 32; then return 0; fi
   gpu_free || return 3
   $PY experiments/k24_train.py real-check --seed 0 --device "$DEV" --micros 8 32
 }
 fitcheck () {
-  if code_fresh reports/k24/fitcheck.json; then echo "    fitcheck: пройден тем же кодом"; return 0; fi
+  if $PY experiments/k24_train.py check-fresh --kind fitcheck --device "$DEV" \
+       --micro 32; then return 0; fi
   gpu_free || return 3
   $PY experiments/k24_train.py fitcheck --device "$DEV" --micro 32
 }

@@ -122,6 +122,51 @@ def control(arch, seed):
                 init_hash=rs["init_hash"], seed=int(rs["config"]["seed"]))
 
 
+def entry_fp(e):
+    """Отпечаток полной записи сида (всё, кроме самого отпечатка)."""
+    import hashlib
+    body = {k: v for k, v in e.items() if k != "fingerprint"}
+    return hashlib.sha1(json.dumps(body, sort_keys=True, default=str)
+                        .encode()).hexdigest()
+
+
+COMMON_KEYS = ("prep_id", "prepare_sha1", "teacher_sha1",
+               "teacher_report_sha1", "bar_revision")
+
+
+def entry_problems(e, common=None):
+    """Запись сида не изменена: отпечаток, файлы контролей, общие
+    источники."""
+    p = []
+    if entry_fp(e) != e.get("fingerprint"):
+        p.append("отпечаток записи сида не совпадает с содержимым")
+    for arch in ("parents", "flat"):
+        c = e[f"control_{arch}"]
+        if not os.path.exists(c["ckpt"]) or full_sha(c["ckpt"]) != \
+                c["ckpt_sha1"]:
+            p.append(f"контроль {arch}: чекпойнт изменён или отсутствует")
+        if not os.path.exists(c["train_report"]) or \
+                full_sha(c["train_report"]) != c["train_report_sha1"]:
+            p.append(f"контроль {arch}: отчёт обучения изменён")
+    if int(e["budget_main"]) != int(e["control_parents"]["updates"]):
+        p.append("бюджет ≠ фактическому бюджету parents-контроля")
+    if common is not None and e.get("common") != common:
+        p.append("общие источники (подготовка, учитель, BAR) изменились")
+    return p
+
+
+def seed_entry(seed, path=None):
+    """Готовая запись сида из prepare.json после проверки отпечатка."""
+    pr = json.load(open(path or PREPARE, encoding="utf-8"))
+    e = (pr.get("seeds") or {}).get(str(seed))
+    if not e or e.get("status") != "ready":
+        raise SystemExit(f"seed {seed}: подготовка не готова")
+    prob = entry_problems(e, {k: pr[k] for k in COMMON_KEYS})
+    if prob:
+        raise SystemExit(f"seed {seed}: " + "; ".join(prob))
+    return e
+
+
 def prepare():
     import k21_data as d21
     old = json.load(open(PREPARE, encoding="utf-8")) \
@@ -146,18 +191,18 @@ def prepare():
                readout=dict(version=kr.VERSION, formula=kr.FORMULA,
                             rank_tol=kr.RANK_TOL),
                seeds=dict((old or {}).get("seeds") or {}))
+    common = {k: rep[k] for k in COMMON_KEYS}
     if old:
-        for k in ("prep_id", "teacher_sha1", "bar_revision"):
+        for k in COMMON_KEYS:
             if old[k] != rep[k]:
                 raise SystemExit(f"подготовка K-21 изменилась: {k}")
     for s in (0, 1):
         e = rep["seeds"].get(str(s))
         if e and e.get("status") == "ready":
-            # готовая запись не меняется; её файлы по-прежнему те же
-            for arch in ("parents", "flat"):
-                c = e[f"control_{arch}"]
-                if full_sha(c["ckpt"]) != c["ckpt_sha1"]:
-                    raise SystemExit(f"seed {s}: контроль {arch} изменён")
+            # готовая запись не меняется: отпечаток, файлы, источники
+            prob = entry_problems(e, common)
+            if prob:
+                raise SystemExit(f"seed {s}: " + "; ".join(prob))
             continue
         cp, cf = control("parents24", s), control("flat24", s)
         if cp is None or cf is None:
@@ -167,10 +212,11 @@ def prepare():
         if cp["seed"] != s or cf["seed"] != s:
             raise SystemExit(f"seed {s}: seed контроля {cp['seed']}/"
                              f"{cf['seed']}")
-        rep["seeds"][str(s)] = dict(
-            status="ready", budget_main=cp["updates"], control_parents=cp,
-            control_flat=cf, fixed=datetime.datetime.now().isoformat(
-                timespec="seconds"))
+        e = dict(status="ready", seed=s, budget_main=cp["updates"],
+                 control_parents=cp, control_flat=cf, common=common,
+                 fixed=datetime.datetime.now().isoformat(timespec="seconds"))
+        e["fingerprint"] = entry_fp(e)
+        rep["seeds"][str(s)] = e
     rep["code"] = {f: sha(os.path.join(HERE, f)) for f in CODE
                    if os.path.exists(os.path.join(HERE, f))}
     os.makedirs("reports/k24", exist_ok=True)
@@ -182,7 +228,9 @@ def prepare():
     for s, e in sorted(rep["seeds"].items()):
         print(f"    seed {s}: {e['status']}" + (
             f", бюджет main {e['budget_main']} (контроль "
-            f"{e['control_parents']['source']}), init {e['control_parents']['init_hash'][:12]}"
+            f"{e['control_parents']['source']}), init "
+            f"{e['control_parents']['init_hash'][:12]}, отпечаток записи "
+            f"{e['fingerprint'][:12]}"
             if e["status"] == "ready" else f" ({e.get('why')})"))
     return 0
 
@@ -192,10 +240,7 @@ def make_plan(seed, device):
     import torch
     import k21_data as d21
     import k24_train as k24t
-    pr = json.load(open(PREPARE, encoding="utf-8"))
-    e = pr["seeds"].get(str(seed)) or {}
-    if e.get("status") != "ready":
-        raise SystemExit(f"seed {seed}: подготовка не готова")
+    e = seed_entry(seed)
     trp = k24t.report_path(seed)
     tr = json.load(open(trp, encoding="utf-8"))
     if int(tr["updates"]) != int(e["budget_main"]):
@@ -208,6 +253,8 @@ def make_plan(seed, device):
             int(c["config"]["seed"]) != seed or \
             c["config"].get("architecture") != "k24_parents_mr24":
         raise SystemExit("чекпойнт K-24: отпечаток, seed или архитектура")
+    if c["config"]["k24"].get("seed_entry_fp") != e["fingerprint"]:
+        raise SystemExit("чекпойнт K-24 обучен по другой записи подготовки")
     lab = f"parents_mr24_s{seed}"
     spec = dict(arch="parents_mr24", seed=seed, ckpt=os.path.abspath(ck),
                 ckpt_sha1=full_sha(ck), weights_hash=c["weights_hash"],
@@ -234,6 +281,7 @@ def make_plan(seed, device):
         kind=KIND, name=f"k24_s{seed}", train_seed=seed,
         created=datetime.datetime.now().isoformat(timespec="seconds"),
         labels=[lab], policy={lab: "k15f"}, specs={lab: spec},
+        seed_entry=e, seed_entry_fp=e["fingerprint"],
         controls=dict(parents=f"parents24_s{seed}", flat=f"flat24_s{seed}"),
         suites=["10"], tasks=list(A["tasks"]), blocks=list(A["blocks"]),
         cells=[["10", t, b] for t in A["tasks"] for b in A["blocks"]],
@@ -267,11 +315,13 @@ def check_plan_inputs(plan):
                 continue          # дополняется для seed 1; запись сида ниже
             if not os.path.exists(f) or sha(f) != plan[f"{grp}_sha1"][k]:
                 p.append(f"{grp} {k} изменён или отсутствует ({f})")
-    pr = json.load(open(PREPARE, encoding="utf-8"))
-    e = pr["seeds"].get(str(plan["train_seed"]))
-    sp = list(plan["specs"].values())[0]
-    if not e or int(e["budget_main"]) != sp["budget_main"]:
-        p.append("запись подготовки сида изменилась")
+    try:
+        e = seed_entry(plan["train_seed"])
+        if e["fingerprint"] != plan["seed_entry_fp"] or \
+                entry_fp(plan["seed_entry"]) != plan["seed_entry_fp"]:
+            p.append("запись подготовки сида ≠ закреплённой в плане")
+    except SystemExit as ex:
+        p.append(f"запись подготовки сида: {ex.code}")
     for lab, s in plan["specs"].items():
         if not os.path.exists(s["ckpt"]) or full_sha(s["ckpt"]) != \
                 s["ckpt_sha1"]:
@@ -324,15 +374,35 @@ def mr_problems(z, label, bounds, tol=MR_TOL):
         "C0", "C1", "Y2", "Z", "G0", "G1", "G2", "W0", "W1", "W2", "split1",
         "split2")}
     root = np.asarray(z["k21_root"], np.float64)
+    lv0 = np.asarray(z[f"k15d_level_{label}"], np.float64)
+    if g["Z"].ndim != 4:
+        return [f"{label}: Z формы {g['Z'].shape}"]
     C, B = g["Z"].shape[:2]
+    want = dict(C0=(4, 6), C1=(8, 6), Y2=(T, 7), Z=(T, 6), G0=(T, 6),
+                G1=(T, 6), G2=(T, 6), W0=(T, 4), W1=(T, 8), W2=(T, 16),
+                split1=(4,), split2=(8,))
+    p = []
+    for k, tail in want.items():
+        if g[k].shape != (C, B) + tail:
+            p.append(f"{label}: {k} формы {g[k].shape}, ожидалось "
+                     f"{(C, B) + tail}")
+    if root.shape != (C, B, 4, 2):
+        p.append(f"{label}: root формы {root.shape}")
+    if lv0.shape[:2] != (C, B) or lv0.shape[-1] != 7:
+        p.append(f"{label}: журнал команд формы {lv0.shape}")
+    if p:
+        return p
+    bad = [k for k, v in list(g.items()) + [("root", root), ("level", lv0)]
+           if not np.isfinite(v).all()]
+    if bad:
+        return [f"{label}: нечисловые значения в {bad}"]
     flat = {k: v.reshape((C * B,) + v.shape[2:]) for k, v in g.items()}
     root = root.reshape((C * B,) + root.shape[2:])
-    p = []
     W0, W1, W2 = weights_from_geometry(root, flat["split1"], flat["split2"])
     for nm, a, b in (("W0", W0, flat["W0"]), ("W1", W1, flat["W1"]),
                      ("W2", W2, flat["W2"])):
         d = float(np.abs(a - b).max())
-        if d > GEOM_TOL:
+        if not d <= GEOM_TOL:
             p.append(f"{label}: {nm} из геометрии ≠ журналу ({d:.2e})")
     Q0 = np.linalg.qr(flat["W0"], mode="reduced")[0]
     Q1 = np.linalg.qr(flat["W1"], mode="reduced")[0]
@@ -350,21 +420,20 @@ def mr_problems(z, label, bounds, tol=MR_TOL):
     for nm, a, b in (("Z", Z, flat["Z"]), ("G0", G0, flat["G0"]),
                      ("G1", G1, flat["G1"]), ("G2", G2, flat["G2"])):
         d = float((np.abs(a - b) / sc).max())
-        if d > tol:
+        if not d <= tol:
             p.append(f"{label}: {nm} пересборки ≠ журналу ({d:.2e})")
     for nm, a, b in (("P0Z", proj(Q0, flat["Z"]), flat["G0"]),
                      ("P1Z", proj(Q1, flat["Z"]), flat["G0"] + flat["G1"])):
         d = float((np.abs(a - b) / sc).max())
-        if d > tol:
+        if not d <= tol:
             p.append(f"{label}: тождество {nm} ({d:.2e})")
     L, U = np.asarray(bounds["L"]), np.asarray(bounds["U"])
     mid, half = (U + L) / 2, (U - L) / 2
     arm = mid + half * np.tanh(flat["Z"] / half)
-    lv = np.asarray(z[f"k15d_level_{label}"], np.float64)
-    lv = lv.reshape((C * B,) + lv.shape[2:])
+    lv = lv0.reshape((C * B,) + lv0.shape[2:])
     d = float((np.abs(arm[:, :8] - lv[..., :6]) /
                np.maximum(1.0, np.abs(lv[..., :6]))).max())
-    if d > tol:
+    if not d <= tol:
         p.append(f"{label}: tanh-формула ≠ исполненным командам ({d:.2e})")
     gr = np.where(flat["Y2"][:, :8, 6] > 0, 1.0, -1.0)
     if not np.array_equal(gr, lv[..., 6]):
@@ -477,11 +546,50 @@ def selftest():
     z4[f"k15d_level_{lab}"] = lv.copy()
     z4[f"k15d_level_{lab}"][0, 0, 0, 6] *= -1
     assert any("схват" in x for x in mr_problems(z4, lab, bounds))
+    for key in ("k21_mr_Z", "k21_mr_G0", "k21_mr_C0", "k21_mr_Y2",
+                "k21_mr_W1", "k21_mr_split2", "k21_root",
+                f"k15d_level_{lab}"):
+        for val in (np.nan, np.inf, -np.inf):
+            zb = dict(z)
+            arr = np.array(z[key], copy=True)
+            arr.reshape(-1)[0] = val
+            zb[key] = arr
+            pb = mr_problems(zb, lab, bounds)
+            assert pb and "нечисловые" in pb[0], (key, val, pb)
+    zs = dict(z)
+    zs["k21_mr_C1"] = z["k21_mr_C1"][..., :5]
+    assert any("C1 формы" in x for x in mr_problems(zs, lab, bounds))
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        ck, trr = os.path.join(td, "c.pt"), os.path.join(td, "t.json")
+        open(ck, "wb").write(b"w")
+        open(trr, "w").write("{}")
+        ctl = dict(ckpt=ck, ckpt_sha1=full_sha(ck), train_report=trr,
+                   train_report_sha1=full_sha(trr), updates=8000,
+                   init_hash="h0")
+        common = {k: "x" for k in COMMON_KEYS}
+        e = dict(status="ready", seed=0, budget_main=8000,
+                 control_parents=dict(ctl), control_flat=dict(ctl),
+                 common=common)
+        e["fingerprint"] = entry_fp(e)
+        assert entry_problems(e, common) == []
+        for mut in (lambda x: x["control_parents"].update(ckpt="/другой.pt"),
+                    lambda x: x["control_parents"].update(init_hash="h1"),
+                    lambda x: x["control_flat"].update(ckpt_sha1="0" * 40),
+                    lambda x: x.update(budget_main=16000),
+                    lambda x: x["common"].update(prep_id="y")):
+            e2 = json.loads(json.dumps(e))
+            mut(e2)
+            assert entry_problems(e2, common), e2
+        open(ck, "wb").write(b"v")
+        assert any("чекпойнт" in x for x in entry_problems(e, common))
     assert parse_label("parents_mr24_s1") == ("parents_mr24", 1)
     assert len(set(CODE)) == len(CODE)
     print("самопроверка k24_protocol пройдена: W0/W1/W2 из геометрии, "
           "пересборка Z/G по записанным W, тождества, tanh и схват против "
-          "журнала; порча Z, геометрии и схвата — отказ")
+          "журнала; порча Z, геометрии и схвата, NaN/±Inf в любом массиве "
+          "и неверная форма — отказ; отпечаток записи сида ловит смену "
+          "чекпойнта, init_hash, SHA, бюджета, источников и файла")
     return 0
 
 

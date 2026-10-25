@@ -48,6 +48,10 @@ MODE = k24m.MODE
 PREPARE = "reports/k24/prepare.json"
 CODE = ("k24_readout.py", "k24_model.py", "k24_train.py", "k22_model.py",
         "k21_fastload.py", "k23_train.py", "k23_smoke.py")
+DEPS = CODE + ("k21_train.py", "k21_model.py", "k21_tree.py",
+               "k21_data.py", "k20_data.py", "k16_models.py",
+               "k24_protocol.py", "k23_protocol.py")
+TRAIN_MICRO = 32
 DIAG_N, DIAG_SEED = 64, 20261025
 HIST_INIT = {0: "data/k22/runs/parents24/resume.pt",
              1: "data/k23/runs/s1/parents24/resume.pt"}
@@ -66,15 +70,62 @@ def report_path(seed):
 
 
 def seed_entry(seed):
-    """Закреплённая запись подготовки для сида (бюджет контроля и т. п.)."""
+    """Запись сида из prepare.json с проверкой отпечатка (k24_protocol)."""
+    import k24_protocol as pc
     if not os.path.exists(PREPARE):
         raise SystemExit(f"нет {PREPARE}: сначала k24_protocol.py prepare")
-    p = json.load(open(PREPARE, encoding="utf-8"))
-    e = (p.get("seeds") or {}).get(str(seed))
-    if not e or e.get("status") != "ready":
-        status = e.get("status") if e else None
-        raise SystemExit(f"seed {seed}: подготовка не готова ({status})")
-    return e
+    return pc.seed_entry(seed)
+
+
+def check_contract(kind, a):
+    """Контракт проверки: при любом расхождении готовый отчёт не
+    переиспользуется (зависимости, данные, BAR, точность, устройство,
+    microbatch; для fitcheck — конфигурация подгонки)."""
+    import torch
+    import k21_data as d21
+    import k24_protocol as pc
+    prep = json.load(open(d21.REPORT, encoding="utf-8"))
+    tj = json.load(open(d21.TEACHER_REPORT, encoding="utf-8"))
+    c = dict(kind=kind,
+             code={f: sha(os.path.join(HERE, f)) for f in DEPS},
+             prep_id=prep["prep_id"], prepare_sha1=pc.full_sha(d21.REPORT),
+             teacher_sha1=tj["out"]["sha1"],
+             teacher_report_sha1=pc.full_sha(d21.TEACHER_REPORT),
+             bar_revision=prep["bar_pin"]["revision"],
+             bar_files=hashlib.sha1(json.dumps(
+                 prep["bar_pin"]["files"], sort_keys=True).encode())
+             .hexdigest(),
+             precision="float16 autocast + GradScaler",
+             device=torch.cuda.get_device_name(torch.device(a.device)),
+             seed_entry_fp_s0=seed_entry(0)["fingerprint"])
+    if kind == "real-check":
+        c.update(micros=sorted(a.micros), seed=a.seed,
+                 train_micro=TRAIN_MICRO)
+    else:
+        c.update(fit=dict(n=kt.FIT_N, updates=kt.FIT_UPDATES, lr_mult=3,
+                          ratio=kt.FIT_RATIO, grip=kt.FIT_GRIP,
+                          rows_seed=kt.SEED + 9, micro=a.micro,
+                          eval_micro=a.eval_micro, seed=0))
+    return c
+
+
+def check_fresh(a):
+    p = dict(real_check="reports/k24/real_check.json",
+             fitcheck="reports/k24/fitcheck.json")[a.kind.replace("-", "_")]
+    if not os.path.exists(p):
+        print(f"  {p}: нет")
+        return 1
+    r = json.load(open(p, encoding="utf-8"))
+    passed = (r.get("problems") == []) if a.kind == "real-check" else \
+        (bool(r.get("ok")) and r.get("exit") == 0)
+    want = check_contract(a.kind, a)
+    got = r.get("contract") or {}
+    diff = sorted(k for k in set(want) | set(got) if want.get(k) != got.get(k))
+    ok = passed and not diff
+    print(f"  {p}: " + ("пройден тем же контрактом" if ok else
+                        f"пересчитать (пройден: {passed}; расхождения "
+                        f"контракта: {diff})"))
+    return 0 if ok else 1
 
 
 def make_model_fn(seed, readout_mode="mr"):
@@ -129,7 +180,8 @@ def mr_diag(torch, mod, bar, D, rows, dev, dt, micro):
                 saturation=float(np.mean(agg["sat"])), rows=len(rows))
 
 
-def install(seed, budget, torch=None, fastload=True, fit_dir=None):
+def install(seed, budget, torch=None, fastload=True, fit_dir=None,
+            entry_fp=None):
     if seed not in SEEDS:
         raise SystemExit(f"training seed {seed}: в K-24 только {SEEDS}")
     sched = k23t.seeded_schedule(kt.schedule, seed)
@@ -160,6 +212,7 @@ def install(seed, budget, torch=None, fastload=True, fit_dir=None):
             budget=dict(warmup=kt.WARM_UPDATES, main=budget,
                         main_max_scheduler=kt.MAIN_MAX, extension=False),
             k24=dict(train_seed=seed, schedule_fp=fp_cache[a.micro],
+                     seed_entry_fp=entry_fp,
                      panel="K-21 (k21_train.SEED + 5)"))
         c["code"] = dict(c["code"], **{f: sha(os.path.join(HERE, f))
                                        for f in CODE})
@@ -209,7 +262,7 @@ def train(a):
     import k21_data as d21
     e = seed_entry(a.seed)
     budget = int(e["budget_main"])
-    st = install(a.seed, budget, torch)
+    st = install(a.seed, budget, torch, entry_fp=e["fingerprint"])
     D = d21.load_prepared(require_teacher=True)
     have = os.path.exists(os.path.join(outdir(a.seed), MODE, "resume.pt"))
     print(f"  K-24 seed {a.seed}: бюджет main {budget} (закреплён по "
@@ -248,15 +301,15 @@ def train(a):
 def fitcheck(a):
     import torch
     import k21_data as d21
-    seed_entry(0)
-    install(0, seed_entry(0)["budget_main"], torch, fastload=False,
-            fit_dir="data/k24/fitcheck")
+    e0 = seed_entry(0)
+    install(0, e0["budget_main"], torch, fastload=False,
+            fit_dir="data/k24/fitcheck", entry_fp=e0["fingerprint"])
     D = d21.load_prepared(require_teacher=True)
     code = kt.fitcheck(torch, a, D)
     p = "reports/k24/fitcheck.json"
     if os.path.exists(p):
         r = json.load(open(p, encoding="utf-8"))
-        r["code"] = {f: sha(os.path.join(HERE, f)) for f in CODE}
+        r["contract"] = check_contract("fitcheck", a)
         r["exit"] = code
         json.dump(r, open(p, "w", encoding="utf-8"), indent=1)
     return code
@@ -274,6 +327,8 @@ def real_check(a):
     M = k24m.build(torch)
     R = M["R"]
     prob, rep = [], dict(seed=a.seed, micros=a.micros)
+    if TRAIN_MICRO not in a.micros:
+        prob.append(f"microbatch обучения {TRAIN_MICRO} не проверяется")
     rows = D["train_rows"][:: max(1, len(D["train_rows"]) // 64)][:64]
 
     def fresh(cls, seed, **kw):
@@ -382,7 +437,7 @@ def real_check(a):
     if not (da <= 1e-6 and yr <= 1e-5):
         prob.append(f"legacy ≠ K-22: |Δarm| {da:.2e}, отн. raw {yr:.2e}")
     rep["problems"] = prob
-    rep["code"] = {f: sha(os.path.join(HERE, f)) for f in CODE}
+    rep["contract"] = check_contract("real-check", a)
     os.makedirs("reports/k24", exist_ok=True)
     json.dump(rep, open("reports/k24/real_check.json", "w", encoding="utf-8"),
               ensure_ascii=False, indent=1, default=float)
@@ -460,6 +515,12 @@ def selftest():
         for k, v in saved.items():
             setattr(kt, k, v)
         d21.make_batch = saved_mb
+    want = dict(kind="real-check", micros=[8, 32], prep_id="p",
+                code={"a.py": "1"}, device="V100")
+    for bad in (dict(want, micros=[8]), dict(want, prep_id="q"),
+                dict(want, code={"a.py": "2"}), dict(want, device="A100")):
+        assert sorted(k for k in set(want) | set(bad)
+                      if want.get(k) != bad.get(k)), bad
     try:
         install(2, 8000, fastload=False)
         raise AssertionError("seed 2 принят")
@@ -478,7 +539,10 @@ def main():
     if "--selftest" in sys.argv:
         return selftest()
     ap = argparse.ArgumentParser(description="K-24: обучение и проверки")
-    ap.add_argument("cmd", choices=("real-check", "fitcheck", "train"))
+    ap.add_argument("cmd", choices=("real-check", "fitcheck", "train",
+                                    "check-fresh"))
+    ap.add_argument("--kind", choices=("real-check", "fitcheck"),
+                    default="real-check")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--micro", type=int, default=32)
@@ -491,6 +555,8 @@ def main():
             return real_check(a)
         if a.cmd == "fitcheck":
             return fitcheck(a)
+        if a.cmd == "check-fresh":
+            return check_fresh(a)
         return train(a)
     except SystemExit as e:
         if isinstance(e.code, str):
