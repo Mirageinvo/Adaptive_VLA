@@ -217,17 +217,28 @@ def selftest():
     assert torch.allclose(o["grip_logit"], gl, atol=1e-6)
     # гейт в начале = 0.1
     assert torch.allclose(o["g1"], torch.full_like(o["g1"], GATE_INIT))
-    # 3. при ненулевом A_a residual зависит от прогноза родителя
+    # 3. δ ребёнка зависит от ЧИСЛЕННОГО прогноза родителя только через A_a:
+    # меняется лишь hidden корней (-> C0), hidden средних и MLP прежние;
+    # A_h = 0, поэтому hidden родителя в контекст не входит
+    h_alt = h.clone()
+    h_alt[:, :4] = torch.randn(B, 4, H, generator=g)
+
+    def run_h(hh):
+        return R["cond_readout"](Rd, cm, norm, hh[:, :4], hh[:, 4:12],
+                                 hh[:, 12:28], iv, iv1, iv2, W0, W1, W2, L, U)
     with torch.no_grad():
+        cm.A_h.weight.zero_()
+        cm.A_a.weight.zero_()
+        b1, b2 = run_h(h), run_h(h_alt)
+        assert float((b1["C0"] - b2["C0"]).abs().max()) > 1e-3   # прогноз иной
+        assert torch.equal(b1["delta1"], b2["delta1"]), \
+            "при A_a = 0 δ1 зависит от прогноза родителя"
         nn.init.normal_(cm.A_a.weight, std=0.5)
-    a1 = run()
-    with torch.no_grad():
-        Rd.mlp[-1].bias[:6] += 0.7          # меняет C0 (прогноз корня)
-    a2 = run()
-    assert float((a1["delta1"] - a2["delta1"]).detach().abs().max()) > 1e-4, \
-        "δ1 не зависит от прогноза родителя"
-    with torch.no_grad():
-        Rd.mlp[-1].bias[:6] -= 0.7
+        c1, c2 = run_h(h), run_h(h_alt)
+        assert float((c1["delta1"] - c2["delta1"]).abs().max()) > 1e-4, \
+            "при A_a ≠ 0 δ1 не зависит от прогноза родителя"
+        # то же для листьев: прогноз среднего меняется через z1
+        assert float((c1["y2"] - c2["y2"]).abs().max()) > 1e-4
         cm.A_a.weight.zero_()
     # 4. градиенты новых модулей и readout конечны
     with torch.no_grad():
@@ -253,7 +264,8 @@ def selftest():
     assert float((ob["Z"] - run()["Z"]).detach().abs().max()) < 0.1
     print("самопроверка k25_readout пройдена: вложенность и индексы "
           "родителей, две формулы Z, нулевые гейты -> W0C0, tanh и схват, "
-          "g = 0.1 в начале, δ зависит от прогноза родителя при A_a ≠ 0, "
+          "g = 0.1 в начале, δ зависит от прогноза родителя при A_a ≠ 0 и не "
+          "зависит при A_a = 0 (меняется только прогноз родителя), "
           "градиенты, детерминированная инициализация, 595201 новых "
           "параметров при H=768, float32 под bf16 autocast")
     return 0

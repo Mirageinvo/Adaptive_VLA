@@ -123,7 +123,7 @@ def check_fresh(a):
     return 0 if ok else 1
 
 
-def make_model_fn(seed, readout_mode="mr"):
+def make_model_fn(seed, readout_mode="cond"):
     def make_model(torch, mode, D, dev, pin, checkpoint=True):
         import k21_data as d21
         bar = d21.load_bar(dev, pin)
@@ -535,6 +535,25 @@ def selftest():
                 dict(want, code={"a.py": "2"}), dict(want, device="A100")):
         assert sorted(k for k in set(want) | set(bad)
                       if want.get(k) != bad.get(k)), bad
+    # настоящая фабрика тренера (не подменённая) на игрушечном BAR
+    saved_lb = d21.load_bar
+    try:
+        d21.load_bar = lambda dev, pin: dict(model=copy.deepcopy(bar0))
+        DF = dict(L=L, U=U, state_mean=None, state_std=None)
+        for s_ in SEEDS:
+            mf, _bf = make_model_fn(s_)(torch, MODE, DF, torch.device("cpu"),
+                                         None, checkpoint=False)
+            assert type(mf).__name__ == "K25" and mf.readout_mode == "cond" \
+                and mf.mode == MODE, (type(mf), mf.readout_mode)
+            bt = km.fake_batch(torch, B=2, pad=1)
+            with torch.no_grad():
+                of = mf.eval()(bt, 1, torch.randn(2, 11))
+            assert "cond" in of and of["arm"].shape == (2, 20, 6)
+            ref22 = k25m.build(torch)["K22"](copy.deepcopy(bar0), L, U, seed=s_)
+            assert shared_hash(kt.trainable_state(mf)) == kt.state_hash(
+                kt.trainable_state(ref22))
+    finally:
+        d21.load_bar = saved_lb
     try:
         install(2, 8000, fastload=False)
         raise AssertionError("seed 2 принят")
@@ -545,7 +564,8 @@ def selftest():
             setattr(kt, k, v)
     print("самопроверка k25_train пройдена: непрерывное = остановка + "
           "возобновление (Trainer, K25), диагностика (гейты 0.1, пересборка), "
-          "общий отпечаток = K-22, полный отличается; отказ для seed вне "
+          "общий отпечаток = K-22, полный отличается; настоящая фабрика "
+          "строит K25 в режиме cond для seed 0 и 1; отказ для seed вне "
           "{0, 1}")
     return 0
 

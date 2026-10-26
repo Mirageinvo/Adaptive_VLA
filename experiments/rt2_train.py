@@ -57,7 +57,8 @@ FACTORIES = {"rt1_model:flat24": ("rt1_model.py", "k21_model.py",
              "rt1_model:parents24": ("rt1_model.py", "k21_model.py",
                                      "k21_tree.py", "k22_model.py")}
 COMMON_DEPS = ("rt2_train.py", "rt1_common.py", "rt1_data.py",
-               "rt1_prepare.py", "k21_data.py", "k23_smoke.py")
+               "rt1_prepare.py", "rt1_realcheck.py", "k21_data.py",
+               "k23_smoke.py")
 
 
 def sha(p):
@@ -138,16 +139,50 @@ def factory(spec):
     return importlib.import_module(mod_name), arch
 
 
-def realcheck_micro(a):
-    """micro обязан совпадать с общим micro закреплённого real-check."""
+def realcheck_problems(r, micro, want):
+    """Пригодность отчёта real-check для этого запуска: пройден; контракт
+    (код, подготовка, BAR, устройство, dtype, версии, запас памяти) совпадает
+    с текущим; выбранный micro проверялся и прошёл у ОБЕИХ архитектур с
+    запасом памяти и равен общему micro."""
+    p = []
+    if r.get("problems"):
+        p.append(f"real-check не пройден: {r['problems'][:2]}")
+    got = dict(r.get("contract") or {})
+    if micro not in (got.get("micros") or []):
+        p.append(f"micro {micro} не проверялся в real-check")
+    skip = ("micros", "seed")
+    diff = sorted(k for k in set(want) | set(got) if k not in skip and
+                  want.get(k) != got.get(k))
+    if diff:
+        p.append(f"контракт real-check не совпадает с текущим: {diff}")
+    if r.get("common_micro") != micro:
+        p.append(f"micro {micro} ≠ общему micro real-check "
+                 f"{r.get('common_micro')}")
+    for arch in ("flat24", "parents24"):
+        a_ = (r.get("archs") or {}).get(arch) or {}
+        m = (a_.get("micros") or {}).get(str(micro)) or {}
+        if not m.get("ok"):
+            p.append(f"{arch}: micro {micro} не прошёл real-check")
+        elif not m.get("peak_gb", 1e9) <= 0.85 * a_.get("free_gb_at_start", 0):
+            p.append(f"{arch}: micro {micro} без запаса памяти")
+    return p
+
+
+def realcheck_micro(a, D):
+    """Закреплённый real-check пригоден для этого запуска (см. выше)."""
+    import torch
+    import rt1_realcheck as rr
     if not os.path.exists(REALCHECK):
         raise SystemExit(f"нет {REALCHECK}: сначала rt1_realcheck.py")
     r = json.load(open(REALCHECK, encoding="utf-8"))
-    if r.get("problems"):
-        raise SystemExit("real-check не пройден")
-    if r.get("common_micro") != a.micro:
-        raise SystemExit(f"micro {a.micro} ≠ общему micro real-check "
-                         f"{r.get('common_micro')}")
+    got = r.get("contract") or {}
+    ns = argparse.Namespace(dtype="bfloat16", micros=got.get("micros", []),
+                            seed=got.get("seed", 0))
+    want = rr.contract(ns, D, torch.cuda.get_device_name(
+        torch.device(a.device)))
+    prob = realcheck_problems(r, a.micro, want)
+    if prob:
+        raise SystemExit("; ".join(prob))
     return r, sha(REALCHECK)
 
 
@@ -156,7 +191,7 @@ def contract(a, D, mode):
     import transformers
     import rt1_common as rc
     deps = COMMON_DEPS + FACTORIES[a.factory]
-    rr, rsha = realcheck_micro(a)
+    rr, rsha = realcheck_micro(a, D)
     return dict(
         mode=mode, factory=a.factory, seed=a.seed, prep_id=D.prep["prep_id"],
         code={f: sha(os.path.join(HERE, f)) for f in deps},
@@ -549,9 +584,37 @@ def selftest():
     assert abs(lr_main(MAIN_WARM, 1.0) - 1.0) < 1e-12
     assert abs(lr_main(HORIZON, 1.0) - LR_FLOOR) < 1e-12
     assert set(FACTORIES) == {"rt1_model:flat24", "rt1_model:parents24"}
+    want = dict(code={"a.py": "1"}, prep_id="p", bar_revision="b",
+                device="A100", dtype="bfloat16", torch="2.4.1",
+                transformers="4.55.4", mem_margin=0.85, micros=[1, 2, 4],
+                seed=0)
+    good = dict(problems=[], common_micro=4, contract=dict(want),
+                archs={a_: dict(free_gb_at_start=17.0, micros={"4": dict(
+                    ok=True, peak_gb=12.0)}) for a_ in ("flat24",
+                                                        "parents24")})
+    assert realcheck_problems(good, 4, want) == []
+    for k, v in (("prep_id", "q"), ("code", {"a.py": "2"}),
+                 ("dtype", "float16"), ("device", "V100"),
+                 ("bar_revision", "c")):
+        bad = json.loads(json.dumps(good))
+        bad["contract"][k] = v
+        assert realcheck_problems(bad, 4, want), k
+    bad = json.loads(json.dumps(good))
+    bad["archs"]["parents24"]["micros"]["4"]["ok"] = False
+    assert realcheck_problems(bad, 4, want)
+    bad = json.loads(json.dumps(good))
+    bad["archs"]["flat24"]["micros"]["4"]["peak_gb"] = 16.0
+    assert realcheck_problems(bad, 4, want)
+    assert realcheck_problems(good, 2, want)          # не общий micro
+    bad = json.loads(json.dumps(good))
+    bad["contract"]["micros"] = [1, 2]
+    assert realcheck_problems(bad, 4, want)
     print("самопроверка rt2_train пройдена: иерархические веса, общая "
           "очередь 32 строк (одинакова при любом micro), seed меняет "
-          "очередь, косинус с горизонтом 8000 до 0.1, закреплённые фабрики")
+          "очередь, косинус с горизонтом 8000 до 0.1, закреплённые фабрики; "
+          "real-check отвергается при чужих prep_id, коде, dtype, "
+          "устройстве, ревизии BAR, непроверенном или непрошедшем micro и "
+          "без запаса памяти")
     return 0
 
 

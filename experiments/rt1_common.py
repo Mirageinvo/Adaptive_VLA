@@ -166,33 +166,49 @@ def shim_libero_imports():
     модельном окружении RoboTwin их нет, поэтому — заглушки: подставляются
     ТОЛЬКО при отсутствии настоящего модуля, любое обращение к ним — ошибка
     (тихо использоваться не могут). Список подставленных — SHIMMED."""
+    import importlib.machinery
     import importlib.util
     import types
+
+    def dunder(k):
+        return k.startswith("__") and k.endswith("__")
 
     class _Missing:
         def __init__(self, name):
             self._n = name
 
         def __getattr__(self, k):
+            if dunder(k):                 # служебные — как у обычного объекта
+                raise AttributeError(k)
             raise RuntimeError(f"заглушка {self._n}.{k}: модуль LIBERO в этом "
                                f"окружении не установлен")
 
         def __call__(self, *a, **k):
             raise RuntimeError(f"заглушка {self._n}: модуль LIBERO в этом "
                                f"окружении не установлен")
-    for name in LIBERO_ONLY:
-        top = name.split(".")[0]
-        if name in sys.modules:
+    # наличие настоящих пакетов — один раз, ДО подстановки заглушек
+    missing = set()
+    for top in {n.split(".")[0] for n in LIBERO_ONLY}:
+        if top in sys.modules and top not in SHIMMED:
             continue
         try:
-            real = importlib.util.find_spec(top) is not None
+            if importlib.util.find_spec(top) is None:
+                missing.add(top)
         except (ImportError, ValueError):
-            real = False
-        if real:
+            missing.add(top)
+    for name in LIBERO_ONLY:
+        if name in sys.modules or name.split(".")[0] not in missing:
             continue
         m = types.ModuleType(name)
-        m.__getattr__ = (lambda n: lambda k: _Missing(f"{n}.{k}"))(name)
+
+        def mod_getattr(k, n=name):
+            if dunder(k):                 # __file__, __spec__ и т. п.
+                raise AttributeError(k)
+            return _Missing(f"{n}.{k}")
+        m.__getattr__ = mod_getattr
         m.__path__ = []
+        m.__file__ = None
+        m.__spec__ = importlib.machinery.ModuleSpec(name, None)
         sys.modules[name] = m
         SHIMMED.append(name)
         parent, _, child = name.rpartition(".")
@@ -293,12 +309,21 @@ def selftest():
             "transform_utils as T; from libero.libero import benchmark; "
             "from libero2gym.vector_env import AsyncVectorEnv; import gym\n"
             "try:\n    benchmark.get_benchmark_dict()\n    raise SystemExit(5)"
-            "\nexcept RuntimeError:\n    pass\nprint(len(sh))") % HERE
+            "\nexcept RuntimeError:\n    pass\n"
+            "import inspect\n"
+            "inspect.getmodule(compile('pass', '/tmp/unloaded.py', 'exec'))\n"
+            "assert not hasattr(gym, '__wrapped__')\n"
+            "assert getattr(gym, '__file__', None) is None\n"
+            "import torch\n"
+            "try:\n    import transformers\nexcept ImportError:\n    pass\n"
+            "print(len(sh))") % HERE
     r = subprocess.run([sys.executable, "-c", code], capture_output=True,
                        text=True)
     assert r.returncode == 0, r.stderr[-500:]
     print("самопроверка rt1_common: заглушек LIBERO-импортов "
-          f"{r.stdout.strip()} (0 — настоящие модули установлены)")
+          f"{r.stdout.strip()} (0 — настоящие модули установлены); "
+          "inspect.getmodule и импорт transformers/torch после заглушек — "
+          "без ошибок")
     print("самопроверка rt1_common пройдена: порядок каналов, цель чанка и "
           "маска, нормировка, пределы URDF, склейка камер, средний предел "
           "шагов 625")
