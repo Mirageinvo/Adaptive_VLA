@@ -24,14 +24,33 @@ import rt1_common as rc  # noqa: E402
 import rt1_prepare as rp  # noqa: E402
 
 
+def verify_prep(prep, index, files=True, log=print):
+    """Контракт подготовки: prep_id = отпечатку содержимого, index.npz и
+    SHA реальных HDF5 (один раз за процесс). Проблемы -> SystemExit."""
+    if prep.get("problems"):
+        raise SystemExit("подготовка с проблемами: "
+                         + "; ".join(prep["problems"][:3]))
+    if rp.contract_id(prep) != prep.get("prep_id"):
+        raise SystemExit("prep.json изменён после подготовки (prep_id ≠ "
+                         "содержимому)")
+    if rc.sha(index) != prep["index_sha1"]:
+        raise SystemExit("index.npz ≠ подготовке")
+    if files:
+        t0 = __import__("time").time()
+        for i, f in enumerate(prep["files"]):
+            p = os.path.join(prep["data_root"], f["path"])
+            if not os.path.exists(p) or rc.sha(p) != f["sha1"]:
+                raise SystemExit(f"файл данных изменён или отсутствует: {p}")
+        log(f"  данные сверены: {len(prep['files'])} файлов, "
+            f"{__import__('time').time() - t0:.0f} с", flush=True)
+
+
 class Data:
-    def __init__(self, prep=rp.PREP, index=rp.INDEX, check=True):
+    def __init__(self, prep=rp.PREP, index=rp.INDEX, check=True,
+                 check_files=True):
         self.prep = json.load(open(prep, encoding="utf-8"))
-        if check and self.prep["problems"]:
-            raise SystemExit("подготовка с проблемами: "
-                             + "; ".join(self.prep["problems"][:3]))
-        if check and rc.sha(index) != self.prep["index_sha1"]:
-            raise SystemExit("index.npz ≠ подготовке")
+        if check:
+            verify_prep(self.prep, index, files=check_files)
         z = np.load(index)
         self.ix = {k: z[k] for k in z.files}
         st = self.prep["stats_train"]["state"]
@@ -42,6 +61,7 @@ class Data:
         self.root = self.prep["data_root"]
         self.decode = rc.decoder()
         self._h = {}
+        self._ch = {}          # fid -> (state[T,14], action[T,14], инструкции)
 
     def rows(self, split):
         return np.where(self.ix["split"] == (1 if split == "val" else 0))[0]
@@ -59,13 +79,14 @@ class Data:
     def sample(self, row):
         fid, t = int(self.ix["ep"][row]), int(self.ix["t"][row])
         h = self._file(fid)
+        if fid not in self._ch:          # малые массивы — в памяти
+            self._ch[fid] = (rc.channels(h, "state"), rc.channels(h, "action"),
+                             rp.instructions(h) or [self.files[fid]["task"]])
+        st, act, ins = self._ch[fid]
         frames = [self.decode(h[f"vision/{c}/colors"][t]) for c in rc.CAMS]
         img = rc.tile(frames)
-        st = rc.channels(h, "state")
-        act = rc.channels(h, "action")
         s_n = rc.normalize(st[t], self.q01, self.q99)
         tgt, valid = rc.chunk_target(act, t)
-        ins = rp.instructions(h) or [self.files[fid]["task"]]
         text = ins[(fid * 100003 + t) % len(ins)]
         return img, s_n, text, tgt, valid
 

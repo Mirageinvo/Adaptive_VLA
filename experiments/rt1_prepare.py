@@ -39,6 +39,7 @@ import rt1_common as rc  # noqa: E402
 OUT_DIR = "data/rt1"
 PREP = os.path.join(OUT_DIR, "prep.json")
 INDEX = os.path.join(OUT_DIR, "index.npz")
+EPISODES_PER_TASK = 50
 VAL_PER_TASK = 5
 SPLIT_SEED = 20261025
 STEP_TOL = 1e-6
@@ -98,6 +99,41 @@ def stats(x):
                 mean=x.mean(0).tolist(), std=x.std(0).tolist())
 
 
+def git_head(path):
+    import subprocess
+    try:
+        return subprocess.check_output(["git", "-C", path, "rev-parse",
+                                        "HEAD"], text=True).strip()
+    except Exception as e:  # noqa: BLE001
+        return f"ошибка: {e}"
+
+
+CONTRACT_KEYS = ("sources", "decisions", "robot", "files", "split",
+                 "index_sha1", "stats_train", "tasks")
+
+
+def contract_id(rep):
+    """prep_id — отпечаток полного содержательного контракта подготовки."""
+    import hashlib
+    body = {k: rep[k] for k in CONTRACT_KEYS}
+    return hashlib.sha1(json.dumps(body, sort_keys=True, default=str)
+                        .encode()).hexdigest()[:16]
+
+
+def limit_violations(A, L, U, names):
+    """Имена каналов и максимальные выходы за пределы URDF (> LIMIT_TOL)."""
+    out = []
+    for j, i in enumerate(rc.ARM_IDX):
+        lo = float(max(0.0, (L[i] - A[:, i]).max()))
+        hi = float(max(0.0, (A[:, i] - U[i]).max()))
+        d = max(lo, hi)
+        if d > LIMIT_TOL:
+            out.append(dict(channel=i, joint=names[j], max_excess_rad=d,
+                            L=float(L[i]), U=float(U[i]),
+                            min=float(A[:, i].min()), max=float(A[:, i].max())))
+    return out
+
+
 def split(names, task):
     rng = np.random.default_rng([SPLIT_SEED, sum(map(ord, task))])
     val = sorted(rng.choice(len(names), VAL_PER_TASK, replace=False).tolist())
@@ -106,17 +142,28 @@ def split(names, task):
 
 def prepare(a):
     import h5py
+    import re
     root = os.path.abspath(a.robotwin_root)
     data_root = os.path.abspath(a.data_root)
+    if not a.dataset_sha or not re.fullmatch(r"[0-9a-f]{40}", a.dataset_sha):
+        raise SystemExit("нужна ревизия датасета (40 hex), не None/main")
     prob, rep = [], dict(created=datetime.datetime.now().isoformat(
         timespec="seconds"), robotwin_root=root, data_root=data_root,
-        dataset_sha=a.dataset_sha, tasks={}, decisions=dict(
+        tasks={}, sources=dict(
+            dataset_repo="TianxingChen/RoboTwin2.0", dataset_sha=a.dataset_sha,
+            robotwin_head=git_head(root),
+            xpolicylab_head=git_head(os.path.join(root, "XPolicyLab")),
+            task_config=rc.TASK_CONFIG, embodiment=rc.EMBODIMENT,
+            bar_revision=rc.BAR_REVISION),
+        split=dict(val_per_task=VAL_PER_TASK, seed=SPLIT_SEED,
+                   episodes_per_task=EPISODES_PER_TASK),
+        decisions=dict(
             channels=[f"{k}[{d}]" for k, d in rc.CH_KEYS], cams=rc.CAMS,
             chunk=rc.T_CHUNK, n_exec=rc.N_EXEC, tile=rc.TILE,
             pos_offset=rc.POS_OFFSET, grip_w=rc.GRIP_W,
             val_per_task=VAL_PER_TASK, split_seed=SPLIT_SEED))
     lim, lim_sha = step_limits(root)
-    rep["step_limit_file_sha1"] = lim_sha
+    rep["sources"]["step_limit_file_sha1"] = lim_sha
     L, U, rinfo = rc.robot_limits(root)
     rep["robot"] = dict(rinfo, L=L.tolist(), U=U.tolist())
     rows = dict(task=[], ep=[], t=[], T=[], split=[])
@@ -127,8 +174,9 @@ def prepare(a):
                         f"{rc.TASKS[task]}")
         d = os.path.join(data_root, rc.DATA_REL.format(task=task))
         eps = sorted(glob.glob(os.path.join(d, "*.hdf5")))
-        if not eps:
-            prob.append(f"{task}: нет данных в {d}")
+        if len(eps) != EPISODES_PER_TASK:
+            prob.append(f"{task}: эпизодов {len(eps)} в {d}, нужно ровно "
+                        f"{EPISODES_PER_TASK}")
             continue
         val = set(split(eps, task))
         tr = dict(episodes=len(eps), val=sorted(val), lengths=[],
@@ -160,27 +208,29 @@ def prepare(a):
         print(f"  {task}: эпизодов {len(eps)} (проверка {sorted(val)}), "
               f"длина {tr['length']}, max|a[t]−s[t+1]| "
               f"{tr['step_max_abs']:.2g}", flush=True)
+    shas = [f["sha1"] for f in files]
+    if len(set(shas)) != len(shas):
+        prob.append("повторяющиеся файлы эпизодов (одинаковый SHA)")
+    tr_ids = {(f["task"], f["path"]) for f in files if f["split"] == "train"}
+    va_ids = {(f["task"], f["path"]) for f in files if f["split"] == "val"}
+    if tr_ids & va_ids:
+        prob.append("эпизоды пересекаются между train и val")
+    rep["stats_train"] = None
     if tr_act:
         A, S = np.concatenate(tr_act), np.concatenate(tr_st)
         rep["stats_train"] = dict(action=stats(A), state=stats(S),
                                   frames=int(len(A)))
-        out_lo = (A[:, rc.ARM_IDX] < L[list(rc.ARM_IDX)] - LIMIT_TOL)
-        out_hi = (A[:, rc.ARM_IDX] > U[list(rc.ARM_IDX)] + LIMIT_TOL)
-        frac = float((out_lo | out_hi).mean())
-        rep["train_actions_outside_robot_limits"] = frac
-        if frac > 0:
-            prob.append(f"обучающие действия за пределами URDF: доля "
-                        f"{frac:.2e}")
+        viol = limit_violations(A, L, U, rinfo["arm_joints"])
+        rep["train_actions_outside_robot_limits"] = viol
+        for v in viol:
+            prob.append(f"действие за пределом URDF: канал {v['channel']} "
+                        f"({v['joint']}) на {v['max_excess_rad']:.4f} рад")
     rep["files"] = files
     rep["problems"] = prob
-    core = json.dumps({k: rep[k] for k in ("tasks", "files", "robot",
-                                           "decisions")}, sort_keys=True,
-                      default=str)
-    import hashlib
-    rep["prep_id"] = hashlib.sha1(core.encode()).hexdigest()[:16]
     os.makedirs(OUT_DIR, exist_ok=True)
     np.savez(INDEX, **{k: np.asarray(v, np.int64) for k, v in rows.items()})
     rep["index_sha1"] = rc.sha(INDEX)
+    rep["prep_id"] = contract_id(rep)
     json.dump(rep, open(PREP, "w", encoding="utf-8"), ensure_ascii=False,
               indent=1, default=str)
     n_tr = int(np.sum(np.asarray(rows["split"]) == 0))
@@ -230,8 +280,20 @@ def selftest():
     v1, v2 = split(names, "lift_pot"), split(names, "lift_pot")
     assert v1 == v2 and len(v1) == VAL_PER_TASK and \
         v1 != split(names, "open_laptop")
+    A = np.zeros((4, 14))
+    A[1, 0] = 2.5
+    v = limit_violations(A, np.full(14, -2.0), np.full(14, 2.0),
+                         [f"j{i}" for i in range(12)])
+    assert len(v) == 1 and v[0]["joint"] == "j0" and \
+        abs(v[0]["max_excess_rad"] - 0.5) < 1e-12
+    rep = {k: dict(x=1) for k in CONTRACT_KEYS}
+    rep["files"] = [dict(sha1="a")]
+    i1 = contract_id(rep)
+    rep["files"] = [dict(sha1="b")]
+    assert contract_id(rep) != i1
     print("самопроверка rt1_prepare пройдена: проверки эпизода (шаг, "
-          "камеры, инструкции), воспроизводимое разбиение по эпизодам")
+          "камеры, инструкции), воспроизводимое разбиение по эпизодам, "
+          "пределы URDF по каналам, prep_id от полного контракта")
     return 0
 
 

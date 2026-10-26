@@ -78,13 +78,20 @@ def build(torch):
             hf = self.ln(h_leaf.float())[:, :, None].expand(B, n, kt.T, H)
             gx = phi(x / kt.T)[None, None].expand(B, n, kt.T, kt.PHI)
             y_leaf = self.mlp(torch.cat([hf, phi(lt), gx], -1))
-            y = torch.einsum("btn,bntc->btc", w.float(), y_leaf)
-            mid, half = (self.U + self.L) / 2, (self.U - self.L) / 2
-            arm = mid + half * torch.tanh(y[..., arm_idx] / half)
-            grip = torch.sigmoid(y[..., grip_idx])
-            act = torch.empty_like(y)
-            act[..., arm_idx] = arm
-            act[..., grip_idx] = grip
+            # смешивание, ограничение и сборка команды — float32 с
+            # выключенным autocast (под bf16 einsum иначе даёт bf16, а запись
+            # float32 через индексирование в bf16-тензор теряет точность)
+            with torch.autocast(device_type=y_leaf.device.type,
+                                enabled=False):
+                y = torch.einsum("btn,bntc->btc", w.float(),
+                                 y_leaf.float()).float()
+                mid, half = (self.U + self.L) / 2, (self.U - self.L) / 2
+                arm = mid + half * torch.tanh(y[..., arm_idx] / half)
+                grip = torch.sigmoid(y[..., grip_idx])
+                act = torch.zeros(y.shape, dtype=torch.float32,
+                                  device=y.device)
+                act[..., arm_idx] = arm
+                act[..., grip_idx] = grip
             return dict(y=y, arm=arm, grip=grip, action=act)
 
     def rt_init(self, L, U, seed):
@@ -180,10 +187,25 @@ def selftest():
         assert all(x > 0 for x in gn.values()), gn
         assert m.state_proj.weight.grad is not None and \
             m.readout.mlp[4].weight.grad is not None
+    # bf16 autocast: команды float32 и совпадают с float32-путём
+    rd = mods["flat24"].readout
+    hh = torch.randn(2, 16, rd.ln.normalized_shape[0])
+    iv = torch.stack([torch.arange(16.0), torch.arange(16.0) + 1.25], -1)[None]
+    iv = iv.expand(2, -1, -1) * (20 / 17.25)
+    ww = torch.softmax(torch.randn(2, 20, 16), -1)
+    with torch.no_grad():
+        o32 = rd(hh, iv, ww)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            o16 = rd(hh, iv, ww)
+    assert all(o16[k].dtype == torch.float32 for k in ("y", "arm", "grip",
+                                                       "action"))
+    assert torch.equal(o16["action"][..., list(rc.ARM_IDX)], o16["arm"])
+    assert torch.equal(o16["action"][..., list(rc.GRIP_IDX)], o16["grip"])
+    assert float((o16["action"] - o32["action"]).abs().max()) < 0.1
     print("самопроверка rt1_model пройдена: 14 каналов (суставы в "
           "пределах, схваты в [0, 1]), активные query 16 и 4/12/28, общие "
           "тензоры пары равны, seed меняет новые модули, градиенты всех "
-          "групп")
+          "групп, float32-команды под bf16 autocast")
     return 0
 
 

@@ -153,6 +153,54 @@ def urdf_limits(text):
 
 
 # --- BAR и промпт -------------------------------------------------------------
+LIBERO_ONLY = ("gym", "robosuite", "robosuite.utils",
+               "robosuite.utils.transform_utils", "libero", "libero.libero",
+               "libero2gym", "libero2gym.vector_env")
+SHIMMED = []
+
+
+def shim_libero_imports():
+    """actioncodec/scripts/utils.py импортирует на уровне модуля gym,
+    robosuite, libero и libero2gym — их используют только функции среды
+    LIBERO; prompt_template, get_cfg и процессор BAR от них не зависят. В
+    модельном окружении RoboTwin их нет, поэтому — заглушки: подставляются
+    ТОЛЬКО при отсутствии настоящего модуля, любое обращение к ним — ошибка
+    (тихо использоваться не могут). Список подставленных — SHIMMED."""
+    import importlib.util
+    import types
+
+    class _Missing:
+        def __init__(self, name):
+            self._n = name
+
+        def __getattr__(self, k):
+            raise RuntimeError(f"заглушка {self._n}.{k}: модуль LIBERO в этом "
+                               f"окружении не установлен")
+
+        def __call__(self, *a, **k):
+            raise RuntimeError(f"заглушка {self._n}: модуль LIBERO в этом "
+                               f"окружении не установлен")
+    for name in LIBERO_ONLY:
+        top = name.split(".")[0]
+        if name in sys.modules:
+            continue
+        try:
+            real = importlib.util.find_spec(top) is not None
+        except (ImportError, ValueError):
+            real = False
+        if real:
+            continue
+        m = types.ModuleType(name)
+        m.__getattr__ = (lambda n: lambda k: _Missing(f"{n}.{k}"))(name)
+        m.__path__ = []
+        sys.modules[name] = m
+        SHIMMED.append(name)
+        parent, _, child = name.rpartition(".")
+        if parent in sys.modules:
+            setattr(sys.modules[parent], child, m)
+    return list(SHIMMED)
+
+
 def load_bar(device, dtype_name="bfloat16", root="third_party/actioncodec",
              cfg_path="config/eval/bar.yaml"):
     """Закреплённый BAR-LIBERO (как k21_data.load_bar, но с выбором типа:
@@ -167,6 +215,7 @@ def load_bar(device, dtype_name="bfloat16", root="third_party/actioncodec",
     r = os.path.abspath(os.path.join(os.path.dirname(HERE), root))
     if r not in sys.path:
         sys.path.insert(0, r)
+    shim_libero_imports()
     import actioncodec  # noqa: F401
     from smolvla.bar import SmolVLABlockwiseAR
     from utils import VisionLanguageActionProcessor, get_cfg
@@ -189,6 +238,7 @@ def prompt_batch(bar, imgs, states_n, texts, device, dtype):
     """Как k20_data.prompt_batch (то же содержание промпта BAR: одно
     изображение-склейка, состояние текстом), но целые тензоры не
     приводятся к float, а вещественные — к dtype."""
+    shim_libero_imports()
     sys.path.insert(0, os.path.join(os.path.dirname(HERE), "third_party",
                                     "actioncodec", "scripts"))
     import utils as U
@@ -237,6 +287,18 @@ def selftest():
             t[0, 0, 300] == 40 and t[0, 0, 500] == 80
     except ImportError:
         print("  (cv2 нет — проверка склейки пропущена)")
+    import subprocess
+    code = ("import sys; sys.path.insert(0, %r); import rt1_common as rc; "
+            "sh = rc.shim_libero_imports(); import robosuite.utils."
+            "transform_utils as T; from libero.libero import benchmark; "
+            "from libero2gym.vector_env import AsyncVectorEnv; import gym\n"
+            "try:\n    benchmark.get_benchmark_dict()\n    raise SystemExit(5)"
+            "\nexcept RuntimeError:\n    pass\nprint(len(sh))") % HERE
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                       text=True)
+    assert r.returncode == 0, r.stderr[-500:]
+    print("самопроверка rt1_common: заглушек LIBERO-импортов "
+          f"{r.stdout.strip()} (0 — настоящие модули установлены)")
     print("самопроверка rt1_common пройдена: порядок каналов, цель чанка и "
           "маска, нормировка, пределы URDF, склейка камер, средний предел "
           "шагов 625")
