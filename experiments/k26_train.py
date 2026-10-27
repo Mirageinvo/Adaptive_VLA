@@ -736,13 +736,16 @@ def real_check(a):
     with torch.autocast("cuda", dtype=torch.float16):
         out = mod(batch, po, st)
         loss, _l1, _b = km.loss_fn(torch, out, tgt, val)
-    loss.mean().backward()
-    rgr = {n: float(getattr(mod.router, n).weight.grad.float().norm())
+    # как в обучении: backward через масштаб GradScaler (без него малые
+    # fp16-градиенты через Wo ≈ 1e-4 и γ уходят в ноль), норма / масштаб
+    sc = float(scaler.get_scale())
+    scaler.scale(loss.mean()).backward()
+    rgr = {n: float(getattr(mod.router, n).weight.grad.float().norm()) / sc
            for n in ("Wq", "Wk", "Wv", "Wo")}
     rep["optimizer_steps"] = dict(optc, note="пропущенный GradScaler шаг "
                                   "не считается выполненным AdamW")
     rep["router_grad_after_step"] = dict(
-        grads=rgr, extra_steps=tries,
+        grads=rgr, extra_steps=tries, grad_scale=sc,
         wo_norm=float(mod.router.Wo.weight.detach().float().norm()))
     if float(mod.router.Wo.weight.detach().abs().sum()) == 0:
         prob.append(f"Wo не изменился за {tries} доп. шагов (пропуски "
