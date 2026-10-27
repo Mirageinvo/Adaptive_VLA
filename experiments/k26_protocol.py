@@ -98,6 +98,36 @@ p23.REFS["k25_s0"] = lambda: ref_k25(0)
 p23.REFS["k25_s1"] = lambda: ref_k25(1)
 
 
+def optional_refs(seed):
+    """Необязательные описательные источники (K-25 cond): закрепляются,
+    только если полный проверенный набор есть; иначе — запись причины.
+    Отсутствие не мешает плану, SR и основному анализу K-26."""
+    name = f"k25_s{seed}"
+    try:
+        return {name: dict(status="pinned", ref=p23.pin_ref(ref_k25(seed)))}
+    except (SystemExit, OSError, KeyError, ValueError) as ex:
+        why = ex.code if isinstance(ex, SystemExit) else repr(ex)
+        return {name: dict(status="не выполнено", why=f"нет полного "
+                           f"проверенного набора: {why}")}
+
+
+def verify_optional(plan):
+    """-> {имя: (блоки | None, причина)}; повреждённый закреплённый набор
+    не принимается — отказ только этого сравнения."""
+    out = {}
+    for name, o in (plan.get("optional_references") or {}).items():
+        if o.get("status") != "pinned":
+            out[name] = (None, o.get("why") or "не закреплён")
+            continue
+        try:
+            out[name] = (p23.verify_refs(dict(references={name: o["ref"]})),
+                         None)
+        except (SystemExit, OSError, KeyError, ValueError) as ex:
+            out[name] = (None, "закреплённый набор не прошёл проверку: " + (
+                str(ex.code) if isinstance(ex, SystemExit) else repr(ex)))
+    return out
+
+
 def entry_problems(e, common=None):
     p = []
     if entry_fp(e) != e.get("fingerprint"):
@@ -239,8 +269,8 @@ def make_plan(seed, mode, device):
     A = rA["plan"]
     refs = {"k21_main_A": p23.pin_ref(rA),
             "fullbar_cached": p23.pin_ref(p23.ref_cached()),
-            f"k24_s{seed}": p23.pin_ref(p25.ref_k24(seed)),
-            f"k25_s{seed}": p23.pin_ref(ref_k25(seed))}
+            f"k24_s{seed}": p23.pin_ref(p25.ref_k24(seed))}
+    optional = optional_refs(seed)
     if seed == 0:
         refs["k22"] = p23.pin_ref(p23.ref_k22())
     else:
@@ -262,9 +292,9 @@ def make_plan(seed, mode, device):
         controls=dict(pair=f"{[m for m in MODES if m != mode][0]}_s{seed}",
                       old_same_arch=("parents24" if mode == "parents_attn24"
                                      else "flat24") + f"_s{seed}",
-                      descriptive=[f"parents_mr24_s{seed}",
-                                   f"parents_cond24_s{seed}", "fullbar",
-                                   "fullbar_cached"]),
+                      reference_bar=["fullbar", "fullbar_cached"],
+                      descriptive=[f"parents_mr24_s{seed}"],
+                      optional_descriptive=[f"parents_cond24_s{seed}"]),
         suites=["10"], tasks=list(A["tasks"]), blocks=list(A["blocks"]),
         cells=[["10", t, b] for t in A["tasks"] for b in A["blocks"]],
         smoke=[["10", t, b] for t, b in A["smoke"]], setups={"10": A["setup"]},
@@ -273,16 +303,30 @@ def make_plan(seed, mode, device):
         snapshot_path=snap, prep_id=prep["prep_id"],
         bar_revision=prep["bar_pin"]["revision"], bounds=prep["bounds_codec"],
         n_envs=5, env_seed=101, bootstrap=dict(BOOT), router=ka.CONFIG,
-        references=refs,
+        references=refs, optional_references=optional,
         inputs={k: os.path.abspath(v) for k, v in inp.items()},
         inputs_sha1={k: sha(v) for k, v in inp.items()},
         code={f: sha(os.path.join(HERE, f)) for f in CODE
               if os.path.exists(os.path.join(HERE, f))},
-        primary=dict(comparison=["parents_attn24_s{S}", "flat_attn24_s{S}"],
-                     holm_over_seeds=True),
-        note="разработочный банк 30–44 (разведочно); основное — "
-             "parents_attn24 − flat_attn24 того же сида; обязательные "
-             "вторичные — новый против старого той же архитектуры")
+        comparisons=dict(
+            mechanism=dict(comparison=["parents_attn24_s{S}",
+                                       "flat_attn24_s{S}"],
+                           holm_over_seeds=True, role="hierarchy_specific_"
+                           "evidence"),
+            project=dict(comparison=["parents_attn24_s{S}", "fullbar",
+                                     "parents24_s{S}"], role="project_result"),
+            secondary=["parents_attn24 − parents24", "flat_attn24 − flat24",
+                       "взаимодействие"]),
+        decision_policy="два независимых вывода (раздел 15.2, поправка от "
+                        "27.10): project_result — SR дерева к исходному BAR "
+                        "и задержка, изменение к parents24; "
+                        "hierarchy_specific_evidence — дерево против нового "
+                        "flat (McNemar, Holm, интервалы). Нет общего "
+                        "сигнала/порога 2 п.п.; результат flat_attn24 не "
+                        "является условием остановки дерева; SR и p не "
+                        "влияют на код завершения",
+        note="разработочный банк 30–44 (разведочно); flat_attn24 — "
+             "дополнительная исследовательская архитектура для сравнения")
 
 
 def check_plan_inputs(plan):
@@ -579,6 +623,27 @@ def selftest():
     zp, labp, _b = fake_journal(torch, "parents_attn24")
     assert any("формы" in x or "нет" in x for x in attn_problems(
         zp, "flat_attn24_s0", "flat_attn24"))
+    # необязательный K-25: отсутствие -> «не выполнено», не отказ плана;
+    # повреждённый закреплённый набор -> отказ только этого сравнения
+    import tempfile
+    saved_ref = ref_k25
+    try:
+        globals()["ref_k25"] = lambda s_: (_ for _ in ()).throw(
+            SystemExit("план K-25 s0: проверено 20/30"))
+        o = optional_refs(0)
+        assert o["k25_s0"]["status"] == "не выполнено" and "20/30" in \
+            o["k25_s0"]["why"]
+        v = verify_optional(dict(optional_references=o))
+        assert v["k25_s0"][0] is None and "20/30" in v["k25_s0"][1]
+        with tempfile.TemporaryDirectory() as td:
+            pin = dict(name="k25_s0", path=td, sha12="x", run_dir=td,
+                       labels=[], blocks={})
+            v = verify_optional(dict(optional_references=dict(
+                k25_s0=dict(status="pinned", ref=pin))))
+            assert v["k25_s0"][0] is None and "не прошёл" in v["k25_s0"][1]
+    finally:
+        globals()["ref_k25"] = saved_ref
+    assert verify_optional({}) == {}
     assert parse_label("flat_attn24_s1") == ("flat_attn24", 1)
     try:
         parse_label("parents24_s0")
@@ -589,7 +654,9 @@ def selftest():
     print("самопроверка k26_protocol пройдена: numpy-пересчёт P/prior = "
           "torch (оба режима), журнал router игрушечной руки проходит; "
           "padding, суммы, флаг конечности, токены, уровни, NaN/Inf, порча "
-          "debug-фрагмента (P, S) и его отсутствие в smoke — отказ")
+          "debug-фрагмента (P, S) и его отсутствие в smoke — отказ; "
+          "необязательный K-25: отсутствие -> «не выполнено», повреждённый "
+          "набор -> отказ только этого сравнения")
     return 0
 
 

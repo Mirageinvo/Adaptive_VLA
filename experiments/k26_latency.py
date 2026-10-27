@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """K-26: задержка parents_attn24 и flat_attn24 против исторических
-parents24 и flat24 (seed 0).
+parents24 и flat24 (seed 0) и исходного BAR в том же замере (fullbar —
+штатный generate; fullbar_cached — только при пройденном допуске
+k21_barcache, иначе «не измерен» с причиной).
 
 Протокол K-21 (k21_latency): общая очередь наблюдений val_sel, батчи 1 и 5
 (батч — из одной задачи, общий pos_offset), 50 прогревов, ≥ 300 измерений на
@@ -31,7 +33,9 @@ if HERE not in sys.path:
 import k21_latency as kl  # noqa: E402
 
 OUT = "reports/k26/latency.json"
-PAIRS = (("parents_attn24", "parents24"), ("flat_attn24", "flat24"))
+PAIRS = (("parents_attn24", "parents24"), ("flat_attn24", "flat24"),
+         ("parents_attn24", "fullbar"), ("flat_attn24", "fullbar"),
+         ("parents_attn24", "fullbar_cached"))
 
 
 def main():
@@ -85,7 +89,23 @@ def main():
             m.collect = False
             m.keep_maps = False
     bar = d21.load_bar(dev, D["prep_report"]["bar_pin"])
-    timers = {k: kl.VisionTimer(torch, m.bar.vlm) for k, m in models.items()}
+    models["fullbar"] = bar["model"]
+    cached = dict(status="не измерен")
+    try:
+        import k21_barcache as bc
+        adm = bc.require_admitted(D)
+        models["fullbar_cached"] = bar["model"]
+        cached = dict(status="измерен", equivalence=adm.get("equivalence"))
+    except SystemExit as e:
+        cached = dict(status="не измерен", why=str(e.code))
+    print(f"  fullbar_cached: {cached}", flush=True)
+    vt, timers = {}, {}
+    for k, m in models.items():                 # общий vlm — один таймер
+        vlm = m.vlm if k.startswith("fullbar") else m.bar.vlm
+        if id(vlm) not in vt:
+            vt[id(vlm)] = kl.VisionTimer(torch, vlm)
+        timers[k] = vt[id(vlm)]
+    E, codec = bar["E"], bar["codec"]
     ac = torch.autocast("cuda", dtype=torch.float16)
     va = np.asarray(D["val_rows"])
     cache, bank = {}, {}
@@ -105,12 +125,27 @@ def main():
         t_prep = time.perf_counter() - t0
         g0 = torch.cuda.Event(enable_timing=True)
         g1 = torch.cuda.Event(enable_timing=True)
+        o = {}
         with torch.no_grad():
             g0.record()
-            with ac:
-                o = models[lab](batch, int(pos[0]), s11)
-            g = torch.where(o["grip_logit"].float() > 0, 1.0, -1.0)
-            chunk = torch.cat([o["arm"].float(), g[..., None]], -1)
+            if lab.startswith("fullbar"):
+                po = int(pos[0])
+                if lab == "fullbar_cached":
+                    import k21_barcache as bc
+                    tk = bc.generate_cached(torch, models[lab], batch, po)
+                else:
+                    tk = models[lab].generate(**batch, position_offset=po,
+                                              do_sample=False,
+                                              initial_position_shift=1)
+                K = tk.reshape(len(rows), 3, 16)
+                z = sum(E[j][K[:, j, :].long()] for j in range(3))
+                x, _ = codec._decode(z, embodiment_ids=0)
+                chunk = x[..., :7].float()
+            else:
+                with ac:
+                    o = models[lab](batch, int(pos[0]), s11)
+                g = torch.where(o["grip_logit"].float() > 0, 1.0, -1.0)
+                chunk = torch.cat([o["arm"].float(), g[..., None]], -1)
             g1.record()
         a_np = chunk.cpu().numpy()
         t_total = time.perf_counter() - t0
@@ -129,7 +164,9 @@ def main():
                                 "float32-чанк [B, 20, 7] на CPU; у новых "
                                 "моделей банк, K/V, шесть router и readout "
                                 "внутри forward; fp16 autocast; "
-                                "checkpointing off; LoRA не слита"))
+                                "checkpointing off; LoRA не слита; fullbar "
+                                "— штатный generate + декодер кодека в том "
+                                "же замере и очереди"))
     for bs in a.batches:
         queue = kl.make_queue(D["task"], va, bs, max(kl.WARM, a.n))
         qa = np.stack(queue).astype(np.int64)
@@ -174,6 +211,8 @@ def main():
                   f"{r['policy_gpu']['median']:.1f} мс; "
                   f"{r['throughput_obs_s']:.1f} набл./с", flush=True)
         for new, old in PAIRS:
+            if old not in res[f"batch{bs}"]:
+                continue
             x = res[f"batch{bs}"][new]["total"]
             b = res[f"batch{bs}"][old]["total"]
             d50 = 100 * (x["median"] / b["median"] - 1)
@@ -183,6 +222,7 @@ def main():
             print(f"    {new} к {old}: медиана {d50:+.1f}%, p95 {d95:+.1f}% "
                   f"(ориентир ≤ +10% медианы)", flush=True)
     res["bank"] = bank
+    res["fullbar_cached"] = cached
     res["device"] = torch.cuda.get_device_name(dev)
     os.makedirs("reports/k26", exist_ok=True)
     json.dump(res, open(OUT, "w", encoding="utf-8"), ensure_ascii=False,

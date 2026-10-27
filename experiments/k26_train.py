@@ -288,10 +288,54 @@ def install(seed, budget, torch=None, fastload=True, fit=False,
         torch.cuda.amp.GradScaler = k23t.counting_scaler(
             torch.cuda.amp.GradScaler)
     st = None
+    import k21_data as d21
+    orig_make = d21.make_batch
     if fastload:
         import k21_fastload as fl
         st = fl.install()
-    return dict(fastload=st, schedule=sched)
+    return dict(fastload=st, schedule=sched, orig_make=orig_make)
+
+
+def fastload_check(torch, D, bar, dev, sched, micro, orig_make, n_scan=8):
+    """Явная сверка ускоренной сборки (k21_fastload: cpu_part + to_device)
+    с прежней k21_data.make_batch на выбранном micro: первый экспертный и
+    первый учительский microbatch очереди этого сида (батч, pos_offset,
+    состояние, цели, маска; у учителя — teacher_idx и его строки).
+    k21_fastload не меняется."""
+    import copy
+    import k21_fastload as fl
+    reader = fl.RowReader(D["prep_report"]["inputs"]["images"]["path"]) \
+        if "prep_report" in D and "inputs" in D["prep_report"] else None
+    pbar = dict(cfg=bar.get("cfg"), proc=copy.deepcopy(bar.get("proc")))
+    res = {}
+    for u in range(n_scan):
+        src, idx = sched(D, u + 1, micro, start=u)[0]
+        if src in res:
+            continue
+        r = np.asarray(idx[0])
+        ti = r if src == "teacher" else None
+        rows = np.asarray(D["teacher_rows"])[r] if ti is not None else r
+        fast = fl.to_device(D, fl.cpu_part(D, rows, pbar, reader, ti), rows,
+                            bar, dev, ti)
+        ref = orig_make(D, rows, bar, dev, teacher_idx=ti)
+        ok = bool(fl.same_batch(fast, ref))
+        if ti is not None:
+            want = torch.as_tensor(D["teacher_target"][ti]).to(fast[3].device)
+            ok = ok and bool(torch.equal(fast[3], want)) and bool(
+                (fast[4] == 1).all())
+        res[src] = dict(update=u, rows=len(rows), equal=ok,
+                        teacher_idx=None if ti is None else
+                        [int(x) for x in ti[:4]])
+        if len(res) == 2:
+            break
+    if set(res) != {"expert", "teacher"} or not all(v["equal"] for v in
+                                                    res.values()):
+        raise SystemExit(f"fastload: сверка экспертного и учительского "
+                         f"батча не пройдена: {res}")
+    print(f"  fastload (micro {micro}): экспертный (u {res['expert']['update']})"
+          f" и учительский (u {res['teacher']['update']}) батчи совпали с "
+          f"прежним путём побитово", flush=True)
+    return res
 
 
 def hist_init_hash(torch, mode, seed):
@@ -365,6 +409,8 @@ def train(a):
           f"без добора), micro {a.micro} × {kt.EFF_BATCH // a.micro}; "
           + ("продолжение" if have else "новый запуск"), flush=True)
     tr = kt.Trainer(torch, a, D, a.mode, a.mode)
+    flc = fastload_check(torch, D, tr.bar, tr.dev, st["schedule"], a.micro,
+                         st["orig_make"])
     s0 = kt.trainable_state(tr.mod)
     want = e[CONTROL[a.mode]]["init_hash"]
     sh, rh = shared_hash(s0), router_hash(s0)
@@ -393,6 +439,7 @@ def train(a):
                init_hash=rs["init_hash"], init_hash_shared=sh,
                router_init_hash=rh, control_init_hash=want,
                schedule_fp=rs["config"]["k26"]["schedule_fp"],
+               fastload_check=flc,
                scaler=(rs.get("scaler") or {}).get("_k23"),
                curve=rs["curve"], config=rs["config"])
     os.makedirs("reports/k26", exist_ok=True)
@@ -496,21 +543,23 @@ def fitcheck(a):
         kt.evaluate = orig_eval
     fin = rec[-1] if rec else {}
     gq = fin.get("grad") or {}
-    branch = bool(fin) and fin["wo_norm"] > 0 and all(
-        gq.get(n) is not None and np.isfinite(gq[n]) and gq[n] > 0
-        for n in ("Wq", "Wk", "Wv", "Wo"))
-    print(f"  fitcheck router: |Wo| {fin.get('wo_norm')}, градиенты "
+    # критерии подгонки — прежние (L1, схват); нормы router только
+    # выводятся; нечисловые значения — техническая ошибка
+    finite = all(np.isfinite(r["wo_norm"]) and all(
+        v is None or np.isfinite(v) for v in r["grad"].values())
+        for r in rec)
+    print(f"  fitcheck router (описательно): |Wo| {fin.get('wo_norm')}, "
+          f"градиенты "
           f"{ {k: (None if v is None else round(v, 6)) for k, v in gq.items()} }"
-          f" -> ветка {'работает' if branch else 'НЕ получает градиент'}",
-          flush=True)
+          + ("" if finite else " — НЕЧИСЛОВЫЕ значения"), flush=True)
     p = "reports/k26/fitcheck.json"
     if os.path.exists(p):
         r = json.load(open(p, encoding="utf-8"))
         r["router_trace"] = rec
-        r["router_branch_ok"] = branch
+        r["router_finite"] = finite
         r["mode"] = FIT_MODE
-        r["ok"] = bool(r.get("ok")) and branch
-        code = code if branch else 3
+        r["ok"] = bool(r.get("ok")) and finite
+        code = code if finite else 3
         r["contract"] = check_contract("fitcheck", a)
         r["exit"] = code
         json.dump(r, open(p, "w", encoding="utf-8"), indent=1)
@@ -609,6 +658,7 @@ def real_check(a):
     last = len(mod.bar.vlm.text_model.layers) - 1
     Lt = torch.as_tensor(D["L"], device=dev)
     Ut = torch.as_tensor(D["U"], device=dev)
+    optc = dict(applied=0, skipped=0)
 
     def step(mb):
         batch, po, st, tgt, val = d21.make_batch(D, rows[:mb], bar, dev)
@@ -620,20 +670,22 @@ def real_check(a):
         mod.collect = False
         scaler.scale(loss.mean()).backward()
         gp, none, norms = sm.grad_problems(named, gn, last)
-        wo_g = mod.router.Wo.weight.grad
         scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_([p for _n, p in named], kt.CLIP)
+        before = float(scaler.get_scale())
         scaler.step(opt)
         scaler.update()
+        applied = float(scaler.get_scale()) >= before   # пропуск = scale ↓
+        optc["applied" if applied else "skipped"] += 1
         opt.zero_grad(set_to_none=True)
-        return out, loss, gp, none, norms, wo_g
+        return out, loss, gp, none, norms, applied
     for mb in sorted(a.micros):
         r = {}
         try:
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats(dev)
             t0 = time.time()
-            out, loss, gp, none, norms, _w = step(mb)
+            out, loss, gp, none, norms, applied = step(mb)
             torch.cuda.synchronize(dev)
             arm = out["arm"].float()
             infos = [ka.info_floats(x) for x in out["router"]]
@@ -655,14 +707,16 @@ def real_check(a):
                                dv=out["bank"]["dv"]),
                      router=[dict(rms_ratio=x["rms_ratio"],
                                   levels=x["levels"]) for x in infos],
-                     scaler_scale=float(scaler.get_scale()))
+                     scaler_scale=float(scaler.get_scale()),
+                     optimizer_step_applied=applied)
             bad = [k for k, v in checks.items() if not v]
             if bad:
                 prob.append(f"micro {mb}: {bad}")
             del out, loss
         except torch.cuda.OutOfMemoryError:
             r = dict(oom=True)
-            if mb == 32 and (rep.get("micro_8") or {}).get("checks"):
+            c8 = (rep.get("micro_8") or {}).get("checks") or {}
+            if mb == 32 and c8 and all(c8.values()):
                 rep["oom32"] = True       # решение 8 × 4 — micro-decision
             else:
                 prob.append(f"micro {mb}: OOM")
@@ -685,9 +739,14 @@ def real_check(a):
     loss.mean().backward()
     rgr = {n: float(getattr(mod.router, n).weight.grad.float().norm())
            for n in ("Wq", "Wk", "Wv", "Wo")}
+    rep["optimizer_steps"] = dict(optc, note="пропущенный GradScaler шаг "
+                                  "не считается выполненным AdamW")
     rep["router_grad_after_step"] = dict(
         grads=rgr, extra_steps=tries,
         wo_norm=float(mod.router.Wo.weight.detach().float().norm()))
+    if float(mod.router.Wo.weight.detach().abs().sum()) == 0:
+        prob.append(f"Wo не изменился за {tries} доп. шагов (пропуски "
+                    f"GradScaler: {optc['skipped']})")
     if not all(np.isfinite(v) and v > 0 for v in rgr.values()):
         prob.append(f"градиент router после шага: {rgr}")
     print(f"  router после шага: {rep['router_grad_after_step']}", flush=True)
@@ -857,6 +916,44 @@ def selftest():
                 pass
     finally:
         d21.load_bar = saved_lb
+    # явная сверка fastload: экспертный и учительский батч; порча цели
+    # учителя или батча — отказ
+    import k21_fastload as fl
+    saved_fl = (fl.cpu_part, fl.to_device, fl.same_batch)
+    DFL = dict(DT, teacher_rows=np.arange(48, 56),
+               teacher_target=np.random.default_rng(0).random((8, 20, 7))
+               .astype(np.float32))
+
+    def orig_mb(D_, rows, bar, dev, teacher_idx=None):
+        b, po, st_, tgt, val = fake_mb(D_, rows, bar, dev)
+        po = torch.full((len(rows),), po, dtype=torch.long)
+        if teacher_idx is not None:
+            tgt = torch.as_tensor(D_["teacher_target"][np.asarray(
+                teacher_idx)])
+            val = torch.ones(tgt.shape[:2])
+        return b, po, st_, tgt, val
+    try:
+        for corrupt, ok_ in ((None, True), ("teacher", False),
+                             ("expert", False)):
+            fl.cpu_part = lambda D_, rows, pb, rd, ti=None: (rows, ti)
+
+            def to_dev(D_, b, rows, bar, dev, ti=None, _c=corrupt):
+                out = list(orig_mb(D_, rows, bar, dev, teacher_idx=ti))
+                if (_c == "teacher" and ti is not None) or \
+                        (_c == "expert" and ti is None):
+                    out[3] = out[3] + 1
+                return tuple(out)
+            fl.to_device = to_dev
+            sch = k23t.seeded_schedule(saved["schedule"], 0)
+            try:
+                r_ = fastload_check(torch, DFL, dict(cfg=None, proc=None),
+                                    torch.device("cpu"), sch, 4, orig_mb)
+                assert ok_ and r_["teacher"]["equal"] and \
+                    r_["teacher"]["update"] == 3, r_
+            except SystemExit:
+                assert not ok_, corrupt
+    finally:
+        fl.cpu_part, fl.to_device, fl.same_batch = saved_fl
     try:
         install(2, 8000, fastload=False)
         raise AssertionError("seed 2 принят")
@@ -869,7 +966,9 @@ def selftest():
     assert len(set(DEPS)) == len(DEPS) and "k26_protocol.py" not in DEPS
     assert [m for _s, m in ORDER] == ["flat_attn24", "parents_attn24"] * 2
     print("самопроверка k26_train пройдена: непрерывное = остановка + "
-          "возобновление (Trainer, оба режима), диагностика router (6 "
+          "возобновление (Trainer, оба режима), явная сверка fastload "
+          "(экспертный и учительский батч; порча — отказ), диагностика "
+          "router (6 "
           "точек, padding 0, нулевой Wo -> поправка 0, KL листьев); "
           "настоящая фабрика строит K26Parents/K26Flat для seed 0 и 1, "
           "общие тензоры = базовой модели, router пары одинаков, fitcheck — "

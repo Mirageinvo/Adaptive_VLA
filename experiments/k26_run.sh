@@ -12,7 +12,9 @@
 # переиспользуются) -> решение microbatch (общее, до обучений) -> fitcheck
 # parents_attn24 -> flat_s0 обучение -> SR -> parents_s0 обучение -> SR ->
 # анализ seed 0 (промежуточно) -> flat_s1 -> SR -> parents_s1 -> SR -> анализ
-# двух сидов -> latency. Любой ненулевой код — останов; повторный run
+# двух сидов -> latency (с fullbar) -> итоговый анализ. Код завершения
+# зависит только от технических проверок, не от SR/p-value; результат
+# flat_attn24 не останавливает цепочку. Любой ненулевой код — останов; повторный run
 # продолжает с проверенного места (обучение — с resume.pt, готовые блоки
 # переиспользуются). flock; проверка занятости карты и места; MuJoCo и
 # обучение не одновременно; старые данные не удаляются.
@@ -179,7 +181,8 @@ case "$MODE" in
       fi
     done
     echo "=== ЭТАП анализ двух сидов"; $PY experiments/k26_analyze.py || finish 3
-    echo "=== ЭТАП latency"; gpu_free || finish 3; $PY experiments/k26_latency.py --device "$DEV" || finish 3
+    echo "=== ЭТАП latency (с исходным BAR в том же замере)"; gpu_free || finish 3; $PY experiments/k26_latency.py --device "$DEV" || finish 3
+    echo "=== ЭТАП итоговый анализ (с задержкой)"; $PY experiments/k26_analyze.py || finish 3
     echo "=== ЦЕПОЧКА K-26 ЗАВЕРШЕНА $(date)"; finish 0 ;;
   *) echo "режим $MODE неизвестен"; finish 2 ;;
 esac
