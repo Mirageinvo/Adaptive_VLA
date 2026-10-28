@@ -117,6 +117,7 @@ def main():
             bank = kmem.MemoryBank()
             warm_memory(bank, chains, B)
             torch.cuda.synchronize(dev)
+            timers["parents_mem24"].take()   # подготовительный vision — вне замера
         rows = ix["cur"][chains]
         torch.cuda.synchronize(dev)
         t0 = time.perf_counter()

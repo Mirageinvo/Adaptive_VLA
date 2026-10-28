@@ -231,18 +231,10 @@ def journal_record(out, B, env, ks, use, keep_debug=False, mem_in=None):
     return rec
 
 
-def build_arm(device, basis, label, torch, *, spec, plan_sha1, debug=False):
-    import k21_main_policy as kmp
-    mode, seed = parse_label(label)
-    orig = kmp.load_policy
-    kmp.load_policy = lambda torch_, label_, ckpt_, device_: load_policy(
-        torch_, label, spec, device_)
-    try:
-        arm = kmp.build_arm(device, basis, label, torch,
-                            ckpt=spec.get("ckpt") or spec["source"]["ckpt"],
-                            plan_sha1=plan_sha1)
-    finally:
-        kmp.load_policy = orig
+def wrap_arm(arm, torch, mode, label, debug=False):
+    """Память, проверки и журнал вокруг руки k21_main_policy (arm.k21 —
+    модель K27, arm.act — базовый вызов). В режиме off память не выбирается
+    и банк не пополняется: use = 0, mem_in = None на каждом вызове."""
     mod = arm.k21
     fwd0 = mod.forward
     bank = kmem.MemoryBank()
@@ -259,9 +251,11 @@ def build_arm(device, basis, label, torch, *, spec, plan_sha1, debug=False):
         last.clear()
         B = int(batch["input_ids"].shape[0])
         env, eps, steps = env_view(B)
-        use, ks_, _rows = bank.select(env, eps, steps)
-        mem_in = k27m.mem_input(torch, bank, env, eps, steps) \
-            if mode == "on" else None
+        if mode == "on":
+            use, ks_, _rows = bank.select(env, eps, steps)
+            mem_in = k27m.mem_input(torch, bank, env, eps, steps)
+        else:
+            use, ks_, mem_in = [False] * B, [0] * B, None
         last["mem_in"] = mem_in
         res = act0(batch, pos_off, autocast, first)
         out = last.get("out")
@@ -272,13 +266,12 @@ def build_arm(device, basis, label, torch, *, spec, plan_sha1, debug=False):
         elif c["vision"] != 1 or any(x != 1 for x in c["text"]) or \
                 c["active"] != [4] * 8 + [12] * 8 + [28] * 8:
             prob.append(f"счётчики {c}")
-        want = ["root", "mid"] if (mode == "on" and mem_in is not None and
+        want = ["root", "mid"] if (mem_in is not None and
                                    "alive_mid" in (out.get("mem") or {})) \
-            else (["root"] if mode == "on" and mem_in is not None else [])
+            else (["root"] if mem_in is not None else [])
         if out is not None and c["mem_reads"] != want:
             prob.append(f"чтения памяти {c['mem_reads']} ≠ {want}")
-        if mode == "on" and any(u and k != kmem.K_EXEC for u, k in
-                                zip(use, ks_)):
+        if any(u and k != kmem.K_EXEC for u, k in zip(use, ks_)):
             prob.append(f"исполнено шагов {ks_} (ожидалось {kmem.K_EXEC})")
         if mode == "off" and out is not None and "mem" in out:
             prob.append("memory off использовал память")
@@ -291,10 +284,27 @@ def build_arm(device, basis, label, torch, *, spec, plan_sha1, debug=False):
         if keep:
             st["dbg_done"] = True
         arm.log.add(**rec)
-        bank.update(env, eps, steps, kmem.split_snapshot(out["snapshot"]))
+        if mode == "on":
+            bank.update(env, eps, steps, kmem.split_snapshot(out["snapshot"]))
         st["calls"] += 1
         return res
     arm.act = act
+    return arm
+
+
+def build_arm(device, basis, label, torch, *, spec, plan_sha1, debug=False):
+    import k21_main_policy as kmp
+    mode, seed = parse_label(label)
+    orig = kmp.load_policy
+    kmp.load_policy = lambda torch_, label_, ckpt_, device_: load_policy(
+        torch_, label, spec, device_)
+    try:
+        arm = kmp.build_arm(device, basis, label, torch,
+                            ckpt=spec.get("ckpt") or spec["source"]["ckpt"],
+                            plan_sha1=plan_sha1)
+    finally:
+        kmp.load_policy = orig
+    wrap_arm(arm, torch, mode, label, debug)
     arm.meta.update(arch="parents_mem24", memory=mode, train_seed=seed,
                     memory_version=kmem.VERSION, memory_debug=bool(debug),
                     k27_policy_sha1=sha(os.path.abspath(__file__)))
@@ -357,10 +367,56 @@ def selftest():
                 "mem_dbg_S0" in rec
         bank.update([0, 1, 2], [7, 7, 8], [step_] * 3,
                     kmem.split_snapshot(o["snapshot"]))
+    # настоящая обёртка руки: три вызова на блок для off и on; журнал
+    # проходит проверку протокола (off — без памяти и без пополнения банка)
+    import types
+    import k21_policy as kp21
+    import k27_protocol as pc
+    for mode_ in ("off", "on"):
+        lab = f"parents_mem24{'off' if mode_ == 'off' else ''}_s0"
+        mm = M["K27"](copy.deepcopy(km.fake_bar(torch)), L, U, seed=0,
+                      memory=mode_).eval()
+        if mode_ == "on":
+            with torch.no_grad():
+                mm.mem.Wo.weight.normal_(0, 0.5, generator=torch.Generator()
+                                         .manual_seed(2))
+        log = kp21.K21Log(lab)
+        calls = dict(n=0)
+
+        def act0(batch, pos_off, autocast, first, _m=mm, _log=log, _c=calls):
+            _c["n"] += 1
+            with torch.no_grad():
+                o = _m(batch, int(pos_off), torch.randn(
+                    5, 11, generator=torch.Generator().manual_seed(_c["n"])))
+            g_ = torch.where(o["grip_logit"] > 0, 1.0, -1.0)
+            a_ = torch.cat([o["arm"], g_[..., None]], -1).numpy()
+            _log.add(act=a_[:, :8], chunk=_c["n"], root=o["root"].numpy())
+            return a_, None
+        arm = types.SimpleNamespace(k21=mm, act=act0, log=log, meta={})
+        wrap_arm(arm, torch, mode_, lab, debug=True)
+        te = TrackedEnvs(FakeEnvs())
+        te.reset(options=[{}] * 5)
+        for _w in range(10):
+            te.step(None)
+        for i in range(3):
+            arm.act(km.fake_batch(torch, B=5, seed=i), 1, None, i == 0)
+            for _s in range(8):
+                te.step(None)
+        _summ, z = log.take()
+        pb = pc.mem_problems(z, lab, mode_, debug=mode_ == "on")
+        assert pb == [], (mode_, pb)
+        if mode_ == "off":
+            assert (z["k21_mem_use"] == 0).all() and \
+                (z["k21_mem_k"] == -1).all()
+        else:
+            assert (z["k21_mem_use"][1:] == 1).all() and \
+                (z["k21_mem_k"][1:] == 8).all()
     print("самопроверка k27_policy пройдена: метки on/off, сверка "
           "спецификации и контракта памяти, учёт сред (reset -> новые "
           "эпизоды и нулевые шаги, step -> шаги), журнал постоянной формы с "
-          "памятью и без, debug-фрагмент")
+          "памятью и без, debug-фрагмент; настоящая обёртка руки — 3 вызова "
+          "off (память не используется, банк не пополняется) и on — журнал "
+          "проходит проверку протокола")
     return 0
 
 
