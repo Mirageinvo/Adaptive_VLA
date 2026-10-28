@@ -79,5 +79,29 @@ python3 experiments/k27_data.py prepare
 сравнение ведётся с замороженной базой — так же, как в руке SR K-22
 (`k22_policy` выключает градиенты у всех параметров).
 
-Пакет B (обучение, real-check/fitcheck, политика с учётом сред, SR, анализ,
-задержка) — после проверки пакета A; GPU-часть — после окончания K-26.
+## Пакет B
+
+- `k27_train.py` — загрузка parents24 сида (SHA файла, отпечаток весов,
+  режим и seed контракта), полная заморозка, обучение только `mem.*` на
+  цепочках собственных прогнозов (ранние вызовы eval/no_grad, потеря только
+  на текущем), real-check (оба сида: база = источнику, memory off и нулевой
+  Wo = замороженный parents24; seed 0: micro 8/16/32 на цепочках из 2 и 3
+  наблюдений, путь градиента через GradScaler), fitcheck (64 цепочки, 200
+  обновлений, снижение L ≥ 10%), обучение 2000 обновлений с возобновлением.
+- `k27_policy.py`, `k27_harness.py` — учёт сред обёрткой `utils.get_envs`
+  (reset -> новые эпизоды, step -> исполненные шаги), MemoryBank, журнал и
+  debug-фрагмент.
+- `k27_protocol.py` — подготовка, планы (memory-off smoke и основной SR),
+  проверка журнала с CPU-пересчётом A0/A1, сверка memory off с закреплёнными
+  блоками parents24 (offcheck).
+- `k27_analyze.py`, `k27_latency.py` (cold и steady), `k27_run.sh`.
+
+GPU-часть — после окончания K-26:
+
+```bash
+bash experiments/k27_run.sh selftest
+bash experiments/k27_run.sh prepare
+bash experiments/k27_run.sh real-check cuda:0
+bash experiments/k27_run.sh fitcheck cuda:0
+nohup bash experiments/k27_run.sh run cuda:0 > /dev/null 2>&1 &
+```

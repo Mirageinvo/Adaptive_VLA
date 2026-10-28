@@ -39,6 +39,11 @@ def build(torch):
     K22 = k22.build(torch)["K22"]
     MM = kmem.build(torch)
 
+    def _rms(new, old):
+        with torch.no_grad():
+            return (new.float() - old.float()).pow(2).mean().sqrt() / \
+                old.float().pow(2).mean().sqrt().clamp_min(1e-30)
+
     class K27(K22):
         def __init__(self, bar, L, U, state_mean=None, state_std=None,
                      backend="math", checkpoint=False, seed=0, lora=True,
@@ -147,11 +152,14 @@ def build(torch):
                         S0, hn = self.mem.scores(roots, P["K"][:, :, :4])
                         O0 = MM["overlap"](iv, P["ivr"])
                         A0, al0 = MM["root_match"](S0, O0, P["alr"])
+                        r0 = roots
                         roots, g0, has0 = self.mem.update(
                             roots, hn, A0, al0, P["V"][:, :, :4])
                         cnt["mem_reads"].append("root")
                         info.update(A0=A0, g_root=g0, has_root=has0,
-                                    alive_root=P["alr"])
+                                    alive_root=P["alr"], S0=S0,
+                                    iv_rem_root=P["ivr"], k=P["k"],
+                                    use=P["use"], rms_root=_rms(roots, r0))
                     W0 = self.T["root_weights"](iv)
                     iv2, s1 = self.T["split"](iv, self.split1(roots), False)
                     W1 = self.T["split_weights"](W0, iv, s1)
@@ -164,12 +172,15 @@ def build(torch):
                         O1 = MM["overlap"](iv2, P["ivm"])
                         A1, al1, _pr = MM["mid_match"](S1, O1, P["alm"],
                                                        info["A0"])
+                        m0 = mids
                         mids, g1, has1 = self.mem.update(
                             mids, hn, A1, al1, P["V"][:, :, 4:])
                         ha = torch.cat([ha[:, :4], mids], 1)
                         cnt["mem_reads"].append("mid")
                         info.update(A1=A1, g_mid=g1, has_mid=has1,
-                                    alive_mid=P["alm"])
+                                    alive_mid=P["alm"], S1=S1,
+                                    iv_rem_mid=P["ivm"],
+                                    rms_mid=_rms(mids, m0))
                     iv3, s2 = self.T["split"](iv2, self.split2(mids), False)
                     W2 = self.T["split_weights"](W1, iv2, s2)
                     aux.update(mid=iv2, split2=s2)
@@ -198,11 +209,16 @@ def shared_keys(st):
     return {k: v for k, v in st.items() if not k.startswith("mem.")}
 
 
-def mem_input(torch, bank, env_ids, episode_ids, steps, like):
-    """MemoryBank -> аргумент mem forward (None, если памяти нет ни у кого)."""
+def mem_input(torch, bank, env_ids, episode_ids, steps, like=None):
+    """MemoryBank -> аргумент mem forward (None, если памяти нет ни у кого).
+    like — батч-снимок для форм пустых строк (по умолчанию — первая
+    непустая строка)."""
     use, ks, rows = bank.select(env_ids, episode_ids, steps)
     if not any(use):
         return None
+    if like is None:
+        r0 = next(r for r in rows if r is not None)
+        like = {k: v[None] for k, v in r0.items()}
     snap, _m = kmem.stack_snapshot(torch, rows, like)
     return dict(snap=snap, use=use, k=ks)
 
@@ -288,7 +304,7 @@ def selftest():
     assert not torch.allclose(om["arm"], ob2["arm"], atol=1e-6)
     perm = [2, 0, 1]
     btp = {k: v[perm] for k, v in bt2.items()}
-    mip = mem_input(torch, bank, [2, 0, 1], [7, 5, 6], [8, 8, 8], snap)
+    mip = mem_input(torch, bank, [2, 0, 1], [7, 5, 6], [8, 8, 8])
     with torch.no_grad():
         op = m(btp, 1, st2[perm], mip)
     assert torch.allclose(op["arm"], om["arm"][perm], atol=1e-5)
