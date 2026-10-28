@@ -9,6 +9,9 @@
 #     (модель обучена и закреплена; отчёт обучения не перезаписывается).
 # Режимы и порядок — как в k26_run.sh; общий lock-файл logs/k26/.k26.lock,
 # общий лог logs/k26/run.log.
+#   K26_MAX_USED_MB=N — допустимая занятость карты чужими процессами для
+#   обучения и SR (по умолчанию 2048 МиБ); замер задержки — всегда на
+#   свободной карте (≤ 2048 МиБ).
 #   nohup bash experiments/k26_continue.sh run cuda:0 > /dev/null 2>&1 &
 set -uo pipefail
 MODE="${1:?нужен режим}"
@@ -36,12 +39,13 @@ k25_busy () { pgrep -f "k25_run.sh|k25_train.py|k25_harness.py|k25_latency.py|k2
 wait_k25 () {
   while k25_busy; do echo "    K-25 ещё выполняется — жду 10 мин ($(date '+%H:%M'))"; sleep 600; done
 }
-gpu_free () {
-  local idx="${DEV#cuda:}" used
+gpu_free () {   # [строгий]: для latency порог всегда 2048 МиБ
+  local idx="${DEV#cuda:}" used lim="${K26_MAX_USED_MB:-2048}"
+  [ "${1:-}" = strict ] && lim=2048
   used="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$idx" 2>/dev/null | tr -d ' ')"
   [ -n "$used" ] || { echo "ОТКАЗ: nvidia-smi не отвечает для $DEV"; return 3; }
-  echo "    $DEV: занято $used МиБ"
-  [ "$used" -le 2048 ] || { echo "ОТКАЗ: на $DEV занято $used МиБ"; return 3; }
+  echo "    $DEV: занято $used МиБ (допустимо до $lim)"
+  [ "$used" -le "$lim" ] || { echo "ОТКАЗ: на $DEV занято $used МиБ"; return 3; }
 }
 disk_ok () {
   local need=0 f sz free
@@ -153,7 +157,7 @@ case "$MODE" in
   real-check) wait_k25; selftests || finish 1; $PY experiments/k26_protocol.py prepare || finish 3; real_check; finish $? ;;
   fitcheck) wait_k25; selftests || finish 1; $PY experiments/k26_protocol.py prepare || finish 3; fitcheck; finish $? ;;
   analyze) $PY experiments/k26_analyze.py; finish $? ;;
-  latency) gpu_free || finish 3; $PY experiments/k26_latency.py --device "$DEV"; finish $? ;;
+  latency) gpu_free strict || finish 3; $PY experiments/k26_latency.py --device "$DEV"; finish $? ;;
   run)
     echo "=== ЭТАП ожидание конца K-25"; wait_k25
     echo "=== ЭТАП самопроверки"; selftests || finish 1
@@ -177,7 +181,7 @@ case "$MODE" in
       fi
     done
     echo "=== ЭТАП анализ двух сидов"; $PY experiments/k26_analyze.py || finish 3
-    echo "=== ЭТАП latency (с исходным BAR в том же замере)"; gpu_free || finish 3; $PY experiments/k26_latency.py --device "$DEV" || finish 3
+    echo "=== ЭТАП latency (с исходным BAR в том же замере)"; gpu_free strict || finish 3; $PY experiments/k26_latency.py --device "$DEV" || finish 3
     echo "=== ЭТАП итоговый анализ (с задержкой)"; $PY experiments/k26_analyze.py || finish 3
     echo "=== ЦЕПОЧКА K-26 ЗАВЕРШЕНА $(date)"; finish 0 ;;
   *) echo "режим $MODE неизвестен"; finish 2 ;;
