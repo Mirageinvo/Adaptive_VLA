@@ -90,7 +90,12 @@ def build(torch):
 
     def command_summary(chunk, W, k, L, U):
         """chunk [B, 20, 7] собственных команд, W [B, 20, n] -> сводка
-        [B, n, 7] по строкам t ≥ k; вес [B, n]."""
+        [B, n, 7] по строкам t ≥ k; вес [B, n]. Весь расчёт вне autocast
+        (float32, явно поданный float64 сохраняется)."""
+        with torch.autocast(chunk.device.type, enabled=False):
+            return _summary(chunk, W, k, L, U)
+
+    def _summary(chunk, W, k, L, U):
         dt = wdt(chunk, W)
         x = chunk.to(dt)
         L = torch.as_tensor(np.asarray(L), dtype=dt, device=x.device)
@@ -130,6 +135,10 @@ def build(torch):
 
     def root_match(S0, O0, alive_root):
         """S0 [B, h, 4, 4], O0 [B, 4, 4], alive [B, 4] -> A0, allowed."""
+        with torch.autocast(S0.device.type, enabled=False):
+            return _root_match(S0, O0, alive_root)
+
+    def _root_match(S0, O0, alive_root):
         dt = wdt(S0, O0)
         allowed = (alive_root[:, None, :] & (O0 > 0))[:, None]
         A0 = masked_softmax(S0.to(dt) + safe_log(O0.to(dt), allowed[:, 0])
@@ -153,6 +162,10 @@ def build(torch):
                            torch.zeros_like(pr))
 
     def mid_match(S1, O1, alive_mid, A0):
+        with torch.autocast(S1.device.type, enabled=False):
+            return _mid_match(S1, O1, alive_mid, A0)
+
+    def _mid_match(S1, O1, alive_mid, A0):
         dt = wdt(S1, O1, A0)
         prior = mid_prior(A0, alive_mid)
         base = alive_mid[:, None, :] & (O1 > 0)            # [B, 8, 8]
@@ -254,10 +267,18 @@ class MemoryBank:
         else:
             self.mem.pop(int(env_id), None)
 
-    def select(self, env_ids, episode_ids, steps):
+    @staticmethod
+    def _check(env_ids, *cols):
         env_ids = [int(x) for x in env_ids]
+        n = [len(env_ids)] + [len(c) for c in cols]
+        if len(set(n)) != 1:
+            raise SystemExit(f"память: разная длина входов {n}")
         if len(set(env_ids)) != len(env_ids):
             raise SystemExit(f"память: повтор env_id в батче {env_ids}")
+        return env_ids
+
+    def select(self, env_ids, episode_ids, steps):
+        env_ids = self._check(env_ids, list(episode_ids), list(steps))
         use, ks, snaps = [], [], []
         for e, ep, s in zip(env_ids, episode_ids, steps):
             m = self.mem.get(e)
@@ -279,6 +300,8 @@ class MemoryBank:
         return use, ks, snaps
 
     def update(self, env_ids, episode_ids, steps, snap_rows):
+        env_ids = self._check(env_ids, list(episode_ids), list(steps),
+                              list(snap_rows))       # до изменения банка
         for e, ep, s, sn in zip(env_ids, episode_ids, steps, snap_rows):
             self.mem[int(e)] = dict(env=int(e), episode=int(ep), step=int(s),
                                     snap=sn)
@@ -339,6 +362,16 @@ def selftest():
     assert torch.allclose(a[0, 0, :6], torch.full((6,), 0.5))
     assert float(sw[0, 0]) == 2.0 and float(sw[0, 1]) == 10.0
     assert abs(float(a[0, 1, 6]) - 0.6) < 1e-6
+    # под bf16-autocast сводка совпадает с float32 по значениям (дробные
+    # веса и команды)
+    chf = torch.rand(2, 20, 7, generator=g) * 1.7 - 0.85
+    Wf = torch.rand(2, 20, 4, generator=g)
+    kf = torch.tensor([8, 3])
+    ref, swr = M["command_summary"](chf, Wf, kf, L, U)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        got, swg = M["command_summary"](chf, Wf, kf, L, U)
+    assert got.dtype == torch.float32 and torch.equal(got, ref) and \
+        torch.equal(swg, swr)
     a2, sw2 = M["command_summary"](ch, W, torch.tensor([12]), L, U)
     assert float(sw2[0, 0]) == 0 and float(a2[0, 0].abs().sum()) == 0
     # 3. A ≥ 0, сумма строки 1 при допустимых ключах и 0 при пустой; нули
@@ -448,6 +481,23 @@ def selftest():
         raise AssertionError("повтор env_id принят")
     except SystemExit:
         pass
+    # разная длина входов и повтор env_id в update — отказ, банк не меняется
+    before = {e: dict(m) for e, m in bank.mem.items()}
+    for args in (([5, 6], [1], [0, 0], [snap, snap]),
+                 ([5, 6], [1, 2], [0, 0], [snap]),
+                 ([5, 5], [1, 2], [0, 0], [snap, snap])):
+        try:
+            bank.update(*args)
+            raise AssertionError(f"update принял {args[:3]}")
+        except SystemExit:
+            pass
+        assert bank.mem == before
+    for args in (([1, 2], [11], [16, 16]), ([1, 2], [11, 12], [16])):
+        try:
+            bank.select(*args)
+            raise AssertionError(f"select принял {args}")
+        except SystemExit:
+            pass
     print("самопроверка k27_memory пройдена: сдвиг 0/8/20, частичное "
           "истечение, остаток 12 при k = 8, перекрытия, сводка только по "
           "собственным строкам t ≥ k, A ≥ 0 / суммы 1 / пустая строка 0 / "
@@ -456,7 +506,8 @@ def selftest():
           "float64, градиент к scores корней, нулевые Wo/Wg -> 0, пустая "
           "строка -> 0 при любом Wo, 403073 параметра при H = 768, "
           "MemoryBank (перестановка, reset, новый эпизод, k ≥ 20, часы "
-          "назад, повтор env_id)")
+          "назад, повтор env_id, разная длина входов — банк не меняется); "
+          "сводка под bf16-autocast = float32 по значениям")
     return 0
 
 
