@@ -30,13 +30,53 @@ if HERE not in sys.path:
 import rt1_common as rc  # noqa: E402
 
 PILOT_N = 10
+EXPECTED = "expected.json"
+ROLLOUT_ERRORS = ("Policy rollout error", "Aborting task")
 SMOKE_TASKS = ("lift_pot", "open_laptop")
 SEED_START = 100000
 
 
+def model_paths(a):
+    import rt2_train as r2
+    return (a.ckpt or os.path.join(r2.outdir(a.seed, a.arch), "best.pt"),
+            a.train_report or r2.report_path(a.seed, a.arch))
+
+
+def manifest_of(meta, n_exec):
+    import rt2_policy as rp
+    return dict({k: meta[k] for k in rp.MODEL_KEYS}, n_exec=int(n_exec))
+
+
+def expect(a):
+    """Манифест ожидаемой модели прогона (без GPU) -> <log_dir>/expected.json.
+    Существующий манифест сверяется ДО записи: другая модель — отказ (новый
+    каталог журнала), та же — продолжение."""
+    import torch
+    import rt1_data as rd
+    import rt2_policy as rp
+    ck, rep = model_paths(a)
+    D = rd.Data(check=True, check_files=False)
+    man = manifest_of(rp.load_spec(torch, ck, rep, D.prep["prep_id"])["meta"],
+                      a.n_exec)
+    p = os.path.join(a.log_dir, EXPECTED)
+    if os.path.exists(p):
+        old = json.load(open(p, encoding="utf-8"))
+        if old != man:
+            diff = sorted(k for k in set(old) | set(man)
+                          if old.get(k) != man.get(k))
+            raise SystemExit(f"журнал {a.log_dir} принадлежит другой модели "
+                             f"(расхождения {diff}); нужен новый каталог")
+        print(f"  ожидаемая модель совпадает с журналом {a.log_dir}")
+        return 0
+    os.makedirs(a.log_dir, exist_ok=True)
+    json.dump(man, open(p, "w", encoding="utf-8"), indent=1)
+    print(f"  ожидаемая модель закреплена: {p} ({man['ckpt_sha1'][:12]}, "
+          f"{man['weights_hash'][:12]})")
+    return 0
+
+
 def serve(a):
     import rt2_policy as rp
-    import rt2_train as r2
     root = os.environ.get("ROBOTWIN_ROOT")
     if not root:
         raise SystemExit("нужен ROBOTWIN_ROOT")
@@ -45,10 +85,16 @@ def serve(a):
         if p not in sys.path:
             sys.path.insert(0, p)
     from client_server.ws.model_server import PolicyServer, PolicyServerConfig
-    ck = a.ckpt or os.path.join(r2.outdir(a.seed, a.arch), "best.pt")
-    rep = a.train_report or r2.report_path(a.seed, a.arch)
+    ck, rep = model_paths(a)
+    p = os.path.join(a.log_dir, EXPECTED)
+    if not os.path.exists(p):
+        raise SystemExit(f"нет {p}: сначала rt2_eval.py expect")
+    want = json.load(open(p, encoding="utf-8"))
     model = rp.Model(dict(ckpt=ck, train_report=rep, device=a.device,
                           log_dir=a.log_dir, n_exec=a.n_exec))
+    got = manifest_of(model.meta, a.n_exec)
+    if got != want:
+        raise SystemExit(f"загруженная модель ≠ ожидаемой: {got} vs {want}")
     json.dump(dict(model.meta, n_exec=a.n_exec, port=a.port),
               open(os.path.join(a.log_dir, "server.json"), "w",
                    encoding="utf-8"), ensure_ascii=False, indent=1)
@@ -68,8 +114,19 @@ def read_task(log_dir, task):
     return [json.loads(x) for x in open(p, encoding="utf-8") if x.strip()]
 
 
-def task_problems(eps, task, n):
+def task_problems(eps, task, n, expected=None):
     p = []
+    if expected is not None:
+        import rt2_policy as rp
+        bad = [e.get("seed") for e in eps
+               if {k: (e.get("model") or {}).get(k) for k in rp.MODEL_KEYS}
+               != {k: expected[k] for k in rp.MODEL_KEYS}
+               or e.get("n_exec") != expected["n_exec"]]
+        if bad:
+            p.append(f"{task}: эпизоды другой модели (seed {bad[:3]})")
+    err = [e.get("seed") for e in eps if e.get("errors")]
+    if err:
+        p.append(f"{task}: отказ модели в эпизодах {err[:3]}")
     if len(eps) != n:
         p.append(f"{task}: эпизодов {len(eps)}, нужно {n}")
     seeds = [e.get("seed") for e in eps]
@@ -89,11 +146,28 @@ def task_problems(eps, task, n):
     return p
 
 
+def client_problems(path):
+    """Лог официального клиента: техническая ошибка раскатки (исключение,
+    перехваченное клиентом; аварийная остановка задачи) — задача
+    непригодна. Обычный неуспех и отбраковка состояний экспертом —
+    допустимы."""
+    if not os.path.exists(path):
+        return [f"нет лога клиента {path}"]
+    txt = open(path, encoding="utf-8", errors="replace").read()
+    return [f"в логе клиента «{m}» ({txt.count(m)} раз)"
+            for m in ROLLOUT_ERRORS if m in txt]
+
+
 def summarize(log_dir, tasks, n, out=None):
     rows, prob, bank, model = {}, [], {}, None
+    p = os.path.join(log_dir, EXPECTED)
+    expected = json.load(open(p, encoding="utf-8")) if os.path.exists(p) \
+        else None
+    if expected is None:
+        prob.append(f"нет манифеста ожидаемой модели {p}")
     for t in tasks:
         eps = read_task(log_dir, t)
-        prob += task_problems(eps, t, n)
+        prob += task_problems(eps, t, n, expected)
         if eps:
             model = eps[0].get("model")
         succ = sum(bool(e["success"]) for e in eps)
@@ -108,6 +182,7 @@ def summarize(log_dir, tasks, n, out=None):
         bank[t] = rows[t]["seeds"]
     srs = [r["sr"] for r in rows.values() if r["sr"] is not None]
     rep = dict(tasks=rows, n_per_task=n, complete=not prob, problems=prob,
+               expected_model=expected,
                sr_equal_weight=float(np.mean(srs)) if len(srs) == len(tasks)
                else None, bank=bank, model=model, log_dir=os.path.abspath(
                    log_dir),
@@ -132,15 +207,19 @@ def summarize(log_dir, tasks, n, out=None):
 
 def selftest():
     import tempfile
+    import rt2_policy as rp
     with tempfile.TemporaryDirectory() as td:
-        model = dict(ckpt_sha1="c", weights_hash="w")
+        model = {k: f"v_{k}" for k in rp.MODEL_KEYS}
+        json.dump(dict(model, n_exec=8), open(os.path.join(td, EXPECTED),
+                                              "w"))
         for t, k in (("lift_pot", 7), ("open_laptop", 3)):
             os.makedirs(os.path.join(td, t))
             with open(os.path.join(td, t, "episodes.jsonl"), "w") as fh:
                 for i in range(10):
                     fh.write(json.dumps(dict(
                         task=t, seed=SEED_START + 2 * i, success=i < k,
-                        calls=5, ms_median=100.0, model=model)) + "\n")
+                        calls=5, ms_median=100.0, model=model, n_exec=8))
+                        + "\n")
         out = os.path.join(td, "r.json")
         assert summarize(td, ["lift_pot", "open_laptop"], 10, out) == 0
         r = json.load(open(out))
@@ -162,10 +241,70 @@ def selftest():
         bad = [dict(e) for e in eps]
         bad[4]["mismatch"] = "x"
         assert task_problems(bad, "lift_pot", 10)
+        exp = json.load(open(os.path.join(td, EXPECTED)))
+        assert task_problems(eps, "lift_pot", 10, exp) == []
+        # другая задача целиком другой моделью — отказ по манифесту прогона
+        bad = [dict(e, model=dict(model, weights_hash="другая"))
+               for e in eps]
+        assert any("другой модели" in x for x in
+                   task_problems(bad, "lift_pot", 10, exp))
+        bad = [dict(e, n_exec=4) for e in eps]
+        assert task_problems(bad, "lift_pot", 10, exp)
+        bad = [dict(e) for e in eps]
+        bad[5]["errors"] = ["SystemExit: выход не конечен"]
+        assert any("отказ модели" in x for x in
+                   task_problems(bad, "lift_pot", 10, exp))
+        with open(os.path.join(td, "open_laptop", "episodes.jsonl"), "w") as fh:
+            for i in range(10):
+                fh.write(json.dumps(dict(
+                    task="open_laptop", seed=SEED_START + i, success=False,
+                    calls=5, model=dict(model, ckpt_sha1="B"), n_exec=8))
+                    + "\n")
+        assert summarize(td, ["lift_pot", "open_laptop"], 10) == 3
+        os.remove(os.path.join(td, EXPECTED))
+        assert summarize(td, ["lift_pot"], 10) == 3     # без манифеста
+        # лог клиента: перехваченная ошибка раскатки и аварийная остановка
+        lg = os.path.join(td, "client.log")
+        open(lg, "w").write("Success rate: 0/1\nFail!\n")
+        assert client_problems(lg) == []
+        open(lg, "w").write("\x1b[91mPolicy rollout error:\x1b[0m\nTraceback\n")
+        assert client_problems(lg)
+        open(lg, "w").write("RuntimeError: Aborting task: 5 consecutive")
+        assert client_problems(lg)
+        assert client_problems(os.path.join(td, "нет.log"))
+    # возобновление: манифест сверяется ДО записи; другая модель — отказ
+    import types
+    import rt1_data as rd
+    saved = (rp.load_spec, rd.Data)
+    metas = [dict({k: f"a_{k}" for k in rp.MODEL_KEYS}),
+             dict({k: f"b_{k}" for k in rp.MODEL_KEYS})]
+    try:
+        rd.Data = lambda **kw: types.SimpleNamespace(prep=dict(prep_id="P"))
+        with tempfile.TemporaryDirectory() as td:
+            args = types.SimpleNamespace(ckpt="c", train_report="r",
+                                         log_dir=td, n_exec=8, seed=0,
+                                         arch="flat24")
+            rp.load_spec = lambda *x: dict(meta=metas[0])
+            assert expect(args) == 0
+            first = open(os.path.join(td, EXPECTED)).read()
+            assert expect(args) == 0                    # та же модель
+            rp.load_spec = lambda *x: dict(meta=metas[1])
+            try:
+                expect(args)
+                raise AssertionError("журнал другой модели принят")
+            except SystemExit as e:
+                assert "другой модели" in str(e.code)
+            assert open(os.path.join(td, EXPECTED)).read() == first
+    finally:
+        rp.load_spec, rd.Data = saved
     assert set(SMOKE_TASKS) <= set(rc.TASKS) and len(rc.TASKS) == 8
     print("самопроверка rt2_eval пройдена: сводка по задачам (SR, равные "
           "веса, банк seed), отказ при неполном наборе, повторе seed, чужой "
-          "задаче, разных моделях и расхождении prepare_case/trial_end")
+          "задаче, разных моделях (в задаче и между задачами по манифесту "
+          "прогона), другом n_exec, без манифеста, отказе модели, "
+          "расхождении prepare_case/trial_end; лог клиента — ошибка "
+          "раскатки и аварийная остановка задачи; манифест при возобновлении "
+          "сверяется до записи (другая модель — отказ, файл не меняется)")
     return 0
 
 
@@ -173,7 +312,9 @@ def main():
     if "--selftest" in sys.argv:
         return selftest()
     ap = argparse.ArgumentParser(description="RoboTwin: официальная оценка")
-    ap.add_argument("cmd", choices=("serve", "summarize", "tasks"))
+    ap.add_argument("cmd", choices=("serve", "summarize", "tasks", "expect",
+                                    "client-check"))
+    ap.add_argument("--log", default=None)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--arch", default="flat24")
     ap.add_argument("--ckpt", default=None)
@@ -191,6 +332,15 @@ def main():
         if a.cmd == "tasks":
             print(" ".join(rc.TASKS))
             return 0
+        if a.cmd == "expect":
+            if not a.log_dir:
+                raise SystemExit("expect: нужен --log-dir")
+            return expect(a)
+        if a.cmd == "client-check":
+            prob = client_problems(a.log)
+            print("  " + ("; ".join(prob) if prob else
+                          "лог клиента: технических ошибок раскатки нет"))
+            return 3 if prob else 0
         if a.cmd == "serve":
             if a.port is None or not a.log_dir:
                 raise SystemExit("serve: нужны --port и --log-dir")

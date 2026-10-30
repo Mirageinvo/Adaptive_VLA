@@ -44,6 +44,10 @@ fi
 $VLA_PY experiments/rt2_policy.py --selftest >/dev/null 2>&1 || { echo "ОТКАЗ: самопроверка rt2_policy"; finish 1; }
 $VLA_PY experiments/rt2_eval.py --selftest >/dev/null 2>&1 || { echo "ОТКАЗ: самопроверка rt2_eval"; finish 1; }
 
+echo "=== ЭТАП ожидаемая модель (сверка журнала до запуска)"
+$VLA_PY experiments/rt2_eval.py expect --seed "$SEED" --arch "$ARCH" --log-dir "$LOGD" \
+  || { echo "ОТКАЗ: модель не совпадает с журналом $LOGD или чекпойнт не прошёл сверку"; finish 3; }
+
 PORT="$($VLA_PY -c 'import socket; s=socket.socket(); s.bind(("localhost",0)); print(s.getsockname()[1])')"
 echo "=== ЭТАП сервер политики (порт $PORT)"
 $VLA_PY experiments/rt2_eval.py serve --seed "$SEED" --arch "$ARCH" --device "$DEV" \
@@ -73,8 +77,12 @@ for T in $TASKS; do
     --seed 0 --test_num '$N' --task_config demo_clean --frequency 15 --expert_check true \
     --additional_info 'ckpt_name=rt2_s${SEED}_${ARCH},action_type=joint'" \
     > "logs/rt2/client_${MODE}_${T}.log" 2>&1 || rc=$?
-  grep -E "Success rate|Final success|Policy rollout error|Error|error" "logs/rt2/client_${MODE}_${T}.log" | tail -n 4
+  grep -E "Success rate|Final success" "logs/rt2/client_${MODE}_${T}.log" | tail -n 2
   [ $rc -eq 0 ] || { echo "ОСТАНОВ: клиент $T код $rc (logs/rt2/client_${MODE}_${T}.log)"; finish 3; }
+  if ! $VLA_PY experiments/rt2_eval.py client-check --log "logs/rt2/client_${MODE}_${T}.log"; then
+    Q="$LOGD/quarantine/$(date +%Y%m%dT%H%M%S)_${T}_rollout_error"; mv "$LOGD/$T" "$Q" 2>/dev/null
+    echo "ОСТАНОВ: $T технически непригодна (ошибка раскатки), журнал -> $Q"; finish 3
+  fi
   kill -0 "$SPID" 2>/dev/null || { echo "ОСТАНОВ: сервер политики упал"; tail -n 30 "logs/rt2/server_${MODE}_s${SEED}_${ARCH}.log"; finish 3; }
   $VLA_PY experiments/rt2_eval.py summarize --log-dir "$LOGD" --tasks "$T" --n "$N" \
     || { echo "ОСТАНОВ: журнал $T неполный"; finish 3; }

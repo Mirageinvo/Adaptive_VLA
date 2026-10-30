@@ -87,6 +87,76 @@ def pack(chunk, n_exec):
     return out
 
 
+MODEL_KEYS = ("ckpt_sha1", "weights_hash", "prep_id", "policy_sha1",
+              "factory", "seed", "version")
+
+
+def load_spec(torch, ck_path, rep_path, prep_id):
+    """Чекпойнт RT2 (формат rt2_train.Trainer.check: weights, update, val_L,
+    contract, init_hash, weights_hash) -> спецификация модели со сверкой:
+    SHA файла = отчёту обучения, отпечаток весов, prep_id подготовки, SHA
+    кода контракта."""
+    import k21_train as ktr
+    rep = json.load(open(rep_path, encoding="utf-8"))
+    if sha(ck_path) != rep["best_sha1"]:
+        raise SystemExit(f"{ck_path} ≠ отчёту обучения {rep_path}")
+    ck = torch.load(ck_path, map_location="cpu", weights_only=False)
+    if "contract" not in ck:
+        raise SystemExit(f"{ck_path}: нет контракта обучения (ключи "
+                         f"{sorted(ck)})")
+    cfg = ck["contract"]
+    if ck["weights_hash"] != rep.get("best_weights_hash") or \
+            ktr.state_hash(ck["weights"]) != ck["weights_hash"]:
+        raise SystemExit("отпечаток весов чекпойнта ≠ отчёту / содержимому")
+    if cfg["prep_id"] != prep_id:
+        raise SystemExit("чекпойнт обучен на другой подготовке")
+    bad = [f for f, s in cfg["code"].items()
+           if sha(os.path.join(HERE, f)) != s]
+    if bad:
+        raise SystemExit(f"код модели изменён после обучения: {bad}")
+    meta = dict(ckpt=os.path.abspath(ck_path), ckpt_sha1=sha(ck_path),
+                weights_hash=ck["weights_hash"], factory=cfg["factory"],
+                seed=int(cfg["seed"]), prep_id=cfg["prep_id"],
+                best_update=ck.get("update"),
+                policy_sha1=sha(os.path.abspath(__file__)), version=VERSION)
+    return dict(ck=ck, contract=cfg, meta=meta)
+
+
+def build_model(torch, spec, D, device):
+    """Модель RT2 на BAR с весами спецификации -> predict(img, s_n, text)."""
+    import k21_train as ktr
+    import rt2_train as r2
+    cfg, ck = spec["contract"], spec["ck"]
+    dev = torch.device(device)
+    mod_m, arch = r2.factory(cfg["factory"])
+    bar = rc.load_bar(dev, "bfloat16")
+    m = bar["model"]
+    m.action_expert.float()
+    mod = mod_m.build(torch)[arch](m, D.L, D.U, checkpoint=False,
+                                   seed=int(cfg["seed"])).to(dev)
+    own = dict(mod.named_parameters())
+    own.update(dict(mod.named_buffers()))
+    with torch.no_grad():
+        for k, v in ck["weights"].items():
+            if k not in own:
+                raise SystemExit(f"в модели нет {k}")
+            own[k].copy_(v.to(own[k].device, own[k].dtype))
+    if ktr.state_hash(ktr.trainable_state(mod)) != ck["weights_hash"]:
+        raise SystemExit("веса после загрузки ≠ отпечатку чекпойнта")
+    mod.eval()
+    for p in mod.parameters():
+        p.requires_grad_(False)
+
+    def predict(img, s_n, text):
+        batch = rc.prompt_batch(bar, [img], [s_n], [text], dev,
+                                torch.bfloat16)
+        st = torch.as_tensor(np.asarray(s_n, np.float32)[None], device=dev)
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            out = mod(batch, rc.POS_OFFSET, st)
+        return out["action"][0].float().cpu().numpy()
+    return predict
+
+
 class Model:
     """Модель для XPolicyLab PolicyServer. model_cfg: ckpt, train_report,
     device, log_dir, n_exec (8). Для самопроверки — _predict (функция
@@ -113,58 +183,15 @@ class Model:
     # --- загрузка -------------------------------------------------------------
     def _load(self):
         import torch
-        import k21_train as ktr
         import rt1_data as rd
-        import rt2_train as r2
-        ck_path, rep_path = self.cfg["ckpt"], self.cfg["train_report"]
-        rep = json.load(open(rep_path, encoding="utf-8"))
-        if sha(ck_path) != rep["best_sha1"]:
-            raise SystemExit(f"{ck_path} ≠ отчёту обучения {rep_path}")
-        ck = torch.load(ck_path, map_location="cpu", weights_only=False)
-        cfg = ck["config"]
-        D = rd.Data(check=True, check_files=False)
-        if cfg["prep_id"] != D.prep["prep_id"]:
-            raise SystemExit("чекпойнт обучен на другой подготовке")
-        bad = [f for f, s in cfg["code"].items()
-               if sha(os.path.join(HERE, f)) != s]
-        if bad:
-            raise SystemExit(f"код модели изменён после обучения: {bad}")
-        dev = torch.device(self.cfg.get("device", "cuda:0"))
-        mod_m, arch = r2.factory(cfg["factory"])
-        bar = rc.load_bar(dev, "bfloat16")
-        m = bar["model"]
-        m.action_expert.float()
-        mod = mod_m.build(torch)[arch](m, D.L, D.U, checkpoint=False,
-                                       seed=int(cfg["seed"])).to(dev)
-        own = dict(mod.named_parameters())
-        own.update(dict(mod.named_buffers()))
-        with torch.no_grad():
-            for k, v in ck["weights"].items():
-                if k not in own:
-                    raise SystemExit(f"в модели нет {k}")
-                own[k].copy_(v.to(own[k].device, own[k].dtype))
-        if ktr.state_hash(ktr.trainable_state(mod)) != ck["weights_hash"]:
-            raise SystemExit("веса после загрузки ≠ отпечатку чекпойнта")
-        mod.eval()
-        for p in mod.parameters():
-            p.requires_grad_(False)
+        D = self.cfg.get("_data") or rd.Data(check=True, check_files=False)
+        spec = load_spec(torch, self.cfg["ckpt"], self.cfg["train_report"],
+                         D.prep["prep_id"])
+        build = self.cfg.get("_build") or build_model
+        self._predict = build(torch, spec, D, self.cfg.get("device",
+                                                           "cuda:0"))
         self.q01, self.q99, self.L, self.U = D.q01, D.q99, D.L, D.U
-        self.meta = dict(ckpt=os.path.abspath(ck_path), ckpt_sha1=sha(ck_path),
-                         weights_hash=ck["weights_hash"], factory=cfg["factory"],
-                         seed=int(cfg["seed"]), prep_id=D.prep["prep_id"],
-                         best_update=ck.get("update"),
-                         policy_sha1=sha(os.path.abspath(__file__)),
-                         version=VERSION)
-
-        def predict(img, s_n, text):
-            batch = rc.prompt_batch(bar, [img], [s_n], [text], dev,
-                                    torch.bfloat16)
-            st = torch.as_tensor(np.asarray(s_n, np.float32)[None],
-                                 device=dev)
-            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-                out = mod(batch, rc.POS_OFFSET, st)
-            return out["action"][0].float().cpu().numpy()
-        self._predict = predict
+        self.meta = spec["meta"]
         print(f"[rt2_policy] загружено: {self.meta}", flush=True)
 
     # --- интерфейс XPolicyLab -------------------------------------------------
@@ -178,6 +205,15 @@ class Model:
         raise NotImplementedError("пакетная оценка не используется")
 
     def get_action(self):
+        try:
+            return self._get_action()
+        except BaseException as e:      # отказ модели — в журнал эпизода
+            if self.ep is not None:
+                self.ep.setdefault("errors", []).append(
+                    f"{type(e).__name__}: {getattr(e, 'code', None) or e}")
+            raise
+
+    def _get_action(self):
         if self.obs is None:
             raise SystemExit("get_action до update_obs")
         t0 = time.perf_counter()
@@ -331,11 +367,83 @@ def selftest():
                 raise AssertionError("плохой выход принят")
             except SystemExit:
                 pass
+    # путь _load на настоящем файле в формате rt2_train.Trainer.check
+    import types as _t
+    import torch
+    import k21_train as ktr
+    with tempfile.TemporaryDirectory() as td:
+        w = {"x.weight": torch.arange(6.0).reshape(2, 3)}
+        contract = dict(mode="train", factory="rt1_model:flat24", seed=0,
+                        prep_id="P1", code={"rt1_common.py": sha(os.path.join(
+                            HERE, "rt1_common.py"))})
+        ckp, rp_ = os.path.join(td, "best.pt"), os.path.join(td, "r.json")
+
+        def write(ck):
+            torch.save(ck, ckp)
+            json.dump(dict(best_sha1=sha(ckp),
+                           best_weights_hash=ck.get("weights_hash")),
+                      open(rp_, "w"))
+        good = dict(weights=w, update=500, val_L=0.1, contract=contract,
+                    init_hash="i", weights_hash=ktr.state_hash(w))
+        write(good)
+        Dd = _t.SimpleNamespace(prep=dict(prep_id="P1"), q01=q01, q99=q99,
+                                L=L, U=U)
+        built = {}
+
+        def fake_build(torch_, spec, D_, device):
+            built.update(spec=spec, device=device)
+            return predict
+        mm = Model(dict(ckpt=ckp, train_report=rp_, device="cuda:1",
+                        _data=Dd, _build=fake_build))
+        assert mm.meta["prep_id"] == "P1" and mm.meta["factory"] == \
+            "rt1_model:flat24" and built["device"] == "cuda:1"
+        assert set(MODEL_KEYS) <= set(mm.meta)
+        mm.update_obs(obs)
+        assert len(mm.get_action()) == 8
+        for mut, word in (
+                (lambda c: c.update(contract=dict(contract, prep_id="P2")),
+                 "подготовке"),
+                (lambda c: c.update(weights_hash="0" * 40), "отпечаток"),
+                (lambda c: c.update(contract=dict(contract, code={
+                    "rt1_common.py": "0" * 40})), "код"),
+                (lambda c: c.update(config=c.pop("contract")), "контракт")):
+            ck = dict(good)
+            mut(ck)
+            write(ck)
+            try:
+                Model(dict(ckpt=ckp, train_report=rp_, _data=Dd,
+                           _build=fake_build))
+                raise AssertionError(word)
+            except SystemExit as e:
+                assert word in str(e.code), (word, e.code)
+        write(good)
+        open(ckp, "ab").write(b"x")             # файл ≠ отчёту
+        try:
+            Model(dict(ckpt=ckp, train_report=rp_, _data=Dd,
+                       _build=fake_build))
+            raise AssertionError("изменённый файл принят")
+        except SystemExit:
+            pass
+    # отказ модели попадает в журнал эпизода
+    mb = Model(dict(_predict=lambda *a: np.full((20, 14), np.nan),
+                    _prep=(q01, q99, L, U)))
+    mb.prepare_case(dict(task_name="lift_pot", seed=100001))
+    mb.update_obs(obs)
+    try:
+        mb.get_action()
+    except SystemExit:
+        pass
+    ep = mb.on_trial_end(dict(task_name="lift_pot", seed=100001,
+                              success=False))
+    assert ep.get("errors") and "SystemExit" in ep["errors"][0]
     print("самопроверка rt2_policy пройдена: 8 команд из 20, ключи и порядок "
           "каналов (левая рука, левый схват, правая рука, правый схват), "
           "склейка head|left|right, нормировка состояния, инструкция из "
           "наблюдения, журнал эпизода (prepare_case/trial_end), reset, отказы "
-          "на неверный вход, NaN и выход за пределы")
+          "на неверный вход, NaN и выход за пределы; загрузка чекпойнта "
+          "формата Trainer.check (contract) и отказы при чужом prep_id, "
+          "отпечатке, коде, ключе config, изменённом файле; ошибка модели — "
+          "в журнале эпизода")
     return 0
 
 
