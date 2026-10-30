@@ -222,8 +222,7 @@ def summarize(log_dir, tasks, n, out=None):
     for t in tasks:
         eps = read_task(log_dir, t)
         prob += task_problems(eps, t, n, expected)
-        if not os.path.exists(os.path.join(log_dir, t, DONE)):
-            prob.append(f"{t}: нет отметки завершения")
+        prob += task_done_problems(log_dir, t, n)
         if eps:
             model = eps[0].get("model")
         succ = sum(bool(e["success"]) for e in eps)
@@ -299,6 +298,7 @@ def selftest():
         open(ep_, "a").write("\n")                            # журнал изменён
         assert any("изменён" in x for x in
                    task_done_problems(td, "open_laptop", 10))
+        assert summarize(td, ["lift_pot", "open_laptop"], 10) == 3
         r = json.load(open(out))
         assert r["tasks"]["lift_pot"]["success"] == 7 and \
             abs(r["sr_equal_weight"] - 0.5) < 1e-12
