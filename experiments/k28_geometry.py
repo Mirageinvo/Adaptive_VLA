@@ -78,14 +78,21 @@ def build(torch):
             return w
 
     def interp(pL, RL, pR, RR, alpha):
-        """alpha [...] в [0, 1] -> (p, R)."""
-        a = alpha.to(_dt(pL))
-        p = pL + a[..., None] * (pR - pL)
-        R = RL @ exp_so3(a[..., None] * log_so3(RL.transpose(-1, -2) @ RR))
-        return p, R
+        """alpha [...] в [0, 1] -> (p, R). Всё тело вне autocast."""
+        with torch.autocast(pL.device.type, enabled=False):
+            dt = torch.promote_types(_dt(pL), _dt(RL))
+            pL, pR, RL, RR = (x.to(dt) for x in (pL, pR, RL, RR))
+            a = alpha.to(dt)
+            p = pL + a[..., None] * (pR - pL)
+            R = RL @ exp_so3(a[..., None] * log_so3(RL.transpose(-1, -2)
+                                                     @ RR))
+            return p, R
 
     def rot_err(R_ref, R_now):
-        return log_so3(R_ref @ R_now.transpose(-1, -2))
+        """Log(R_ref @ R_now.T); всё тело вне autocast."""
+        with torch.autocast(R_ref.device.type, enabled=False):
+            dt = torch.promote_types(_dt(R_ref), _dt(R_now))
+            return log_so3(R_ref.to(dt) @ R_now.to(dt).transpose(-1, -2))
 
     def pose_of_state8(s8):
         """state8 [..., 8] (позиция, axis-angle, пальцы) -> (p, R)."""
@@ -155,10 +162,24 @@ def selftest():
         L32b = G["log_so3"](R32b)
     assert R32b.dtype == torch.float32 and torch.equal(R32, R32b)
     assert L32b.dtype == torch.float32
+    # interp и rot_err под bf16-autocast совпадают с float32 по значениям
+    Rf = G["exp_so3"](torch.randn(8, 3, generator=g) * 0.9)
+    Rn = G["exp_so3"](torch.randn(8, 3, generator=g) * 0.9)
+    pf, pn = torch.randn(8, 3, generator=g), torch.randn(8, 3, generator=g)
+    al = torch.rand(8, generator=g)
+    e_ref = G["rot_err"](Rf, Rn)
+    i_ref = G["interp"](pf, Rf, pn, Rn, al)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        e_b = G["rot_err"](Rf, Rn)
+        i_b = G["interp"](pf, Rf, pn, Rn, al)
+    assert e_b.dtype == torch.float32 and torch.equal(e_b, e_ref)
+    assert torch.equal(i_b[0], i_ref[0]) and torch.equal(i_b[1], i_ref[1])
+    assert G["rot_err"](Rf.double(), Rn.double()).dtype == torch.float64
     print("самопроверка k28_geometry пройдена: Exp/Log ортонормированы и "
           "взаимно обратны (обычные, около 0, около π и ровно π), "
           "интерполяция (концы, поступательная, геодезическая четверть), "
-          "ошибка Log(R_ref R_nowᵀ), gradcheck float64, float32 вне autocast")
+          "ошибка Log(R_ref R_nowᵀ), gradcheck float64, float32 вне autocast; "
+          "interp и rot_err под bf16-autocast = float32 по значениям")
     return 0
 
 
