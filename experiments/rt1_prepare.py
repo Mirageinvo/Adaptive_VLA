@@ -53,13 +53,29 @@ def step_limits(robotwin_root):
     return yaml.safe_load(open(p, encoding="utf-8")), rc.sha(p)
 
 
+INS_MAX_CHARS = 400
+
+
 def instructions(h):
+    """Список формулировок задачи. В RoboTwin поле instructions — ОДНА
+    байтовая строка с JSON-списком (иногда словарём seen/unseen); каждый
+    элемент — отдельная инструкция. Массив строк тоже принимается."""
     if "instructions" not in h:
         return []
     v = h["instructions"][()]
-    v = np.asarray(v).reshape(-1)
-    return [x.decode("utf-8") if isinstance(x, (bytes, bytearray)) else str(x)
-            for x in v]
+    items = []
+    for x in np.asarray(v, dtype=object).reshape(-1):
+        x = x.decode("utf-8") if isinstance(x, (bytes, bytearray)) else str(x)
+        t = x.strip()
+        if t[:1] in "[{":
+            j = json.loads(t)
+            if isinstance(j, dict):
+                j = [y for k in sorted(j) for y in (j[k] if isinstance(
+                    j[k], list) else [j[k]])]
+            items += [str(y).strip() for y in j]
+        else:
+            items.append(t)
+    return [x for x in items if x]
 
 
 def check_episode(h, name):
@@ -88,7 +104,13 @@ def check_episode(h, name):
     ins = instructions(h)
     if not ins:
         p.append(f"{name}: нет инструкций")
-    return dict(T=T, step_max_abs=d, n_instructions=len(ins)), p, act, st
+    long_ = [x[:60] for x in ins if len(x) > INS_MAX_CHARS]
+    if long_:
+        p.append(f"{name}: инструкция длиннее {INS_MAX_CHARS} символов "
+                 f"(не разобран список?): {long_[:1]}")
+    return dict(T=T, step_max_abs=d, n_instructions=len(ins),
+                ins_max_chars=max((len(x) for x in ins), default=0)), \
+        p, act, st
 
 
 def stats(x):
@@ -180,7 +202,7 @@ def prepare(a):
             continue
         val = set(split(eps, task))
         tr = dict(episodes=len(eps), val=sorted(val), lengths=[],
-                  step_max_abs=0.0)
+                  step_max_abs=0.0, n_ins=[], ins_chars=0)
         for ei, f in enumerate(eps):
             with h5py.File(f, "r") as h:
                 s, p, act, st = check_episode(h, f"{task}/{os.path.basename(f)}")
@@ -190,6 +212,8 @@ def prepare(a):
                               sha1=rc.sha(f), T=s["T"],
                               split="val" if ei in val else "train"))
             tr["lengths"].append(s["T"])
+            tr["n_ins"].append(s["n_instructions"])
+            tr["ins_chars"] = max(tr["ins_chars"], s["ins_max_chars"])
             tr["step_max_abs"] = max(tr["step_max_abs"], s["step_max_abs"])
             for t in range(s["T"]):
                 rows["task"].append(ti)
@@ -204,10 +228,18 @@ def prepare(a):
         tr["length"] = dict(min=int(Ls.min()), median=float(np.median(Ls)),
                             max=int(Ls.max()))
         del tr["lengths"]
+        tr["instructions"] = dict(
+            parse="json-list v2", per_episode_min=int(min(tr["n_ins"])),
+            per_episode_max=int(max(tr["n_ins"])),
+            max_chars=int(tr.pop("ins_chars")))
+        del tr["n_ins"]
         rep["tasks"][task] = tr
         print(f"  {task}: эпизодов {len(eps)} (проверка {sorted(val)}), "
               f"длина {tr['length']}, max|a[t]−s[t+1]| "
-              f"{tr['step_max_abs']:.2g}", flush=True)
+              f"{tr['step_max_abs']:.2g}; инструкций на эпизод "
+              f"{tr['instructions']['per_episode_min']}–"
+              f"{tr['instructions']['per_episode_max']}, до "
+              f"{tr['instructions']['max_chars']} символов", flush=True)
     shas = [f["sha1"] for f in files]
     if len(set(shas)) != len(shas):
         prob.append("повторяющиеся файлы эпизодов (одинаковый SHA)")
@@ -270,6 +302,20 @@ def selftest():
     h["instructions"] = np.array([b"lift the pot"])
     s, p, act, _ = check_episode(h, "ok")
     assert p == [] and s["T"] == T and s["n_instructions"] == 1, p
+    # формат RoboTwin: одна байтовая строка с JSON-списком; словарь seen/unseen
+    lst = ["Lift the pot.", "Use both arms to raise the pot"]
+    hj = H(h)
+    hj["instructions"] = np.array(json.dumps(lst).encode())   # 0-d, как h5py
+    s, p, _a, _ = check_episode(hj, "json")
+    assert p == [] and s["n_instructions"] == 2 and \
+        instructions(hj) == lst, (p, instructions(hj))
+    hd = H(h)
+    hd["instructions"] = np.array(json.dumps(dict(seen=lst,
+                                                  unseen=["Raise it"])).encode())
+    assert instructions(hd) == lst + ["Raise it"]
+    hl = H(h)
+    hl["instructions"] = np.array(("x" * 500).encode())
+    assert any("длиннее" in x for x in check_episode(hl, "long")[1])
     h2 = H(h)
     h2["action/left_arm_joint_states"] = h["action/left_arm_joint_states"] + 1
     assert any("state[t+1]" in x for x in check_episode(h2, "bad")[1])
