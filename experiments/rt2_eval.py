@@ -158,6 +158,60 @@ def client_problems(path):
             for m in ROLLOUT_ERRORS if m in txt]
 
 
+DONE = "done.json"
+
+
+def _sha(path):
+    import hashlib
+    return hashlib.sha1(open(path, "rb").read()).hexdigest()
+
+
+def task_done_problems(log_dir, task, n):
+    """Задача пропускается при возобновлении, только если есть отметка
+    завершения (после кода клиента 0, чистого лога клиента и полной сводки),
+    она привязана к текущему манифесту, задаче, n и SHA журнала, а журнал
+    по-прежнему проходит проверку."""
+    p = []
+    mp = os.path.join(log_dir, EXPECTED)
+    dp = os.path.join(log_dir, task, DONE)
+    ep = os.path.join(log_dir, task, "episodes.jsonl")
+    if not os.path.exists(dp):
+        return [f"{task}: нет отметки завершения"]
+    d = json.load(open(dp, encoding="utf-8"))
+    exp = json.load(open(mp, encoding="utf-8")) if os.path.exists(mp) else None
+    if d.get("expected") != exp or exp is None:
+        p.append(f"{task}: отметка другой модели")
+    if d.get("task") != task or d.get("n") != n:
+        p.append(f"{task}: отметка для {d.get('task')}/{d.get('n')}")
+    if not os.path.exists(ep) or _sha(ep) != d.get("episodes_sha1"):
+        p.append(f"{task}: журнал изменён после отметки")
+    if not p:
+        p += task_problems(read_task(log_dir, task), task, n, exp)
+    return p
+
+
+def mark_done(log_dir, task, n, client_log):
+    """Отметка завершения задачи — только после чистого лога клиента и
+    полной проверки журнала против манифеста."""
+    mp = os.path.join(log_dir, EXPECTED)
+    if not os.path.exists(mp):
+        raise SystemExit(f"нет {mp}")
+    exp = json.load(open(mp, encoding="utf-8"))
+    prob = client_problems(client_log) + task_problems(
+        read_task(log_dir, task), task, n, exp)
+    if prob:
+        raise SystemExit("отметка завершения не ставится: " +
+                         "; ".join(prob[:4]))
+    ep = os.path.join(log_dir, task, "episodes.jsonl")
+    d = dict(task=task, n=n, expected=exp, episodes_sha1=_sha(ep),
+             client_log=os.path.abspath(client_log),
+             client_log_sha1=_sha(client_log))
+    json.dump(d, open(os.path.join(log_dir, task, DONE), "w",
+                      encoding="utf-8"), ensure_ascii=False, indent=1)
+    print(f"  {task}: отметка завершения поставлена")
+    return 0
+
+
 def summarize(log_dir, tasks, n, out=None):
     rows, prob, bank, model = {}, [], {}, None
     p = os.path.join(log_dir, EXPECTED)
@@ -168,6 +222,8 @@ def summarize(log_dir, tasks, n, out=None):
     for t in tasks:
         eps = read_task(log_dir, t)
         prob += task_problems(eps, t, n, expected)
+        if not os.path.exists(os.path.join(log_dir, t, DONE)):
+            prob.append(f"{t}: нет отметки завершения")
         if eps:
             model = eps[0].get("model")
         succ = sum(bool(e["success"]) for e in eps)
@@ -220,8 +276,29 @@ def selftest():
                         task=t, seed=SEED_START + 2 * i, success=i < k,
                         calls=5, ms_median=100.0, model=model, n_exec=8))
                         + "\n")
+        clean = os.path.join(td, "clean.log")
+        open(clean, "w").write("Success rate: 7/10\nFail!\n")
         out = os.path.join(td, "r.json")
+        assert summarize(td, ["lift_pot", "open_laptop"], 10, out) == 3
+        # отметка: полный журнал + лог с ошибкой клиента — не ставится и
+        # не переиспользуется; обычный неуспех без ошибок — принимается
+        dirty = os.path.join(td, "dirty.log")
+        open(dirty, "w").write("Policy rollout error:\nTraceback\nFail!\n")
+        try:
+            mark_done(td, "lift_pot", 10, dirty)
+            raise AssertionError("отметка при ошибке раскатки")
+        except SystemExit:
+            pass
+        assert task_done_problems(td, "lift_pot", 10)
+        for t in ("lift_pot", "open_laptop"):
+            assert mark_done(td, t, 10, clean) == 0
+            assert task_done_problems(td, t, 10) == []
         assert summarize(td, ["lift_pot", "open_laptop"], 10, out) == 0
+        assert task_done_problems(td, "lift_pot", 9)          # другое n
+        ep_ = os.path.join(td, "open_laptop", "episodes.jsonl")
+        open(ep_, "a").write("\n")                            # журнал изменён
+        assert any("изменён" in x for x in
+                   task_done_problems(td, "open_laptop", 10))
         r = json.load(open(out))
         assert r["tasks"]["lift_pot"]["success"] == 7 and \
             abs(r["sr_equal_weight"] - 0.5) < 1e-12
@@ -304,7 +381,10 @@ def selftest():
           "прогона), другом n_exec, без манифеста, отказе модели, "
           "расхождении prepare_case/trial_end; лог клиента — ошибка "
           "раскатки и аварийная остановка задачи; манифест при возобновлении "
-          "сверяется до записи (другая модель — отказ, файл не меняется)")
+          "сверяется до записи (другая модель — отказ, файл не меняется); "
+          "отметка завершения задачи — только после чистого лога клиента и "
+          "полной сводки, привязана к манифесту, n и SHA журнала; полный "
+          "журнал с ошибкой клиента без отметки не переиспользуется")
     return 0
 
 
@@ -313,7 +393,7 @@ def main():
         return selftest()
     ap = argparse.ArgumentParser(description="RoboTwin: официальная оценка")
     ap.add_argument("cmd", choices=("serve", "summarize", "tasks", "expect",
-                                    "client-check"))
+                                    "client-check", "mark-done", "is-done"))
     ap.add_argument("--log", default=None)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--arch", default="flat24")
@@ -336,6 +416,15 @@ def main():
             if not a.log_dir:
                 raise SystemExit("expect: нужен --log-dir")
             return expect(a)
+        if a.cmd in ("mark-done", "is-done"):
+            if not a.log_dir or not a.tasks or len(a.tasks) != 1:
+                raise SystemExit(f"{a.cmd}: нужны --log-dir и одна --tasks")
+            if a.cmd == "mark-done":
+                return mark_done(a.log_dir, a.tasks[0], a.n, a.log)
+            prob = task_done_problems(a.log_dir, a.tasks[0], a.n)
+            print("  " + ("; ".join(prob) if prob else
+                          f"{a.tasks[0]}: завершена и проверена"))
+            return 3 if prob else 0
         if a.cmd == "client-check":
             prob = client_problems(a.log)
             print("  " + ("; ".join(prob) if prob else

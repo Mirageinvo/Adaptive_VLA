@@ -6,8 +6,11 @@
 # раз; клиент — официальный RoboTwin scripts/eval_policy_xpolicylab.py в
 # окружении RoboTwin, по одной задаче подряд (seed 0: состояния от 100000,
 # экспертная проверка, task_config demo_clean, частота 15). Журнал эпизодов —
-# reports/rt2/eval/<режим>_s<SEED>_<ARCH>/<задача>/episodes.jsonl; полная
-# задача при повторном запуске пропускается, неполная — в карантин и заново.
+# reports/rt2/eval/<режим>_s<SEED>_<ARCH>/<задача>/episodes.jsonl. Задача
+# получает отметку завершения (done.json) только после кода клиента 0, чистого
+# лога клиента и полной проверки журнала против манифеста модели; при
+# повторном запуске пропускается только задача с такой отметкой, остальные —
+# в карантин и заново.
 # Не одновременно с обучением; flock. Окружения:
 #   VLA_PY    — python окружения vla (по умолчанию /home/malinin_aa/envs/vla/bin/python)
 #   RT_ENV_SH — скрипт активации окружения RoboTwin (по умолчанию /home/malinin_aa/robotwin_env.sh)
@@ -63,8 +66,8 @@ $VLA_PY -c "import socket,sys; s=socket.socket(); sys.exit(s.connect_ex(('localh
 grep -E "загружено" "logs/rt2/server_${MODE}_s${SEED}_${ARCH}.log" | tail -n 1
 
 for T in $TASKS; do
-  if $VLA_PY experiments/rt2_eval.py summarize --log-dir "$LOGD" --tasks "$T" --n "$N" >/dev/null 2>&1; then
-    echo "    $T: уже есть $N эпизодов"; continue
+  if $VLA_PY experiments/rt2_eval.py is-done --log-dir "$LOGD" --tasks "$T" --n "$N" >/dev/null 2>&1; then
+    echo "    $T: уже завершена и проверена ($N эпизодов)"; continue
   fi
   if [ -d "$LOGD/$T" ]; then
     Q="$LOGD/quarantine/$(date +%Y%m%dT%H%M%S)_$T"; mv "$LOGD/$T" "$Q"
@@ -84,8 +87,9 @@ for T in $TASKS; do
     echo "ОСТАНОВ: $T технически непригодна (ошибка раскатки), журнал -> $Q"; finish 3
   fi
   kill -0 "$SPID" 2>/dev/null || { echo "ОСТАНОВ: сервер политики упал"; tail -n 30 "logs/rt2/server_${MODE}_s${SEED}_${ARCH}.log"; finish 3; }
-  $VLA_PY experiments/rt2_eval.py summarize --log-dir "$LOGD" --tasks "$T" --n "$N" \
-    || { echo "ОСТАНОВ: журнал $T неполный"; finish 3; }
+  $VLA_PY experiments/rt2_eval.py mark-done --log-dir "$LOGD" --tasks "$T" --n "$N" \
+    --log "logs/rt2/client_${MODE}_${T}.log" \
+    || { echo "ОСТАНОВ: журнал $T не прошёл проверку — отметка завершения не поставлена"; finish 3; }
 done
 echo "=== ЭТАП сводка"
 $VLA_PY experiments/rt2_eval.py summarize --log-dir "$LOGD" --n "$N" \
