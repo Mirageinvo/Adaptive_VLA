@@ -75,23 +75,43 @@ def expect(a):
     return 0
 
 
+def module_origins(names):
+    """{имя: путь} уже загруженных модулей (для сверки, что импорт сервера
+    не подменил модули модели)."""
+    out = {}
+    for n in names:
+        m = sys.modules.get(n)
+        if m is not None:
+            out[n] = getattr(m, "__file__", None) or str(
+                list(getattr(m, "__path__", [])))
+    return out
+
+
 def serve(a):
     import rt2_policy as rp
     root = os.environ.get("ROBOTWIN_ROOT")
     if not root:
         raise SystemExit("нужен ROBOTWIN_ROOT")
-    xpl = os.path.join(root, "XPolicyLab")
-    for p in (xpl, root):
-        if p not in sys.path:
-            sys.path.insert(0, p)
-    from client_server.ws.model_server import PolicyServer, PolicyServerConfig
     ck, rep = model_paths(a)
     p = os.path.join(a.log_dir, EXPECTED)
     if not os.path.exists(p):
         raise SystemExit(f"нет {p}: сначала rt2_eval.py expect")
     want = json.load(open(p, encoding="utf-8"))
+    # модель — ДО путей RoboTwin: в $ROBOTWIN_ROOT есть свой пакет scripts,
+    # который перекрывает scripts actioncodec (namespace-пакет без
+    # __init__.py) и ломает «from scripts.utils import …» внутри actioncodec
     model = rp.Model(dict(ckpt=ck, train_report=rep, device=a.device,
                           log_dir=a.log_dir, n_exec=a.n_exec))
+    ac_mods = module_origins(("scripts", "utils", "smolvla"))
+    xpl = os.path.join(root, "XPolicyLab")
+    for p_ in (xpl, root):
+        if p_ not in sys.path:
+            sys.path.append(p_)           # в конец: не перекрывать actioncodec
+    from client_server.ws.model_server import PolicyServer, PolicyServerConfig
+    if module_origins(tuple(ac_mods)) != ac_mods:
+        raise SystemExit("импорт сервера XPolicyLab подменил модули "
+                         f"actioncodec: {ac_mods} -> "
+                         f"{module_origins(tuple(ac_mods))}")
     got = manifest_of(model.meta, a.n_exec)
     if got != want:
         raise SystemExit(f"загруженная модель ≠ ожидаемой: {got} vs {want}")
