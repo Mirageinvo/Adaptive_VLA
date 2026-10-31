@@ -10,9 +10,12 @@ STATE_Q01/Q99, промпт, масштаб действия max(|Q99|, |Q01|) �
 схвата в одном месте, условия завершения, хеши начальных состояний и
 исполненных действий, формат JSON + npz блока.
 Отличие одно: команда шага t берётся у руки ДО записи в журнал —
-  a_codec = arm.step(plan, process_state(свежий obs), t, active = ~done);
+  a_codec = arm.step(plan, process_state(свежий obs), t,
+                     active = эпизод ещё не завершался (done_step < 0));
   a_exec  = масштаб(a_codec);  acts_log.append(a_exec);  envs.step(a_exec)
-— в среду уходит ровно записанный массив. В legacy-режиме руки шаг — строка
+— в среду уходит ровно записанный массив. done из envs.step в LIBERO не
+накапливается (может вернуться в False), поэтому активность — по первому
+done_step, как в протоколе. В legacy-режиме руки шаг — строка
 номинального чанка (численно путь K-9h). Тяжёлый план — один на 8 шагов.
 """
 import hashlib
@@ -133,7 +136,7 @@ def run(args, arm):
                 if np.all(done) or steps >= args.max_steps:
                     break
                 s_now = np.asarray(process_state(obs["state"]), np.float64)
-                a_codec = arm.step(plan, s_now, t, ~np.asarray(done, bool))
+                a_codec = arm.step(plan, s_now, t, done_step < 0)
                 a_t = scale_exec(np.asarray(a_codec, np.float32), max_act_q)
                 acts_log.append(np.asarray(a_t, np.float32).copy())
                 newly_grip = (a_t[:, -1] > 0) & (grip_pos_step < 0) & (~done)
@@ -238,14 +241,16 @@ def selftest():
           "построчно = арифметике чанка K-9h побитово; игрушечная раскатка: "
           "каждый шаг получает process_state свежего obs (не состояние "
           "момента плана), в среду уходит ровно записанный массив, план — "
-          "раз в 8 шагов, завершённые среды неактивны")
+          "раз в 8 шагов, завершённые среды неактивны и при done, вернувшемся в "
+          "False")
     return 0
 
 
 def toy_rollout_check():
     """Цикл run() на фальшивых средах/утилитах: состояние шага t =
     process_state(obs после шага t − 1); envs.step получает записанный
-    массив; план раз в 8 шагов; маска активности = ~done."""
+    массив; план раз в 8 шагов; маска активности = эпизод ещё не
+    завершался (done_step < 0), в том числе когда done вернулся в False."""
     import tempfile
     import types
     n, T_done = 3, (13, 30, 21)
@@ -292,8 +297,13 @@ def toy_rollout_check():
             self.st = self.st + 0.01 * (1 + np.arange(9))[None] + \
                 a[:, :1].sum() * 0 + (self.t + 11)
             self.t += 1
-            done = np.array([self.t > d for d in T_done]) \
+            # done не накапливается: среда 0 «завершена» только на двух
+            # шагах (как бывает в LIBERO), остальные — с первого done
+            done = np.array([self.t > d if i else d < self.t <= d + 2
+                             for i, d in enumerate(T_done)]) \
                 if self.t >= 0 else np.zeros(n, bool)
+            if self.t > max(T_done):
+                done[:] = True
             return self.obs(), done.astype(float) * 0, done, {}
 
     class Proc:
@@ -360,7 +370,7 @@ def toy_rollout_check():
         assert np.array_equal(a_, A[i]), "в среду ушёл не записанный массив"
     act = np.stack(arm.active)
     want = np.stack([np.arange(N) <= d for d in T_done], 1)
-    assert np.array_equal(act, want), "маска активности ≠ ~done"
+    assert np.array_equal(act, want), "маска активности ≠ первому done"
 
 
 if __name__ == "__main__":
