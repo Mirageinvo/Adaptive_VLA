@@ -47,8 +47,10 @@ CAP = 200_000
 MID_MARK = 100_000
 TRAIN_INIT = tuple(range(0, 20))
 VAL_INIT = tuple(range(20, 25))
-CFG = dict(lr_actor=1e-5, wd_actor=0.0, lr_critic=3e-4, epochs=4, minibatch=32,
+CFG = dict(lr_actor=1e-6, wd_actor=0.0, lr_critic=3e-4, epochs=4, minibatch=32,
            clip=0.2, grad_clip=1.0, lambda_ref=0.01, kl_old_max=0.03,
+           kl_rule="после каждого шага actor: средний joint KL на всём batch; "
+                   "> 0.03 — откат шага и остановка actor на batch",
            mu_tol=1e-5, logp_tol=1e-3, adv_std_min=1e-8, cycles_per_batch=2,
            cap=CAP, cycle_max=kc.CYCLE_MAX, tasks=list(kc.CYCLE_TASKS),
            train_init=list(TRAIN_INIT), val_init=list(VAL_INIT),
@@ -81,16 +83,24 @@ def mu_all(torch, actor, M, buf, dev, mb):
 
 def ppo_update(torch, M, actor, critic, opt_a, opt_c, buf, dev, rng_seed,
                cfg=CFG, check=True):
-    """-> статистика обновления (dict). buf — concat циклов (CPU)."""
+    """-> статистика обновления (dict). buf — concat циклов (CPU).
+
+    Каждый кандидатный шаг actor: снимок actor и полного состояния AdamW ->
+    шаг -> точный средний joint KL(θ‖old) на ВСЁМ batch (фактические k);
+    конечный KL ≤ kl_old_max — шаг принят; иначе откат только этого шага и
+    остановка actor на текущем batch (все эпохи). policy_old, V_old,
+    преимущества, μ_old и старые log π фиксированы до обновлений. Критик —
+    до epochs эпох независимо от остановки actor."""
     N = len(buf["k"])
     k = torch.as_tensor(buf["k"])
     Y, mu_ref = buf["Y"].float(), buf["mu_ref"].float()
     R = torch.as_tensor(buf["R"], dtype=torch.float32)
     el = torch.as_tensor(buf["elapsed"], dtype=torch.float32)
     mb = int(cfg["minibatch"])
+    limit = cfg.get("actor_step_limit")             # только самопроверки
     st = dict(n=N, episodes=int(len(set(buf["episode"].tolist()))),
-              R_mean=float(R.mean()), epochs=0, rollback=None,
-              actor_skipped=None)
+              R_mean=float(R.mean()), epochs=0, attempts=0, accepted_steps=0,
+              stop=None, actor_skipped=None)
     # V_old и μ_old до всех обновлений
     critic.eval()
     with torch.no_grad():
@@ -115,22 +125,25 @@ def ppo_update(torch, M, actor, critic, opt_a, opt_c, buf, dev, rng_seed,
         A = (A - A.mean()) / A.std()
     else:
         st["actor_skipped"] = "std(A) ≤ 1e-8: actor не обновляется"
-    kl_ref0 = kd.kl(torch, mu_old, mu_ref, k)
-    st["kl_ref_before"] = float(kl_ref0.mean())
+        st["stop"] = "std(A) ≤ 1e-8"
+    st["kl_ref_before"] = float(kd.kl(torch, mu_old, mu_ref, k).mean())
     bce = torch.nn.BCEWithLogitsLoss()
     hist = []
+    kl_last = 0.0
+
+    def kl_batch():
+        mu_new = mu_all(torch, actor, M, buf, dev, mb)
+        return float(kd.kl(torch, mu_new, mu_old, k).mean()), mu_new
     for ep in range(int(cfg["epochs"])):
-        snap_a = copy.deepcopy(actor.state_dict())
-        snap_o = copy.deepcopy(opt_a.state_dict())
         perm = np.random.default_rng([*rng_seed, ep]).permutation(N)
-        actor.train()
         critic.train()
         la_s = lc_s = 0.0
-        nb = 0
+        na = nb = 0
         for s in range(0, N, mb):
             idx = perm[s:s + mb]
             Fm = to_dev(buf["F"], idx, dev)
             if actor_on:
+                actor.train()
                 mu = M["mu_of"](actor(Fm)).float()
                 lp = kd.log_prob(torch, Y[idx].to(dev), mu, k[idx].to(dev))
                 ratio = torch.exp(lp - lp_old[idx].to(dev))
@@ -141,12 +154,33 @@ def ppo_update(torch, M, actor, critic, opt_a, opt_c, buf, dev, rng_seed,
                 la = -surr.mean() + cfg["lambda_ref"] * klr.mean()
                 if not bool(torch.isfinite(la)):
                     raise SystemExit("нечисловая потеря actor")
+                snap_a = copy.deepcopy(actor.state_dict())
+                snap_o = copy.deepcopy(opt_a.state_dict())
                 opt_a.zero_grad(set_to_none=True)
                 la.backward()
                 torch.nn.utils.clip_grad_norm_(actor.parameters(),
                                                cfg["grad_clip"])
                 opt_a.step()
-                la_s += float(la.detach())
+                st["attempts"] += 1
+                kl_try, _m = kl_batch()
+                if not np.isfinite(kl_try):
+                    raise SystemExit("нечисловой KL после шага actor")
+                if kl_try <= cfg["kl_old_max"]:
+                    st["accepted_steps"] += 1
+                    kl_last = kl_try
+                    la_s += float(la.detach())
+                    na += 1
+                    if limit is not None and st["accepted_steps"] >= limit:
+                        actor_on = False
+                        st["stop"] = "лимит шагов (самопроверка)"
+                else:
+                    actor.load_state_dict(snap_a)
+                    opt_a.load_state_dict(snap_o)
+                    actor_on = False
+                    st["stop"] = (f"KL {kl_try:.4f} > {cfg['kl_old_max']} на "
+                                  f"шаге {st['attempts']} (эпоха {ep}); шаг "
+                                  f"откатан, actor на batch остановлен")
+                    st["kl_rejected"] = kl_try
             v = critic(Fm, buf["s11n"][idx].to(dev), el[idx].to(dev))
             lc = bce(v, R[idx].to(dev))
             if not bool(torch.isfinite(lc)):
@@ -158,27 +192,25 @@ def ppo_update(torch, M, actor, critic, opt_a, opt_c, buf, dev, rng_seed,
             opt_c.step()
             lc_s += float(lc.detach())
             nb += 1
-        mu_new = mu_all(torch, actor, M, buf, dev, mb)
-        kl_old = float(kd.kl(torch, mu_new, mu_old, k).mean())
-        rec = dict(epoch=ep, loss_actor=la_s / nb, loss_critic=lc_s / nb,
-                   kl_old=kl_old,
-                   kl_ref=float(kd.kl(torch, mu_new, mu_ref, k).mean()))
-        if actor_on and kl_old > cfg["kl_old_max"]:
-            actor.load_state_dict(snap_a)
-            opt_a.load_state_dict(snap_o)
-            rec["rolled_back"] = True
-            st["rollback"] = dict(epoch=ep, kl_old=kl_old)
-            hist.append(rec)
-            break
-        hist.append(rec)
+        hist.append(dict(epoch=ep, accepted_steps=na,
+                         loss_actor=la_s / na if na else None,
+                         loss_critic=lc_s / nb))
         st["epochs"] = ep + 1
+    actor.eval()
+    critic.eval()
+    kl_fin, mu_fin = kl_batch()                    # сохранённый actor
+    st["kl_old_final"] = kl_fin
+    st["kl_ref_final"] = float(kd.kl(torch, mu_fin, mu_ref, k).mean())
+    if st["accepted_steps"] and abs(kl_fin - kl_last) > 1e-6 * max(1.0,
+                                                                  kl_fin):
+        raise SystemExit("KL сохранённого actor ≠ KL последнего принятого "
+                         "шага")
     for p in list(actor.parameters()) + list(critic.parameters()):
         if not bool(torch.isfinite(p).all()):
             raise SystemExit("нечисловые веса после обновления")
     st["history"] = hist
-    st["accepted"] = bool(actor_on and st["epochs"] > 0)
-    actor.eval()
-    critic.eval()
+    st["accepted"] = st["accepted_steps"] >= 1
+    st["stop"] = st["stop"] or "все эпохи выполнены"
     return st
 
 
@@ -372,15 +404,11 @@ class Trainer:
         self.save()
         for f, _d in items:
             os.remove(f)
-        self.log(f"  обновление {u}: переходов {st['n']}, R {st['R_mean']:.2f},"
-                 f" эпох {st['epochs']}" + (f", ОТКАТ на эпохе "
-                                           f"{st['rollback']['epoch']} (KL "
-                                           f"{st['rollback']['kl_old']:.3f})"
-                                           if st["rollback"] else "")
-                 + (f", {st['actor_skipped']}" if st["actor_skipped"] else "")
-                 + f"; KL old/ref {st['history'][-1]['kl_old']:.4f}/"
-                 f"{st['history'][-1]['kl_ref']:.4f}; пересчёт μ "
-                 f"{st['mu_recompute_max']:.1e} ({st['seconds']:.0f} с)")
+        self.log(f"  обновление {u}: переходов {st['n']}, R {st['R_mean']:.2f}"
+                 f", шагов actor принято {st['accepted_steps']}/"
+                 f"{st['attempts']}; остановка: {st['stop']}; KL old/ref "
+                 f"{st['kl_old_final']:.4f}/{st['kl_ref_final']:.4f}; пересчёт "
+                 f"μ {st['mu_recompute_max']:.1e} ({st['seconds']:.0f} с)")
         return st
 
     def run(self):
@@ -472,16 +500,47 @@ def selftest():
     actor, critic = actor0, critic0
     assert st["mu_recompute_max"] <= 1e-5 and st["epochs"] >= 1
     assert k29m.tensor_hash(ref.state_dict()) == h_ref
-    # откат: огромный LR -> KL > порога -> веса и optimizer как до эпохи
-    a2 = copy.deepcopy(actor)
-    o2 = torch.optim.AdamW(a2.parameters(), lr=1.0, weight_decay=0)
-    before = k29m.tensor_hash(a2.state_dict())
-    st2 = ppo_update(torch, M, a2, copy.deepcopy(critic), o2,
-                     torch.optim.Adam(critic.parameters(), lr=3e-4), buf,
-                     "cpu", (0, 3, 1))
-    assert st2["rollback"] and st2["rollback"]["epoch"] == 0 and \
-        k29m.tensor_hash(a2.state_dict()) == before and not st2["accepted"]
-    assert all(len(v) == 0 for v in o2.state.values()) or not o2.state
+    # --- KL-остановка по шагам (регрессии раздела 11 после изменения)
+    def run_upd(cfg_, lr=1e-4):
+        a_, c_ = copy.deepcopy(actor), copy.deepcopy(critic)
+        o_ = torch.optim.AdamW(a_.parameters(), lr=lr, weight_decay=0)
+        st_ = ppo_update(torch, M, a_, c_, o_, torch.optim.Adam(
+            c_.parameters(), lr=3e-4), buf, "cpu", (0, 3, 1), cfg_)
+        return a_, o_, st_
+
+    def opt_equal(o1, o2):
+        s1, s2 = o1.state_dict(), o2.state_dict()
+        if s1["param_groups"] != s2["param_groups"] or \
+                set(s1["state"]) != set(s2["state"]):
+            return False
+        return all(torch.equal(s1["state"][i][k_], s2["state"][i][k_])
+                   for i in s1["state"] for k_ in s1["state"][i])
+    C8 = dict(CFG, minibatch=8)              # несколько шагов в эпохе
+    big = dict(C8, kl_old_max=1e9)
+    a1, o1, s1_ = run_upd(dict(big, actor_step_limit=1))  # ровно 1 шаг
+    a2_, o2_, s2_ = run_upd(dict(big, actor_step_limit=2))
+    kl1, kl2 = s1_["kl_old_final"], s2_["kl_old_final"]
+    assert 0 < kl1 < kl2, (kl1, kl2)
+    # первый шаг принят, второй отклонён -> actor И optimizer = после первого
+    a3_, o3_, s3_ = run_upd(dict(C8, kl_old_max=(kl1 + kl2) / 2))
+    assert s3_["accepted_steps"] == 1 and s3_["attempts"] == 2 and \
+        s3_["accepted"] and "откатан" in s3_["stop"]
+    assert k29m.tensor_hash(a3_.state_dict()) == k29m.tensor_hash(
+        a1.state_dict()) and opt_equal(o3_, o1)
+    # KL по всему batch: сохранённый actor против μ_old на всех переходах
+    mu_f = mu_all(torch, a3_, M, buf, "cpu", 8)
+    kk = torch.as_tensor(buf["k"])
+    assert abs(float(kd.kl(torch, mu_f, buf["mu"], kk).mean()) -
+               s3_["kl_old_final"]) < 1e-6 and s3_["n"] == len(buf["k"])
+    # частичная эпоха (1 из нескольких шагов) — принятое обновление
+    assert len(buf["k"]) > 8 and s3_["history"][0]["accepted_steps"] == 1
+    # первый шаг отклонён -> actor исходный, optimizer без состояния
+    a4_, o4_, s4_ = run_upd(dict(C8, kl_old_max=kl1 / 2))
+    assert s4_["accepted_steps"] == 0 and not s4_["accepted"] and \
+        k29m.tensor_hash(a4_.state_dict()) == k29m.tensor_hash(
+            actor.state_dict()) and not o4_.state_dict()["state"]
+    # критик учится все эпохи и после остановки actor
+    assert s4_["epochs"] == CFG["epochs"]
     # std(A) = 0 -> actor пропускается, critic учится
     b3 = dict(buf, R=np.ones(len(buf["k"]), np.float32))
     a3, c3 = copy.deepcopy(actor), copy.deepcopy(critic)
@@ -618,8 +677,10 @@ def selftest():
         assert len(set(s_)) == 5 and all(0 <= x < 20 for x in s_)
         assert s_ == pick_init(0, w)
     print("самопроверка k29_ppo пройдена: пересчёт μ по кешу = записанному, "
-          "reference неизменен, откат по KL восстанавливает actor и "
-          "optimizer, std(A) = 0 -> actor пропущен, награда влияет на "
+          "reference неизменен, KL-остановка по шагам: 1-й принят и 2-й "
+          "отклонён -> actor и AdamW = после 1-го, 1-й отклонён -> исходный, "
+          "KL по всему batch, частичная эпоха = принятое обновление, критик "
+          "учится все эпохи, std(A) = 0 -> actor пропущен, награда влияет на "
           "обновление, порча μ -> отказ; тренер: бюджет и последний неполный "
           "batch, валидации start/end, прерванный + продолжение = непрерывный,"
           " авария внутри цикла списывает резерв, авария после обновления до "

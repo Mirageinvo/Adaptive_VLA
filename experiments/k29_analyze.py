@@ -122,10 +122,13 @@ def per_seed(seed, init, final, p):
             actor_changed=r["changed"],
             train_steps=r["ledger"]["train_spent"],
             crashes=len(r["ledger"]["crashes"]),
-            rollbacks=sum(1 for u in r["update_stats"] if u.get("rollback")),
+            rollbacks=sum(1 for u in r["update_stats"]
+                          if "KL" in str(u.get("stop"))),
+            actor_steps=sum(int(u.get("accepted_steps", 0))
+                            for u in r["update_stats"]),
             skipped=sum(1 for u in r["update_stats"]
                         if u.get("actor_skipped")),
-            kl_ref_last=(r["update_stats"][-1]["history"][-1]["kl_ref"]
+            kl_ref_last=(r["update_stats"][-1].get("kl_ref_final")
                          if r["update_stats"] else None))
     return o
 
@@ -188,7 +191,8 @@ def report(per, summ, lat):
         if "training" in o:
             t = o["training"]
             print(f"    обучение: обновлений {t['updates']} (принято "
-                  f"{t['accepted']}, откатов {t['rollbacks']}, пропусков "
+                  f"{t['accepted']}, шагов actor {t['actor_steps']}, KL-остановок "
+                  f"{t['rollbacks']}, пропусков "
                   f"{t['skipped']}), шагов {t['train_steps']}, аварий "
                   f"{t['crashes']}; actor "
                   + ("изменён" if t["actor_changed"] else "НЕ изменён")

@@ -411,8 +411,9 @@ def real_check(a):
             torch.optim.Adam(c2.parameters(), lr=kpo.CFG["lr_critic"]), buf,
             dev, (s, 99, 0), dict(kpo.CFG, epochs=1))
         r["ppo_epoch_descriptive"] = dict(
-            steps=int(np.ceil(N / kpo.CFG["minibatch"])), epochs=st2["epochs"],
-            rollback=st2["rollback"], kl_old=st2["history"][-1]["kl_old"],
+            steps=int(np.ceil(N / kpo.CFG["minibatch"])),
+            attempts=st2["attempts"], accepted_steps=st2["accepted_steps"],
+            stop=st2["stop"], kl_old_final=st2["kl_old_final"],
             mu_recompute=st2["mu_recompute_max"])
         del a1, c1, a2, c2
         r["params"] = dict(
