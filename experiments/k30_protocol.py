@@ -18,9 +18,12 @@ check-block — validate_block (холодный K-9h: начальные хеш
      (a − mid)/half ≤ 1e−5 абсолютно; пределы; схват = знак Σ W2·y2[6];
   4) исполненные действия = журналу побитово (k15h_protocol);
   5) в smoke — CPU-повтор root_ln/classifier/plan_proj/Expand1 из весов
-     best.pt по записанному h8: допуск 1e−4·max(1,|ref|) (для выхода
-     Expand1 + слагаемое fp16-шага Linear под autocast: 2^−10·|W·φ|);
-     равенство ID — при разрыве top1 − top2 > 1e−3, иначе сверяются logits.
+     best.pt по записанному h8: допуск 1e−4·max(1,|ref|); Expand1 — с явным
+     воспроизведением fp16 autocast (вход, веса и выход Linear в fp16,
+     накопление fp32, затем (h + side) + Linear во float32); сверх допуска
+     принимается только ровно один fp16-шаг выхода Linear (флип округления
+     из-за порядка накопления GEMM); равенство ID — при разрыве top1 − top2
+     > 1e−3, иначе сверяются logits.
 Везде `not err <= tol` — нечисловая ошибка тоже отказ.
 """
 import argparse
@@ -263,7 +266,6 @@ def journal_problems(z, label, mode, bounds, P, spec=None, smoke=False):
 def debug_problems(z, label, spec, g, G):
     """CPU-повтор root_ln/classifier/plan_proj/Expand1 из весов best.pt."""
     import torch
-    import k21_tree as kt
     keys = [f"k21_k30_dbg_{k}" for k in ("h8", "hrp", "mid_init")]
     if any(k not in z for k in keys):
         return [f"{label}: в smoke нет debug-фрагмента"]
@@ -290,20 +292,45 @@ def debug_problems(z, label, spec, g, G):
     d = _rel(hrp_c, hrp)
     if not d <= TOL_DBG:
         p.append(f"{label}: h8 + plan_proj ≠ GPU ({d:.2e})")
+    half = bool(np.asarray(z["k21_k30_dbg_half"])[0].max() > 0) \
+        if "k21_k30_dbg_half" in z else False
+    mid_c, w16 = expand1_fp16(torch, hrp, W, G, half)
+    err = np.abs(mid_c - mid)
+    tol = TOL_DBG * np.maximum(1.0, np.abs(mid))
+    over = ~(err <= tol)
+    # единственное допущение сверх общего допуска: ровно один шаг fp16
+    # выхода Linear (флип округления из-за порядка накопления в GEMM)
+    flip = over & np.isclose(err, np.abs(np.spacing(w16.astype(np.float16))
+                                         .astype(np.float64)), rtol=1e-3,
+                             atol=0)
+    if (over & ~flip).any():
+        p.append(f"{label}: Expand1 CPU ≠ GPU (max {float(err.max()):.2e}, "
+                 f"вне допуска {int((over & ~flip).sum())})")
+    return p
+
+
+def expand1_fp16(torch, hrp, W, G, half=False):
+    """CPU-повтор Expand1 с приведениями fp16 autocast и порядком сложений
+    GPU: Linear(φ) — вход и веса округлены до fp16, накопление fp32, выход
+    fp16; затем (h + side) + Linear в float32. hrp [B,4,H] (float32)."""
+    import k21_tree as kt
     TT = kt.build(torch)
-    iv = torch.as_tensor(G["IV1"])[None]
+    iv = torch.as_tensor(G["IV1"], dtype=torch.float32)[None]
     l_, r_ = iv[..., 0] / 20, iv[..., 1] / 20
     phi = TT["phi"]
     fe = torch.cat([phi(l_), phi(r_), phi((l_ + r_) / 2), phi(r_ - l_)],
-                   -1)[0].numpy()
-    wf = fe @ W["exp1.W.weight"].T + W["exp1.W.bias"]
-    side = np.tile(W["exp1.e_side"], (4, 1))
-    mid_c = np.repeat(hrp, 2, 1) + side + wf
-    tol = TOL_DBG * np.maximum(1.0, np.abs(mid)) + 2.0 ** -10 * np.abs(wf)
-    if not (np.abs(mid_c - mid) <= tol).all():
-        p.append(f"{label}: Expand1 CPU ≠ GPU (max "
-                 f"{float(np.abs(mid_c - mid).max()):.2e})")
-    return p
+                   -1)[0].float()
+    Wh = torch.as_tensor(W["exp1.W.weight"]).half().float()
+    bh = torch.as_tensor(W["exp1.W.bias"]).half().float()
+    w16 = (fe.half().float() @ Wh.T + bh).half()                  # [8, H]
+    dt = torch.float16 if half else torch.float32   # dtype h на GPU
+    hp = torch.as_tensor(hrp, dtype=torch.float32).to(dt).repeat_interleave(
+        2, 1)
+    side = torch.as_tensor(W["exp1.e_side"], dtype=torch.float32).repeat(
+        4, 1).to(dt)
+    mid = ((hp + side[None]) + w16.to(dt)[None]).float()
+    return mid.double().numpy(), w16.float().numpy()[None].repeat(
+        len(hrp), 0)
 
 
 def check_block(plan, plan_path_, path, label, suite, task, block):
@@ -431,7 +458,7 @@ def selftest():
                                     .manual_seed(0)), debug=True)
             dbg = kp.record(o, True)
             zd = dict(z)
-            for k in ("h8", "hrp", "mid_init"):
+            for k in ("h8", "hrp", "mid_init", "half"):
                 zd[f"k21_k30_dbg_{k}"] = dbg[f"k30_dbg_{k}"][None]
             for k in SHAPES:
                 zd[f"k21_k30_{k}"] = np.concatenate(
@@ -442,11 +469,59 @@ def selftest():
             zb["k21_k30_dbg_mid_init"] = zd["k21_k30_dbg_mid_init"] + 0.01
             assert any("Expand1" in x for x in journal_problems(
                 zb, lab, mode, bounds, P, dict(ckpt=ckp), smoke=True))
+    # Expand1: сокращающиеся слагаемые с большими весами (квантование fp16
+    # весов и входа даёт ошибку больше прежнего допуска), «GPU» — честный
+    # fp16-расчёт; повтор с явными приведениями проходит, внесённая ошибка
+    # 1e−3 обнаруживается
+    Hs = 64
+    gg = torch.Generator().manual_seed(7)
+    W_ = {"exp1.W.weight": (torch.randn(Hs, 36, generator=gg) * 40).double()
+          .numpy(), "exp1.W.bias": (torch.randn(Hs, generator=gg) * 40)
+          .double().numpy(), "exp1.e_side": (torch.randn(2, Hs, generator=gg)
+                                             * 1e-3).double().numpy()}
+    G_ = geometry_np()
+    import k21_tree as kt_
+    TT = kt_.build(torch)
+    iv = torch.as_tensor(G_["IV1"], dtype=torch.float32)[None]
+    l_, r_ = iv[..., 0] / 20, iv[..., 1] / 20
+    fe = torch.cat([TT["phi"](l_), TT["phi"](r_), TT["phi"]((l_ + r_) / 2),
+                    TT["phi"](r_ - l_)], -1)[0].float()
+    hrp = torch.randn(2, 4, Hs, generator=gg).float()
+    # «GPU»: вход и веса fp16, накопление fp32 в ДРУГОМ порядке (обратном,
+    # как может cuBLAS), смещение fp16, выход fp16
+    fh = fe.half().float()
+    Whh = torch.as_tensor(W_["exp1.W.weight"]).half().float()
+    acc = torch.zeros(fh.shape[0], Whh.shape[0])
+    for k_ in reversed(range(fh.shape[1])):
+        acc = acc + fh[:, k_:k_ + 1] * Whh[:, k_][None]
+    lin = (acc + torch.as_tensor(W_["exp1.W.bias"]).half().float()).half()
+    gpu_mid = (hrp.repeat_interleave(2, 1) + torch.as_tensor(
+        W_["exp1.e_side"]).float().repeat(4, 1)[None]) + lin.float()[None]
+    f64 = (fe.double() @ torch.as_tensor(W_["exp1.W.weight"]).T +
+           torch.as_tensor(W_["exp1.W.bias"]))
+    old_err = float((torch.as_tensor(gpu_mid).double() - (
+        hrp.double().repeat_interleave(2, 1) + torch.as_tensor(
+            W_["exp1.e_side"]).repeat(4, 1)[None] + f64[None])).abs().max())
+    assert old_err > 1e-4, old_err          # прежняя пересборка отвергла бы
+    mid_c, w16 = expand1_fp16(torch, hrp.numpy(), W_, G_)
+    gm = gpu_mid.double().numpy()
+    err = np.abs(mid_c - gm)
+    tol = TOL_DBG * np.maximum(1.0, np.abs(gm))
+    flip = np.isclose(err, np.abs(np.spacing(w16.astype(np.float16))
+                                  .astype(np.float64)), rtol=1e-3, atol=0)
+    assert ((err <= tol) | flip).all(), float(err.max())
+    err2 = np.abs(mid_c - (gm + 1e-3))
+    assert not ((err2 <= tol) | np.isclose(err2, np.abs(np.spacing(
+        w16.astype(np.float16)).astype(np.float64)), rtol=1e-3,
+        atol=0)).all()
     assert len(set(CODE)) == len(CODE)
     print("самопроверка k30_protocol пройдена: журнал игрушечной руки (hard и "
           "soft) проходит; порча ID, b_used, logits, C0, Z, схвата, "
           "действий, NaN, форм и подмена режима — отказ; smoke: CPU-повтор "
-          "root_ln/classifier/plan_proj/Expand1 проходит, порча — отказ")
+          "root_ln/classifier/plan_proj/Expand1 проходит, порча — отказ; Expand1 с "
+          "сокращающимися слагаемыми и честным fp16: явный повтор приведений "
+          "проходит (прежний допуск отверг бы), внесённая ошибка 1e−3 — "
+          "отказ")
     return 0
 
 

@@ -572,21 +572,57 @@ def rc_contract(a):
                 micros=list(MICROS))
 
 
+def fresh_problems(kind, a):
+    """Свежесть real-check (и micro.json) или fitcheck против ТЕКУЩИХ
+    prepare, кода, устройства и SHA отчётов. Пустой список — свежо. Одна
+    функция для check-fresh, fitcheck и train (до создания модели)."""
+    try:
+        p = load_prepare()
+    except SystemExit as e:
+        return [str(e.code)]
+    pr = []
+    if not (os.path.exists(REAL_CHECK) and os.path.exists(MICRO_FILE)):
+        return ["нет real_check.json/micro.json"]
+    r = json.load(open(REAL_CHECK, encoding="utf-8"))
+    m = json.load(open(MICRO_FILE, encoding="utf-8"))
+    if r.get("problems") != []:
+        pr.append("real-check не пройден")
+    if r.get("contract") != rc_contract(a):
+        pr.append("real-check другого контракта (prepare/код/устройство)")
+    if m.get("prepare") != fp(p) or m.get("real_check_sha1") != \
+            sha(REAL_CHECK) or m.get("micro") != r.get("micro_choice"):
+        pr.append("micro.json не согласован с real_check/prepare")
+    if kind == "fitcheck":
+        if not os.path.exists(FITCHECK):
+            return pr + ["нет fitcheck.json"]
+        f = json.load(open(FITCHECK, encoding="utf-8"))
+        if not f.get("ok"):
+            pr.append("fitcheck не пройден")
+        want = dict(rc_contract(a), micro=m.get("micro"),
+                    micro_file_sha1=sha(MICRO_FILE),
+                    real_check_sha1=sha(REAL_CHECK))
+        if f.get("contract") != want:
+            pr.append("fitcheck другого контракта")
+    return pr
+
+
 def decided_micro(a=None):
-    """micro из micro.json — только при согласии с пройденным real_check
-    того же base-контракта."""
+    """micro из micro.json — только при свежем real-check текущего
+    контракта (при a) или при согласии файлов с prepare (без a)."""
     if not (os.path.exists(MICRO_FILE) and os.path.exists(REAL_CHECK)):
         return None
-    m = json.load(open(MICRO_FILE, encoding="utf-8"))
-    r = json.load(open(REAL_CHECK, encoding="utf-8"))
-    p = load_prepare()
-    if r.get("problems") != [] or m.get("real_check_sha1") != sha(REAL_CHECK) \
-            or m.get("prepare") != fp(p) or r.get("micro_choice") != \
-            m.get("micro") or (r.get("contract") or {}).get("prepare") != fp(p):
-        raise SystemExit("micro.json не согласован с real_check/prepare")
-    if a is not None and r.get("contract") != rc_contract(a):
-        raise SystemExit("real-check другого контракта")
-    return int(m["micro"])
+    if a is not None:
+        pr = fresh_problems("real-check", a)
+        if pr:
+            raise SystemExit("; ".join(pr))
+    else:
+        m = json.load(open(MICRO_FILE, encoding="utf-8"))
+        r = json.load(open(REAL_CHECK, encoding="utf-8"))
+        if r.get("problems") != [] or m.get("prepare") != fp(load_prepare()) \
+                or m.get("real_check_sha1") != sha(REAL_CHECK) or \
+                m.get("micro") != r.get("micro_choice"):
+            raise SystemExit("micro.json не согласован с real_check/prepare")
+    return int(json.load(open(MICRO_FILE, encoding="utf-8"))["micro"])
 
 
 def applied_step(torch, mod, opt, scaler, fn):
@@ -616,12 +652,149 @@ def applied_step(torch, mod, opt, scaler, fn):
     return False, gn
 
 
-def real_check(a):
-    import torch
+def free_cuda(torch):
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _cpu_batch(batch):
+    return {k: (v.detach().cpu() if hasattr(v, "detach") else v)
+            for k, v in batch.items()}
+
+
+def _to_dev(batch, dev):
+    return {k: (v.to(dev) if hasattr(v, "to") else v) for k, v in batch.items()}
+
+
+def source_part(torch, s, p, D, C, dev, ac, rows5):
+    """Источник seed s: (1) настоящий K-25 cond (k25_policy) на B = 1/5 ->
+    выходы на CPU, модель освобождается; (2) H и C фабрики K-30 по очереди:
+    K25.forward на общих весах (source_forward) = (1) побитово; основной
+    hybrid-forward — счётчики, конечность, пределы, пересборка, FP32, план;
+    отпечаток полного state_dict — на CPU. Возвращает только CPU-данные."""
     import k21_data as d21
     import k21_train as kt
     import k25_policy as kp25
-    import k30_codec as kc
+    e = p["sources"][str(s)]
+    r, prob = {}, []
+    spec = dict(arch="parents_cond24", seed=s, ckpt=e["ckpt"],
+                weights_hash=e["weights_hash"])
+    ref, bar_r, _ck, _pr = kp25.load_policy(
+        torch, f"parents_cond24_s{s}", spec, str(dev))
+    inputs, ref_out = {}, {}
+    for B in (1, 5):
+        batch, po, st, _t, _v = d21.make_batch(D, rows5[:B], bar_r, dev)
+        with torch.no_grad(), ac:
+            o = ref(batch, po, st)
+        inputs[B] = (_cpu_batch(batch), po.detach().cpu(), st.detach().cpu())
+        ref_out[B] = (o["arm"].detach().cpu(), o["grip_logit"].detach().cpu())
+        del o, batch
+    del ref, bar_r, _ck
+    free_cuda(torch)
+    hashes = {}
+    for mode in ("hard", "soft"):
+        m_, b_ = make(torch, s, mode, p, D, C, dev, checkpoint=False)
+        m_.eval()
+        hashes[mode] = kt.state_hash({k: v.detach().cpu() for k, v in
+                                      m_.state_dict().items()})
+        if mode == "hard":
+            n_new = sum(q.numel() for n, q in m_.named_parameters()
+                        if n.startswith(k30m.NEW_PREFIX))
+            n_src = sum(v.numel() for v in torch.load(
+                e["ckpt"], map_location="cpu", weights_only=False)[
+                    "weights"].values())
+            r["new_params"], r["new_share"] = n_new, n_new / n_src
+            if n_new != k30m.new_param_count(m_.H) or r["new_share"] >= 0.01:
+                prob.append(f"s{s}: новых параметров {n_new}")
+        for B in (1, 5):
+            bc, po, st = inputs[B]
+            batch = _to_dev(bc, dev)
+            po, st = po.to(dev), st.to(dev)
+            with torch.no_grad(), ac:
+                ol = m_.source_forward(batch, po, st)
+                eq = bool(torch.equal(ol["arm"].cpu(), ref_out[B][0]) and
+                          torch.equal(ol["grip_logit"].cpu(), ref_out[B][1]))
+                del ol
+                o = m_(batch, po, st)
+            r[f"source_legacy_{mode}_B{B}"] = eq
+            if not eq:
+                prob.append(f"s{s} {mode} B{B}: K25.forward на весах фабрики "
+                            f"K-30 ≠ настоящему K-25")
+            cn, pl, cd = m_.counters, o["plan"], o["cond"]
+            L = torch.as_tensor(np.asarray(D["L"])[:6], device=dev)
+            U = torch.as_tensor(np.asarray(D["U"])[:6], device=dev)
+            want_b = C["P32"][pl["ids"].cpu().numpy()] if mode == "hard" \
+                else (pl["p"].double().cpu().numpy() @
+                      C["P32"].astype(np.float64))
+            rr = dict(
+                classifier=cn["classifier"], vision=cn["vision"],
+                layers_once=all(x == 1 for x in cn["text"]),
+                active_ok=cn["active"] == k30m.ACTIVE,
+                finite=all(bool(torch.isfinite(x).all()) for x in
+                           (o["arm"], o["grip_logit"], pl["logits"])),
+                in_bounds=bool(((o["arm"] >= L - 1e-4) &
+                                (o["arm"] <= U + 1e-4)).all()),
+                recon=float((cd["G0"] + cd["G1"] + cd["G2"] - cd["Z"]).abs()
+                            .max()),
+                fp32=all(x.dtype == torch.float32 for x in (
+                    pl["logits"], pl["p"], pl["b_used"], cd["Z"], o["arm"])),
+                plan_diff=float(np.abs(pl["b_used"].double().cpu().numpy() -
+                                       want_b).max()))
+            r[f"{mode}_B{B}"] = rr
+            bad = [k for k, v in rr.items() if v is False]
+            if rr["classifier"] != 1:
+                bad.append(f"classifier {rr['classifier']}")
+            if not rr["recon"] <= 1e-4:
+                bad.append("recon")
+            if not rr["plan_diff"] <= 2e-6:
+                bad.append("plan")
+            if bad:
+                prob.append(f"s{s} {mode} B{B}: {bad}")
+            del o, pl, cd, batch
+        del m_, b_
+        free_cuda(torch)
+    r["pair_init_equal"] = hashes["hard"] == hashes["soft"]
+    if not r["pair_init_equal"]:
+        prob.append(f"s{s}: начальные тензоры H ≠ C")
+    return r, prob
+
+
+def step_part(torch, s, mode, mb, p, D, C, dev, ac):
+    """Отдельная область жизни: модель создаётся, шаги warmup и main,
+    память и время; только CPU-результат; освобождение до следующего."""
+    free_cuda(torch)
+    base = torch.cuda.memory_allocated(dev) / 2 ** 30
+    m_, b_ = make(torch, s, mode, p, D, C, dev)
+    r = step_check(torch, m_, b_, D, C, dev, ac, mb, p, s, mode)
+    r["alloc_before_gb"] = base
+    del m_, b_
+    free_cuda(torch)
+    return r
+
+
+def write_conflicts(p, choice):
+    """Конфликты, проверяемые ДО записи real_check.json и micro.json:
+    другой micro для того же prepare; уже начатое обучение."""
+    conf = []
+    if os.path.exists(MICRO_FILE):
+        old = json.load(open(MICRO_FILE, encoding="utf-8"))
+        if old.get("prepare") == fp(p) and old.get("micro") != choice:
+            conf.append(f"micro уже выбран для этого prepare: "
+                        f"{old.get('micro')} ≠ {choice}")
+    started = [f for f in (report_path(s, m) for s in SEEDS
+                           for m in k30m.MODES) if os.path.exists(f)] + \
+        [d for d in (outdir(s, m) for s in SEEDS for m in k30m.MODES)
+         if os.path.exists(os.path.join(d, "resume.pt"))]
+    if started:
+        conf.append(f"обучение уже начато ({started[:2]}): real-check не "
+                    f"перезаписывается")
+    return conf, started
+
+
+def real_check(a):
+    import torch
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     p = load_prepare()
@@ -629,98 +802,29 @@ def real_check(a):
     check_codec(p, C)
     dev = torch.device(a.device)
     ac = torch.autocast("cuda", dtype=torch.float16)
-    prob, rep = [], dict(seeds={})
+    prob, rep = [], dict(seeds={"0": {}, "1": {}})
     tr = np.asarray(D["train_rows"])
     rows5 = tr[np.argsort(D["task"][tr], kind="stable")][:5]
     for s in SEEDS:
-        r = {}
-        e = p["sources"][str(s)]
-        # source_legacy: настоящий K-25 cond (k25_policy) против загрузки
-        # через фабрику K-30 (общий путь копирования весов)
-        spec = dict(arch="parents_cond24", seed=s, ckpt=e["ckpt"],
-                    weights_hash=e["weights_hash"])
-        ref, bar_r, _ck, _pr = kp25.load_policy(
-            torch, f"parents_cond24_s{s}", spec, a.device)
-        mods = {}
-        for mode in ("hard", "soft"):
-            mods[mode] = make(torch, s, mode, p, D, C, dev, checkpoint=False)
-        h_s, h_c = mods["hard"][0], mods["soft"][0]
-        sd_h, sd_c = h_s.state_dict(), h_c.state_dict()
-        r["pair_init_equal"] = set(sd_h) == set(sd_c) and all(
-            torch.equal(sd_h[k], sd_c[k].to(sd_h[k].device)) for k in sd_h)
-        n_new = sum(q.numel() for n, q in h_s.named_parameters()
-                    if n.startswith(k30m.NEW_PREFIX))
-        n_src = sum(v.numel() for v in torch.load(
-            e["ckpt"], map_location="cpu", weights_only=False)[
-                "weights"].values())
-        r["new_params"], r["new_share"] = n_new, n_new / n_src
-        if not r["pair_init_equal"]:
-            prob.append(f"s{s}: начальные тензоры H ≠ C")
-        if n_new != k30m.new_param_count(h_s.H) or r["new_share"] >= 0.01:
-            prob.append(f"s{s}: новых параметров {n_new}")
-        for B in (1, 5):
-            batch, po, st, tgt, val = d21.make_batch(D, rows5[:B], bar_r, dev)
-            with torch.no_grad(), ac:
-                o_ref = ref(batch, po, st)
-                o_ref2 = ref(batch, po, st)
-            r[f"source_legacy_B{B}"] = bool(
-                torch.equal(o_ref["arm"], o_ref2["arm"]) and
-                torch.equal(o_ref["grip_logit"], o_ref2["grip_logit"]))
-            for mode, (m_, b_) in mods.items():
-                m_.eval()
-                with torch.no_grad(), ac:
-                    o = m_(batch, po, st)
-                cn = m_.counters
-                pl = o["plan"]
-                fin = all(bool(torch.isfinite(x).all()) for x in
-                          (o["arm"], o["grip_logit"], pl["logits"]))
-                L = torch.as_tensor(np.asarray(D["L"])[:6], device=dev)
-                U = torch.as_tensor(np.asarray(D["U"])[:6], device=dev)
-                inb = bool(((o["arm"] >= L - 1e-4) & (o["arm"] <= U + 1e-4))
-                           .all())
-                cd = o["cond"]
-                rec = float((cd["G0"] + cd["G1"] + cd["G2"] - cd["Z"]).abs()
-                            .max())
-                f32 = all(x.dtype == torch.float32 for x in (
-                    pl["logits"], pl["p"], pl["b_used"], cd["Z"], o["arm"]))
-                want_b = C["P32"][pl["ids"].cpu().numpy()] if mode == "hard" \
-                    else (pl["p"].double().cpu().numpy() @ C["P32"].astype(
-                        np.float64))
-                db = float(np.abs(pl["b_used"].double().cpu().numpy() -
-                                  want_b).max())
-                rr = dict(classifier=cn["classifier"], vision=cn["vision"],
-                          layers_once=all(x == 1 for x in cn["text"]),
-                          active_ok=cn["active"] == k30m.ACTIVE, finite=fin,
-                          in_bounds=inb, recon=rec, fp32=f32, plan_diff=db)
-                r[f"{mode}_B{B}"] = rr
-                bad = [k for k, v in rr.items() if v is False] + \
-                    ([f"classifier {cn['classifier']}"] if cn["classifier"]
-                     != 1 else []) + (["recon"] if not rec <= 1e-4 else []) + \
-                    (["plan"] if not db <= 2e-6 else [])
-                if bad:
-                    prob.append(f"s{s} {mode} B{B}: {bad}")
-            if not r[f"source_legacy_B{B}"]:
-                prob.append(f"s{s} B{B}: source_legacy не детерминирован")
-        del ref, bar_r
-        # шаги и память (seed 0 — micro 8/32 обоих режимов; seed 1 — позже)
-        for mode, (m_, b_) in mods.items():
-            if s != 0:
-                continue
-            for mb in MICROS:
-                r[f"{mode}_micro{mb}"] = step_check(
-                    torch, m_, b_, D, C, dev, ac, mb, p, s, mode)
-                if r[f"{mode}_micro{mb}"].get("bad"):
-                    prob.append(f"s0 {mode} micro {mb}: "
-                                f"{r[f'{mode}_micro{mb}']['bad']}")
-        rep["seeds"][str(s)] = r
-        print(f"  seed {s}: " + json.dumps(r, default=float)[:1500],
-              flush=True)
-        del mods, h_s, h_c
-        torch.cuda.empty_cache()
+        r, pr = source_part(torch, s, p, D, C, dev, ac, rows5)
+        rep["seeds"][str(s)].update(r)
+        prob += pr
+        print(f"  seed {s}: источник/инициализация " + json.dumps(
+            r, default=float)[:1200], flush=True)
+    for mode in ("hard", "soft"):
+        for mb in MICROS:
+            r = step_part(torch, 0, mode, mb, p, D, C, dev, ac)
+            rep["seeds"]["0"][f"{mode}_micro{mb}"] = r
+            if r.get("bad"):
+                prob.append(f"s0 {mode} micro {mb}: {r['bad']}")
+            print(f"  s0 {mode} micro {mb}: " + json.dumps(
+                {k: (v if k != "warmup" and k != "main" else
+                     {kk: vv for kk, vv in v.items() if kk in
+                      ("peak_gb", "seconds", "bad")})
+                 for k, v in r.items()}, default=float), flush=True)
     ok_m = [mb for mb in MICROS
-            if all(not (rep["seeds"]["0"].get(f"{m}_micro{mb}") or {})
-                   .get("bad") and not (rep["seeds"]["0"].get(
-                       f"{m}_micro{mb}") or {}).get("oom")
+            if all(not rep["seeds"]["0"][f"{m}_micro{mb}"].get("bad") and
+                   not rep["seeds"]["0"][f"{m}_micro{mb}"].get("oom")
                    for m in ("hard", "soft"))]
     if 8 not in ok_m:
         prob.append("micro 8 не прошёл")
@@ -728,32 +832,29 @@ def real_check(a):
     rep["micro_choice"] = choice
     if choice:
         for mode in ("hard", "soft"):
-            m_, b_ = make(torch, 1, mode, p, D, C, dev)
-            rr = step_check(torch, m_, b_, D, C, dev, ac, choice, p, 1, mode)
-            rep["seeds"]["1"][f"{mode}_micro{choice}"] = rr
-            if rr.get("bad") or rr.get("oom"):
-                prob.append(f"s1 {mode} micro {choice}: {rr.get('bad')}")
-            del m_, b_
-            torch.cuda.empty_cache()
-    _ = (kc, kt)
+            r = step_part(torch, 1, mode, choice, p, D, C, dev, ac)
+            rep["seeds"]["1"][f"{mode}_micro{choice}"] = r
+            if r.get("bad") or r.get("oom"):
+                prob.append(f"s1 {mode} micro {choice}: "
+                            f"{'OOM' if r.get('oom') else r['bad']}")
+    # все конфликты — до записи обоих файлов
+    conf, started = write_conflicts(p, choice)
+    prob += conf
     rep["problems"] = prob
     rep["contract"] = rc_contract(a)
+    if started:
+        print("  ОТКАЗ: " + "; ".join(prob), flush=True)
+        return 3
     os.makedirs("reports/k30", exist_ok=True)
     with open(REAL_CHECK + ".tmp", "w", encoding="utf-8") as fh:
         json.dump(rep, fh, ensure_ascii=False, indent=1, default=float)
     os.replace(REAL_CHECK + ".tmp", REAL_CHECK)
     if not prob:
-        old = json.load(open(MICRO_FILE)) if os.path.exists(MICRO_FILE) \
-            else None
-        if old and old.get("micro") != choice and \
-                old.get("prepare") == fp(p):
-            prob.append(f"micro уже выбран: {old.get('micro')}")
-        else:
-            with open(MICRO_FILE + ".tmp", "w", encoding="utf-8") as fh:
-                json.dump(dict(micro=choice, accumulation=EFF // choice,
-                               prepare=fp(p), real_check_sha1=sha(REAL_CHECK)),
-                          fh, indent=1)
-            os.replace(MICRO_FILE + ".tmp", MICRO_FILE)
+        with open(MICRO_FILE + ".tmp", "w", encoding="utf-8") as fh:
+            json.dump(dict(micro=choice, accumulation=EFF // choice,
+                           prepare=fp(p), real_check_sha1=sha(REAL_CHECK)),
+                      fh, indent=1)
+        os.replace(MICRO_FILE + ".tmp", MICRO_FILE)
     print("  " + ("ОТКАЗ: " + "; ".join(prob) if prob else
                   f"real-check K-30 пройден; micro {choice}"), flush=True)
     return 3 if prob else 0
@@ -955,27 +1056,10 @@ def fitcheck(a):
 
 
 def check_fresh(a):
-    try:
-        if a.kind == "real-check":
-            m = decided_micro(a)
-            ok = m is not None
-        else:
-            if not os.path.exists(FITCHECK):
-                ok = False
-            else:
-                r = json.load(open(FITCHECK, encoding="utf-8"))
-                m = decided_micro(a)
-                ok = bool(r.get("ok")) and m is not None and \
-                    r.get("contract") == dict(
-                        rc_contract(a), micro=m,
-                        micro_file_sha1=sha(MICRO_FILE),
-                        real_check_sha1=sha(REAL_CHECK))
-    except SystemExit as e:
-        print(f"  {a.kind}: пересчитать ({e.code})")
-        return 1
-    print(f"  {a.kind}: " + ("пройден тем же контрактом" if ok else
-                             "пересчитать"))
-    return 0 if ok else 1
+    pr = fresh_problems(a.kind, a)
+    print(f"  {a.kind}: " + ("пройден тем же контрактом" if not pr else
+                             "пересчитать: " + "; ".join(pr)))
+    return 0 if not pr else 1
 
 
 def train(a):
@@ -986,13 +1070,12 @@ def train(a):
     if a.seed not in SEEDS or a.mode not in k30m.MODES:
         raise SystemExit("seed/режим")
     p = load_prepare()
+    pr = fresh_problems("fitcheck", a)          # до создания модели
+    if pr:
+        raise SystemExit("проверки не свежи: " + "; ".join(pr))
     micro = decided_micro(a)
     if micro != a.micro:
         raise SystemExit(f"micro {a.micro} ≠ решению {micro}")
-    fr = json.load(open(FITCHECK, encoding="utf-8")) if \
-        os.path.exists(FITCHECK) else {}
-    if not fr.get("ok"):
-        raise SystemExit("fitcheck не пройден")
     a._rc_sha, a._micro_sha = sha(REAL_CHECK), sha(MICRO_FILE)
     D, C = load_data()
     tr = Trainer(torch, a, a.seed, a.mode, p, D, C)
@@ -1154,11 +1237,73 @@ def selftest():
     assert abs(lr_main(HORIZON, 1.0) - FLOOR) < 1e-12 and \
         lr_main(0, 1.0) == 1.0 / MAIN_WARM
     _ = kt
+    # свежесть: устаревший fitcheck не пропускает train до создания модели;
+    # конфликт micro и начатое обучение — до записи real-check
+    with tempfile.TemporaryDirectory() as td:
+        names = ("PREPARE", "REAL_CHECK", "MICRO_FILE", "FITCHECK",
+                 "load_prepare", "rc_contract", "Trainer", "outdir",
+                 "report_path")
+        keep = {n: g[n] for n in names}
+        try:
+            g["PREPARE"] = os.path.join(td, "prepare.json")
+            g["REAL_CHECK"] = os.path.join(td, "rc.json")
+            g["MICRO_FILE"] = os.path.join(td, "micro.json")
+            g["FITCHECK"] = os.path.join(td, "fit.json")
+            pfake = dict(x=1)
+            g["load_prepare"] = lambda: pfake
+            g["rc_contract"] = lambda a__: dict(prepare=fp(pfake), dev="D")
+            g["outdir"] = lambda s_, m_: os.path.join(td, f"run_{s_}_{m_}")
+            g["report_path"] = lambda s_, m_: os.path.join(td,
+                                                           f"tr_{s_}_{m_}.json")
+
+            def boom(*x, **k):
+                raise AssertionError("Trainer создан при несвежих проверках")
+            g["Trainer"] = boom
+            json.dump(dict(problems=[], micro_choice=32,
+                           contract=dict(prepare=fp(pfake), dev="D")),
+                      open(g["REAL_CHECK"], "w"))
+            json.dump(dict(micro=32, prepare=fp(pfake),
+                           real_check_sha1=sha(g["REAL_CHECK"])),
+                      open(g["MICRO_FILE"], "w"))
+            good = dict(dict(prepare=fp(pfake), dev="D"), micro=32,
+                        micro_file_sha1=sha(g["MICRO_FILE"]),
+                        real_check_sha1=sha(g["REAL_CHECK"]))
+            json.dump(dict(ok=True, contract=good), open(g["FITCHECK"], "w"))
+            a2 = types.SimpleNamespace(device="cpu", micro=32, seed=0,
+                                       mode="hard")
+            assert fresh_problems("fitcheck", a2) == []
+            json.dump(dict(ok=True, contract=dict(good, micro=8)),
+                      open(g["FITCHECK"], "w"))
+            assert fresh_problems("fitcheck", a2)
+            try:
+                train(a2)
+                raise AssertionError("train принял устаревший fitcheck")
+            except SystemExit as e:
+                assert "не свежи" in str(e.code)
+            # micro.json от другого real-check — несвежо
+            json.dump(dict(micro=32, prepare=fp(pfake),
+                           real_check_sha1="0" * 40),
+                      open(g["MICRO_FILE"], "w"))
+            assert fresh_problems("real-check", a2)
+            # конфликты до записи
+            json.dump(dict(micro=32, prepare=fp(pfake)),
+                      open(g["MICRO_FILE"], "w"))
+            c1, _s = write_conflicts(pfake, 8)
+            assert c1 and write_conflicts(pfake, 32)[0] == []
+            os.makedirs(g["outdir"](0, "hard"))
+            open(os.path.join(g["outdir"](0, "hard"), "resume.pt"), "w") \
+                .close()
+            assert write_conflicts(pfake, 32)[1]
+        finally:
+            for n, v in keep.items():
+                g[n] = v
     print("самопроверка k30_train пройдена: метки не входят в forward, "
           "L_total = L_action + 0.02·L_code + 0.1·L_coarse, непрерывное = "
           "прерванное + возобновление (веса, кривая, best только в main), "
           "каждая обучаемая — в одной группе, warmup — только новые, "
-          "очередь u_abs/teacher/сид, LR")
+          "очередь u_abs/teacher/сид, LR; свежесть: устаревший fitcheck и "
+          "чужой micro.json отвергаются до создания модели, конфликты micro и "
+          "начатого обучения — до записи real-check")
     return 0
 
 

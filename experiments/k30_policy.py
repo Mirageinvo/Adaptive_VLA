@@ -29,7 +29,7 @@ import k30_model as k30m  # noqa: E402
 
 LOG_KEYS = ("logits", "ids", "b_soft", "b_used", "C0", "g1", "g2", "delta1",
             "y2", "Z", "grip")
-DBG_KEYS = ("h8", "hrp", "mid_init")
+DBG_KEYS = ("h8", "hrp", "mid_init", "half")
 
 
 def sha(p):

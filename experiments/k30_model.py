@@ -98,6 +98,11 @@ def build(torch):
                 self.register_buffer(f"geo_{k_}", v)
             self.classifier_calls = 0
 
+        def source_forward(self, batch, po, state):
+            """Исходный forward K-25 cond на общих весах этого экземпляра
+            (загруженных фабрикой K-30) — для сверки source_legacy."""
+            return K25.forward(self, batch, po, state)
+
         def geo(self):
             return {k: getattr(self, f"geo_{k}") for k in
                     ("IV0", "IV1", "IV2", "W0", "W1", "W2")}
@@ -194,7 +199,9 @@ def build(torch):
                     if debug:
                         dbg = dict(h8=h8.detach().float(),
                                    hrp=hrp.detach().float(),
-                                   mid_init=mids0.detach().float())
+                                   mid_init=mids0.detach().float(),
+                                   half=torch.full((B,), float(
+                                       hrp.dtype == torch.float16)))
                     ha = torch.cat([hrp, mids0], 1)
                 elif si == 1:
                     mids = ha[:, 4:12]
@@ -325,6 +332,30 @@ def selftest():
     def mk(mode, seed=0):
         return M["K30"](copy.deepcopy(bar0), L, U, P, s, seed=seed,
                         plan_mode=mode)
+    # source_legacy: K25.forward на общих весах K30 = настоящему K-25
+    # побитово; порча общего тензора в K30 нарушает сверку
+    torch.manual_seed(11)
+    ref = k25m.build(torch)["K25"](copy.deepcopy(bar0), L, U, seed=0).eval()
+    with torch.no_grad():
+        for p_ in list(ref.cond.parameters()) + list(ref.readout.parameters()):
+            p_.add_(torch.randn(p_.shape, generator=g) * 0.05)
+    m30 = M["K30"](copy.deepcopy(bar0), L, U, P, s, seed=0,
+                   plan_mode="hard").eval()
+    own = dict(m30.named_parameters())
+    own.update(dict(m30.named_buffers()))
+    with torch.no_grad():
+        for k_, v in ref.state_dict().items():
+            own[k_].copy_(v)
+    bt0 = km.fake_batch(torch, B=2)
+    st0 = torch.randn(2, 11, generator=g)
+    with torch.no_grad():
+        oa, ob = ref(bt0, 1, st0), m30.source_forward(bt0, 1, st0)
+    assert torch.equal(oa["arm"], ob["arm"]) and \
+        torch.equal(oa["grip_logit"], ob["grip_logit"])
+    with torch.no_grad():
+        m30.cond.A_h.weight.add_(1e-3)
+        oc = m30.source_forward(bt0, 1, st0)
+    assert not torch.equal(oa["arm"], oc["arm"])
     # глобальный RNG не сдвигается созданием новых модулей
     torch.manual_seed(5)
     k25m.build(torch)["K25"](copy.deepcopy(bar0), L, U, seed=0)
@@ -415,7 +446,9 @@ def selftest():
           f"один проход (4/12/28) и один вызов классификатора после слоя 8, "
           f"hard = P[ids], soft = p@P, Z = G0+G1+G2, причинность плана, "
           f"передача плана (одно добавление до Expand1), C0 зависит от кода "
-          f"при plan_proj = 0, группы warmup/main без dur/split, STE-градиент")
+          f"при plan_proj = 0, группы warmup/main без dur/split, STE-градиент, "
+          f"source_forward (K-25 cond на общих весах K30) = K-25 побитово, "
+          f"порча общего тензора — расхождение")
     return 0
 
 
