@@ -73,9 +73,12 @@ def block_problems(path, p, seed, which, task, block, want_model):
     if d.get("model") != want_model or d.get("seed") != seed or \
             d.get("which") != which:
         pr.append("модель/сид/вид блока ≠ ожидаемым")
-    if int(d.get("task", -1)) != task or d.get("starts") != list(
-            range(block, block + 5)):
+    starts = list(range(block, block + 5))
+    if int(d.get("task", -1)) != task or d.get("starts") != starts:
         pr.append("задача/старты")
+    got = [int(e.get("init_state_id", -1)) for e in d.get("episodes") or []]
+    if got != starts:
+        pr.append(f"init_state_id эпизодов {got} ≠ стартам блока {starts}")
     if d.get("contract") != pc.contract(p)["fingerprint"]:
         pr.append("контракт подготовки")
     for i, e in enumerate(d.get("episodes") or []):
@@ -165,7 +168,7 @@ def run_eval(a):
 
 def outcomes(seed, which, p=None):
     """{(задача, init): успех} проверенных блоков или отказ при неполноте."""
-    p = p or pc.load_prepare()
+    p = pc.load_prepare() if p is None else p
     want = expected_model(p, seed, which)
     out = {}
     for t in pc.EVAL_TASKS:
@@ -175,7 +178,16 @@ def outcomes(seed, which, p=None):
             if pr:
                 raise SystemExit(f"s{seed} {which} t{t} i{b}: {pr[:2]}")
             for e in json.load(open(path, encoding="utf-8"))["episodes"]:
-                out[(t, int(e["init_state_id"]))] = bool(e["success"])
+                key = (t, int(e["init_state_id"]))
+                if key in out:
+                    raise SystemExit(f"s{seed} {which}: повтор состояния {key}")
+                out[key] = bool(e["success"])
+    want_keys = {(t, i) for t in pc.EVAL_TASKS for b in pc.EVAL_BLOCKS
+                 for i in range(b, b + 5)}
+    if set(out) != want_keys:
+        raise SystemExit(f"s{seed} {which}: набор состояний ≠ ожидаемым 75 "
+                         f"(лишние {sorted(set(out) - want_keys)[:3]}, "
+                         f"пропущены {sorted(want_keys - set(out))[:3]})")
     return out
 
 
@@ -185,7 +197,7 @@ def check(a):
     except SystemExit as e:
         print(f"  {e.code}")
         return 3
-    print(f"  s{a.seed} {a.which}: 75/75 эпизодов проверены; SR "
+    print(f"  s{a.seed} {a.which}: {len(o)}/75 уникальных состояний проверены; SR "
           f"{np.mean(list(o.values())):.3f}")
     return 0
 
@@ -231,11 +243,50 @@ def selftest():
             json.dump(dict(d, episodes=e3), open(path, "w"))
             assert any("действия" in x for x in block_problems(
                 path, p, 0, "init", 0, 30, want))
+            # init_state_id эпизодов: повтор, посторонний старт, перестановка
+            for ids in ([30, 30, 32, 33, 34], [30, 31, 32, 33, 44],
+                        [31, 30, 32, 33, 34]):
+                e4 = [dict(e, init_state_id=i) for e, i in zip(eps, ids)]
+                json.dump(dict(d, episodes=e4), open(path, "w"))
+                assert any("init_state_id" in x for x in block_problems(
+                    path, p, 0, "init", 0, 30, want)), ids
         finally:
             pc.contract = orig
-    print("самопроверка k29_harness пройдена: блок проходит; старты, модель, "
+    # outcomes: повтор блока (5 уникальных из 75), пропуск, посторонний
+    with tempfile.TemporaryDirectory() as td:
+        orig = (eval_dir, block_problems, expected_model)
+        g = globals()
+        g["eval_dir"] = lambda s_, w_: td
+        g["block_problems"] = lambda *a_, **k_: []
+        g["expected_model"] = lambda *a_, **k_: {}
+
+        def write(blocks):
+            for t in pc.EVAL_TASKS:
+                for b in pc.EVAL_BLOCKS:
+                    ids = blocks(t, b)
+                    json.dump(dict(episodes=[dict(init_state_id=i,
+                                                  success=True) for i in ids]),
+                              open(block_path(0, "init", t, b), "w"))
+        try:
+            write(lambda t, b: range(b, b + 5))
+            assert len(outcomes(0, "init", p={})) == 75
+            for bad in (lambda t, b: range(30, 35),            # повтор
+                        lambda t, b: range(b, b + 4),          # пропуск
+                        lambda t, b: [b, b + 1, b + 2, b + 3,
+                                      45 if (t, b) == (8, 40) else b + 4]):
+                write(bad)
+                try:
+                    outcomes(0, "init", p={})
+                    raise AssertionError("неверный набор состояний принят")
+                except SystemExit:
+                    pass
+        finally:
+            g["eval_dir"], g["block_problems"], g["expected_model"] = orig
+    print("самопроверка k29_harness пройдена: блок проходит; старты, "
+          "init_state_id эпизодов (повтор/посторонний/порядок), модель, "
           "контракт, начальный хеш (холодный эталон K-25) и действия/npz — "
-          "отказ")
+          "отказ; набор состояний: повтор блоков, пропуск, посторонний старт "
+          "— отказ, ровно 75 уникальных")
     return 0
 
 

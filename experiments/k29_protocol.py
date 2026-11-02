@@ -52,6 +52,7 @@ PRIMARY_TASKS = kc.CYCLE_TASKS
 EVAL_BLOCKS = (30, 35, 40)
 CLOSED = tuple(range(45, 50))
 SMOKE_MAX = 2 * kc.WAVE_MAX
+ARM_TOL = 1e-6          # пересборка руки на CPU против GPU (абсолютный)
 MODEL_CODE = ("k29_dist.py", "k29_model.py", "k29_policy.py",
               "k29_collect.py", "k29_ppo.py", "k29_protocol.py",
               "k25_readout.py", "k25_model.py", "k25_policy.py",
@@ -431,7 +432,7 @@ def smoke(a):
             sent.append(np.asarray(acts, np.float32).copy())
             return step0(acts)
         sim.step = step
-        prob, waves, bufs, phys = [], [], [], 0
+        prob, waves, bufs, phys, arm_max = [], [], [], 0, 0.0
         for w, task in enumerate((0, 8)):
             starts = kpo.pick_init(0, 10_000 + w)
             sent.clear()
@@ -448,12 +449,18 @@ def smoke(a):
                     len(sent) != 10 + c["steps"]:
                 prob.append(f"волна {w}: учёт шагов")
             # рука = mid + half·tanh(Y/half) по записанным Y активных сред
+            # независимая пересборка на CPU: допуск закреплён заранее —
+            # max|Δarm| ≤ 1e−6 (абсолютный), всё конечно
             half, mid = pol.half.cpu(), pol.mid.cpu()
             arm = (mid + half * torch.tanh(buf["Y"] / half)).numpy()
             rec = np.concatenate([ch["a_codec"][ch["active"]] for ch in
                                   log["chunks"] if ch["active"].any()])
-            if not np.array_equal(arm, rec[..., :6]):
-                prob.append(f"волна {w}: рука ≠ tanh(Y)")
+            d_arm = float(np.abs(arm - rec[..., :6]).max())
+            arm_max = max(arm_max, d_arm)
+            if not (np.isfinite(arm).all() and np.isfinite(rec).all() and
+                    d_arm <= ARM_TOL):
+                prob.append(f"волна {w}: рука ≠ mid + half·tanh(Y/half) "
+                            f"({d_arm:.2e})")
             for i, e in enumerate(eps):
                 kk = buf["k"][buf["env"] == i]
                 if kk.sum() != e["own_steps"]:
@@ -479,6 +486,7 @@ def smoke(a):
             prob.append(f"пересчёт по кешу: Δμ {dm:.2e}, Δlog π {dl:.2e}")
         rep = dict(waves=waves, physical=phys, transitions=int(len(buf["k"])),
                    recompute=dict(mu_max=dm, logp_max=dl),
+                   arm_rebuild_max=arm_max, arm_tol=ARM_TOL,
                    k_hist=np.bincount(buf["k"], minlength=9).tolist(),
                    problems=prob, contract=check_contract(a))
         with open(SMOKE + ".tmp", "w", encoding="utf-8") as fh:
@@ -488,6 +496,8 @@ def smoke(a):
             print(f"  smoke задача {wv['task']}, init {wv['starts']}: успех "
                   f"{sum(wv['success'])}/5, шагов {wv['counts']['physical']}, "
                   f"{wv['counts']['seconds']:.0f} с", flush=True)
+        print(f"  пересборка руки на CPU: max|Δ| {arm_max:.1e} (допуск "
+              f"{ARM_TOL:g})", flush=True)
         print(f"  пересчёт по кешу: Δμ {dm:.1e}, Δlog π {dl:.1e}; k "
               f"{rep['k_hist']}", flush=True)
         print("  " + ("ОТКАЗ: " + "; ".join(prob) if prob else

@@ -219,6 +219,11 @@ class Trainer:
     def actor_hash(self):
         return self.M_hash(self.actor)
 
+    def _crash(self, point):
+        """Точка аварии для самопроверок (в работе не срабатывает)."""
+        if getattr(self, "crash_at", None) == point:
+            raise KeyboardInterrupt(point)
+
     # --- сохранение ----------------------------------------------------------------
     def save(self):
         torch = self.torch
@@ -273,8 +278,12 @@ class Trainer:
             if d["policy_old"] != self.actor_hash():
                 raise SystemExit(f"{f}: собран другим policy_old")
             if d["cycle"] >= self.st["cycle"]:    # авария до сохранения
-                self.st["cycle"] = d["cycle"] + 1  # счётчиков цикла
+                self.st["cycle"] = d["cycle"] + 1  # счётчиков цикла: всё —
                 self.st["wave"] = max(self.st["wave"], d["wave_end"])
+                for k_ in ("episodes", "transitions", "policy_steps"):
+                    self.st[k_] += int(d["counts"][k_])   # из данных цикла
+                self.st["phys_train"] = self.ledger.d["train_spent"]
+                self.save()                       # одно начисление
             out.append((f, d))
         return out
 
@@ -307,8 +316,10 @@ class Trainer:
         p = os.path.join(self.dir, "pending", f"cycle_{cid:04d}.pt")
         torch.save(d, p + ".tmp")
         os.replace(p + ".tmp", p)
+        self._crash("after_pending")
         self.ledger.commit(phys, dict(cycle=cid, success=float(np.mean(
             [e["success"] for e in eps_all])), **cnt))
+        self._crash("after_commit")
         self.st["cycle"] = cid + 1
         self.st["episodes"] += cnt["episodes"]
         self.st["transitions"] += cnt["transitions"]
@@ -560,6 +571,40 @@ def selftest():
         t7.load()
         assert t7.pending() == [] and not glob.glob(os.path.join(
             td4, "pending", "cycle_*.pt"))
+    # аварии после записи pending и после ledger.commit, до state.pt:
+    # счётчики восстанавливаются из данных цикла и ledger, один раз
+    for point in ("after_pending", "after_commit"):
+        with tempfile.TemporaryDirectory() as td5:
+            t8 = trainer(td5, 4 * kc.CYCLE_MAX)
+            t8.cfg = small
+            t8.load()
+            t8.validate("start")
+            t8.crash_at = point
+            try:
+                t8.collect_cycle()
+                raise AssertionError("авария не сработала")
+            except KeyboardInterrupt:
+                pass
+            t9 = trainer(td5, 4 * kc.CYCLE_MAX)
+            t9.cfg = small
+            t9.load()
+            pend = t9.pending()
+            assert len(pend) == 1
+            cnt = pend[0][1]["counts"]
+            for _ in range(2):                    # повторный вызов — без
+                t9.pending()                      # двойного начисления
+                t10 = trainer(td5, 4 * kc.CYCLE_MAX)
+                t10.cfg = small
+                t10.load()
+                t10.pending()
+                for k_ in ("episodes", "transitions", "policy_steps"):
+                    assert t10.st[k_] == cnt[k_] > 0, (point, k_, t10.st[k_])
+                assert t10.st["cycle"] == 1 and t10.st["wave"] == 3
+                assert t10.st["phys_train"] == t10.ledger.d["train_spent"]
+                if point == "after_commit":
+                    assert t10.ledger.d["train_spent"] == pend[0][1]["phys"]
+                else:                             # резерв списан целиком
+                    assert t10.ledger.d["train_spent"] == kc.CYCLE_MAX
     with tempfile.TemporaryDirectory() as td3:
         t4 = trainer(td3, 4 * kc.CYCLE_MAX)
         t4.cfg = small
@@ -578,7 +623,9 @@ def selftest():
           "обновление, порча μ -> отказ; тренер: бюджет и последний неполный "
           "batch, валидации start/end, прерванный + продолжение = непрерывный,"
           " авария внутри цикла списывает резерв, авария после обновления до "
-          "удаления pending не блокирует продолжение; init без повторов")
+          "удаления pending не блокирует продолжение, аварии после pending и "
+          "после ledger.commit восстанавливают счётчики один раз; init без "
+          "повторов")
     return 0
 
 
