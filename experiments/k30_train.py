@@ -837,15 +837,20 @@ def real_check(a):
             if r.get("bad") or r.get("oom"):
                 prob.append(f"s1 {mode} micro {choice}: "
                             f"{'OOM' if r.get('oom') else r['bad']}")
-    # все конфликты — до записи обоих файлов
-    conf, started = write_conflicts(p, choice)
-    prob += conf
-    rep["problems"] = prob
     rep["contract"] = rc_contract(a)
-    if started:
-        print("  ОТКАЗ: " + "; ".join(prob), flush=True)
+    return finalize_real_check(rep, prob, choice, p)
+
+
+def finalize_real_check(rep, prob, choice, p):
+    """Все конфликты — ДО записи: при любом конфликте ни real_check.json,
+    ни micro.json не меняются. Иначе — real_check.json, затем (если
+    проблем нет) micro.json."""
+    conf, _started = write_conflicts(p, choice)
+    if conf:
+        print("  ОТКАЗ (файлы не изменены): " + "; ".join(conf), flush=True)
         return 3
-    os.makedirs("reports/k30", exist_ok=True)
+    rep["problems"] = prob
+    os.makedirs(os.path.dirname(REAL_CHECK) or ".", exist_ok=True)
     with open(REAL_CHECK + ".tmp", "w", encoding="utf-8") as fh:
         json.dump(rep, fh, ensure_ascii=False, indent=1, default=float)
     os.replace(REAL_CHECK + ".tmp", REAL_CHECK)
@@ -1290,6 +1295,12 @@ def selftest():
                       open(g["MICRO_FILE"], "w"))
             c1, _s = write_conflicts(pfake, 8)
             assert c1 and write_conflicts(pfake, 32)[0] == []
+            # конфликт micro: оба файла после отказа побайтно неизменны
+            before = {f: open(f, "rb").read() for f in (g["REAL_CHECK"],
+                                                        g["MICRO_FILE"])}
+            rc_ = finalize_real_check(dict(x=1), [], 8, pfake)
+            assert rc_ == 3 and all(open(f, "rb").read() == v
+                                    for f, v in before.items())
             os.makedirs(g["outdir"](0, "hard"))
             open(os.path.join(g["outdir"](0, "hard"), "resume.pt"), "w") \
                 .close()

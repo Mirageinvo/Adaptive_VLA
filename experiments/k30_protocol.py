@@ -294,25 +294,32 @@ def debug_problems(z, label, spec, g, G):
         p.append(f"{label}: h8 + plan_proj ≠ GPU ({d:.2e})")
     half = bool(np.asarray(z["k21_k30_dbg_half"])[0].max() > 0) \
         if "k21_k30_dbg_half" in z else False
-    mid_c, w16 = expand1_fp16(torch, hrp, W, G, half)
-    err = np.abs(mid_c - mid)
-    tol = TOL_DBG * np.maximum(1.0, np.abs(mid))
-    over = ~(err <= tol)
-    # единственное допущение сверх общего допуска: ровно один шаг fp16
-    # выхода Linear (флип округления из-за порядка накопления в GEMM)
-    flip = over & np.isclose(err, np.abs(np.spacing(w16.astype(np.float16))
-                                         .astype(np.float64)), rtol=1e-3,
-                             atol=0)
-    if (over & ~flip).any():
+    cands = expand1_fp16(torch, hrp, W, G, half)
+    bad = expand1_mismatch(cands, mid)
+    if bad.any():
+        err = np.abs(cands[0] - mid)
         p.append(f"{label}: Expand1 CPU ≠ GPU (max {float(err.max()):.2e}, "
-                 f"вне допуска {int((over & ~flip).sum())})")
+                 f"вне допуска {int(bad.sum())})")
     return p
+
+
+def expand1_mismatch(cands, mid):
+    """Совпадение GPU-выхода с основным повтором ИЛИ с одним из двух
+    повторов, где выход Linear заменён соседним значением fp16 (nextafter
+    вверх/вниз) — флип округления из-за порядка накопления; допуск прежний
+    1e−4·max(1,|ref|). Исключение — только для этой проверки Expand1."""
+    tol = TOL_DBG * np.maximum(1.0, np.abs(mid))
+    ok = np.zeros(mid.shape, bool)
+    for c in cands:
+        ok |= np.abs(c - mid) <= tol
+    return ~ok
 
 
 def expand1_fp16(torch, hrp, W, G, half=False):
     """CPU-повтор Expand1 с приведениями fp16 autocast и порядком сложений
     GPU: Linear(φ) — вход и веса округлены до fp16, накопление fp32, выход
-    fp16; затем (h + side) + Linear в float32. hrp [B,4,H] (float32)."""
+    fp16; затем (h + side) + Linear в dtype h на GPU (fp32 или fp16).
+    -> [основной, сосед fp16 вверх, сосед fp16 вниз] (float64 [B,8,H])."""
     import k21_tree as kt
     TT = kt.build(torch)
     iv = torch.as_tensor(G["IV1"], dtype=torch.float32)[None]
@@ -322,15 +329,22 @@ def expand1_fp16(torch, hrp, W, G, half=False):
                    -1)[0].float()
     Wh = torch.as_tensor(W["exp1.W.weight"]).half().float()
     bh = torch.as_tensor(W["exp1.W.bias"]).half().float()
-    w16 = (fe.half().float() @ Wh.T + bh).half()                  # [8, H]
-    dt = torch.float16 if half else torch.float32   # dtype h на GPU
+    w16 = (fe.half().float() @ Wh.T + bh).half().numpy()          # [8, H]
+    return expand1_combine(torch, hrp, W["exp1.e_side"], w16, half)
+
+
+def expand1_combine(torch, hrp, e_side, w16, half):
+    dt = torch.float16 if half else torch.float32
     hp = torch.as_tensor(hrp, dtype=torch.float32).to(dt).repeat_interleave(
         2, 1)
-    side = torch.as_tensor(W["exp1.e_side"], dtype=torch.float32).repeat(
-        4, 1).to(dt)
-    mid = ((hp + side[None]) + w16.to(dt)[None]).float()
-    return mid.double().numpy(), w16.float().numpy()[None].repeat(
-        len(hrp), 0)
+    side = torch.as_tensor(e_side, dtype=torch.float32).repeat(4, 1).to(dt)
+    w16 = np.asarray(w16, np.float16)
+    out = []
+    for w in (w16, np.nextafter(w16, np.float16(np.inf)),
+              np.nextafter(w16, np.float16(-np.inf))):
+        wt = torch.as_tensor(w.astype(np.float32)).to(dt)
+        out.append(((hp + side[None]) + wt[None]).float().double().numpy())
+    return out
 
 
 def check_block(plan, plan_path_, path, label, suite, task, block):
@@ -503,17 +517,28 @@ def selftest():
         hrp.double().repeat_interleave(2, 1) + torch.as_tensor(
             W_["exp1.e_side"]).repeat(4, 1)[None] + f64[None])).abs().max())
     assert old_err > 1e-4, old_err          # прежняя пересборка отвергла бы
-    mid_c, w16 = expand1_fp16(torch, hrp.numpy(), W_, G_)
+    cands = expand1_fp16(torch, hrp.numpy(), W_, G_)
     gm = gpu_mid.double().numpy()
-    err = np.abs(mid_c - gm)
-    tol = TOL_DBG * np.maximum(1.0, np.abs(gm))
-    flip = np.isclose(err, np.abs(np.spacing(w16.astype(np.float16))
-                                  .astype(np.float64)), rtol=1e-3, atol=0)
-    assert ((err <= tol) | flip).all(), float(err.max())
-    err2 = np.abs(mid_c - (gm + 1e-3))
-    assert not ((err2 <= tol) | np.isclose(err2, np.abs(np.spacing(
-        w16.astype(np.float16)).astype(np.float64)), rtol=1e-3,
-        atol=0)).all()
+    assert not expand1_mismatch(cands, gm).any()
+    assert expand1_mismatch(cands, gm + 1e-3).any()
+    # соседи fp16 у +1 и −1 (на границе степени двойки расстояния до
+    # соседей вверх и вниз различаются), обе ветки dtype h; подмена на два
+    # шага fp16 обнаруживается
+    one = np.array([[1.0, -1.0, 1.0, -1.0]], np.float16).repeat(8, 0)
+    hz = np.zeros((1, 4, 4), np.float32)
+    sz = np.zeros((2, 4))
+    for half_ in (False, True):
+        base = expand1_combine(torch, hz, sz, one, half_)
+        for direction in (np.inf, -np.inf):
+            nb = np.nextafter(one, np.float16(direction))
+            gpu = expand1_combine(torch, hz, sz, nb, half_)[0]
+            if not half_:
+                d = np.abs(gpu - base[0])
+                assert d.max() > TOL_DBG          # без соседей — отказ
+            assert not expand1_mismatch(base, gpu).any(), (half_, direction)
+            two = np.nextafter(nb, np.float16(direction))
+            gpu2 = expand1_combine(torch, hz, sz, two, half_)[0]
+            assert expand1_mismatch(base, gpu2).any(), (half_, direction)
     assert len(set(CODE)) == len(CODE)
     print("самопроверка k30_protocol пройдена: журнал игрушечной руки (hard и "
           "soft) проходит; порча ID, b_used, logits, C0, Z, схвата, "
@@ -521,7 +546,8 @@ def selftest():
           "root_ln/classifier/plan_proj/Expand1 проходит, порча — отказ; Expand1 с "
           "сокращающимися слагаемыми и честным fp16: явный повтор приведений "
           "проходит (прежний допуск отверг бы), внесённая ошибка 1e−3 — "
-          "отказ")
+          "отказ; соседи fp16 (nextafter) у ±1 в обеих ветках dtype "
+          "принимаются, подмена на два шага — отказ")
     return 0
 
 
