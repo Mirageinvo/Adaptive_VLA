@@ -347,30 +347,74 @@ def real_check(a):
             r[f"ppo_mb{mbs}"] = dict(
                 peak_gb=torch.cuda.max_memory_allocated(dev) / 2 ** 30,
                 ms_fwd_bwd=(time.perf_counter() - t1) * 1e3)
-        # полный шаг PPO
-        h_a, h_c = km.tensor_hash(actor.state_dict()), km.tensor_hash(
-            critic.state_dict())
+        # (а) механика одного полного шага actor и critic (критерий плана):
+        # один minibatch 32, потеря actor (суррогат + 0.01·KL к reference) и
+        # BCE критика, по одному шагу оптимизаторов
+        import copy
         h_r = km.tensor_hash(ref.state_dict())
-        oa = torch.optim.AdamW(actor.parameters(), lr=kpo.CFG["lr_actor"],
-                               weight_decay=0.0)
-        oc = torch.optim.Adam(critic.parameters(), lr=kpo.CFG["lr_critic"])
-        cfg1 = dict(kpo.CFG, epochs=1)
-        stp = kpo.ppo_update(torch, M, actor, critic, oa, oc, buf, dev,
-                             (s, 99, 0), cfg1)
+        a1, c1 = copy.deepcopy(actor), copy.deepcopy(critic)
+        h_a, h_c = km.tensor_hash(a1.state_dict()), km.tensor_hash(
+            c1.state_dict())
+        oa = torch.optim.AdamW(a1.parameters(), lr=kpo.CFG["lr_actor"],
+                               weight_decay=kpo.CFG["wd_actor"])
+        oc = torch.optim.Adam(c1.parameters(), lr=kpo.CFG["lr_critic"])
+        idx = np.arange(min(kpo.CFG["minibatch"], N))
+        kk = torch.as_tensor(buf["k"][idx]).to(dev)
+        Fm = kpo.to_dev(buf["F"], idx, dev)
+        mu_o = buf["mu"][idx].to(dev)
+        Am = torch.as_tensor(buf["R"][idx] - 0.5, device=dev)
+        Am = (Am - Am.mean()) / Am.std()
+        mu = M["mu_of"](a1(Fm)).float()
+        ratio = torch.exp(kd.log_prob(torch, buf["Y"][idx].to(dev), mu, kk) -
+                          kd.log_prob(torch, buf["Y"][idx].to(dev), mu_o, kk))
+        la = -torch.min(ratio * Am, torch.clamp(ratio, 0.8, 1.2) * Am).mean() \
+            + kpo.CFG["lambda_ref"] * kd.kl(torch, mu, mu_o, kk).mean()
+        oa.zero_grad(set_to_none=True)
+        la.backward()
+        gn_a = float(torch.nn.utils.clip_grad_norm_(a1.parameters(),
+                                                    kpo.CFG["grad_clip"]))
+        oa.step()
+        v = c1(Fm, buf["s11n"][idx].to(dev), torch.as_tensor(
+            buf["elapsed"][idx], dtype=torch.float32, device=dev))
+        lc = torch.nn.functional.binary_cross_entropy_with_logits(
+            v, torch.as_tensor(buf["R"][idx], device=dev))
+        oc.zero_grad(set_to_none=True)
+        lc.backward()
+        gn_c = float(torch.nn.utils.clip_grad_norm_(c1.parameters(),
+                                                    kpo.CFG["grad_clip"]))
+        oc.step()
+        mu1 = kpo.mu_all(torch, a1, M, buf, dev, kpo.CFG["minibatch"])
         r["ppo_step"] = dict(
-            epochs=stp["epochs"], rollback=stp["rollback"],
-            mu_recompute=stp["mu_recompute_max"],
-            actor_changed=km.tensor_hash(actor.state_dict()) != h_a,
-            critic_changed=km.tensor_hash(critic.state_dict()) != h_c,
+            loss_actor=float(la), loss_critic=float(lc), grad_norm_actor=gn_a,
+            grad_norm_critic=gn_c,
+            kl_old_after_one_step=float(kd.kl(
+                torch, mu1, buf["mu"], torch.as_tensor(buf["k"])).mean()),
+            actor_changed=km.tensor_hash(a1.state_dict()) != h_a,
+            critic_changed=km.tensor_hash(c1.state_dict()) != h_c,
             reference_same=km.tensor_hash(ref.state_dict()) == h_r,
             source_same=km.frozen_hash(mod) == p["sources"][str(s)][
                 "weights_hash"],
             finite=all(bool(torch.isfinite(q).all()) for q in
-                       list(actor.parameters()) + list(critic.parameters())))
+                       list(a1.parameters()) + list(c1.parameters())) and
+            bool(torch.isfinite(la)) and bool(torch.isfinite(lc)))
         bad = [k for k in ("actor_changed", "critic_changed", "reference_same",
                            "source_same", "finite") if not r["ppo_step"][k]]
         if bad:
             prob.append(f"s{s}: шаг PPO: {bad}")
+        # (б) описательно: одна эпоха ppo_update с порогом KL на этом
+        # синтетическом batch (случайные R и k) — не критерий
+        a2, c2 = copy.deepcopy(actor), copy.deepcopy(critic)
+        st2 = kpo.ppo_update(
+            torch, M, a2, c2, torch.optim.AdamW(
+                a2.parameters(), lr=kpo.CFG["lr_actor"],
+                weight_decay=kpo.CFG["wd_actor"]),
+            torch.optim.Adam(c2.parameters(), lr=kpo.CFG["lr_critic"]), buf,
+            dev, (s, 99, 0), dict(kpo.CFG, epochs=1))
+        r["ppo_epoch_descriptive"] = dict(
+            steps=int(np.ceil(N / kpo.CFG["minibatch"])), epochs=st2["epochs"],
+            rollback=st2["rollback"], kl_old=st2["history"][-1]["kl_old"],
+            mu_recompute=st2["mu_recompute_max"])
+        del a1, c1, a2, c2
         r["params"] = dict(
             actor=sum(q.numel() for q in actor.parameters()),
             critic=sum(q.numel() for q in critic.parameters()),
