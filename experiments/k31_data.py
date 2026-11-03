@@ -72,24 +72,18 @@ def label_class(d):
     return {-1: 0, 0: 1, 1: 2}[int(d)]
 
 
-def load_case(cdir):
-    """-> dict случая или None (не завершён)."""
-    cj = os.path.join(cdir, "case.json")
-    if not os.path.exists(cj):
-        return None
-    case = json.load(open(cj, encoding="utf-8"))
-    z = dict(np.load(os.path.join(cdir, "ref.npz")))
-    rj = json.load(open(os.path.join(cdir, "ref.json"), encoding="utf-8"))
+def load_case(cdir, *, seed, space, task, init):
+    """-> dict случая; повреждённый/незавершённый — технический отказ
+    (общая проверка k31_collect.case_problems: id, файлы, исходы, R0,
+    метки Rc − R0, подтверждение noop)."""
     import k31_collect as kcol
-    if kcol.sha(os.path.join(cdir, "ref.npz")) != rj["npz_sha1"]:
-        raise SystemExit(f"{cdir}: ref.npz изменён")
-    for n in case["order"]:
-        b = json.load(open(os.path.join(cdir, f"b_{n}.json"),
-                           encoding="utf-8"))
-        if kcol.sha(os.path.join(cdir, f"b_{n}.npz")) != b["npz_sha1"]:
-            raise SystemExit(f"{cdir}: b_{n}.npz изменён")
-        if bool(b["episode"]["success"]) != bool(case["branches"][n]):
-            raise SystemExit(f"{cdir}: исход {n} ≠ case.json")
+    pr = kcol.case_problems(cdir, seed=seed, space=space, task=task,
+                            init=init)
+    if pr:
+        raise SystemExit(f"{cdir}: {pr[:3]}")
+    case = json.load(open(os.path.join(cdir, "case.json"), encoding="utf-8"))
+    rj = json.load(open(os.path.join(cdir, "ref.json"), encoding="utf-8"))
+    z = dict(np.load(os.path.join(cdir, "ref.npz")))
     return dict(case=case, ref=rj, z=z)
 
 

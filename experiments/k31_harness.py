@@ -138,22 +138,23 @@ def journal_problems(J, A_eps, done_steps, half, mid, L, U, scale_q,
     for k_ in ("a_codec", "Z0", "ref_arm", "grip_logit", "X", "sel_logits"):
         if not np.isfinite(np.asarray(J[k_], np.float64)).all():
             return [f"журнал {k_}: нечисловые значения"]
-    hp, al = J["has_pool"], J["allowed"]
-    for k_, cell in (("Du", (kc.T, 6)), ("pool_arm", (kc.N8, 6))):
+    hp, al, va = J["has_pool"], J["allowed"], J["valid"]
+    if (al & ~va).any() or (hp & ~va[:, 0]).any():
+        return ["журнал: разрешённая строка не валидна"]
+    for k_, src in (("Du", va), ("pool_arm", al)):
         fin = np.isfinite(J[k_]).reshape(n, 7, -1)
         want = np.zeros((n, 7), bool)
-        want[hp] = al[hp]
+        want[hp] = src[hp]
         if k_ == "pool_arm":
             want[:, 0] = False
-        else:
-            want[hp, 0] = True
         if not (np.array_equal(fin.all(-1), want) and
                 np.array_equal(fin.any(-1), want)):
             return [f"журнал {k_}: NaN/±Inf вне недопустимых строк"]
     lam_f = np.isfinite(J["lam"])
-    if (lam_f & ~(al & hp[:, None])).any() or \
-            (~lam_f[:, 1:] & (al & hp[:, None])[:, 1:]).any():
-        return ["журнал λ: нечисловые значения у разрешённых строк"]
+    want_l = va & hp[:, None]
+    want_l[:, 0] = False
+    if not np.array_equal(lam_f, want_l):
+        return ["журнал λ: нечисловые значения у допустимых строк"]
     sc = np.where(hp[:, None] & al, J["scores"], 0.0)
     if not np.isfinite(sc).all():
         return ["журнал score: нечисловые значения"]
@@ -189,7 +190,7 @@ def journal_problems(J, A_eps, done_steps, half, mid, L, U, scale_q,
         if not np.array_equal(want, al[i]) or m != int(J["m"][i]):
             p.append(f"вызов {i}: m/разрешённые строки ≠ правилу")
         for j in range(1, 7):
-            if not al[i, j]:
+            if not va[i, j]:
                 continue
             Du = torch.as_tensor(J["Du"][i, j])
             rms = float(torch.sqrt(torch.mean(Du[:kc.N8] ** 2)))
@@ -197,6 +198,8 @@ def journal_problems(J, A_eps, done_steps, half, mid, L, U, scale_q,
                     not float(J["lam"][i, j]) <= kc.LAMBDA_MAX or \
                     not float(Du[:kc.N8].abs().max()) <= kc.DU_MAX:
                 p.append(f"вызов {i} строка {j}: нормировка")
+            if not al[i, j]:
+                continue
             with torch.autocast("cpu", enabled=False):
                 arm = (m_ + h * torch.tanh(Z0 / h + Du))[:kc.N8].numpy()
             if not np.array_equal(arm, J["pool_arm"][i, j]):

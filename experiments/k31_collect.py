@@ -188,10 +188,14 @@ def continuation_problems(ref, br, tau):
 
 # --- журнал бюджета ---------------------------------------------------------------
 class Ledger:
-    """Физические шаги по областям (scope -> cap). Резерв пишется до
-    исполнения; commit заменяет его фактическим расходом и помечает id
-    исполненным (повтор id не начисляется); незакрытый резерв при загрузке
-    списывается консервативно как авария."""
+    """Физические шаги по областям (scope -> cap). Порядок исполнения:
+    reserve(id) -> исполнение -> атомарная запись результата (с id и
+    фактическим расходом) -> commit(id). Незакрытый резерв переживает
+    перезапуск: если результат id уже записан, settle(id, расход) закрывает
+    его фактическим расходом (результат не теряется, расход не задваивается);
+    иначе при следующем reserve резерв списывается целиком как авария
+    (аварийный расход в бюджет не возвращается). Повтор исполненного id не
+    начисляется и не резервируется."""
 
     def __init__(self, path, caps):
         self.path = path
@@ -199,14 +203,6 @@ class Ledger:
             self.d = json.load(open(path, encoding="utf-8"))
             if self.d["caps"] != {k: int(v) for k, v in caps.items()}:
                 raise SystemExit(f"{path}: другие лимиты {self.d['caps']}")
-            if self.d["pending"]:
-                pd = self.d["pending"]
-                self.d["spent"][pd["scope"]] = self.d["spent"].get(
-                    pd["scope"], 0) + int(pd["amount"])
-                self.d["crashes"].append(dict(pd, time=time.strftime(
-                    "%Y-%m-%dT%H:%M:%S")))
-                self.d["pending"] = None
-                self._save()
         else:
             self.d = dict(caps={k: int(v) for k, v in caps.items()},
                           spent={k: 0 for k in caps}, pending=None,
@@ -225,11 +221,23 @@ class Ledger:
     def is_done(self, eid):
         return eid in self.d["done"]
 
+    def pending_id(self):
+        return (self.d["pending"] or {}).get("id")
+
+    def _crash_pending(self):
+        pd = self.d["pending"]
+        self.d["spent"][pd["scope"]] = self.spent(pd["scope"]) + \
+            int(pd["amount"])
+        self.d["crashes"].append(dict(pd, time=time.strftime(
+            "%Y-%m-%dT%H:%M:%S")))
+        self.d["pending"] = None
+        self._save()
+
     def reserve(self, scope, eid, amount=EXEC_MAX, limit=None):
-        if self.d["pending"]:
-            raise SystemExit("резерв уже открыт")
         if eid in self.d["done"]:
             raise SystemExit(f"{eid} уже исполнен и учтён")
+        if self.d["pending"]:
+            self._crash_pending()             # результата нет — авария
         cap = self.d["caps"][scope] if limit is None else min(
             int(limit), self.d["caps"][scope])
         if self.spent(scope) + int(amount) > cap:
@@ -248,6 +256,17 @@ class Ledger:
         self.d["done"][eid] = dict(scope=pd["scope"], actual=int(actual))
         self.d["pending"] = None
         self._save()
+
+    def settle(self, eid, actual):
+        """Результат eid записан: учесть его, если commit не успел."""
+        if eid in self.d["done"]:
+            if int(self.d["done"][eid]["actual"]) != int(actual):
+                raise SystemExit(f"{eid}: расход результата ≠ учтённому")
+            return False
+        if self.pending_id() == eid:
+            self.commit(eid, actual)
+            return True
+        raise SystemExit(f"{eid}: результат записан, но не учтён в бюджете")
 
 
 # --- случай ------------------------------------------------------------------------
@@ -276,36 +295,135 @@ def _ep_summary(ep):
                                "n_active_calls")}
 
 
+EP_EQ = ("success", "success_step", "done_step", "own_steps", "steps",
+         "actions_sha1")
+
+
+def case_problems(cdir, *, seed, space, task, init, smoke=False):
+    """Общая проверка завершённого случая (гейт, набор, возобновление):
+    идентификаторы, SHA файлов, обязательные ветви, исходы, R0, метки
+    Rc − R0, подтверждение noop, повтор (smoke). Пустой список — случай
+    цел."""
+    p = []
+    paths = {k: os.path.join(cdir, k) for k in ("case.json", "ref.json",
+                                                 "ref.npz")}
+    miss = [k for k, v in paths.items() if not os.path.exists(v)]
+    if miss:
+        return [f"нет {miss}"]
+    try:
+        case = json.load(open(paths["case.json"], encoding="utf-8"))
+        rj = json.load(open(paths["ref.json"], encoding="utf-8"))
+        z = np.load(paths["ref.npz"])
+        allowed = np.asarray(z["allowed"], bool)
+    except Exception as e:                                   # noqa: BLE001
+        return [f"не читается: {type(e).__name__}"]
+    want = dict(seed=int(seed), space=int(space), task=int(task),
+                init=int(init))
+    for doc, nm in ((case, "case"), (rj, "ref")):
+        bad = [k for k, v in want.items() if doc.get(k) != v]
+        if bad:
+            p.append(f"{nm}: идентификаторы {bad}")
+    if sha(paths["ref.npz"]) != rj.get("npz_sha1"):
+        p.append("ref.npz изменён")
+    if case.get("R0") != bool(rj["episode"]["success"]):
+        p.append("R0 ≠ исходу reference")
+    if case.get("allowed") != [bool(x) for x in allowed]:
+        p.append("allowed ≠ ref.npz")
+    if case.get("fork", {}).get("tau") != rj["fork"]["tau"] or \
+            case.get("fork", {}).get("call") != rj["fork"]["call"]:
+        p.append("развилка ≠ ref.json")
+    order = case.get("order") or []
+    names = [n for n in order if n != "noop" and "#" not in n]
+    allowed_names = [kc.ROWS[i] for i in range(1, 7) if allowed[i]]
+    if not order or order[0] != "noop":
+        p.append("noop не первый")
+    if smoke:
+        if not set(names) <= set(allowed_names):
+            p.append("ветви вне разрешённого пула")
+    elif names != branch_order(space, seed, task, init, allowed):
+        p.append("набор/порядок ветвей ≠ разрешённым кандидатам в "
+                 "перестановке")
+    eps = {}
+    for n in order:
+        bj = os.path.join(cdir, f"b_{n}.json")
+        bn = os.path.join(cdir, f"b_{n}.npz")
+        if not (os.path.exists(bj) and os.path.exists(bn)):
+            p.append(f"нет ветви {n}")
+            continue
+        b = json.load(open(bj, encoding="utf-8"))
+        if sha(bn) != b.get("npz_sha1") or b.get("name") != n:
+            p.append(f"ветвь {n}: файл изменён")
+        eps[n] = b["episode"]
+        if bool(b["episode"]["success"]) != bool(
+                (case.get("branches") or {}).get(n)):
+            p.append(f"ветвь {n}: исход ≠ case.json")
+        if (case.get("physical") or {}).get(n) != b["episode"]["physical"]:
+            p.append(f"ветвь {n}: расход ≠ case.json")
+    if p:
+        return p
+    R0 = int(case["R0"])
+    want_lab = {n: int(eps[n]["success"]) - R0 for n in names}
+    if case.get("labels") != want_lab:
+        p.append(f"метки ≠ Rc − R0 ({case.get('labels')} vs {want_lab})")
+    ne = eps["noop"]
+    if any(ne[k] != rj["episode"][k] for k in EP_EQ):
+        p.append("noop не подтверждает reference")
+    reps = [n for n in order if "#" in n]
+    if smoke:
+        if len(reps) != 1:
+            p.append("smoke: нет повтора кандидата")
+        else:
+            a_, b_ = eps[reps[0].split("#")[0]], eps[reps[0]]
+            eq = all(a_[k] == b_[k] for k in EP_EQ)
+            if case.get("repeat_equal") != eq or not eq:
+                p.append("smoke: повтор кандидата не воспроизвёлся")
+    elif reps:
+        p.append("повторы вне smoke")
+    return p
+
+
 def run_case(sim, io, agent, task, init, *, seed, space, cdir, ledger, scope,
              limit, pool_fn, capture, tag, max_branches=None, repeat=None):
     """-> dict случая (case.json). pool_fn(payload, fork) -> dict(arms [7,8,6]
-    float32 (NaN — нет), allowed [7], прочие поля пула для npz/json).
+    float32 (NaN — нет), allowed [7], npz/json — поля пула).
     max_branches — smoke: один tree и один flat (первые в перестановке);
-    repeat=True — smoke: выбранный tree исполняется повторно."""
+    repeat=True — smoke: выбранный tree исполняется повторно.
+    Результат каждого исполнения записывается ДО commit бюджета; при
+    возобновлении записанный результат закрывается ledger.settle."""
+    smoke = max_branches is not None
     os.makedirs(cdir, exist_ok=True)
+    cj = os.path.join(cdir, "case.json")
+    if os.path.exists(cj):
+        pr = case_problems(cdir, seed=seed, space=space, task=task,
+                           init=init, smoke=smoke)
+        if pr:
+            raise Mismatch(f"{tag}: готовый случай повреждён: {pr[:3]}")
+        return json.load(open(cj, encoding="utf-8"))
+    if os.path.exists(os.path.join(cdir, "noop_mismatch.json")):
+        raise Mismatch(f"{tag}: noop ранее не воспроизвёл reference "
+                       f"(noop_mismatch.json)")
     rj = os.path.join(cdir, "ref.json")
     rid = f"{tag}/ref"
     if os.path.exists(rj):
         ref_d = json.load(open(rj, encoding="utf-8"))
+        if sha(os.path.join(cdir, "ref.npz")) != ref_d["npz_sha1"] or \
+                ref_d.get("eid") != rid:
+            raise Mismatch(f"{rid}: ref.npz/ref.json изменены")
+        ledger.settle(rid, ref_d["episode"]["physical"])
         z = dict(np.load(os.path.join(cdir, "ref.npz")))
-        if sha(os.path.join(cdir, "ref.npz")) != ref_d["npz_sha1"]:
-            raise Mismatch("ref.npz изменён")
         ref = dict(ref_d["episode"], actions=z["actions"],
                    calls=[dict(tau=int(t), hash=h) for t, h in
                           zip(z["call_tau"], ref_d["call_hashes"])])
         fork = dict(tau=ref_d["fork"]["tau"], hash=ref_d["fork"]["hash"],
                     call=ref_d["fork"]["call"])
-        pool = dict(z_pool=z)
         allowed = np.asarray(z["allowed"], bool)
-        arms = z["arms"]
-        grip = z["fork_grip"]
+        arms, grip = z["arms"], z["fork_grip"]
         ref_codec = z["fork_ref_codec"]
     else:
         ledger.reserve(scope, rid, limit=limit)
         ref = run_episode(sim, io, agent, task, init,
                           reservoir=kc.rng(space, seed, task, init, 0, "fork"),
                           capture=capture)
-        ledger.commit(rid, ref["physical"])
         ch = ref["reservoir"]
         if ch is None:
             raise Mismatch(f"t{task} i{init}: нет активной границы для развилки")
@@ -315,19 +433,19 @@ def run_case(sim, io, agent, task, init, *, seed, space, cdir, ledger, scope,
         arms = np.asarray(pool["arms"], np.float32)
         ref_codec = ch["a_codec"]
         grip = ref_codec[:, 6].copy()
-        extra = {k: v for k, v in pool.get("npz", {}).items()}
         _save_npz(os.path.join(cdir, "ref.npz"), actions=ref["actions"],
                   call_tau=np.array([c["tau"] for c in ref["calls"]]),
                   allowed=allowed, arms=arms, fork_grip=grip,
-                  fork_ref_codec=ref_codec, **extra)
+                  fork_ref_codec=ref_codec, **pool.get("npz", {}))
         _save_json(rj, dict(
             task=int(task), init=int(init), seed=int(seed), space=int(space),
-            episode=_ep_summary(ref), fork=fork,
+            eid=rid, episode=_ep_summary(ref), fork=fork,
             call_hashes=[c["hash"] for c in ref["calls"]],
             pool=pool.get("json", {}),
             npz_sha1=sha(os.path.join(cdir, "ref.npz"))))
+        ledger.commit(rid, ref["physical"])
     names = branch_order(space, seed, task, init, allowed)
-    if max_branches is not None:
+    if smoke:
         tree = [n for n in names if n in ("root", "mid", "leaf")][:1]
         flat = [n for n in names if n.startswith("flat")][:1]
         names = [n for n in names if n in tree + flat]
@@ -341,8 +459,10 @@ def run_case(sim, io, agent, task, init, *, seed, space, cdir, ledger, scope,
         bid = f"{tag}/b_{name}"
         if os.path.exists(bj):
             b = json.load(open(bj, encoding="utf-8"))
-            if sha(os.path.join(cdir, f"b_{name}.npz")) != b["npz_sha1"]:
-                raise Mismatch(f"{bid}: npz изменён")
+            if sha(os.path.join(cdir, f"b_{name}.npz")) != b["npz_sha1"] or \
+                    b.get("eid") != bid:
+                raise Mismatch(f"{bid}: файлы ветви изменены")
+            ledger.settle(bid, b["episode"]["physical"])
             out[name] = b
             continue
         i = kc.ROWS.index(base)
@@ -357,20 +477,21 @@ def run_case(sim, io, agent, task, init, *, seed, space, cdir, ledger, scope,
         br = run_episode(sim, io, agent, task, init,
                          prefix=np.asarray(ref["actions"])[:fork["tau"]],
                          fork=dict(fork, a_codec=a_codec))
-        ledger.commit(bid, br["physical"])
         if base == "noop":
             pr = continuation_problems(ref, br, fork["tau"])
             if pr:
                 _save_json(os.path.join(cdir, "noop_mismatch.json"),
                            dict(problems=pr, ref=_ep_summary(ref),
-                                noop=_ep_summary(br)))
+                                noop=_ep_summary(br), eid=bid))
+                ledger.commit(bid, br["physical"])
                 raise Mismatch(f"t{task} i{init}: noop не воспроизвёл "
                                f"reference: {pr}")
         _save_npz(os.path.join(cdir, f"b_{name}.npz"), actions=br["actions"],
                   fork_codec=a_codec)
-        b = dict(name=name, episode=_ep_summary(br),
+        b = dict(name=name, eid=bid, episode=_ep_summary(br),
                  npz_sha1=sha(os.path.join(cdir, f"b_{name}.npz")))
         _save_json(bj, b)
+        ledger.commit(bid, br["physical"])
         out[name] = b
     R0 = bool(ref["success"])
     labels = {n: int(out[n]["episode"]["success"]) - int(R0) for n in out
@@ -386,9 +507,12 @@ def run_case(sim, io, agent, task, init, *, seed, space, cdir, ledger, scope,
                                  for n in out}))
     if rep_name:
         a_, b_ = out[rep_name]["episode"], out[f"{rep_name}#2"]["episode"]
-        case["repeat_equal"] = all(a_[k] == b_[k] for k in (
-            "success", "done_step", "own_steps", "actions_sha1"))
-    _save_json(os.path.join(cdir, "case.json"), case)
+        case["repeat_equal"] = all(a_[k] == b_[k] for k in EP_EQ)
+    _save_json(cj, case)
+    pr = case_problems(cdir, seed=seed, space=space, task=task, init=init,
+                       smoke=smoke)
+    if pr:
+        raise Mismatch(f"{tag}: новый случай не прошёл проверку: {pr[:3]}")
     return case
 
 
@@ -555,11 +679,84 @@ def selftest():
                       tag="s0/t0_i3")
         assert c2["labels"] == c1["labels"] and \
             Ledger(lp, caps).spent("dev_s0") == spent
-        # авария посреди ветви: резерв списан, данные не задвоены
-        L3 = Ledger(lp, caps)
-        L3.reserve("dev_s0", "x/crash")
+        # общая проверка случая: подмена метки / R0 / исхода — отказ
+        assert case_problems(cd, seed=0, space=0, task=0, init=3) == []
+        cj = os.path.join(cd, "case.json")
+        good = open(cj).read()
+        for mut in (lambda c: c["labels"].__setitem__(
+                        "root", 1 - c["labels"]["root"]),
+                    lambda c: c.__setitem__("R0", not c["R0"]),
+                    lambda c: c["branches"].__setitem__(
+                        "leaf", not c["branches"]["leaf"]),
+                    lambda c: c.__setitem__("order", c["order"][:-1]),
+                    lambda c: c.__setitem__("init", 4)):
+            c_ = json.loads(good)
+            mut(c_)
+            json.dump(c_, open(cj, "w"))
+            assert case_problems(cd, seed=0, space=0, task=0, init=3)
+            try:
+                run_case(FakeSim(), io, ag, 0, 3, seed=0, space=0, cdir=cd,
+                         ledger=Ledger(lp, caps), scope="dev_s0", limit=None,
+                         pool_fn=pool_fn, capture=lambda a: None,
+                         tag="s0/t0_i3")
+                raise AssertionError("повреждённый случай принят")
+            except Mismatch:
+                pass
+        open(cj, "w").write(good)
+        # авария между записью результата и commit — для reference и для
+        # кандидата: результат не теряется, расход не задваивается
+        for crash_at in ("ref", "b_leaf"):
+            lp2 = os.path.join(td, f"l_{crash_at}.json")
+            cd2 = os.path.join(td, f"c_{crash_at}")
+
+            class Dying(Ledger):
+                def commit(self, eid, actual):
+                    if eid.endswith("/" + crash_at):
+                        raise RuntimeError("процесс убит до commit")
+                    return super().commit(eid, actual)
+            try:
+                run_case(FakeSim(), io, ag, 0, 3, seed=0, space=0, cdir=cd2,
+                         ledger=Dying(lp2, caps), scope="dev_s0", limit=None,
+                         pool_fn=pool_fn, capture=lambda a: None,
+                         tag="s0/t0_i3")
+                raise AssertionError("авария не сработала")
+            except RuntimeError:
+                pass
+            Lr = Ledger(lp2, caps)
+            assert Lr.pending_id() == f"s0/t0_i3/{crash_at}"
+            cr = run_case(FakeSim(), io, ag, 0, 3, seed=0, space=0, cdir=cd2,
+                          ledger=Lr, scope="dev_s0", limit=None,
+                          pool_fn=pool_fn, capture=lambda a: None,
+                          tag="s0/t0_i3")
+            Lr = Ledger(lp2, caps)
+            assert cr["labels"] == c1["labels"] and not Lr.d["crashes"]
+            assert Lr.spent("dev_s0") == sum(cr["physical"].values()), \
+                crash_at
+        # авария до записи результата: резерв списан целиком, не возвращён
+        lp3, cd3 = os.path.join(td, "l3.json"), os.path.join(td, "c3")
+        ag_die = FakeAgent()
+        od, n_ = ag_die.decide, dict(n=0)
+
+        def die(batch, po, s8, el):
+            n_["n"] += 1
+            if n_["n"] == 60:
+                raise RuntimeError("процесс убит посреди ветви")
+            return od(batch, po, s8, el)
+        ag_die.decide = die
+        try:
+            run_case(FakeSim(), io, ag_die, 0, 3, seed=0, space=0, cdir=cd3,
+                     ledger=Ledger(lp3, caps), scope="dev_s0", limit=None,
+                     pool_fn=pool_fn, capture=lambda a: None, tag="s0/t0_i3")
+            raise AssertionError("авария не сработала")
+        except RuntimeError:
+            pass
+        c3 = run_case(FakeSim(), io, ag, 0, 3, seed=0, space=0, cdir=cd3,
+                      ledger=Ledger(lp3, caps), scope="dev_s0", limit=None,
+                      pool_fn=pool_fn, capture=lambda a: None, tag="s0/t0_i3")
+        L3 = Ledger(lp3, caps)
+        assert len(L3.d["crashes"]) == 1 and L3.spent("dev_s0") == \
+            sum(c3["physical"].values()) + EXEC_MAX
         L4 = Ledger(lp, caps)
-        assert L4.spent("dev_s0") == spent + EXEC_MAX and L4.d["crashes"]
         try:
             L4.reserve("dev_s0", "s0/t0_i3/ref")
             raise AssertionError("повторное начисление исполненного id")

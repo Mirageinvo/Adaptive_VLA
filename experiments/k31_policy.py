@@ -136,14 +136,14 @@ class Arm:
             rec.update(path=list(pr["path"]), info=pr["info"], d=pr["d"],
                        flat=pr["flat"], valid=P["valid"],
                        allowed=P["allowed"], m=P["m"],
-                       lam=np.array([r["lam"] if (P["allowed"][i] and i)
+                       lam=np.array([r["lam"] if (P["valid"][i] and i)
                                      else np.nan
                                      for i, r in enumerate(P["rows"])],
                                     np.float64),
                        lam_raw=[r["lam"] for r in P["rows"]],
                        why=[r["why"] for r in P["rows"]],
                        Du=np.stack([np.asarray(r["Du"], np.float32)
-                                    if P["allowed"][i] else
+                                    if P["valid"][i] else
                                     np.full((kc.T, 6), np.nan, np.float32)
                                     for i, r in enumerate(P["rows"])]),
                        pool_arm=P["arm"].numpy(), X=X,
