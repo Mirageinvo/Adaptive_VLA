@@ -307,11 +307,14 @@ def expand1_mismatch(cands, mid):
     """Совпадение GPU-выхода с основным повтором ИЛИ с одним из двух
     повторов, где выход Linear заменён соседним значением fp16 (nextafter
     вверх/вниз) — флип округления из-за порядка накопления; допуск прежний
-    1e−4·max(1,|ref|). Исключение — только для этой проверки Expand1."""
+    1e−4·max(1,|ref|). Исключение — только для этой проверки Expand1.
+    Неконечные значения (NaN, ±Inf) — всегда несовпадение: при mid = ±Inf
+    допуск тоже Inf, и сравнение без явной проверки прошло бы."""
     tol = TOL_DBG * np.maximum(1.0, np.abs(mid))
     ok = np.zeros(mid.shape, bool)
-    for c in cands:
-        ok |= np.abs(c - mid) <= tol
+    with np.errstate(invalid="ignore"):
+        for c in cands:
+            ok |= np.isfinite(mid) & np.isfinite(c) & (np.abs(c - mid) <= tol)
     return ~ok
 
 
@@ -521,6 +524,17 @@ def selftest():
     gm = gpu_mid.double().numpy()
     assert not expand1_mismatch(cands, gm).any()
     assert expand1_mismatch(cands, gm + 1e-3).any()
+    # неконечный записанный mid_init (NaN, +Inf, −Inf) — отказ, в том числе
+    # когда и повтор неконечен
+    for bad in (np.nan, np.inf, -np.inf):
+        gb = gm.copy()
+        gb.flat[0] = bad
+        assert expand1_mismatch(cands, gb).flat[0], bad
+        assert expand1_mismatch(cands, gb).sum() == 1, bad
+        cb = [c.copy() for c in cands]
+        for c in cb:
+            c.flat[0] = bad
+        assert expand1_mismatch(cb, gb).flat[0], bad
     # соседи fp16 у +1 и −1 (на границе степени двойки расстояния до
     # соседей вверх и вниз различаются), обе ветки dtype h; подмена на два
     # шага fp16 обнаруживается
@@ -546,8 +560,9 @@ def selftest():
           "root_ln/classifier/plan_proj/Expand1 проходит, порча — отказ; Expand1 с "
           "сокращающимися слагаемыми и честным fp16: явный повтор приведений "
           "проходит (прежний допуск отверг бы), внесённая ошибка 1e−3 — "
-          "отказ; соседи fp16 (nextafter) у ±1 в обеих ветках dtype "
-          "принимаются, подмена на два шага — отказ")
+          "отказ; NaN/±Inf в mid_init — отказ; соседи fp16 (nextafter) "
+          "у ±1 в обеих ветках dtype принимаются, подмена на два шага — "
+          "отказ")
     return 0
 
 
