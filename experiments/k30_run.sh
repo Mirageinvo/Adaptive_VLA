@@ -12,8 +12,8 @@
 # C_s0 -> H_s1 -> C_s1 -> анализ двух сидов -> latency (свободная карта) ->
 # итоговый анализ. Все четыре обучения — независимо от промежуточного SR.
 # Технический отказ — останов; повторный run продолжает с проверенного места.
-# flock; MuJoCo и обучение не одновременно. K30_MAX_USED_MB — допустимая
-# чужая занятость (по умолчанию 2048 МиБ); latency — всегда ≤ 2048.
+# flock; MuJoCo и обучение не одновременно. Перед обучением/раскатками —
+# ожидание свободной памяти (см. gpu_free); latency — всегда занято ≤ 2048.
 set -uo pipefail
 MODE="${1:?нужен режим}"
 DEV="${2:-cuda:0}"
@@ -37,13 +37,33 @@ PY=python3
 
 k29_busy () { pgrep -f "k29_run.sh|k29_protocol.py|k29_harness.py|k29_latency.py" >/dev/null; }
 wait_k29 () { while k29_busy; do echo "    K-29 ещё выполняется — жду 10 мин ($(date '+%H:%M'))"; sleep 600; done; }
+# gpu_free strict — для latency: занято ≤ 2048 МиБ, без ожидания (чужая
+# нагрузка искажает замер). gpu_free train|roll — по свободной памяти:
+# нужно K30_NEED_TRAIN_MB (14000; пик micro 32 ≈ 9.2 ГиБ) или
+# K30_NEED_ROLL_MB (8000); если меньше — ждём по 10 мин до K30_GPU_WAIT_MIN
+# (720) и только потом отказ.
 gpu_free () {
-  local idx="${DEV#cuda:}" used lim="${K30_MAX_USED_MB:-2048}"
-  [ "${1:-}" = strict ] && lim=2048
-  used="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$idx" 2>/dev/null | tr -d ' ')"
-  [ -n "$used" ] || { echo "ОТКАЗ: nvidia-smi не отвечает для $DEV"; return 3; }
-  echo "    $DEV: занято $used МиБ (допустимо до $lim)"
-  [ "$used" -le "$lim" ] || { echo "ОТКАЗ: на $DEV занято $used МиБ"; return 3; }
+  local idx="${DEV#cuda:}" mode="${1:-train}" used free need waited=0
+  local cap="${K30_GPU_WAIT_MIN:-720}"
+  while :; do
+    used="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$idx" 2>/dev/null | tr -d ' ')"
+    free="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$idx" 2>/dev/null | tr -d ' ')"
+    [ -n "$used" ] && [ -n "$free" ] || { echo "ОТКАЗ: nvidia-smi не отвечает для $DEV"; return 3; }
+    if [ "$mode" = strict ]; then
+      echo "    $DEV: занято $used МиБ (допустимо до 2048)"
+      [ "$used" -le 2048 ] || { echo "ОТКАЗ: на $DEV занято $used МиБ"; return 3; }
+      return 0
+    fi
+    if [ "$mode" = roll ]; then need="${K30_NEED_ROLL_MB:-8000}"; else need="${K30_NEED_TRAIN_MB:-14000}"; fi
+    if [ "$free" -ge "$need" ]; then
+      echo "    $DEV: свободно $free МиБ, занято $used (нужно ≥ $need)"; return 0
+    fi
+    if [ "$waited" -ge "$cap" ]; then
+      echo "ОТКАЗ: на $DEV свободно $free МиБ < $need после ожидания $waited мин"; return 3
+    fi
+    echo "    $DEV: свободно $free МиБ < $need — жду 10 мин (прошло $waited из $cap, $(date '+%H:%M'))"
+    sleep 600; waited=$((waited + 10))
+  done
 }
 disk_ok () {
   local free; free=$(df -Pm data | awk 'NR==2 {print $4}')
@@ -118,7 +138,7 @@ run_plan () {
   $PY experiments/k30_protocol.py check-plan --plan "$P" || { echo "ОТКАЗ: входы/код/источники плана"; return 1; }
   OUTD="reports/k30/run/p$(sha1sum "$P" | cut -c1-12)"; mkdir -p "$OUTD/quarantine"
   echo "    план $P, каталог $OUTD"
-  gpu_free || return 3
+  gpu_free roll || return 3
   for cell in $($PY experiments/k30_protocol.py cells --plan "$P" --which smoke); do
     IFS=: read -r L S T B <<< "$cell"; run_one "$P" "$OUTD" "$L" "$S" "$T" "$B" || return $?
   done
