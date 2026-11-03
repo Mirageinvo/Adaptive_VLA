@@ -67,6 +67,7 @@ A_LIMIT = 160000
 SMOKE_CASES = ((0, 0, 0), (0, 8, 1), (1, 0, 0), (1, 8, 1))
 GATE = dict(tree_coverage=0.8, rescued_pairs=2)
 Z_TOL, ARM_TOL = 1e-5, 1e-6
+DU_TOL, LAM_TOL = 1e-5, 1e-4     # пересборка: |ΔDu| абс., |Δλ|/λ
 MODEL_CODE = ("k31_readout.py", "k31_candidates.py", "k31_policy.py",
               "k31_collect.py", "k31_data.py", "k31_train.py",
               "k31_harness.py", "k31_protocol.py", "k29_model.py",
@@ -622,7 +623,7 @@ def _rel(a, b):
     return float(np.abs(a - b).max() / max(1.0, float(np.abs(b).max())))
 
 
-def rebuild_problems(cdir, dec, seed, space, task, init):
+def rebuild_problems(cdir, dec, seed, space, task, init, scale_q):
     """reference -> правка узла -> потомки -> Zhat -> нормировка -> команда
     из закреплённых весов и сохранённых признаков развилки (CPU, FP32);
     плюс валидность всех строк (в т. ч. отсечённых по m)."""
@@ -661,29 +662,68 @@ def rebuild_problems(cdir, dec, seed, space, task, init):
             or int(P["m"]) != int(z["m"]):
         p.append(f"валидность/m пересборки {P['valid'].tolist()}/{P['m']} ≠ "
                  f"записанным {z['valid'].tolist()}/{int(z['m'])}")
-    da, du = [], []
+    da, du, dl = [], [], []
+    zv = np.asarray(z["valid"], bool)
+    lam_rec = np.asarray(z["lam"], np.float64)
     for i in range(1, 7):
-        if P["valid"][i] and np.asarray(z["valid"], bool)[i]:
-            du.append(float(np.abs(np.asarray(P["rows"][i]["Du"]) -
-                                   z["Du"][i]).max()))
+        if not zv[i]:
+            if np.isfinite(lam_rec[i]) or np.isfinite(z["Du"][i]).any():
+                p.append(f"строка {i}: λ/Du у недопустимой строки")
+            continue
+        Dr = np.asarray(z["Du"][i], np.float64)
+        if not (np.isfinite(Dr).all() and np.isfinite(lam_rec[i])):
+            p.append(f"строка {i}: записанные Du/λ не конечны")
+            continue
+        rms = float(np.sqrt(np.mean(Dr[:kc.N8] ** 2)))
+        if not (abs(rms - kc.TARGET_RMS) <= kc.RMS_TOL and
+                lam_rec[i] <= kc.LAMBDA_MAX and
+                np.abs(Dr[:kc.N8]).max() <= kc.DU_MAX):
+            p.append(f"строка {i}: записанный Du вне нормировки")
+        if P["valid"][i]:
+            du.append(float(np.abs(np.asarray(P["rows"][i]["Du"],
+                                              np.float64) - Dr).max()))
+            dl.append(abs(float(P["rows"][i]["lam"]) - lam_rec[i]) /
+                      max(abs(float(P["rows"][i]["lam"])), 1e-12))
         if P["allowed"][i] and np.asarray(z["allowed"], bool)[i]:
             da.append(float(np.abs(P["arm"][i].numpy() - z["arms"][i]).max()))
     st["Du_max"] = max(du) if du else None
+    st["lam_rel_max"] = max(dl) if dl else None
     st["arm_max"] = max(da) if da else None
+    if du and not max(du) <= DU_TOL:
+        p.append(f"Du пересборки ≠ записанному ({max(du):.2e})")
+    if dl and not max(dl) <= LAM_TOL:
+        p.append(f"λ пересборки ≠ записанной ({max(dl):.2e})")
     if da and not max(da) <= ARM_TOL:
         p.append(f"команды пересборки ≠ записанным ({max(da):.2e})")
     g = np.where(ref["grip_logit"][0, :kc.N8].numpy() > 0, 1.0, -1.0)
     if not np.array_equal(g.astype(np.float32), z["fork_grip"]):
         p.append("схват развилки ≠ логиту reference")
+    import k29_policy as kp
+    tau = int(rj["fork"]["tau"])
+    A_ref = np.asarray(z["actions"], np.float32)
+    q = np.asarray(scale_q, np.float64)
     for n in json.load(open(os.path.join(cdir, "case.json")))["order"]:
         base = n.split("#")[0]
+        bz = np.load(os.path.join(cdir, f"b_{n}.npz"))
         if base == "noop":
+            want = np.asarray(z["fork_ref_codec"], np.float32)
+        else:
+            want = np.concatenate([z["arms"][kc.ROWS.index(base)],
+                                   z["fork_grip"][:, None]], 1).astype(
+                np.float32)
+        if not np.array_equal(bz["fork_codec"], want):
+            p.append(f"ветвь {n}: записанный чанк ≠ кандидату")
+        A = np.asarray(bz["actions"], np.float32)
+        k = min(kc.N8, len(A) - tau)
+        if k < 1:
+            p.append(f"ветвь {n}: нет исполненных шагов после развилки")
             continue
-        fc = np.load(os.path.join(cdir, f"b_{n}.npz"))["fork_codec"]
-        want = np.concatenate([z["arms"][kc.ROWS.index(base)],
-                               z["fork_grip"][:, None]], 1)
-        if not np.array_equal(fc, want.astype(np.float32)):
-            p.append(f"ветвь {n}: исполненный чанк ≠ записанному кандидату")
+        if not np.array_equal(A[:tau], A_ref[:tau]):
+            p.append(f"ветвь {n}: префикс ≠ reference")
+        ex = kp.scale_exec(want[None], q)[0][:k].astype(np.float32)
+        if not np.array_equal(A[tau:tau + k], ex):
+            p.append(f"ветвь {n}: исполненные физические команды ≠ "
+                     f"масштабу ожидаемого чанка")
     return p, st
 
 
@@ -708,7 +748,7 @@ def fork_smoke(a):
         for (s_, split, t, i) in [k for k in out if k[0] == s]:
             pr, st = rebuild_problems(case_dir(s_, split, t, i,
                                                "data/k31/smoke"),
-                                      dcpu, s_, 1, t, i)
+                                      dcpu, s_, 1, t, i, p["scale_q"])
             rebuild[f"s{s_}_t{t}_i{i}"] = dict(problems=pr, **st)
             prob += [f"s{s_} t{t} i{i}: {x}" for x in pr]
         del dcpu
@@ -727,7 +767,8 @@ def fork_smoke(a):
     for k, v in rebuild.items():
         print(f"  пересборка {k}: Z0 {v.get('Z0_rel', float('nan')):.2e}, "
               f"Zhat {v.get('Zhat_rel', float('nan')):.2e}, |Δкоманд| "
-              f"{v.get('arm_max')}, |ΔDu| {v.get('Du_max')}; "
+              f"{v.get('arm_max')}, |ΔDu| {v.get('Du_max')}, |Δλ|/λ "
+              f"{v.get('lam_rel_max')}; "
               + ("ок" if not v["problems"] else "; ".join(v["problems"])))
     print(f"  fork-smoke: шагов {spent}, {rep['seconds'] / 60:.1f} мин; "
           f"{rep['sec_per_step'] * 1e3:.1f} мс/шаг; верхняя оценка A+B "
@@ -1078,21 +1119,66 @@ def rebuild_selftest():
     fork = dict(call=pay["call"], tau=0)
     pool = make_pool_fn(arm)(pay, fork)
     grip = arm.last["rec"]["a_codec"][:, 6].copy()
+    import k29_policy as kp
+    q = np.array([0.9375, 0.91, 0.9375, 0.2036, 0.2636, 0.375, 1.0])
+    i = int(np.nonzero(pool["allowed"][1:])[0][0]) + 1
+    name = kc.ROWS[i]
+    ref_codec = arm.last["rec"]["a_codec"]
+    prefix = np.random.default_rng(0).normal(size=(16, 7)).astype(np.float32)
+    fork["tau"] = 16
     with tempfile.TemporaryDirectory() as td:
-        def write(npz_over=None):
+        def branch(nm, chunk, k=8, act_over=None):
+            ex = kp.scale_exec(chunk[None], q)[0][:k].astype(np.float32)
+            A = np.concatenate([prefix, ex])
+            if act_over is not None:
+                A = act_over(A.copy())
+            np.savez(os.path.join(td, f"b_{nm}.npz"), actions=A,
+                     fork_codec=chunk)
+
+        def write(npz_over=None, act_over=None, k=8):
             npz = dict(pool["npz"], allowed=pool["allowed"],
-                       arms=pool["arms"], fork_grip=grip)
+                       arms=pool["arms"], fork_grip=grip,
+                       fork_ref_codec=ref_codec,
+                       actions=np.concatenate([prefix, np.zeros((5, 7),
+                                                                np.float32)]))
             npz.update(npz_over or {})
             np.savez(os.path.join(td, "ref.npz"), **npz)
             json.dump(dict(fork=fork), open(os.path.join(td, "ref.json"),
                                             "w"))
-            json.dump(dict(order=["noop"]), open(os.path.join(
+            json.dump(dict(order=["noop", name]), open(os.path.join(
                 td, "case.json"), "w"))
-            return rebuild_problems(td, dw, 0, 1, 8, 1)
+            branch("noop", ref_codec.astype(np.float32))
+            cand = np.concatenate([pool["arms"][i], grip[:, None]],
+                                  1).astype(np.float32)
+            branch(name, cand, k=k, act_over=act_over)
+            return rebuild_problems(td, dw, 0, 1, 8, 1, q)
         pr, st = write()
         assert pr == [], pr
         assert st["Z0_rel"] == 0.0 and st["arm_max"] in (0.0, None)
-        i = int(np.nonzero(pool["allowed"][1:])[0][0]) + 1
+        assert write(k=3)[0] == []                 # раннее завершение
+        Du2 = pool["npz"]["Du"].copy()
+        Du2[i] *= 2.0
+        assert write(dict(Du=Du2))[0]              # удвоенный Du
+        l2 = pool["npz"]["lam"].copy()
+        l2[i] = np.inf
+        assert write(dict(lam=l2))[0]              # λ = Inf
+        l3 = pool["npz"]["lam"].copy()
+        l3[i] *= 1.01
+        assert write(dict(lam=l3))[0]              # λ ≠ пересборке
+        vcut = [j for j in range(1, 7) if pool["npz"]["valid"][j]]
+        Du3 = pool["npz"]["Du"].copy()
+        Du3[vcut[-1], 0, 0] += 1e-4                # последняя допустимая строка
+        assert write(dict(Du=Du3))[0]
+
+        def bump(A):
+            A[16, 0] += 1e-6
+            return A
+        assert any("физические" in x for x in write(act_over=bump)[0])
+
+        def bump_prefix(A):
+            A[3, 1] += 1e-6
+            return A
+        assert any("префикс" in x for x in write(act_over=bump_prefix)[0])
         bad = pool["arms"].copy()
         bad[i, 0, 0] += 1e-5
         assert write(dict(arms=bad))[0]
@@ -1108,7 +1194,7 @@ def rebuild_selftest():
         miss = {k: v for k, v in pool["npz"].items() if k != "F_W2"}
         np.savez(os.path.join(td, "ref.npz"), **miss, allowed=pool["allowed"],
                  arms=pool["arms"], fork_grip=grip)
-        assert rebuild_problems(td, dw, 0, 1, 8, 1)[0]
+        assert rebuild_problems(td, dw, 0, 1, 8, 1, q)[0]
 
 
 def selftest():
@@ -1172,7 +1258,9 @@ def selftest():
     rebuild_selftest()
     print("самопроверка k31_protocol пройдена: CPU-декодер из весов = "
           "декодеру источника побитово; независимая пересборка развилки "
-          "проходит, подмена команд/Du-направления/Zhat/путей — отказ; "
+          "проходит (и при раннем завершении), подмена команд, удвоенный Du, "
+          "λ = Inf/≠, Du допустимой строки, направление, Zhat, валидность, "
+          "физическая команда при верном fork_codec, префикс — отказ; "
           "план SR -> загрузчик "
           "источника SR (тот же формат, что prepare), чужой селектор — отказ; "
           "банки не пересекаются и не "
