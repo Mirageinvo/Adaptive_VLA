@@ -14,12 +14,15 @@ bank — кандидаты: seed из журнала источника (по �
   (setup_demo + play_once, plan_success и check_success), инструкция —
   build_instruction (тот же test_num, что в источнике), затем два свежих
   setup_demo без эксперта -> отпечатки начального состояния должны совпасть
-  (состояние руки, позы всех объектов среды с get_pose, кадры камер);
+  (состояние руки, позы всех объектов среды с get_pose, кадры камер) —
+  каждый на НОВОМ объекте среды (class_decorator), не на том, где шёл
+  эксперт: иначе в отпечаток попадают объекты, оставшиеся после play_once;
   случай, не прошедший эксперта или воспроизводимость, пропускается с
   причиной; берутся первые N принятых. Закрепляются: задача, seed,
   инструкция, отпечатки, SHA конфигураций задачи/эмбодимента/камер, коммит
   RoboTwin, параметры.
-eval — для каждого случая задачи: setup_demo(seed) без эксперта -> отпечаток
+eval — для каждого случая задачи: новый объект среды, setup_demo(seed) без
+  эксперта -> отпечаток
   физического состояния (рука и позы объектов) = банку, иначе технический
   отказ (кадры — сверяются и пишутся, несовпадение кадров — тоже отказ);
   подтверждённый случай (seed, ep_num, инструкция, отпечаток, отпечаток
@@ -40,6 +43,8 @@ import traceback
 import numpy as np
 
 KIND = "rt3_bank"
+FP_PROTOCOL = "fresh_env_v2"    # отпечаток — на НОВОМ объекте среды (без
+                                # хвостов экспертного прогона/прошлых случаев)
 CASES = "rt3_cases.jsonl"       # подтверждённые случаи (сверяет rt3_check)
 SOURCE_TEST_NUM = 10            # test_num пилота RT2 — от него строится инструкция
 
@@ -154,7 +159,7 @@ def build_bank(a):
     from envs.utils.create_actor import UnStableError
     bank = dict(kind=KIND, created=time.strftime("%Y-%m-%dT%H:%M:%S"),
                 source=os.path.abspath(a.source), n=a.n, tasks={},
-                source_test_num=SOURCE_TEST_NUM)
+                source_test_num=SOURCE_TEST_NUM, fp_protocol=FP_PROTOCOL)
     for task in a.tasks:
         cands = sorted(json.loads(x)["seed"] for x in open(
             os.path.join(a.source, task, "episodes.jsonl"), encoding="utf-8")
@@ -186,11 +191,12 @@ def build_bank(a):
                                          seed)
             fps = []
             for rep in range(2):
+                fe = ep.class_decorator(task)       # свежий объект среды
                 try:
-                    fps.append(setup_fp(ep, task_env, args, i, seed))
-                    task_env.close_env()
+                    fps.append(setup_fp(ep, fe, args, i, seed))
+                    fe.close_env()
                 except Exception as e:                      # noqa: BLE001
-                    ep.safe_close_env(task_env)
+                    ep.safe_close_env(fe)
                     fps.append(dict(error=f"{type(e).__name__}: {e}"))
             if "error" in fps[0] or fps[0] != fps[1]:
                 skipped.append(dict(seed=seed, why="начальное состояние не "
@@ -283,6 +289,9 @@ def eval_bank(a):
             bank["tasks"], sort_keys=True).encode()).hexdigest() != \
             bank["fingerprint"]:
         raise SystemExit("банк повреждён")
+    if bank.get("fp_protocol") != FP_PROTOCOL:
+        raise SystemExit(f"банк снят по протоколу {bank.get('fp_protocol')}, "
+                         f"нужен {FP_PROTOCOL} (пересобрать банк)")
     tb = bank["tasks"][a.task]
     args, itype, _emb = task_setup(ep, a.task)
     cfg = config_shas(ep, args, a.root)
@@ -300,10 +309,10 @@ def eval_bank(a):
         raise SystemExit(f"{cpath} уже есть: незавершённый журнал задачи "
                          f"должен быть убран в карантин")
     model_client = ep.build_policy_client(usr)
-    task_env = ep.class_decorator(a.task)
     suc = 0
     try:
         for k, case in enumerate(cases):
+            task_env = ep.class_decorator(a.task)   # свежий объект на случай
             task_env.setup_demo(now_ep_num=case["ep_num"], seed=case["seed"],
                                 is_test=True, **args)
             fp = fingerprint(ep, task_env)

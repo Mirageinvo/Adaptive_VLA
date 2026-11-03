@@ -8,7 +8,7 @@
 # Журнал оценки привязан к банку (rt3_check bind); задача считается готовой
 # только с отметками RT2 (done.json) и rt3 (rt3_done.json: банк, запись
 # задачи, подтверждённые случаи, инструкции, манифест, SHA журналов).
-# smoke — отдельный каталог reports/rt3/smoke, в анализ не идёт.
+# smoke — отдельный каталог reports/rt3/smoke_v2, в анализ не идёт.
 # Банк: первые 5 seed пилота flat24 RT2 каждой задачи (по возрастанию),
 # прошедшие ОДНУ экспертную проверку сейчас и воспроизводимые (два свежих
 # setup дают одинаковые отпечатки); при оценке случай не заменяется: если
@@ -26,9 +26,9 @@ VLA_PY="${VLA_PY:-/home/malinin_aa/envs/vla/bin/python}"
 RT_ENV_SH="${RT_ENV_SH:-/home/malinin_aa/robotwin_env.sh}"
 : "${ROBOTWIN_ROOT:?нужен ROBOTWIN_ROOT}"
 export HF_HUB_OFFLINE=1 PYTHONUTF8=1 PYTHONUNBUFFERED=1
-BANK="$ROOT/reports/rt3/bank.json"
+BANK="$ROOT/reports/rt3/bank_v2.json"     # v1 (bank.json) — отпечатки с хвостами эксперта, не используется
 SRC="$ROOT/reports/rt2/eval/pilot_s0_flat24"
-mkdir -p logs/rt3 reports/rt3/eval
+mkdir -p logs/rt3 reports/rt3/eval_v2
 exec 8>logs/rt3/.rt3.lock
 flock -n 8 || { echo "ОТКАЗ: другой rt3_run.sh уже выполняется"; exit 2; }
 LOGF="logs/rt3/${MODE}${NEXEC:+_$NEXEC}_$(date +%Y%m%dT%H%M%S).log"
@@ -48,8 +48,8 @@ case "$MODE" in
     finish $? ;;
   compare)
     $VLA_PY experiments/rt3_compare.py; finish $? ;;
-  eval) N=5; LIMIT=0; RUN_TASKS="$TASKS"; LOGD="reports/rt3/eval/nexec${NEXEC}_s0_flat24" ;;
-  smoke) NEXEC=8; N=1; LIMIT=1; RUN_TASKS="lift_pot open_laptop"; LOGD="reports/rt3/smoke/nexec8_s0_flat24" ;;
+  eval) N=5; LIMIT=0; RUN_TASKS="$TASKS"; LOGD="reports/rt3/eval_v2/nexec${NEXEC}_s0_flat24" ;;
+  smoke) NEXEC=8; N=1; LIMIT=1; RUN_TASKS="lift_pot open_laptop"; LOGD="reports/rt3/smoke_v2/nexec8_s0_flat24" ;;
   *) echo "режим $MODE неизвестен"; finish 2 ;;
 esac
 
@@ -98,5 +98,5 @@ if [ "$MODE" = smoke ]; then
   echo "=== smoke пройден: $RUN_TASKS по одному случаю банка, журналы привязаны и проверены"; finish 0
 fi
 echo "=== ЭТАП сводка"
-$VLA_PY experiments/rt2_eval.py summarize --log-dir "$LOGD" --n "$N" --out "reports/rt3/nexec${NEXEC}_s0_flat24.json" || finish 3
+$VLA_PY experiments/rt2_eval.py summarize --log-dir "$LOGD" --n "$N" --out "reports/rt3/v2_nexec${NEXEC}_s0_flat24.json" || finish 3
 finish 0

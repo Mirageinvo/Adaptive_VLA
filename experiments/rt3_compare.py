@@ -47,10 +47,10 @@ def bank_keys(bank):
 def main():
     import rt2_compare as rcmp
     ap = argparse.ArgumentParser(description="RoboTwin: n_exec по банку")
-    ap.add_argument("--bank", default="reports/rt3/bank.json")
-    ap.add_argument("--a", default="reports/rt3/eval/nexec4_s0_flat24")
-    ap.add_argument("--b", default="reports/rt3/eval/nexec8_s0_flat24")
-    ap.add_argument("--out", default="reports/rt3/compare_nexec4_nexec8.json")
+    ap.add_argument("--bank", default="reports/rt3/bank_v2.json")
+    ap.add_argument("--a", default="reports/rt3/eval_v2/nexec4_s0_flat24")
+    ap.add_argument("--b", default="reports/rt3/eval_v2/nexec8_s0_flat24")
+    ap.add_argument("--out", default="reports/rt3/v2_compare_nexec4_nexec8.json")
     ap.add_argument("--na", type=int, default=4)
     ap.add_argument("--nb", type=int, default=8)
     a = ap.parse_args()
