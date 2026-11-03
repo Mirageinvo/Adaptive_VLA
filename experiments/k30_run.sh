@@ -65,10 +65,23 @@ gpu_free () {
     sleep 600; waited=$((waited + 10))
   done
 }
+# Место на вариант: обучение seed 0 — 4.1 ГиБ (файл продолжения + best.pt),
+# раскатки — ~0.15 ГиБ; нужно K30_NEED_DISK_MB (8000) свободно. Если
+# меньше — ждём по 10 мин до K30_DISK_WAIT_MIN (360) и только потом отказ.
 disk_ok () {
-  local free; free=$(df -Pm data | awk 'NR==2 {print $4}')
-  echo "    место: свободно ${free} МиБ (нужно ~25000)"
-  [ "$free" -ge 25000 ] || { echo "ОТКАЗ: мало места"; return 3; }
+  local free need="${K30_NEED_DISK_MB:-8000}" waited=0 cap="${K30_DISK_WAIT_MIN:-360}"
+  while :; do
+    free=$(df -Pm data | awk 'NR==2 {print $4}')
+    [ -n "$free" ] || { echo "ОТКАЗ: df не отвечает"; return 3; }
+    if [ "$free" -ge "$need" ]; then
+      echo "    место: свободно ${free} МиБ (нужно ≥ $need)"; return 0
+    fi
+    if [ "$waited" -ge "$cap" ]; then
+      echo "ОТКАЗ: мало места — свободно ${free} МиБ < $need после ожидания $waited мин"; return 3
+    fi
+    echo "    место: свободно ${free} МиБ < $need — жду 10 мин (прошло $waited из $cap, $(date '+%H:%M'))"
+    sleep 600; waited=$((waited + 10))
+  done
 }
 selftests () {
   local m
