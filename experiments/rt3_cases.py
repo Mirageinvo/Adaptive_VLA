@@ -22,6 +22,9 @@ bank — кандидаты: seed из журнала источника (по �
 eval — для каждого случая задачи: setup_demo(seed) без эксперта -> отпечаток
   физического состояния (рука и позы объектов) = банку, иначе технический
   отказ (кадры — сверяются и пишутся, несовпадение кадров — тоже отказ);
+  подтверждённый случай (seed, ep_num, инструкция, отпечаток, отпечаток
+  банка) дописывается в <log_dir>/<задача>/rt3_cases.jsonl до раскатки;
+  --limit k — только первые k случаев (smoke);
   инструкция — из банка; официальный цикл исполнения эпизода (update_obs /
   get_action / take_action, успех, лимит шагов); prepare_case/trial_end.
 """
@@ -37,6 +40,7 @@ import traceback
 import numpy as np
 
 KIND = "rt3_bank"
+CASES = "rt3_cases.jsonl"       # подтверждённые случаи (сверяет rt3_check)
 SOURCE_TEST_NUM = 10            # test_num пилота RT2 — от него строится инструкция
 
 
@@ -288,11 +292,18 @@ def eval_bank(a):
                xpolicylab_root=os.path.join(a.root, "XPolicyLab"),
                evaluation_id=f"rt3-{a.task}", trial_id=f"{a.task}-bank",
                action_case_id=f"{a.task}-case")
+    cases = tb["cases"][:a.limit] if a.limit else tb["cases"]
+    cdir = os.path.join(a.log_dir, a.task)
+    os.makedirs(cdir, exist_ok=True)
+    cpath = os.path.join(cdir, CASES)
+    if os.path.exists(cpath):
+        raise SystemExit(f"{cpath} уже есть: незавершённый журнал задачи "
+                         f"должен быть убран в карантин")
     model_client = ep.build_policy_client(usr)
     task_env = ep.class_decorator(a.task)
     suc = 0
     try:
-        for k, case in enumerate(tb["cases"]):
+        for k, case in enumerate(cases):
             task_env.setup_demo(now_ep_num=case["ep_num"], seed=case["seed"],
                                 is_test=True, **args)
             fp = fingerprint(ep, task_env)
@@ -302,6 +313,12 @@ def eval_bank(a):
                 ep.safe_close_env(task_env)
                 raise SystemExit(f"Aborting task: случай {a.task}/"
                                  f"{case['seed']} не воспроизводится ({bad})")
+            with open(cpath, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(dict(
+                    task=a.task, seed=case["seed"], ep_num=case["ep_num"],
+                    instruction=case["instruction"],
+                    bank_fingerprint=bank["fingerprint"], fingerprint=fp),
+                    ensure_ascii=False) + "\n")
             task_env.set_instruction(instruction=case["instruction"])
             succ, steps = run_case(ep, task_env, args, case, model_client,
                                    a.frequency, "joint")
@@ -310,12 +327,12 @@ def eval_bank(a):
                   "\033[91mFail!\033[0m")
             task_env.close_env(clear_cache=((k + 1) %
                                             args["clear_cache_freq"] == 0))
-            print(f"{a.task} | case {k + 1}/{len(tb['cases'])} seed "
+            print(f"{a.task} | case {k + 1}/{len(cases)} seed "
                   f"{case['seed']} | шагов {steps}\nSuccess rate: "
                   f"{suc}/{k + 1}", flush=True)
     finally:
         ep.close_policy_client(model_client)
-    n = len(tb["cases"])
+    n = len(cases)
     print(f"Final success rate: {suc}/{n} = {round(suc / n * 100, 1)}%")
     return 0
 
@@ -366,7 +383,13 @@ def main():
     ap.add_argument("--host", default="localhost")
     ap.add_argument("--port", type=int, default=None)
     ap.add_argument("--frequency", type=int, default=15)
+    ap.add_argument("--log-dir", default=None,
+                    help="eval: каталог журнала оценки (rt3_cases.jsonl)")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="eval: только первые случаи банка (smoke)")
     a = ap.parse_args()
+    if a.cmd == "eval" and not a.log_dir:
+        raise SystemExit("eval: нужен --log-dir")
     if not a.root:
         raise SystemExit("нужен ROBOTWIN_ROOT")
     official(a.root)
