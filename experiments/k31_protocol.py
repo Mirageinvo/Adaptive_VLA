@@ -195,7 +195,8 @@ CONTRACT_KEYS = ("prep_id", "prepare_sha1", "bar_revision", "bounds",
 
 
 def prepare():
-    rep = make_prepare()
+    # сравнение — в JSON-форме (кортежи CFG после записи становятся списками)
+    rep = json.loads(json.dumps(make_prepare(), default=str))
     if os.path.exists(PREPARE):
         old = json.load(open(PREPARE, encoding="utf-8"))
         diff = [k for k in CONTRACT_KEYS if old.get(k) != rep.get(k)]
@@ -1202,6 +1203,12 @@ def selftest():
     assert set(b["pilot_train"]) == set(range(8)) and \
         b["more_val"] == [22, 23, 24]
     assert len(items_of("A")) == 30 and len(items_of("B")) == 45
+    import k31_train as kt
+    cfg = dict(selector=kt.CFG, candidates=kc.CONFIG, caps=CAPS, gate=GATE)
+    written = json.loads(json.dumps(cfg))         # как prepare.json на диске
+    fresh_ = json.loads(json.dumps(cfg, default=str))   # как в prepare()
+    assert all(written[k] == fresh_[k] for k in cfg), \
+        "повторная сверка prepare видит изменение без изменений"
     # гейт: покрытие, две различные спасённые пары, сиды не удваивают
     def case(R0, lab, allowed=(True,) * 7):
         return dict(R0=R0, labels=lab, allowed=list(allowed),
