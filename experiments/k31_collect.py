@@ -282,10 +282,11 @@ def _save_json(path, d):
     os.replace(path + ".tmp", path)
 
 
-def _save_npz(path, **arr):
-    with open(path + ".tmp", "wb") as fh:
+def _save_npz(fname, /, **arr):
+    """fname — только позиционно: в массивах бывают ключи path/fname."""
+    with open(fname + ".tmp", "wb") as fh:
         np.savez_compressed(fh, **arr)
-    os.replace(path + ".tmp", path)
+    os.replace(fname + ".tmp", fname)
 
 
 def _ep_summary(ep):
@@ -652,6 +653,12 @@ def selftest():
                                a_codec=cand))
     assert not np.array_equal(cb["actions"], r["actions"])
     assert cb["physical"] <= EXEC_MAX and cb["steps"] <= 600
+    # ключи массивов, совпадающие с именами параметров записи
+    with tempfile.TemporaryDirectory() as td:
+        fn = os.path.join(td, "x.npz")
+        _save_npz(fn, path=np.array([0, 1, 3]), fname=np.zeros(1),
+                  fh=np.ones(1))
+        assert np.load(fn)["path"].tolist() == [0, 1, 3]
     # случай целиком, возобновление без двойного расхода, перестановка
     with tempfile.TemporaryDirectory() as td:
         lp = os.path.join(td, "ledger.json")
@@ -663,7 +670,7 @@ def selftest():
             for i in np.nonzero(al)[0][1:]:
                 arms[i] = 0.05 * i
             return dict(arms=arms, allowed=al, json=dict(m=2),
-                        npz=dict(m=np.array(2)))
+                        npz=dict(m=np.array(2), path=np.array([0, 1, 3])))
         cd = os.path.join(td, "case")
         c1 = run_case(FakeSim(), io, ag, 0, 3, seed=0, space=0, cdir=cd,
                       ledger=L, scope="dev_s0", limit=None, pool_fn=pool_fn,
