@@ -196,6 +196,13 @@ def ppo_update(torch, actor, critic, opt_a, opt_c, buf, H, rng_seed, cfg=CFG):
     return st
 
 
+def make_optimizers(torch, actor, critic, cfg=CFG):
+    """Общая фабрика: обучение и описательный PPO-smoke."""
+    return (torch.optim.AdamW(actor.parameters(), lr=cfg["lr_actor"],
+                              weight_decay=cfg["wd_actor"]),
+            torch.optim.Adam(critic.parameters(), lr=cfg["lr_critic"]))
+
+
 def tensor_hash(sd):
     import hashlib
     h = hashlib.sha1()
@@ -215,13 +222,11 @@ class Trainer:
         os.makedirs(os.path.join(odir, "pending"), exist_ok=True)
         self.scope = f"train_{op}_s{seed}"
         self.vscope = f"val_{op}_s{seed}"
-        self.opt_a = torch.optim.AdamW(actor.parameters(), lr=cfg["lr_actor"],
-                                       weight_decay=cfg["wd_actor"])
-        self.opt_c = torch.optim.Adam(critic.parameters(),
-                                      lr=cfg["lr_critic"])
+        self.opt_a, self.opt_c = make_optimizers(torch, actor, critic, cfg)
         self.state_path = os.path.join(odir, "state.pt")
         self.st = dict(wave=0, update=0, accepted=0, updates=[], val={},
-                       used_waves=[], discarded=[], finished=False)
+                       used_waves=[], discarded=[], finished=False,
+                       pending_val=None)
         self.init_hash = tensor_hash(actor.state_dict())
 
     def _crash(self, point):
@@ -372,6 +377,9 @@ class Trainer:
         self.st["accepted"] += int(st["accepted"])
         self.st["used_waves"] += [d["wave"] for d in items]
         self.st["updates"].append(st)
+        if st["accepted"] and "mid" not in self.st["val"] and \
+                st["train_steps"] >= self.cfg["mid_mark"]:
+            self.st["pending_val"] = "mid"      # тем же checkpoint, что update
         self.save()
         self._crash("after_update_save")
         for d in items:
@@ -418,7 +426,7 @@ class Trainer:
                 with open(vf + ".tmp", "w", encoding="utf-8") as fh:
                     json.dump(v, fh, ensure_ascii=False, default=float)
                 os.replace(vf + ".tmp", vf)
-                self._crash("val_after_write")
+                self._crash(f"val_after_write_{tag}")
                 self.ledger.commit(eid, ph)
             phys += int(v["phys"])
             res[str(task)] = list(v["success"])
@@ -427,6 +435,8 @@ class Trainer:
                                    at_train_steps=self.spent(),
                                    update=self.st["update"],
                                    actor_hash=self.actor_hash())
+        if self.st.get("pending_val") == tag:
+            self.st["pending_val"] = None
         self.save()
         self.log(f"  {self.op} s{self.seed} валидация {tag}: SR {sr:.3f} "
                  f"{ {k: sum(v) for k, v in res.items()} }")
@@ -436,6 +446,9 @@ class Trainer:
         self.validate("start")
         n = len(self.cfg["tasks"])
         while True:
+            if self.st.get("pending_val"):     # до любого нового сбора,
+                self.validate(self.st["pending_val"])   # обновления и
+                continue                                # резерва
             pend = self.pending()
             full, cur = self.cycles(pend)
             room = self.cfg["cap"] - self.spent()
@@ -455,10 +468,7 @@ class Trainer:
                     (full and not can_new_cycle):
                 items = [pend[w] for c in full[:self.cfg["cycles_per_batch"]]
                          for w in c]
-                su = self.update(items)
-                if su["accepted"] and "mid" not in self.st["val"] and \
-                        su["train_steps"] >= self.cfg["mid_mark"]:
-                    self.validate("mid")
+                self.update(items)
                 continue
             if not can_new_cycle:
                 break
@@ -624,7 +634,7 @@ def selftest():
             assert not t2.ledger.d["crashes"], crash
     # авария валидации между записью и commit: повтор без исполнения
     with tempfile.TemporaryDirectory() as td:
-        t = trainer(td, "val_after_write")
+        t = trainer(td, "val_after_write_start")
         try:
             t.run()
             raise AssertionError("авария валидации не сработала")
@@ -636,6 +646,46 @@ def selftest():
         assert t2.ledger.spent("val_T_s0") == sum(
             v["phys"] for v in st2["val"].values()), "валидация задвоена"
         assert not t2.ledger.d["crashes"]
+    # авария промежуточной валидации между записью и commit: продолжение с
+    # тем же actor, без повторного исполнения и аварийного списания
+    mid_cfg = dict(small, mid_mark=1)
+    with tempfile.TemporaryDirectory() as td:
+        a_, c_, mk_ = make("T", 6)
+        tm = Trainer(torch, seed=0, op="T", H=H, actor=a_, critic=c_,
+                     make_arm=mk_, sim=ToySim(), io=io,
+                     ledger=kcol.Ledger(os.path.join(td, "ledger.json"),
+                                        caps),
+                     odir=os.path.join(td, "run"), contract=dict(c=1),
+                     cfg=mid_cfg, log=lambda *x: None)
+        st_m = tm.run()
+        h_m = tm.actor_hash()
+        assert "mid" in st_m["val"], "mid-валидация не выполнена"
+    for crash in ("val_after_write_mid", "after_update_save"):
+        with tempfile.TemporaryDirectory() as td:
+            def tr_mid(cr=None):
+                a_, c_, mk_ = make("T", 6)
+                t_ = Trainer(torch, seed=0, op="T", H=H, actor=a_, critic=c_,
+                             make_arm=mk_, sim=ToySim(), io=io,
+                             ledger=kcol.Ledger(os.path.join(
+                                 td, "ledger.json"), caps),
+                             odir=os.path.join(td, "run"), contract=dict(c=1),
+                             cfg=mid_cfg, log=lambda *x: None)
+                t_.crash_at = cr
+                return t_
+            t = tr_mid(crash)
+            try:
+                t.run()
+                raise AssertionError(f"авария {crash} не сработала")
+            except KeyboardInterrupt:
+                pass
+            t2 = tr_mid()
+            st2 = t2.run()
+            assert t2.actor_hash() == h_m, crash
+            assert st2["val"]["mid"]["actor_hash"] == \
+                st_m["val"]["mid"]["actor_hash"], crash
+            assert not t2.ledger.d["crashes"], crash
+            assert t2.ledger.spent("val_T_s0") == sum(
+                v["phys"] for v in st2["val"].values()), crash
     # чужая волна T в тренере P при одинаковом начальном actor — отказ до
     # каких-либо изменений бюджета/файлов
     with tempfile.TemporaryDirectory() as td:
@@ -684,8 +734,10 @@ def selftest():
           "меняют обновление, подмена μ — отказ; тренер: полный прогон в "
           "капе, возобновление после аварий (запись/commit/обновление) даёт "
           "тот же actor, число обновлений и расход без аварийных списаний; "
-          "авария валидации между записью и commit — результат сохранён, "
-          "расход один раз; волна T в тренере P (одинаковый actor) — отказ "
+          "авария стартовой и промежуточной валидации между записью и commit "
+          "и авария после сохранения обновления — валидация завершается тем "
+          "же actor до нового сбора, расход один раз, без аварийных "
+          "списаний; волна T в тренере P (одинаковый actor) — отказ "
           "до изменения бюджета и файлов; чужой контракт — отказ")
     return 0
 

@@ -662,11 +662,9 @@ def _smoke_seed(torch, a, b, c, L, sim, s):
         buf = kcol32.pack(trs)
         aC = copy.deepcopy(actor)
         _a, cC = build_actor(torch, b, s, op, mod.H)
-        ppo = kppo.ppo_update(
-            torch, aC, cC, torch.optim.AdamW(aC.parameters(),
-                                             lr=kppo.CFG["lr_actor"]),
-            torch.optim.Adam(cC.parameters(), lr=kppo.CFG["lr_critic"]),
-            buf, mod.H, (32, s, 9, 0), kppo.CFG)
+        oaC, ocC = kppo.make_optimizers(torch, aC, cC, kppo.CFG)
+        ppo = kppo.ppo_update(torch, aC, cC, oaC, ocC, buf, mod.H,
+                              (32, s, 9, 0), kppo.CFG)
         out[f"{op}_s{s}"] = dict(
             physical=n_ph, problems=pj, rebuild=rb_st,
             rebuild_coverage="первый вызов каждого из 4 эпизодов",
