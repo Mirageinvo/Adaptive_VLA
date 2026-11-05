@@ -358,18 +358,161 @@ def fresh(kind):
 
 
 # --- real-check ----------------------------------------------------------------------
+def _real_check_seed(torch, a, b, s, obs5):
+    """Проверки одного сида; все ссылки на модель живут только здесь
+    (освобождаются при возврате до загрузки следующего сида)."""
+    import k25_policy as kp25
+    import k29_policy as kp
+    import k21_model as km
+    import k31_readout as kr
+    import k32_model as km32
+    import k32_policy as kpol
+    mod, bar, M, dec = load_source_dec(torch, b, s, a.device)
+    dev = torch.device(a.device)
+    inp = kp.Inputs(torch, bar["proc"], a.device)
+    desc = inp.task_desc(0)
+    ac = torch.autocast(dev.type, dtype=torch.float16)
+    r = {}
+    batch5, po, s8_5 = inp(obs5, desc, 0)
+    s11 = torch.as_tensor(km.state11(s8_5), device=dev)
+    with torch.no_grad(), ac:
+        F5, _sn, cnt = M["export"](mod, batch5, po, s11)
+        legacy = dec(F5, autocast=ac)
+        real = mod(batch5, po, s11)
+    r["legacy_B5"] = bool(torch.equal(legacy["arm"], real["arm"]) and
+                          torch.equal(legacy["Z"], real["y"]))
+    r["counters"] = kp25.counters_problems(cnt)
+    frozen_v = {n: p_._version for n, p_ in mod.named_parameters()}
+    H = mod.H
+    obs1 = [{k: v[i:i + 1] for k, v in obs5.items()} for i in range(5)]
+    ins = [inp(o, desc, 0) for o in obs1]
+    arms_out = {}
+    for kind in ("R",) + OPS:
+        actor = None
+        if kind != "R":
+            actor, critic = build_actor(torch, b, s, kind, H)
+            r[f"params_{kind}"] = dict(actor=km32.n_params(actor),
+                                       critic=km32.n_params(critic))
+        arm = kpol.Arm(torch, mod, dec, M, kind=kind, seed=s, actor=actor)
+        arm.begin(0, 0, 0)
+        torch.cuda.synchronize(dev)
+        t0 = time.perf_counter()
+        arms_out[kind] = arm.decide(*ins[0], 0)[0]
+        torch.cuda.synchronize(dev)
+        r[f"ms_{kind}"] = (time.perf_counter() - t0) * 1e3
+    r["mean_init_eq_reference"] = {k: bool(np.array_equal(arms_out[k],
+                                                           arms_out["R"]))
+                                   for k in OPS}
+    aT, _c = build_actor(torch, b, s, "T", H)
+    aP, _c = build_actor(torch, b, s, "P", H)
+    r["T_P_init_equal"] = all(torch.equal(x, y) for x, y in zip(
+        aT.state_dict().values(), aP.state_dict().values()))
+    # тождества операторов и границы на настоящих весах
+    E = kr.build(torch)
+    with torch.no_grad(), ac:
+        F1, _s1, _c = M["export"](mod, ins[0][0], ins[0][1], torch.as_tensor(
+            km.state11(ins[0][2]), device=dev))
+    with torch.no_grad():
+        ref1 = dec(F1)
+    h, m = E["half_mid"](dec._L, dec._U, "cpu")
+    rc = dict(Z0=ref1["Z"][0].float().cpu(), arm=ref1["arm"][0, :8].float()
+              .cpu(), half=h, mid=m)
+    pi = ko.path_info(F1)
+
+    def edited(rr, e):
+        o = E["edited"](dec, F1, ref1, [kr.LEVELS[rr]], [pi["path"][rr]],
+                        np.asarray(e)[None])
+        return o["Zhat"][0].float().cpu()
+    rng = np.random.default_rng(32000 + s)
+    ident, bounds = {}, []
+    for _t in range(4):
+        eta = rng.normal(size=6).astype(np.float32)
+        for rr in range(3):
+            dT = ko.raw_effect(torch, "T", rr, eta, rc, pi, edited)[0]
+            dP = ko.raw_effect(torch, "P", rr, eta, rc, pi, edited)[0]
+            ident.setdefault(kr.LEVELS[rr], []).append(
+                float((dT - dP).abs().max()))
+        for op in OPS:
+            e = (3 * rng.normal(size=ko.DIM[op])).astype(np.float32)
+            _arm, j = ko.command(torch, op, int(rng.integers(3)), e, rc, pi,
+                                 edited)
+            bounds.append(dict(op=op, max=j["lim"]["max"],
+                               rms=j["lim"]["rms"]))
+    r["T_minus_P_maxabs"] = {k: max(v) for k, v in ident.items()}
+    r["bounds_ok"] = all(x["max"] <= ko.CLIP + 1e-7 and
+                         x["rms"] <= ko.RMS_CAP + 1e-7 for x in bounds)
+    r["c"], r["c_floor"] = pi["c"].tolist(), pi["floor"].tolist()
+    # ненулевой actor (T/P/F): журнал стохастического решения = пересчёту
+    # по кешу S (μ, log π), независимость от minibatch; шаг actor и critic
+    r["nonzero"] = {}
+    for op in OPS:
+        aN, cN = build_actor(torch, b, s, op, H)
+        with torch.no_grad():
+            g_ = torch.Generator().manual_seed(5)
+            for p_ in aN.out.parameters():
+                p_.copy_(0.3 * torch.randn(p_.shape, generator=g_))
+        arm = kpol.Arm(torch, mod, dec, M, kind=op, seed=s, actor=aN,
+                       stochastic=True, space=2)
+        recs = []
+        for i, x in enumerate(ins):
+            arm.begin(0, i, i)
+            recs.append(arm.decide(*x, 8 * i)[1])
+        S = torch.as_tensor(np.stack([q["S"] for q in recs]))
+        X = km32.actor_inputs(torch, S, H)
+        lgs = {mb: kppo.policy_all(torch, aN, X, mb) for mb in (1, 2, 4)}
+        lg, mu = lgs[2]
+        lp = kd.log_prob(torch, lg.double(), mu.double(),
+                         torch.as_tensor([q["r"] for q in recs]),
+                         torch.as_tensor(np.stack([q["eta"] for q in recs]))
+                         .double())
+        Xn = torch.as_tensor(km32.actor_inputs_np(S.numpy(), H),
+                             dtype=torch.float32)
+        nz = dict(
+            mu_rec=float((mu - torch.as_tensor(np.stack(
+                [q["mu"] for q in recs]))).abs().max()),
+            logp_rec=float((lp - torch.as_tensor([q["logpi"] for q in recs]))
+                           .abs().max()),
+            mu_mb=max(float((lgs[k][1] - mu).abs().max()) for k in (1, 4)),
+            inputs_np_torch=float((Xn - X).abs().max()),
+            nonzero_effect=not all(q["zero"] for q in recs))
+        oa = torch.optim.AdamW(aN.parameters(), lr=1e-4)
+        oc = torch.optim.Adam(cN.parameters(), lr=3e-4)
+        ha, hc = kppo.tensor_hash(aN.state_dict()), kppo.tensor_hash(
+            cN.state_dict())
+        lg2, raw2 = aN(X)
+        la = -kd.mu_of(torch, raw2).sum() + lg2.sum()
+        tgt = torch.tensor([float(i % 2) for i in range(len(recs))])
+        lc = torch.mean((cN(S) - tgt) ** 2)            # непостоянные цели
+        (la + lc).backward()
+        nz["grads_finite"] = all(
+            p_.grad is not None and bool(torch.isfinite(p_.grad).all())
+            for p_ in list(aN.parameters()) + list(cN.parameters()))
+        nz["critic_grad_norm"] = float(sum(float(p_.grad.abs().sum())
+                                           for p_ in cN.parameters()))
+        oa.step()
+        oc.step()
+        nz["actor_changed"] = kppo.tensor_hash(aN.state_dict()) != ha
+        nz["critic_changed"] = kppo.tensor_hash(cN.state_dict()) != hc
+        r["nonzero"][op] = nz
+        del aN, cN, arm, oa, oc
+    r["source_no_grad"] = all(p_.grad is None for p_ in mod.parameters())
+    r["source_versions_same"] = all(p_._version == frozen_v[n]
+                                    for n, p_ in mod.named_parameters())
+    r["peak_gb"] = torch.cuda.max_memory_allocated(dev) / 2 ** 30 \
+        if dev.type == "cuda" else None
+    return r
+
+
 def real_check(a):
     import k18_collector as k18c
     sim = k18c.Sim(5, "persistent")
     import torch
-    import k25_policy as kp25
-    import k29_policy as kp
-    import k21_model as km
-    import k32_model as km32
-    import k32_policy as kpol
     b = load_base()
     c = contract(b)
     L = ledger()
+    n_steps = 5 * kcol.ENV["waiting_steps"]
+    eid = f"checks/real_check@{time.strftime('%Y%m%dT%H%M%S')}"
+    L.reserve("checks", eid, amount=n_steps)          # до физических шагов
     try:
         obs5 = sim.reset(0, [0, 1, 2, 3, 4])
         dummy = np.array([kcol.DUMMY] * 5)
@@ -377,148 +520,44 @@ def real_check(a):
             obs5, _r, _d, _s = sim.step(dummy)
     finally:
         sim.close()
-    eid = f"checks/real_check@{time.strftime('%Y%m%dT%H%M%S')}"
-    L.reserve("checks", eid, amount=5 * kcol.ENV["waiting_steps"])
-    L.commit(eid, 5 * kcol.ENV["waiting_steps"])
+    L.commit(eid, n_steps)
     rep = dict(contract=c, seeds={})
     prob = []
     for s in SEEDS:
-        mod, bar, M, dec = load_source_dec(torch, b, s, a.device)
-        dev = torch.device(a.device)
-        inp = kp.Inputs(torch, bar["proc"], a.device)
-        desc = inp.task_desc(0)
-        ac = torch.autocast(dev.type, dtype=torch.float16)
-        r = {}
-        batch5, po, s8_5 = inp(obs5, desc, 0)
-        s11 = torch.as_tensor(km.state11(s8_5), device=dev)
-        with torch.no_grad(), ac:
-            F5, _sn, cnt = M["export"](mod, batch5, po, s11)
-            legacy = dec(F5, autocast=ac)
-            real = mod(batch5, po, s11)
-        r["legacy_B5"] = bool(torch.equal(legacy["arm"], real["arm"]) and
-                              torch.equal(legacy["Z"], real["y"]))
-        r["counters"] = kp25.counters_problems(cnt)
-        frozen_v = {n: p._version for n, p in mod.named_parameters()}
-        H = mod.H
-        arms, recs = {}, {}
-        for kind in ("R",) + OPS:
-            actor = None
-            if kind != "R":
-                actor, critic = build_actor(torch, b, s, kind, H)
-                r[f"params_{kind}"] = dict(
-                    actor=km32.n_params(actor), critic=km32.n_params(critic))
-            arm = kpol.Arm(torch, mod, dec, M, kind=kind, seed=s, actor=actor)
-            arm.begin(0, 0, 0)
-            b1 = {k: v[:1] for k, v in obs5.items()}
-            bt1, po1, s81 = inp(b1, desc, 0)
-            torch.cuda.synchronize(dev)
-            t0 = time.perf_counter()
-            a_, rec = arm.decide(bt1, po1, s81, 0)
-            torch.cuda.synchronize(dev)
-            r[f"ms_{kind}"] = (time.perf_counter() - t0) * 1e3
-            arms[kind], recs[kind] = a_, rec
-        r["mean_init_eq_reference"] = {k: bool(np.array_equal(arms[k],
-                                                               arms["R"]))
-                                       for k in OPS}
-        aT, _c = build_actor(torch, b, s, "T", H)
-        aP, _c = build_actor(torch, b, s, "P", H)
-        r["T_P_init_equal"] = all(torch.equal(x, y) for x, y in zip(
-            aT.state_dict().values(), aP.state_dict().values()))
-        # ненулевые фиксированные η: тождества и границы на настоящих весах
-        import k31_readout as kr
-        E = kr.build(torch)
-        bt1, po1, s81 = inp({k: v[:1] for k, v in obs5.items()}, desc, 0)
-        with torch.no_grad(), ac:
-            F1, s11n1, _c = M["export"](mod, bt1, po1, torch.as_tensor(
-                km.state11(s81), device=dev))
-        with torch.no_grad():
-            ref1 = dec(F1)
-        h, m = E["half_mid"](dec._L, dec._U, "cpu")
-        rc = dict(Z0=ref1["Z"][0].float().cpu(), arm=ref1["arm"][0, :8]
-                  .float().cpu(), half=h, mid=m)
-        pi = ko.path_info(F1)
-
-        def edited(rr, e, dec=dec, F1=F1, ref1=ref1, pi=pi):
-            o = E["edited"](dec, F1, ref1, [kr.LEVELS[rr]], [pi["path"][rr]],
-                            np.asarray(e)[None])
-            return o["Zhat"][0].float().cpu()
-        rng = np.random.default_rng(32000 + s)
-        ident, bounds = {}, []
-        for t in range(4):
-            eta = rng.normal(size=6).astype(np.float32)
-            for rr in range(3):
-                dT = ko.raw_effect(torch, "T", rr, eta, rc, pi, edited)[0]
-                dP = ko.raw_effect(torch, "P", rr, eta, rc, pi, edited)[0]
-                ident.setdefault(kr.LEVELS[rr], []).append(
-                    float((dT - dP).abs().max()))
-            for op in OPS:
-                e = (3 * rng.normal(size=ko.DIM[op])).astype(np.float32)
-                _arm, j = ko.command(torch, op, int(rng.integers(3)), e, rc,
-                                     pi, edited)
-                bounds.append(dict(op=op, max=j["lim"]["max"],
-                                   rms=j["lim"]["rms"],
-                                   clipped=j["lim"]["clipped"],
-                                   capped=j["lim"]["capped"]))
-        r["T_minus_P_maxabs"] = {k: max(v) for k, v in ident.items()}
-        r["bounds_ok"] = all(x["max"] <= ko.CLIP + 1e-7 and
-                             x["rms"] <= ko.RMS_CAP + 1e-7 for x in bounds)
-        r["c"] = pi["c"].tolist()
-        r["c_floor"] = pi["floor"].tolist()
-        # кеш ↔ online для ненулевого actor и механический шаг
-        S = np.stack([recs[k]["S"] for k in OPS] * 6)
-        Snp = S + np.random.default_rng(1).normal(0, 0.01, S.shape).astype(
-            np.float32)
-        aN, cN = build_actor(torch, b, s, "T", H)
-        with torch.no_grad():
-            g_ = torch.Generator().manual_seed(5)
-            for p_ in aN.out.parameters():
-                p_.copy_(0.1 * torch.randn(p_.shape, generator=g_))
-        X = km32.actor_inputs(torch, torch.as_tensor(Snp), H)
-        mus = {mb: kppo.policy_all(torch, aN, X, mb)[1] for mb in (8, 32, 64)}
-        r["cache_mu_max_mb"] = max(float((mus[k] - mus[32]).abs().max())
-                                   for k in (8, 64))
-        Xn = torch.as_tensor(km32.actor_inputs_np(Snp, H), dtype=torch.float32)
-        r["np_vs_torch_inputs_max"] = float((Xn - X).abs().max())
-        oa = torch.optim.AdamW(aN.parameters(), lr=1e-4)
-        oc = torch.optim.Adam(cN.parameters(), lr=3e-4)
-        h0 = kppo.tensor_hash(aN.state_dict())
-        lg, raw = aN(X)
-        loss = -kd.mu_of(torch, raw).sum() + lg.sum() + \
-            ((cN(torch.as_tensor(Snp)) - 0.5) ** 2).sum()
-        loss.backward()
-        oa.step()
-        oc.step()
-        r["mechanical_step_changes_actor"] = kppo.tensor_hash(
-            aN.state_dict()) != h0
-        r["source_no_grad"] = all(p.grad is None for p in mod.parameters())
-        r["source_versions_same"] = all(
-            p._version == frozen_v[n] for n, p in mod.named_parameters())
-        r["peak_gb"] = torch.cuda.max_memory_allocated(dev) / 2 ** 30 \
-            if dev.type == "cuda" else None
+        r = _real_check_seed(torch, a, b, s, obs5)
+        free()
         rep["seeds"][str(s)] = r
+        nzs = r["nonzero"]
         for k, v in (("legacy_B5", r["legacy_B5"]),
                      ("mean_init", all(r["mean_init_eq_reference"].values())),
                      ("T_P_init", r["T_P_init_equal"]),
                      ("leaf T=P", r["T_minus_P_maxabs"]["leaf"] <= 1e-6),
                      ("bounds", r["bounds_ok"]),
-                     ("cache", r["cache_mu_max_mb"] <= 1e-6),
-                     ("inputs", r["np_vs_torch_inputs_max"] <= 1e-6),
-                     ("step", r["mechanical_step_changes_actor"]),
                      ("frozen", r["source_no_grad"] and
                       r["source_versions_same"])):
             if not v:
                 prob.append(f"s{s}: {k}")
+        for op, nz in nzs.items():
+            for k, ok in (("μ кеша", nz["mu_rec"] <= 1e-6),
+                          ("log π кеша", nz["logp_rec"] <= 1e-4),
+                          ("minibatch", nz["mu_mb"] <= 1e-6),
+                          ("входы", nz["inputs_np_torch"] <= 1e-6),
+                          ("ненулевая поправка", nz["nonzero_effect"]),
+                          ("градиенты", nz["grads_finite"]),
+                          ("шаг actor", nz["actor_changed"]),
+                          ("шаг critic", nz["critic_changed"])):
+                if not ok:
+                    prob.append(f"s{s} {op}: {k}")
         if r["counters"]:
             prob.append(f"s{s}: счётчики")
         print(f"  s{s}: legacy B5 {r['legacy_B5']}; mean-init = R "
               f"{r['mean_init_eq_reference']}; T=P init {r['T_P_init_equal']}"
-              f"; |T−P| root/mid/leaf {r['T_minus_P_maxabs']}; c {r['c']}; "
-              f"границы {r['bounds_ok']}; кеш {r['cache_mu_max_mb']:.1e}; "
-              f"мс R/T/P/F {r['ms_R']:.0f}/{r['ms_T']:.0f}/{r['ms_P']:.0f}/"
-              f"{r['ms_F']:.0f}; параметры {r['params_T']} {r['params_F']}",
-              flush=True)
-        del mod, bar, M, dec
-        free()
+              f"; |T−P| {r['T_minus_P_maxabs']}; c {r['c']}; границы "
+              f"{r['bounds_ok']}; ненулевой actor (μ/log π кеша): " +
+              ", ".join(f"{op} {nz['mu_rec']:.1e}/{nz['logp_rec']:.1e}"
+                        for op, nz in nzs.items()) +
+              f"; мс R/T/P/F {r['ms_R']:.0f}/{r['ms_T']:.0f}/{r['ms_P']:.0f}/"
+              f"{r['ms_F']:.0f}; пик {r['peak_gb']}", flush=True)
     rep["ok"] = not prob
     rep["problems"] = prob
     save_json(REAL_CHECK, rep)
@@ -528,6 +567,132 @@ def real_check(a):
 
 
 # --- collector-smoke ----------------------------------------------------------------
+SMOKE_DIR = "data/k32/smoke"
+TR_KEYS = ("S", "logits", "mu", "r", "eta", "logpi", "k", "elapsed",
+           "episode", "call", "clipped", "capped", "rms")
+FIRST_KEYS = ("Z0", "path", "c", "r", "eta", "Du", "a_codec", "zero")
+
+
+def smoke_episode(sim, io, arm, L, c, op, s, j, task, init, dim):
+    """reserve -> эпизод -> атомарный файл (журнал, кеш переходов, признаки
+    первого вызова) -> commit; сохранённый эпизод переиспользуется."""
+    import torch
+    import k32_harness as kh
+    eid = f"checks/smoke/{op}/s{s}/t{task}_i{init}"
+    d = os.path.join(SMOKE_DIR, f"{op}_s{s}")
+    jp, np_ = os.path.join(d, f"t{task}_i{init}.json"), \
+        os.path.join(d, f"t{task}_i{init}.npz")
+    if not os.path.exists(jp):
+        if L.is_done(eid):
+            raise SystemExit(f"{eid}: учтён, но результата нет")
+        L.reserve("checks", eid)
+        arm.episode = 9 * 10 ** 6 + j
+        ep = kcol.run_episode(sim, io, arm, task, init)
+        os.makedirs(d, exist_ok=True)
+        J = kh.pack_journal([(0, ep["calls"])], dim)
+        recs = [dict(cl["rec"], k=cl["k"]) for cl in ep["calls"]]
+        f0 = ep["calls"][0]["rec"]
+        arr = {f"tr_{k}": np.asarray([q[k] for q in recs]) for k in TR_KEYS}
+        arr.update({f"f_{k}": np.asarray(f0[k]) for k in FIRST_KEYS})
+        arr.update(f_Zhat=np.asarray(f0["Zhat"] if f0.get("Zhat") is not None
+                                     else np.zeros((20, 6), np.float32)),
+                   f_has_zhat=np.array(f0.get("Zhat") is not None))
+        arr.update({f"F_{k}": v.numpy() for k, v in arm.first_F.items()})
+        with open(np_ + ".tmp", "wb") as fh:
+            np.savez_compressed(fh, actions=ep["actions"],
+                                **{f"j_{k}": v for k, v in J.items()}, **arr)
+        os.replace(np_ + ".tmp", np_)
+        save_json(jp, dict(eid=eid, contract=c, op=op, seed=s, task=task,
+                           init=init, phys=int(ep["physical"]),
+                           success=bool(ep["success"]),
+                           done_step=int(ep["done_step"]),
+                           npz_sha1=sha(np_)))
+        L.commit(eid, ep["physical"])
+    rec = json.load(open(jp, encoding="utf-8"))
+    if rec.get("eid") != eid or rec.get("contract") != c or \
+            sha(np_) != rec.get("npz_sha1"):
+        raise SystemExit(f"{jp}: чужой/изменённый эпизод smoke")
+    L.settle(eid, rec["phys"])
+    z = dict(np.load(np_))
+    J = {k[2:]: v for k, v in z.items() if k.startswith("j_")}
+    trs = [{k: z[f"tr_{k}"][i] for k in TR_KEYS}
+           for i in range(len(z["tr_r"]))]
+    for t in trs:
+        t["R"] = float(rec["success"])
+        for k in ("r", "k", "elapsed", "episode", "call"):
+            t[k] = int(t[k])
+    first = {k: z[f"f_{k}"] for k in FIRST_KEYS}
+    first["Zhat"] = z["f_Zhat"] if bool(z["f_has_zhat"]) else None
+    first["r"], first["zero"] = int(first["r"]), bool(first["zero"])
+    F = {k[2:]: torch.as_tensor(v) for k, v in z.items()
+         if k.startswith("F_")}
+    return dict(J=J, A=z["actions"], done=rec["done_step"], trs=trs,
+                first=(F, first), phys=rec["phys"])
+
+
+def _smoke_seed(torch, a, b, c, L, sim, s):
+    import copy
+    import k29_policy as kp
+    import k31_harness as kh31
+    import k32_policy as kpol
+    out, prob, phys = {}, [], 0
+    mod, bar, M, dec = load_source_dec(torch, b, s, a.device)
+    io = kh31.IO(kp.Inputs(torch, bar["proc"], a.device))
+    for op in OPS:
+        actor, _c = build_actor(torch, b, s, op, mod.H)
+        arm = kpol.Arm(torch, mod, dec, M, kind=op, seed=s, actor=actor,
+                       stochastic=True, space=1)
+        arm.keep_first = True
+        res = [smoke_episode(sim, io, arm, L, c, op, s, j, t, i, ko.DIM[op])
+               for j, (t, i) in enumerate(SMOKE_EPS)]
+        J = {k: np.concatenate([np.full(len(x["J"]["ep"]), j, np.int64)
+                                if k == "ep" else x["J"][k]
+                                for j, x in enumerate(res)])
+             for k in res[0]["J"]}
+        trs = [t for x in res for t in x["trs"]]
+        n_ph = sum(x["phys"] for x in res)
+        phys += n_ph
+        pj = smoke_journal_problems(torch, J, trs, [x["A"] for x in res],
+                                    [x["done"] for x in res], b, op, s, actor)
+        rb_p, rb_st = rebuild_problems(torch, [x["first"] for x in res], b,
+                                       op, s)
+        pj += rb_p
+        # описательный полный PPO-batch на собранных данных (копии моделей;
+        # ничего не сохраняется, параметры по результату не подбираются)
+        buf = kcol32.pack(trs)
+        aC = copy.deepcopy(actor)
+        _a, cC = build_actor(torch, b, s, op, mod.H)
+        ppo = kppo.ppo_update(
+            torch, aC, cC, torch.optim.AdamW(aC.parameters(),
+                                             lr=kppo.CFG["lr_actor"]),
+            torch.optim.Adam(cC.parameters(), lr=kppo.CFG["lr_critic"]),
+            buf, mod.H, (32, s, 9, 0), kppo.CFG)
+        out[f"{op}_s{s}"] = dict(
+            physical=n_ph, problems=pj, rebuild=rb_st,
+            rebuild_coverage="первый вызов каждого из 4 эпизодов",
+            clip_share=float(np.mean([t["clipped"] for t in trs])),
+            cap_share=float(np.mean([t["capped"] for t in trs])),
+            rms_mean=float(np.mean([t["rms"] for t in trs])),
+            route=np.bincount([t["r"] for t in trs], minlength=3).tolist(),
+            ppo=dict(n=ppo["n"], R_mean=ppo["R_mean"],
+                     accepted=ppo["accepted_steps"], attempts=ppo["attempts"],
+                     stop=ppo["stop"], kl_old=ppo["kl_old_final"],
+                     kl_init=ppo["kl_init_final"],
+                     mu_recompute=ppo["mu_recompute_max"],
+                     logp_recompute=ppo["logp_recompute_max"]))
+        prob += [f"{op} s{s}: {x}" for x in pj]
+        v = out[f"{op}_s{s}"]
+        print(f"  smoke {op} s{s}: шагов {n_ph}; RMS Du {v['rms_mean']:.4f}; "
+              f"clip/cap {v['clip_share']:.2f}/{v['cap_share']:.2f}; маршруты "
+              f"{v['route']}; PPO-batch {v['ppo']['n']} переходов, шагов "
+              f"actor {v['ppo']['accepted']}/{v['ppo']['attempts']} "
+              f"({v['ppo']['stop']}), KL old/init {v['ppo']['kl_old']:.4f}/"
+              f"{v['ppo']['kl_init']:.4f}; пересборка {rb_st}; "
+              + ("ок" if not pj else "; ".join(pj[:3])), flush=True)
+        del actor, arm, aC, cC
+    return out, prob, phys
+
+
 def smoke(a):
     pr = fresh("real_check")
     if pr:
@@ -535,10 +700,6 @@ def smoke(a):
     import k18_collector as k18c
     sim = k18c.Sim(1, "persistent")
     import torch
-    import k29_policy as kp
-    import k31_harness as kh31
-    import k32_harness as kh
-    import k32_policy as kpol
     b = load_base()
     c = contract(b)
     L = ledger()
@@ -548,50 +709,11 @@ def smoke(a):
     phys_all = 0
     try:
         for s in SEEDS:
-            mod, bar, M, dec = load_source_dec(torch, b, s, a.device)
-            io = kh31.IO(kp.Inputs(torch, bar["proc"], a.device))
-            for op in OPS:
-                actor, _c = build_actor(torch, b, s, op, mod.H)
-                arm = kpol.Arm(torch, mod, dec, M, kind=op, seed=s,
-                               actor=actor, stochastic=True, space=1)
-                arm.keep_first = True
-                ec, A_eps, ds, trs, n_ph, firsts = [], [], [], [], 0, []
-                for j, (task, init) in enumerate(SMOKE_EPS):
-                    eid = f"checks/smoke/{op}/s{s}/t{task}_i{init}"
-                    if L.is_done(eid):
-                        eid += f"@{time.strftime('%Y%m%dT%H%M%S')}"
-                    L.reserve("checks", eid)
-                    arm.episode = 9 * 10 ** 6 + j
-                    ep = kcol.run_episode(sim, io, arm, task, init)
-                    L.commit(eid, ep["physical"])
-                    n_ph += ep["physical"]
-                    ec.append((j, ep["calls"]))
-                    A_eps.append(ep["actions"])
-                    ds.append(ep["done_step"])
-                    trs += [cl["rec"] for cl in ep["calls"]]
-                    firsts.append((arm.first_F, ep["calls"][0]["rec"]))
-                phys_all += n_ph
-                J = kh.pack_journal(ec, ko.DIM[op])
-                pj = smoke_journal_problems(torch, J, trs, A_eps, ds, b, op,
-                                            s, actor)
-                rb_p, rb_st = rebuild_problems(torch, firsts, b, op, s)
-                pj += rb_p
-                rep["runs"][f"{op}_s{s}"] = dict(
-                    physical=n_ph, problems=pj,
-                    clip_share=float(np.mean([t_["clipped"] for t_ in trs])),
-                    cap_share=float(np.mean([t_["capped"] for t_ in trs])),
-                    rms_mean=float(np.mean([t_["rms"] for t_ in trs])),
-                    route=np.bincount([t_["r"] for t_ in trs],
-                                      minlength=3).tolist(), rebuild=rb_st)
-                prob += [f"{op} s{s}: {x}" for x in pj]
-                print(f"  smoke {op} s{s}: шагов {n_ph}; RMS Du "
-                      f"{rep['runs'][f'{op}_s{s}']['rms_mean']:.4f}; clip/cap "
-                      f"{rep['runs'][f'{op}_s{s}']['clip_share']:.2f}/"
-                      f"{rep['runs'][f'{op}_s{s}']['cap_share']:.2f}; маршруты "
-                      f"{rep['runs'][f'{op}_s{s}']['route']}; "
-                      + ("ок" if not pj else "; ".join(pj[:3])), flush=True)
-            del mod, bar, M, dec
+            o, pr_, ph = _smoke_seed(torch, a, b, c, L, sim, s)
             free()
+            rep["runs"].update(o)
+            prob += pr_
+            phys_all += ph
     finally:
         sim.close()
     sec = time.time() - t_all
@@ -602,8 +724,9 @@ def smoke(a):
         sr_upper=rep["sec_per_step"] * CAPS["sr"] / 3600)
     save_json(SMOKE, rep)
     print(f"  collector-smoke: шагов {phys_all}, {sec / 60:.1f} мин, "
-          f"{rep['sec_per_step'] * 1e3:.0f} мс/шаг; верхняя оценка обучения "
-          f"{rep['forecast_hours']['train_upper']:.0f} ч, SR "
+          f"{rep['sec_per_step'] * 1e3:.0f} мс/шаг (с учётом повторно "
+          f"использованных эпизодов — оценка неточна); верхняя оценка "
+          f"обучения {rep['forecast_hours']['train_upper']:.0f} ч, SR "
           f"{rep['forecast_hours']['sr_upper']:.0f} ч; "
           + ("пройден" if not prob else "НЕ пройден"))
     return 0 if not prob else 3
@@ -692,6 +815,47 @@ def rebuild_problems(torch, firsts, b, op, seed):
 
 
 # --- обучение ------------------------------------------------------------------------
+def _train_one(torch, a, b, c, L, sim, mod, bar, M, dec, op, s):
+    import k29_policy as kp
+    import k31_harness as kh31
+    import k32_policy as kpol
+    io = kh31.IO(kp.Inputs(torch, bar["proc"], a.device))
+    actor, critic = build_actor(torch, b, s, op, mod.H)
+
+    def make_arm(act, stochastic):
+        return kpol.Arm(torch, mod, dec, M, kind=op, seed=s, actor=act,
+                        stochastic=stochastic)
+    tr = kppo.Trainer(torch, seed=s, op=op, H=mod.H, actor=actor,
+                      critic=critic, make_arm=make_arm, sim=sim, io=io,
+                      ledger=L, odir=run_dir(op, s),
+                      contract=dict(contract=c, op=op, seed=s),
+                      log=lambda x: print(x, flush=True))
+    st = tr.run()
+    fpth = final_path(op, s)
+    torch.save(dict(actor=actor.state_dict(), actor_hash=tr.actor_hash(),
+                    op=op, seed=s, contract=c), fpth + ".tmp")
+    os.replace(fpth + ".tmp", fpth)
+    save_json(train_report(op, s), dict(
+        contract=c, op=op, seed=s, finished=True, final_sha1=sha(fpth),
+        actor_hash=tr.actor_hash(), updates=st["update"],
+        accepted=st["accepted"], no_actor_update=st["no_actor_update"],
+        val=st["val"], train_steps=tr.spent(), discarded=st["discarded"],
+        history=[{k: v for k, v in u.items() if k != "history"}
+                 for u in st["updates"]]))
+    print(f"  {op} s{s}: итог — обновлений {st['update']} (принято "
+          f"{st['accepted']}), шагов {tr.spent()}; валидация "
+          f"{ {k: round(v['sr'], 3) for k, v in st['val'].items()} }"
+          + ("; stopped_no_actor_update" if st["no_actor_update"] else ""),
+          flush=True)
+
+
+def _train_seed(torch, a, b, c, L, sim, s, ops):
+    """Все модели сида живут только внутри этой функции."""
+    mod, bar, M, dec = load_source_dec(torch, b, s, a.device)
+    for op in ops:
+        _train_one(torch, a, b, c, L, sim, mod, bar, M, dec, op, s)
+
+
 def train(a):
     for k in ("real_check", "smoke"):
         pr = fresh(k)
@@ -700,59 +864,25 @@ def train(a):
     import k18_collector as k18c
     sim = k18c.Sim(1, "persistent")
     import torch
-    import k29_policy as kp
-    import k31_harness as kh31
-    import k32_policy as kpol
     b = load_base()
     c = contract(b)
     L = ledger()
-    todo = [(o, s) for o, s in ORDER if a.only is None or f"{o}_s{s}" ==
-            a.only]
     try:
-        cur = None
-        for op, s in todo:
-            if os.path.exists(train_report(op, s)):
-                rj = json.load(open(train_report(op, s), encoding="utf-8"))
-                if rj.get("contract") == c and rj.get("finished") and \
-                        sha(final_path(op, s)) == rj.get("final_sha1"):
-                    print(f"  {op} s{s}: обучение завершено и закреплено")
+        for s in SEEDS:
+            ops = []
+            for op in OPS:
+                if a.only is not None and f"{op}_s{s}" != a.only:
                     continue
-            if cur != s:
-                if cur is not None:
-                    del mod, bar, M, dec                  # noqa: F821
-                    free()
-                mod, bar, M, dec = load_source_dec(torch, b, s, a.device)
-                io = kh31.IO(kp.Inputs(torch, bar["proc"], a.device))
-                cur = s
-            actor, critic = build_actor(torch, b, s, op, mod.H)
-
-            def make_arm(act, stochastic, op=op, s=s):
-                return kpol.Arm(torch, mod, dec, M, kind=op, seed=s,
-                                actor=act, stochastic=stochastic)
-            tr = kppo.Trainer(torch, seed=s, op=op, H=mod.H, actor=actor,
-                              critic=critic, make_arm=make_arm, sim=sim,
-                              io=io, ledger=L, odir=run_dir(op, s),
-                              contract=dict(contract=c, op=op, seed=s),
-                              log=lambda x: print(x, flush=True))
-            st = tr.run()
-            fpth = final_path(op, s)
-            torch.save(dict(actor=actor.state_dict(),
-                            actor_hash=tr.actor_hash(), op=op, seed=s,
-                            contract=c), fpth + ".tmp")
-            os.replace(fpth + ".tmp", fpth)
-            save_json(train_report(op, s), dict(
-                contract=c, op=op, seed=s, finished=True,
-                final_sha1=sha(fpth), actor_hash=tr.actor_hash(),
-                updates=st["update"], accepted=st["accepted"],
-                no_actor_update=st["no_actor_update"], val=st["val"],
-                train_steps=tr.spent(), discarded=st["discarded"],
-                history=[{k: v for k, v in u.items() if k != "history"}
-                         for u in st["updates"]]))
-            print(f"  {op} s{s}: итог — обновлений {st['update']} (принято "
-                  f"{st['accepted']}), шагов {tr.spent()}; валидация "
-                  f"{ {k: round(v['sr'], 3) for k, v in st['val'].items()} }"
-                  + ("; stopped_no_actor_update" if st["no_actor_update"]
-                     else ""), flush=True)
+                if os.path.exists(train_report(op, s)):
+                    rj = json.load(open(train_report(op, s), encoding="utf-8"))
+                    if rj.get("contract") == c and rj.get("finished") and \
+                            sha(final_path(op, s)) == rj.get("final_sha1"):
+                        print(f"  {op} s{s}: обучение завершено и закреплено")
+                        continue
+                ops.append(op)
+            if ops:
+                _train_seed(torch, a, b, c, L, sim, s, ops)
+                free()
     finally:
         sim.close()
     return 0
@@ -908,6 +1038,39 @@ def rebuild_selftest():
             trs[1] = dict(trs[1], eta=trs[1]["eta"] + 1e-3)
             assert smoke_journal_problems(torch, J, trs, A_eps, ds, bb, op,
                                           0, actor), op
+            # эпизод smoke: сохранение и повторное использование без
+            # исполнения и без второго начисления
+            g = globals()
+            old_dir = g["SMOKE_DIR"]
+            g["SMOKE_DIR"] = os.path.join(td, "smoke")
+            try:
+                Ls = kcol.Ledger(os.path.join(td, f"l_{op}.json"),
+                                 dict(checks=50000))
+                arm.keep_first = True
+                x1 = smoke_episode(kppo.ToySim(), io, arm, Ls, "C", op, 0, 0,
+                                   0, 3, ko.DIM[op])
+                sp = Ls.spent("checks")
+
+                class NoSim:
+                    def reset(self, *a_):
+                        raise AssertionError("эпизод исполнен повторно")
+                x2 = smoke_episode(NoSim(), io, arm, Ls, "C", op, 0, 0, 0,
+                                   3, ko.DIM[op])
+                assert Ls.spent("checks") == sp and \
+                    np.array_equal(x1["A"], x2["A"]) and \
+                    len(x1["trs"]) == len(x2["trs"])
+                buf = kcol32.pack(x2["trs"])
+                assert kcol32.buf_problems(buf, ko.DIM[op], H) == []
+                pr2, _st = rebuild_problems(torch, [x2["first"]], b, op, 0)
+                assert pr2 == [], pr2
+                try:
+                    smoke_episode(NoSim(), io, arm, Ls, "D", op, 0, 0, 0, 3,
+                                  ko.DIM[op])
+                    raise AssertionError("эпизод чужого контракта принят")
+                except SystemExit:
+                    pass
+            finally:
+                g["SMOKE_DIR"] = old_dir
             for k_, f in (("Du", lambda r_: r_["Du"].__iadd__(1e-3)),
                           ("a_codec", lambda r_: r_["a_codec"][:, :6]
                            .__iadd__(1e-5)),
@@ -954,7 +1117,9 @@ def selftest():
     print("самопроверка k32_protocol пройдена: CPU-пересборка вызова T/P/F "
           "из весов чекпойнта (подмена Du/руки/пути — отказ), журнал стохастического "
           "smoke (повтор (r, η) по ключу, log π, D/Du/рука; подмена η — "
-          "отказ); строки нормировки "
+          "отказ), эпизод smoke переиспользуется без исполнения и без "
+          "второго начисления, кеш переходов и признаки первого вызова "
+          "восстанавливаются, чужой контракт — отказ; строки нормировки "
           "(детерминизм, уникальность, баланс задач, метки — текст), план SR "
           "-> загрузчик источника, бюджеты (обучение 1.2 млн, SR 732 тыс., "
           "всего с валидацией и проверками 2 146 700)")

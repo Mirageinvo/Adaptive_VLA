@@ -24,6 +24,7 @@ init 20…24): start, после первого принятого обновл�
 """
 import copy
 import glob
+import json
 import os
 import sys
 import time
@@ -262,19 +263,56 @@ class Trainer:
     def wave_path(self, w):
         return os.path.join(self.dir, "pending", f"wave_{w:05d}.pt")
 
+    def wave_eid(self, w):
+        return f"k32/{self.op}/s{self.seed}/wave{w}"
+
+    def ledger_problems(self, eid, phys, scope):
+        """Запись бюджета eid принадлежит этому запуску (scope) и расходу."""
+        dn = self.ledger.d["done"].get(eid)
+        pd = self.ledger.d["pending"] or {}
+        if dn is not None:
+            if dn["scope"] != scope or int(dn["actual"]) != int(phys):
+                return [f"{eid}: учтён в {dn['scope']} ({dn['actual']}) ≠ "
+                        f"{scope} ({phys})"]
+            return []
+        if pd.get("id") == eid:
+            return [] if pd["scope"] == scope else \
+                [f"{eid}: открытый резерв в {pd['scope']} ≠ {scope}"]
+        return [f"{eid}: результат не учтён в бюджете"]
+
     def pending(self):
-        """Волны текущего old-actor (после возобновления — с settle)."""
-        out = {}
+        """Волны текущего old-actor. Сначала ВСЕ файлы проверяются (контракт,
+        оператор, seed, область бюджета, номер волны, задача, eid,
+        принадлежность бюджетной записи, old-actor), и только затем —
+        удаление использованных и settle."""
+        n = len(self.cfg["tasks"])
+        files = []
         for f in sorted(glob.glob(os.path.join(self.dir, "pending",
                                                "wave_*.pt"))):
             d = self.torch.load(f, map_location="cpu", weights_only=False)
-            if d["wave"] in self.st["used_waves"]:
+            w = int(os.path.basename(f)[5:10])
+            bad = [k for k, v in (("contract", self.contract), ("op", self.op),
+                                  ("seed", self.seed), ("scope", self.scope),
+                                  ("wave", w),
+                                  ("task", self.cfg["tasks"][w % n]),
+                                  ("eid", self.wave_eid(w)))
+                   if d.get(k) != v]
+            if bad:
+                raise SystemExit(f"{f}: чужая волна ({bad})")
+            pr = self.ledger_problems(d["eid"], d["phys"], self.scope)
+            if pr:
+                raise SystemExit(f"{f}: {pr[0]}")
+            if w not in self.st["used_waves"] and \
+                    d["policy_old"] != self.actor_hash():
+                raise SystemExit(f"{f}: собран другим old-actor")
+            files.append((f, w, d))
+        out = {}
+        for f, w, d in files:
+            if w in self.st["used_waves"]:
                 os.remove(f)                   # авария после сохранения
                 continue                       # обновления, до удаления
-            if d["policy_old"] != self.actor_hash():
-                raise SystemExit(f"{f}: собран другим old-actor")
             self.ledger.settle(d["eid"], d["phys"])
-            out[d["wave"]] = d
+            out[w] = d
         if out:
             self.st["wave"] = max(self.st["wave"], max(out) + 1)
         return out
@@ -294,7 +332,7 @@ class Trainer:
         w = self.st["wave"]
         n = len(self.cfg["tasks"])
         task = self.cfg["tasks"][w % n]
-        eid = f"k32/{self.op}/s{self.seed}/wave{w}"
+        eid = self.wave_eid(w)
         self.ledger.reserve(self.scope, eid, amount=self.cfg["wave_max"],
                             limit=self.cfg["cap"])
         arm = self.make_arm(self.actor, stochastic=True)
@@ -305,7 +343,9 @@ class Trainer:
         if buf is None:
             raise SystemExit(f"волна {w}: нет переходов")
         d = dict(wave=w, task=task, eid=eid, phys=phys, buf=buf, eps=eps,
-                 policy_old=self.actor_hash(), seconds=sec)
+                 policy_old=self.actor_hash(), seconds=sec,
+                 contract=self.contract, op=self.op, seed=self.seed,
+                 scope=self.scope)
         p = self.wave_path(w)
         self.torch.save(d, p + ".tmp")
         os.replace(p + ".tmp", p)
@@ -347,17 +387,41 @@ class Trainer:
             return
         arm = self.make_arm(self.actor, stochastic=False)
         res, phys = {}, 0
+        vdir = os.path.join(self.dir, "val")
+        os.makedirs(vdir, exist_ok=True)
+        ah = self.actor_hash()
         for i, task in enumerate(self.cfg["tasks"]):
             eid = f"k32/{self.op}/s{self.seed}/val_{tag}_t{task}"
-            if self.ledger.is_done(eid):
-                eid += f"@{time.strftime('%Y%m%dT%H%M%S')}"
-            self.ledger.reserve(self.vscope, eid, amount=self.cfg["wave_max"])
-            eps, _b, ph, _s = kcol32.run_wave(
-                self.sim, self.io, arm, task, list(self.cfg["val_init"]),
-                episode_base=10 ** 6 + i * 10, record=False)
-            self.ledger.commit(eid, ph)
-            phys += ph
-            res[str(task)] = [bool(e["success"]) for e in eps]
+            vf = os.path.join(vdir, f"{tag}_t{task}.json")
+            if os.path.exists(vf):            # результат пережил аварию
+                v = json.load(open(vf, encoding="utf-8"))
+                bad = [k for k, x in (("eid", eid), ("actor_hash", ah),
+                                      ("contract", self.contract),
+                                      ("scope", self.vscope))
+                       if v.get(k) != x]
+                pr = bad or self.ledger_problems(eid, v["phys"], self.vscope)
+                if pr:
+                    raise SystemExit(f"{vf}: {pr}")
+                self.ledger.settle(eid, v["phys"])
+            else:
+                if self.ledger.is_done(eid):
+                    raise SystemExit(f"{eid}: учтён, но результата нет")
+                self.ledger.reserve(self.vscope, eid,
+                                    amount=self.cfg["wave_max"])
+                eps, _b, ph, _s = kcol32.run_wave(
+                    self.sim, self.io, arm, task, list(self.cfg["val_init"]),
+                    episode_base=10 ** 6 + i * 10, record=False)
+                v = dict(eid=eid, actor_hash=ah, contract=self.contract,
+                         scope=self.vscope, phys=int(ph),
+                         success=[bool(e["success"]) for e in eps],
+                         episodes=eps)
+                with open(vf + ".tmp", "w", encoding="utf-8") as fh:
+                    json.dump(v, fh, ensure_ascii=False, default=float)
+                os.replace(vf + ".tmp", vf)
+                self._crash("val_after_write")
+                self.ledger.commit(eid, ph)
+            phys += int(v["phys"])
+            res[str(task)] = list(v["success"])
         sr = float(np.mean([np.mean(v) for v in res.values()]))
         self.st["val"][tag] = dict(sr=sr, per_task=res, phys=phys,
                                    at_train_steps=self.spent(),
@@ -558,6 +622,45 @@ def selftest():
             assert st2["update"] == n_upd, crash
             assert t2.spent() == spent_full, crash
             assert not t2.ledger.d["crashes"], crash
+    # авария валидации между записью и commit: повтор без исполнения
+    with tempfile.TemporaryDirectory() as td:
+        t = trainer(td, "val_after_write")
+        try:
+            t.run()
+            raise AssertionError("авария валидации не сработала")
+        except KeyboardInterrupt:
+            pass
+        t2 = trainer(td)
+        st2 = t2.run()
+        assert t2.actor_hash() == h_full and st2["update"] == n_upd
+        assert t2.ledger.spent("val_T_s0") == sum(
+            v["phys"] for v in st2["val"].values()), "валидация задвоена"
+        assert not t2.ledger.d["crashes"]
+    # чужая волна T в тренере P при одинаковом начальном actor — отказ до
+    # каких-либо изменений бюджета/файлов
+    with tempfile.TemporaryDirectory() as td:
+        t = trainer(td, "after_commit")
+        try:
+            t.run()
+        except KeyboardInterrupt:
+            pass
+        caps_p = dict(caps, train_P_s0=caps["train_T_s0"], val_P_s0=VAL_CAP)
+        a_, c_, mk_ = make("P", 6)
+        Lp = kcol.Ledger(os.path.join(td, "ledger_p.json"), caps_p)
+        tp = Trainer(torch, seed=0, op="P", H=H, actor=a_, critic=c_,
+                     make_arm=mk_, sim=ToySim(), io=io, ledger=Lp,
+                     odir=os.path.join(td, "run"), contract=dict(c=1),
+                     cfg=dict(small, cap=caps["train_T_s0"]),
+                     log=lambda *x: None)
+        before = json.dumps(Lp.d, sort_keys=True)
+        files = sorted(os.listdir(os.path.join(td, "run", "pending")))
+        try:
+            tp.pending()
+            raise AssertionError("волна T принята тренером P")
+        except SystemExit:
+            pass
+        assert json.dumps(Lp.d, sort_keys=True) == before
+        assert sorted(os.listdir(os.path.join(td, "run", "pending"))) == files
     # другой контракт — отказ возобновления
     with tempfile.TemporaryDirectory() as td:
         t = trainer(td, "after_commit")
@@ -581,7 +684,9 @@ def selftest():
           "меняют обновление, подмена μ — отказ; тренер: полный прогон в "
           "капе, возобновление после аварий (запись/commit/обновление) даёт "
           "тот же actor, число обновлений и расход без аварийных списаний; "
-          "чужой контракт — отказ")
+          "авария валидации между записью и commit — результат сохранён, "
+          "расход один раз; волна T в тренере P (одинаковый actor) — отказ "
+          "до изменения бюджета и файлов; чужой контракт — отказ")
     return 0
 
 

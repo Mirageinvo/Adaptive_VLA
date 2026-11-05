@@ -33,6 +33,9 @@ if HERE not in sys.path:
 import k31_collect as kcol  # noqa: E402
 import k32_operator as ko  # noqa: E402
 
+REQUIRED = ("ep", "elapsed", "k", "a_codec", "Z0", "ref_arm", "grip_logit",
+            "has_actor", "logits", "mu", "r", "eta", "c", "w", "Zhat",
+            "has_zhat", "zero", "D", "Du", "path")
 TASKS = tuple(range(10))
 BLOCKS = (30, 35, 40)
 PRIMARY = (0, 6, 8)
@@ -98,7 +101,27 @@ def journal_problems(J, A_eps, done_steps, half, mid, L, U, q, kind):
     import torch
     import k29_policy as kp
     p = []
+    miss = [k_ for k_ in REQUIRED if k_ not in J]
+    if miss:
+        return [f"журнал: нет полей {miss}"]
     n = len(J["ep"])
+    d = J["eta"].shape[-1] if J["eta"].ndim == 2 else -1
+    shapes = dict(ep=(n,), elapsed=(n,), k=(n,), a_codec=(n, N8, 7),
+                  Z0=(n, 20, 6), ref_arm=(n, N8, 6), grip_logit=(n, N8),
+                  has_actor=(n,), logits=(n, 3), mu=(n, 3, d), r=(n,),
+                  eta=(n, d), c=(n, 3), w=(n, N8), Zhat=(n, 20, 6),
+                  has_zhat=(n,), zero=(n,), D=(n, N8, 6), Du=(n, N8, 6),
+                  path=(n, 3))
+    bad = [k_ for k_, sh in shapes.items() if J[k_].shape != sh]
+    if bad or (kind != "R" and d != ko.DIM[kind]):
+        return [f"журнал: неверные формы {bad or ['eta']}"]
+    if sorted(set(J["ep"].tolist())) != list(range(len(A_eps))):
+        return [f"журнал: эпизоды {sorted(set(J['ep'].tolist()))} ≠ "
+                f"0…{len(A_eps) - 1}"]
+    if not np.array_equal(J["ep"], np.sort(J["ep"], kind="stable")):
+        return ["журнал: записи эпизодов не по порядку"]
+    if ((J["k"] < 1) | (J["k"] > N8)).any():
+        return ["журнал: k вне 1…8"]
     for k_, v in J.items():
         if v.dtype.kind == "f" and not np.isfinite(v).all():
             return [f"журнал {k_}: нечисловые значения"]
@@ -206,7 +229,10 @@ def block_problems(path, plan, lab, task, block):
     if p:
         return p
     eps = d["episodes"]
-    offs = np.asarray(z["ep_offsets"])
+    offs = np.asarray(z.get("ep_offsets", []))
+    if offs.shape != (6,) or offs[0] != 0 or (np.diff(offs) < 0).any() or \
+            offs[-1] != len(z["actions"]):
+        return p + ["смещения эпизодов не покрывают действия"]
     A_eps = [z["actions"][offs[i]:offs[i + 1]] for i in range(5)]
     for i, e in enumerate(eps):
         if e["init_hash"] != plan["init_ref"].get(
@@ -236,24 +262,91 @@ def write_block(path, d, J, A_eps):
     os.replace(path + ".tmp", path)
 
 
-def run_block(sim, io, arm, plan, lab, task, block, ledger, d):
-    eps, ec, A_eps = [], [], []
+def ep_paths(lab, task, init):
+    d = os.path.join(eval_dir(lab), "ep")
+    return os.path.join(d, f"t{task}_i{init}.json"), \
+        os.path.join(d, f"t{task}_i{init}.npz")
+
+
+def save_episode(lab, task, init, eid, want, ep, dim):
+    jp, np_ = ep_paths(lab, task, init)
+    os.makedirs(os.path.dirname(jp), exist_ok=True)
+    J = pack_journal([(0, ep["calls"])], dim)
+    with open(np_ + ".tmp", "wb") as fh:
+        np.savez_compressed(fh, actions=ep["actions"].astype(np.float32),
+                            **{f"j_{k}": v for k, v in J.items()})
+    os.replace(np_ + ".tmp", np_)
+    rec = dict(eid=eid, label=want["label"], plan_sha1=want["plan_sha1"],
+               actor_hash=want["actor_hash"], contract=want["contract"],
+               phys=int(ep["physical"]), npz_sha1=kcol.sha(np_),
+               summary=dict(init_state_id=int(init), **{
+                   k: ep[k] for k in ("success", "success_step", "done_step",
+                                      "own_steps", "steps", "physical",
+                                      "init_hash", "init_hash_full",
+                                      "actions_sha1")}))
+    with open(jp + ".tmp", "w", encoding="utf-8") as fh:
+        json.dump(rec, fh, ensure_ascii=False, default=float)
+    os.replace(jp + ".tmp", jp)
+    return rec
+
+
+def load_episode(lab, task, init, eid, want):
+    jp, np_ = ep_paths(lab, task, init)
+    if not (os.path.exists(jp) and os.path.exists(np_)):
+        return None
+    rec = json.load(open(jp, encoding="utf-8"))
+    bad = [k for k, v in (("eid", eid), ("label", want["label"]),
+                          ("plan_sha1", want["plan_sha1"]),
+                          ("actor_hash", want["actor_hash"]),
+                          ("contract", want["contract"]))
+           if rec.get(k) != v]
+    if bad or kcol.sha(np_) != rec.get("npz_sha1"):
+        raise SystemExit(f"{jp}: сохранённый эпизод чужой/изменён ({bad})")
+    z = dict(np.load(np_))
+    return rec, z
+
+
+def ledger_owner_problems(ledger, eid, phys, scope="sr"):
+    dn = ledger.d["done"].get(eid)
+    pd = ledger.d["pending"] or {}
+    if dn is not None:
+        return [] if dn["scope"] == scope and int(dn["actual"]) == int(
+            phys) else [f"{eid}: учтён иначе ({dn})"]
+    if pd.get("id") == eid and pd.get("scope") == scope:
+        return []
+    return [f"{eid}: результат не учтён в бюджете"]
+
+
+def run_block(sim, io, arm, plan, lab, task, block, ledger, d, crash=None):
+    """Эпизод: reserve -> исполнение -> атомарный файл эпизода -> commit;
+    сохранённый эпизод переживает перезапуск (settle, без повтора)."""
+    want = plan["arms"][lab]
+    eps, Js, A_eps = [], [], []
     for i, init in enumerate(range(block, block + 5)):
         eid = f"sr/{lab}/t{task}_i{init}"
-        if ledger.is_done(eid):
-            eid = f"{eid}@{time.strftime('%Y%m%dT%H%M%S')}"
-        ledger.reserve("sr", eid)
-        arm.episode = 10 ** 7 + init
-        ep = kcol.run_episode(sim, io, arm, task, init)
-        ledger.commit(eid, ep["physical"])
-        eps.append(dict(init_state_id=int(init), **{
-            k: ep[k] for k in ("success", "success_step", "done_step",
-                               "own_steps", "steps", "physical", "init_hash",
-                               "init_hash_full", "actions_sha1")}))
-        ec.append((i, ep["calls"]))
-        A_eps.append(ep["actions"])
-    J = pack_journal(ec, d)
-    want = plan["arms"][lab]
+        got = load_episode(lab, task, init, eid, want)
+        if got is None:
+            if ledger.is_done(eid):
+                raise SystemExit(f"{eid}: учтён, но результата нет")
+            ledger.reserve("sr", eid)
+            arm.episode = 10 ** 7 + init
+            ep = kcol.run_episode(sim, io, arm, task, init)
+            save_episode(lab, task, init, eid, want, ep, d)
+            if crash == (task, init):
+                raise KeyboardInterrupt("после записи эпизода")
+            ledger.commit(eid, ep["physical"])
+            got = load_episode(lab, task, init, eid, want)
+        rec, z = got
+        pr = ledger_owner_problems(ledger, eid, rec["phys"])
+        if pr:
+            raise SystemExit(pr[0])
+        ledger.settle(eid, rec["phys"])
+        eps.append(rec["summary"])
+        J = {k[2:]: v for k, v in z.items() if k.startswith("j_")}
+        J["ep"] = np.full(len(J["ep"]), i, np.int64)
+        Js.append(J)
+        A_eps.append(z["actions"])
+    J = {k: np.concatenate([x[k] for x in Js]) for k in Js[0]}
     write_block(block_path(lab, task, block), dict(
         label=lab, seed=want["seed"], plan_sha1=want["plan_sha1"],
         contract=want["contract"], actor_hash=want["actor_hash"],
@@ -435,18 +528,54 @@ def selftest():
                         ("действие", lambda zz: zz["actions"].__setitem__(
                             (2, 0), zz["actions"][2, 0] + 1e-6))):
                     assert mutate(f), (kind, nm)
+                ne = int((z["j_ep"] == 4).sum())
+                for nm, f in (
+                        ("пустой журнал", lambda zz: [zz.__setitem__(k_, v[:0])
+                                                      for k_, v in list(
+                                                          zz.items())
+                                                      if k_.startswith("j_")]),
+                        ("нет эпизода 4", lambda zz: [zz.__setitem__(
+                            k_, v[z["j_ep"] != 4]) for k_, v in list(
+                                zz.items()) if k_.startswith("j_")]),
+                        ("нет последнего вызова", lambda zz: [zz.__setitem__(
+                            k_, v[:-1]) for k_, v in list(zz.items())
+                            if k_.startswith("j_")]),
+                        ("нет поля", lambda zz: zz.pop("j_Du")),
+                        ("смещения", lambda zz: zz.__setitem__(
+                            "ep_offsets", zz["ep_offsets"] - 1))):
+                    assert mutate(f), (kind, nm)
+                assert ne >= 1
                 mutate(lambda zz: None)
                 assert block_problems(path, plan, lab, 0, 30) == []
             json.dump(dict(dj, harness=dict(dj["harness"], n_envs=5)),
                       open(path, "w"))
             assert any("обвязка" in x for x in block_problems(
                 path, plan, lab, 0, 30))
+            # авария SR между записью эпизода и commit: повтор без исполнения
+            labc = label("T", 1)
+            plan["arms"][labc] = dict(plan["arms"][lab], label=labc, seed=1)
+            os.makedirs(eval_dir(labc), exist_ok=True)
+            Lc = kcol.Ledger("ledger_c.json", dict(sr=732000))
+            try:
+                run_block(kppo.ToySim(), io, arm, plan, labc, 0, 30, Lc, d,
+                          crash=(0, 32))
+                raise AssertionError("авария SR не сработала")
+            except KeyboardInterrupt:
+                pass
+            eps_c = run_block(kppo.ToySim(), io, arm, plan, labc, 0, 30,
+                              kcol.Ledger("ledger_c.json", dict(sr=732000)),
+                              d)
+            Lc2 = kcol.Ledger("ledger_c.json", dict(sr=732000))
+            assert Lc2.spent("sr") == sum(e["physical"] for e in eps_c) and \
+                not Lc2.d["crashes"], "SR задвоен"
         finally:
             os.chdir(cwd)
     print("самопроверка k32_harness пройдена: блоки R/T/P/F (B = 1, "
           "ненулевой actor) проходят независимую пересборку; NaN/±Inf, "
           "подмена η, Du, руки, схвата, физического действия, обвязка "
-          "n_envs = 5 — отказ")
+          "n_envs = 5, пустой журнал, нет эпизода, нет последнего вызова, нет "
+          "поля, смещения — отказ; авария SR между записью эпизода и commit "
+          "— эпизод сохранён, расход один раз")
     return 0
 
 
