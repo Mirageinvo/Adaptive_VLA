@@ -10,8 +10,12 @@
   размерности, отпечаток модели, runtime body_pos/body_quat (в т. ч.
   фикстуры), каноническая физическая подпись (позы тел и qpos суставов,
   кватернионы со знаком w ≥ 0, округление 1e−6);
-  затем execution seed 101 (np/random) и 10 шагов ожидания [0,…,0,−1] —
-  post-wait init_hash / init_hash_full по формуле K-9h.
+  затем set_init_state(S0) — тот же вызов, что при воспроизведении и в
+  штатном пути LIBERO/K-9h (он задаёт фазу опроса observables robosuite и
+  тёплый старт решателя; без него post-wait наблюдение пути генерации
+  отличается от пути воспроизведения при равном физическом состоянии —
+  диагностика K-33 2026-11-07), execution seed 101 (np/random) и 10 шагов
+  ожидания [0,…,0,−1] — post-wait init_hash / init_hash_full по формуле K-9h.
 Воспроизведение: новый объект среды по тому же рецепту, native reset,
   сверка имён/размерностей/отпечатка модели и runtime-массивов поз с
   снимком (несовпадение — отказ: ничего не подменяется), set_init_state(S0),
@@ -53,7 +57,9 @@ CAMERAS = ["agentview", "robot0_eye_in_hand"]
 BANK_DIR = "data/k33/bank"
 MANIFEST = "reports/k33/bank_manifest.json"
 RECIPE = dict(seed_seq=[33, 20261106], scene_seed="np+random+env.seed before "
-              "create, np.random.seed before native reset", exec_seed=EXEC_SEED,
+              "create, np.random.seed before native reset",
+              after_snapshot="set_init_state(S0) before exec seed and wait",
+              exec_seed=EXEC_SEED,
               wait=WAIT, dummy=DUMMY, round=ROUND, cameras=CAMERAS,
               image_size=224, suite=SUITE)
 
@@ -205,6 +211,9 @@ def generate(task, seed):
         sig = signature(sim, meta)
         sig_j = signature(sim, meta, joints_only=True)
         succ0 = bool(env.check_success())
+        env.set_init_state(S0)                       # как restore_into / K-9h
+        if signature(sim, meta) != sig:
+            raise Technical("подпись после set_init_state(S0) ≠ снимку")
         seed_all(EXEC_SEED)
         obs, done, succ_w = None, False, False
         for _ in range(WAIT):

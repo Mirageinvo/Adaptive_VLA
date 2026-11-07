@@ -16,6 +16,8 @@
 Шаги среды учитываются в журнале K-33 (scope checks).
   python experiments/k33_diag.py --cases 0:9:0,0:9:1,0:0:0,1:9:0
   (space:task:позиция случая в банке задачи)
+  --post-fix: текущий k33_bank — generate дважды и replay одного seed,
+  равенство post-wait хешей (проверка правки set_init_state в generate).
 """
 import argparse
 import hashlib
@@ -159,13 +161,51 @@ def first_diff(A, B, stages):
     return None
 
 
+def post_fix(specs, kp):
+    """Текущий k33_bank: generate и replay одного seed (новый объект среды
+    на каждый вызов) дают одинаковые post-wait хеши? Банк не читается для
+    хешей — только seed случая."""
+    L = kp.ledger()
+    eid = f"checks/diag_bank_postfix/{int(time.time())}"
+    L.reserve("checks", eid, amount=len(specs) * 3 * kb.WAIT)
+    steps, out = 0, []
+    for space, task, pos in specs:
+        cases, _meta = kb.load_task(space, task)
+        seed = cases[pos]["seed"]
+        g = kb.generate(task, seed)
+        g2 = kb.generate(task, seed)
+        case = dict(case_id=kb.case_id(space, task, cases[pos]["idx"]),
+                    seed=seed, S0=g["S0"], body_pos=g["body_pos"],
+                    body_quat=g["body_quat"], sig=g["sig"])
+        r = kb.replay(task, case, g["meta"])
+        steps += 3 * kb.WAIT
+        hg = [g["init_hash"], g["init_hash_full"]]
+        row = dict(case_id=case["case_id"],
+                   gen_eq_gen=hg == [g2["init_hash"], g2["init_hash_full"]],
+                   gen_eq_replay=hg == [r["init_hash"], r["init_hash_full"]],
+                   S0_eq_bank=bool(np.array_equal(g["S0"], cases[pos]["S0"])),
+                   sig_eq_bank=g["sig"] == cases[pos]["sig"])
+        out.append(row)
+        print(f"  {row}", flush=True)
+    L.commit(eid, steps)
+    ok = all(r["gen_eq_gen"] and r["gen_eq_replay"] for r in out)
+    print("  после правки: generate = replay " + ("во всех случаях" if ok
+                                                    else "НЕ во всех"))
+    kp.save_json(OUT.replace(".json", "_postfix.json"),
+                 dict(cases=out, ok=ok))
+    return 0 if ok else 3
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cases", default="0:9:0,0:9:1,0:0:0,1:9:0")
     ap.add_argument("--out", default=OUT)
+    ap.add_argument("--post-fix", action="store_true")
     a = ap.parse_args()
     import k33_protocol as kp
     specs = [tuple(int(v) for v in s.split(":")) for s in a.cases.split(",")]
+    if a.post_fix:
+        return post_fix(specs, kp)
     L = kp.ledger()
     eid = f"checks/diag_bank/{int(time.time())}"
     L.reserve("checks", eid, amount=len(specs) * len(TRACES) * kb.WAIT)
