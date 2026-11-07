@@ -84,6 +84,12 @@ def snap(env, obs=None):
         s["act"] = np.array(d.act, np.float64, copy=True)
     for k, v in controller_state(env).items():
         s["ctl:" + k] = v
+    for name, ob in sorted(getattr(env.env, "_observables", {}).items()):
+        for a in ("_time_since_last_sample", "_current_delay",
+                  "_sampling_timestep"):
+            v = getattr(ob, a, None)
+            if v is not None:
+                s[f"obt:{name}.{a}"] = np.asarray(v, np.float64).reshape(-1)
     if obs is not None:
         s["obs_state"] = np.asarray(obs["state"], np.float64).copy()
         for c in kb.CAMERAS:
@@ -126,8 +132,21 @@ def diff(a, b):
                 out[k] = "sha"
         elif x.shape != y.shape:
             out[k] = f"форма {x.shape} vs {y.shape}"
-        elif not np.array_equal(x, y):
-            out[k] = float(np.max(np.abs(x - y)))
+        elif not np.array_equal(x, y, equal_nan=True):
+            dd = np.abs(x - y)
+            out[k] = float(np.nanmax(dd)) if np.isfinite(dd).any() \
+                else "NaN-маска"
+    return out
+
+
+def stage_diffs(A, B, stages):
+    """Все стадии с различиями: стадия -> поля."""
+    out = {}
+    for s in stages:
+        if s in A["snaps"] and s in B["snaps"]:
+            d = diff(A["snaps"][s], B["snaps"][s])
+            if d:
+                out[s] = d
     return out
 
 
@@ -177,8 +196,18 @@ def main():
         r["G1reset_vs_R1set"] = diff(g["reset"], rr["set"])
         r["G1_vs_R1_steps"] = first_diff(
             T["G1"], T["R1"], [f"step{k}" for k in range(kb.WAIT)])
+        st_w = [f"step{k}" for k in range(kb.WAIT)]
+        r["G1_vs_R1_all"] = {k: sorted(v) for k, v in
+                             stage_diffs(T["G1"], T["R1"], st_w).items()}
+        r["G1_vs_G2_hash"] = r["hashes"]["G1"] == r["hashes"]["G2"]
+        r["R1_vs_R2_hash"] = r["hashes"]["R1"] == r["hashes"]["R2"]
         rep["cases"].append(r)
         print(f"  {c['case_id']}: банк={r['match_bank']}", flush=True)
+        print(f"    хеши: G1=G2 {r['G1_vs_G2_hash']}, R1=R2 "
+              f"{r['R1_vs_R2_hash']}", flush=True)
+        print("    G1 vs R1 по шагам: " + ("; ".join(
+            f"{k}: {','.join(v)}" for k, v in r["G1_vs_R1_all"].items())
+            or "равны"), flush=True)
         for k in ("S0_vs_reset_G1", "G1reset_vs_R1reset", "G1reset_vs_R1set",
                   "G1_vs_G2", "R1_vs_R2", "G1_vs_R1_steps"):
             v = r[k]
