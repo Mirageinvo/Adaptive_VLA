@@ -185,6 +185,16 @@ def run_chunk(L, eid, jobs, fn, workers, work_file, cfp="test",
     return res
 
 
+def leftover_problems(cpath):
+    """Новое построение (нет contract.json v2) при непустых каталогах
+    прежнего банка — отказ; продолжение построения v2 — допустимо."""
+    left = [p_ for p_ in (kb.BANK_DIR, WORK_V1) if os.path.isdir(p_) and
+            os.listdir(p_)]
+    if not os.path.exists(cpath) and left:
+        return f"остатки прежнего банка {left} — сначала archive-v1"
+    return None
+
+
 def bank(a):
     contract, cfp = bank_contract()
     if os.path.exists(kb.MANIFEST):
@@ -200,11 +210,9 @@ def bank(a):
               f"(bank_id {m['bank_id'][:12]})")
         return 0
     cpath = os.path.join(WORK, "contract.json")
-    left = [p_ for p_ in (kb.BANK_DIR, WORK_V1) if os.path.isdir(p_) and
-            os.listdir(p_)]
-    if not os.path.exists(cpath) and left:
-        raise SystemExit(f"остатки прежнего банка {left} — сначала "
-                         f"archive-v1")
+    pr = leftover_problems(cpath)
+    if pr:
+        raise SystemExit(pr)
     if os.path.exists(cpath):
         if json.load(open(cpath, encoding="utf-8")).get("fp") != cfp:
             raise SystemExit(f"{cpath}: незавершённое построение другого "
@@ -419,10 +427,30 @@ def _tree_sha(paths):
     return out
 
 
+def archive_integrity(A):
+    """Архив v1: каждый файл на месте назначения с SHA до переноса; снимок
+    журнала не изменён. -> проблемы."""
+    moved = {}
+    for path_ in A["sha_before"]:
+        for it in A["items"]:
+            if path_ == it["src"] or path_.startswith(it["src"].rstrip("/")
+                                                     + "/"):
+                moved[path_] = it["dst"] + path_[len(it["src"]):]
+    pr = [f"{q}: нет или SHA ≠" for p_, q in moved.items()
+          if not os.path.exists(q) or sha(q) != A["sha_before"][p_]]
+    if len(moved) != len(A["sha_before"]):
+        pr.append("не все файлы сопоставлены местам архива")
+    if not os.path.exists(A["ledger_snapshot"]) or \
+            sha(A["ledger_snapshot"]) != A["ledger_snapshot_sha1"]:
+        pr.append("снимок журнала изменён")
+    return pr, len(moved)
+
+
 def archive_v1(a):
     """Перенос (не удаление) банка v1: файлы банка, bank_work, манифест,
     отчёт bank-check; снимок журнала. Сверка SHA до и после переноса.
-    Повтор безопасен: перенесённое пропускается, итог сверяется."""
+    Повтор безопасен: завершённый архив только сверяется (файлы банка v2
+    на прежних путях при этом не трогаются); незавершённый — доносится."""
     import shutil
     items = [(kb.BANK_DIR, os.path.join(ARCH_V1, "bank")),
              (WORK_V1, os.path.join(ARCH_V1, "bank_work")),
@@ -431,6 +459,13 @@ def archive_v1(a):
     af = os.path.join(ARCH_V1, "archive.json")
     if os.path.exists(af):
         A = json.load(open(af, encoding="utf-8"))
+        if A.get("done"):
+            pr, n = archive_integrity(A)
+            if pr:
+                raise SystemExit("архив v1 повреждён: " + "; ".join(pr[:3]))
+            print(f"  архив v1 уже завершён: bank_id {A['bank_id'][:12]}, "
+                  f"файлов {n}, SHA совпадают; рабочие файлы v2 не тронуты")
+            return 0
     else:
         if not os.path.exists(kb.MANIFEST):
             raise SystemExit("нет манифеста банка v1 — архивировать нечего")
@@ -456,24 +491,39 @@ def archive_v1(a):
         if os.path.exists(s_):
             os.makedirs(os.path.dirname(d_), exist_ok=True)
             shutil.move(s_, d_)
-    moved = {}
-    for path_, h in A["sha_before"].items():
-        for it in A["items"]:
-            if path_ == it["src"] or path_.startswith(it["src"].rstrip("/")
-                                                     + "/"):
-                moved[path_] = it["dst"] + path_[len(it["src"]):]
-    bad = [p_ for p_, q in moved.items()
-           if not os.path.exists(q) or sha(q) != A["sha_before"][p_]]
-    if bad or len(moved) != len(A["sha_before"]):
-        raise SystemExit(f"архив v1: SHA после переноса ≠ до ({bad[:3]})")
-    if sha(A["ledger_snapshot"]) != A["ledger_snapshot_sha1"]:
-        raise SystemExit("снимок журнала изменён")
-    A["done"], A["n_files"] = True, len(moved)
+    pr, n = archive_integrity(A)
+    if pr:
+        raise SystemExit("архив v1: " + "; ".join(pr[:3]))
+    A["done"], A["n_files"] = True, n
     save_json(af, A)
-    print(f"  архив v1: bank_id {A['bank_id'][:12]}, файлов {len(moved)} "
+    print(f"  архив v1: bank_id {A['bank_id'][:12]}, файлов {n} "
           f"перенесено в {ARCH_V1} (SHA совпадают), снимок журнала "
           f"{A['ledger_snapshot_sha1'][:12]}")
     return 0
+
+
+def v1_bank_source(cfp):
+    """Банк v1 для post-fix: завершённый архив, иначе действующий банк
+    прежнего контракта. -> (bank_id, каталог банка)."""
+    af = os.path.join(ARCH_V1, "archive.json")
+    if os.path.exists(af):
+        A = json.load(open(af, encoding="utf-8"))
+        if not A.get("done"):
+            raise SystemExit("архив v1 не завершён")
+        pr, _n = archive_integrity(A)
+        if pr:
+            raise SystemExit("архив v1 повреждён: " + "; ".join(pr[:3]))
+        return A["bank_id"], os.path.join(ARCH_V1, "bank")
+    if not os.path.exists(kb.MANIFEST):
+        raise SystemExit("нет банка v1 (ни архива, ни манифеста)")
+    m = json.load(open(kb.MANIFEST, encoding="utf-8"))
+    if m.get("contract_fp") == cfp:
+        raise SystemExit("действующий манифест — уже банк текущего контракта")
+    bad = [p_ for p_, h in m["files"].items()
+           if not os.path.exists(p_) or sha(p_) != h]
+    if bad:
+        raise SystemExit(f"файлы банка v1 изменены {bad[:3]}")
+    return m["bank_id"], kb.BANK_DIR
 
 
 CMP_ARRAYS = ("S0", "body_pos", "body_quat")
@@ -806,12 +856,13 @@ def migration_selftest():
             assert compare_v1_problems(o, nw)[0], "расхождение не замечено"
         # архив v1: перенос со сверкой SHA, повтор безопасен
         g = globals()
-        keep = {k: g[k] for k in ("ARCH_V1", "WORK_V1", "CHECK", "LEDGER",
-                                  "bank_contract")}
+        keep = {k: g[k] for k in ("ARCH_V1", "WORK_V1", "WORK", "CHECK",
+                                  "LEDGER", "bank_contract")}
         keep_kb = (kb.BANK_DIR, kb.MANIFEST)
         try:
             g.update(ARCH_V1=os.path.join(td, "arch"),
                      WORK_V1=os.path.join(td, "wk"),
+                     WORK=os.path.join(td, "wk2"),
                      CHECK=os.path.join(td, "chk.json"), LEDGER=lp,
                      bank_contract=lambda: ({}, "new"))
             kb.BANK_DIR, kb.MANIFEST = o, os.path.join(td, "man.json")
@@ -826,6 +877,33 @@ def migration_selftest():
             assert sorted(before.values()) == sorted(
                 v for k, v in after.items()
                 if not k.endswith(("archive.json", "ledger_snapshot.json")))
+            assert v1_bank_source("new") == ("old", os.path.join(
+                g["ARCH_V1"], "bank"))
+            # регрессия: архив -> частичное построение v2 -> повтор цепочки
+            cp2 = os.path.join(g["WORK"], "contract.json")
+            assert leftover_problems(cp2) is None
+            save_json(cp2, dict(fp="new"))
+            kb.save_task(0, 0, [dict(seed=1, idx=0, S0=np.zeros(4),
+                                     body_pos=np.zeros((2, 3)),
+                                     body_quat=np.zeros((2, 4)), sig="v2",
+                                     init_hash="a", init_hash_full="b")],
+                         meta, o)
+            v2f = _tree_sha([o, g["WORK"]])
+            assert archive_v1(None) == 0
+            assert _tree_sha([o, g["WORK"]]) == v2f, "файлы v2 тронуты"
+            assert leftover_problems(cp2) is None     # продолжение v2
+            os.remove(cp2)
+            assert leftover_problems(cp2), "остатки без contract v2 приняты"
+            save_json(cp2, dict(fp="new"))
+            # повреждение архива — отказ
+            af1 = os.path.join(g["ARCH_V1"], "bank", "s0", "t1.npz")
+            with open(af1, "ab") as fh:
+                fh.write(b"x")
+            try:
+                archive_v1(None)
+                raise AssertionError("повреждённый архив принят")
+            except SystemExit:
+                pass
             # банк текущего контракта не архивируется
             g["ARCH_V1"] = os.path.join(td, "arch2")
             save_json(kb.MANIFEST, dict(bank_id="cur", contract_fp="new"))
