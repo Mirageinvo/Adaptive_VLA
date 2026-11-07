@@ -101,11 +101,23 @@ def runtime_arrays(sim):
 
 
 def canon_quat(q):
-    """Знак кватерниона (w, x, y, z): w ≥ 0; форма входа сохраняется."""
+    """Знак кватерниона (w, x, y, z): w ≥ 0; форма входа сохраняется.
+    (Для подписи используется quat_key — однозначный и при w = 0.)"""
     q = np.asarray(q, np.float64)
     flat = q.reshape(-1, 4).copy()
     flat[flat[:, 0] < 0] *= -1
     return flat.reshape(q.shape)
+
+
+def quat_key(q):
+    """Кватернион -> целые на сетке 1e−6 с однозначным знаком: первая
+    ненулевая компонента ОКРУГЛЁННОГО кватерниона положительна (q и −q,
+    в т. ч. при w = 0 около π, дают одно и то же)."""
+    k = np.round(np.asarray(q, np.float64) / ROUND).astype(np.int64)
+    nz = np.nonzero(k)[0]
+    if len(nz) and k[nz[0]] < 0:
+        k = -k
+    return k
 
 
 def signature(sim, meta=None, joints_only=False):
@@ -120,16 +132,18 @@ def signature(sim, meta=None, joints_only=False):
         n = {0: 7, 1: 4, 2: 1, 3: 1}[t]
         q = np.asarray(d.qpos[adr:adr + n], np.float64).copy()
         if t == 0:
-            q[3:] = canon_quat(q[3:])
+            k = np.concatenate([np.round(q[:3] / ROUND).astype(np.int64),
+                                quat_key(q[3:])])
         elif t == 1:
-            q = canon_quat(q)
-        parts.append((name, np.round(q / ROUND).astype(np.int64)))
+            k = quat_key(q)
+        else:
+            k = np.round(q / ROUND).astype(np.int64)
+        parts.append((name, k))
     if not joints_only:
         bp, bq = runtime_arrays(sim)
-        bq = canon_quat(bq)
         for i, name in enumerate(meta["bodies"]):
-            parts.append(("body:" + name, np.round(np.concatenate(
-                [bp[i], bq[i]]) / ROUND).astype(np.int64)))
+            parts.append(("body:" + name, np.concatenate(
+                [np.round(bp[i] / ROUND).astype(np.int64), quat_key(bq[i])])))
     h = hashlib.sha1()
     for name, a in parts:
         h.update(name.encode())
@@ -459,6 +473,14 @@ def selftest():
     s1 = signature(sim, meta)
     sim.data.qpos = np.array([0.1, 0.2, 0.3, 1.0, 0, 0, 0, 0.5])  # q ≡ −q
     assert signature(sim, meta) == s1, "знак кватерниона меняет подпись"
+    for q0 in ([0.0, 1.0, 0, 0], [1e-9, 0.6, 0.8, 0], [2e-6, 0, 0.6, 0.8]):
+        q0 = np.array(q0)
+        assert np.array_equal(quat_key(q0), quat_key(-q0)), q0
+        sim.data.qpos = np.concatenate([[0.1, 0.2, 0.3], q0, [0.5]])
+        s_a = signature(sim, meta)
+        sim.data.qpos = np.concatenate([[0.1, 0.2, 0.3], -q0, [0.5]])
+        assert signature(sim, meta) == s_a, f"q и −q около π: {q0}"
+    sim.data.qpos = np.array([0.1, 0.2, 0.3, 1.0, 0, 0, 0, 0.5])
     sj = signature(sim, meta, joints_only=True)
     sim.model.body_pos = sim.model.body_pos.copy()
     sim.model.body_pos[1, 0] += 1e-3                     # сдвиг фикстуры
@@ -482,7 +504,7 @@ def selftest():
                                       "дубликат физической сцены"], rj
     print("самопроверка k33_bank пройдена: seed сцен (детерминизм, без "
           "коллизий в 3050), case_id по пространствам, канонизация "
-          "кватернионов, подпись ловит сдвиг фикстуры при том же qpos и не "
+          "кватернионов (q и −q, в т. ч. w = 0 около π), подпись ловит сдвиг фикстуры при том же qpos и не "
           "зависит от знака кватерниона, отбор первых допустимых с причинами "
           "(успех/done, ошибка reset, официальный init, дубликат)")
     return 0

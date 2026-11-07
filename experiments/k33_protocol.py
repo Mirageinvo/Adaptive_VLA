@@ -94,17 +94,50 @@ def task_files():
     return out
 
 
+BANK_CODE = ("k33_bank.py", "k18_collector.py")
+
+
+def bank_contract():
+    """Контракт банка: код sampler/restore/отбора (только k33_bank и формула
+    хешей), рецепт, размеры пространств, версии среды, BDDL/init — без кода
+    моделей и анализа."""
+    c = dict(code={f: sha(os.path.join(HERE, f)) for f in BANK_CODE},
+             recipe=kb.RECIPE, spaces={str(k): v for k, v in kb.SPACES.items()},
+             versions=versions(), tasks=task_files())
+    c = json.loads(json.dumps(c, default=str))
+    return c, hashlib.sha1(json.dumps(c, sort_keys=True).encode()).hexdigest()
+
+
 def pool(workers):
     import multiprocessing as mp
     return mp.get_context("forkserver").Pool(int(workers))
 
 
-def run_chunk(L, eid, jobs, fn, workers, work_file):
-    """reserve -> исполнение -> файл -> commit; готовый файл — settle."""
+def jobs_key(jobs):
+    """Упорядоченный ключ заданий пачки (seed/индексы/case_id)."""
+    out = []
+    for j in jobs:
+        if isinstance(j, tuple) and len(j) == 3 and not isinstance(j[2], dict):
+            sp, t, i = j
+            out.append([int(sp), int(t), int(i), kb.scene_seed(sp, t, i)])
+        elif isinstance(j, tuple) and len(j) == 4:
+            out.append([int(j[0]), int(j[1]), j[2]["case_id"], int(j[2]["seed"])])
+        else:
+            out.append(json.loads(json.dumps(j, default=str)))
+    return out
+
+
+def run_chunk(L, eid, jobs, fn, workers, work_file, cfp="test"):
+    """reserve -> исполнение -> файл -> commit; готовый файл — settle.
+    Файл пачки закрепляет eid, отпечаток контракта и упорядоченный список
+    заданий; всё сверяется ДО settle."""
+    key = jobs_key(jobs)
     if os.path.exists(work_file):
         d = pickle.load(open(work_file, "rb"))
-        if d["eid"] != eid:
-            raise SystemExit(f"{work_file}: чужая пачка")
+        bad = [k for k, v in (("eid", eid), ("contract", cfp), ("jobs", key))
+               if d.get(k) != v]
+        if bad:
+            raise SystemExit(f"{work_file}: чужая пачка ({bad})")
         L.settle(eid, d["steps"])
         return d["res"]
     if L.is_done(eid):
@@ -115,23 +148,34 @@ def run_chunk(L, eid, jobs, fn, workers, work_file):
     steps = int(sum(r.get("steps", kb.WAIT) for r in res))
     os.makedirs(os.path.dirname(work_file), exist_ok=True)
     with open(work_file + ".tmp", "wb") as fh:
-        pickle.dump(dict(eid=eid, res=res, steps=steps), fh)
+        pickle.dump(dict(eid=eid, contract=cfp, jobs=key, res=res,
+                         steps=steps), fh)
     os.replace(work_file + ".tmp", work_file)
     L.commit(eid, steps)
     return res
 
 
 def bank(a):
+    contract, cfp = bank_contract()
     if os.path.exists(kb.MANIFEST):
         m = json.load(open(kb.MANIFEST, encoding="utf-8"))
         bad = [p for p, s in m["files"].items()
                if not os.path.exists(p) or sha(p) != s]
-        if bad:
-            raise SystemExit(f"манифест банка закреплён, файлы изменены: "
-                             f"{bad[:3]}")
-        print(f"  {kb.MANIFEST}: закреплён, файлы совпадают "
+        if bad or m.get("contract_fp") != cfp:
+            diff = [k for k in contract if m.get("contract", {}).get(k) !=
+                    contract[k]]
+            raise SystemExit(f"манифест банка закреплён; файлы изменены "
+                             f"{bad[:3]} или контракт другой {diff}")
+        print(f"  {kb.MANIFEST}: закреплён, файлы и контракт совпадают "
               f"(bank_id {m['bank_id'][:12]})")
         return 0
+    cpath = os.path.join(WORK, "contract.json")
+    if os.path.exists(cpath):
+        if json.load(open(cpath, encoding="utf-8")).get("fp") != cfp:
+            raise SystemExit(f"{cpath}: незавершённое построение другого "
+                             f"контракта — нужен новый каталог")
+    else:
+        save_json(cpath, dict(fp=cfp, contract=contract))
     L = ledger()
     tf = task_files()
     seen = set()
@@ -155,7 +199,8 @@ def bank(a):
                 jobs = [(space, t, i) for i in range(start, start + n)]
                 eid = f"bank/gen/s{space}/t{t}/c{start}"
                 wf = os.path.join(WORK, f"gen_s{space}_t{t}_c{start}.pkl")
-                results += run_chunk(L, eid, jobs, kb._gen_job, a.workers, wf)
+                results += run_chunk(L, eid, jobs, kb._gen_job, a.workers, wf,
+                                     cfp)
                 start += n
             cases, rej = kb.select(results, need, seen, official[t])
             metas = {json.dumps(c["meta"], sort_keys=True) for c in cases}
@@ -171,8 +216,12 @@ def bank(a):
             print(f"  s{space} t{t}: случаев {len(cases)} из {start} "
                   f"кандидатов; отбраковано "
                   f"{per[f's{space}_t{t}']['reject_counts']}", flush=True)
+    seeds_all = [int(x) for p_ in files for x in np.load(p_)["seed"]]
+    if len(set(seeds_all)) != len(seeds_all):
+        raise SystemExit("коллизия seed среди выбранных случаев")
     man = dict(recipe=kb.RECIPE, spaces=kb.SPACES, versions=versions(),
-               tasks=tf, files=files, per=per,
+               tasks=tf, files=files, per=per, contract=contract,
+               contract_fp=cfp, n_selected=len(seeds_all),
                created=time.strftime("%Y-%m-%dT%H:%M:%S"),
                budget=dict(bank=L.spent("bank")))
     man["bank_id"] = hashlib.sha1(json.dumps(
@@ -187,8 +236,9 @@ def bank(a):
 def bank_check(a):
     m = json.load(open(kb.MANIFEST, encoding="utf-8"))
     bad = [p for p, s in m["files"].items() if sha(p) != s]
-    if bad:
-        raise SystemExit(f"файлы банка изменены: {bad[:3]}")
+    _c, cfp = bank_contract()
+    if bad or m.get("contract_fp") != cfp:
+        raise SystemExit(f"файлы банка изменены {bad[:3]} или контракт другой")
     L = ledger()
     rep = dict(bank_id=m["bank_id"], rounds={})
     prob = []
@@ -208,7 +258,7 @@ def bank_check(a):
             part = jobs[k:k + step]
             eid = f"bank/{rname}/{m['bank_id'][:12]}/p{k}"
             wf = os.path.join(WORK, f"check_{rname}_p{k}.pkl")
-            res += run_chunk(L, eid, part, kb._replay_job, a.workers, wf)
+            res += run_chunk(L, eid, part, kb._replay_job, a.workers, wf, cfp)
         by = {r["case_id"]: r for r in res}
         bad_r = []
         for (space, t, c, _meta) in jobs:
@@ -237,62 +287,114 @@ def bank_check(a):
     return 0 if rep["ok"] else 3
 
 
-def _blocks(d):
-    out = {}
-    for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
-        if f.endswith(".json"):
-            j = json.load(open(os.path.join(d, f), encoding="utf-8"))
-            if "episodes" not in j:
-                continue
-            npz = os.path.join(d, f[:-5] + ".actions.npz")
-            A = np.load(npz)["actions"] if os.path.exists(npz) else None
-            out[f] = (j, A)
-    return out
-
-
 EP_KEYS = ("success", "success_step", "done_step", "own_steps", "init_hash",
-           "init_hash_full", "action_sha1", "env_steps", "policy_calls")
+           "init_hash_full", "action_sha1", "env_steps", "policy_calls",
+           "init_state_id", "rollout_seed")
+LEGACY_SET = ((0, 30), (8, 30))
+DEV_SET = ((0, 0), (8, 0))
+
+
+def block_file(d, task, start):
+    return os.path.join(d, f"fullbar_t{task}_i{start}.json")
+
+
+def harness_block_problems(d, task, start):
+    """Один блок K-9h: настройки, 5 эпизодов start…start+4 по порядку,
+    обязательные поля, действия (форма, конечность) и пересчёт action SHA."""
+    import k15g_local_probe as pr
+    f = block_file(d, task, start)
+    if not os.path.exists(f):
+        return [f"нет блока {os.path.basename(f)}"], None, None
+    j = json.load(open(f, encoding="utf-8"))
+    p = []
+    argv = j.get("argv") or {}
+    for k, v in (("seed", 101), ("task_id", task), ("init_start", start)):
+        if j.get(k) != v:
+            p.append(f"{os.path.basename(f)}: {k} = {j.get(k)}")
+    for k, v in (("rollout_seed_mode", "fixed"), ("n_envs", 5)):
+        if argv.get(k) != v:
+            p.append(f"{os.path.basename(f)}: argv {k} = {argv.get(k)}")
+    eps = j.get("episodes") or []
+    if [e.get("init_state_id") for e in eps] != list(range(start, start + 5)):
+        p.append(f"{os.path.basename(f)}: эпизоды "
+                 f"{[e.get('init_state_id') for e in eps]}")
+    miss = [k for e in eps for k in EP_KEYS if k not in e]
+    if miss:
+        p.append(f"{os.path.basename(f)}: нет полей {sorted(set(miss))}")
+    if any(e.get("rollout_seed") != 101 for e in eps):
+        p.append(f"{os.path.basename(f)}: rollout_seed ≠ 101")
+    npz = f[:-5] + ".actions.npz"
+    A = np.load(npz)["actions"] if os.path.exists(npz) else None
+    if A is None or A.ndim != 3 or A.shape[1:] != (5, 7) or \
+            not np.isfinite(A).all():
+        p.append(f"{os.path.basename(f)}: действия отсутствуют/форма/"
+                 f"конечность")
+    elif not p:
+        for i, e in enumerate(eps):
+            h, _end = pr.episode_action_sha(A, i, e["done_step"])
+            if h != e["action_sha1"]:
+                p.append(f"{os.path.basename(f)} эпизод {i}: action SHA ≠ JSON")
+    return p, j, A
+
+
+def legacy_problems(cur, new):
+    prob = []
+    for t, b in LEGACY_SET:
+        pc_, jc, Ac = harness_block_problems(cur, t, b)
+        pn_, jn, An = harness_block_problems(new, t, b)
+        prob += [f"старый путь: {x}" for x in pc_] + \
+            [f"адаптер: {x}" for x in pn_]
+        if pc_ or pn_:
+            continue
+        for i, (ec, en) in enumerate(zip(jc["episodes"], jn["episodes"])):
+            for grp in (("init_hash", "init_hash_full"),
+                        ("action_sha1", "env_steps", "policy_calls"),
+                        ("success", "success_step", "done_step",
+                         "own_steps")):
+                diff = [k for k in grp if ec[k] != en[k]]
+                if diff:
+                    prob.append(f"t{t} эпизод {i}: {diff}")
+                    break
+        if not np.array_equal(Ac, An):
+            prob.append(f"t{t}: исполненные действия не совпали побитово")
+    return prob
 
 
 def legacy_compare(a):
-    """Старый холодный путь против адаптера legacy: эпизоды и действия."""
-    cur, new = _blocks(a.cur), _blocks(a.new)
-    prob, rows = [], []
-    if not cur or set(cur) != set(new):
-        prob.append(f"наборы блоков различаются: {sorted(cur)} / "
-                    f"{sorted(new)}")
-    for f in sorted(set(cur) & set(new)):
-        (jc, Ac), (jn, An) = cur[f], new[f]
-        for i, (ec, en) in enumerate(zip(jc["episodes"], jn["episodes"])):
-            diff = [k for k in EP_KEYS if ec.get(k) != en.get(k)]
-            rows.append(dict(block=f, ep=i, diff=diff))
-            if diff:
-                prob.append(f"{f} эпизод {i}: {diff}")
-        if Ac is None or An is None or not np.array_equal(Ac, An):
-            prob.append(f"{f}: исполненные действия не совпали побитово")
-    rep = dict(ok=not prob, problems=prob, rows=rows)
-    save_json(os.path.join("reports/k33", "legacy_compare.json"), rep)
-    print("  legacy-smoke: " + ("совпадение побитово (сцены, хеши, действия, "
-                                "исходы)" if not prob else
+    """Старый холодный путь против адаптера legacy (сцена -> действия ->
+    исходы) на точном наборе блоков t0/t8 i30."""
+    prob = legacy_problems(a.cur, a.new)
+    save_json(os.path.join("reports/k33", "legacy_compare.json"),
+              dict(ok=not prob, problems=prob, set=LEGACY_SET))
+    print("  legacy-smoke: " + ("совпадение побитово (хеши сцен, действия, "
+                                "исходы; 2 блока × 5)" if not prob else
                                 "РАСХОЖДЕНИЕ: " + "; ".join(prob[:4])))
     return 0 if not prob else 3
 
 
-def dev_compare(a):
-    """Харнесс в режиме bank: post-wait хеши эпизодов = банку."""
-    prob, n = [], 0
-    for f, (j, _A) in _blocks(a.new).items():
-        t = int(j["task_id"])
-        cases, _m = kb.load_task(int(a.space), t)
+def dev_problems(new, space, load=None):
+    load = load or kb.load_task
+    prob = []
+    for t, b in DEV_SET:
+        p_, j, _A = harness_block_problems(new, t, b)
+        prob += p_
+        if p_:
+            continue
+        cases, _m = load(int(space), t)
         for e in j["episodes"]:
             c = cases[int(e["init_state_id"])]
-            n += 1
             if e["init_hash"] != c["init_hash"] or \
                     e["init_hash_full"] != c["init_hash_full"]:
-                prob.append(f"{f} {c['case_id']}: post-wait хеш ≠ банку")
-    print(f"  dev-replay: эпизодов {n}; " + ("хеши = банку" if not prob
-                                            else "; ".join(prob[:4])))
-    return 0 if (n and not prob) else 3
+                prob.append(f"t{t} {c['case_id']}: post-wait хеш ≠ банку")
+    return prob
+
+
+def dev_compare(a):
+    """Харнесс в режиме bank: точный набор t0/t8 блок 0, хеши = банку."""
+    prob = dev_problems(a.new, a.space)
+    print("  dev-replay: " + ("10 эпизодов, хеши = банку" if not prob
+                              else "; ".join(prob[:4])))
+    return 0 if not prob else 3
 
 
 def ledger_cmd(a):
@@ -308,6 +410,86 @@ def ledger_cmd(a):
     L.commit(a.eid, actual)
     print(f"    шагов {actual}; checks {L.spent('checks')}/{CAPS['checks']}")
     return 0
+
+
+def strict_selftest():
+    import tempfile
+    import k15g_local_probe as pr
+
+    def write(d, task, start, n=5, ids=None, mutate=None):
+        os.makedirs(d, exist_ok=True)
+        rng = np.random.default_rng(task * 100 + start)
+        A = rng.normal(size=(30, 5, 7)).astype(np.float32)
+        ds = [10, -1, 5, 29, 3]
+        eps = []
+        for i in range(n):
+            h, _e = pr.episode_action_sha(A, i, ds[i])
+            eps.append(dict(success=bool(i % 2), success_step=-1,
+                            done_step=ds[i], own_steps=ds[i] + 1,
+                            init_hash=f"h{task}_{start + i}",
+                            init_hash_full=f"f{task}_{start + i}",
+                            action_sha1=h, env_steps=30, policy_calls=4,
+                            init_state_id=(ids or list(range(start,
+                                                             start + 5)))[i],
+                            rollout_seed=101))
+        j = dict(seed=101, task_id=task, init_start=start,
+                 argv=dict(rollout_seed_mode="fixed", n_envs=5), episodes=eps)
+        if mutate:
+            mutate(j)
+        f = block_file(d, task, start)
+        json.dump(j, open(f, "w"))
+        np.savez(f[:-5] + ".actions.npz", actions=A)
+    with tempfile.TemporaryDirectory() as td:
+        cur, new = os.path.join(td, "c"), os.path.join(td, "n")
+        for t, b in LEGACY_SET:
+            write(cur, t, b)
+            write(new, t, b)
+        assert legacy_problems(cur, new) == []
+        # пустые эпизоды в обоих — отказ
+        for t, b in LEGACY_SET:
+            write(cur, t, b, mutate=lambda j: j.__setitem__("episodes", []))
+            write(new, t, b, mutate=lambda j: j.__setitem__("episodes", []))
+        assert legacy_problems(cur, new)
+        # 5 против 4 — отказ
+        for t, b in LEGACY_SET:
+            write(cur, t, b)
+            write(new, t, b, n=4)
+        assert legacy_problems(cur, new)
+        # нет блока t8 в обоих — отказ
+        for t, b in LEGACY_SET:
+            write(new, t, b)
+        os.remove(block_file(cur, 8, 30))
+        os.remove(block_file(new, 8, 30))
+        assert legacy_problems(cur, new)
+        write(cur, 8, 30)
+        write(new, 8, 30)
+        # неверный режим seed / порядок id / подмена action SHA — отказ
+        write(new, 0, 30, mutate=lambda j: j["argv"].__setitem__(
+            "rollout_seed_mode", "block"))
+        assert legacy_problems(cur, new)
+        write(new, 0, 30, ids=[31, 30, 32, 33, 34])
+        assert legacy_problems(cur, new)
+        write(new, 0, 30, mutate=lambda j: j["episodes"][2].__setitem__(
+            "action_sha1", "0" * 16))
+        assert legacy_problems(cur, new)
+        write(new, 0, 30)
+        assert legacy_problems(cur, new) == []
+        # dev: точный набор t0/t8 блок 0; один эпизод одной задачи — отказ
+        dev = os.path.join(td, "d")
+
+        def load(space, t):
+            return [dict(case_id=f"c{t}_{i}", init_hash=f"h{t}_{i}",
+                         init_hash_full=f"f{t}_{i}") for i in range(5)], {}
+        for t, b in DEV_SET:
+            write(dev, t, b)
+        assert dev_problems(dev, 0, load) == []
+        os.remove(block_file(dev, 8, 0))
+        write(dev, 0, 0, n=1)
+        assert dev_problems(dev, 0, load)
+        write(dev, 0, 0)
+        write(dev, 8, 0, mutate=lambda j: j["episodes"][1].__setitem__(
+            "init_hash", "x"))
+        assert dev_problems(dev, 0, load)
 
 
 def selftest():
@@ -347,7 +529,8 @@ def selftest():
             L2 = kcol.Ledger(os.path.join(td, "l.json"), CAPS)
             L2.reserve("bank", "e2", amount=20)
             with open(os.path.join(td, "w2.pkl"), "wb") as fh:
-                pickle.dump(dict(eid="e2", res=[], steps=20), fh)
+                pickle.dump(dict(eid="e2", contract="test",
+                                 jobs=jobs_key([1, 2]), res=[], steps=20), fh)
             run_chunk(kcol.Ledger(os.path.join(td, "l.json"), CAPS), "e2",
                       [1, 2], fn, 1, os.path.join(td, "w2.pkl"))
             L3 = kcol.Ledger(os.path.join(td, "l.json"), CAPS)
@@ -357,9 +540,24 @@ def selftest():
                 raise AssertionError("чужая пачка принята")
             except SystemExit:
                 pass
+            # тот же eid, другое задание (новый seed) или контракт — отказ
+            wg = os.path.join(td, "g.pkl")
+            run_chunk(L3, "eg", [(1, 0, 5)], fn, 1, wg, "C1")
+            n0 = calls["n"]
+            for jobs, cf in (([(1, 0, 6)], "C1"), ([(1, 0, 5)], "C2")):
+                try:
+                    run_chunk(L3, "eg", jobs, fn, 1, wg, cf)
+                    raise AssertionError("подменённая пачка принята")
+                except SystemExit:
+                    pass
+            assert calls["n"] == n0
         finally:
             g["pool"] = orig
-    print("самопроверка k33_protocol пройдена: пачка банка — резерв, файл до "
+    strict_selftest()
+    print("самопроверка k33_protocol пройдена: строгие legacy/dev-сверки "
+          "(пустые эпизоды, 5 против 4, один эпизод, неверные id/настройки, "
+          "action SHA — отказ), пачка закрепляет контракт и задания (новый "
+          "seed при том же eid — отказ); пачка банка — резерв, файл до "
           "commit, повтор без исполнения и без двойного расхода, авария "
           "между записью и commit закрывается settle, чужая пачка — отказ")
     return 0

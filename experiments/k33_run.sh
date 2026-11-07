@@ -23,8 +23,12 @@ echo "=== СТАРТ $(date) === режим $MODE $ARG2, коммит $(git rev-
 finish () { echo "=== КОНЕЦ $(date), код $1 ==="; exit "$1"; }
 PY=python3
 PROT="$PY experiments/k33_protocol.py"
-PLAN_A="$($PY -c "import sys; sys.path.insert(0,'experiments'); import k21_main_protocol as p; print(p.plan_path('A'))")"
-CKPT="$($PY -c "import json; print(json.load(open('$PLAN_A'))['setup']['ckpt'])")"
+PLAN_A="" CKPT=""
+plan_a () {   # путь плана A K-21 и снимок BAR (только для режимов с раскатками)
+  PLAN_A="$($PY -c "import sys; sys.path.insert(0,'experiments'); import k21_main_protocol as p; print(p.plan_path('A'))")" || return 3
+  CKPT="$($PY -c "import json; print(json.load(open('$PLAN_A'))['setup']['ckpt'])")" || return 3
+  [ -d "$CKPT" ] || { echo "ОТКАЗ: нет снимка BAR $CKPT"; return 3; }
+}
 COMMON () {   # DEV
   echo "--ckpt $CKPT --task-suite 10 --n-envs 5 --seed 101 --rollout-seed-mode fixed \
 --ensemble off --horizon 8 --max-steps 600 --waiting-steps 10 --device $1 --save-actions \
@@ -55,14 +59,14 @@ case "$MODE" in
   bank) $PROT bank --workers "${ARG2:-6}"; finish $? ;;
   bank-check) $PROT bank-check --workers "${ARG2:-6}"; finish $? ;;
   legacy-smoke)
-    DEV="${ARG2:-cuda:0}"
+    DEV="${ARG2:-cuda:0}"; plan_a || finish 3
     for T in 0 8; do
       block cur "$DEV" "$T" 30 reports/k33/legacy/cur || finish 3
       block new "$DEV" "$T" 30 reports/k33/legacy/new legacy || finish 3
     done
     $PROT legacy-compare --cur reports/k33/legacy/cur --new reports/k33/legacy/new; finish $? ;;
   dev-replay)
-    DEV="${ARG2:-cuda:0}"
+    DEV="${ARG2:-cuda:0}"; plan_a || finish 3
     for T in 0 8; do
       block new "$DEV" "$T" 0 reports/k33/devreplay bank 0 || finish 3
     done
