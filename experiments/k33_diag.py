@@ -17,7 +17,8 @@
   python experiments/k33_diag.py --cases 0:9:0,0:9:1,0:0:0,1:9:0
   (space:task:позиция случая в банке задачи)
   --post-fix: текущий k33_bank — generate дважды и replay одного seed,
-  равенство post-wait хешей (проверка правки set_init_state в generate).
+  равенство post-wait хешей, S0 и подпись = банку v1; итог — все четыре
+  флага; отчёт reports/k33/diag_bank_postfix.json пишется до commit.
 """
 import argparse
 import hashlib
@@ -161,11 +162,43 @@ def first_diff(A, B, stages):
     return None
 
 
-def post_fix(specs, kp):
-    """Текущий k33_bank: generate и replay одного seed (новый объект среды
-    на каждый вызов) дают одинаковые post-wait хеши? Банк не читается для
-    хешей — только seed случая."""
+POSTFIX = "reports/k33/diag_bank_postfix.json"
+FLAGS = ("gen_eq_gen", "gen_eq_replay", "S0_eq_bank", "sig_eq_bank")
+
+
+def postfix_ok(rows, n_want):
+    """Итог --post-fix: все случаи на месте и все четыре флага истинны."""
+    return len(rows) == n_want and n_want > 0 and \
+        all(bool(r.get(k)) for r in rows for k in FLAGS)
+
+
+def postfix_recover(L, path, cases_arg):
+    """Отчёт уже записан: сверить случаи и учесть его расход (commit не
+    успел — settle). -> код или None (отчёта нет)."""
+    if not os.path.exists(path):
+        return None
+    d = json.load(open(path, encoding="utf-8"))
+    if d.get("cases_arg") != cases_arg:
+        raise SystemExit(f"{path}: отчёт других случаев ({d.get('cases_arg')})"
+                         f" — новый прогон только после переноса отчёта")
+    L.settle(d["eid"], d["steps"])
+    ok = postfix_ok(d["cases"], d["n_cases"])
+    print(f"  отчёт {path} уже записан (eid {d['eid']}, шагов {d['steps']}), "
+          f"учтён; после правки: " + ("generate = replay, S0 и подписи = "
+                                      "банку во всех случаях" if ok else
+                                      "НЕ во всех случаях"))
+    return 0 if ok else 3
+
+
+def post_fix(specs, kp, cases_arg, path=POSTFIX):
+    """Текущий k33_bank: generate дважды и replay одного seed (новый объект
+    среды на каждый вызов) — равенство post-wait хешей; S0 и подпись
+    генерации = банку v1 (сцена не меняется). Отчёт с eid и расходом
+    пишется атомарно ДО commit; повтор после аварии — settle по отчёту."""
     L = kp.ledger()
+    r0 = postfix_recover(L, path, cases_arg)
+    if r0 is not None:
+        return r0
     eid = f"checks/diag_bank_postfix/{int(time.time())}"
     L.reserve("checks", eid, amount=len(specs) * 3 * kb.WAIT)
     steps, out = 0, []
@@ -184,16 +217,52 @@ def post_fix(specs, kp):
                    gen_eq_gen=hg == [g2["init_hash"], g2["init_hash_full"]],
                    gen_eq_replay=hg == [r["init_hash"], r["init_hash_full"]],
                    S0_eq_bank=bool(np.array_equal(g["S0"], cases[pos]["S0"])),
-                   sig_eq_bank=g["sig"] == cases[pos]["sig"])
+                   sig_eq_bank=g["sig"] == cases[pos]["sig"],
+                   hash_changed_vs_bank=hg != [cases[pos]["init_hash"],
+                                               cases[pos]["init_hash_full"]])
         out.append(row)
         print(f"  {row}", flush=True)
+    ok = postfix_ok(out, len(specs))
+    _c, cfp = kp.bank_contract()
+    kp.save_json(path, dict(eid=eid, steps=steps, cases_arg=cases_arg,
+                            n_cases=len(specs), cases=out, ok=ok,
+                            contract_fp=cfp, recipe=kb.RECIPE))
     L.commit(eid, steps)
-    ok = all(r["gen_eq_gen"] and r["gen_eq_replay"] for r in out)
-    print("  после правки: generate = replay " + ("во всех случаях" if ok
-                                                    else "НЕ во всех"))
-    kp.save_json(OUT.replace(".json", "_postfix.json"),
-                 dict(cases=out, ok=ok))
+    print("  после правки: " + ("generate = replay, S0 и подписи = банку во "
+                                "всех случаях" if ok else "НЕ во всех случаях"))
     return 0 if ok else 3
+
+
+def selftest():
+    import tempfile
+    import k31_collect as kcol
+    good = {k: True for k in FLAGS}
+    assert postfix_ok([good, good], 2)
+    assert not postfix_ok([good], 2) and not postfix_ok([], 0)
+    for k in FLAGS:
+        assert not postfix_ok([good, dict(good, **{k: False})], 2), k
+    with tempfile.TemporaryDirectory() as td:
+        L = kcol.Ledger(os.path.join(td, "l.json"), dict(checks=1000))
+        pth = os.path.join(td, "pf.json")
+        assert postfix_recover(L, pth, "0:9:0") is None
+        L.reserve("checks", "checks/pf/1", amount=90)
+        json.dump(dict(eid="checks/pf/1", steps=90, cases_arg="0:9:0",
+                       n_cases=1, cases=[dict(good, S0_eq_bank=False)]),
+                  open(pth, "w"))
+        L2 = kcol.Ledger(os.path.join(td, "l.json"), dict(checks=1000))
+        assert postfix_recover(L2, pth, "0:9:0") == 3      # settle + флаг
+        assert L2.spent("checks") == 90 and L2.is_done("checks/pf/1")
+        assert postfix_recover(L2, pth, "0:9:0") == 3      # повтор без расхода
+        assert L2.spent("checks") == 90
+        try:
+            postfix_recover(L2, pth, "0:0:0")
+            raise AssertionError("отчёт других случаев принят")
+        except SystemExit:
+            pass
+    print("самопроверка k33_diag пройдена: итог --post-fix требует все четыре "
+          "флага во всех случаях; отчёт до commit, повтор — settle без "
+          "двойного расхода, отчёт других случаев — отказ")
+    return 0
 
 
 def main():
@@ -201,11 +270,14 @@ def main():
     ap.add_argument("--cases", default="0:9:0,0:9:1,0:0:0,1:9:0")
     ap.add_argument("--out", default=OUT)
     ap.add_argument("--post-fix", action="store_true")
+    ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
+    if a.selftest:
+        return selftest()
     import k33_protocol as kp
     specs = [tuple(int(v) for v in s.split(":")) for s in a.cases.split(",")]
     if a.post_fix:
-        return post_fix(specs, kp)
+        return post_fix(specs, kp, a.cases)
     L = kp.ledger()
     eid = f"checks/diag_bank/{int(time.time())}"
     L.reserve("checks", eid, amount=len(specs) * len(TRACES) * kb.WAIT)
