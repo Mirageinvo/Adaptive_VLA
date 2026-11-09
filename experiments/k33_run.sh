@@ -93,11 +93,13 @@ COMMON0 () {   # DEV
 }
 arm_args () { $PY -c "import sys; sys.path.insert(0,'experiments'); import k33_policy as p; print(' '.join(p.k9h_args('$1')))"; }
 k26_plan () { $PY -c "import sys; sys.path.insert(0,'experiments'); import k33_policy as p; print(p.k26_plan_path('$1'))"; }
-gpu_free () {   # DEV
-  local idx="${1#cuda:}" used
+gpu_free () {   # DEV; порог занятой памяти — K33_GPU_MAX_MB (2048 по умолчанию)
+  local idx="${1#cuda:}" used util max="${K33_GPU_MAX_MB:-2048}"
   used="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$idx" 2>/dev/null | tr -d ' ')"
+  util="$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits -i "$idx" 2>/dev/null | tr -d ' ')"
   [ -n "$used" ] || { echo "ОТКАЗ: nvidia-smi не отвечает для $1"; return 3; }
-  [ "$used" -le 2048 ] || { echo "ОТКАЗ: на $1 занято $used МиБ"; return 3; }
+  echo "    $1: занято $used МиБ, загрузка ${util:-?}% (порог $max МиБ)"
+  [ "$used" -le "$max" ] || { echo "ОТКАЗ: на $1 занято $used МиБ > $max"; return 3; }
 }
 disk_wait () {   # ждать места до K33_WAIT_MIN (720) минут; чужое не удаляется
   local need="${K33_DISK_MB:-3000}" waited=0 free
@@ -229,7 +231,7 @@ case "$MODE" in
     $EV gates --plan "$PLAN" || finish 3; gpu_free "$DEV" || finish 3
     run_phase sr "$DEV" || finish 3; $EV progress --plan "$PLAN"; finish 0 ;;
   analyze) $PY experiments/k33_analyze.py; finish $? ;;
-  latency) DEV="${ARG2:-cuda:0}"; gpu_free "$DEV" || { echo "    latency_pending: карта занята"; finish 3; }
+  latency) DEV="${ARG2:-cuda:0}"; K33_GPU_MAX_MB=2048 gpu_free "$DEV" || { echo "    latency_pending: карта занята"; finish 3; }
     $PY experiments/k33_latency.py --device "$DEV"; finish $? ;;
   eval)
     M="${ARG2:?нужна машина A|B}"; DEV="${3:-cuda:0}"
