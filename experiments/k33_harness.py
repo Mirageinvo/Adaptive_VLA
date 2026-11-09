@@ -117,6 +117,9 @@ def install_planned(argv, plan_path, arm, debug, mode, space, bank_dir):
     install(argv, mode, space, bank_dir)
     kp.install_arm(arm, plan["arms"][arm]["source"], ke.sha(plan_path),
                    cell["debug"])
+    if ke.wants_bsnap(arm, mode, cell["space"]):
+        out = str(h16.arg(argv, "--out")).replace("{i0}", str(cell["start"]))
+        kp.install_b_snapshot(out)
 
 
 def selftest():

@@ -44,15 +44,24 @@
 bash experiments/k33_run.sh eval A cuda:0
 ```
 selftest -> plan A -> legacy-smoke 6 рук (t0/t8 i30, старый путь против
-адаптера, побитово) -> dev 50 сцен × 6 рук -> холодные повторы dev t0/6/8 ->
+адаптера, побитово) -> dev 50 сцен × 6 рук (у B — контрольный снимок
+токены -> decode -> команды) -> холодные повторы dev t6/t8 × 6 рук ->
 прогноз -> гейты -> SR (продолжается с места при повторе).
+Checks: 96 блоков на A (предел машины 331 700 с прежним расходом), 6 на B
+(18 300). Отвергнутый блок — карантин и маркер reports/k33/rejected/:
+новая попытка той же ячейки только по решению.
 
 Машина B (cds2), после завершения K-32 и переноса банка/источников:
 ```
 bash experiments/k33_run.sh eval B cuda:0
 ```
-plan B (контракт обязан совпасть с A) -> dev t0/6/8 × 6 рук (перенос) ->
-прогноз -> гейты -> SR.
+plan B (контракт обязан совпасть с A) -> строгий перенос: dev t0 × 6 рук,
+побитово против dev-блоков A -> прогноз -> гейты (свои и A) -> SR.
+На cds2 до этого перенести и сверить по SHA: банк v2 (data/k33/bank,
+reports/k33/bank_manifest.json, bank_check.json), reports/k33/plan_A.json,
+gate_{legacy,dev,repeat}_A.json и блоки reports/k33/{legacy_cur,legacy_new,
+dev,repeat}/A, планы и чекпойнты K-26 (reports/k26, data/k26), подготовку
+K-21, допуск barcache, снимок BAR.
 
 Анализ (на A, после копирования `reports/k33/plan_B.json` и `reports/k33/sr/B`):
 ```

@@ -23,6 +23,8 @@ import json
 import os
 import sys
 
+import numpy as np
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
@@ -92,8 +94,10 @@ def source_problems(arm, src):
             if int(bu) != int(spec["best_update"]):
                 p.append(f"{arm}: шаг best {spec['best_update']} ≠ отчёту {bu}")
         for f, s_ in plan["code"].items():
+            # план K-26 хранит 12-символьные SHA кода (k21_protocol.sha);
+            # чекпойнт и отчёт обучения — полные (full_sha)
             q = os.path.join(HERE, f)
-            if not os.path.exists(q) or sha(q) != s_:
+            if not os.path.exists(q) or pp.sha(q) != s_:
                 p.append(f"{arm}: код K-26 {f} изменён")
         for k in ("ckpt_sha1", "weights_hash", "best_update", "arch", "seed",
                   "prep_id"):
@@ -192,6 +196,89 @@ def install_arm(arm, src, plan_sha1, debug):
     k15f_policy.build_arm = build
 
 
+def bsnap_path(json_path):
+    return json_path[:-5] + ".bsnap.npz"
+
+
+def install_b_snapshot(json_path):
+    """Рука B в development: контрольный снимок первого вызова блока —
+    токены generate и официальный decode процессора по этим же токенам.
+    Генерация не меняется: обёртка вызывает исходный generate и возвращает
+    его результат; decode — тот же, что в проверке сборки K-9h. Снимок
+    пишется атомарно при выходе процесса (после JSON блока)."""
+    import atexit
+    import joint12_vla
+    import utils
+    st = dict(proc=None, toks=None, dec=None)
+    orig_make = joint12_vla.make_joint12_class
+    orig_proc = utils.VisionLanguageActionProcessor.from_pretrained
+
+    def make(base):
+        cls = orig_make(base)
+
+        class Rec(cls):
+            def generate(self, *a, **kw):
+                toks = super().generate(*a, **kw)
+                if st["toks"] is None:
+                    t = toks.detach().cpu().numpy()
+                    st["toks"] = t
+                    # как в проверке сборки K-9h: decode(...)[0] —
+                    # действия [B, 20, D] (второй элемент — маска)
+                    st["dec"] = np.asarray(
+                        st["proc"].action_processor.decode(t.tolist())[0],
+                        np.float64)
+                return toks
+        Rec.__name__ = cls.__name__
+        return Rec
+
+    def proc_fp(*a, **kw):
+        st["proc"] = orig_proc(*a, **kw)
+        return st["proc"]
+    joint12_vla.make_joint12_class = make
+    utils.VisionLanguageActionProcessor.from_pretrained = proc_fp
+
+    def save():
+        if st["toks"] is None or not os.path.exists(json_path):
+            return
+        out = bsnap_path(json_path)
+        tmp = out + f".tmp.{os.getpid()}"
+        with open(tmp, "wb") as fh:
+            np.savez(fh, tokens=st["toks"], decoded=st["dec"])
+        os.replace(tmp, out)
+    atexit.register(save)
+
+
+def bsnap_problems(json_path, z, scale, horizon=8, tol=1e-3):
+    """Снимок B: токены [5, 48] целые; команды = официальный decode с
+    масштабом и знаком схвата харнесса = исполненные действия первого
+    вызова (до завершения среды); допуск — допуск тождества сборки K-9h
+    (1e-3 в нормированной шкале)."""
+    f = bsnap_path(json_path)
+    if not os.path.exists(f):
+        return ["B: нет контрольного снимка токены -> decode -> команды"]
+    w = np.load(f)
+    T, X = np.asarray(w["tokens"]), np.asarray(w["decoded"], np.float64)
+    A = np.asarray(z["actions"], np.float64)
+    p = []
+    if T.ndim != 2 or T.shape[0] != A.shape[1] or T.shape[1] != 48 or \
+            not np.issubdtype(T.dtype, np.integer):
+        return [f"B: токены формы {T.shape} {T.dtype}"]
+    if X.ndim != 3 or X.shape[0] != T.shape[0] or X.shape[2] < 7 or \
+            not np.isfinite(X).all():
+        return [f"B: decode формы {X.shape}"]
+    cmd = X[:, :horizon, :7].copy()
+    cmd[..., :-1] = cmd[..., :-1] * scale[:-1]
+    cmd[..., -1] = -cmd[..., -1]
+    ds = np.asarray(z["done_step"])
+    for b in range(A.shape[1]):
+        end = min(horizon, int(ds[b]) + 1 if int(ds[b]) >= 0 else horizon)
+        lim = tol * np.maximum(np.abs(np.r_[scale[:-1], 1.0]), 1.0)
+        if not np.all(np.abs(A[:end, b] - cmd[b, :end]) <= lim + 1e-6):
+            p.append(f"B: среда {b}: исполненные действия первого вызова ≠ "
+                     f"decode токенов")
+    return p
+
+
 def joint_problems(arm, d, src, plan_sha1, debug):
     """Метаданные руки в JSON блока K-9h."""
     a = ARMS[arm]
@@ -240,6 +327,45 @@ def journal_problems(arm, z, bounds, debug):
     return p
 
 
+def source_regression():
+    """Источник T/F в настоящем формате плана K-26: SHA кода — 12 символов
+    (k21_protocol.sha), чекпойнт и отчёт — полные. Неизменённый источник
+    принимается; изменение кода, чекпойнта, отчёта или шага best — отказ."""
+    import tempfile
+    import k21_protocol as pp
+    with tempfile.TemporaryDirectory() as td:
+        ck = os.path.join(td, "best.pt")
+        open(ck, "wb").write(b"weights")
+        tr = os.path.join(td, "train.json")
+        json.dump(dict(best_sha1=pp.full_sha(ck), best_weights_hash="w1",
+                       best_update=40), open(tr, "w"))
+        files = ("k26_policy.py", "k26_model.py", "k21_main_policy.py")
+        spec = dict(arch="parents_attn24", seed=0, ckpt=ck,
+                    ckpt_sha1=pp.full_sha(ck), weights_hash="w1",
+                    best_update=40, val_L=1.0, prep_id="P", train_report=tr,
+                    train_report_sha1=pp.full_sha(tr), router={})
+        plan = dict(kind="k26_plan", train_seed=0, mode="parents_attn24",
+                    specs={"parents_attn24_s0": spec},
+                    code={f: pp.sha(os.path.join(HERE, f)) for f in files})
+        assert all(len(v) == 12 for v in plan["code"].values())
+        pl = os.path.join(td, "plan.json")
+        json.dump(plan, open(pl, "w"))
+        src = dict(k26_plan=pl, k26_plan_sha1=sha(pl), spec=dict(spec),
+                   content={})
+        assert source_problems("T0", src) == [], source_problems("T0", src)
+        bad = dict(plan, code=dict(plan["code"], **{files[0]: "0" * 12}))
+        json.dump(bad, open(pl, "w"))
+        assert source_problems("T0", dict(src, k26_plan_sha1=sha(pl)))
+        json.dump(plan, open(pl, "w"))
+        assert source_problems("T0", dict(src, spec=dict(spec,
+                                                          best_update=39)))
+        json.dump(dict(json.load(open(tr)), best_update=41), open(tr, "w"))
+        assert source_problems("T0", dict(src, spec=dict(
+            spec, train_report_sha1=pp.full_sha(tr))))
+        open(ck, "wb").write(b"other")
+        assert source_problems("T0", src)
+
+
 def selftest():
     assert set(ORDER0) == set(ARMS) and len(ORDER0) == 6
     assert k26_plan_path("T1") == "reports/k26/plan_s1_parents_attn24.json"
@@ -253,6 +379,27 @@ def selftest():
         "flat_attn24_s1", "fullbar", "fullbar_cached"}
     d = dict(joint=dict(label="x"))
     assert joint_problems("B", d, {}, "p", False) == []
+    source_regression()
+    # снимок B: decode с масштабом и знаком = исполненным; порча — отказ
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        jp = os.path.join(td, "t0_i0.json")
+        scale = np.array([0.9, 0.9, 0.9, 0.3, 0.3, 0.3, 1.0])
+        X = np.random.default_rng(0).uniform(-1, 1, (5, 20, 7))
+        A = np.zeros((12, 5, 7), np.float32)
+        A[:8] = (np.concatenate([X[:, :8, :6] * scale[:6], -X[:, :8, 6:]],
+                                -1)).transpose(1, 0, 2)
+        z = dict(actions=A, done_step=np.array([-1, 3, -1, -1, 11]))
+        assert bsnap_problems(jp, z, scale)                  # нет снимка
+        np.savez(bsnap_path(jp), tokens=np.zeros((5, 48), np.int64),
+                 decoded=X)
+        assert bsnap_problems(jp, z, scale) == []
+        A2 = A.copy()
+        A2[2, 0, 0] += 0.01
+        assert bsnap_problems(jp, dict(z, actions=A2), scale)
+        A3 = A.copy()
+        A3[5, 1, 0] += 0.5                                   # после done 3
+        assert bsnap_problems(jp, dict(z, actions=A3), scale) == []
     assert joint_problems("BC", d, dict(admission=dict(
         barcache_sha1="a", equivalence="e")), "p", False)
     print("самопроверка k33_policy пройдена: шесть рук (T0/F0/T1/F1 из "

@@ -115,8 +115,8 @@ run_cell () {   # фаза рука задача блок режим space debug
   if [ -f "$F" ]; then $EV block --op finish $ARGS >/dev/null || { $EV block --op finish $ARGS; return 3; }; return 0; fi
   disk_wait || return 3
   mkdir -p "$D0"
-  $EV block --op reserve $ARGS || return 3
   t0=$(date +%s.%N)
+  $EV block --op reserve $ARGS || return 3
   echo "    $PH $A t$T i$S — $(date '+%H:%M:%S')"
   if [ "$PH" = legacy_cur ]; then
     case "$A" in
@@ -146,15 +146,23 @@ run_cell () {   # фаза рука задача блок режим space debug
     return 3
   fi
   grep -E "успех [0-9]/5" "$D0/t${T}_i${S}.log" | tail -n 1
-  printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$PH" "$A" "$T" "$S" "$t0" "$(date +%s.%N)" >> "reports/k33/timing_${MACH}.tsv"
   $EV block --op finish $ARGS || return 3
+  # время всей ячейки: резерв, сверка источников, загрузка модели, раскатка,
+  # проверка блока
+  printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$PH" "$A" "$T" "$S" "$t0" "$(date +%s.%N)" >> "reports/k33/timing_${MACH}.tsv"
 }
 run_phase () {   # фаза DEV
-  local PH="$1" DEV="$2" c A T S MD SP DB
-  for c in $($EV cells --plan "$PLAN" --phase "$PH"); do
-    IFS=: read -r A T S MD SP DB <<< "$c"
-    run_cell "$PH" "$A" "$T" "$S" "$MD" "$SP" "$DB" "$DEV" || return 3
-  done
+  local PH="$1" DEV="$2" out n want c A T S MD SP DB
+  # очередь — отдельной командой с проверкой кода и полноты (пустая или
+  # усечённая очередь — отказ, а не «успех на нуле блоков»)
+  out="$($EV cells --plan "$PLAN" --phase "$PH")" || { echo "$out"; echo "ОТКАЗ: очередь фазы $PH"; return 3; }
+  want="$(printf '%s\n' "$out" | sed -n '1s/^#//p')"
+  n="$(printf '%s\n' "$out" | tail -n +2 | grep -c .)"
+  [ -n "$want" ] && [ "$want" -gt 0 ] && [ "$n" = "$want" ] || { echo "ОТКАЗ: очередь фазы $PH: $n из ${want:-?}"; return 3; }
+  echo "    фаза $PH: ячеек $n"
+  while IFS=: read -r A T S MD SP DB; do
+    run_cell "$PH" "$A" "$T" "$S" "$MD" "$SP" "$DB" "$DEV" < /dev/null || return 3
+  done < <(printf '%s\n' "$out" | tail -n +2)
 }
 gates_a () {   # DEV
   echo "=== ЭТАП legacy-smoke 6 рук (t0/t8 i30: старый путь и адаптер)"

@@ -55,8 +55,10 @@ EP_CAP = 610                         # 600 управляющих + 10 ожид�
 BLOCK_CAP = 5 * EP_CAP
 LEGACY = ((0, 30), (8, 30))
 DEV_START = 0
-REPEAT_TASKS = (0, 6, 8)
-PORT_TASKS = (0, 6, 8)               # перенос на B: dev этих задач
+REPEAT_TASKS = (6, 8)                # холодные повторы dev на A
+PORT_TASKS = (0,)                    # строгий перенос на B: dev t0
+CHECKS_LIMIT = dict(A=331_700, B=18_300)   # с прежним расходом машины
+REJECTED = "reports/k33/rejected"
 PHASES = ("legacy_cur", "legacy_new", "dev", "repeat", "port", "sr")
 STATS = dict(alpha=0.05, holm=2, boot_n=100_000, boot_seed=33011,
              ni_margin=0.03, ni_tail=0.05 / 8, ni_family=8,
@@ -165,11 +167,37 @@ def eid(plan, phase, arm, task, start):
 
 def limits(m):
     n_sr = len(sr_queue(m))
-    return dict(sr=n_sr * BLOCK_CAP,
+    return dict(sr=n_sr * BLOCK_CAP, checks=CHECKS_LIMIT[m],
                 checks_new=(len(cells(m, "legacy_cur")) +
                             len(cells(m, "legacy_new")) +
                             len(cells(m, "dev")) + len(cells(m, "repeat")) +
                             len(cells(m, "port"))) * BLOCK_CAP)
+
+
+def wants_bsnap(arm, mode, space):
+    """Контрольный снимок B (токены -> decode -> команды) — в development."""
+    return arm == "B" and mode == "bank" and space == 0
+
+
+def schedule_problems(plan):
+    """Ячейки, очередь и лимиты плана = расписанию из кода для его машины;
+    ни одна обязательная фаза не пуста."""
+    m = plan.get("machine")
+    if m not in MACHINES:
+        return [f"машина {m}"]
+    p = []
+    for ph in PHASES:
+        want = [list(x) for x in cells(m, ph)]
+        if plan.get("cells", {}).get(ph) != want:
+            p.append(f"ячейки {ph} ≠ расписанию машины {m}")
+    if plan.get("queue_sr") != [list(x) for x in sr_queue(m)]:
+        p.append("очередь SR ≠ расписанию")
+    if plan.get("limits") != limits(m):
+        p.append("лимиты ≠ расписанию")
+    need = (("legacy_cur", "legacy_new", "dev", "repeat", "sr") if m == "A"
+            else ("port", "sr"))
+    p += [f"фаза {ph} пуста" for ph in need if not plan.get("cells", {}).get(ph)]
+    return p
 
 
 # --- план ----------------------------------------------------------------------------
@@ -245,6 +273,7 @@ def plan_problems(plan, arms=None):
     p = []
     if plan.get("kind") != KIND:
         return ["не план K-33"]
+    p += schedule_problems(plan)
     for f, s_ in plan["code"].items():
         q = os.path.join(HERE, f)
         if not os.path.exists(q) or sha(q) != s_:
@@ -345,6 +374,9 @@ def block_problems(plan, plan_file, phase, arm, task, start, path=None):
     mode, space = phase_mode(phase)
     if mode == "bank":
         p += bank_parity(space, task, start, d["episodes"])
+    if wants_bsnap(arm, mode, space):
+        import k15h_protocol as hpc
+        p += kp.bsnap_problems(path, z, hpc.harness_scale())
     return p
 
 
@@ -355,6 +387,15 @@ def block_actual(path):
     if any(int(e["env_steps"]) != steps for e in eps) or len(eps) != 5:
         raise SystemExit(f"{path}: env_steps эпизодов различаются")
     return len(eps) * (steps + int(d.get("waiting_steps", 10)))
+
+
+def reject_path(e):
+    return os.path.join(REJECTED, e.replace("/", "__") + ".json")
+
+
+def mark_rejected(e, reasons, q):
+    save_json(reject_path(e), dict(eid=e, reasons=reasons, quarantine=q,
+                                   time=time.strftime("%Y-%m-%dT%H:%M:%S")))
 
 
 def quarantine(path):
@@ -379,13 +420,33 @@ def scope_of(phase):
 def txn_reserve(L, plan, phase, arm, task, start):
     e = eid(plan, phase, arm, task, start)
     path = block_path(plan["machine"], phase, arm, task, start)
+    if os.path.exists(reject_path(e)):
+        raise SystemExit(f"{e}: результат был отвергнут ({reject_path(e)}) — "
+                         f"технический стоп; новая попытка только по решению")
     if os.path.exists(path):
         raise SystemExit(f"{path}: результат уже есть — нужен finish")
     if L.is_done(e):
         raise SystemExit(f"{e}: учтён, но результата нет")
-    lim = plan["limits"]["sr"] if phase == "sr" else None
+    if plan["machine"] == "B":
+        pr_ = contract_ab_problems(plan)
+        if pr_:
+            raise SystemExit("; ".join(pr_))
+    lim = plan["limits"]["sr"] if phase == "sr" else plan["limits"]["checks"]
     L.reserve(scope_of(phase), e, amount=BLOCK_CAP, limit=lim)
     return e
+
+
+def contract_ab_problems(plan):
+    """B исполняет только при плане A того же контракта."""
+    pa = plan_path("A")
+    if not os.path.exists(pa):
+        return ["нет плана A (reports/k33/plan_A.json) для сверки контракта"]
+    a = json.load(open(pa, encoding="utf-8"))
+    p = schedule_problems(a)
+    if a.get("contract_fp") != plan["contract_fp"] or \
+            contract_of(a) != a.get("contract_fp"):
+        p.append("контракт B ≠ контракту A")
+    return p
 
 
 def txn_finish(L, plan, plan_file, phase, arm, task, start):
@@ -393,11 +454,15 @@ def txn_finish(L, plan, plan_file, phase, arm, task, start):
     сверка при уже учтённом; чужое состояние журнала — отказ."""
     e = eid(plan, phase, arm, task, start)
     path = block_path(plan["machine"], phase, arm, task, start)
+    if os.path.exists(reject_path(e)):
+        raise SystemExit(f"{e}: результат был отвергнут — технический стоп")
     pr_ = block_problems(plan, plan_file, phase, arm, task, start, path)
     if pr_:
         q = quarantine(path) if os.path.exists(path) else None
+        mark_rejected(e, pr_, q)
         raise SystemExit(f"{arm} t{task} i{start}: " + "; ".join(pr_[:4]) +
-                         (f" -> карантин {q}" if q else ""))
+                         (f" -> карантин {q}" if q else "") +
+                         " (маркер отказа сохранён)")
     actual = block_actual(path)
     done = L.d["done"].get(e)
     if done is not None and done.get("scope") != scope_of(phase):
@@ -431,14 +496,20 @@ def block_cmd(a):
         return 0 if os.path.exists(path) else 1
     act = txn_finish(L, plan, a.plan, a.phase, a.arm, a.task, a.start)
     sc = scope_of(a.phase)
-    lim = plan["limits"]["sr"] if sc == "sr" else None
+    lim = plan["limits"]["sr"] if sc == "sr" else plan["limits"]["checks"]
     print(f"    {a.arm} t{a.task} i{a.start}: проверен, шагов {act}; {sc} "
-          f"{L.spent(sc)}" + (f"/{lim}" if lim else ""))
+          f"{L.spent(sc)}/{lim}")
     return 0
 
 
 def cells_cmd(a):
     plan = json.load(open(a.plan, encoding="utf-8"))
+    pr_ = schedule_problems(plan)
+    if pr_:
+        raise SystemExit("расписание плана: " + "; ".join(pr_[:3]))
+    if not plan["cells"][a.phase]:
+        raise SystemExit(f"фаза {a.phase} пуста на машине {plan['machine']}")
+    print(f"#{len(plan['cells'][a.phase])}")
     for arm, t, s in plan["cells"][a.phase]:
         mode, space = phase_mode(a.phase)
         print(f"{arm}:{t}:{s}:{mode}:{space if space is not None else '-'}:"
@@ -471,9 +542,80 @@ def pair_problems(fa, fb, tag):
     return p
 
 
+GATES = dict(A=("legacy", "dev", "repeat"), B=("port",))
+GATE_PHASES = dict(legacy=("legacy_cur", "legacy_new"), dev=("dev",),
+                   repeat=("repeat",), port=("port",))
+
+
+def gate_path(tag, m):
+    return os.path.join(OUT, f"gate_{tag}_{m}.json")
+
+
+def block_files(path):
+    fs = [path, path[:-5] + ".actions.npz"]
+    if os.path.exists(kp.bsnap_path(path)):
+        fs.append(kp.bsnap_path(path))
+    return fs
+
+
+def expected_blocks(tag, m):
+    """JSON блоков, на которых стоит гейт (включая эталоны сравнения)."""
+    out = []
+    for ph in GATE_PHASES[tag]:
+        out += [block_path(m, ph, a, t, s) for a, t, s in cells(m, ph)]
+    if tag == "port":
+        out += [block_path("A", "dev", a, t, s) for a, t, s in cells(m, "port")]
+    return out
+
+
+def write_gate(tag, plan, plan_file, prob, extra=None):
+    m = plan["machine"]
+    blocks = {}
+    for f in expected_blocks(tag, m):
+        for q in (block_files(f) if os.path.exists(f) else []):
+            blocks[q] = sha(q)
+    rep = dict(tag=tag, machine=m, plan=os.path.abspath(plan_file),
+               plan_sha1=sha(plan_file), contract_fp=plan["contract_fp"],
+               bank_id=plan["bank"]["bank_id"],
+               cells={ph: [list(x) for x in cells(m, ph)]
+                      for ph in GATE_PHASES[tag]},
+               blocks=blocks, ok=not prob, problems=prob[:100],
+               time=time.strftime("%Y-%m-%dT%H:%M:%S"), **(extra or {}))
+    save_json(gate_path(tag, m), rep)
+    return rep
+
+
+def verify_gate(tag, m, plan, plan_file):
+    """Отчёт гейта этой машины и этого плана: ok, контракт, банк, SHA
+    плана, полный ожидаемый набор ячеек и неизменённые проверенные блоки."""
+    f = gate_path(tag, m)
+    if not os.path.exists(f):
+        return [f"нет отчёта гейта {tag} машины {m}"]
+    r = json.load(open(f, encoding="utf-8"))
+    p = []
+    if r.get("ok") is not True:
+        p.append(f"гейт {tag} {m} не пройден")
+    for k, v in (("machine", m), ("plan_sha1", sha(plan_file)),
+                 ("contract_fp", plan["contract_fp"]),
+                 ("bank_id", plan["bank"]["bank_id"])):
+        if r.get(k) != v:
+            p.append(f"гейт {tag} {m}: {k} не этого плана")
+    want = {ph: [list(x) for x in cells(m, ph)] for ph in GATE_PHASES[tag]}
+    if r.get("cells") != want or not any(want.values()):
+        p.append(f"гейт {tag} {m}: набор ячеек ≠ расписанию или пуст")
+    blocks = r.get("blocks") or {}
+    for q in expected_blocks(tag, m):
+        if q not in blocks:
+            p.append(f"гейт {tag} {m}: блок {q} не проверен")
+    for q, h in blocks.items():
+        if not os.path.exists(q) or sha(q) != h:
+            p.append(f"гейт {tag} {m}: {q} отсутствует или изменён")
+    return p
+
+
 def legacy_compare(a):
     plan = json.load(open(a.plan, encoding="utf-8"))
-    prob = []
+    prob = schedule_problems(plan)
     for arm, t, s in plan["cells"]["legacy_new"]:
         fc = block_path("A", "legacy_cur", arm, t, s)
         fn = block_path("A", "legacy_new", arm, t, s)
@@ -482,21 +624,22 @@ def legacy_compare(a):
                 plan, a.plan, ph, arm, t, s, f)]
         if os.path.exists(fc) and os.path.exists(fn):
             prob += pair_problems(fc, fn, f"{arm} t{t}")
-    rep = dict(ok=not prob, problems=prob, cells=plan["cells"]["legacy_new"])
-    save_json(os.path.join(OUT, "legacy6_compare.json"), rep)
+    rep = write_gate("legacy", plan, a.plan, prob)
+    n = len(plan["cells"]["legacy_new"])
     print("  legacy-smoke 6 рук: " + (
-        f"совпадение побитово ({len(rep['cells'])} блоков × 5: сцены, "
-        f"действия, исходы)" if not prob else "РАСХОЖДЕНИЕ: " +
-        "; ".join(prob[:4])))
-    return 0 if not prob else 3
+        f"совпадение побитово ({n} блоков × 5: сцены, действия, исходы)"
+        if rep["ok"] else "РАСХОЖДЕНИЕ: " + "; ".join(prob[:4])))
+    return 0 if rep["ok"] else 3
 
 
 def dev_check(a):
-    """Все dev-блоки (6 рук × 10 задач) проверены; сцены и pre-policy хеши
-    одинаковы у всех рук и = банку; SR — описательно."""
+    """Все блоки фазы проверены; сцены и pre-policy хеши одинаковы у всех
+    рук и = банку; SR — описательно. Для port (B) — строгое побитовое
+    совпадение с эталонными dev-блоками A (обязательны) и контракт = A."""
     plan = json.load(open(a.plan, encoding="utf-8"))
     ph = a.phase
-    prob, sr, hashes = [], {}, {}
+    prob = schedule_problems(plan)
+    sr, hashes = {}, {}
     for arm, t, s in plan["cells"][ph]:
         f = block_path(plan["machine"], ph, arm, t, s)
         prob += block_problems(plan, a.plan, ph, arm, t, s, f)
@@ -511,75 +654,83 @@ def dev_check(a):
     multi = [k for k, v in hashes.items() if len(v) != 1]
     if multi:
         prob.append(f"pre-policy хеши различаются между руками: {multi[:3]}")
-    rep = dict(phase=ph, ok=not prob, problems=prob[:50],
-               sr_descriptive={k: float(np.mean(v)) for k, v in sr.items()},
-               n={k: len(v) for k, v in sr.items()})
-    if ph == "port" and os.path.exists(os.path.join(OUT, "dev_check.json")):
-        rep["vs_A_dev"] = port_vs_dev(plan)
-    save_json(os.path.join(OUT, f"{ph}_check.json"), rep)
+    if not plan["cells"][ph]:
+        prob.append(f"фаза {ph} пуста")
+    extra = dict(sr_descriptive={k: float(np.mean(v)) for k, v in sr.items()},
+                 n={k: len(v) for k, v in sr.items()})
+    if ph == "port":
+        prob += contract_ab_problems(plan)
+        prob += port_problems(plan)
+    tag = "port" if ph == "port" else "dev"
+    rep = write_gate(tag, plan, a.plan, prob, extra)
     print(f"  {ph}: " + (f"блоков {len(plan['cells'][ph])}, все проверки "
                          f"пройдены; сцены рук совпадают; SR (описательно) "
                          + ", ".join(f"{k} {v:.2f}" for k, v in
-                                     rep["sr_descriptive"].items())
-                         if not prob else "ОТКАЗ: " + "; ".join(prob[:4])))
-    return 0 if not prob else 3
+                                     extra["sr_descriptive"].items())
+                         if rep["ok"] else "ОТКАЗ: " + "; ".join(prob[:4])))
+    return 0 if rep["ok"] else 3
 
 
-def port_vs_dev(plan):
-    """Перенос на B: те же dev-блоки A (если скопированы в dev/A) —
-    совпадение действий/исходов, описательно."""
-    out = {}
+def port_problems(plan):
+    """Перенос на B: эталонные dev-блоки A (скопированные, проверенные по
+    плану A) и блоки port B совпадают побитово (сцены, действия, исходы)."""
+    pa = plan_path("A")
+    if not os.path.exists(pa):
+        return ["нет плана A"]
+    plan_a = json.load(open(pa, encoding="utf-8"))
+    p = []
     for arm, t, s in plan["cells"]["port"]:
         fa = block_path("A", "dev", arm, t, s)
         fb = block_path("B", "port", arm, t, s)
-        if os.path.exists(fa) and os.path.exists(fb):
-            out[f"{arm}_t{t}"] = pair_problems(fa, fb, f"{arm} t{t}") or "равны"
-        else:
-            out[f"{arm}_t{t}"] = "нет блока A"
-    return out
+        if not os.path.exists(fa):
+            p.append(f"нет эталонного блока A {fa}")
+            continue
+        p += [f"эталон A: {x}" for x in block_problems(
+            plan_a, pa, "dev", arm, t, s, fa)]
+        if os.path.exists(fb):
+            p += pair_problems(fa, fb, f"перенос {arm} t{t}")
+    return p
 
 
 def repeat_compare(a):
     plan = json.load(open(a.plan, encoding="utf-8"))
-    prob = []
+    prob = schedule_problems(plan)
     for arm, t, s in plan["cells"]["repeat"]:
         fr = block_path("A", "repeat", arm, t, s)
         fd = block_path("A", "dev", arm, t, s)
         prob += [f"repeat: {x}" for x in block_problems(
             plan, a.plan, "repeat", arm, t, s, fr)]
-        if os.path.exists(fr) and os.path.exists(fd):
+        if not os.path.exists(fd):
+            prob.append(f"нет dev-блока {fd}")
+        elif os.path.exists(fr):
             prob += pair_problems(fd, fr, f"{arm} t{t}")
-    save_json(os.path.join(OUT, "repeat_compare.json"),
-              dict(ok=not prob, problems=prob))
-    print("  холодные повторы dev (t0/6/8 × 6 рук): " + (
-        "действия и исходы совпали побитово" if not prob else
-        "РАСХОЖДЕНИЕ: " + "; ".join(prob[:4])))
-    return 0 if not prob else 3
+    rep = write_gate("repeat", plan, a.plan, prob)
+    print(f"  холодные повторы dev ({'/'.join(f't{t}' for t in REPEAT_TASKS)}"
+          f" × 6 рук): " + ("действия и исходы совпали побитово" if rep["ok"]
+                           else "РАСХОЖДЕНИЕ: " + "; ".join(prob[:4])))
+    return 0 if rep["ok"] else 3
 
 
-def gates_problems(plan):
-    """Технические гейты до SR этой машины."""
-    need = (["legacy6_compare.json", "dev_check.json", "repeat_compare.json"]
-            if plan["machine"] == "A" else ["port_check.json"])
-    p = []
-    for f in need:
-        q = os.path.join(OUT, f)
-        if not os.path.exists(q) or not json.load(open(
-                q, encoding="utf-8")).get("ok"):
-            p.append(f"гейт {f} не пройден")
-    other = plan_path("A")
-    if plan["machine"] == "B":
-        if not os.path.exists(other):
-            p.append("нет плана A для сверки контракта")
-        elif json.load(open(other, encoding="utf-8"))["contract_fp"] != \
-                plan["contract_fp"]:
-            p.append("контракт B ≠ контракту A")
+def gates_problems(plan, plan_file):
+    """Технические гейты до SR машины: свои; для B — ещё гейты A по
+    скопированным плану, отчётам и блокам A и контракт = A."""
+    m = plan["machine"]
+    p = schedule_problems(plan)
+    for tag in GATES[m]:
+        p += verify_gate(tag, m, plan, plan_file)
+    if m == "B":
+        p += contract_ab_problems(plan)
+        pa = plan_path("A")
+        if os.path.exists(pa):
+            plan_a = json.load(open(pa, encoding="utf-8"))
+            for tag in GATES["A"]:
+                p += verify_gate(tag, "A", plan_a, pa)
     return p
 
 
 def gates_cmd(a):
     plan = json.load(open(a.plan, encoding="utf-8"))
-    p = gates_problems(plan) + plan_problems(plan)
+    p = gates_problems(plan, a.plan) + plan_problems(plan)
     print("  гейты SR: " + ("пройдены" if not p else "ОТКАЗ: " +
                             "; ".join(p[:4])))
     return 0 if not p else 3
@@ -637,6 +788,146 @@ def progress(a):
 
 
 # --- самопроверка ---------------------------------------------------------------------------
+def gates_regression():
+    """Гейты: пустой/чужой/неполный/изменённый отчёт — отказ; перенос без
+    эталона A или с расхождением — отказ; отвергнутый блок — стоп до
+    резерва; ячейки фазы получаются только по расписанию."""
+    import tempfile
+    import k31_collect as kcol
+    import k33_protocol as kpr
+    g = globals()
+    keep = dict(OUT=g["OUT"], REJECTED=g["REJECTED"], PLAN=g["PLAN"],
+                block_problems=g["block_problems"])
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            g.update(OUT=td, REJECTED=os.path.join(td, "rej"),
+                     PLAN=os.path.join(td, "plan_{m}.json"))
+            g["block_problems"] = lambda *aa, **kw: []
+
+            def mkplan(m, fp="C1"):
+                pl = dict(machine=m, contract_fp=fp,
+                          bank=dict(bank_id="bank1"),
+                          cells={ph: [list(x) for x in cells(m, ph)]
+                                 for ph in PHASES},
+                          queue_sr=[list(x) for x in sr_queue(m)],
+                          limits=limits(m))
+                f = plan_path(m)
+                save_json(f, pl)
+                return pl, f
+
+            def mkblock(f, acts=0.0, succ=True):
+                os.makedirs(os.path.dirname(f), exist_ok=True)
+                npz = f[:-5] + ".actions.npz"
+                np.savez(npz, actions=np.full((3, 5, 7), acts, np.float32))
+                json.dump(dict(actions_npz=os.path.basename(npz), episodes=[
+                    dict(init_hash="h", init_hash_full="f", action_sha1="a",
+                         env_steps=3, policy_calls=1, success=succ,
+                         success_step=1, done_step=1, own_steps=2,
+                         init_state_id=i) for i in range(5)]), open(f, "w"))
+            pa, fa = mkplan("A")
+            # гейт без блоков — отказ при проверке
+            write_gate("dev", pa, fa, [])
+            assert verify_gate("dev", "A", pa, fa)
+            for ph in ("dev",):
+                for arm, t, s_ in cells("A", ph):
+                    mkblock(block_path("A", ph, arm, t, s_))
+            write_gate("dev", pa, fa, [])
+            assert verify_gate("dev", "A", pa, fa) == []
+            # чужой контракт/банк/план — отказ
+            pa2 = dict(pa, contract_fp="C2")
+            assert verify_gate("dev", "A", pa2, fa)
+            assert verify_gate("dev", "A", dict(pa, bank=dict(bank_id="x")),
+                               fa)
+            # изменённый блок после гейта — отказ
+            f0 = block_path("A", "dev", *cells("A", "dev")[0])
+            mkblock(f0, acts=1.0)
+            assert verify_gate("dev", "A", pa, fa)
+            mkblock(f0)
+            write_gate("dev", pa, fa, [])
+            # отчёт с усечённым набором ячеек — отказ
+            r = json.load(open(gate_path("dev", "A")))
+            r["cells"]["dev"] = r["cells"]["dev"][:3]
+            save_json(gate_path("dev", "A"), r)
+            assert verify_gate("dev", "A", pa, fa)
+            write_gate("dev", pa, fa, [])
+            # нет гейтов legacy/repeat — SR A не допускается
+            assert gates_problems(pa, fa)
+            # перенос: нет эталона A — отказ; эталон есть и совпадает — ок;
+            # расхождение действий — отказ
+            pb, fb = mkplan("B")
+            for arm, t, s_ in cells("B", "port"):
+                mkblock(block_path("B", "port", arm, t, s_))
+            assert port_problems(pb) == []                 # эталоны dev A есть
+            fref = block_path("A", "dev", *cells("B", "port")[0])
+            os.rename(fref, fref + ".x")
+            assert port_problems(pb)
+            os.rename(fref + ".x", fref)
+            mkblock(block_path("B", "port", *cells("B", "port")[1]),
+                    acts=0.5)
+            assert port_problems(pb)
+            mkblock(block_path("B", "port", *cells("B", "port")[1]))
+            # контракт B ≠ A — отказ до резерва
+            g_contract = g["contract_of"]
+            g["contract_of"] = lambda plan_: plan_["contract_fp"]
+            assert contract_ab_problems(pb) == []
+            assert contract_ab_problems(dict(pb, contract_fp="C9"))
+            L = kcol.Ledger(os.path.join(td, "l.json"), kpr.CAPS)
+            t0_, a0_, s0_ = sr_queue("B")[0]
+            try:
+                txn_reserve(L, dict(pb, contract_fp="C9"), "sr", a0_, t0_,
+                            s0_)
+                raise AssertionError("B резервирует при чужом контракте")
+            except SystemExit as ex:
+                assert "контракт" in str(ex.code), ex.code
+            assert L.d["pending"] is None
+            txn_reserve(L, pb, "sr", a0_, t0_, s0_)       # тот же контракт
+            L._crash_pending()
+            # гейты B требуют и гейты A
+            write_gate("port", pb, fb, [])
+            assert gates_problems(pb, fb)
+            g["contract_of"] = g_contract
+            # маркер отказа: после карантина новый резерв той же ячейки —
+            # отказ (стоп), журнал не меняется
+            g["block_problems"] = lambda *aa, **kw: ["плохо"]
+            e = eid(pa, "dev", "B", 0, 0)
+            L.reserve("checks", e, amount=BLOCK_CAP)
+            fbad = block_path("A", "dev", "B", 0, 0)
+            mkblock(fbad)
+            try:
+                txn_finish(L, pa, fa, "dev", "B", 0, 0)
+                raise AssertionError("плохой блок принят")
+            except SystemExit:
+                pass
+            assert os.path.exists(reject_path(e)) and not os.path.exists(fbad)
+            h = json.dumps(L.d, sort_keys=True)
+            try:
+                txn_reserve(L, pa, "dev", "B", 0, 0)
+                raise AssertionError("повторный резерв отвергнутой ячейки")
+            except SystemExit:
+                pass
+            assert json.dumps(L.d, sort_keys=True) == h
+            # предел checks машины применяется при резерве
+            for arm, t, s_ in cells("B", "port"):
+                for q in block_files(block_path("B", "port", arm, t, s_)):
+                    os.remove(q)
+            L2 = kcol.Ledger(os.path.join(td, "l2.json"), kpr.CAPS)
+            pb2 = dict(pb, limits=dict(pb["limits"], checks=2 * BLOCK_CAP))
+            g["contract_of"] = lambda plan_: plan_["contract_fp"]
+            g["block_problems"] = lambda *aa, **kw: []
+            txn_reserve(L2, pb2, "port", "T0", 0, 0)
+            L2._crash_pending()
+            txn_reserve(L2, pb2, "port", "F0", 0, 0)
+            L2._crash_pending()
+            try:
+                txn_reserve(L2, pb2, "port", "BC", 0, 0)
+                raise AssertionError("предел checks машины не сработал")
+            except SystemExit:
+                pass
+            g["contract_of"] = g_contract
+        finally:
+            g.update(keep)
+
+
 def selftest():
     import tempfile
     import k31_collect as kcol
@@ -659,17 +950,29 @@ def selftest():
     assert task_order() == task_order() and sorted(task_order()) == \
         list(range(10))
     assert len(cells("A", "legacy_new")) == 12 and \
-        len(cells("A", "dev")) == 60 and len(cells("A", "repeat")) == 18 and \
-        cells("B", "dev") == [] and len(cells("B", "port")) == 18
+        len(cells("A", "dev")) == 60 and len(cells("A", "repeat")) == 12 and \
+        cells("B", "dev") == [] and len(cells("B", "port")) == 6
     assert debug_for("T0", "dev") and not debug_for("T0", "sr") and \
         not debug_for("B", "dev") and not debug_for("BC", "legacy_new")
     lim = limits("A")
-    assert lim["sr"] == 1800 * BLOCK_CAP and \
-        lim["checks_new"] == (24 + 60 + 18) * BLOCK_CAP
+    assert lim["sr"] == 1800 * BLOCK_CAP and lim["checks"] == 331_700 and \
+        lim["checks_new"] == (24 + 60 + 12) * BLOCK_CAP
+    assert limits("B")["checks_new"] == 6 * BLOCK_CAP == \
+        limits("B")["checks"]
+    assert lim["checks_new"] + limits("B")["checks_new"] == 311_100
+    assert wants_bsnap("B", "bank", 0) and not wants_bsnap("B", "bank", 1) \
+        and not wants_bsnap("BC", "bank", 0)
     # ячейки плана
     plan = dict(machine="A", cells={ph: [list(x) for x in cells("A", ph)]
                                     for ph in PHASES},
-                bank=dict(bank_id="abcdef0123456789"))
+                bank=dict(bank_id="abcdef0123456789"),
+                queue_sr=[list(x) for x in sr_queue("A")], limits=limits("A"))
+    assert schedule_problems(plan) == []
+    for ph in ("legacy_new", "dev", "repeat"):        # удалённые ячейки
+        bad = dict(plan, cells=dict(plan["cells"], **{ph: []}))
+        assert schedule_problems(bad), ph
+    assert schedule_problems(dict(plan, queue_sr=plan["queue_sr"][:-1]))
+    assert schedule_problems(dict(plan, limits=dict(lim, sr=1)))
     ok = dict(arm="T0", task=task_order()[0], start=0, mode="bank", space=1,
               debug=False)
     assert cell_problems(plan, ok) == []
@@ -695,10 +998,11 @@ def selftest():
     with tempfile.TemporaryDirectory() as td:
         g = globals()
         keep = dict(OUT=g["OUT"], block_problems=g["block_problems"],
-                    ledger_for=g["ledger_for"])
+                    ledger_for=g["ledger_for"], REJECTED=g["REJECTED"])
         L = kcol.Ledger(os.path.join(td, "l.json"), kpr.CAPS)
         try:
             g["OUT"] = td
+            g["REJECTED"] = os.path.join(td, "rejected")
             g["block_problems"] = lambda *aa, **kw: []
             g["ledger_for"] = lambda plan_: L
             pl = dict(plan, limits=dict(sr=2 * BLOCK_CAP))
@@ -746,6 +1050,7 @@ def selftest():
                 os.path.join(td, "quarantine"))
         finally:
             g.update(keep)
+    gates_regression()
     # сверка пар блоков
     with tempfile.TemporaryDirectory() as td:
         def wr(name, A, succ):
@@ -768,7 +1073,12 @@ def selftest():
           "сдвиг рук, 1800 блоков на машину), ячейки и debug по фазам, eid, "
           "паритет хешей банка, транзакция блока (settle без двойного учёта, "
           "лимит машины, авария, неучтённый результат — отказ, карантин), "
-          "побитовая сверка пар блоков")
+          "побитовая сверка пар блоков; расписание из кода (удалённые "
+          "ячейки, очередь, лимиты — отказ); гейты привязаны к контракту, "
+          "банку, плану и SHA блоков (пустой, чужой, усечённый, изменённый "
+          "— отказ); B — только при контракте A и гейтах A; перенос строгий "
+          "(нет эталона A или расхождение — отказ); маркер отказа "
+          "останавливает новый резерв; предел checks машины")
     return 0
 
 
