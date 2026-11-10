@@ -552,153 +552,370 @@ def fitcheck(a):
         del mod, bar
         torch.cuda.empty_cache()
     rep["ok"] = all(v["ok"] for v in rep.values() if isinstance(v, dict))
-    rep["code"] = {f: sha(os.path.join(HERE, f)) for f in CODE}
+    rep["contract"] = stage_contract("fitcheck", a.device, a.micro, a.dtype)
     os.makedirs("reports/k34", exist_ok=True)
-    json.dump(rep, open("reports/k34/fitcheck.json", "w", encoding="utf-8"),
+    json.dump(rep, open(FITCHECK, "w", encoding="utf-8"),
               ensure_ascii=False, indent=1, default=float)
     return 0 if rep["ok"] else 3
 
 
+# --- контракты этапов и проверка готовых результатов -----------------------------------
+REAL_CHECK = "reports/k34/real_check.json"
+FITCHECK = "reports/k34/fitcheck.json"
+RC_KEYS = ("B1_legacy_equal", "B5_legacy_equal", "B1_d8_vs_all",
+           "B1_d16_vs_all", "B5_d8_vs_all", "B5_d16_vs_all", "ms_B5",
+           "main_step", "save_load", "peak_gb", "mem_before_load_gb",
+           "n_new", "source")
+
+
+def code_now():
+    return {f: sha(os.path.join(HERE, f)) for f in CODE
+            if os.path.exists(os.path.join(HERE, f))}
+
+
+def source_contract():
+    if not os.path.exists(PREPARE):
+        raise SystemExit(f"нет {PREPARE}")
+    p = json.load(open(PREPARE, encoding="utf-8"))
+    return {k: {kk: v["spec"][kk] for kk in ("ckpt_sha1", "weights_hash",
+                                              "best_update")}
+            for k, v in sorted(p["sources"].items())}
+
+
+def stage_contract(kind, device=None, micro=None, dtype=None):
+    """То, что определяет результат этапа: подготовка и источники, код,
+    точность, microbatch (fitcheck/обучение), устройство (GPU-проверки)."""
+    c = dict(kind=kind, prepare_sha1=sha(PREPARE), sources=source_contract(),
+             code=code_now(), dtype=dtype)
+    if kind in ("fitcheck", "train"):
+        c["micro"] = micro
+    if kind in ("real_check", "fitcheck") and device is not None:
+        import torch
+        c["device_name"] = torch.cuda.get_device_name(torch.device(device))
+    return c
+
+
+def real_check_problems(r, want):
+    p = []
+    if r.get("contract") != want:
+        diff = sorted(k for k in set(want) | set(r.get("contract") or {})
+                      if want.get(k) != (r.get("contract") or {}).get(k))
+        p.append(f"контракт real-check другой {diff}")
+    if r.get("problems") != []:
+        p.append("real-check не пройден")
+    res = r.get("results") or {}
+    tags = [f"{m}_s{s}" for m in MODES for s in SEEDS]
+    for t in tags:
+        x = res.get(t)
+        if not isinstance(x, dict):
+            p.append(f"нет результата {t}")
+            continue
+        miss = [k for k in RC_KEYS if k not in x]
+        if miss:
+            p.append(f"{t}: нет {miss}")
+            continue
+        if not (x["B1_legacy_equal"] and x["B5_legacy_equal"]):
+            p.append(f"{t}: legacy ≠")
+        for k in ("B1_d8_vs_all", "B1_d16_vs_all", "B5_d8_vs_all",
+                  "B5_d16_vs_all"):
+            e = x[k]
+            if not (e.get("arm", 1) <= 1e-6 and e.get("grip", 1) <= 1e-5):
+                p.append(f"{t}: {k} {e}")
+        ms = x["main_step"]
+        if not (ms.get("finite") and ms.get("heads8") and ms.get("heads16")
+                and ms.get("frozen_unchanged") and all(
+                    (ms.get("changed") or {}).values()) and
+                set(ms.get("changed") or {}) == {"expert", "lora", "new",
+                                                 "heads"}):
+            p.append(f"{t}: main-шаг {ms}")
+        if x["save_load"] is not True:
+            p.append(f"{t}: save/load различающихся голов")
+    return p
+
+
+def fitcheck_problems(r, want):
+    p = []
+    if r.get("contract") != want:
+        p.append("контракт fitcheck другой")
+    if r.get("ok") is not True:
+        p.append("fitcheck не пройден")
+    for m in MODES:
+        x = r.get(m)
+        dr = {str(k): v for k, v in ((x or {}).get("drop") or {}).items()} \
+            if isinstance(x, dict) else {}
+        if not isinstance(x, dict) or x.get("ok") is not True or \
+                set(dr) != {"8", "16"} or not all(
+                    np.isfinite(v) and v >= FIT_DROP for v in dr.values()) \
+                or x.get("source_unchanged") is not True or \
+                x.get("out24_unchanged") is not True:
+            p.append(f"fitcheck {m}: нет полного пройденного результата")
+    return p
+
+
+def check_fresh(a):
+    """Готовый отчёт пройден ровно тем же контрактом и полон -> 0."""
+    if a.kind == "real_check":
+        path, fn = REAL_CHECK, real_check_problems
+        want = stage_contract("real_check", a.device, dtype="float16")
+    else:
+        path, fn = FITCHECK, fitcheck_problems
+        if a.micro is None:
+            import k26_train as k26t
+            a.micro = k26t.decided_micro() or 8
+        want = stage_contract("fitcheck", a.device, a.micro, a.dtype)
+    if not os.path.exists(path):
+        print(f"  {path}: нет")
+        return 1
+    pr = fn(json.load(open(path, encoding="utf-8")), want)
+    print(f"  {path}: " + ("пройден тем же контрактом" if not pr else
+                           "пересчитать — " + "; ".join(pr[:3])))
+    return 0 if not pr else 1
+
+
+def train_problems(seed, mode, micro, dtype):
+    """Готовое обучение: отчёт, best.pt и их контракт = текущим."""
+    rp = report_path(seed, mode)
+    ck = os.path.join(run_dir(seed, mode), "best.pt")
+    if not os.path.exists(rp) or not os.path.exists(ck):
+        return ["нет отчёта или best.pt"]
+    r = json.load(open(rp, encoding="utf-8"))
+    p = []
+    if sha(ck) != r.get("best_sha1"):
+        p.append("best.pt ≠ отчёту")
+    c = r.get("config") or {}
+    src = source_contract().get(f"{mode}_s{seed}")
+    for k, v in (("mode", mode), ("seed", seed), ("micro", micro),
+                 ("dtype", dtype), ("code", code_now()),
+                 ("architecture", k34m.ARCH[mode])):
+        if c.get(k) != v:
+            p.append(f"конфигурация {k} ≠ текущей")
+    if c.get("source") != src:
+        p.append("источник обучения ≠ подготовке")
+    if (r.get("updates") or {}).get("main") != MAIN_UPDATES:
+        p.append("обучение не дошло до 4000 main")
+    return p
+
+
+def train_valid(a):
+    if a.micro is None:
+        import k26_train as k26t
+        a.micro = k26t.decided_micro()
+    pr = train_problems(a.seed, a.mode, a.micro, a.dtype)
+    print(f"  обучение {a.mode} s{a.seed}: " + ("готово, контракт тот же"
+                                               if not pr else
+                                               "; ".join(pr[:3])))
+    return 0 if not pr else 1
+
+
+def trained_ckpt_problems(ck, mode, seed, spec, code=None):
+    """Checkpoint K-34 перед использованием: архитектура, seed, источник,
+    отпечаток, контракт кода = текущему."""
+    c = ck.get("config") or {}
+    p = []
+    if c.get("architecture") != k34m.ARCH[mode] or int(c.get("seed", -1)) != \
+            seed:
+        p.append("архитектура или seed")
+    if (c.get("source") or {}).get("ckpt_sha1") != \
+            spec["source"]["ckpt_sha1"]:
+        p.append("источник")
+    if ck.get("weights_hash") != spec.get("weights_hash"):
+        p.append("отпечаток ≠ плану")
+    if c.get("code") != (code if code is not None else code_now()):
+        p.append("контракт кода checkpoint ≠ текущему")
+    if c.get("exits") != list(k34m.EXITS) or c.get("loss") != LOSS:
+        p.append("выходы или потеря")
+    return p
+
+
 # --- real-check --------------------------------------------------------------------------
-def real_check(a):
-    """Настоящий BAR: источник K-26 (рука k26_policy) против выхода 24 нового
-    экземпляра — побитово; 8/16 усечённые = forward_all; счётчики; один
-    main-шаг; замороженное не меняется; память/скорость."""
-    import torch
+def _gpu_free(torch):
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def _legacy_outputs(torch, D, rows, tag, spec, device):
+    """Исходная рука K-26 -> CPU-выходы B = 1 и 5; модель освобождается
+    внутри функции."""
+    import k21_data as d21
+    import k26_policy as kp26
+    dev = torch.device(device)
+    ref, bar, _ck, _p = kp26.load_policy(torch, tag, spec, device)
+    out = {}
+    with torch.no_grad():
+        for B in (1, 5):
+            batch, po, st, _t, _v = d21.make_batch(D, rows[:B], bar, dev)
+            with torch.autocast("cuda", dtype=torch.float16):
+                o = ref(batch, po, st)
+            out[B] = (o["arm"].float().cpu(), o["grip_logit"].float().cpu())
+    return out
+
+
+def _new_checks(torch, D, rows, mode, seed, spec, device, ref_out):
+    """Новый экземпляр K-34: побитовая сверка, усечение, счётчики,
+    скорость, main-шаг, сохранение/загрузка различающихся голов. Только
+    CPU-результаты наружу."""
+    import tempfile
     import k21_data as d21
     import k21_model as km
     import k21_train as kt
-    import k26_policy as kp26
+    tag = f"{mode}_s{seed}"
+    dev = torch.device(device)
+    r, prob = {}, []
+    r["mem_before_load_gb"] = torch.cuda.memory_allocated(dev) / 2 ** 30
+    torch.cuda.reset_peak_memory_stats(dev)
+    mod, bar = load_source(torch, mode, seed, spec, device, checkpoint=False)
+    mod.eval()
+    with torch.no_grad():
+        for B in (1, 5):
+            batch, po, st, _t, _v = d21.make_batch(D, rows[:B], bar, dev)
+            with torch.autocast("cuda", dtype=torch.float16):
+                o24 = mod(batch, po, st, exit_depth=24)
+                c24 = copy.deepcopy(mod.counters)
+                oe, ce = {}, {}
+                for d in (8, 16):
+                    oe[d] = mod(batch, po, st, exit_depth=d)
+                    ce[d] = copy.deepcopy(mod.counters)
+                oa = mod.forward_all(batch, po, st)
+                ca = copy.deepcopy(mod.counters)
+            same = torch.equal(o24["arm"].float().cpu(), ref_out[B][0]) and \
+                torch.equal(o24["grip_logit"].float().cpu(), ref_out[B][1])
+            r[f"B{B}_legacy_equal"] = bool(same)
+            if not same:
+                prob.append(f"{tag} B{B}: выход 24 ≠ K-26 побитово")
+            for d in (8, 16):
+                da = float((oe[d]["arm"] - oa["exits"][d]["arm"]).abs().max())
+                dg = float((oe[d]["grip_logit"] -
+                            oa["exits"][d]["grip_logit"]).abs().max())
+                r[f"B{B}_d{d}_vs_all"] = dict(arm=da, grip=dg)
+                if not (da <= 1e-6 and dg <= 1e-5):
+                    prob.append(f"{tag} B{B} d{d}: усечённый ≠ forward_all "
+                                f"({da:.2e}, {dg:.2e})")
+            for d, c in ((24, c24), (8, ce[8]), (16, ce[16])):
+                prob += [f"{tag} d{d}: {x}" for x in
+                         k34m.counters_problems(mode, c, d)]
+            prob += [f"{tag} all: {x}" for x in
+                     k34m.counters_problems(mode, ca, 24, True)]
+            del o24, oe, oa
+    batch, po, st, tgt, val = d21.make_batch(D, rows, bar, dev)
+    sp = {}
+    with torch.no_grad():
+        for d in k34m.EXITS:
+            for _ in range(3):
+                with torch.autocast("cuda", dtype=torch.float16):
+                    mod(batch, po, st, exit_depth=d)
+            torch.cuda.synchronize(dev)
+            t0 = time.perf_counter()
+            for _ in range(10):
+                with torch.autocast("cuda", dtype=torch.float16):
+                    mod(batch, po, st, exit_depth=d)
+            torch.cuda.synchronize(dev)
+            sp[d] = (time.perf_counter() - t0) / 10 * 1e3
+    r["ms_B5"] = sp
+    # один main-шаг
+    G = k34m.groups(mod)
+    frozen = {n: p.detach().cpu().clone() for n, p in mod.named_parameters()
+              if not p.requires_grad}
+    before = {k: [p.detach().cpu().clone() for p in G[k]] for k in G}
+    set_phase(G, "main")
+    opt = make_opt(torch, G, "main")
+    mod.train()
+    mod.checkpoint = True
+    opt.zero_grad(set_to_none=True)
+    with torch.autocast("cuda", dtype=torch.float16):
+        out = mod.forward_all(batch, po, st)
+        tot, _per = multi_loss(torch, km, out, tgt, val)
+    tot.mean().backward()
+    del out, tot, _per
+    fin = all(bool(torch.isfinite(p.grad).all()) for k in G for p in G[k]
+              if p.grad is not None)
+    opt.step()
+    chg = {k: any(not torch.equal(p.detach().cpu(), q) for p, q in
+                  zip(G[k], before[k])) for k in G}
+    nh = len(list(mod.readout8.parameters()))
+    h8 = any(not torch.equal(p.detach().cpu(), q) for p, q in
+             zip(mod.readout8.parameters(), before["heads"][:nh]))
+    h16 = any(not torch.equal(p.detach().cpu(), q) for p, q in
+              zip(mod.readout16.parameters(), before["heads"][nh:]))
+    fz = all(torch.equal(p.detach().cpu(), frozen[n]) for n, p in
+             mod.named_parameters() if n in frozen)
+    del opt, G, before, frozen
+    r["main_step"] = dict(finite=bool(fin), changed=chg, heads8=bool(h8),
+                          heads16=bool(h16), frozen_unchanged=bool(fz))
+    if not (fin and all(chg.values()) and h8 and h16 and fz):
+        prob.append(f"{tag}: main-шаг — {r['main_step']}")
+    # сохранение и загрузка уже различающихся голов 8/16/24
+    mod.eval()
+    mod.checkpoint = False
+    with torch.no_grad():
+        with torch.autocast("cuda", dtype=torch.float16):
+            o1 = mod.forward_all(batch, po, st)
+        ref1 = {d: o1["exits"][d]["arm"].float().cpu() for d in k34m.EXITS}
+        del o1
+        diff_heads = not torch.equal(mod.readout8.mlp[0].weight,
+                                     mod.readout16.mlp[0].weight) and \
+            not torch.equal(mod.readout16.mlp[0].weight,
+                            mod.readout.mlp[0].weight)
+        with tempfile.TemporaryDirectory() as td:
+            f = os.path.join(td, "s.pt")
+            torch.save(kt.trainable_state(mod), f)
+            for nm in ("readout8", "readout16", "readout"):
+                for p_ in getattr(mod, nm).parameters():
+                    p_.add_(0.01)
+            own = dict(mod.named_parameters())
+            own.update(dict(mod.named_buffers()))
+            for k, v in torch.load(f, weights_only=False).items():
+                own[k].copy_(v.to(own[k].device, own[k].dtype))
+        with torch.autocast("cuda", dtype=torch.float16):
+            o2 = mod.forward_all(batch, po, st)
+        sl = diff_heads and all(torch.equal(o2["exits"][d]["arm"].float()
+                                            .cpu(), ref1[d])
+                                for d in k34m.EXITS)
+        del o2
+    r["save_load"] = bool(sl)
+    if not sl:
+        prob.append(f"{tag}: сохранение/загрузка различающихся голов")
+    r.update(peak_gb=torch.cuda.max_memory_allocated(dev) / 2 ** 30,
+             n_new=k34m.n_new_params(mod.H),
+             source=dict(ckpt_sha1=spec["ckpt_sha1"],
+                         weights_hash=spec["weights_hash"]))
+    if r["n_new"] != sum(p.numel() for p in mod.heads_params()):
+        prob.append(f"{tag}: число новых параметров ≠ формуле")
+    del mod, bar, batch, po, st, tgt, val
+    return r, prob
+
+
+def real_check(a):
+    import torch
+    import k21_data as d21
     D = d21.load_prepared(require_teacher=False)
-    dev = torch.device(a.device)
     rows = np.asarray(D["val_rows"])[:5]
     rep, prob = {}, []
     for mode in MODES:
         for seed in SEEDS:
             tag = f"{mode}_s{seed}"
             spec = source_entry(seed, mode)["spec"]
-            r = {}
-            torch.cuda.reset_peak_memory_stats(dev)
-            # 1) исходная рука K-26
-            ref, bar, _ck, _p = kp26.load_policy(torch, tag, spec, a.device)
-            outs_ref = {}
-            with torch.no_grad():
-                for B in (1, 5):
-                    batch, po, st, _t, _v = d21.make_batch(D, rows[:B], bar,
-                                                           dev)
-                    with torch.autocast("cuda", dtype=torch.float16):
-                        o = ref(batch, po, st)
-                    outs_ref[B] = (o["arm"].float().cpu(),
-                                   o["grip_logit"].float().cpu())
-            del ref
-            torch.cuda.empty_cache()
-            # 2) новый экземпляр K-34
-            mod, bar = load_source(torch, mode, seed, spec, a.device,
-                                   checkpoint=False)
-            mod.eval()
-            with torch.no_grad():
-                for B in (1, 5):
-                    batch, po, st, _t, _v = d21.make_batch(D, rows[:B], bar,
-                                                           dev)
-                    with torch.autocast("cuda", dtype=torch.float16):
-                        o24 = mod(batch, po, st, exit_depth=24)
-                        c24 = copy.deepcopy(mod.counters)
-                        oe, ce = {}, {}
-                        for d in (8, 16):
-                            oe[d] = mod(batch, po, st, exit_depth=d)
-                            ce[d] = copy.deepcopy(mod.counters)
-                        oa = mod.forward_all(batch, po, st)
-                        ca = copy.deepcopy(mod.counters)
-                    same = torch.equal(o24["arm"].float().cpu(),
-                                       outs_ref[B][0]) and torch.equal(
-                        o24["grip_logit"].float().cpu(), outs_ref[B][1])
-                    r[f"B{B}_legacy_equal"] = bool(same)
-                    if not same:
-                        prob.append(f"{tag} B{B}: выход 24 ≠ K-26 побитово")
-                    for d in (8, 16):
-                        da = float((oe[d]["arm"] - oa["exits"][d]["arm"])
-                                   .abs().max())
-                        dg = float((oe[d]["grip_logit"] -
-                                    oa["exits"][d]["grip_logit"]).abs().max())
-                        r[f"B{B}_d{d}_vs_all"] = dict(arm=da, grip=dg)
-                        if da > 1e-6 or dg > 1e-5:
-                            prob.append(f"{tag} B{B} d{d}: усечённый ≠ "
-                                        f"forward_all ({da:.2e}, {dg:.2e})")
-                    for d, c in ((24, c24), (8, ce[8]), (16, ce[16])):
-                        prob += [f"{tag} d{d}: {x}" for x in
-                                 k34m.counters_problems(mode, c, d)]
-                    prob += [f"{tag} all: {x}" for x in
-                             k34m.counters_problems(mode, ca, 24, True)]
-            # 3) скорость выбранных глубин (B = 5), одна модель в памяти
-            batch, po, st, tgt, val = d21.make_batch(D, rows, bar, dev)
-            sp = {}
-            with torch.no_grad():
-                for d in k34m.EXITS:
-                    for _ in range(3):
-                        with torch.autocast("cuda", dtype=torch.float16):
-                            mod(batch, po, st, exit_depth=d)
-                    torch.cuda.synchronize(dev)
-                    t0 = time.perf_counter()
-                    for _ in range(10):
-                        with torch.autocast("cuda", dtype=torch.float16):
-                            mod(batch, po, st, exit_depth=d)
-                    torch.cuda.synchronize(dev)
-                    sp[d] = (time.perf_counter() - t0) / 10 * 1e3
-            r["ms_B5"] = sp
-            # 4) один main-шаг
-            G = k34m.groups(mod)
-            frozen = {n: p.detach().clone() for n, p in
-                      mod.named_parameters() if not p.requires_grad}
-            before = {k: [p.detach().clone() for p in G[k]] for k in G}
-            set_phase(G, "main")
-            opt = make_opt(torch, G, "main")
-            mod.train()
-            mod.checkpoint = True
-            opt.zero_grad(set_to_none=True)
-            with torch.autocast("cuda", dtype=torch.float16):
-                out = mod.forward_all(batch, po, st)
-                tot, _per = multi_loss(torch, km, out, tgt, val)
-            tot.mean().backward()
-            fin = all(torch.isfinite(p.grad).all() for k in G for p in G[k]
-                      if p.grad is not None)
-            opt.step()
-            chg = {k: any(not torch.equal(p, q) for p, q in
-                          zip(G[k], before[k])) for k in G}
-            fz = all(torch.equal(p, frozen[n]) for n, p in
-                     mod.named_parameters() if n in frozen)
-            r8 = [p for p in mod.readout8.parameters()]
-            r16 = [p for p in mod.readout16.parameters()]
-            nh = len(r8)
-            h8 = any(not torch.equal(p, q) for p, q in zip(
-                r8, before["heads"][:nh]))
-            h16 = any(not torch.equal(p, q) for p, q in zip(
-                r16, before["heads"][nh:]))
-            r.update(main_step=dict(finite=bool(fin), changed=chg,
-                                    heads8=bool(h8), heads16=bool(h16),
-                                    frozen_unchanged=bool(fz)),
-                     peak_gb=torch.cuda.max_memory_allocated(dev) / 2 ** 30,
-                     n_new=k34m.n_new_params(mod.H),
-                     source=dict(ckpt_sha1=spec["ckpt_sha1"],
-                                 weights_hash=spec["weights_hash"]))
-            if not (fin and all(chg.values()) and h8 and h16 and fz):
-                prob.append(f"{tag}: main-шаг — конечность {fin}, изменения "
-                            f"{chg}, головы {h8}/{h16}, замороженное {fz}")
-            if k34m.n_new_params(mod.H) != sum(p.numel() for p in
-                                               mod.heads_params()):
-                prob.append(f"{tag}: число новых параметров ≠ формуле")
-            print(f"  real-check {tag}: legacy B1/B5 "
-                  f"{r['B1_legacy_equal']}/{r['B5_legacy_equal']}, d8/d16 к "
-                  f"forward_all {r['B5_d8_vs_all']}/{r['B5_d16_vs_all']}, мс "
-                  f"B5 " + ", ".join(f"d{d} {v:.1f}" for d, v in sp.items())
-                  + f", память {r['peak_gb']:.1f} ГБ, новых "
-                  f"{r['n_new']}", flush=True)
-            rep[tag] = r
-            del mod, bar, opt
-            torch.cuda.empty_cache()
-    out = dict(problems=prob, results=rep, device=torch.cuda.get_device_name(
-        dev), code={f: sha(os.path.join(HERE, f)) for f in CODE})
+            ref_out = _legacy_outputs(torch, D, rows, tag, spec, a.device)
+            _gpu_free(torch)
+            r, pr = _new_checks(torch, D, rows, mode, seed, spec, a.device,
+                                ref_out)
+            _gpu_free(torch)
+            r["mem_after_free_gb"] = torch.cuda.memory_allocated(
+                torch.device(a.device)) / 2 ** 30
+            rep[tag], prob = r, prob + pr
+            print(f"  real-check {tag}: legacy B1/B5 {r['B1_legacy_equal']}/"
+                  f"{r['B5_legacy_equal']}, d8/d16 к forward_all "
+                  f"{r['B5_d8_vs_all']}/{r['B5_d16_vs_all']}, мс B5 "
+                  + ", ".join(f"d{d} {v:.1f}" for d, v in r["ms_B5"].items())
+                  + f", память до загрузки {r['mem_before_load_gb']:.2f} ГБ, "
+                  f"пик {r['peak_gb']:.1f} ГБ, после освобождения "
+                  f"{r['mem_after_free_gb']:.2f} ГБ; save/load "
+                  f"{r['save_load']}", flush=True)
+    out = dict(problems=prob, results=rep,
+               contract=stage_contract("real_check", a.device,
+                                       dtype="float16"))
     os.makedirs("reports/k34", exist_ok=True)
-    json.dump(out, open("reports/k34/real_check.json", "w", encoding="utf-8"),
+    json.dump(out, open(REAL_CHECK, "w", encoding="utf-8"),
               ensure_ascii=False, indent=1, default=float)
     print("  real-check K-34 " + ("пройден" if not prob else "НЕ пройден: "
                                    + "; ".join(prob[:4])))
@@ -706,6 +923,87 @@ def real_check(a):
 
 
 # --- самопроверка ---------------------------------------------------------------------
+def reuse_regression():
+    """Готовые результаты принимаются только своего контракта и полными."""
+    import tempfile
+    want = dict(kind="real_check", prepare_sha1="P", sources={"a": 1},
+                code={"x": "1"}, dtype="float16", device_name="V100")
+    full = {f"{m}_s{s_}": dict(
+        B1_legacy_equal=True, B5_legacy_equal=True,
+        B1_d8_vs_all=dict(arm=0.0, grip=0.0),
+        B1_d16_vs_all=dict(arm=0.0, grip=0.0),
+        B5_d8_vs_all=dict(arm=0.0, grip=0.0),
+        B5_d16_vs_all=dict(arm=0.0, grip=0.0), ms_B5={}, peak_gb=1.0,
+        mem_before_load_gb=0.0, n_new=1, source={},
+        main_step=dict(finite=True, heads8=True, heads16=True,
+                       frozen_unchanged=True, changed=dict(
+                           expert=True, lora=True, new=True, heads=True)),
+        save_load=True) for m in MODES for s_ in SEEDS}
+    ok = dict(problems=[], results=full, contract=want)
+    assert real_check_problems(ok, want) == []
+    assert real_check_problems(dict(ok, results={}), want)       # пустой
+    assert real_check_problems(ok, dict(want, device_name="A100"))
+    assert real_check_problems(ok, dict(want, prepare_sha1="Q"))
+    bad = copy.deepcopy(full)
+    bad["flat_attn24_s1"]["save_load"] = False
+    assert real_check_problems(dict(ok, results=bad), want)
+    bad = copy.deepcopy(full)
+    del bad["parents_attn24_s0"]["main_step"]
+    assert real_check_problems(dict(ok, results=bad), want)
+    fw = dict(kind="fitcheck", micro=8)
+    fr = {m: dict(ok=True, drop={"8": 0.5, "16": 0.4},
+                  source_unchanged=True, out24_unchanged=True)
+          for m in MODES}
+    assert fitcheck_problems(dict(fr, ok=True, contract=fw), fw) == []
+    assert fitcheck_problems(dict(fr, ok=True, contract=fw),
+                             dict(fw, micro=4))
+    fr2 = copy.deepcopy(fr)
+    fr2["flat_attn24"]["drop"]["16"] = float("nan")
+    assert fitcheck_problems(dict(fr2, ok=True, contract=fw), fw)
+    # checkpoint с чужим контрактом кода — отказ до использования
+    spec = dict(source=dict(ckpt_sha1="S"), weights_hash="W")
+    ck = dict(weights_hash="W", config=dict(
+        architecture=k34m.ARCH["parents_attn24"], seed=0,
+        source=dict(ckpt_sha1="S"), code={"k": "1"}, exits=list(k34m.EXITS),
+        loss=LOSS))
+    assert trained_ckpt_problems(ck, "parents_attn24", 0, spec,
+                                 code={"k": "1"}) == []
+    assert trained_ckpt_problems(ck, "parents_attn24", 0, spec,
+                                 code={"k": "2"})
+    assert trained_ckpt_problems(ck, "parents_attn24", 1, spec,
+                                 code={"k": "1"})
+    assert trained_ckpt_problems(dict(ck, weights_hash="V"),
+                                 "parents_attn24", 0, spec, code={"k": "1"})
+    # готовое обучение: только с тем же контрактом и полным отчётом
+    g = globals()
+    keep = {k: g[k] for k in ("run_dir", "report_path", "source_contract",
+                              "code_now")}
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            g["run_dir"] = lambda s_, m: os.path.join(td, m)
+            g["report_path"] = lambda s_, m: os.path.join(td, m + ".json")
+            g["source_contract"] = lambda: {"parents_attn24_s0": {"c": 1}}
+            g["code_now"] = lambda: {"k": "1"}
+            os.makedirs(os.path.join(td, "parents_attn24"))
+            bp = os.path.join(td, "parents_attn24", "best.pt")
+            open(bp, "wb").write(b"w")
+            rep = dict(best_sha1=sha(bp), updates=dict(main=MAIN_UPDATES),
+                       config=dict(mode="parents_attn24", seed=0, micro=8,
+                                   dtype="float16", code={"k": "1"},
+                                   architecture=k34m.ARCH["parents_attn24"],
+                                   source={"c": 1}))
+            json.dump(rep, open(os.path.join(td, "parents_attn24.json"), "w"))
+            assert train_problems(0, "parents_attn24", 8, "float16") == []
+            assert train_problems(0, "parents_attn24", 4, "float16")
+            g["code_now"] = lambda: {"k": "2"}
+            assert train_problems(0, "parents_attn24", 8, "float16")
+            g["code_now"] = lambda: {"k": "1"}
+            open(bp, "wb").write(b"x")                      # подмена best.pt
+            assert train_problems(0, "parents_attn24", 8, "float16")
+        finally:
+            g.update(keep)
+
+
 def selftest():
     import tempfile
     import types
@@ -828,6 +1126,7 @@ def selftest():
                 g.update(FIT_UPDATES=keep["FIT_UPDATES"], FIT_N=keep["FIT_N"])
     finally:
         g.update(keep)
+    reuse_regression()
     print("самопроверка k34_train пройдена: LR (разогрев, косинус до 0.1 на "
           "4000), очередь u_abs = 200000 + u (учитель по u_abs mod 4, seed "
           "различает, отпечаток), warmup меняет только головы 8/16, main — "
@@ -837,28 +1136,13 @@ def selftest():
     return 0
 
 
-def check_fresh(a):
-    """Готовый отчёт проверки пройден тем же кодом -> 0, иначе 1."""
-    p = dict(fitcheck="reports/k34/fitcheck.json",
-             real_check="reports/k34/real_check.json")[a.kind]
-    if not os.path.exists(p):
-        return 1
-    r = json.load(open(p, encoding="utf-8"))
-    passed = r.get("ok") is True if a.kind == "fitcheck" else \
-        r.get("problems") == []
-    same = r.get("code") == {f: sha(os.path.join(HERE, f)) for f in CODE}
-    print(f"  {p}: " + ("пройден тем же кодом" if passed and same else
-                        f"пересчитать (пройден {passed}, код тот же {same})"))
-    return 0 if passed and same else 1
-
-
 def main():
     if "--selftest" in sys.argv:
         return selftest()
-    if len(sys.argv) > 2 and sys.argv[1] == "check-fresh":
-        return check_fresh(argparse.Namespace(kind=sys.argv[2]))
     ap = argparse.ArgumentParser(description="K-34: обучение")
-    ap.add_argument("cmd", choices=("train", "fitcheck", "real-check"))
+    ap.add_argument("cmd", choices=("train", "fitcheck", "real-check",
+                                    "check-fresh", "train-valid"))
+    ap.add_argument("--kind", choices=("real_check", "fitcheck"))
     ap.add_argument("--mode", choices=MODES)
     ap.add_argument("--seed", type=int, choices=SEEDS)
     ap.add_argument("--device", default="cuda:0")
@@ -870,7 +1154,8 @@ def main():
     a = ap.parse_args()
     try:
         return dict(train=train, fitcheck=fitcheck,
-                    **{"real-check": real_check})[a.cmd](a)
+                    **{"real-check": real_check, "check-fresh": check_fresh,
+                       "train-valid": train_valid})[a.cmd](a)
     except SystemExit as e:
         if isinstance(e.code, str):
             print(f"  ОТКАЗ: {e.code}", flush=True)

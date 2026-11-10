@@ -28,6 +28,7 @@ pilot-gate — SR рук пилота (по 50 эпизодов) и правил
   reports/k34/latency_pilot.json (свободная карта), иначе awaiting_latency.
 """
 import argparse
+import copy
 import datetime
 import hashlib
 import json
@@ -329,7 +330,8 @@ def block_problems(plan, plan_file, kind, lab, task, start, path=None):
         p += [f"{lab}: {k} = {j.get(k)!r}, ожидалось {v!r}"
               for k, v in want.items() if j.get(k) != v]
         p += pp.journal_problems(lab, z, plan["bounds"])
-        p += kp.journal_problems(lab, z, debug=bool(plan["debug"]))
+        p += kp.journal_problems(lab, z, debug=bool(plan["debug"]),
+                                 bounds=plan["bounds"])
     if not p:
         p += hpc.actions_problems(lab, z, hpc.harness_scale())
     return p
@@ -425,7 +427,9 @@ def smoke_check(a):
         same = kp.head_recompute(torch, z, ck, 24, L, U, device=a.device,
                                  autocast=a.device.startswith("cuda"))
         cpu = kp.head_recompute(torch, z, ck, 24, L, U)
-        bad = {k: v for k, v in same.items() if v > DBG_TOL[k]}
+        bad = {k: v for k, v in same.items() if not (v <= DBG_TOL[k])}
+        if set(same) != set(DBG_TOL):
+            bad["поля"] = sorted(same)
         if bad:
             prob.append(f"{lab}: пересчёт головы на том же устройстве — "
                         f"{bad}")
@@ -480,39 +484,210 @@ def gate_decision(s, lat):
     return ("passed" if ok else "stop"), dict(t24_vs_r=c1, early=early)
 
 
-def pilot_gate(a):
-    plan = json.load(open(a.plan, encoding="utf-8"))
-    prob = plan_problems(plan)
+GATE_FILE = os.path.join(OUT, "pilot_gate.json")
+LAT_PILOT = os.path.join(OUT, "latency_pilot.json")
+
+
+def _block_shas(kind, plan):
+    out = {}
     for lab, t, b in plan["cells"]:
-        prob += block_problems(plan, a.plan, "pilot", lab, t, b)
-    prob += parity_problems(plan, "pilot")
-    if prob:
-        print("  пилот: ОТКАЗ — " + "; ".join(prob[:4]))
-        save_json(os.path.join(OUT, "pilot_gate.json"),
-                  dict(status="technical_stop", problems=prob[:50]))
-        return 3
+        f = block_path(kind, lab, t, b)
+        for q in (f, f[:-5] + ".actions.npz"):
+            out[q] = sha(q) if os.path.exists(q) else None
+    return out
+
+
+def _successes(plan):
     s = {}
     for lab, arm in plan["arms"].items():
         k, n = sr_of("pilot", plan, lab)
         if n != 50:
             raise SystemExit(f"{lab}: эпизодов {n} из 50")
-        s["R" if arm["depth"] is None else arm["depth"]] = k
-    lat = None
-    lp = os.path.join(OUT, "latency_pilot.json")
-    if os.path.exists(lp):
-        r = json.load(open(lp, encoding="utf-8"))
-        lat = {int(d): r["batch1"][f"d{d}"]["total"]["median"]
+        s["R" if arm["depth"] is None else str(arm["depth"])] = k
+    return s
+
+
+def _latency(plan, plan_file, lat_path=None):
+    """-> (p50 B1 по глубинам или None, привязка, проблемы). Чужой замер —
+    проблема, а не «нет замера»."""
+    lat_path = lat_path or LAT_PILOT
+    if not os.path.exists(lat_path):
+        return None, None, []
+    r = json.load(open(lat_path, encoding="utf-8"))
+    p = []
+    if r.get("plan_sha1") != sha(plan_file):
+        p.append("замер задержки другого плана")
+    want = plan["arms"][kp.label("parents_attn24", 0, 24)]["spec"]["ckpt_sha1"]
+    if (r.get("ckpt_sha1") or {}).get("parents_attn24") != want:
+        p.append("замер задержки другого checkpoint")
+    try:
+        lat = {str(d): float(r["batch1"][f"d{d}"]["total"]["median"])
                for d in k34m.EXITS}
-    status, det = gate_decision(s, lat)
-    save_json(os.path.join(OUT, "pilot_gate.json"),
-              dict(status=status, successes=s, latency_p50_b1=lat,
-                   details=det, rule=GATE))
-    print(f"  пилот: успехи из 50 — T24 {s[24]}, T16 {s[16]}, T8 {s[8]}, "
-          f"R {s['R']}; задержка B1 p50 {lat}; статус {status}")
+    except (KeyError, TypeError):
+        return None, None, p + ["замер задержки неполон"]
+    if not all(np.isfinite(v) and v > 0 for v in lat.values()):
+        p.append("замер задержки не конечен")
+    return lat, dict(path=os.path.abspath(lat_path), sha1=sha(lat_path),
+                     plan_sha1=r.get("plan_sha1")), p
+
+
+def _decide(s, lat):
+    si = {(int(k) if k != "R" else k): v for k, v in s.items()}
+    li = None if lat is None else {int(k): v for k, v in lat.items()}
+    return gate_decision(si, li)
+
+
+def pilot_gate(a):
+    plan = json.load(open(a.plan, encoding="utf-8"))
+    prob = plan_problems(plan)
+    if plan.get("plan_kind") != "pilot":
+        prob.append("не план пилота")
+    for lab, t, b in plan["cells"]:
+        prob += block_problems(plan, a.plan, "pilot", lab, t, b)
+    prob += parity_problems(plan, "pilot")
+    lat, lat_bind, lp = _latency(plan, a.plan)
+    prob += lp
+    if prob:
+        save_json(GATE_FILE, dict(status="technical_stop", problems=prob[:50],
+                                  plan_sha1=sha(a.plan)))
+        print("  пилот: ОТКАЗ — " + "; ".join(prob[:4]))
+        return 3
+    s = _successes(plan)
+    status, det = _decide(s, lat)
+    rec = dict(status=status, successes=s, latency_p50_b1=lat,
+               latency=lat_bind, details=det, rule=GATE,
+               plan=os.path.abspath(a.plan), plan_sha1=sha(a.plan),
+               ckpt={lab: arm["spec"]["ckpt_sha1"]
+                     for lab, arm in plan["arms"].items()},
+               blocks=_block_shas("pilot", plan))
+    save_json(GATE_FILE, rec)
+    print(f"  пилот: успехи из 50 — T24 {s['24']}, T16 {s['16']}, T8 {s['8']}"
+          f", R {s['R']}; задержка B1 p50 {lat}; статус {status}")
     return 0
 
 
+def pilot_verify_problems(plan_file, gate_file=None, lat_path=None):
+    """Отчёт гейта = текущим артефактам: план, checkpoint, все блоки,
+    замер задержки; успехи и статус пересчитываются заново."""
+    gate_file = gate_file or GATE_FILE
+    if not os.path.exists(gate_file):
+        return ["нет отчёта гейта"]
+    g = json.load(open(gate_file, encoding="utf-8"))
+    plan = json.load(open(plan_file, encoding="utf-8"))
+    p = []
+    if g.get("plan_sha1") != sha(plan_file):
+        p.append("гейт другого плана")
+    p += plan_problems(plan)
+    if g.get("ckpt") != {lab: arm["spec"]["ckpt_sha1"]
+                         for lab, arm in plan["arms"].items()}:
+        p.append("checkpoint гейта ≠ плану")
+    want = _block_shas("pilot", plan)
+    if g.get("blocks") != want or any(v is None for v in want.values()):
+        p.append("блоки пилота отсутствуют или изменены после гейта")
+    lat, bind, lp = _latency(plan, plan_file, lat_path)
+    p += lp
+    if (g.get("latency") or None) != bind:
+        p.append("замер задержки ≠ закреплённому в гейте")
+    if p:
+        return p
+    s = _successes(plan)
+    if g.get("successes") != s:
+        p.append("успехи ≠ блокам")
+    st, _d = _decide(s, lat)
+    if g.get("status") != st:
+        p.append(f"статус ≠ пересчитанному ({st})")
+    if st != "passed":
+        p.append(f"статус {st}")
+    return p
+
+
+def pilot_verify(a):
+    p = pilot_verify_problems(a.plan)
+    print("  гейт пилота: " + ("passed, привязки сходятся" if not p else
+                               "ОТКАЗ — " + "; ".join(p[:4])))
+    return 0 if not p else 3
+
+
 # --- самопроверка -----------------------------------------------------------------------------
+def gate_regression():
+    """Гейт пилота: поддельный {"status": "passed"}, чужой замер, изменённый
+    блок — отказ; полный проверенный набор — passed."""
+    import tempfile
+    g = globals()
+    keep = {k: g[k] for k in ("OUT", "GATE_FILE", "LAT_PILOT",
+                              "plan_problems", "block_problems",
+                              "parity_problems")}
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            g.update(OUT=td, GATE_FILE=os.path.join(td, "gate.json"),
+                     LAT_PILOT=os.path.join(td, "lat.json"))
+            g["plan_problems"] = lambda plan: []
+            g["block_problems"] = lambda *aa, **kw: []
+            g["parity_problems"] = lambda *aa, **kw: []
+            arms = {lab: dict(mode=m, seed=s_, depth=d,
+                              spec=dict(ckpt_sha1=f"c{d}"))
+                    for lab, m, s_, d in arms_for("pilot")}
+            plan = dict(plan_kind="pilot", arms=arms,
+                        cells=[list(c) for c in cells("pilot")])
+            pf = os.path.join(td, "plan.json")
+            save_json(pf, plan)
+            succ = {kp.label("parents_attn24", 0, 24): 4,
+                    kp.label("parents_attn24", 0, 16): 4,
+                    kp.label("parents_attn24", 0, 8): 2,
+                    kp.label("parents_attn24", 0): 4}
+            for lab, t, b in plan["cells"]:
+                f = block_path("pilot", lab, t, b)
+                os.makedirs(os.path.dirname(f), exist_ok=True)
+                np.savez(f[:-5] + ".actions.npz", a=np.zeros(1))
+                save_json(f, dict(episodes=[dict(success=i < succ[lab],
+                                                 init_state_id=b + i)
+                                            for i in range(5)]))
+            lat = dict(plan_sha1=sha(pf), ckpt_sha1=dict(parents_attn24="c24"),
+                       batch1={f"d{d}": dict(total=dict(median=m_)) for d, m_
+                               in ((8, 50.0), (16, 80.0), (24, 100.0))})
+            save_json(g["LAT_PILOT"], lat)
+            a_ = argparse.Namespace(plan=pf)
+            assert pilot_gate(a_) == 0
+            assert json.load(open(g["GATE_FILE"]))["status"] == "passed"
+            assert pilot_verify_problems(pf) == [], pilot_verify_problems(pf)
+            # поддельный отчёт гейта
+            save_json(g["GATE_FILE"], dict(status="passed"))
+            assert pilot_verify_problems(pf)
+            assert pilot_gate(a_) == 0 and pilot_verify_problems(pf) == []
+            # изменённый блок после гейта
+            f0 = block_path("pilot", *plan["cells"][0])
+            d0 = json.load(open(f0))
+            d0["episodes"][0]["success"] = not d0["episodes"][0]["success"]
+            save_json(f0, d0)
+            assert pilot_verify_problems(pf)
+            d0["episodes"][0]["success"] = not d0["episodes"][0]["success"]
+            save_json(f0, d0)
+            assert pilot_gate(a_) == 0 and pilot_verify_problems(pf) == []
+            # замер другого плана: гейт отказывает, verify тоже
+            save_json(g["LAT_PILOT"], dict(lat, plan_sha1="чужой"))
+            assert pilot_gate(a_) == 3
+            assert pilot_verify_problems(pf)
+            # замер другого checkpoint
+            save_json(g["LAT_PILOT"], dict(lat, ckpt_sha1=dict(
+                parents_attn24="x")))
+            assert pilot_gate(a_) == 3
+            # замер подменён после гейта
+            save_json(g["LAT_PILOT"], lat)
+            assert pilot_gate(a_) == 0
+            lat2 = copy.deepcopy(lat)
+            lat2["batch1"]["d16"]["total"]["median"] = 90.0
+            save_json(g["LAT_PILOT"], lat2)
+            assert pilot_verify_problems(pf)
+            # без замера — awaiting_latency, продолжение не допускается
+            os.remove(g["LAT_PILOT"])
+            assert pilot_gate(a_) == 0
+            assert json.load(open(g["GATE_FILE"]))["status"] == \
+                "awaiting_latency"
+            assert pilot_verify_problems(pf)
+        finally:
+            g.update(keep)
+
+
 def selftest():
     # расписание
     assert sorted(task_order()) == list(range(10))
@@ -544,6 +719,7 @@ def selftest():
     assert gate_decision({**s, 16: 34}, None)[0] == "stop"
     assert gate_decision({**s, 8: 35}, {8: 80, 16: 90, 24: 100})[0] \
         == "passed"
+    gate_regression()
     print("самопроверка k34_protocol пройдена: расписание (пилот 40 блоков, "
           "оценка 480, сдвиг рук по задачам, бюджеты = блоки × 3050), "
           "правило пилота (T24 к R, ранний выход к T24, задержка ≤ 0.85; без "
@@ -556,7 +732,8 @@ def main():
         return selftest()
     ap = argparse.ArgumentParser(description="K-34: протокол")
     ap.add_argument("cmd", choices=("prepare", "plan", "block", "cells",
-                                    "smoke-check", "pilot-gate"))
+                                    "smoke-check", "pilot-gate",
+                                    "pilot-verify"))
     ap.add_argument("--kind", choices=KINDS)
     ap.add_argument("--plan")
     ap.add_argument("--op", choices=("reserve", "finish"))
@@ -568,7 +745,8 @@ def main():
     try:
         return dict(prepare=prepare, plan=plan_cmd, block=block_cmd,
                     cells=cells_cmd, **{"smoke-check": smoke_check,
-                                        "pilot-gate": pilot_gate})[a.cmd](a)
+                                        "pilot-gate": pilot_gate,
+                                        "pilot-verify": pilot_verify})[a.cmd](a)
     except SystemExit as e:
         if isinstance(e.code, str):
             print(f"  ОТКАЗ: {e.code}", flush=True)

@@ -92,24 +92,28 @@ run_plan () {   # вид DEV
   done < <(printf '%s\n' "$out" | tail -n +2)
 }
 real_check () {   # DEV
-  $TRN check-fresh real_check && return 0
+  $TRN check-fresh --kind real_check --device "$1" && return 0
   gpu_free "$1" || return 3
   $TRN real-check --device "$1"
 }
 fitcheck () {   # DEV
-  $TRN check-fresh fitcheck && return 0
+  $TRN check-fresh --kind fitcheck --device "$1" && return 0
   gpu_free "$1" || return 3
   $TRN fitcheck --device "$1"
 }
 train_one () {   # SEED MODE DEV
   local rp="reports/k34/train_s$1_$2.json"
-  [ -f "$rp" ] && { echo "    обучение $2 s$1: готово ($rp)"; return 0; }
+  # готовое обучение принимается только с тем же контрактом (источник,
+  # код, micro/dtype, 4000 main); отчёт другого контракта — стоп, а не
+  # тихое переобучение
+  if [ -f "$rp" ]; then
+    $TRN train-valid --seed "$1" --mode "$2" && return 0
+    echo "ОТКАЗ: $rp не соответствует текущему контракту"; return 3
+  fi
   gpu_free "$3" || return 3; disk_wait || return 3
   $TRN train --seed "$1" --mode "$2" --device "$3"
 }
-smoke () {   # DEV
-  [ -f reports/k34/smoke_check.json ] && $PY -c "import json,sys; sys.exit(0 if json.load(open('reports/k34/smoke_check.json')).get('ok') else 1)" \
-    && { echo "    collector-smoke: пройден"; return 0; }
+smoke () {   # DEV — готовые блоки переиспользуются, проверка всегда заново
   run_plan smoke "$1" || return 3
   $PROT smoke-check --plan reports/k34/plan_smoke.json --device "$1"
 }
@@ -123,7 +127,7 @@ pilot () {   # DEV
   echo "=== ЭТАП задержка пилота"; [ -f reports/k34/latency_pilot.json ] || latency pilot "$1"
   echo "=== ЭТАП гейт пилота"; $PROT pilot-gate --plan reports/k34/plan_pilot.json
 }
-gate_passed () { $PY -c "import json,sys; sys.exit(0 if json.load(open('reports/k34/pilot_gate.json')).get('status')=='passed' else 1)" 2>/dev/null; }
+gate_passed () { $PROT pilot-verify --plan reports/k34/plan_pilot.json; }
 evaluation () {   # DEV
   local DEV="$1" sm s m
   gate_passed || { echo "ОТКАЗ: гейт пилота не пройден (reports/k34/pilot_gate.json)"; return 3; }

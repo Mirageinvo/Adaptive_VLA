@@ -41,6 +41,77 @@ def ops(counters):
                 expand=int(counters["expand"]))
 
 
+def measure_model(torch, a, D, cache, queues, mode, spec, kp, kd, km):
+    """Одна модель в памяти: загрузка, замеры, снятие обёртки таймера и
+    освобождение ссылок до выхода; наружу — только CPU-числа."""
+    dev = torch.device(a.device)
+    out = dict(mem_before_load_gb=torch.cuda.memory_allocated(dev) / 2 ** 30)
+    mod, bar, _ck, _p = kp.load_trained(torch, mode, 0, 24, spec, a.device)
+    mod.checkpoint = False
+    vt = kl.VisionTimer(torch, mod.bar.vlm)
+    ac = torch.autocast("cuda", dtype=torch.float16)
+    lab = kp.label(mode, 0, 24)
+
+    def run(d, rows):
+        torch.cuda.synchronize(dev)
+        t0 = time.perf_counter()
+        batch = kd.prompt_batch(bar, [cache[int(i)] for i in rows],
+                                kd.norm_states(np.asarray(D["state8"][rows])),
+                                D["task"][rows].tolist())
+        pos = np.unique(D["pos_offset"][rows])
+        if len(pos) != 1:
+            raise SystemExit("в батче разные pos_offset")
+        s11 = torch.as_tensor(km.state11(np.asarray(D["state8"][rows])),
+                              device=dev)
+        with torch.no_grad(), ac:
+            o = mod(batch, int(pos[0]), s11, exit_depth=d)
+        g = torch.where(o["grip_logit"].float() > 0, 1.0, -1.0)
+        chunk = torch.cat([o["arm"].float(), g[..., None]], -1)
+        arr = chunk.cpu().numpy()
+        torch.cuda.synchronize(dev)
+        tot = (time.perf_counter() - t0) * 1e3
+        _v_ms, v_calls = vt.take()
+        prob = k34m.counters_problems(mode, mod.counters, d)
+        if prob or v_calls != 1 or arr.shape[1:] != (20, 7) or \
+                arr.dtype != np.float32 or not np.isfinite(arr).all():
+            raise SystemExit(f"{lab} d{d}: {prob} vision {v_calls} "
+                             f"{arr.shape}")
+        return tot, ops(mod.counters)
+    try:
+        for bs, q in queues.items():
+            for d in k34m.EXITS:
+                for j in range(kl.WARM):
+                    run(d, q[j % len(q)])
+            torch.cuda.reset_peak_memory_stats(dev)
+            meas = {d: [] for d in k34m.EXITS}
+            op, pos = {}, {d: 0 for d in k34m.EXITS}
+            while min(len(v) for v in meas.values()) < a.n:
+                for d in k34m.EXITS:
+                    for _ in range(kl.BLOCK):
+                        if len(meas[d]) >= a.n:
+                            break
+                        t, op[d] = run(d, q[pos[d] % len(q)])
+                        pos[d] += 1
+                        meas[d].append(t)
+            r = {f"d{d}": dict(total=kl.q(meas[d]), ops=op[d], n=len(meas[d]))
+                 for d in k34m.EXITS}
+            for d in (8, 16):
+                r[f"d{d}"]["p50_ratio_to_d24"] = \
+                    r[f"d{d}"]["total"]["median"] / r["d24"]["total"]["median"]
+            r["peak_memory_gb"] = torch.cuda.max_memory_allocated(dev) / 2 ** 30
+            out[f"batch{bs}"] = r
+            print(f"  {mode} batch {bs}: " + ", ".join(
+                f"d{d} p50 {r[f'd{d}']['total']['median']:.1f} мс "
+                f"(p95 {r[f'd{d}']['total']['p95']:.1f})"
+                for d in k34m.EXITS), flush=True)
+    finally:
+        # снять обёртку таймера: иначе она удерживает прежний VLM
+        vt.vlm.__dict__.pop("get_image_features", None)
+        vt.vlm = vt.orig = None
+        del vt, mod, bar
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description="K-34: латентность")
     ap.add_argument("--device", default="cuda:0")
@@ -79,71 +150,18 @@ def main():
         for r in np.unique(np.concatenate(q)):
             if int(r) not in cache:
                 cache[int(r)] = np.array(D["IMG"][int(r)], copy=True)
+    res["ckpt_sha1"] = {}
     for mode in modes:
         lab = kp.label(mode, 0, 24)
         spec = plan["arms"][lab]["spec"]
-        mod, bar, _ck, _p = kp.load_trained(torch, mode, 0, 24, spec,
-                                            a.device)
-        mod.checkpoint = False
-        vt = kl.VisionTimer(torch, mod.bar.vlm)
-        ac = torch.autocast("cuda", dtype=torch.float16)
-
-        def run(d, rows):
-            torch.cuda.synchronize(dev)
-            t0 = time.perf_counter()
-            batch = kd.prompt_batch(bar, [cache[int(i)] for i in rows],
-                                    kd.norm_states(np.asarray(
-                                        D["state8"][rows])),
-                                    D["task"][rows].tolist())
-            pos = np.unique(D["pos_offset"][rows])
-            if len(pos) != 1:
-                raise SystemExit("в батче разные pos_offset")
-            s11 = torch.as_tensor(km.state11(np.asarray(D["state8"][rows])),
-                                  device=dev)
-            with torch.no_grad(), ac:
-                o = mod(batch, int(pos[0]), s11, exit_depth=d)
-            g = torch.where(o["grip_logit"].float() > 0, 1.0, -1.0)
-            chunk = torch.cat([o["arm"].float(), g[..., None]], -1)
-            out = chunk.cpu().numpy()
-            torch.cuda.synchronize(dev)
-            tot = (time.perf_counter() - t0) * 1e3
-            v_ms, v_calls = vt.take()
-            prob = k34m.counters_problems(mode, mod.counters, d)
-            if prob or v_calls != 1 or out.shape[1:] != (20, 7) or \
-                    out.dtype != np.float32 or not np.isfinite(out).all():
-                raise SystemExit(f"{lab} d{d}: {prob} vision {v_calls} "
-                                 f"{out.shape}")
-            return tot, ops(mod.counters)
-        res[mode] = {}
-        for bs, q in queues.items():
-            for d in k34m.EXITS:
-                for j in range(kl.WARM):
-                    run(d, q[j % len(q)])
-            torch.cuda.reset_peak_memory_stats(dev)
-            meas = {d: [] for d in k34m.EXITS}
-            op = {}
-            pos = {d: 0 for d in k34m.EXITS}
-            while min(len(v) for v in meas.values()) < a.n:
-                for d in k34m.EXITS:
-                    for _ in range(kl.BLOCK):
-                        if len(meas[d]) >= a.n:
-                            break
-                        t, op[d] = run(d, q[pos[d] % len(q)])
-                        pos[d] += 1
-                        meas[d].append(t)
-            r = {f"d{d}": dict(total=kl.q(meas[d]), ops=op[d], n=len(meas[d]))
-                 for d in k34m.EXITS}
-            for d in (8, 16):
-                r[f"d{d}"]["p50_ratio_to_d24"] = \
-                    r[f"d{d}"]["total"]["median"] / r["d24"]["total"]["median"]
-            r["peak_memory_gb"] = torch.cuda.max_memory_allocated(dev) / 2 ** 30
-            res[mode][f"batch{bs}"] = r
-            print(f"  {mode} batch {bs}: " + ", ".join(
-                f"d{d} p50 {r[f'd{d}']['total']['median']:.1f} мс "
-                f"(p95 {r[f'd{d}']['total']['p95']:.1f})"
-                for d in k34m.EXITS), flush=True)
-        del mod, bar
+        res["ckpt_sha1"][mode] = spec["ckpt_sha1"]
+        res[mode] = measure_model(torch, a, D, cache, queues, mode, spec,
+                                  kp, kd, km)
+        import gc
+        gc.collect()
         torch.cuda.empty_cache()
+        res[mode]["mem_after_free_gb"] = torch.cuda.memory_allocated(
+            dev) / 2 ** 30
     if a.kind == "pilot":
         res["batch1"] = res["parents_attn24"]["batch1"]
     os.makedirs("reports/k34", exist_ok=True)

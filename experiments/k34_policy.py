@@ -65,16 +65,13 @@ def load_trained(torch, mode, seed, depth, spec, device):
         for p in mod.parameters():
             p.requires_grad_(False)
         return mod, bar, dict(weights_hash=None, update=None), prep
+    if sha(spec["ckpt"]) != spec["ckpt_sha1"]:
+        raise SystemExit("best.pt K-34 ≠ плану")
     ck = torch.load(spec["ckpt"], map_location="cpu", weights_only=False)
-    cfg = ck["config"]
-    if cfg.get("architecture") != k34m.ARCH[mode] or \
-            int(cfg.get("seed", -1)) != seed or \
-            cfg.get("source", {}).get("ckpt_sha1") != \
-            spec["source"]["ckpt_sha1"]:
+    pr = k34t.trained_ckpt_problems(ck, mode, seed, spec)
+    if pr:
         raise SystemExit(f"{label(mode, seed)}: checkpoint K-34 — "
-                         f"архитектура, seed или источник")
-    if ck["weights_hash"] != spec["weights_hash"]:
-        raise SystemExit("отпечаток best.pt K-34 ≠ плану")
+                         + "; ".join(pr))
     own = dict(mod.named_parameters())
     own.update(dict(mod.named_buffers()))
     with torch.no_grad():
@@ -195,7 +192,52 @@ def build_arm(device, basis, lab, torch, *, spec, plan_sha1, debug=False):
     return arm
 
 
-def journal_problems(lab, z, debug=False):
+NODES = dict(parents_attn24={8: 4, 16: 8, 24: 16},
+             flat_attn24={8: 16, 16: 16, 24: 16})
+
+
+def debug_problems(lab, z, bounds, tol_arm=1e-6):
+    """Отладочный снимок головы первого вызова: формы и конечность; схват =
+    y[..., 6]; рука = mid + half·tanh(y/half) по записанному y; связь с
+    исполнением — первые 8 команд и знак схвата = первому вызову журнала."""
+    mode, _seed, depth = parse(lab)
+    k = {n: np.asarray(z[f"k21_dbg_{n}"])[0] for n in
+         ("x", "iv", "w", "y", "arm", "grip")}
+    lv = np.asarray(z[f"k15d_level_{lab}"])
+    B = lv.shape[1]
+    n = NODES[mode][depth]
+    want = dict(iv=(B, n, 2), w=(B, 20, n), y=(B, 20, 7), arm=(B, 20, 6),
+                grip=(B, 20))
+    p = [f"{lab}: снимок {nm} формы {k[nm].shape}, ожидалось {sh}"
+         for nm, sh in want.items() if k[nm].shape != sh]
+    if k["x"].ndim != 3 or k["x"].shape[:2] != (B, n):
+        p.append(f"{lab}: снимок x формы {k['x'].shape}")
+    if p:
+        return p
+    bad = [nm for nm, v in k.items() if not np.isfinite(v).all()]
+    if bad:
+        return [f"{lab}: снимок не конечен: {bad}"]
+    if not np.array_equal(k["grip"], k["y"][..., 6]):
+        p.append(f"{lab}: логит схвата снимка ≠ y[..., 6]")
+    L = np.asarray(bounds["L"], np.float32)
+    U = np.asarray(bounds["U"], np.float32)
+    mid, half = (U + L) / 2, (U - L) / 2
+    arm = mid + half * np.tanh(k["y"][..., :6].astype(np.float32) / half)
+    e = np.abs(arm - k["arm"])
+    if not (np.isfinite(e).all() and float(e.max()) <= tol_arm):
+        p.append(f"{lab}: рука снимка ≠ сборке из y ({float(np.nanmax(e))})")
+    l0 = lv[0]
+    if l0.shape != (B, 8, 7):
+        return p + [f"{lab}: первый вызов журнала формы {l0.shape}"]
+    if not np.array_equal(l0[..., :6], k["arm"][:, :8].astype(l0.dtype)):
+        p.append(f"{lab}: снимок не первого вызова — рука ≠ журналу")
+    g = np.where(k["grip"][:, :8] > 0, 1.0, -1.0).astype(l0.dtype)
+    if not np.array_equal(l0[..., 6], g):
+        p.append(f"{lab}: снимок не первого вызова — схват ≠ журналу")
+    return p
+
+
+def journal_problems(lab, z, debug=False, bounds=None):
     """Журнал выбранной глубины: глубина, число слоёв/router/Expand/голов —
     ожидаемые на каждом вызове; router по выполненным точкам."""
     mode, _seed, depth = parse(lab)
@@ -230,6 +272,10 @@ def journal_problems(lab, z, debug=False):
             p.append(f"{lab}: нет отладочного снимка головы")
         elif int(np.asarray(z["k21_dbg_depth"]).reshape(-1)[0]) != depth:
             p.append(f"{lab}: снимок головы другой глубины")
+        elif bounds is None:
+            p.append(f"{lab}: нет пределов для проверки снимка")
+        else:
+            p += debug_problems(lab, z, bounds)
     return p
 
 
@@ -261,7 +307,12 @@ def head_recompute(torch, z, ckpt_path, depth, L, U, device="cpu",
     for k, nm in (("y", "k21_dbg_y"), ("arm", "k21_dbg_arm"),
                   ("grip_logit", "k21_dbg_grip")):
         ref = np.asarray(z[nm])[0]
-        out[k] = float(np.abs(o[k].float().cpu().numpy() - ref).max())
+        got = o[k].float().cpu().numpy()
+        if got.shape != ref.shape or not np.isfinite(ref).all() or \
+                not np.isfinite(got).all():
+            out[k] = float("nan")              # отказ: не <= допуска
+        else:
+            out[k] = float(np.abs(got - ref).max())
     return out
 
 
@@ -292,6 +343,39 @@ def selftest():
             assert journal_problems(lab, z, debug=True)    # нет снимка
     assert n == 6 and k34m.expected_counters("parents_attn24", 8)[
         "router"] == [4, 4]
+    # снимок: правильный проходит; NaN, другой вызов, чужая сборка — отказ
+    rng = np.random.default_rng(0)
+    bounds = dict(L=[-1.0] * 6, U=[2.0] * 6)
+    Lb, Ub = np.float32(-1.0), np.float32(2.0)
+    B, nn_ = 5, 4
+    y = rng.normal(size=(1, B, 20, 7)).astype(np.float32)
+    arm = ((Ub + Lb) / 2 + (Ub - Lb) / 2 * np.tanh(
+        y[..., :6] / ((Ub - Lb) / 2))).astype(np.float32)
+    grip = y[..., 6].copy()
+    lv = np.zeros((3, B, 8, 7), np.float32)
+    lv[0, ..., :6] = arm[0, :, :8]
+    lv[0, ..., 6] = np.where(grip[0, :, :8] > 0, 1.0, -1.0)
+    zd = dict(k21_dbg_x=rng.normal(size=(1, B, nn_, 12)).astype(np.float32),
+              k21_dbg_iv=np.zeros((1, B, nn_, 2), np.float32),
+              k21_dbg_w=np.zeros((1, B, 20, nn_), np.float32), k21_dbg_y=y,
+              k21_dbg_arm=arm, k21_dbg_grip=grip,
+              k21_dbg_depth=np.int32([8]),
+              **{"k15d_level_parents_attn24_s0_d8": lv})
+    lab8 = "parents_attn24_s0_d8"
+    assert debug_problems(lab8, zd, bounds) == [], debug_problems(
+        lab8, zd, bounds)
+    z2 = dict(zd, k21_dbg_arm=arm.copy())
+    z2["k21_dbg_arm"][0, 0, 0, 0] = np.nan
+    assert debug_problems(lab8, z2, bounds)                   # NaN
+    lv2 = lv.copy()
+    lv2[0, 1, 2, 0] += 0.5
+    assert debug_problems(lab8, dict(zd, **{
+        "k15d_level_parents_attn24_s0_d8": lv2}), bounds)     # другой вызов
+    z3 = dict(zd, k21_dbg_arm=arm + np.float32(1e-3))
+    assert debug_problems(lab8, z3, bounds)                   # не из y
+    z4 = dict(zd, k21_dbg_w=np.zeros((1, B, 20, 8), np.float32))
+    assert debug_problems(lab8, z4, bounds)                   # форма
+    assert not (float("nan") <= 1e-5)                         # NaN -> отказ
     print("самопроверка k34_policy пройдена: метки T/F/R, журнал выбранной "
           "глубины (глубина, слои, router, Expand, головы на каждом вызове; "
           "отладочный снимок головы)")
