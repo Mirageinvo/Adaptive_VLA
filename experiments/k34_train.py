@@ -485,10 +485,12 @@ def fitcheck_run(torch, a, D, mod, bar, mb):
     heads0 = {k: v for k, v in st0.items()
               if k.startswith(("readout8.", "readout16."))}
     ev0 = evaluate(torch, km, mod, bar, D, rows, dev, dt, a.eval_micro, mb)
+    ac = torch.autocast("cuda", dtype=dt, enabled=dev.type == "cuda")
     with torch.no_grad():
         mod.eval()
         b0 = mb(D, rows[:a.eval_micro], bar, dev)
-        o24_0 = mod(b0[0], b0[1], b0[2], exit_depth=24)["arm"].clone()
+        with ac:                         # как evaluate и харнесс
+            o24_0 = mod(b0[0], b0[1], b0[2], exit_depth=24)["arm"].clone()
     opt = make_opt(torch, G, "warmup")
     scaler = torch.cuda.amp.GradScaler(
         enabled=(dt == torch.float16 and dev.type == "cuda"))
@@ -512,7 +514,8 @@ def fitcheck_run(torch, a, D, mod, bar, mb):
     st1 = kt.trainable_state(mod)
     with torch.no_grad():
         mod.eval()
-        o24_1 = mod(b0[0], b0[1], b0[2], exit_depth=24)["arm"]
+        with torch.autocast("cuda", dtype=dt, enabled=dev.type == "cuda"):
+            o24_1 = mod(b0[0], b0[1], b0[2], exit_depth=24)["arm"]
     drop = {d: 1 - ev1[str(d)]["L"] / ev0[str(d)]["L"] for d in (8, 16)}
     changed = {nm: any(not torch.equal(st1[k], heads0[k]) for k in heads0
                        if k.startswith(nm + "."))
