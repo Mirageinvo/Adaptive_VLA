@@ -43,7 +43,7 @@ gpu_used_le () {   # DEV порог_занято_МиБ
   used="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$idx" 2>/dev/null | tr -d ' ')"
   [ -n "$used" ] || { echo "ОТКАЗ: nvidia-smi не отвечает для $1"; return 3; }
   echo "    $1: занято $used МиБ (порог $2)"
-  [ "$used" -le "$2" ] || { echo "    на $1 занято $used МиБ > $2"; return 3; }
+  [ "$used" -le "$2" ] || { echo "    на $1 занято $used МиБ > $2"; return 4; }
 }
 gpu_free_ge () {   # DEV нужно_свободно_МиБ
   local idx="${1#cuda:}" free
@@ -109,13 +109,13 @@ run_plan () {   # вид DEV
   done < <(printf '%s\n' "$out" | tail -n +2)
 }
 real_check () {   # DEV
-  $TRN check-fresh --kind real_check && return 0
+  $TRN check-fresh --kind real_check --device "$1" && return 0
   gpu_free_ge "$1" "${K35_TRAIN_FREE_MB:-14336}" || return 3
   $TRN real-check --device "$1"
 }
 fitcheck () {   # DEV
-  $TRN check-fresh --kind fitcheck && return 0
-  $TRN check-fresh --kind real_check || { echo "ОТКАЗ: real-check не свеж"; return 3; }
+  $TRN check-fresh --kind fitcheck --device "$1" && return 0
+  $TRN check-fresh --kind real_check --device "$1" || { echo "ОТКАЗ: real-check не свеж"; return 3; }
   gpu_free_ge "$1" "${K35_TRAIN_FREE_MB:-14336}" || return 3
   $TRN fitcheck --device "$1"
 }
@@ -149,10 +149,13 @@ pilot () {   # DEV
   run_plan pilot "$1" || return 3
   $PROT pilot-gate --plan reports/k35/plan_pilot.json
 }
-latency () {   # DEV
-  gpu_used_le "$1" 2048 || { echo "    latency_pending: карта занята"; return 0; }
-  $PY experiments/k35_latency.py --device "$1"
+latency () {   # DEV — занятая карта: штатный latency_pending (0); отказ замера — 3
+  local rc=0; gpu_used_le "$1" 2048 || rc=$?
+  [ "$rc" -eq 4 ] && { echo "    latency_pending: карта занята"; return 0; }
+  [ "$rc" -eq 0 ] || return 3
+  $PY experiments/k35_latency.py --device "$1" || { echo "ОТКАЗ: замер задержки"; return 3; }
 }
+analyze () { $PY experiments/k35_analyze.py || { echo "ОТКАЗ: анализ"; return 3; }; }
 
 case "$MODE" in
   selftest) selftests; finish $? ;;
@@ -167,7 +170,7 @@ case "$MODE" in
   selector-gate) $PROT selector-gate; finish $? ;;
   pilot) pilot "${2:-cuda:0}"; finish $? ;;
   latency) latency "${2:-cuda:0}"; finish $? ;;
-  analyze) $PY experiments/k35_analyze.py; finish $? ;;
+  analyze) analyze; finish $? ;;
   run-a)
     DEV="${2:-cuda:0}"
     echo "=== ЭТАП самопроверки"; selftests || finish 1
@@ -178,13 +181,13 @@ case "$MODE" in
     echo "=== ЭТАП обучение общего декодера"; train "$DEV" || { echo "ОСТАНОВ: обучение"; finish 3; }
     echo "=== ЭТАП оракул"; oracle "$DEV" || { echo "ОСТАНОВ: оракул"; finish 3; }
     echo "=== ЭТАП гейт оракула"; $PROT oracle-gate || finish 3
-    gate_or_stop reports/k35/oracle_gate.json || { $PY experiments/k35_analyze.py; finish 0; }
+    gate_or_stop reports/k35/oracle_gate.json || { analyze || finish 3; finish 0; }
     echo "=== ЭТАП селекторы"; [ -f data/k35/selectors.pt ] || $PROT selectors || finish 3
     $PROT selector-gate || finish 3
-    gate_or_stop reports/k35/selector_gate.json || { $PY experiments/k35_analyze.py; finish 0; }
+    gate_or_stop reports/k35/selector_gate.json || { analyze || finish 3; finish 0; }
     echo "=== ЭТАП SR-пилот"; pilot "$DEV" || { echo "ОСТАНОВ: пилот"; finish 3; }
-    echo "=== ЭТАП задержка"; [ -f reports/k35/latency.json ] || latency "$DEV"
-    echo "=== ЭТАП анализ"; $PY experiments/k35_analyze.py
+    echo "=== ЭТАП задержка"; [ -f reports/k35/latency.json ] || latency "$DEV" || finish 3
+    echo "=== ЭТАП анализ"; analyze || finish 3
     echo "=== K35-A ЗАВЕРШЁН $(date); статус пилота: $(status_of reports/k35/pilot_gate.json)"
     finish 0 ;;
   *) echo "режим $MODE неизвестен"; finish 2 ;;

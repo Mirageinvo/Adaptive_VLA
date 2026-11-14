@@ -242,8 +242,9 @@ def build(torch):
             a = torch.as_tensor(a, dtype=torch.long).reshape(-1).cpu()
             if a.numel() != B or int(a.min()) < 0 or int(a.max()) > 5:
                 raise SystemExit("решение a вне 0…5")
-            sel_r = TAB["split_roots"][a]                          # [B, 2]
-            term_r = TAB["term_roots"][a]
+            a6 = 6 * a                  # таблицы — по c; строка 6a — срезы с этим a
+            sel_r = TAB["split_roots"][a6]                         # [B, 2]
+            term_r = TAB["term_roots"][a6]
             iv_sel = gather_nodes(iv, sel_r)
             iv_mid, s1 = self.T["split"](iv_sel, gather_nodes(
                 v1[..., None], sel_r)[..., 0], False)              # [B, 4, 2]
@@ -256,8 +257,9 @@ def build(torch):
             cnt["expand"] += 1
             ha = torch.cat([roots, h_mid], 1)
             # --- стадия 2: корни + 4 средних -----------------------------------
-            par_mid = TAB["mid_parent_local"][a]                   # [B, 4]
-            run_stage(8, 16, TAB["slots2"][a], (4, 4), [par_mid])
+            par_mid = TAB["mid_parent_local"][a6]                  # [B, 4]
+            slots2 = TAB["slots2"][a6]
+            run_stage(8, 16, slots2, (4, 4), [par_mid])
             mids = ha[:, 4:8]
             v2 = self.split2(mids)                                 # [B, 4]
             mids_n = norm(mids)
@@ -266,7 +268,7 @@ def build(torch):
             else:
                 b = controller.second(dict(roots_n=roots_n, iv=iv,
                                            mids_n=mids_n, iv_mid=iv_mid,
-                                           mids=TAB["mids"][a], a=a, B=B))
+                                           mids=TAB["mids"][a6], a=a, B=B))
                 cnt["decisions"] += 1
             b = torch.as_tensor(b, dtype=torch.long).reshape(-1).cpu()
             if b.numel() != B or int(b.min()) < 0 or int(b.max()) > 5:
@@ -288,7 +290,8 @@ def build(torch):
             ha = torch.cat([ha, h_leaf], 1)
             # --- стадия 3: корни + средние + 4 листа ---------------------------
             par_leaf = TAB["leaf_parent_local"][c]
-            run_stage(16, 24, TAB["slots3"][c], (4, 4, 4),
+            slots3 = TAB["slots3"][c]
+            run_stage(16, 24, slots3, (4, 4, 4),
                       [par_mid, par_leaf])
             leaves = ha[:, 8:12]
             y_leaf = self._partial("leaf", leaves, iv_leaf, W_leaf, cnt)
@@ -306,6 +309,17 @@ def build(torch):
                        w_sum=w_sum, iv_leaf=iv_leaf, W_leaf=W_leaf,
                        term_roots=term_r, term_mid_local=term_m,
                        snap=snap)
+            # фактически исполненный маршрут (то, что ушло в gather, Expand,
+            # router и RoPE) — для сверки с ожидаемой топологией среза
+            out["route"] = dict(
+                split_roots=sel_r, term_roots=term_r,
+                mids=TAB["mids"][a6], mid_parent_local=par_mid,
+                slots2=slots2, split_mid_local=sel_m,
+                term_mid_local=term_m,
+                leaves=gather_nodes(TAB["mids"][a6][..., None].float(),
+                                    sel_m)[..., 0].long().repeat_interleave(
+                                        2, 1) * 2 + torch.tensor([0, 1, 0, 1]),
+                leaf_parent_local=par_leaf, slots3=slots3)
             out["bank"] = dict(counts=bank["counts"],
                                n_max=int(bank["E"].shape[1]),
                                dv=int(bank["E"].shape[2]))
@@ -318,7 +332,7 @@ def build(torch):
         m = K35(bar, L, U, state_mean, state_std, **kw)
         return m
 
-    return dict(K35=K35, make=make, mapped_probs=mapped_probs,
+    return dict(K35=K35, make=make, mapped_probs=mapped_probs, TAB=TAB,
                 router_mapped=router_mapped, M34=M34, R=R,
                 gather_nodes=gather_nodes, gather_w=gather_w)
 
@@ -354,6 +368,107 @@ def assemble_np(partials, L, U):
     U = np.asarray(U, np.float32)
     mid, half = (U + L) / 2, (U - L) / 2
     return y, mid + half * np.tanh(y[..., :6] / half), y[..., 6]
+
+
+def route_check(torch, m, bt, st, cut_lists, po=1, iv_tol=1e-5):
+    """Перехват фактических аргументов forward и сверка с tp.CUTS."""
+    for cs in cut_lists:
+        rec = dict(split=[], exp=[], slots=[], heads=[])
+        f_s1, f_s2 = m.split1.forward, m.split2.forward
+        f_e1, f_e2 = m.exp1.forward, m.exp2.forward
+        f_pos, f_part = m._pos_rows, m._partial
+
+        def s1(x, _f=f_s1):
+            rec["split"].append(x.detach().clone())
+            return _f(x)
+
+        def s2(x, _f=f_s2):
+            rec["split"].append(x.detach().clone())
+            return _f(x)
+
+        def e1(hh, ivc, _f=f_e1):
+            rec["exp"].append((hh.detach().clone(), ivc.detach().clone()))
+            return _f(hh, ivc)
+
+        def e2(hh, ivc, _f=f_e2):
+            rec["exp"].append((hh.detach().clone(), ivc.detach().clone()))
+            return _f(hh, ivc)
+
+        def pos(B, V, slots, po, dev, _f=f_pos):
+            rec["slots"].append(slots.detach().clone())
+            return _f(B, V, slots, po, dev)
+
+        def part(level, h, iv, w, cnt, _f=f_part):
+            rec["heads"].append((level, h.detach().clone(),
+                                 iv.detach().clone()))
+            return _f(level, h, iv, w, cnt)
+        m.split1.forward, m.split2.forward = s1, s2
+        m.exp1.forward, m.exp2.forward = e1, e2
+        m._pos_rows, m._partial = pos, part
+        m.router_capture = []
+        try:
+            with torch.no_grad():
+                o = m(bt, po, st, cuts=cs)
+        finally:
+            for nm in ("split1", "split2", "exp1", "exp2"):
+                del getattr(m, nm).forward
+            del m._pos_rows, m._partial
+            cap, m.router_capture = m.router_capture, None
+        roots, mids = rec["split"]
+        sn = o["snap"]
+        for i, c in enumerate(cs):
+            C = tp.CUTS[c]
+            r = {k: v[i].tolist() for k, v in o["route"].items()}
+            for k in ("split_roots", "term_roots", "mids",
+                      "mid_parent_local", "slots2", "split_mid_local",
+                      "term_mid_local", "leaves", "leaf_parent_local",
+                      "slots3"):
+                assert r[k] == C[k], (c, k, r[k], C[k])
+            assert int(o["c"][i]) == c
+            # Expand-1: скрытые и интервалы именно выбранных корней
+            h1, iv1 = rec["exp"][0]
+            assert torch.equal(h1[i], roots[i, C["split_roots"]]), (c, "exp1")
+            ivr = sn["iv_root"][i]
+            for j, rr in enumerate(C["split_roots"]):
+                lo, hi = ivr[rr]
+                sub = iv1[i, 2 * j:2 * j + 2]
+                assert float(sub[:, 0].min()) >= float(lo) - iv_tol and \
+                    float(sub[:, 1].max()) <= float(hi) + iv_tol, (c, "iv1")
+            # Expand-2: средние в локальных позициях split_mid_local
+            h2, iv2 = rec["exp"][1]
+            assert torch.equal(h2[i], mids[i, C["split_mid_local"]]), \
+                (c, "exp2")
+            ivm = sn["iv_mid"][i]
+            for j, mm in enumerate(C["split_mid_local"]):
+                lo, hi = ivm[mm]
+                sub = iv2[i, 2 * j:2 * j + 2]
+                assert float(sub[:, 0].min()) >= float(lo) - iv_tol and \
+                    float(sub[:, 1].max()) <= float(hi) + iv_tol, (c, "iv2")
+            # средние — дети выбранных корней по интервалу
+            for j, mm in enumerate(C["mids"]):
+                lo, hi = ivr[mm // 2]
+                assert float(ivm[j, 0]) >= float(lo) - iv_tol and \
+                    float(ivm[j, 1]) <= float(hi) + iv_tol, (c, "mid iv")
+            # RoPE: слоты стадий 1–3
+            assert rec["slots"][0][i].tolist() == list(tp.ROOT_SLOTS)
+            assert rec["slots"][1][i].tolist() == C["slots2"], (c, "slots2")
+            assert rec["slots"][2][i].tolist() == C["slots3"], (c, "slots3")
+            # router: явные родители (стадии 2 и 3, по две точки)
+            for k in (2, 3):
+                assert cap[k]["parents"][0][i].tolist() == \
+                    C["mid_parent_local"], (c, "router mid")
+            for k in (4, 5):
+                assert cap[k]["parents"][0][i].tolist() == \
+                    C["mid_parent_local"] and cap[k]["parents"][1][i]\
+                    .tolist() == C["leaf_parent_local"], (c, "router leaf")
+            # головы: интервалы конечных корней / средних
+            lv = {x[0]: x for x in rec["heads"]}
+            assert torch.equal(lv["root"][2][i], ivr[C["term_roots"]]), \
+                (c, "head root iv")
+            assert torch.equal(lv["mid"][2][i], ivm[C["term_mid_local"]]), \
+                (c, "head mid iv")
+            assert torch.equal(lv["root"][1][i], roots[i, C["term_roots"]])
+            assert torch.equal(lv["mid"][1][i], mids[i, C["term_mid_local"]])
 
 
 # --- самопроверка ------------------------------------------------------------------
@@ -476,8 +591,30 @@ def selftest():
         for i, c in enumerate(mix):
             assert torch.allclose(om["arm"][i], outs[c]["arm"][i],
                                   atol=1e-5), (i, c)
-    assert len({tuple(outs[c]["arm"][0].flatten()[:5].tolist())
-                for c in range(36)}) > 30
+    # весь чанк (первые шаги покрыты одним корнем во многих срезах)
+    assert len({tuple(np.round(outs[c]["arm"][0].flatten().numpy(), 6)
+                      .tolist()) for c in range(36)}) == 36
+    # 1a. фактический маршрут каждого среза = топологии: Expand получает
+    # скрытые состояния и интервалы выбранных родителей, router — явных
+    # родителей, RoPE — слоты среза, головы — интервалы конечных узлов;
+    # смешанный батч — по строкам
+    route_check(torch, m, bt, st, [[c] * 3 for c in range(36)] +
+                [[0, 17, 35], [35, 6, 29], [12, 1, 23]])
+    # регрессия: прежняя ошибка (таблица по a вместо 6a) ловится
+    TAB0 = M["TAB"]
+    keep = {k: v.clone() for k, v in TAB0.items()}
+    try:
+        for k in ("split_roots", "term_roots", "mids", "slots2"):
+            TAB0[k][6:] = TAB0[k][:30].clone() * 0 + TAB0[k][0]
+        try:
+            route_check(torch, m, bt, st, [[35] * 3])
+            raise AssertionError("ошибочный маршрут не пойман")
+        except AssertionError as e:
+            if "не пойман" in str(e):
+                raise
+    finally:
+        for k, v in keep.items():
+            TAB0[k].copy_(v)
     # 10. сборка = независимой; сумма уже ограниченных arm — провал
     o = outs[14]
     y, arm, grip = assemble_np({k: v.numpy() for k, v in o["partial"].items()},

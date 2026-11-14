@@ -114,6 +114,27 @@ def schedule_fp(D, micro, points=(0, 1, 2, 3, 499, 500, 4499)):
     return h.hexdigest()
 
 
+def base_config(source, micro, dtype, panel):
+    """Контракт обучения без очереди (schedule_fp зависит от данных);
+    JSON-нормализован (кортежи -> списки)."""
+    return json.loads(json.dumps(dict(
+        source=source, loss=LOSS, micro=micro, dtype=dtype,
+        eff_batch=EFF_BATCH,
+        warm=dict(updates=WARM_UPDATES, lr=WARM_LR, groups=["heads"]),
+        main=dict(updates=MAIN_UPDATES, lr=LR, warm=MAIN_WARM,
+                  floor=LR_FLOOR), wd=WD, clip=CLIP, u_offset=U_OFFSET,
+        seed=SEED, ckpt_cuts=list(ko.CKPT_CUTS),
+        panel_sha1=ko.sha_arr(panel),
+        topology=dict(n_cuts=tp.N_CUTS, pairs=[list(x) for x in tp.PAIRS]),
+        code=code_now())))
+
+
+def source_binding():
+    p = prepare_entry()
+    return dict(ckpt_sha1=p["source"]["ckpt_sha1"],
+                weights_hash=p["source"]["weights_hash"])
+
+
 # --- источник ---------------------------------------------------------------------
 def prepare_entry():
     if not os.path.exists(PREPARE):
@@ -221,9 +242,7 @@ class Trainer:
         self.panel = np.asarray(panel_rows)
         if make_model is None:
             self.mod, self.bar = load_k35(torch, a.device)
-            p = prepare_entry()
-            self.source = dict(ckpt_sha1=p["source"]["ckpt_sha1"],
-                               weights_hash=p["source"]["weights_hash"])
+            self.source = source_binding()
         else:
             self.mod, self.bar = make_model()
             self.source = dict(fake=True)
@@ -236,17 +255,10 @@ class Trainer:
                        init_hash=self.init_hash, acc={})
 
     def config(self):
-        return dict(source=self.source, loss=LOSS, micro=self.a.micro,
-                    dtype=self.a.dtype, eff_batch=EFF_BATCH,
-                    warm=dict(updates=WARM_UPDATES, lr=WARM_LR,
-                              groups=["heads"]),
-                    main=dict(updates=MAIN_UPDATES, lr=LR, warm=MAIN_WARM,
-                              floor=LR_FLOOR), wd=WD, clip=CLIP,
-                    u_offset=U_OFFSET, seed=SEED, ckpt_cuts=list(ko.CKPT_CUTS),
-                    panel_sha1=ko.sha_arr(self.panel),
+        return dict(base_config(self.source, self.a.micro, self.a.dtype,
+                                self.panel),
                     schedule_fp=schedule_fp(self.D, self.a.micro),
-                    topology=dict(n_cuts=tp.N_CUTS, pairs=list(tp.PAIRS)),
-                    code=code_now(), **self.extra)
+                    **self.extra)
 
     def save(self, opt):
         import k21_train as kt
@@ -404,29 +416,107 @@ class Trainer:
 def micro_now():
     if os.path.exists(REAL_CHECK):
         r = json.load(open(REAL_CHECK, encoding="utf-8"))
-        if r.get("problems") == [] and r.get("micro"):
+        if not realcheck_result_problems(r):
             return int(r["micro"])
     return None
 
 
-def fresh_problems(kind):
-    """Отчёт real-check / fitcheck пройден и с текущим контрактом."""
+def device_contract(torch, dev, dtype):
+    return dict(code=code_now(), prepare_sha1=sha(PREPARE),
+                device=torch.cuda.get_device_name(dev), dtype=dtype)
+
+
+def realcheck_result_problems(r):
+    """Полнота и прохождение всех результатов real-check."""
+    p = []
+    if r.get("problems") != []:
+        p.append("real-check: есть проблемы")
+    R = r.get("results") or {}
+    for B in (1, 5):
+        if R.get(f"B{B}_source_equal") is not True:
+            p.append(f"real-check: нет/не пройдено B{B}_source_equal")
+        if R.get(f"B{B}_route_ok") is not True:
+            p.append(f"real-check: нет/не пройден маршрут B{B}")
+        w = R.get(f"B{B}_worst") or {}
+        if set(w) != set(RC_TOL) or not all(
+                isinstance(w[k], (int, float)) and np.isfinite(w[k]) and
+                w[k] <= RC_TOL[k] for k in RC_TOL):
+            p.append(f"real-check: допуски B{B} неполны или превышены")
+    if R.get("route_hooks_ok") is not True:
+        p.append("real-check: нет перехвата маршрута")
+    ms = R.get("main_step") or {}
+    ch = ms.get("changed") or {}
+    if ms.get("finite") is not True or ms.get("frozen_unchanged") is not \
+            True or set(ch) != {"expert", "lora", "new", "heads"} or \
+            not all(v is True for v in ch.values()):
+        p.append("real-check: main-шаг неполон или не пройден")
+    if R.get("save_load") is not True:
+        p.append("real-check: save/load")
+    mc = r.get("micro")
+    prof = R.get("micro_profile") or {}
+    pk = prof.get(str(mc))
+    if mc not in MICROS or R.get("micro") != mc or \
+            not isinstance(pk, (int, float)) or not pk <= PEAK_LIMIT_GB:
+        p.append("real-check: micro или его профиль неполны")
+    else:
+        for m_ in MICROS:
+            if m_ == mc:
+                break
+            v = prof.get(str(m_))
+            if not (v == "OOM" or (isinstance(v, (int, float)) and
+                                   v > PEAK_LIMIT_GB)):
+                p.append(f"real-check: micro {m_} не исключён измерением")
+    return p
+
+
+def fitcheck_result_problems(r):
+    p = []
+    try:
+        drop = 1 - float(r["L_after"]) / float(r["L_before"])
+    except (KeyError, TypeError, ZeroDivisionError, ValueError):
+        return ["fitcheck: нет L до/после"]
+    if not (np.isfinite(drop) and abs(drop - float(r.get("drop", np.nan)))
+            < 1e-9 and drop >= FIT_DROP):
+        p.append("fitcheck: снижение L не подтверждается или < 30%")
+    hc = r.get("heads_changed") or {}
+    if set(hc) != {"readout8", "readout16", "readout"} or \
+            not all(v is True for v in hc.values()):
+        p.append("fitcheck: не все три головы изменились")
+    if r.get("rest_unchanged") is not True:
+        p.append("fitcheck: изменилось что-то вне голов")
+    if r.get("criterion") != dict(drop=FIT_DROP, updates=FIT_UPDATES,
+                                  n=FIT_N) or len(r.get("rows") or []) != \
+            FIT_N:
+        p.append("fitcheck: критерий или строки ≠ плану")
+    if r.get("ok") is not True:
+        p.append("fitcheck: не пройден")
+    return p
+
+
+def fresh_problems(kind, device_name=None, dtype="float16"):
+    """Отчёт real-check / fitcheck полон, пройден и с текущим контрактом
+    (код, подготовка, устройство, dtype, micro)."""
     path = dict(real_check=REAL_CHECK, fitcheck=FITCHECK)[kind]
     if not os.path.exists(path):
         return [f"нет {path}"]
     r = json.load(open(path, encoding="utf-8"))
-    p = []
-    ok = r.get("problems") == [] if kind == "real_check" else \
-        r.get("ok") is True
-    if not ok:
-        p.append(f"{kind} не пройден")
+    p = realcheck_result_problems(r) if kind == "real_check" else \
+        fitcheck_result_problems(r)
     c = r.get("contract") or {}
     if c.get("code") != code_now():
         p.append(f"{kind}: код изменён после проверки")
     if not os.path.exists(PREPARE) or c.get("prepare_sha1") != sha(PREPARE):
         p.append(f"{kind}: другая подготовка")
-    if kind == "fitcheck" and c.get("micro") != micro_now():
-        p.append("fitcheck: micro ≠ решению real-check")
+    if c.get("dtype") != dtype:
+        p.append(f"{kind}: dtype {c.get('dtype')} ≠ {dtype}")
+    if device_name is not None and c.get("device") != device_name:
+        p.append(f"{kind}: устройство {c.get('device')} ≠ {device_name}")
+    if kind == "fitcheck":
+        rc = json.load(open(REAL_CHECK, encoding="utf-8")) \
+            if os.path.exists(REAL_CHECK) else {}
+        if c.get("micro") != micro_now() or c.get("device") != \
+                (rc.get("contract") or {}).get("device"):
+            p.append("fitcheck: micro/устройство ≠ решению real-check")
     return p
 
 
@@ -454,7 +544,9 @@ def train(a):
     import k21_data as d21
     import k21_train as kt
     import k23_train as k23t
-    pr = fresh_problems("real_check") + fresh_problems("fitcheck")
+    nm = torch.cuda.get_device_name(torch.device(a.device))
+    pr = fresh_problems("real_check", nm, a.dtype) + \
+        fresh_problems("fitcheck", nm, a.dtype)
     if pr:
         raise SystemExit("; ".join(pr))
     a.micro = a.micro or micro_now()
@@ -491,6 +583,8 @@ def train(a):
 
 
 def train_problems(micro, dtype):
+    """Отчёт обучения полон и соответствует контракту: источник, seed,
+    панель, потеря, режим, очередь, код, micro/dtype, 4000 main, best."""
     if not os.path.exists(REPORT):
         return ["нет отчёта обучения"]
     r = json.load(open(REPORT, encoding="utf-8"))
@@ -498,12 +592,33 @@ def train_problems(micro, dtype):
     p = []
     if not os.path.exists(ck) or sha(ck) != r.get("best_sha1"):
         p.append("best.pt ≠ отчёту")
-    c = r.get("config") or {}
-    for k, v in (("micro", micro), ("dtype", dtype), ("code", code_now())):
-        if c.get(k) != v:
-            p.append(f"конфигурация {k} ≠ текущей")
-    if (r.get("updates") or {}).get("main") != MAIN_UPDATES:
-        p.append("обучение не дошло до 4000 main")
+    if micro is None:
+        return p + ["нет решения о micro (real-check)"]
+    try:
+        pan = json.load(open(ko.PANELS, encoding="utf-8"))
+        want = base_config(source_binding(), micro, dtype,
+                           pan["checkpoint_val"]["rows"])
+        init = prepare_entry()["source"]["weights_hash"]
+    except (OSError, KeyError, SystemExit) as e:
+        return p + [f"нет подготовки/панелей: {e}"]
+    c = dict(r.get("config") or {})
+    if not isinstance(c.pop("schedule_fp", None), str):
+        p.append("в конфигурации нет отпечатка очереди")
+    diff = sorted(k for k in set(c) | set(want) if c.get(k) != want.get(k))
+    if diff:
+        p.append(f"конфигурация обучения ≠ контракту: {diff}")
+    if r.get("init_hash") != init:
+        p.append("начальные веса обучения ≠ источнику K-34 T0")
+    if r.get("updates") != dict(warmup=WARM_UPDATES, main=MAIN_UPDATES):
+        p.append("обучение не дошло до 500 + 4000")
+    ups = [x.get("update") for x in r.get("curve") or []]
+    if ups != list(range(0, MAIN_UPDATES + 1, EVAL_EVERY)):
+        p.append("кривая проверок неполна")
+    else:
+        vals = [x["val"]["mean_L"] for x in r["curve"]]
+        bu = ups[int(np.argmin(vals))]
+        if r.get("best_update") != bu or (r.get("best") or [None])[0] != bu:
+            p.append("best ≠ минимуму кривой (ничья — ранний шаг)")
     return p
 
 
@@ -514,9 +629,14 @@ def load_trained(torch, device, checkpoint=False):
     ck_path = os.path.join(RUN_DIR, "best.pt")
     if sha(ck_path) != r["best_sha1"]:
         raise SystemExit("best.pt K-35 ≠ отчёту")
+    pr = train_problems(micro_now(), "float16")
+    if pr:
+        raise SystemExit("обучение K-35: " + "; ".join(pr))
     ck = torch.load(ck_path, map_location="cpu", weights_only=False)
-    if ck["config"].get("code") != code_now():
-        raise SystemExit("контракт кода best.pt K-35 ≠ текущему")
+    if ck.get("config") != r["config"] or ck.get("weights_hash") != \
+            r["best_weights_hash"] or ck.get("update") != r["best_update"] \
+            or ck.get("init_hash") != r["init_hash"]:
+        raise SystemExit("best.pt K-35: конфигурация/отпечаток ≠ отчёту")
     mod, bar = load_k35(torch, device, checkpoint=checkpoint)
     own = dict(mod.named_parameters())
     own.update(dict(mod.named_buffers()))
@@ -593,12 +713,17 @@ def fitcheck_run(torch, a, D, mod, bar, mb):
 def fitcheck(a):
     import torch
     import k21_data as d21
-    a.micro = a.micro or micro_now() or 8
+    nm = torch.cuda.get_device_name(torch.device(a.device))
+    pr = fresh_problems("real_check", nm, a.dtype)
+    if pr:
+        raise SystemExit("fitcheck требует свежего real-check: " +
+                         "; ".join(pr))
+    a.micro = micro_now()
     D = d21.load_prepared(require_teacher=False)
     mod, bar = load_k35(torch, a.device)
     r = fitcheck_run(torch, a, D, mod, bar, d21.make_batch)
-    r["contract"] = dict(code=code_now(), prepare_sha1=sha(PREPARE),
-                         micro=a.micro, dtype=a.dtype)
+    r["contract"] = dict(device_contract(torch, torch.device(a.device),
+                                         a.dtype), micro=a.micro)
     os.makedirs("reports/k35", exist_ok=True)
     json.dump(r, open(FITCHECK, "w", encoding="utf-8"), ensure_ascii=False,
               indent=1, default=float)
@@ -639,48 +764,65 @@ def slow_probs(S, valid, sizes, parents, eps):
     return P
 
 
-def real_check(a):
-    """GPU: источник, 36 срезов, router, сборка, шаг, save/load, micro."""
+RC_TOL = dict(w_sum=5e-6, router=5e-6, y=1e-5, arm=1e-6)
+ROUTE_IV_TOL = 0.05        # вложенность интервалов под fp16 (единицы шагов)
+SMOKE_CUTS_RC = ([0, 17, 35, 9, 26], [35] * 5, [17] * 5)
+
+
+def _free(torch):
     import gc
-    import tempfile
-    import torch
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def _ref_outputs(torch, D, rows, spec, device):
+    """Настоящая рука K-34 T0 -> CPU-входы и выходы B = 1, 5; модель
+    освобождается внутри функции."""
     import k21_data as d21
-    import k21_model as km
-    import k21_train as kt
     import k34_policy as kp34
-    D = d21.load_prepared(require_teacher=False)
-    dev = torch.device(a.device)
-    prep = prepare_entry()
-    rows = np.asarray(D["val_rows"])[:5]
-    prob, rep = [], {}
-    # 1) настоящая рука K-34 T0 (отдельная область жизни)
-    spec = prep["source"]["spec"]
+    dev = torch.device(device)
     ref, bar, _ck, _p = kp34.load_trained(torch, "parents_attn24", 0, 24,
-                                          spec, a.device)
+                                          spec, device)
     ref_out, inputs = {}, {}
     with torch.no_grad():
         for B in (1, 5):
             batch, po, st, tgt, val = d21.make_batch(D, rows[:B], bar, dev)
             inputs[B] = (dict((k, v.cpu()) for k, v in batch.items()),
-                         po.cpu(), st.cpu(), tgt.cpu(), val.cpu())
+                         po.cpu() if hasattr(po, "cpu") else po, st.cpu(),
+                         tgt.cpu(), val.cpu())
             with torch.autocast("cuda", dtype=torch.float16):
                 o = ref(batch, po, st, exit_depth=24)
-            ref_out[B] = (o["arm"].float().cpu(), o["grip_logit"].float().cpu())
-    del ref, bar
-    gc.collect()
-    torch.cuda.empty_cache()
+            ref_out[B] = (o["arm"].float().cpu(),
+                          o["grip_logit"].float().cpu())
+    del ref, bar, o, batch
+    return inputs, ref_out
 
-    def to_dev(B):
-        b, po, st, tgt, val = inputs[B]
-        return ({k: v.to(dev) for k, v in b.items()}, po.to(dev),
-                st.to(dev), tgt.to(dev), val.to(dev))
+
+def _to_dev(torch, inp, dev):
+    b, po, st, tgt, val = inp
+    return ({k: v.to(dev) for k, v in b.items()},
+            po.to(dev) if hasattr(po, "to") else po, st.to(dev), tgt.to(dev),
+            val.to(dev))
+
+
+def _k35_checks(torch, inputs, ref_out, device):
+    """Источник, 36 срезов (B1/B5, смешанные), фактический маршрут, router,
+    сборка, main-шаг, save/load. Возвращает только CPU-результаты."""
+    import tempfile
+    import k21_model as km
+    import k21_train as kt
+    dev = torch.device(device)
+    rep, prob = {}, []
     rep["mem_before_load_gb"] = torch.cuda.memory_allocated(dev) / 2 ** 30
     torch.cuda.reset_peak_memory_stats(dev)
-    mod, bar = load_k35(torch, a.device, checkpoint=False)
+    mod, _bar = load_k35(torch, device, checkpoint=False)
+    rep["mem_loaded_gb"] = torch.cuda.memory_allocated(dev) / 2 ** 30
     mod.eval()
+    TAB = tp.tables()
+    eps = float(mod.router.eps)
     with torch.no_grad():
         for B in (1, 5):
-            batch, po, st, tgt, val = to_dev(B)
+            batch, po, st, tgt, val = _to_dev(torch, inputs[B], dev)
             with torch.autocast("cuda", dtype=torch.float16):
                 o = mod.source_forward(batch, po, st)
             same = torch.equal(o["arm"].float().cpu(), ref_out[B][0]) and \
@@ -689,52 +831,73 @@ def real_check(a):
             if not same:
                 prob.append(f"B{B}: source_forward ≠ K-34 T0 побитово")
             worst = dict(w_sum=0.0, router=0.0, y=0.0, arm=0.0)
+            route_bad = []
             cut_lists = [[c] * B for c in range(36)]
             if B == 5:
-                cut_lists.append([0, 17, 35, 9, 26])
+                cut_lists += [list(x) for x in SMOKE_CUTS_RC]
             for cs in cut_lists:
                 mod.router_capture = []
                 with torch.autocast("cuda", dtype=torch.float16):
                     o = mod(batch, po, st, cuts=cs)
-                cap = mod.router_capture
-                mod.router_capture = None
+                cap, mod.router_capture = mod.router_capture, None
                 prob += [f"c={cs[0]}: {x}" for x in
                          k35m.counters_problems(mod.counters)]
                 if not (torch.isfinite(o["arm"]).all() and
                         torch.isfinite(o["y"]).all()):
                     prob.append(f"c={cs}: нечисловой выход")
+                cc = np.asarray(cs)
+                if not np.array_equal(o["c"].numpy(), cc):
+                    route_bad.append(f"c {cs}")
+                for k, v in o["route"].items():
+                    if not np.array_equal(v.cpu().numpy(), TAB[k][cc]):
+                        route_bad.append(f"{k} при c {cs}")
                 worst["w_sum"] = max(worst["w_sum"], float(
                     (o["w_sum"] - 1).abs().max()))
-                last = cap[-1]
-                Ps = slow_probs(last["S"].numpy(), last["valid"].numpy(),
-                                last["sizes"], [x.numpy() for x in
-                                                last["parents"]], 0.1)
-                worst["router"] = max(worst["router"], float(
-                    np.abs(Ps - last["P"].numpy()).max()))
+                for last in cap:
+                    Ps = slow_probs(last["S"].numpy(), last["valid"].numpy(),
+                                    last["sizes"], [x.numpy() for x in
+                                                    last["parents"]], eps)
+                    worst["router"] = max(worst["router"], float(
+                        np.abs(Ps - last["P"].numpy()).max()))
                 y, arm, grip = k35m.assemble_np(
                     {k: v.cpu().numpy() for k, v in o["partial"].items()},
                     mod.readout.L.cpu().numpy(), mod.readout.U.cpu().numpy())
                 worst["y"] = max(worst["y"], float(np.abs(
-                    y - o["y"].cpu().numpy()).max()))
+                    y - o["y"].cpu().numpy()).max()), float(np.abs(
+                        grip - o["grip_logit"].cpu().numpy()).max()))
                 worst["arm"] = max(worst["arm"], float(np.abs(
                     arm - o["arm"].cpu().numpy()).max()))
             rep[f"B{B}_worst"] = worst
-            if not (worst["w_sum"] <= 5e-6 and worst["router"] <= 5e-6 and
-                    worst["y"] <= 1e-5 and worst["arm"] <= 1e-6):
+            rep[f"B{B}_route_ok"] = not route_bad
+            if route_bad:
+                prob.append(f"B{B}: исполненный маршрут ≠ топологии: "
+                            f"{route_bad[:3]}")
+            if not all(worst[k] <= RC_TOL[k] for k in RC_TOL):
                 prob.append(f"B{B}: допуски {worst}")
-    # 2) main-шаг, save/load
+        # перехват аргументов Expand / router / RoPE / голов на настоящей
+        # модели (те же проверки, что в самопроверке k35_model)
+        batch, po, st, tgt, val = _to_dev(torch, inputs[5], dev)
+        try:
+            with torch.autocast("cuda", dtype=torch.float16):
+                k35m.route_check(torch, mod, batch, st,
+                                 [list(x) for x in SMOKE_CUTS_RC],
+                                 po=po, iv_tol=ROUTE_IV_TOL)
+            rep["route_hooks_ok"] = True
+        except AssertionError as e:
+            rep["route_hooks_ok"] = False
+            prob.append(f"перехват маршрута: {str(e)[:200]}")
+    # main-шаг
     G = k35m.groups(mod)
+    set_phase(G, "main")
     frozen = {n: p.detach().cpu().clone() for n, p in mod.named_parameters()
               if not p.requires_grad}
     before = {k: [p.detach().cpu().clone() for p in G[k]] for k in G}
-    set_phase(G, "main")
     opt = make_opt(torch, G, "main")
     mod.train()
     mod.checkpoint = True
-    batch, po, st, tgt, val = to_dev(5)
     opt.zero_grad(set_to_none=True)
     with torch.autocast("cuda", dtype=torch.float16):
-        o = mod(batch, po, st, cuts=[0, 17, 35, 9, 26])
+        o = mod(batch, po, st, cuts=list(SMOKE_CUTS_RC[0]))
         loss = km.loss_fn(torch, o, tgt, val)[0]
     loss.mean().backward()
     fin = all(bool(torch.isfinite(p.grad).all()) for k in G for p in G[k]
@@ -744,17 +907,18 @@ def real_check(a):
                   zip(G[k], before[k])) for k in G}
     fz = all(torch.equal(p.detach().cpu(), frozen[n]) for n, p in
              mod.named_parameters() if n in frozen)
-    del opt, G, before, frozen, o, loss
     rep["main_step"] = dict(finite=bool(fin), changed=chg,
                             frozen_unchanged=bool(fz))
     if not (fin and all(chg.values()) and fz):
         prob.append(f"main-шаг {rep['main_step']}")
+    del opt, before, frozen, o, loss
+    # save/load: порча голов и общего веса, восстановление, те же выходы
     mod.eval()
     mod.checkpoint = False
+    cs = [3, 14, 25, 30, 1]
     with torch.no_grad():
         with torch.autocast("cuda", dtype=torch.float16):
-            r1 = mod(batch, po, st, cuts=[3, 14, 25, 30, 1])["arm"].float()\
-                .cpu()
+            r1 = mod(batch, po, st, cuts=cs)["arm"].float().cpu()
         with tempfile.TemporaryDirectory() as td:
             f = os.path.join(td, "s.pt")
             torch.save(kt.trainable_state(mod), f)
@@ -763,67 +927,199 @@ def real_check(a):
                     p_.add_(0.01)
             for p_ in mod.bar.action_expert.layers[0].parameters():
                 p_.add_(0.001)
+            with torch.autocast("cuda", dtype=torch.float16):
+                r_bad = mod(batch, po, st, cuts=cs)["arm"].float().cpu()
             own = dict(mod.named_parameters())
             own.update(dict(mod.named_buffers()))
             for k, v in torch.load(f, weights_only=False).items():
                 own[k].copy_(v.to(own[k].device, own[k].dtype))
+            del own
         with torch.autocast("cuda", dtype=torch.float16):
-            r2 = mod(batch, po, st, cuts=[3, 14, 25, 30, 1])["arm"].float()\
-                .cpu()
-    rep["save_load"] = bool(torch.equal(r1, r2))
+            r2 = mod(batch, po, st, cuts=cs)["arm"].float().cpu()
+    rep["save_load"] = bool(torch.equal(r1, r2) and not torch.equal(r1,
+                                                                    r_bad))
     if not rep["save_load"]:
         prob.append("save/load")
-    rep["peak_gb_eval"] = torch.cuda.max_memory_allocated(dev) / 2 ** 30
-    # 3) micro: первый из 32/16/8 без OOM и с пиком ≤ 14 ГиБ на полном шаге
-    mod.train()
-    mod.checkpoint = True
-    G = k35m.groups(mod)
-    set_phase(G, "main")
-    opt = make_opt(torch, G, "main")
+    rep["peak_gb_checks"] = torch.cuda.max_memory_allocated(dev) / 2 ** 30
+    del mod, _bar, G, batch, st, tgt, val
+    return rep, prob
+
+
+def _micro_profile(torch, D, device, mc):
+    """Отдельная область жизни: модель -> полный обучающий шаг (backward на
+    32 строках, GradScaler, clip, optimizer.step с состояниями AdamW) ->
+    пик памяти (CPU-число) или 'OOM'."""
+    import k21_data as d21
+    import k21_model as km
+    dev = torch.device(device)
+    mod = bar = opt = G = scaler = None
+    try:
+        torch.cuda.reset_peak_memory_stats(dev)
+        mod, bar = load_k35(torch, device, checkpoint=True)
+        G = k35m.groups(mod)
+        set_phase(G, "main")
+        opt = make_opt(torch, G, "main")
+        scaler = torch.cuda.amp.GradScaler(enabled=True)
+        mod.train()
+        vr = np.asarray(D["train_rows"])[:EFF_BATCH]
+        cuts = cuts_for(U_OFFSET)
+        opt.zero_grad(set_to_none=True)
+        for s0 in range(0, EFF_BATCH, mc):
+            b2, po2, st2, tg2, va2 = d21.make_batch(D, vr[s0:s0 + mc], bar,
+                                                    dev)
+            with torch.autocast("cuda", dtype=torch.float16):
+                o = mod(b2, po2, st2, cuts=list(cuts[s0:s0 + mc]))
+                loss = km.loss_fn(torch, o, tg2, va2)[0]
+            scaler.scale(loss.mean() * mc / EFF_BATCH).backward()
+            del o, loss, b2, st2, tg2, va2
+        scaler.unscale_(opt)
+        torch.nn.utils.clip_grad_norm_([p for g in opt.param_groups
+                                        for p in g["params"]], CLIP)
+        scaler.step(opt)
+        scaler.update()
+        torch.cuda.synchronize(dev)
+        return float(torch.cuda.max_memory_allocated(dev) / 2 ** 30)
+    except torch.OutOfMemoryError:
+        return "OOM"
+    finally:
+        del mod, bar, opt, G, scaler
+        _free(torch)
+
+
+def real_check(a):
+    """GPU: источник, 36 срезов, маршрут, router, сборка, шаг, save/load,
+    micro. Каждая модель — в своей функции; наружу только CPU-числа."""
+    import torch
+    import k21_data as d21
+    D = d21.load_prepared(require_teacher=False)
+    dev = torch.device(a.device)
+    prep = prepare_entry()
+    rows = np.asarray(D["val_rows"])[:5]
+    inputs, ref_out = _ref_outputs(torch, D, rows, prep["source"]["spec"],
+                                   a.device)
+    _free(torch)
+    rep, prob = _k35_checks(torch, inputs, ref_out, a.device)
+    _free(torch)
+    rep["mem_after_checks_gb"] = torch.cuda.memory_allocated(dev) / 2 ** 30
     micro, prof = None, {}
-    vr = np.asarray(D["train_rows"])[:32]
     for mc in MICROS:
-        try:
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats(dev)
-            opt.zero_grad(set_to_none=True)
-            for s0 in range(0, 32, mc):
-                b2, po2, st2, tg2, va2 = d21.make_batch(D, vr[s0:s0 + mc], bar,
-                                                        dev)
-                with torch.autocast("cuda", dtype=torch.float16):
-                    o = mod(b2, po2, st2,
-                            cuts=list(cuts_for(0)[s0:s0 + mc]))
-                    loss = km.loss_fn(torch, o, tg2, va2)[0]
-                (loss.mean() * mc / 32).backward()
-                del o, loss
-            pk = torch.cuda.max_memory_allocated(dev) / 2 ** 30
-            prof[mc] = pk
-            if pk <= PEAK_LIMIT_GB:
-                micro = mc
-                break
-        except torch.OutOfMemoryError:
-            prof[mc] = "OOM"
-            opt.zero_grad(set_to_none=True)
+        pk = _micro_profile(torch, D, a.device, mc)
+        prof[str(mc)] = pk
+        if pk != "OOM" and pk <= PEAK_LIMIT_GB:
+            micro = mc
+            break
     rep.update(micro=micro, micro_profile=prof)
     if micro is None:
         prob.append("ни один micro из 32/16/8 не помещается в 14 ГиБ")
-    del mod, bar, opt, G
-    gc.collect()
-    torch.cuda.empty_cache()
+    _free(torch)
     rep["mem_after_free_gb"] = torch.cuda.memory_allocated(dev) / 2 ** 30
     out = dict(problems=prob, micro=micro, results=rep,
-               contract=dict(code=code_now(), prepare_sha1=sha(PREPARE),
-                             device=torch.cuda.get_device_name(dev)))
+               contract=device_contract(torch, dev, a.dtype))
     os.makedirs("reports/k35", exist_ok=True)
     json.dump(out, open(REAL_CHECK, "w", encoding="utf-8"),
               ensure_ascii=False, indent=1, default=float)
     print(f"  real-check K-35: источник B1/B5 {rep.get('B1_source_equal')}/"
-          f"{rep.get('B5_source_equal')}; худшие B5 {rep.get('B5_worst')}; "
+          f"{rep.get('B5_source_equal')}; маршрут B1/B5/перехват "
+          f"{rep.get('B1_route_ok')}/{rep.get('B5_route_ok')}/"
+          f"{rep.get('route_hooks_ok')}; худшие B5 {rep.get('B5_worst')}; "
           f"main-шаг {rep['main_step']}; save/load {rep['save_load']}; micro "
           f"{micro} ({prof}); память до {rep['mem_before_load_gb']:.2f} / "
           f"после {rep['mem_after_free_gb']:.2f} ГБ — "
           + ("пройден" if not prob else "НЕ пройден: " + "; ".join(prob[:3])))
     return 0 if not prob else 3
+
+
+def good_realcheck():
+    prof = {"32": "OOM", "16": 13.0}
+    R = dict(B1_source_equal=True, B5_source_equal=True, B1_route_ok=True,
+             B5_route_ok=True, route_hooks_ok=True,
+             B1_worst={k: 0.0 for k in RC_TOL},
+             B5_worst={k: 0.0 for k in RC_TOL},
+             main_step=dict(finite=True, frozen_unchanged=True,
+                            changed=dict(expert=True, lora=True, new=True,
+                                         heads=True)),
+             save_load=True, micro=16, micro_profile=prof)
+    return dict(problems=[], micro=16, results=R)
+
+
+def validators_regression():
+    import copy as cp
+    import tempfile
+    g = good_realcheck()
+    assert realcheck_result_problems(g) == [], realcheck_result_problems(g)
+    for mut in (lambda r: r["results"].pop("B5_worst"),
+                lambda r: r["results"].pop("route_hooks_ok"),
+                lambda r: r["results"]["main_step"]["changed"].pop("lora"),
+                lambda r: r["results"]["B1_worst"].update(arm=1e-3),
+                lambda r: r["results"]["micro_profile"].update({"32": 12.0}),
+                lambda r: r["results"].pop("save_load"),
+                lambda r: r.update(problems=None),
+                lambda r: r.update(results={})):
+        b = cp.deepcopy(g)
+        mut(b)
+        assert realcheck_result_problems(b), b
+    f = dict(L_before=1.0, L_after=0.6, drop=0.4, ok=True,
+             heads_changed=dict(readout8=True, readout16=True, readout=True),
+             rest_unchanged=True, rows=list(range(FIT_N)),
+             criterion=dict(drop=FIT_DROP, updates=FIT_UPDATES, n=FIT_N))
+    assert fitcheck_result_problems(f) == []
+    for mut in (lambda r: r.pop("heads_changed"),
+                lambda r: r.update(L_after=0.9),
+                lambda r: r.update(rest_unchanged=None),
+                lambda r: r.update(rows=[1, 2]),
+                lambda r: r.pop("L_before")):
+        b = cp.deepcopy(f)
+        mut(b)
+        assert fitcheck_result_problems(b), b
+    # отчёт обучения: чужие source / seed / panel / loss — отказ
+    G = globals()
+    keep = {k: G[k] for k in ("REPORT", "RUN_DIR", "PREPARE", "REAL_CHECK")}
+    keep_pan = ko.PANELS
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            G.update(REPORT=os.path.join(td, "r.json"),
+                     RUN_DIR=os.path.join(td, "run"),
+                     PREPARE=os.path.join(td, "prep.json"),
+                     REAL_CHECK=os.path.join(td, "rc.json"))
+            ko.PANELS = os.path.join(td, "pan.json")
+            os.makedirs(G["RUN_DIR"])
+            json.dump(dict(source=dict(ckpt_sha1="c", weights_hash="w"),
+                           prep_id="x"), open(G["PREPARE"], "w"))
+            json.dump(dict(checkpoint_val=dict(rows=[4, 8, 15])),
+                      open(ko.PANELS, "w"))
+            ckf = os.path.join(G["RUN_DIR"], "best.pt")
+            open(ckf, "wb").write(b"best")
+            cfg = dict(base_config(dict(ckpt_sha1="c", weights_hash="w"), 16,
+                                   "float16", [4, 8, 15]), schedule_fp="q")
+            curve = [dict(update=u, val=dict(mean_L=1.0 - u / 1e4 if u <=
+                                             2000 else 0.9))
+                     for u in range(0, MAIN_UPDATES + 1, EVAL_EVERY)]
+            rep = dict(best_sha1=sha(ckf), config=cfg, init_hash="w",
+                       updates=dict(warmup=WARM_UPDATES, main=MAIN_UPDATES),
+                       curve=curve, best_update=2000, best=[2000, 0.8])
+            json.dump(rep, open(G["REPORT"], "w"))
+            assert train_problems(16, "float16") == [], \
+                train_problems(16, "float16")
+            for mut in (
+                    lambda r: r["config"]["source"].update(ckpt_sha1="z"),
+                    lambda r: r["config"].update(seed=1),
+                    lambda r: r["config"].update(panel_sha1="p"),
+                    lambda r: r["config"].update(loss="другая"),
+                    lambda r: r["config"].pop("schedule_fp"),
+                    lambda r: r.update(init_hash="v"),
+                    lambda r: r.update(best_update=2250),
+                    lambda r: r.update(curve=r["curve"][:-1]),
+                    lambda r: r["updates"].update(main=3999)):
+                b = cp.deepcopy(rep)
+                mut(b)
+                json.dump(b, open(G["REPORT"], "w"))
+                assert train_problems(16, "float16"), mut
+            json.dump(rep, open(G["REPORT"], "w"))
+            assert train_problems(32, "float16")         # другой micro
+            assert train_problems(None, "float16")
+        finally:
+            G.update(keep)
+            ko.PANELS = keep_pan
 
 
 # --- самопроверка ---------------------------------------------------------------
@@ -931,11 +1227,13 @@ def selftest():
     finally:
         gl.update(keep)
         gl.update(FIT_UPDATES=200, FIT_N=64)
+    validators_regression()
     print("самопроверка k35_train пройдена: срезы строк детерминированы и "
           "сбалансированы (каждые 36 логических строк — все срезы), LR, "
           "медленный эталон router = mapped, warmup меняет только три головы, "
           "прерванное и продолженное обучение = непрерывному, чужой контракт "
-          "— отказ, fitcheck не трогает ничего вне голов")
+          "— отказ, fitcheck не трогает ничего вне голов; валидаторы real-check / "
+          "fitcheck / обучения отвергают неполные и чужие отчёты")
     return 0
 
 
@@ -954,7 +1252,12 @@ def main():
     a = ap.parse_args()
     try:
         if a.cmd == "check-fresh":
-            p = fresh_problems(a.kind)
+            import torch
+            nm = torch.cuda.get_device_name(torch.device(a.device)) \
+                if torch.cuda.is_available() else None
+            p = fresh_problems(a.kind, nm, a.dtype)
+            if nm is None:
+                p.append("CUDA недоступна — устройство не сверено")
             print(f"  {a.kind}: " + ("свежий, пройден" if not p else
                                      "нужен заново — " + "; ".join(p)))
             return 0 if not p else 1

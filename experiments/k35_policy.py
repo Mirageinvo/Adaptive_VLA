@@ -42,6 +42,9 @@ TOL = dict(y=1e-5, grip_logit=1e-5, arm=1e-6)
 ROUTE_TOL = 1e-5
 TAB = tp.tables()
 LEVELS = ("root", "mid", "leaf")
+ROUTE_KEYS = ("split_roots", "term_roots", "mids", "mid_parent_local",
+              "slots2", "split_mid_local", "term_mid_local", "leaves",
+              "leaf_parent_local", "slots3")
 N_TERM = dict(root=2, mid=2, leaf=4)
 
 
@@ -298,9 +301,8 @@ def build_arm(device, basis, lab, torch, *, spec, plan_sha1, ctx,
         cnt = mod.counters
         rec.update(
             ctrl=np.int32(KIND_ID[ctrl_kind]), a=a, b=b, c=c,
-            term_roots=TAB["term_roots"][c], mids=TAB["mids"][c],
-            term_mid_local=TAB["term_mid_local"][c], leaves=TAB["leaves"][c],
-            leaf_parent_local=TAB["leaf_parent_local"][c],
+            **{k: o["route"][k].cpu().numpy().astype(np.int64)
+               for k in ROUTE_KEYS},
             scores1=nan6 if ctrl.rec["scores1"] is None else
             ctrl.rec["scores1"].astype(np.float32),
             scores2=nan6 if ctrl.rec["scores2"] is None else
@@ -377,9 +379,8 @@ def journal_problems(lab, z, spec, ctx, bounds, debug=False):
         import k34_policy as kp34
         return kp34.journal_problems("parents_attn24_s0_d24", z)
     kind = spec["controller"]
-    need = ("k21_ctrl", "k21_a", "k21_b", "k21_c", "k21_term_roots",
-            "k21_mids", "k21_term_mid_local", "k21_leaves",
-            "k21_leaf_parent_local", "k21_scores1", "k21_scores2", "k21_X1",
+    need = ("k21_ctrl", "k21_a", "k21_b", "k21_c") + tuple(
+        f"k21_{k}" for k in ROUTE_KEYS) + ("k21_scores1", "k21_scores2", "k21_X1",
             "k21_X2", "k21_n_vision", "k21_n_kv", "k21_n_text", "k21_active",
             "k21_router_q", "k21_n_expand", "k21_n_heads", "k21_n_decisions",
             "k21_y", "k21_partial_root", "k21_partial_mid",
@@ -413,10 +414,9 @@ def journal_problems(lab, z, spec, ctx, bounds, debug=False):
     if (a < 0).any() or (a > 5).any() or (b < 0).any() or (b > 5).any() or \
             not np.array_equal(c, 6 * a + b):
         return p + [f"{lab}: c ≠ 6a + b или вне диапазона"]
-    for k in ("term_roots", "mids", "term_mid_local", "leaves",
-              "leaf_parent_local"):
+    for k in ROUTE_KEYS:
         if not np.array_equal(np.asarray(z[f"k21_{k}"]), TAB[k][c]):
-            p.append(f"{lab}: {k} ≠ топологии среза")
+            p.append(f"{lab}: исполненный {k} ≠ топологии среза")
     s1 = np.asarray(z["k21_scores1"], np.float64)
     s2 = np.asarray(z["k21_scores2"], np.float64)
     X1 = np.asarray(z["k21_X1"])
@@ -762,8 +762,7 @@ def fake_journal(kind, ctx, bounds, rng, C=4):
              k21_attn_pad=np.zeros((C, 6)), k21_attn_sumerr=np.zeros((C, 6)),
              k21_attn_finite=np.ones((C, 6)),
              **{f"k21_partial_{k}": v for k, v in parts.items()})
-    for k in ("term_roots", "mids", "term_mid_local", "leaves",
-              "leaf_parent_local"):
+    for k in ROUTE_KEYS:
         z[f"k21_{k}"] = TAB[k][c]
     H = 12
     for lv_, n in N_TERM.items():
@@ -793,8 +792,7 @@ def _m_scores(z, lab, kind):
 def _m_decision(z, lab, kind):
     z["k21_b"][1, 2] = (z["k21_b"][1, 2] + 1) % 6
     z["k21_c"][1, 2] = 6 * z["k21_a"][1, 2] + z["k21_b"][1, 2]
-    for k in ("term_roots", "mids", "term_mid_local", "leaves",
-              "leaf_parent_local"):
+    for k in ROUTE_KEYS:
         z[f"k21_{k}"] = TAB[k][z["k21_c"]]
     return "решение"
 
@@ -872,7 +870,23 @@ def _m_missing_last(z, lab, kind):
     return "нет последнего вызова"
 
 
-MUTATIONS = (_m_scores, _m_decision, _m_c, _m_parent, _m_ids, _m_partial,
+def _m_exec_roots(z, lab, kind):
+    # исполнены корни [0, 1] при записанном c с другими корнями
+    c = z["k21_c"]
+    i = np.argwhere(c // 6 != 0)
+    if not len(i):
+        return None
+    k, e = i[0]
+    z["k21_split_roots"][k, e] = [0, 1]
+    return "исполненные корни"
+
+
+def _m_slots(z, lab, kind):
+    z["k21_slots3"][0, 0, -1] += 1
+    return "слоты"
+
+
+MUTATIONS = (_m_exec_roots, _m_slots, _m_scores, _m_decision, _m_c, _m_parent, _m_ids, _m_partial,
              _m_action, _m_grip, _m_empty, _m_counter, _m_router,
              _m_snapshot, _m_nan, _m_onehot, _m_missing_last)
 

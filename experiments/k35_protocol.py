@@ -165,17 +165,26 @@ def make_prepare():
         placement={k: dict(path=v, sha256=sha256(v)) for k, v in
                    files.items()},
         dtype="float16", libraries=libs(),
-        topology=dict(pairs=list(tp.PAIRS), n_cuts=tp.N_CUTS,
+        topology=dict(pairs=[list(x) for x in tp.PAIRS], n_cuts=tp.N_CUTS,
                       active=tp.ACTIVE, router=tp.ROUTER_ACTIVE))
+
+
+def norm_json(d):
+    return json.loads(json.dumps(d, ensure_ascii=False, default=float))
+
+
+def prepare_diff(old, new):
+    new = norm_json(new)
+    return sorted(k for k in set(old) | set(new) if k != "created" and
+                  old.get(k) != new.get(k))
 
 
 def prepare(a):
     import k21_data as d21
-    new = make_prepare()
+    new = norm_json(make_prepare())
     if os.path.exists(PREPARE):
         old = load_json(PREPARE)
-        diff = sorted(k for k in set(old) | set(new) if k != "created" and
-                      old.get(k) != new.get(k))
+        diff = prepare_diff(old, new)
         if diff:
             raise SystemExit(f"{PREPARE} закреплён иначе: {diff}")
         print(f"  {PREPARE}: закреплён, источник совпадает")
@@ -184,9 +193,9 @@ def prepare(a):
                                 .isoformat(timespec="seconds")))
         print(f"  {PREPARE}: записан")
     D = d21.load_prepared(require_teacher=False)
-    pan = ko.make_panels(D)
+    pan = norm_json(ko.make_panels(D))
     if os.path.exists(ko.PANELS):
-        if load_json(ko.PANELS) != json.loads(json.dumps(pan)):
+        if load_json(ko.PANELS) != pan:
             raise SystemExit(f"{ko.PANELS} закреплён с другими строками")
         print(f"  {ko.PANELS}: закреплены, строки совпадают")
     else:
@@ -240,6 +249,16 @@ def decoder_binding():
                 prepare_sha1=sha(PREPARE))
 
 
+def shard_state(base, panel, task, rows, bind):
+    """ok — завершён и с этим контрактом; missing — нет записи
+    завершённости (можно достроить); foreign — завершён, но с другим
+    контрактом или изменён (отказ без изменения файлов)."""
+    if not os.path.exists(base + ".json"):
+        return "missing"
+    return "ok" if not shard_problems(base, panel, task, rows, bind) else \
+        "foreign"
+
+
 def shard_problems(base, panel, task, rows, bind):
     if not os.path.exists(base + ".json") or not os.path.exists(base +
                                                                 ".npz"):
@@ -264,13 +283,23 @@ def oracle_cmd(a):
     if pr:
         raise SystemExit("; ".join(pr))
     bind = decoder_binding()
-    todo = [(panel, ti, t, rows) for panel, ti, t, rows in shard_list()
-            if shard_problems(shard_name(panel, ti), panel, t, rows, bind)]
     src_base = os.path.join(ko.ORACLE_DIR, "source_val")
     pan = load_json(ko.PANELS)
     vrows = pan["oracle_val"]["rows"]
-    need_src = bool(shard_problems(src_base, "source_val", "all", vrows,
-                                   bind))
+    states = {(panel, ti): shard_state(shard_name(panel, ti), panel, t, rows,
+                                       bind)
+              for panel, ti, t, rows in shard_list()}
+    s_src = shard_state(src_base, "source_val", "all", vrows, bind)
+    foreign = [shard_name(*k) for k, v in states.items() if v == "foreign"]
+    if s_src == "foreign":
+        foreign.append(src_base)
+    if foreign:
+        raise SystemExit(f"завершённые шарды другого контракта или "
+                         f"изменённые: {foreign[:4]} — файлы не тронуты; "
+                         f"решение — за пользователем")
+    todo = [(panel, ti, t, rows) for panel, ti, t, rows in shard_list()
+            if states[(panel, ti)] == "missing"]
+    need_src = s_src == "missing"
     print(f"  оракул: шардов к расчёту {len(todo)} из "
           f"{len(shard_list())}; источник S на oracle-val: "
           f"{'нужен' if need_src else 'готов'}", flush=True)
@@ -284,9 +313,9 @@ def oracle_cmd(a):
         mod, bar, _ck = k35t.load_trained(torch, a.device)
         for j, (panel, ti, t, rows) in enumerate(todo):
             base = shard_name(panel, ti)
-            for f in (base + ".json",):
-                if os.path.exists(f):
-                    os.remove(f)                 # чужая запись завершённости
+            if os.path.exists(base + ".json"):
+                raise SystemExit(f"{base}: запись завершённости появилась "
+                                 f"во время расчёта")
             t0 = time.time()
             r = ko.oracle_rows(torch, km, mod, bar, D, np.asarray(rows), dev,
                                dt, a.micro, d21.make_batch)
@@ -478,7 +507,7 @@ def selector_gate_compute():
                                c, g["c_const"], Ova["C"]["arm8"])
     Cv = Ova["C"]["full"]
     o = np.argmin(Cv, 1)
-    oa, ob = o // 6, o % 6
+    oa = o // 6
     best_b_given_a = np.argmin(Cv.reshape(nva, 6, 6)[np.arange(nva), a], 1)
     met.update(first_decision_err=float(np.mean(a != oa)),
                second_decision_err_given_a=float(np.mean(b != best_b_given_a)),
@@ -902,6 +931,7 @@ def smoke_check(a):
         prob.append("N: на первом вызове все элементы B5 получили один срез")
     per_block = sum(sizes) / max(1, len(sizes) // 2)
     rep.update(ok=not prob, problems=prob, bytes_per_block=per_block,
+               blocks=_block_shas("smoke", plan),
                disk_forecast_gb=dict(pilot=per_block * len(cells("pilot")) /
                                      2 ** 30),
                tolerances=DBG_TOL, plan_sha1=sha(a.plan),
@@ -919,21 +949,39 @@ def smoke_check(a):
     return 0 if not prob else 3
 
 
-def smoke_verify(a):
+def smoke_verify_problems():
+    """smoke пройден, план свеж, все блоки на месте с теми же SHA, что
+    при smoke-check, и заново проходят проверку журналов и паритет."""
     f = os.path.join(OUT, "smoke_check.json")
-    p = []
     if not os.path.exists(f):
-        p.append("нет smoke_check.json")
-    else:
-        r = load_json(f)
-        if not r.get("ok"):
-            p.append("smoke не пройден")
-        pf = plan_path("smoke")
-        if not os.path.exists(pf) or r.get("plan_sha1") != sha(pf):
-            p.append("smoke другого плана")
-        else:
-            p += plan_problems(load_json(pf))
-    print("  smoke: " + ("пройден, план свеж" if not p else
+        return ["нет smoke_check.json"]
+    r = load_json(f)
+    p = []
+    if r.get("ok") is not True or r.get("problems") != []:
+        p.append("smoke не пройден")
+    pf = plan_path("smoke")
+    if not os.path.exists(pf) or r.get("plan_sha1") != sha(pf):
+        return p + ["smoke другого плана"]
+    plan = load_json(pf)
+    p += plan_problems(plan)
+    want = _block_shas("smoke", plan)
+    if len(want) != 2 * len(plan["cells"]) or \
+            any(v is None for v in want.values()):
+        return p + ["блоки smoke отсутствуют"]
+    if r.get("blocks") != want:
+        return p + ["блоки smoke изменены после smoke-check"]
+    for lab, t, b in plan["cells"]:
+        if plan["arms"][lab]["spec"]["kind"] != "S" and \
+                "same_device" not in (r.get(lab) or {}):
+            p.append(f"{lab}: нет пересчёта голов в smoke-check")
+        p += block_problems(plan, pf, "smoke", lab, t, b)
+    p += parity_problems(plan, "smoke")
+    return p
+
+
+def smoke_verify(a):
+    p = smoke_verify_problems()
+    print("  smoke: " + ("пройден, план и блоки сходятся" if not p else
                          "ОТКАЗ — " + "; ".join(p[:3])))
     return 0 if not p else 3
 
@@ -1039,6 +1087,67 @@ def selftest():
         assert shard_problems(base, "oracle_val", "t0", rows, bind)
         os.remove(base + ".json")
         assert shard_problems(base, "oracle_val", "t0", rows, bind)
+    # повторный prepare: JSON-нормализация (кортежи) не даёт ложной разницы
+    newp = dict(topology=dict(pairs=list(tp.PAIRS)), x=(1, 2))
+    oldp = json.loads(json.dumps(dict(newp, created="t")))
+    assert prepare_diff(oldp, newp) == []
+    assert prepare_diff(oldp, dict(newp, x=(1, 3))) == ["x"]
+    # шарды: нет записи — достраивается; завершённый чужой — foreign, файлы
+    # не меняются
+    with tempfile.TemporaryDirectory() as td:
+        base = os.path.join(td, "s")
+        rows = [3, 5, 9]
+        bind = dict(decoder_sha1="d", decoder_weights_hash="w",
+                    train_report_sha1="r", panels_sha1="p", code={},
+                    prepare_sha1="q")
+        assert shard_state(base, "oracle_val", "t0", rows, bind) == "missing"
+        np.savez(base + ".npz", rows=np.asarray(rows))
+        assert shard_state(base, "oracle_val", "t0", rows, bind) == "missing"
+        save_json(base + ".json", dict(panel="oracle_val", task="t0",
+                                       rows=rows, rows_sha1=ko.sha_arr(rows),
+                                       npz_sha1=sha(base + ".npz"),
+                                       cuts=list(range(36)), **bind))
+        assert shard_state(base, "oracle_val", "t0", rows, bind) == "ok"
+        before = {f: sha(os.path.join(td, f)) for f in os.listdir(td)}
+        assert shard_state(base, "oracle_val", "t0", rows,
+                           dict(bind, decoder_sha1="x")) == "foreign"
+        assert before == {f: sha(os.path.join(td, f)) for f in os.listdir(td)}
+    import inspect
+    assert "os.remove" not in inspect.getsource(oracle_cmd)
+    # smoke-verify: ok = true и верный SHA плана без блоков — отказ
+    g = globals()
+    keep = {k: g[k] for k in ("OUT", "plan_problems", "block_problems",
+                              "parity_problems")}
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            g.update(OUT=td)
+            g["plan_problems"] = lambda plan, offline=True: []
+            g["block_problems"] = lambda *aa, **kw: []
+            g["parity_problems"] = lambda *aa, **kw: []
+            plan = dict(kind="k35_plan", plan_kind="smoke",
+                        arms={lab: dict(spec=dict(kind="S" if lab == "k35_S"
+                                                  else "K35"))
+                              for lab in SMOKE_ARMS},
+                        cells=[list(c) for c in cells("smoke")])
+            pf = plan_path("smoke")
+            save_json(pf, plan)
+            rep = dict(ok=True, problems=[], plan_sha1=sha(pf), blocks={})
+            save_json(os.path.join(td, "smoke_check.json"), rep)
+            assert smoke_verify_problems()                # нет блоков
+            for lab, t, b in plan["cells"]:
+                f = block_path("smoke", lab, t, b)
+                os.makedirs(os.path.dirname(f), exist_ok=True)
+                save_json(f, dict(episodes=[]))
+                np.savez(f[:-5] + ".actions.npz", a=np.zeros(1))
+            rep.update(blocks=_block_shas("smoke", plan),
+                       **{lab: dict(same_device={}) for lab in SMOKE_ARMS})
+            save_json(os.path.join(td, "smoke_check.json"), rep)
+            assert smoke_verify_problems() == [], smoke_verify_problems()
+            f0 = block_path("smoke", *plan["cells"][0])
+            save_json(f0, dict(episodes=[1]))             # подмена блока
+            assert smoke_verify_problems()
+        finally:
+            g.update(keep)
     # обход отрицательного офлайн-гейта: plan_problems пилота вызывает
     # offline_problems
     g = globals()
@@ -1060,7 +1169,8 @@ def selftest():
         g.update(keep)
     print("самопроверка k35_protocol пройдена: расписание (smoke 6 блоков, "
           "пилот 40 блоков, сдвиг рук по задачам, бюджеты = блоки × 3050), "
-          "правило пилота (C к S ≤ 5, A > C и A > N хотя бы на 1), шард "
+          "правило пилота (C к S ≤ 5, A > C и A > N хотя бы на 1), повторный "
+          "prepare, smoke-verify требует все блоки с прежними SHA, шард "
           "оракула — чужая запись и подмена отвергаются, пилот без "
           "пройденных офлайн-гейтов не планируется")
     return 0
