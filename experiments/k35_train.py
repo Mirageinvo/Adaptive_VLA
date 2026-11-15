@@ -469,8 +469,19 @@ def realcheck_result_problems(r):
     return p
 
 
-def fitcheck_result_problems(r):
+def fitcheck_result_problems(r, D=None):
     p = []
+    if D is not None:
+        rows = r.get("rows") or []
+        want = fit_rows(D).tolist()
+        tr = set(np.asarray(D["train_rows"]).tolist())
+        va = set(np.asarray(D["val_rows"]).tolist())
+        if len(set(rows)) != len(rows):
+            p.append("fitcheck: повтор индекса строки")
+        if not set(rows) <= tr or set(rows) & va:
+            p.append("fitcheck: строки вне train или из validation")
+        if rows != want:
+            p.append("fitcheck: строки ≠ fit_rows текущей подготовки")
     try:
         drop = 1 - float(r["L_after"]) / float(r["L_before"])
     except (KeyError, TypeError, ZeroDivisionError, ValueError):
@@ -493,15 +504,18 @@ def fitcheck_result_problems(r):
     return p
 
 
-def fresh_problems(kind, device_name=None, dtype="float16"):
+def fresh_problems(kind, device_name=None, dtype="float16", D=None):
     """Отчёт real-check / fitcheck полон, пройден и с текущим контрактом
     (код, подготовка, устройство, dtype, micro)."""
     path = dict(real_check=REAL_CHECK, fitcheck=FITCHECK)[kind]
     if not os.path.exists(path):
         return [f"нет {path}"]
     r = json.load(open(path, encoding="utf-8"))
+    if kind == "fitcheck" and D is None:
+        import k21_data as d21
+        D = d21.load_prepared(require_teacher=False)
     p = realcheck_result_problems(r) if kind == "real_check" else \
-        fitcheck_result_problems(r)
+        fitcheck_result_problems(r, D)
     c = r.get("contract") or {}
     if c.get("code") != code_now():
         p.append(f"{kind}: код изменён после проверки")
@@ -945,6 +959,42 @@ def _k35_checks(torch, inputs, ref_out, device):
     return rep, prob
 
 
+PROFILE_TRIES = 6
+
+
+def adam_stepped(opt, n_steps):
+    """Шаг AdamW действительно выполнен n_steps раз: у каждого параметра с
+    градиентом есть exp_avg / exp_avg_sq и счётчик step = n_steps."""
+    ps = [p for g in opt.param_groups for p in g["params"]
+          if p.grad is not None]
+    if not ps:
+        return False
+    for p in ps:
+        st = opt.state.get(p) or {}
+        if "exp_avg" not in st or "exp_avg_sq" not in st:
+            return False
+        if int(float(st.get("step", 0))) != int(n_steps):
+            return False
+    return True
+
+
+def _profile_step(torch, opt, scaler, backward_once):
+    """Полный шаг с подтверждением: при переполнении GradScaler пропускает
+    step — повторяем (масштаб уменьшается) до PROFILE_TRIES раз. ->
+    True, если шаг AdamW выполнен и состояния выделены."""
+    for _ in range(PROFILE_TRIES):
+        opt.zero_grad(set_to_none=True)
+        backward_once()
+        scaler.unscale_(opt)
+        torch.nn.utils.clip_grad_norm_([p for g in opt.param_groups
+                                        for p in g["params"]], CLIP)
+        scaler.step(opt)
+        scaler.update()
+        if adam_stepped(opt, 1):
+            return True
+    return False
+
+
 def _micro_profile(torch, D, device, mc):
     """Отдельная область жизни: модель -> полный обучающий шаг (backward на
     32 строках, GradScaler, clip, optimizer.step с состояниями AdamW) ->
@@ -963,20 +1013,18 @@ def _micro_profile(torch, D, device, mc):
         mod.train()
         vr = np.asarray(D["train_rows"])[:EFF_BATCH]
         cuts = cuts_for(U_OFFSET)
-        opt.zero_grad(set_to_none=True)
-        for s0 in range(0, EFF_BATCH, mc):
-            b2, po2, st2, tg2, va2 = d21.make_batch(D, vr[s0:s0 + mc], bar,
-                                                    dev)
-            with torch.autocast("cuda", dtype=torch.float16):
-                o = mod(b2, po2, st2, cuts=list(cuts[s0:s0 + mc]))
-                loss = km.loss_fn(torch, o, tg2, va2)[0]
-            scaler.scale(loss.mean() * mc / EFF_BATCH).backward()
-            del o, loss, b2, st2, tg2, va2
-        scaler.unscale_(opt)
-        torch.nn.utils.clip_grad_norm_([p for g in opt.param_groups
-                                        for p in g["params"]], CLIP)
-        scaler.step(opt)
-        scaler.update()
+
+        def backward_once():
+            for s0 in range(0, EFF_BATCH, mc):
+                b2, po2, st2, tg2, va2 = d21.make_batch(D, vr[s0:s0 + mc],
+                                                        bar, dev)
+                with torch.autocast("cuda", dtype=torch.float16):
+                    o = mod(b2, po2, st2, cuts=list(cuts[s0:s0 + mc]))
+                    loss = km.loss_fn(torch, o, tg2, va2)[0]
+                scaler.scale(loss.mean() * mc / EFF_BATCH).backward()
+                del o, loss, b2, st2, tg2, va2
+        if not _profile_step(torch, opt, scaler, backward_once):
+            return "no_step"
         torch.cuda.synchronize(dev)
         return float(torch.cuda.max_memory_allocated(dev) / 2 ** 30)
     except torch.OutOfMemoryError:
@@ -1005,6 +1053,10 @@ def real_check(a):
     for mc in MICROS:
         pk = _micro_profile(torch, D, a.device, mc)
         prof[str(mc)] = pk
+        if pk == "no_step":
+            prob.append(f"micro {mc}: шаг AdamW не выполнен за "
+                        f"{PROFILE_TRIES} попыток (переполнение)")
+            break
         if pk != "OOM" and pk <= PEAK_LIMIT_GB:
             micro = mc
             break
@@ -1063,6 +1115,48 @@ def validators_regression():
              rest_unchanged=True, rows=list(range(FIT_N)),
              criterion=dict(drop=FIT_DROP, updates=FIT_UPDATES, n=FIT_N))
     assert fitcheck_result_problems(f) == []
+    # строки fitcheck: только fit_rows текущей подготовки
+    Df = dict(train_rows=np.arange(100, 400), val_rows=np.arange(400, 450))
+    f["rows"] = fit_rows(Df).tolist()
+    assert fitcheck_result_problems(f, Df) == [], \
+        fitcheck_result_problems(f, Df)
+    other = sorted(set(Df["train_rows"].tolist()) - set(f["rows"]))[0]
+    for rows in ([-1] * FIT_N, f["rows"][:-1] + [other],
+                 f["rows"][:-1] + [420], f["rows"][:-1] + [f["rows"][0]]):
+        assert fitcheck_result_problems(dict(f, rows=sorted(rows)), Df), rows
+    # шаг AdamW: пропущенный GradScaler-шаг не принимается за профиль
+    import torch
+    w = torch.nn.Parameter(torch.ones(3))
+    opt = torch.optim.AdamW([w], lr=1e-3)
+
+    class SkipScaler:
+        def __init__(self, skips):
+            self.skips = skips
+
+        def unscale_(self, o):
+            pass
+
+        def step(self, o):
+            if self.skips > 0:
+                self.skips -= 1             # переполнение: шаг пропущен
+            else:
+                o.step()
+
+        def update(self):
+            pass
+
+    def bw():
+        (w * 2).sum().backward()
+    assert not adam_stepped(opt, 1)
+    keep_t = globals()["PROFILE_TRIES"]
+    try:
+        globals()["PROFILE_TRIES"] = 3
+        assert not _profile_step(torch, opt, SkipScaler(10), bw)
+        assert not adam_stepped(opt, 1) and len(opt.state) == 0
+        assert _profile_step(torch, opt, SkipScaler(2), bw)
+        assert adam_stepped(opt, 1)
+    finally:
+        globals()["PROFILE_TRIES"] = keep_t
     for mut in (lambda r: r.pop("heads_changed"),
                 lambda r: r.update(L_after=0.9),
                 lambda r: r.update(rest_unchanged=None),
@@ -1233,7 +1327,8 @@ def selftest():
           "медленный эталон router = mapped, warmup меняет только три головы, "
           "прерванное и продолженное обучение = непрерывному, чужой контракт "
           "— отказ, fitcheck не трогает ничего вне голов; валидаторы real-check / "
-          "fitcheck / обучения отвергают неполные и чужие отчёты")
+          "fitcheck / обучения отвергают неполные и чужие отчёты; строки "
+          "fitcheck = fit_rows; пропущенный шаг AdamW не даёт профиль micro")
     return 0
 
 
