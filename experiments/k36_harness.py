@@ -787,6 +787,7 @@ def _real_check_seed(torch, prep, s, D, rows, device):
     import k32_ppo as kppo
     import k32_protocol as pc32
     dev = torch.device(device)
+    torch.zeros(1, device=dev)             # CUDA-контекст до сброса пика
     torch.cuda.reset_peak_memory_stats(dev)
     r, prob = {}, []
     mod, bar, M, dec = pc32.load_source_dec(torch, pc32.load_base(), s,
