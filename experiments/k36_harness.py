@@ -57,6 +57,7 @@ SUMMARY = ("success", "success_step", "done_step", "own_steps", "steps",
            "physical", "init_hash", "init_hash_full", "actions_sha1")
 FIRST_KEYS = ("Z0", "path", "c", "r", "eta", "Du", "a_codec", "zero")
 ACTOR_PARAMS, CRITIC_PARAMS = 203_271, 607_489      # при H = 768
+SOURCE_H = 768
 Z_TOL, ARM_TOL, DU_TOL = 1e-5, 1e-6, 1e-5
 MIN_FREE_GB = 10.0
 
@@ -423,6 +424,20 @@ def files_of(wants):
 REBUILD_TOL = dict(Z0=Z_TOL, Zhat=Z_TOL, Du=DU_TOL, arm=ARM_TOL, c=1e-6)
 
 
+def rebuild_entry_problems(kind, st):
+    """Запись пересборки первого вызова: обязательные ошибки (R: Z0, arm;
+    T/P: Z0, Zhat, Du, arm, c) конечны и 0 ≤ ошибка ≤ допуска K-32."""
+    keys = ("Z0", "arm") if kind == "R" else ("Z0", "Zhat", "Du", "arm", "c")
+    if not isinstance(st, dict):
+        return ["нет пересборки"]
+    for k in keys:
+        v = st.get(k)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or \
+                not np.isfinite(v) or not 0 <= v <= REBUILD_TOL[k]:
+            return [f"пересборка {k} = {v!r} нет/вне [0; {REBUILD_TOL[k]}]"]
+    return []
+
+
 def realcheck_content_problems(g):
     p = []
     seeds = g.get("seeds") or {}
@@ -444,11 +459,12 @@ def realcheck_content_problems(g):
                 p.append(f"real-check s{s} {kind}: кеш μ/log π неполон или "
                          f"вне допуска")
             par = r.get(f"params_{kind}") or {}
-            if r.get("H") == 768 and (par.get("actor") != ACTOR_PARAMS or
-                                      par.get("critic") != CRITIC_PARAMS):
-                p.append(f"real-check s{s} {kind}: число параметров")
-            if not par:
-                p.append(f"real-check s{s} {kind}: нет числа параметров")
+            if r.get("H") != SOURCE_H or par.get("actor") != ACTOR_PARAMS or \
+                    par.get("critic") != CRITIC_PARAMS:
+                p.append(f"real-check s{s} {kind}: размерность источника "
+                         f"{r.get('H')} или число параметров {par} ≠ "
+                         f"паспорту (H {SOURCE_H}: {ACTOR_PARAMS} / "
+                         f"{CRITIC_PARAMS})")
         pk = r.get("peak_gb")
         if not isinstance(pk, (int, float)) or not np.isfinite(pk):
             p.append(f"real-check s{s}: нет пика памяти")
@@ -486,13 +502,9 @@ def episodes_content_problems(kind, g, prep, C):
     elif kind == "smoke":
         rb = g.get("rebuild") or {}
         for w in wants:
-            st = rb.get(w["eid"])
-            keys = ("Z0", "arm") if w["kind"] == "R" else \
-                ("Z0", "Du", "arm", "c")
-            if not isinstance(st, dict) or not all(
-                    isinstance(st.get(k), (int, float)) and
-                    st[k] <= REBUILD_TOL[k] for k in keys):
-                p.append(f"smoke {w['eid']}: пересборка неполна/вне допуска")
+            pr = rebuild_entry_problems(w["kind"], rb.get(w["eid"]))
+            if pr:
+                p.append(f"smoke {w['eid']}: {pr[0]}")
     elif kind == "repeat":
         for w in wants:
             w0 = dict(w, stage="smoke", scope="checks",
@@ -817,8 +829,9 @@ def _real_check_seed(torch, prep, s, D, rows, device):
         actor, critic = load_actor(torch, prep, kind, s, mod.H)
         r[f"params_{kind}"] = dict(actor=km32.n_params(actor),
                                    critic=km32.n_params(critic))
-        if mod.H == 768 and (r[f"params_{kind}"]["actor"] != ACTOR_PARAMS or
-                             r[f"params_{kind}"]["critic"] != CRITIC_PARAMS):
+        if mod.H != SOURCE_H or \
+                r[f"params_{kind}"]["actor"] != ACTOR_PARAMS or \
+                r[f"params_{kind}"]["critic"] != CRITIC_PARAMS:
             prob.append(f"s{s} {kind}: число параметров ≠ паспорту")
         sto = kpol.Arm(torch, mod, dec, M, kind=kind, seed=s, actor=actor,
                        stochastic=True, space=36)
@@ -1094,6 +1107,31 @@ def extra_selftests(torch, td, prep, C, io, mod, dec, M, actor, rec, got):
             for s in (0, 1)}
     assert realcheck_content_problems(dict(seeds=good)) == []
     assert realcheck_content_problems(dict())
+    # без H и с actor = critic = 1 — отказ (обход проверки параметров)
+    gg = copy.deepcopy(good)
+    for s in ("0", "1"):
+        gg[s].pop("H")
+        gg[s]["params_T"] = dict(actor=1, critic=1)
+        gg[s]["params_P"] = dict(actor=1, critic=1)
+    assert realcheck_content_problems(dict(seeds=gg))
+    gg = copy.deepcopy(good)
+    gg["0"].pop("H")
+    assert realcheck_content_problems(dict(seeds=gg))      # только без H
+    gg = copy.deepcopy(good)
+    gg["1"]["H"] = 512
+    assert realcheck_content_problems(dict(seeds=gg))
+    # пересборка: Zhat обязателен для T/P; конечность и 0 ≤ e ≤ допуска
+    okT = dict(Z0=1e-7, Zhat=2e-6, Du=1e-7, arm=1e-7, c=0.0)
+    assert rebuild_entry_problems("T", okT) == []
+    assert rebuild_entry_problems("P", okT) == []
+    assert rebuild_entry_problems("R", dict(Z0=0.0, arm=0.0)) == []
+    for kind in ("T", "P"):
+        for bad in ({k: v for k, v in okT.items() if k != "Zhat"},
+                    dict(okT, Zhat=float("nan")), dict(okT, Zhat=1.0),
+                    dict(okT, Du=-1e-9), dict(okT, arm=float("inf")),
+                    dict(okT, c=True), None):
+            assert rebuild_entry_problems(kind, bad), (kind, bad)
+    assert rebuild_entry_problems("R", dict(Z0=float("nan"), arm=0.0))
     for mut in (lambda g: g["1"].pop("cache_P"),
                 lambda g: g["0"]["cache_T"].pop("64"),
                 lambda g: g["0"]["cache_T"]["8"].update(logp=1e-3),
@@ -1381,7 +1419,9 @@ def selftest():
           "сохранённый эпизод — отказ; сравнение пар побитово; гейт — "
           "подмена файла, голый passed, другой prepare — отказ; сводка "
           "эпизода (незавершённый короткий, NaN, own_steps, длина) — отказ; "
-          "real-check без результатов и гейт с произвольным файлом — отказ; "
+          "real-check без результатов / без H / с чужим числом параметров и "
+          "гейт с произвольным файлом — отказ; пересборка T/P без Zhat, с "
+          "NaN/Inf, отрицательной или сверх допуска ошибкой — отказ; "
           "прежний источник освобождён до загрузки следующего; этап A "
           "кусками по сидам, повтор без исполнения")
     return 0
