@@ -9,6 +9,7 @@ reports/k34/latency_eval.json (p50 total по глубинам, модели see
 (таблица тех же чисел). Средняя по двум сидам — линия с точками,
 каждый сид — полые маркеры той же формы. Ничего не пересчитывает.
 """
+import hashlib
 import json
 import os
 import sys
@@ -17,6 +18,7 @@ import numpy as np
 
 ANALYSIS = "reports/k34/analysis.json"
 LATENCY = "reports/k34/latency_eval.json"
+PLAN = "reports/k34/plan_eval.json"
 OUT_PNG = "reports/k34/tradeoff.png"
 OUT_JSON = "reports/k34/tradeoff.json"
 DEPTHS = (8, 16, 24)
@@ -24,6 +26,43 @@ ARCH = (("T", "parents_attn24", "дерево (T)", "#2a78d6", "o"),
         ("F", "flat_attn24", "flat (F)", "#eb6834", "s"))
 INK, INK2, MUTED = "#0b0b0b", "#52514e", "#898781"
 GRID, AXIS, SURF = "#e1e0d9", "#c3c2b7", "#fcfcfb"
+
+
+def sha(p):
+    return hashlib.sha1(open(p, "rb").read()).hexdigest()
+
+
+def input_problems(an, lat, plan, plan_sha1, batches=(1, 5)):
+    """Входы согласованы: анализ полон; задержка — по закреплённому плану
+    eval и checkpoint сида 0 каждой архитектуры; SR конечны в [0, 1];
+    времена конечны и положительны."""
+    p = []
+    if an.get("ok") is not True:
+        p.append("analysis.ok ≠ true")
+    if lat.get("plan_sha1") != plan_sha1:
+        p.append("задержка измерена не по текущему плану eval")
+    for k, mode, _nm, _c, _m in ARCH:
+        lab = f"{mode}_s0_d24"
+        want = (((plan.get("arms") or {}).get(lab) or {}).get("spec") or
+                {}).get("ckpt_sha1")
+        if want is None or (lat.get("ckpt_sha1") or {}).get(mode) != want:
+            p.append(f"задержка {mode}: checkpoint ≠ сиду 0 плана")
+        for d in DEPTHS:
+            for s in (0, 1):
+                v = (an.get("sr") or {}).get(f"s{s}:{k}{d}")
+                if not isinstance(v, (int, float)) or not np.isfinite(v) or \
+                        not 0 <= v <= 1:
+                    p.append(f"SR s{s}:{k}{d} нет или вне [0, 1]")
+            for b in batches:
+                try:
+                    q = lat[mode][f"batch{b}"][f"d{d}"]["total"]
+                    ok = all(np.isfinite(float(q[x])) and float(q[x]) > 0
+                             for x in ("median", "p95"))
+                except (KeyError, TypeError, ValueError):
+                    ok = False
+                if not ok:
+                    p.append(f"задержка {mode} d{d} B{b} нет или не > 0")
+    return p
 
 
 def table(an, lat, batches=(1, 5)):
@@ -87,9 +126,8 @@ def plot(rows, path, batches=(1, 5)):
     fig.suptitle("K-34: SR и задержка выходов 8/16/24 (числа у точек — "
                  "глубина выхода)", fontsize=11, color=INK, x=0.01,
                  ha="left")
-    fig.text(0.01, 0.005, "Задержка — модели сида 0 (одна архитектура на "
-             "оба сида). Разности SR между выходами в пределах ±5–8 п.п. "
-             "интервалов; различия n.s.", fontsize=7.5, color=MUTED)
+    fig.text(0.01, 0.005, "SR показан для двух обучающих сидов. Задержка "
+             "измерена на моделях сида 0.", fontsize=7.5, color=MUTED)
     fig.tight_layout(rect=(0, 0.03, 1, 0.95))
     fig.savefig(path, dpi=160, facecolor=SURF)
     plt.close(fig)
@@ -98,23 +136,31 @@ def plot(rows, path, batches=(1, 5)):
 def main():
     if "--selftest" in sys.argv:
         return selftest()
-    for f in (ANALYSIS, LATENCY):
+    for f in (ANALYSIS, LATENCY, PLAN):
         if not os.path.exists(f):
             print(f"  ОТКАЗ: нет {f}")
             return 3
     an = json.load(open(ANALYSIS, encoding="utf-8"))
     lat = json.load(open(LATENCY, encoding="utf-8"))
+    plan = json.load(open(PLAN, encoding="utf-8"))
+    pr = input_problems(an, lat, plan, sha(PLAN))
+    if pr:
+        print("  ОТКАЗ: " + "; ".join(pr[:5]))
+        return 3
     rows = table(an, lat)
     plot(rows, OUT_PNG)
     json.dump(dict(rows=rows, analysis=ANALYSIS, latency=LATENCY,
+                   analysis_sha1=sha(ANALYSIS), latency_sha1=sha(LATENCY),
+                   plan_eval_sha1=sha(PLAN),
                    latency_device=lat.get("device"),
                    latency_plan_sha1=lat.get("plan_sha1")),
               open(OUT_JSON, "w", encoding="utf-8"), ensure_ascii=False,
               indent=1)
     for r in rows:
         print(f"  {r['arch']}{r['depth']}: SR {100 * r['sr_s0']:.1f} / "
-              f"{100 * r['sr_s1']:.1f} (ср. {100 * r['sr_mean']:.1f}); p50 "
-              f"B1 {r['p50_b1_ms']:.1f} мс, B5 {r['p50_b5_ms']:.1f} мс")
+              f"{100 * r['sr_s1']:.1f} (ср. {100 * r['sr_mean']:.1f}); "
+              f"B1 p50/p95 {r['p50_b1_ms']:.1f}/{r['p95_b1_ms']:.1f} мс, "
+              f"B5 p50/p95 {r['p50_b5_ms']:.1f}/{r['p95_b5_ms']:.1f} мс")
     print(f"  {OUT_PNG}, {OUT_JSON}")
     return 0
 
@@ -127,14 +173,33 @@ def selftest():
                                                        p95=d * 9.0 * b))
                              for d in DEPTHS} for b in (1, 5)}
            for _k, m, _n, _c, _mk in ARCH}
+    plan = {"arms": {f"{m}_s0_d24": {"spec": {"ckpt_sha1": f"c{k}"}}
+                     for k, m, _n, _c, _mk in ARCH}}
+    good = dict(lat, plan_sha1="P", ckpt_sha1={m: f"c{k}" for k, m, _n, _c,
+                                               _mk in ARCH})
+    an = dict(ok=True, sr=sr)
+    assert input_problems(an, good, plan, "P") == []
+    import copy
+    bad = [(dict(an, ok=False), good, "P"), (an, good, "Q"),
+           (an, dict(good, ckpt_sha1={}), "P"),
+           (dict(an, sr=dict(sr, **{"s1:T8": float("nan")})), good, "P")]
+    g2 = copy.deepcopy(good)
+    g2["flat_attn24"]["batch5"]["d16"]["total"]["median"] = 0.0
+    bad.append((an, g2, "P"))
+    g3 = copy.deepcopy(good)
+    del g3["parents_attn24"]["batch1"]["d8"]
+    bad.append((an, g3, "P"))
+    for a_, l_, ps in bad:
+        assert input_problems(a_, l_, plan, ps), (ps,)
     rows = table(dict(sr=sr), lat)
     assert len(rows) == 6 and rows[0]["p50_b5_ms"] == 8 * 8.0 * 5
     with tempfile.TemporaryDirectory() as td:
         p = os.path.join(td, "t.png")
         plot(rows, p)
         assert os.path.getsize(p) > 10000
-    print("самопроверка k34_tradeoff пройдена: таблица 6 строк, график "
-          "строится")
+    print("самопроверка k34_tradeoff пройдена: входы (analysis.ok, план eval, "
+          "checkpoint сида 0, конечность SR и времён) — подмены отвергаются; "
+          "таблица 6 строк, график строится")
     return 0
 
 
