@@ -10,10 +10,11 @@
 #   bash experiments/k36_run.sh analyze-a
 #   bash experiments/k36_run.sh status
 #   bash experiments/k36_run.sh run DEV            # всё выше по порядку
-# continue-b / screen-b / confirm-c / latency / analyze — вторая часть
-# реализации (пока технический отказ, код 3).
-# Свободная память карты до загрузки: K36_FREE_MB (10240); диск K36_DISK_MB
-# (12288), ждать до K36_WAIT_MIN = 720 мин, чужое не удаляется.
+# Этот раннер и модули k36_* закреплены prepare этапа A и не меняются.
+# Этапы B/C (continue-b, screen-b, confirm-c с BAR, latency, итоговый
+# анализ) — отдельные новые модули и отдельный раннер (вторая часть).
+# Свободная память карты до загрузки: max(10 ГиБ, пик real-check + 2 ГиБ);
+# диск K36_DISK_MB (12288), ждать до K36_WAIT_MIN = 720 мин, чужое не удаляется.
 set -uo pipefail
 MODE="${1:?нужен режим}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -55,8 +56,12 @@ selftests () {
     $PY "experiments/${m}.py" --selftest || { echo "ОТКАЗ: самопроверка $m"; return 1; }
   done
 }
+need_mb () {   # max(10 ГиБ, пик real-check + 2 ГиБ)
+  $PY -c "import sys; sys.path.insert(0, 'experiments'); import k36_harness as h; print(int(h.need_free_gb() * 1024))"
+}
 gpu_step () {   # команда_харнесса DEV
-  gpu_free_ge "$2" "${K36_FREE_MB:-10240}" || return 3
+  local need; need="$(need_mb)" || { echo "ОТКАЗ: порог памяти не вычислен"; return 3; }
+  gpu_free_ge "$2" "$need" || return 3
   disk_wait || return 3
   $HAR "$1" --device "$2"
 }
@@ -65,7 +70,7 @@ smoke () {   # DEV
   echo "=== bank-smoke (36 эпизодов)"; gpu_step bank-smoke "$1" || return 3
   echo "=== cold-repeat (12 эпизодов, отдельный холодный процесс)"; gpu_step cold-repeat "$1" || return 3
 }
-later () { echo "ОТКАЗ: $1 — вторая часть реализации K-36 (ещё не написана)"; return 3; }
+later () { echo "ОТКАЗ: $1 — этапы B/C исполняются отдельным раннером второй части K-36"; return 3; }
 
 case "$MODE" in
   selftest) selftests; finish $? ;;

@@ -86,6 +86,22 @@ def ci(v, level):
     return [float(np.quantile(v, a)), float(np.quantile(v, 1 - a))]
 
 
+def resource_rule(Y):
+    """Ресурсное правило перехода к B — только по точечным величинам
+    (неокруглённым), без бутстрэпа. -> (статус, флаги)."""
+    R = pc.RULE_A
+    j = {k: macro(joint_d(Y, *k.split("-"))) for k in ("T32-P32", "T32-R")}
+    ps = {s: {k: macro(joint_d(Y, *k.split("-"), seeds=(s,)))
+              for k in ("T32-P32", "T32-R")} for s in (0, 1)}
+    rule = dict(joint_T32_P32=bool(j["T32-P32"] >= R["joint_T32_P32"]),
+                joint_T32_R=bool(j["T32-R"] >= R["joint_T32_R"]),
+                per_seed=bool(all(v >= R["per_seed_floor"] for s in (0, 1)
+                                  for v in ps[s].values())))
+    st = "passed_A_development" if all(rule.values()) else \
+        "stopped_A_no_signal"
+    return st, rule
+
+
 def analyze(Y, n_boot=None, seed=None):
     st = pc.STATS
     n_boot = n_boot or st["boot_n"]
@@ -125,17 +141,9 @@ def analyze(Y, n_boot=None, seed=None):
         test2=dict(comparison="T32-R", formally_tested=bool(t1),
                    confirmed=bool(t2),
                    note=None if t1 else "описательно: тест 1 не подтверждён"))
-    # ресурсное правило перехода к B
-    R = pc.RULE_A
-    seeds_ok = all(per_seed[str(s)][k]["delta"] >= R["per_seed_floor"]
-                   for s in (0, 1) for k in ("T32-P32", "T32-R"))
-    rule = dict(joint_T32_P32=joint["T32-P32"]["delta"] >=
-                R["joint_T32_P32"],
-                joint_T32_R=joint["T32-R"]["delta"] >= R["joint_T32_R"],
-                per_seed=seeds_ok)
-    status = "passed_A_development" if all(rule.values()) else \
-        "stopped_A_no_signal"
-    return dict(status=status, rule=rule, rule_thresholds=R, family=family,
+    status, rule = resource_rule(Y)
+    return dict(status=status, rule=rule, rule_thresholds=pc.RULE_A,
+                family=family,
                 joint=joint, per_seed=per_seed, sr=sr,
                 boot=dict(n=n_boot, seed=seed, shared_indices="все руки и "
                           "оба сида на случае задачи"),
@@ -219,8 +227,10 @@ def analyze_a(a):
 
 
 def gate_a_problems():
-    """Решение A свежее и полное (для continue-b): файлы, prepare,
-    пересчёт статуса по тем же данным."""
+    """Решение A свежее и полное (для continue-b): точный набор 1800
+    эпизодов и их SHA, prepare, анализ не изменён, статус анализа и решения
+    совпадают с ресурсным правилом, пересчитанным по исходам эпизодов."""
+    import k36_harness as kh
     if not os.path.exists(GATE_A):
         return ["нет решения A"]
     g = json.load(open(GATE_A, encoding="utf-8"))
@@ -231,18 +241,30 @@ def gate_a_problems():
     p = []
     if g.get("prepare_sha1") != prep["sha1"]:
         p.append("решение A другого prepare")
-    for f, s in (g.get("files") or {}).items():
-        if not os.path.exists(f) or pc.sha(f) != s:
+    files = g.get("files") or {}
+    if set(files) != kh.a_files(prep):
+        p.append(f"решение A: набор файлов ≠ ожидаемым 1800 эпизодам "
+                 f"({len(files)} файлов)")
+    for f, sh in files.items():
+        if not os.path.exists(f) or pc.sha(f) != sh:
             p.append("файлы A изменены после решения")
             break
-    if not g.get("files") or len(g["files"]) != 2 * 1800:
-        p.append("решение A не закрепляет все 1800 эпизодов")
     if not os.path.exists(OUT_A) or pc.sha(OUT_A) != g.get("analysis_sha1"):
         p.append("анализ A изменён после решения")
     if p:
         return p
-    return [] if g.get("status") == "passed_A_development" else \
-        [f"статус A: {g.get('status')}"]
+    try:
+        Y, pr, _f, _prep = collect_a()
+    except SystemExit as e:
+        return [f"сбор A: {e.code}"]
+    if pr:
+        return [f"данные A: {pr[:3]}"]
+    st, rule = resource_rule(Y)
+    an = json.load(open(OUT_A, encoding="utf-8"))
+    if an.get("status") != st or g.get("status") != st or \
+            g.get("rule") != rule or an.get("rule") != rule:
+        return [f"статус решения/анализа ≠ пересчёту по исходам ({st})"]
+    return [] if st == "passed_A_development" else [f"статус A: {st}"]
 
 
 # --- CPU-аудит точности (§7.4) ---------------------------------------------------------
@@ -262,35 +284,38 @@ def k32_table():
 
 
 def precision(Y, n_new=100):
-    """Ожидаемая SE разницы при n_new случаев на задачу: по сидам и
-    совместно (наблюдаемая корреляция сидов и консервативная r = 1)."""
+    """Ожидаемая SE разницы при n_new случаев на задачу (§7.4). Совместно —
+    внутри каждой задачи: v_t = Var_i((d0 + d1)/2), SE = √(Σ_t v_t/n)/3
+    (наблюдаемая зависимость сидов); консервативно — r = 1 внутри задачи:
+    v_t = ((sd0_t + sd1_t)/2)². По сиду: √(Σ_t Var_t(d_s)/n)/3."""
     out = {}
+    T = len(TASKS)
     for x, y in (("T32", "P32"), ("T32", "R")):
         k = f"{x}-{y}"
         ds = {s: {t: Y[x][s][t].astype(float) - Y[y][s][t].astype(float)
                   for t in TASKS} for s in (0, 1)}
-        var_s = {s: float(np.mean([ds[s][t].var(ddof=1) for t in TASKS]))
-                 for s in (0, 1)}
-        se_seed = {str(s): float(np.sqrt(var_s[s] / (len(TASKS) * n_new)))
+        se_seed = {str(s): float(np.sqrt(sum(ds[s][t].var(ddof=1)
+                                             for t in TASKS) / n_new) / T)
                    for s in (0, 1)}
-        a = np.concatenate([ds[0][t] for t in TASKS])
-        b = np.concatenate([ds[1][t] for t in TASKS])
-        r = float(np.corrcoef(a, b)[0, 1]) if a.std() > 0 and b.std() > 0 \
-            else float("nan")
-        vj = {}
-        for nm, rr in (("observed", r), ("conservative_r1", 1.0)):
-            rr = 0.0 if not np.isfinite(rr) else rr
-            v = 0.25 * (var_s[0] + var_s[1] + 2 * rr * np.sqrt(
-                var_s[0] * var_s[1]))
-            vj[nm] = float(np.sqrt(v / (len(TASKS) * n_new)))
+        v_obs = sum(((ds[0][t] + ds[1][t]) / 2).var(ddof=1) for t in TASKS)
+        v_con = sum(((ds[0][t].std(ddof=1) + ds[1][t].std(ddof=1)) / 2) ** 2
+                    for t in TASKS)
+        vj = dict(observed=float(np.sqrt(v_obs / n_new) / T),
+                  conservative_r1=float(np.sqrt(v_con / n_new) / T))
+        corr_t = {}
+        for t in TASKS:
+            a, b = ds[0][t], ds[1][t]
+            corr_t[str(t)] = float(np.corrcoef(a, b)[0, 1]) \
+                if a.std() > 0 and b.std() > 0 else None
         q = {str(s): float(np.mean(np.concatenate(
             [np.abs(ds[s][t]) for t in TASKS]))) for s in (0, 1)}
-        out[k] = dict(q_old=q, corr_seeds_old=r, se_seed=se_seed,
-                      se_joint=vj,
+        out[k] = dict(q_old=q, corr_seeds_within_task=corr_t,
+                      se_seed=se_seed, se_joint=vj,
                       halfwidth97_5_joint={kk: 2.241 * v for kk, v in
                                            vj.items()},
-                      old_delta=dict({str(s): float(np.mean(
-                          [ds[s][t].mean() for t in TASKS])) for s in (0, 1)}))
+                      old_delta={str(s): float(np.mean(
+                          [ds[s][t].mean() for t in TASKS]))
+                          for s in (0, 1)})
     return out
 
 
@@ -300,8 +325,8 @@ def cpu_audit(a):
                "(q из K-33 не используется)", precision=precision(Y))
     pc.save_json(AUDIT, res)
     for k, v in res["precision"].items():
-        print(f"  {k}: q K-32 {v['q_old']}, корреляция сидов "
-              f"{v['corr_seeds_old']:.2f}; ожидаемая SE на сид "
+        print(f"  {k}: q K-32 {v['q_old']}, корреляция сидов по задачам "
+              f"{v['corr_seeds_within_task']}; ожидаемая SE на сид "
               f"{v['se_seed']}, совместно {v['se_joint']}; полуширина 97.5% "
               f"{ {kk: round(100 * x, 1) for kk, x in v['halfwidth97_5_joint'].items()} } п.п.")
     return 0
@@ -371,11 +396,76 @@ def selftest():
     for v in pr.values():
         assert v["se_joint"]["conservative_r1"] >= v["se_joint"][
             "observed"] - 1e-12
+    # совместная SE: внутри задач, а не через общую корреляцию
+    Yp = {nm: {s: {} for s in (0, 1)} for nm in NAMES}
+    rg = np.random.default_rng(3)
+    for t, off in ((0, 0.0), (6, 0.4), (8, -0.3)):
+        base = rg.random(15)
+        for s in (0, 1):
+            u = base if s == 0 else rg.random(15)
+            Yp["T32"][s][t] = u < 0.6 + off * (s == 0)
+            Yp["P32"][s][t] = u < 0.5
+            Yp["R"][s][t] = u < 0.45
+    pv = precision(Yp, n_new=100)["T32-P32"]
+    d = {s: {t: Yp["T32"][s][t].astype(float) - Yp["P32"][s][t]
+             .astype(float) for t in TASKS} for s in (0, 1)}
+    want = np.sqrt(sum(((d[0][t] + d[1][t]) / 2).var(ddof=1)
+                       for t in TASKS) / 100) / 3
+    assert abs(pv["se_joint"]["observed"] - want) < 1e-12
+    # гейт A: статус решения пересчитывается по исходам; подделанный
+    # passed при стоп-исходах, чужой набор файлов, правка анализа — отказ
+    import tempfile
+    import k36_harness as kh
+    G = globals()
+    keep = dict(OUT_A=G["OUT_A"], GATE_A=G["GATE_A"],
+                collect_a=G["collect_a"])
+    keep_lp, keep_af = pc.load_prepare, kh.a_files
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            fs = [os.path.join(td, f"e{i}.json") for i in range(4)]
+            for f in fs:
+                open(f, "w").write(f)
+            G.update(OUT_A=os.path.join(td, "an.json"),
+                     GATE_A=os.path.join(td, "gate.json"))
+            pc.load_prepare = lambda: dict(sha1="PREP")
+            kh.a_files = lambda prep: set(fs)
+            for Ytab, want_st in ((table(), "passed_A_development"),
+                                  (table(0.8, 0.8, 0.8),
+                                   "stopped_A_no_signal")):
+                G["collect_a"] = lambda Ytab=Ytab: (Ytab, [], {}, None)
+                st, ru = resource_rule(Ytab)
+                assert st == want_st
+                pc.save_json(G["OUT_A"], dict(status=st, rule=ru))
+                gate = dict(status=st, rule=ru, prepare_sha1="PREP",
+                            files={f: pc.sha(f) for f in fs},
+                            analysis_sha1=pc.sha(G["OUT_A"]))
+                pc.save_json(G["GATE_A"], gate)
+                pr = gate_a_problems()
+                assert (pr == []) == (st == "passed_A_development"), pr
+                if st == "stopped_A_no_signal":     # подделка passed
+                    pc.save_json(G["OUT_A"], dict(
+                        status="passed_A_development", rule=dict(
+                            joint_T32_P32=True, joint_T32_R=True,
+                            per_seed=True)))
+                    pc.save_json(G["GATE_A"], dict(
+                        gate, status="passed_A_development",
+                        rule=dict(joint_T32_P32=True, joint_T32_R=True,
+                                  per_seed=True),
+                        analysis_sha1=pc.sha(G["OUT_A"])))
+                    assert gate_a_problems()
+            pc.save_json(G["GATE_A"], dict(gate, files={fs[0]: pc.sha(
+                fs[0])}))
+            assert gate_a_problems()                  # неполный набор
+        finally:
+            G.update(keep)
+            pc.load_prepare, kh.a_files = keep_lp, keep_af
     print("самопроверка k36_analyze пройдена: явный сигнал — оба теста "
           "семьи A и ресурсное правило; одинаковые руки — Δ 0, стоп, тест 2 "
           "не открывается; порог по сидам; общие индексы = прямому resample "
           "(в т. ч. неравные задачи); McNemar; консервативная SE ≥ "
-          "наблюдаемой")
+          "наблюдаемой; совместная SE — внутри задач (не через общую "
+          "корреляцию); гейт A — статус пересчитывается по исходам, "
+          "подделанный passed и неполный набор файлов — отказ")
     return 0
 
 

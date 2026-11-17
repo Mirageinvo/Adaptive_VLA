@@ -31,5 +31,6 @@ nohup bash experiments/k36_run.sh confirm-a cuda:0 > /dev/null 2>&1 &
 bash experiments/k36_run.sh analyze-a
 ```
 
+Файлы этапа A закреплены prepare (включая `k36_run.sh`) и не меняются.
 Вторая часть (continue-b, screen-b, confirm-c с BAR, latency, итоговый
-analyze) пишется, пока идёт этап A.
+analyze) — новые модули и отдельный раннер; пишется, пока идёт этап A.
