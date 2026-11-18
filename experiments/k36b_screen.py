@@ -81,20 +81,23 @@ def _screen_seed(torch, prep, C, L, sim, s, wants, device, loader=None,
     act = actor if actor is not None else load_tplus(torch, prep, s,
                                                      v["mod"].H)
     arm = kh.make_arm(torch, prep, f"T32_s{s}", v, actor=act)
-    hashes = {w["seed"]: w["actor_hash"] for w in wants}
-
-    def woe(eid):
-        _st, lab, t, key = kg.parse_eid(eid)
-        s2 = pc.parse_arm(lab)[2]
-        return screen_want(prep, s2, t, key, hashes[s2])
+    by_eid = {w["eid"]: w for w in wants}     # полная закреплённая очередь
+    val = (lambda r, z, w2: kh.episode_problems(r, z, w2, C))
     out = []
     for w in wants:
-        if w["seed"] == s:
-            if kh.load_ep(w) is None:          # дальше будет новый reserve
-                kg.before_reserve(L, w, kg.SCREEN_PENDING, woe,
-                                  lambda r, z, w2: kh.episode_problems(
-                                      r, z, w2, C))
-            out.append((w, kh.run_ep(w, sim, v["io"], arm, L, C)))
+        if w["seed"] != s:
+            continue
+
+        def run_save(w=w):
+            import k31_collect as kcol
+            arm.episode = kh.episode_number(w["eid"])
+            arm.keep_first = False
+            ep = kcol.run_episode(sim, v["io"], arm, w["task"],
+                                  w["reset_id"])
+            kh.save_ep(w, ep)
+            return ep["physical"]
+        out.append((w, kg.transact(w, L, run_save, val, kg.SCREEN_PENDING,
+                                   lambda eid: by_eid[eid])))
     return out
 
 
@@ -299,7 +302,10 @@ def selftest():
             kh.load_source = lambda *a, **k: dict(mod=types.SimpleNamespace(
                 H=4), io=None)
             kh.make_arm = lambda *a, **k: None
-            kh.run_ep = lambda *a, **k: ("rec", "z")
+            keep_tr = kg.transact
+            kg.transact = lambda w_, L_, rs, val_, al, woe: (
+                ("rec", "z") if kh.load_ep(w_) is not None else
+                kg.before_reserve(L_, w_, al, woe, val_))
             kh.load_ep = lambda w_: ("rec", "z")          # уже записан
             out = _screen_seed(None, {}, {}, L, None, 0, [w], "cpu",
                                actor=object())
@@ -316,6 +322,7 @@ def selftest():
         finally:
             for k, v in keep.items():
                 setattr(kh, k, v)
+            kg.transact = keep_tr
     print("самопроверка k36b_screen пройдена: правило B (joint ≥ 0.03, "
           "6 чистых успехов из 180 проходят, отставание по сиду > 2 — стоп, "
           "неизменённый actor — стоп); при открытом резерве C записанный "

@@ -146,6 +146,16 @@ def c_want(prep, plan, lab, t, cid, revision=None):
                       actor_hash=ah)
 
 
+def c_lookup(prep, plan, revision):
+    """eid -> ожидаемый эпизод по ВСЕЙ закреплённой очереди C."""
+    out = {}
+    for lab, t, _g, cases in cells_c(prep["splits"]):
+        for cid in cases:
+            w = c_want(prep, plan, lab, t, cid, revision)
+            out[w["eid"]] = w
+    return out
+
+
 def block_path(lab, t, g):
     return os.path.join(pc.OUT, STAGE, lab, f"t{t}_b{g:02d}.json")
 
@@ -174,9 +184,10 @@ def _chunk(torch, prep, plan, C, L, sim, src_key, chunk, device, revision,
     n = 0
     qb = kbar.consts_bar(prep)
 
+    by_eid = c_lookup(prep, plan, revision)  # полная закреплённая очередь C
+
     def woe(eid):
-        _st, lab, t, key = kg.parse_eid(eid)
-        return c_want(prep, plan, lab, t, key, revision)
+        return by_eid[eid]
 
     vb = int(json.load(open(kbar.GATES["bar_smoke"], encoding="utf-8"))[
         "vocab"])                      # словарь BAR из пройденного smoke
@@ -217,9 +228,16 @@ def _chunk(torch, prep, plan, C, L, sim, src_key, chunk, device, revision,
         files = {}
         for cid in cases:
             w = c_want(prep, plan, lab, t, cid)
-            if kh.load_ep(w) is None:          # дальше будет новый reserve
-                kg.before_reserve(L, w, kg.C_PENDING, woe, validate)
-            kh.run_ep(w, sim, v["io"], arms[lab], L, C)
+
+            def run_save(w=w, arm=arms[lab]):
+                import k31_collect as kcol
+                arm.episode = kh.episode_number(w["eid"])
+                arm.keep_first = False
+                ep = kcol.run_episode(sim, v["io"], arm, w["task"],
+                                      w["reset_id"])
+                kh.save_ep(w, ep)
+                return ep["physical"]
+            kg.transact(w, L, run_save, validate, kg.C_PENDING, woe)
             files.update(kh.ep_files(w))
         pc.save_json(block_path(lab, t, g), dict(
             label=lab, task=t, block=g, cases=cases, files=files,

@@ -102,10 +102,17 @@ def latency_problems(plan_c_sha1, n=300, warm=50, qsha=None):
     if not p:
         want_s = summary_of(r)
         got = r.get("summary") or {}
-        if any(not isinstance(got.get(k), (int, float)) or
-               abs(got[k] - v) > 1e-9 * max(1.0, abs(v))
-               for k, v in want_s.items() if k != "p50"):
-            p.append("задержка: записанные отношения ≠ пересчёту из медиан")
+
+        def same(a, b):
+            return isinstance(a, (int, float)) and not isinstance(a, bool) \
+                and np.isfinite(a) and abs(a - b) <= 1e-9 * max(1.0, abs(b))
+        if any(not same(got.get(k), v) for k, v in want_s.items()
+               if k != "p50") or not isinstance(got.get("p50"), dict) or \
+                set(got["p50"]) != set(want_s["p50"]) or \
+                any(not same(got["p50"][k], v)
+                    for k, v in want_s["p50"].items()):
+            p.append("задержка: записанная сводка (медианы/отношения) ≠ "
+                     "пересчёту из замеров или не конечна")
     return p
 
 
@@ -119,13 +126,19 @@ def summary_of(r):
 
 
 def gpu_used_mb(device):
-    """Занятость карты по nvidia-smi (до CUDA-контекста процесса)."""
+    """Занятость карты по nvidia-smi (до CUDA-контекста процесса); ответ
+    не число (N/A) или сбой — технический отказ, а не «карта занята»."""
     import subprocess
     idx = str(device).split(":")[-1]
-    out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used",
-                          "--format=csv,noheader,nounits", "-i", idx],
-                         capture_output=True, text=True, check=True)
-    return int(out.stdout.strip().splitlines()[0])
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used",
+                              "--format=csv,noheader,nounits", "-i", idx],
+                             capture_output=True, text=True, check=True)
+        return int(out.stdout.strip().splitlines()[0])
+    except (OSError, subprocess.CalledProcessError, ValueError,
+            IndexError) as e:
+        raise SystemExit(f"nvidia-smi: занятость {device} не прочитана "
+                         f"({type(e).__name__})")
 
 
 def collect_obs(sim, io, L, stamp):
@@ -332,7 +345,11 @@ def selftest():
             assert latency_problems("P", qsha=Q)
             assert abs(summary_of(tw)["Tplus_over_BAR"] - 1.5) < 1e-12
             for bad in (dict(good, queue=[[0, "a"]]),
-                        dict(good, mem_used_before_mb=8192)):
+                        dict(good, mem_used_before_mb=8192),
+                        dict(good, summary=dict(good["summary"],
+                                                Tplus_over_BAR=float("nan"))),
+                        dict(good, summary=dict(good["summary"], p50=dict(
+                            good["summary"]["p50"], BAR=1.0)))):
                 pc.save_json(g["OUT"], bad)
                 assert latency_problems("P", qsha=Q), bad
             open(g["OUT"], "w").write("{испорчен")
@@ -345,7 +362,8 @@ def selftest():
         queue_sha([(0, "b")])
     print("самопроверка k36c_latency пройдена: задержка чужого плана C, "
           "неполного объёма, другой очереди, без руки, без p50/p95, с p95 < "
-          "p50 или NaN, испорченный файл, неверное записанное отношение, "
+          "p50 или NaN, испорченный файл, неверное/NaN отношение, ложная "
+          "медиана сводки, "
           "чужой список очереди, занятая карта — отказ; нет файла — "
           "latency_pending без чтения данных (замер — на GPU)")
     return 0

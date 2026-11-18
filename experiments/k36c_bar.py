@@ -240,41 +240,25 @@ def bar_episode_problems(rec, z, want, q, vocab):
 
 def run_bar_ep(want, sim, io, arm, L, q, vocab, keep_first=False,
                crash=None, allowed=None, woe=None, validate=None):
-    """allowed — допустимые открытые резервы [(scope, префикс eid)];
-    чужой открытый резерв — отказ до списания."""
+    """Транзакция эпизода BAR (k36b_gate.transact): журнал меняется только
+    после полной проверки результата; allowed — допустимые открытые
+    резервы стадии, woe — eid -> ожидаемый эпизод из закреплённой очереди
+    стадии."""
     import k36b_gate as kg
-    if os.path.exists(kh.reject_path(want["eid"])):
-        raise SystemExit(f"{want['eid']}: был отвергнут — технический стоп")
-    got = kh.load_ep(want)
-    if got is None:
-        if L.is_done(want["eid"]):
-            raise SystemExit(f"{want['eid']}: учтён, но результата нет")
-        kg.before_reserve(
-            L, want, allowed or [(want["scope"],
-                                  f"{want['scope']}/{want['stage']}/")],
-            woe or (lambda eid: (_ for _ in ()).throw(
-                SystemExit(f"{eid}: нет ожидаемого эпизода"))),
-            validate or (lambda r, z, w2: bar_episode_problems(
-                r, z, w2, q, vocab)))
-        L.reserve(want["scope"], want["eid"], amount=pc.EP)
+    val = validate or (lambda r, z, w2: bar_episode_problems(r, z, w2, q,
+                                                             vocab))
+
+    def run_save():
         arm.keep_first = bool(keep_first)
         ep = kcol.run_episode(sim, io, arm, want["task"], want["reset_id"])
         save_bar_ep(want, ep, arm.first if keep_first else None)
         if crash == "after_write":
             raise KeyboardInterrupt("после записи эпизода")
-        L.commit(want["eid"], ep["physical"])
-        got = kh.load_ep(want)
-    rec, z = got
-    pr = kh.ledger_owner_problems(L, want["eid"], rec["phys"], want["scope"])
-    if pr:
-        raise SystemExit(pr[0])
-    L.settle(want["eid"], rec["phys"])
-    pr = bar_episode_problems(rec, z, want, q, vocab)
-    if pr:
-        q_ = kh.quarantine(want, pr)
-        raise SystemExit(f"{want['eid']}: эпизод BAR отвергнут ({pr[:3]}) -> "
-                         f"карантин {q_}")
-    return rec, z
+        return ep["physical"]
+    return kg.transact(
+        want, L, run_save, val,
+        allowed or [(want["scope"], f"{want['scope']}/{want['stage']}/")],
+        woe or {want["eid"]: want}.__getitem__)
 
 
 # --- ожидаемые наборы и гейты ------------------------------------------------------------

@@ -201,8 +201,10 @@ def analyze_c(a):
     res = analyze(Y, YB)
     res.update(status="complete", prepare_sha1=prep["sha1"],
                n_files=len(files),
-               latency=json.load(open(kl36.OUT)) if lp is not None else
-               "latency_pending",
+               latency=(dict(json.load(open(kl36.OUT)),
+                             summary=kl36.summary_of(json.load(open(
+                                 kl36.OUT))))
+                        if lp is not None else "latency_pending"),
                table={f"{nm}_s{s}": {str(t): Y[nm][s][t].astype(int).tolist()
                                      for t in ALL}
                       for nm in NAMES for s in (0, 1)},

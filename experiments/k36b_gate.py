@@ -217,6 +217,65 @@ def before_reserve(L, want, allowed, want_of_eid, validate):
     L.settle(pd["id"], phys)
 
 
+def phys_problems(rec, amount):
+    phys = rec.get("phys") if isinstance(rec, dict) else None
+    if isinstance(phys, bool) or not isinstance(phys, int) or \
+            not 0 < phys <= int(amount):
+        return [f"расход {phys!r} вне (0, {amount}]"]
+    return []
+
+
+def transact(want, L, run_and_save, validate, allowed, woe):
+    """Транзакция эпизода B/C (k36_harness.run_ep закреплён за A и делает
+    settle ДО проверки). Здесь журнал меняется только после полной
+    проверки результата:
+      - записанный результат того же eid: проверка (validate + 0 < phys ≤
+        резерва, scope открытого резерва) -> settle; иначе карантин и
+        маркер, журнал не меняется;
+      - новый: before_reserve -> reserve -> run_and_save() (исполнение и
+        атомарная запись, -> фактический расход) -> проверка записанного
+        (validate, границы, записанный расход = исполненному) -> commit;
+        иначе карантин и маркер, резерв остаётся открытым (следующий
+        reserve консервативно спишет его как аварию)."""
+    import k36_harness as kh
+    eid = want["eid"]
+    if os.path.exists(kh.reject_path(eid)):
+        raise SystemExit(f"{eid}: был отвергнут — технический стоп")
+    got = kh.load_ep(want)
+    if got is None:
+        if L.is_done(eid):
+            raise SystemExit(f"{eid}: учтён, но результата нет")
+        before_reserve(L, want, allowed, woe, validate)
+        L.reserve(want["scope"], eid, amount=pc.EP)
+        phys_run = int(run_and_save())
+        got = kh.load_ep(want)
+        pr = ["нет записанного результата"] if got is None else (
+            validate(*got, want) + phys_problems(got[0], pc.EP) +
+            ([] if got[0].get("phys") == phys_run else
+             ["записанный расход ≠ исполненному"]))
+        if pr:
+            q = kh.quarantine(want, pr)
+            raise SystemExit(f"{eid}: эпизод отвергнут до commit ({pr[:3]})"
+                             f" -> карантин {q}")
+        L.commit(eid, got[0]["phys"])
+        return got
+    rec, z = got
+    pd = L.d.get("pending") or {}
+    amount = int(pd["amount"]) if pd.get("id") == eid else pc.EP
+    pr = validate(rec, z, want) + phys_problems(rec, amount)
+    if pd.get("id") == eid and pd.get("scope") != want["scope"]:
+        pr.append(f"открытый резерв в scope {pd.get('scope')}")
+    if pr:
+        q = kh.quarantine(want, pr)
+        raise SystemExit(f"{eid}: записанный эпизод отвергнут до settle "
+                         f"({pr[:3]}) -> карантин {q}")
+    owner = kh.ledger_owner_problems(L, eid, rec["phys"], want["scope"])
+    if owner:
+        raise SystemExit(owner[0])
+    L.settle(eid, rec["phys"])
+    return rec, z
+
+
 def parse_eid(eid):
     """'<scope>/<stage>/<метка>/t<задача>/<ключ>' -> (stage, label, task,
     key)."""
@@ -323,6 +382,21 @@ def selftest():
                 except SystemExit:
                     pass
                 assert json.dumps(L.d, sort_keys=True) == before
+            # сосед вне закреплённой очереди этапа (нет в lookup) — отказ
+            e5 = "bar_c/confirm_c/BAR/t0/k33s1_t0_c00005"
+            L.d["pending"] = dict(scope="bar_c", id=e5, amount=610)
+            jp5, np5 = kh.ep_paths("confirm_c", "BAR", 0, "k33s1_t0_c00005")
+            np.savez(np5, a=np.zeros(1))
+            pc.save_json(jp5, dict(eid=e5, scope="bar_c", phys=30,
+                                   npz_sha1=pc.sha(np5)))
+            before = json.dumps(L.d, sort_keys=True)
+            only_known = {w2["eid"]: w2}
+            try:
+                before_reserve(L, w2, C_PENDING, only_known.__getitem__, val)
+                raise AssertionError("сосед вне очереди зачтён")
+            except SystemExit:
+                pass
+            assert json.dumps(L.d, sort_keys=True) == before
             # тот же eid в другом scope — отказ
             L.d["pending"] = dict(scope="confirm_c", id=w2["eid"],
                                   amount=610)
@@ -386,6 +460,67 @@ def selftest():
             G.update(keep)
             ka.GATE_A, ka.OUT_A, ka.collect_a = keep_ka
             pc.load_prepare, kh.a_files = keep_lp, keep_af
+    # транзакция B/C: записанный phys −7 того же eid — карантин ДО settle,
+    # журнал не меняется; корректный — settle; свежий с неверным
+    # результатом — не commit
+    with tempfile.TemporaryDirectory() as td:
+        keep_out, keep_rej = kh.OUT, kh.REJECTED
+        try:
+            kh.OUT = os.path.join(td, "r")
+            kh.REJECTED = os.path.join(td, "r", "rejected")
+            L = kcol.Ledger(os.path.join(td, "l3.json"), pc.CAPS)
+            w = dict(eid="screen_b/screen_b/Tplus_s0/t0/c1", scope="screen_b",
+                     stage="screen_b", label="Tplus_s0", task=0, key="c1")
+
+            def write(phys):
+                jp, np_ = kh.ep_paths("screen_b", "Tplus_s0", 0, "c1")
+                os.makedirs(os.path.dirname(jp), exist_ok=True)
+                np.savez(np_, a=np.zeros(1))
+                pc.save_json(jp, dict(eid=w["eid"], scope="screen_b",
+                                      phys=phys, npz_sha1=pc.sha(np_)))
+            keep_le = kh.load_ep
+            kh.load_ep = lambda w_: (json.load(open(kh.ep_paths(
+                w_["stage"], w_["label"], w_["task"], w_["key"])[0])), {}) \
+                if os.path.exists(kh.ep_paths(w_["stage"], w_["label"],
+                                              w_["task"], w_["key"])[0]) \
+                else None
+            ok_val = (lambda r, z, w_: [])
+            L.reserve("screen_b", w["eid"])
+            write(-7)
+            before = json.dumps(L.d, sort_keys=True)
+            try:
+                transact(w, L, lambda: 0, ok_val, SCREEN_PENDING,
+                         lambda e: w)
+                raise AssertionError("phys −7 зачтён")
+            except SystemExit:
+                pass
+            assert json.dumps(L.d, sort_keys=True) == before
+            assert os.path.exists(kh.reject_path(w["eid"]))
+            # свежий эпизод: записанный расход ≠ исполненному — без commit
+            w2 = dict(w, eid="screen_b/screen_b/Tplus_s0/t0/c2", key="c2")
+
+            def run_save():
+                jp, np_ = kh.ep_paths("screen_b", "Tplus_s0", 0, "c2")
+                np.savez(np_, a=np.zeros(1))
+                pc.save_json(jp, dict(eid=w2["eid"], scope="screen_b",
+                                      phys=30, npz_sha1=pc.sha(np_)))
+                return 40
+            sp = L.spent("screen_b")
+            try:
+                transact(w2, L, run_save, ok_val, SCREEN_PENDING,
+                         lambda e: {w["eid"]: w, w2["eid"]: w2}[e])
+                raise AssertionError("расхождение расхода зачтено")
+            except SystemExit:
+                pass
+            # резерв отвергнутого c1 консервативно списан как авария (610),
+            # c2 не зачтён: его резерв открыт
+            assert L.spent("screen_b") == sp + pc.EP and \
+                L.d["crashes"][-1]["id"] == w["eid"] and \
+                L.d["pending"]["id"] == w2["eid"] and \
+                not L.is_done(w2["eid"])
+            kh.load_ep = keep_le
+        finally:
+            kh.OUT, kh.REJECTED = keep_out, keep_rej
     assert code_of("stopped") == 4 and code_of("technical") == 3
     print("самопроверка k36b_gate пройдена: правило A в целых (ровно +18 и "
           "−6 проходят, +17 и −7 — стоп), чужой открытый резерв — отказ; "

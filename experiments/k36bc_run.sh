@@ -34,14 +34,14 @@ need_mb () {
 gpu_free_ge () {   # DEV нужно_МиБ
   local idx="${1#cuda:}" free
   free="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$idx" 2>/dev/null | tr -d ' ')"
-  [ -n "$free" ] || { echo "ОТКАЗ: nvidia-smi не отвечает для $1"; return 3; }
+  [[ "$free" =~ ^[0-9]+$ ]] || { echo "ОТКАЗ: nvidia-smi для $1 вернул '${free}' (не число)"; return 3; }
   echo "    $1: свободно $free МиБ (нужно $2)"
   [ "$free" -ge "$2" ] || { echo "ОТКАЗ: на $1 свободно $free МиБ < $2"; return 3; }
 }
 gpu_used_le () {   # DEV порог: 0 — да, 4 — занята, 3 — сбой
   local idx="${1#cuda:}" used
   used="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$idx" 2>/dev/null | tr -d ' ')"
-  [ -n "$used" ] || { echo "ОТКАЗ: nvidia-smi не отвечает для $1"; return 3; }
+  [[ "$used" =~ ^[0-9]+$ ]] || { echo "ОТКАЗ: nvidia-smi для $1 вернул '${used}' (не число)"; return 3; }
   echo "    $1: занято $used МиБ (порог $2)"
   [ "$used" -le "$2" ] || return 4
 }
