@@ -105,7 +105,8 @@ def latency_problems(plan_c_sha1, n=300, warm=50, qsha=None):
 
         def same(a, b):
             return isinstance(a, (int, float)) and not isinstance(a, bool) \
-                and np.isfinite(a) and abs(a - b) <= 1e-9 * max(1.0, abs(b))
+                and np.isfinite(a) and np.isfinite(b) and \
+                abs(a - b) <= 1e-9 * max(1.0, abs(b))
         if any(not same(got.get(k), v) for k, v in want_s.items()
                if k != "p50") or not isinstance(got.get("p50"), dict) or \
                 set(got["p50"]) != set(want_s["p50"]) or \
@@ -350,6 +351,13 @@ def selftest():
                                                 Tplus_over_BAR=float("nan"))),
                         dict(good, summary=dict(good["summary"], p50=dict(
                             good["summary"]["p50"], BAR=1.0)))):
+                pc.save_json(g["OUT"], bad)
+                assert latency_problems("P", qsha=Q), bad
+            # медиана 5e−324 мс: отношение Inf уже при пересчёте — отказ
+            tiny = dict(good, bar=dict(BAR=dict(total=dict(
+                median=5e-324, p95=1e-300), n=300)))
+            tiny["summary"] = dict(good["summary"])
+            for bad in (tiny,):
                 pc.save_json(g["OUT"], bad)
                 assert latency_problems("P", qsha=Q), bad
             open(g["OUT"], "w").write("{испорчен")
