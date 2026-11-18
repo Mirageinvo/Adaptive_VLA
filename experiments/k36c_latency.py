@@ -33,6 +33,36 @@ OUT = "reports/k36/latency.json"
 ARMS = ("R_s0", "T32_s0", "Tplus_s0")
 
 
+def latency_problems(plan_c_sha1, queue_sha1=None, n=300, warm=50):
+    """Отчёт задержки принадлежит этому плану C, полной очереди и объёму:
+    plan_c_sha1, B = 1, n/warm, все четыре руки с n измерениями."""
+    if not os.path.exists(OUT):
+        return None
+    r = json.load(open(OUT, encoding="utf-8"))
+    p = []
+    if r.get("plan_c_sha1") != plan_c_sha1:
+        p.append("задержка другого плана C")
+    if r.get("batch") != 1 or r.get("n") != n or r.get("warm") != warm:
+        p.append("задержка: батч/объём ≠ 1 / 300 / 50")
+    if queue_sha1 is not None and r.get("queue_sha1") != queue_sha1:
+        p.append("задержка: другая очередь")
+    pol = r.get("policies") or {}
+    bar = r.get("bar") or {}
+    for k in ARMS:
+        if (pol.get(k) or {}).get("n") != n:
+            p.append(f"задержка: нет полного замера {k}")
+    if (bar.get("BAR") or {}).get("n") != n:
+        p.append("задержка: нет полного замера BAR")
+    return p
+
+
+def queue_sha(D, n=300, warm=50):
+    import hashlib
+    import k21_latency as kl
+    q = kl.make_queue(D["task"], np.asarray(D["val_rows"]), 1, max(warm, n))
+    return hashlib.sha1(np.stack(q).astype(np.int64).tobytes()).hexdigest()
+
+
 def measure(torch, dev, queue, cache, D, arms_fn, n, warm, block):
     """arms_fn() -> {метка: callable(rows) -> (чанк, rec)}; одна модель."""
     import k21_latency as kl
@@ -163,10 +193,37 @@ def main():
     return 0
 
 
+def selftest():
+    import tempfile
+    g = globals()
+    keep = g["OUT"]
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            g["OUT"] = os.path.join(td, "lat.json")
+            assert latency_problems("P", "Q") is None       # нет -> pending
+            good = dict(plan_c_sha1="P", batch=1, n=300, warm=50,
+                        queue_sha1="Q",
+                        policies={k: dict(n=300) for k in ARMS},
+                        bar=dict(BAR=dict(n=300)))
+            pc.save_json(g["OUT"], good)
+            assert latency_problems("P", "Q") == []
+            for bad in (dict(good, plan_c_sha1="X"), dict(good, n=1),
+                        dict(good, warm=0), dict(good, queue_sha1="Z"),
+                        dict(good, policies={"R_s0": dict(n=300)}),
+                        dict(good, bar={"BAR": dict(n=1)})):
+                pc.save_json(g["OUT"], bad)
+                assert latency_problems("P", "Q"), bad
+        finally:
+            g["OUT"] = keep
+    print("самопроверка k36c_latency пройдена: задержка чужого плана C, "
+          "неполного объёма, другой очереди или без руки — отказ; нет "
+          "файла — latency_pending (замер — на GPU)")
+    return 0
+
+
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
-        print("самопроверка k36c_latency: только импорт (замер — на GPU)")
-        sys.exit(0)
+        sys.exit(selftest())
     try:
         sys.exit(main())
     except SystemExit as e:

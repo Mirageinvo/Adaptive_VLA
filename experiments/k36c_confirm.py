@@ -31,6 +31,7 @@ import numpy as np  # noqa: E402
 import k36_bank as kb36  # noqa: E402
 import k36_harness as kh  # noqa: E402
 import k36_protocol as pc  # noqa: E402
+import k36b_gate as kg  # noqa: E402
 import k36b_screen as kbs  # noqa: E402
 import k36b_train as kbt  # noqa: E402
 import k36c_bar as kbar  # noqa: E402
@@ -74,6 +75,17 @@ def chunks(cells):
     return out
 
 
+CODE_BC = ("k36b_gate.py", "k36b_train.py", "k36b_screen.py", "k36c_bar.py",
+           "k36c_confirm.py", "k36c_latency.py", "k36c_analyze.py",
+           "k36bc_run.sh")
+
+
+def bar_revision():
+    import k21_data as d21
+    return json.load(open(d21.REPORT, encoding="utf-8"))["bar_pin"][
+        "revision"]
+
+
 def make_plan_c(prep):
     gb = kbs.gate_b_problems()
     if gb:
@@ -85,37 +97,33 @@ def make_plan_c(prep):
         tplus[str(s)] = dict(actor_hash=r["actor_hash"],
                              final_sha1=pc.sha(kbt.final_path(s)),
                              report_sha1=pc.sha(kbt.report_path(s)))
-    return dict(kind="k36_plan_c", prepare_sha1=prep["sha1"],
-                gate_b_sha1=pc.sha(kbs.GATE_B),
-                gate_b_files=json.load(open(kbs.GATE_B))["files"],
-                tplus=tplus, task_order=task_order_c(),
-                cells_sha1=hashlib.sha1(json.dumps(cells).encode())
-                .hexdigest(), n_cells=len(cells),
-                n_episodes=sum(len(c[3]) for c in cells))
+    return json.loads(json.dumps(dict(
+        kind="k36_plan_c", prepare_sha1=prep["sha1"],
+        gate_b_sha1=pc.sha(kbs.GATE_B),
+        gate_b_files=json.load(open(kbs.GATE_B))["files"],
+        tplus=tplus, bar_revision=bar_revision(),
+        code={f: pc.sha(os.path.join(HERE, f)) for f in CODE_BC},
+        task_order=task_order_c(),
+        cells_sha1=hashlib.sha1(json.dumps(cells).encode()).hexdigest(),
+        n_cells=len(cells),
+        n_blocks=dict(policy=sum(c[0] != "BAR" for c in cells),
+                      bar=sum(c[0] == "BAR" for c in cells)),
+        n_episodes=sum(len(c[3]) for c in cells))))
 
 
 def plan_c_problems(prep):
+    """Закреплённый план C = полному ожидаемому плану, построенному заново
+    из текущих артефактов (оба Tplus, решение B и его файлы, ревизия BAR,
+    SHA модулей B/C, очередь и объёмы)."""
     if not os.path.exists(PLAN_C):
         return ["нет плана C"]
     pl = json.load(open(PLAN_C, encoding="utf-8"))
-    p = []
-    if pl.get("prepare_sha1") != prep["sha1"]:
-        p.append("план C другого prepare")
-    if not os.path.exists(kbs.GATE_B) or pc.sha(kbs.GATE_B) != \
-            pl.get("gate_b_sha1"):
-        p.append("решение B изменено после плана C")
-    for f, s in (pl.get("gate_b_files") or {}).items():
-        if not os.path.exists(f) or pc.sha(f) != s:
-            p.append("файлы B изменены после плана C")
-            break
-    for s, v in (pl.get("tplus") or {}).items():
-        if pc.sha(kbt.final_path(int(s))) != v["final_sha1"]:
-            p.append(f"Tplus_s{s} изменён после плана C")
-    cells = cells_c(prep["splits"])
-    if hashlib.sha1(json.dumps(cells).encode()).hexdigest() != \
-            pl.get("cells_sha1"):
-        p.append("очередь C ≠ плану")
-    return p
+    try:
+        want = make_plan_c(prep)
+    except SystemExit as e:
+        return [f"ожидаемый план C не строится: {e.code}"]
+    diff = sorted(k for k in set(pl) | set(want) if pl.get(k) != want.get(k))
+    return [f"план C ≠ ожидаемому: {diff}"] if diff else []
 
 
 def c_want(prep, plan, lab, t, cid, revision=None):
@@ -168,7 +176,8 @@ def _chunk(torch, prep, plan, C, L, sim, src_key, chunk, device, revision,
             files = {}
             for cid in cases:
                 w = c_want(prep, plan, lab, t, cid, b["revision"])
-                kbar.run_bar_ep(w, sim, b["io"], arm, L, q, vocab)
+                kbar.run_bar_ep(w, sim, b["io"], arm, L, q, vocab,
+                                allowed=kg.C_PENDING)
                 files.update(kh.ep_files(w))
             pc.save_json(block_path(lab, t, g), dict(
                 label=lab, task=t, block=g, cases=cases, files=files,
@@ -189,6 +198,9 @@ def _chunk(torch, prep, plan, C, L, sim, src_key, chunk, device, revision,
         files = {}
         for cid in cases:
             w = c_want(prep, plan, lab, t, cid)
+            pr = kg.pending_problems(L, kg.C_PENDING)
+            if pr:
+                raise SystemExit("; ".join(pr))
             kh.run_ep(w, sim, v["io"], arms[lab], L, C)
             files.update(kh.ep_files(w))
         pc.save_json(block_path(lab, t, g), dict(
@@ -272,9 +284,36 @@ def selftest():
     assert [k for k, _ in ch] == [0, 1, "BAR", 0, 1, "BAR", 0] and \
         sum(len(v) for _k, v in ch) == 14
     assert 1800 + 840 + 440 == 3080
+    # план C: неполный (без Tplus, файлов B, объёмов) — отказ; полный — ок
+    import tempfile
+    g = globals()
+    keep = dict(PLAN_C=g["PLAN_C"], make_plan_c=g["make_plan_c"])
+    want = dict(kind="k36_plan_c", prepare_sha1="P", gate_b_sha1="G",
+                gate_b_files={"f": "1"}, tplus={"0": dict(actor_hash="a"),
+                                                "1": dict(actor_hash="b")},
+                bar_revision="R", code={"k36c_bar.py": "x"},
+                task_order=task_order_c(), cells_sha1="C", n_cells=616,
+                n_blocks=dict(policy=528, bar=88), n_episodes=3080)
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            g["PLAN_C"] = os.path.join(td, "plan_c.json")
+            g["make_plan_c"] = lambda prep: json.loads(json.dumps(want))
+            pc.save_json(g["PLAN_C"], want)
+            assert plan_c_problems(dict(sha1="P")) == []
+            for k in ("tplus", "gate_b_files", "n_episodes", "n_cells",
+                      "bar_revision", "code"):
+                bad = {kk: v for kk, v in want.items() if kk != k}
+                pc.save_json(g["PLAN_C"], bad)
+                assert plan_c_problems(dict(sha1="P")), k
+            pc.save_json(g["PLAN_C"], dict(want, tplus={"0": dict(
+                actor_hash="a")}))
+            assert plan_c_problems(dict(sha1="P"))
+        finally:
+            g.update(keep)
     print("самопроверка k36c_confirm пройдена: очередь C — 528 блоков R/T "
           "(2640 эпизодов) + 88 BAR (440), сдвиг 7 меток по блокам, все "
-          "C-случаи каждой метки ровно по разу; куски по источнику")
+          "C-случаи каждой метки ровно по разу; куски по источнику; план C "
+          "без Tplus/файлов B/объёмов/ревизии BAR/кода — отказ")
     return 0
 
 

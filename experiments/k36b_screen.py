@@ -31,6 +31,7 @@ if HERE not in sys.path:
 import k36_bank as kb36  # noqa: E402
 import k36_harness as kh  # noqa: E402
 import k36_protocol as pc  # noqa: E402
+import k36b_gate as kg  # noqa: E402
 import k36b_train as kbt  # noqa: E402
 
 GATE_B = "reports/k36/gate_b.json"
@@ -63,6 +64,9 @@ def screen_wants(prep, hashes):
 
 
 def load_tplus(torch, prep, s, H):
+    pr = kbt.train_problems(s, prep)
+    if pr:
+        raise SystemExit(f"Tplus_s{s}: " + "; ".join(pr[:3]))
     ah, fsha = tplus_hash(s)
     if pc.sha(kbt.final_path(s)) != fsha:
         raise SystemExit(f"Tplus_s{s}: final.pt ≠ отчёту продолжения")
@@ -80,6 +84,9 @@ def _screen_seed(torch, prep, C, L, sim, s, wants, device, loader=None,
     out = []
     for w in wants:
         if w["seed"] == s:
+            pr = kg.pending_problems(L, kg.SCREEN_PENDING)
+            if pr:
+                raise SystemExit("; ".join(pr))
             out.append((w, kh.run_ep(w, sim, v["io"], arm, L, C)))
     return out
 
@@ -134,10 +141,9 @@ def rule_b(Y, train_reps):
 def screen_b(a, sim=None, loader=None):
     sim = sim or kb36.BankSim("bank", kb36.SPACE_CONF)
     import torch
-    import k36_analyze as an
     try:
         prep = pc.load_prepare()
-        p = an.gate_a_problems()
+        p = kg.gate_a_problems()
         for s in pc.parse_seeds():
             p += [f"Tplus_s{s}: {x}" for x in kbt.train_problems(s, prep)]
         if p:
@@ -183,35 +189,50 @@ def decide_b(prep, hashes, C):
     return 0
 
 
-def gate_b_problems():
-    """Решение B свежее: файлы, prepare, пересчёт статуса по исходам."""
+def decision_b():
+    """-> (вид: passed|stopped|technical, статус, проблемы)."""
     if not os.path.exists(GATE_B):
-        return ["нет решения B"]
+        return "technical", None, ["нет решения B (screen-b)"]
     g = json.load(open(GATE_B, encoding="utf-8"))
+    if g.get("status") == "technical_stop":
+        return "technical", None, ["решение B — технический стоп"]
     try:
         prep = pc.load_prepare()
     except SystemExit as e:
-        return [str(e.code)]
+        return "technical", None, [str(e.code)]
     if g.get("prepare_sha1") != prep["sha1"]:
-        return ["решение B другого prepare"]
-    for f, s in (g.get("files") or {}).items():
-        if not os.path.exists(f) or pc.sha(f) != s:
-            return ["файлы B изменены после решения"]
+        return "technical", None, ["решение B другого prepare"]
+    for f, sh in (g.get("files") or {}).items():
+        if not os.path.exists(f) or pc.sha(f) != sh:
+            return "technical", None, ["файлы B изменены после решения"]
+    p = []
+    for s in pc.parse_seeds():
+        p += [f"Tplus_s{s}: {x}" for x in kbt.train_problems(s, prep)]
+    if p:
+        return "technical", None, p
     C = kh.consts(prep)
-    hashes = {s: g["tplus_actor_hash"][str(s)] for s in pc.parse_seeds()}
+    hashes = {s: tplus_hash(s)[0] for s in pc.parse_seeds()}
+    if g.get("tplus_actor_hash") != {str(s): h for s, h in hashes.items()}:
+        return "technical", None, ["решение B для других Tplus"]
     Y, files, p = outcomes(prep, hashes, C)
     if p:
-        return [f"данные B: {p[:2]}"]
+        return "technical", None, [f"данные B: {p[:2]}"]
     want = set(files) | {f for s in pc.parse_seeds() for f in
                          (kbt.report_path(s), kbt.final_path(s))}
     if set(g["files"]) != want:
-        return ["решение B: набор файлов ≠ ожидаемому"]
+        return "technical", None, ["решение B: набор файлов ≠ ожидаемому"]
     reps = {s: json.load(open(kbt.report_path(s), encoding="utf-8"))
             for s in pc.parse_seeds()}
     st, flags, _d = rule_b(Y, reps)
     if g.get("status") != st or g.get("flags") != flags:
-        return [f"статус решения B ≠ пересчёту ({st})"]
-    return [] if st == "passed_B_candidate" else [f"статус B: {st}"]
+        return "technical", None, [f"статус решения B ≠ пересчёту ({st})"]
+    return ("passed" if st == "passed_B_candidate" else "stopped"), st, []
+
+
+def gate_b_problems():
+    """[] только при проверенном passed_B_candidate."""
+    kind, st, p = decision_b()
+    return [] if kind == "passed" else (p or [f"статус B: {st}"])
 
 
 def selftest():
@@ -270,10 +291,10 @@ def main():
     a = ap.parse_args()
     try:
         if a.cmd == "gate-b":
-            p = gate_b_problems()
-            print("  решение B: " + ("passed_B_candidate, привязки сходятся"
-                                     if not p else "; ".join(p)))
-            return 0 if not p else 4
+            kind, st, p = decision_b()
+            print(f"  решение B: {st or 'нет'} ({kind})" +
+                  ("" if not p else " — " + "; ".join(p[:3])))
+            return kg.code_of(kind)
         return screen_b(a)
     except SystemExit as e:
         if isinstance(e.code, str):

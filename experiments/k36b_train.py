@@ -175,27 +175,56 @@ def finish_report(torch, t, st, s):
     return rep
 
 
-def train_problems(seed, prep=None):
-    """Отчёт продолжения полон и соответствует контракту и final.pt."""
+def train_problems(seed, prep):
+    """Отчёт продолжения сида seed полон и принадлежит ИМЕННО этому сиду:
+    seed/оператор/контракт/prepare, три исходных отпечатка = prepare этого
+    сида, final.pt (SHA, seed, op, контракт, фактический tensor-hash actor)
+    и состояние завершённого тренера (actor, импорт, finished)."""
+    import torch
     p = report_path(seed)
     if not os.path.exists(p):
         return [f"нет {p}"]
     r = json.load(open(p, encoding="utf-8"))
+    sd = prep["k32"]["seeds"][str(seed)]
     pr = []
+    c = r.get("contract") or {}
+    want_c = dict(k36_prepare=prep["sha1"],
+                  k32_contract=prep["k32"]["k32_contract"], op="T",
+                  seed=int(seed), code=code_b(),
+                  cfg=json.loads(json.dumps(CFG)))
+    if r.get("seed") != int(seed) or json.loads(json.dumps(c)) != want_c:
+        pr.append("seed/оператор/контракт/код/prepare ≠ этому сиду")
     if r.get("finished") is not True:
         pr.append("продолжение не завершено")
-    if not os.path.exists(final_path(seed)) or \
-            pc.sha(final_path(seed)) != r.get("final_sha1"):
-        pr.append("final.pt ≠ отчёту")
-    c = r.get("contract") or {}
-    if c.get("code") != code_b() or c.get("cfg") != json.loads(
-            json.dumps(CFG)):
-        pr.append("код/конфигурация продолжения изменены")
-    if prep is not None and c.get("k36_prepare") != prep["sha1"]:
-        pr.append("продолжение другого prepare")
+    for k, v in (("rl_init_hash", sd["T_state"]["rl_init_hash"]),
+                 ("continuation_start_actor_hash", sd["T"]["actor_hash"]),
+                 ("source_weights_hash", sd["source"]["weights_hash"])):
+        if r.get(k) != v:
+            pr.append(f"{k} ≠ prepare сида {seed}")
     if not isinstance(r.get("spent_added"), int) or \
             not 0 < r["spent_added"] <= pc.CAPS[f"train_tplus_s{seed}"]:
         pr.append("добавленный расход вне (0, кап]")
+    fp_ = final_path(seed)
+    if not os.path.exists(fp_) or pc.sha(fp_) != r.get("final_sha1"):
+        return pr + ["final.pt ≠ отчёту"]
+    ck = torch.load(fp_, map_location="cpu", weights_only=False)
+    ah = kppo.tensor_hash(ck["actor"])
+    if ck.get("seed") != int(seed) or ck.get("op") != "T" or \
+            json.loads(json.dumps(ck.get("contract"))) != want_c or \
+            not (ah == ck.get("actor_hash") == r.get("actor_hash")):
+        pr.append("final.pt: seed/op/контракт/фактический actor ≠ отчёту")
+    stp = os.path.join(kin.run_dir(seed), "state.pt")
+    if not os.path.exists(stp):
+        return pr + ["нет состояния тренера продолжения"]
+    st = torch.load(stp, map_location="cpu", weights_only=False)
+    imp = st.get("imported") or {}
+    if kppo.tensor_hash(st["actor"]) != ah or st.get("actor_hash") != ah or \
+            (st.get("st") or {}).get("finished") is not True or \
+            imp.get("rl_init_hash") != sd["T_state"]["rl_init_hash"] or \
+            imp.get("continuation_start_actor_hash") != \
+            sd["T"]["actor_hash"] or \
+            json.loads(json.dumps(st.get("contract"))) != want_c:
+        pr.append("состояние тренера ≠ final.pt / импорту этого сида")
     return pr
 
 
@@ -203,13 +232,16 @@ def continue_b(a):
     import k18_collector as k18c
     sim = k18c.Sim(1, "persistent")
     import torch
-    import k36_analyze as an
     import k36_harness as kh
     try:
-        p = an.gate_a_problems()
+        import k36b_gate as kg
+        p = kg.gate_a_problems()
         if p:
             raise SystemExit("этап B не разрешён: " + "; ".join(p[:3]))
         prep = pc.load_prepare()
+        pr = kg.pending_problems(pc.ledger(), kg.TRAIN_PENDING)
+        if pr:
+            raise SystemExit("; ".join(pr))
         pr = kh.resources_problems(torch, a.device)
         if pr:
             raise SystemExit("; ".join(pr))
@@ -380,6 +412,45 @@ def selftest():
                 rep["updates_added"] == n_ref - int(snap["st"]["update"])
             assert set(rep["continuation_val"]) == {"continuation_start",
                                                    "continuation_end"}
+            # принадлежность сиду: отчёт/final.pt/состояние s0 на местах
+            # s1 (SHA каждого файла сходится со своим отчётом) — отказ
+            import shutil
+            a_, c_ = km32.build(torch, H, 6, 0, norm)
+            a_.load_state_dict(snap["actor"])
+            c_.load_state_dict(snap["critic"])
+            start = kppo.tensor_hash(a_.state_dict())
+            prepf = dict(sha1="P", k32=dict(k32_contract="K", seeds={
+                str(sd): dict(T_state=dict(rl_init_hash=snap["init_hash"]),
+                              T=dict(actor_hash=start),
+                              source=dict(weights_hash="W"))
+                for sd in (0, 1)}))
+            want_c = dict(k36_prepare="P", k32_contract="K", op="T", seed=0,
+                          code=code_b(), cfg=CFG)
+            imp = dict(cont(d0).imported, continuation_start_actor_hash=start,
+                       rl_init_hash=snap["init_hash"])
+            L3 = kcol.Ledger(os.path.join(td, "led_own.json"), caps2)
+            t0_ = ContTrainer(torch, seed=0, H=H, actor=a_, critic=c_,
+                              make_arm=make_arm, sim=kppo.ToySim(), io=io,
+                              ledger=L3, odir=kin.run_dir(0),
+                              contract=want_c, imported=imp, cfg=cfg2,
+                              log=lambda *x: None)
+            st0 = t0_.run(snap)
+            finish_report(torch, t0_, st0, 0)
+            assert train_problems(0, prepf) == [], train_problems(0, prepf)
+            os.makedirs(kin.run_dir(1), exist_ok=True)
+            for f in ("final.pt", "state.pt"):
+                shutil.copyfile(os.path.join(kin.run_dir(0), f),
+                                os.path.join(kin.run_dir(1), f))
+            shutil.copyfile(report_path(0), report_path(1))
+            assert train_problems(1, prepf), "actor s0 принят как s1"
+            # фактический actor final.pt ≠ отчёту — отказ
+            ck = torch.load(final_path(0), weights_only=False)
+            ck["actor"] = {k: v + 1e-3 for k, v in ck["actor"].items()}
+            torch.save(ck, final_path(0))
+            rj = json.load(open(report_path(0)))
+            rj["final_sha1"] = pc.sha(final_path(0))
+            pc.save_json(report_path(0), rj)
+            assert train_problems(0, prepf)
         finally:
             g.update(keep)
             kin.RUNS = kr
@@ -390,7 +461,8 @@ def selftest():
           "добавленным шагам; аварии записи/commit/обновления дают тот же "
           "actor и расход без списаний; чужой импорт и несоответствие "
           "начала — отказ; отчёт разделяет imported/added/total и три "
-          "отпечатка")
+          "отпечатка; отчёт/final.pt/состояние другого сида и подменённый "
+          "actor — отказ")
     return 0
 
 

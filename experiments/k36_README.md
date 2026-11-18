@@ -39,6 +39,7 @@ analyze) — новые модули и отдельный раннер; пиш�
 
 | Файл | Что |
 |---|---|
+| `k36b_gate.py` | точное решение A → B в целых (Σ(выигрыши − потери) ≥ 18 совместно, ≥ −6 на сид; 0 passed / 4 stopped / 3 сбой), принадлежность открытого резерва |
 | `k36b_train.py` | продолжение T из снимка `state.pt` K-32 (k32_ppo.Trainer без изменений математики; scopes `train_tplus_s<S>`/`val_tplus_s<S>`, кап +200 000, mid по добавленным шагам) |
 | `k36b_screen.py` | B-screen (180 эпизодов Tplus на закреплённых 30 A-сценах 0/6/8), гейт B с пересчётом по исходам |
 | `k36c_bar.py` | original BAR в цикле B1 (generate + сборка кодов, контроль официального decode), предварительные проверки legacy 4 / smoke 6 / repeat 3 |
@@ -49,5 +50,6 @@ analyze) — новые модули и отдельный раннер; пиш�
 
 ```
 bash experiments/k36bc_run.sh selftest
+bash experiments/k36bc_run.sh gate-a        # после analyze-a: точное решение A
 nohup bash experiments/k36bc_run.sh run cuda:N > /dev/null 2>&1 &   # после A
 ```

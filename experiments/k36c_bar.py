@@ -100,14 +100,7 @@ class BarArm:
         if not np.isfinite(a).all():
             raise SystemExit("BAR: нечисловые команды")
         if self.call == 1 and self.keep_first:
-            ref = np.asarray(self.bar["proc"].action_processor.decode(
-                t.tolist())[0], np.float64)
-            d = float(np.abs(a[:ref.shape[0]] - ref[:, :7]).max())
-            if not d <= DECODE_TOL:
-                raise SystemExit(f"BAR: своя сборка ≠ официальному decode "
-                                 f"({d:.2e})")
-            self.first = dict(toks=t[0].copy(), a_codec=a.copy(),
-                              official=ref.astype(np.float32), delta=d)
+            self.first = official_check(self.bar["proc"], t, a)
         rec = dict(elapsed=int(elapsed), toks=t[0].astype(np.int64),
                    a_codec=a.astype(np.float32))
         self.last = dict(rec=rec)
@@ -115,6 +108,43 @@ class BarArm:
 
     def executed(self, k):
         self.last["rec"]["k"] = int(k)
+
+
+def official_check(proc, toks, a):
+    """Контроль первого вызова: официальный decode(...)[0] — [B, T, D];
+    сравниваются ВСЕ шаги decoded[0, :, :7] со своей сборкой [T, 7] после
+    проверки форм; |Δ| ≤ 1e−3 (порог K-9h)."""
+    dec = np.asarray(proc.action_processor.decode(
+        np.asarray(toks).tolist())[0], np.float64)
+    if dec.ndim != 3 or dec.shape[0] != 1 or dec.shape[1] != a.shape[0] \
+            or dec.shape[2] < 7 or a.shape[1] != 7:
+        raise SystemExit(f"BAR: формы официального decode {dec.shape} и "
+                         f"своей сборки {a.shape} несовместимы")
+    ref = dec[0, :, :7]
+    d = float(np.abs(a.astype(np.float64) - ref).max())
+    if not np.isfinite(d) or not d <= DECODE_TOL:
+        raise SystemExit(f"BAR: своя сборка ≠ официальному decode ({d:.2e})")
+    return dict(toks=np.asarray(toks)[0].copy(), a_codec=a.copy(),
+                official=ref.astype(np.float32), delta=d)
+
+
+def snapshot_problems(z):
+    """Повторная проверка снимка по сохранённым массивам (не по записанному
+    delta): формы, пересчёт |Δ| по f_official, связь с первым вызовом."""
+    need = ("f_toks", "f_a_codec", "f_official")
+    if any(k not in z for k in need):
+        return ["нет контрольного снимка"]
+    a, o = np.asarray(z["f_a_codec"], np.float64), np.asarray(
+        z["f_official"], np.float64)
+    if a.shape != o.shape or a.ndim != 2 or a.shape[1] != 7:
+        return [f"снимок: формы {a.shape} / {o.shape}"]
+    d = float(np.abs(a - o).max())
+    if not np.isfinite(d) or not d <= DECODE_TOL:
+        return [f"снимок: |Δ| к официальному decode {d:.2e}"]
+    if not np.array_equal(z["f_a_codec"], z["j_a_codec"][0]) or \
+            not np.array_equal(z["f_toks"], z["j_toks"][0]):
+        return ["снимок не первого вызова журнала"]
+    return []
 
 
 # --- эпизоды BAR ----------------------------------------------------------------------
@@ -203,7 +233,15 @@ def bar_episode_problems(rec, z, want, q, vocab):
 
 
 def run_bar_ep(want, sim, io, arm, L, q, vocab, keep_first=False,
-               crash=None):
+               crash=None, allowed=None):
+    """allowed — допустимые открытые резервы [(scope, префикс eid)];
+    чужой открытый резерв — отказ до списания."""
+    import k36b_gate as kg
+    pr = kg.pending_problems(L, allowed or [(want["scope"],
+                                             f"{want['scope']}/"
+                                             f"{want['stage']}/")])
+    if pr:
+        raise SystemExit("; ".join(pr))
     if os.path.exists(kh.reject_path(want["eid"])):
         raise SystemExit(f"{want['eid']}: был отвергнут — технический стоп")
     got = kh.load_ep(want)
@@ -290,10 +328,7 @@ def gate_problems(kind, prep, revision, vocab):
                 p.append(f"bar_legacy t{t}: {d[:3]}")
     elif kind == "bar_smoke":
         for (key, t), (rec, z) in got.items():
-            if "f_delta" not in z or not float(z["f_delta"]) <= DECODE_TOL or \
-                    not np.array_equal(z["f_a_codec"], z["j_a_codec"][0]) or \
-                    not np.array_equal(z["f_toks"], z["j_toks"][0]):
-                p.append(f"bar_smoke t{t} {key}: контрольный снимок")
+            p += [f"bar_smoke t{t} {key}: {x}" for x in snapshot_problems(z)]
     else:
         for w in wants:
             w0 = dict(w, stage="bar_smoke",
@@ -324,7 +359,12 @@ def bar_check(a, kind, sims=None, src=None):
                     new=kb36.BankSim("legacy")) if kind == "bar_legacy" else \
             dict(new=kb36.BankSim("bank", kb36.SPACE_DEV))
     import torch
+    import k36b_screen as kbs
     try:
+        gb = kbs.gate_b_problems()
+        if gb:
+            raise SystemExit(f"{kind} без passed_B_candidate: " +
+                             "; ".join(gb[:3]))
         prep = pc.load_prepare()
         q = consts_bar(prep)
         pr = kh.resources_problems(torch, a.device)
@@ -450,15 +490,86 @@ def selftest():
             r2 = run_bar_ep(w2, kppo.ToySim(), kcol.FakeIO(), arm, L2, q, 512)
             assert L2.spent("bar_c") == sp + r2[0]["phys"] and \
                 not L2.d["crashes"]
+            # открытый резерв этапа A: BAR отказывает без списания
+            L2.reserve("confirm_a", "confirm_a/confirm_a/R_s0/t0/k")
+            before = json.dumps(L2.d, sort_keys=True)
+            w3 = want_bar(prep, "confirm_c", 0, "k33s1_t0_c00013", 13,
+                          "bank", "REV", space=1, case_id="k33s1_t0_c00013")
+            try:
+                run_bar_ep(w3, kppo.ToySim(), kcol.FakeIO(), arm, L2, q, 512)
+                raise AssertionError("чужой резерв списан BAR")
+            except SystemExit:
+                pass
+            assert json.dumps(L2.d, sort_keys=True) == before
+            # вход BAR без passed_B_candidate — стоп до резерва
+            import types
+            import k36b_screen as kbs
+            keep_g = kbs.gate_b_problems
+            closed = []
+
+            class S:
+                def close(self):
+                    closed.append(1)
+            try:
+                kbs.gate_b_problems = lambda: ["нет решения B"]
+                try:
+                    bar_check(types.SimpleNamespace(device="cpu"),
+                              "bar_legacy", sims=dict(old=S(), new=S()))
+                    raise AssertionError("BAR без решения B")
+                except SystemExit:
+                    pass
+            finally:
+                kbs.gate_b_problems = keep_g
+            assert len(closed) == 2 and json.dumps(
+                L2.d, sort_keys=True) == before
         finally:
             g_.update(keep)
     assert kh.STAGE_SCOPE["bar_smoke"] == "checks"
+    # контроль официального decode: [B, T, D] против [T, 7] по всем шагам
+    class _AP:
+        def __init__(self, arr):
+            self.arr = arr
+
+        def decode(self, toks):
+            return [self.arr]
+
+    class _P:
+        def __init__(self, arr):
+            self.action_processor = _AP(arr)
+    T_ = 20
+    aa = np.cumsum(np.full((T_, 7), 0.01, np.float32), 0)    # меняющийся
+    full = np.concatenate([aa, np.zeros((T_, 1), np.float32)], 1)[None]
+    toks = np.arange(48)[None]
+    f0 = official_check(_P(full), toks, aa)
+    assert f0["delta"] == 0.0 and f0["official"].shape == (T_, 7)
+    bad = full.copy()
+    bad[0, -1, 0] += 1.0                                     # только последний шаг
+    try:
+        official_check(_P(bad), toks, aa)
+        raise AssertionError("расхождение последнего шага принято")
+    except SystemExit:
+        pass
+    try:
+        official_check(_P(full[:, :8]), toks, aa)           # другая длина T
+        raise AssertionError("несовместимые формы приняты")
+    except SystemExit:
+        pass
+    zz = dict(f_toks=toks[0], f_a_codec=aa, f_official=f0["official"],
+              j_a_codec=aa[None], j_toks=toks)
+    assert snapshot_problems(zz) == []
+    z2 = dict(zz, f_official=bad[0, :, :7])
+    assert snapshot_problems(z2)                    # пересчёт, не delta
+    z3 = dict(zz, j_a_codec=(aa + 1e-3)[None])
+    assert snapshot_problems(z3)
     print("самопроверка k36c_bar пройдена: эпизод BAR (B1, свой схват) — "
           "журнал токенов и команд, исполненное = масштабу команд; подмены "
           "действия/команды/токена/NaN/последнего вызова/пустой журнал, "
           "чужой prepare, неверный хеш — отказ; контрольный снимок первого "
           "вызова = журналу; повтор без исполнения; авария между записью и "
-          "commit — settle без списания")
+          "commit — settle без списания; чужой открытый резерв и вход без "
+          "passed_B_candidate — отказ до списания; контроль decode по всем "
+          "шагам [B, T, D] -> [T, 7] (расхождение последнего шага и чужая "
+          "длина — отказ), снимок пересчитывается по f_official")
     return 0
 
 

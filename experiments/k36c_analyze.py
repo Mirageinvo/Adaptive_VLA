@@ -191,11 +191,19 @@ def analyze_c(a):
         pc.save_json(OUT, dict(status="technical_stop", problems=prob[:50]))
         print("  анализ C: ТЕХНИЧЕСКИЙ СТОП — " + "; ".join(prob[:4]))
         return 3
+    import k21_data as d21
+    import k36c_confirm as kc
+    import k36c_latency as kl36
+    lp = kl36.latency_problems(pc.sha(kc.PLAN_C), kl36.queue_sha(
+        d21.load_prepared(require_teacher=False)))
+    if lp:
+        pc.save_json(OUT, dict(status="technical_stop", problems=lp))
+        print("  анализ C: ТЕХНИЧЕСКИЙ СТОП — задержка: " + "; ".join(lp))
+        return 3
     res = analyze(Y, YB)
-    lat = "reports/k36/latency.json"
     res.update(status="complete", prepare_sha1=prep["sha1"],
                n_files=len(files),
-               latency=json.load(open(lat)) if os.path.exists(lat) else
+               latency=json.load(open(kl36.OUT)) if lp is not None else
                "latency_pending",
                table={f"{nm}_s{s}": {str(t): Y[nm][s][t].astype(int).tolist()
                                      for t in ALL}

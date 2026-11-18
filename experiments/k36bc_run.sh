@@ -1,6 +1,7 @@
 #!/bin/bash
 # K-36, вторая часть: этапы B и C (файлы этапа A и k36_run.sh не меняются).
 #   bash experiments/k36bc_run.sh selftest
+#   bash experiments/k36bc_run.sh gate-a             # точное решение A: 0 passed, 4 stopped, 3 сбой
 #   bash experiments/k36bc_run.sh continue-b DEV     # только при passed_A_development
 #   bash experiments/k36bc_run.sh screen-b DEV       # 180 эпизодов Tplus -> гейт B
 #   bash experiments/k36bc_run.sh bar-preflight DEV  # legacy 4 -> bank-smoke 6 -> cold-repeat 3
@@ -8,7 +9,8 @@
 #   bash experiments/k36bc_run.sh latency DEV        # свободная карта, иначе latency_pending
 #   bash experiments/k36bc_run.sh analyze
 #   bash experiments/k36bc_run.sh run DEV            # B -> (passed) C -> задержка -> анализ
-# Информационный стоп A/B — код 0 и явный статус; техническая ошибка — 3.
+# Проверенный отрицательный статус A/B — код 0 в run (4 у gate-a / gate-b);
+# отсутствующие/повреждённые данные и технические ошибки — 3.
 # Общая блокировка с k36_run.sh (logs/k36/.k36.lock).
 set -uo pipefail
 MODE="${1:?нужен режим}"
@@ -59,11 +61,10 @@ gpu () {   # DEV
 }
 selftests () {
   local m
-  for m in k36b_train k36b_screen k36c_bar k36c_confirm k36c_analyze k36c_latency; do
+  for m in k36b_gate k36b_train k36b_screen k36c_bar k36c_confirm k36c_analyze k36c_latency; do
     $PY "experiments/${m}.py" --selftest || { echo "ОТКАЗ: самопроверка $m"; return 1; }
   done
 }
-status_of () { $PY -c "import json,sys; print(json.load(open(sys.argv[1])).get('status'))" "$1" 2>/dev/null; }
 continue_b () { gpu "$1" || return 3; $PY experiments/k36b_train.py continue-b --device "$1"; }
 screen_b () { gpu "$1" || return 3; $PY experiments/k36b_screen.py screen-b --device "$1"; }
 bar_preflight () {
@@ -84,6 +85,7 @@ analyze () { $PY experiments/k36c_analyze.py analyze || { echo "ОТКАЗ: ан
 
 case "$MODE" in
   selftest) selftests; finish $? ;;
+  gate-a) $PY experiments/k36b_gate.py gate-a; finish $? ;;
   continue-b) continue_b "${2:-cuda:0}"; finish $? ;;
   screen-b) screen_b "${2:-cuda:0}"; finish $? ;;
   bar-preflight) bar_preflight "${2:-cuda:0}"; finish $? ;;
@@ -93,11 +95,14 @@ case "$MODE" in
   run)
     DEV="${2:-cuda:0}"
     echo "=== ЭТАП самопроверки"; selftests || finish 1
-    $PY experiments/k36_analyze.py gate-a || { echo "=== K-36: этап B не открыт (решение A — см. reports/k36/gate_a.json)"; finish 0; }
+    rc=0; $PY experiments/k36b_gate.py gate-a || rc=$?
+    [ "$rc" -eq 4 ] && { echo "=== K-36: проверенное решение A — stopped_A_no_signal; B не открывается"; finish 0; }
+    [ "$rc" -eq 0 ] || { echo "ОТКАЗ: решение A отсутствует или не сходится (код $rc)"; finish 3; }
     echo "=== ЭТАП продолжение T"; continue_b "$DEV" || finish 3
     echo "=== ЭТАП screen B"; screen_b "$DEV" || finish 3
-    st="$(status_of reports/k36/gate_b.json)"
-    [ "$st" = "passed_B_candidate" ] || { echo "=== K-36: B — статус ${st:-нет}; C не открывается"; finish 0; }
+    rc=0; $PY experiments/k36b_screen.py gate-b || rc=$?
+    [ "$rc" -eq 4 ] && { echo "=== K-36: проверенное решение B — stopped_B_no_gain; C не открывается"; finish 0; }
+    [ "$rc" -eq 0 ] || { echo "ОТКАЗ: решение B отсутствует или не сходится (код $rc)"; finish 3; }
     echo "=== ЭТАП предварительные проверки BAR"; bar_preflight "$DEV" || finish 3
     echo "=== ЭТАП C"; confirm_c "$DEV" || finish 3
     echo "=== ЭТАП задержка"; [ -f reports/k36/latency.json ] || latency "$DEV" || finish 3
