@@ -34,3 +34,20 @@ bash experiments/k36_run.sh analyze-a
 Файлы этапа A закреплены prepare (включая `k36_run.sh`) и не меняются.
 Вторая часть (continue-b, screen-b, confirm-c с BAR, latency, итоговый
 analyze) — новые модули и отдельный раннер; пишется, пока идёт этап A.
+
+## Вторая часть: этапы B и C (новые файлы, отдельный раннер)
+
+| Файл | Что |
+|---|---|
+| `k36b_train.py` | продолжение T из снимка `state.pt` K-32 (k32_ppo.Trainer без изменений математики; scopes `train_tplus_s<S>`/`val_tplus_s<S>`, кап +200 000, mid по добавленным шагам) |
+| `k36b_screen.py` | B-screen (180 эпизодов Tplus на закреплённых 30 A-сценах 0/6/8), гейт B с пересчётом по исходам |
+| `k36c_bar.py` | original BAR в цикле B1 (generate + сборка кодов, контроль официального decode), предварительные проверки legacy 4 / smoke 6 / repeat 3 |
+| `k36c_confirm.py` | план C (SHA Tplus и решения B до первого эпизода), очередь 616 блоков, исполнение кусками по источнику |
+| `k36c_latency.py` | задержка B1: R/T32/Tplus (s0) и BAR |
+| `k36c_analyze.py` | семья C (Tplus−T32, Tplus−R на 0/6/8, Tplus−BAR на all10), описательные таблицы |
+| `k36bc_run.sh` | раннер второй части (общая блокировка с `k36_run.sh`) |
+
+```
+bash experiments/k36bc_run.sh selftest
+nohup bash experiments/k36bc_run.sh run cuda:N > /dev/null 2>&1 &   # после A
+```
