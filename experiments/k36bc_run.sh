@@ -79,7 +79,9 @@ latency () {
   local rc=0; gpu_used_le "$1" 2048 || rc=$?
   [ "$rc" -eq 4 ] && { echo "    latency_pending: карта занята"; return 0; }
   [ "$rc" -eq 0 ] || return 3
-  $PY experiments/k36c_latency.py --device "$1" || { echo "ОТКАЗ: замер задержки"; return 3; }
+  rc=0; $PY experiments/k36c_latency.py --device "$1" || rc=$?
+  [ "$rc" -eq 4 ] && { echo "    latency_pending: карта занята перед загрузкой модели"; return 0; }
+  [ "$rc" -eq 0 ] || { echo "ОТКАЗ: замер задержки (код $rc)"; return 3; }
 }
 analyze () { $PY experiments/k36c_analyze.py analyze || { echo "ОТКАЗ: анализ C"; return 3; }; }
 

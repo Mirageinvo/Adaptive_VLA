@@ -168,14 +168,25 @@ def _paths_of(eid):
     return kh.ep_paths(parts[1], parts[2], int(parts[3][1:]), parts[4])
 
 
-def before_reserve(L, want, allowed):
-    """Непосредственно перед новым reserve эпизода want: открытый резерв —
-    этот же eid (его обработает транзакция) либо резерв этой стадии
-    (точные scope и префикс eid). Если для него уже записан результат —
-    settle фактическим расходом (без аварийного списания); если нет —
-    reserve спишет его как аварию. Чужая стадия — отказ без изменений."""
+def before_reserve(L, want, allowed, want_of_eid, validate):
+    """Непосредственно перед НОВЫМ reserve эпизода want.
+    Открытый резерв:
+      - тот же eid — scope обязан совпасть (иначе отказ);
+      - эпизод этой стадии (точные scope и префикс eid) с записанным
+        результатом — результат проходит ПОЛНУЮ проверку эпизода против
+        ожидаемого контракта (want_of_eid -> validate: идентификаторы,
+        prepare, контракт, actor, хеши, журнал, расход = 10 + шагам = длине
+        действий) и только тогда settle фактическим расходом;
+      - без результата — reserve спишет его как аварию;
+      - чужая стадия или непроверяемый результат — отказ без изменений."""
+    import k36_harness as kh
     pd = L.d.get("pending")
-    if not pd or pd.get("id") == want["eid"]:
+    if not pd:
+        return
+    if pd.get("id") == want["eid"]:
+        if pd.get("scope") != want["scope"]:
+            raise SystemExit(f"{want['eid']}: открытый резерв в scope "
+                             f"{pd.get('scope')} ≠ {want['scope']}")
         return
     pr = pending_problems(L, allowed)
     if pr:
@@ -184,13 +195,35 @@ def before_reserve(L, want, allowed):
     if paths is None:
         raise SystemExit(f"открытый резерв {pd['id']}: не эпизод стадии")
     jp, np_ = paths
-    if os.path.exists(jp) and os.path.exists(np_):
-        rec = json.load(open(jp, encoding="utf-8"))
-        if rec.get("eid") != pd["id"] or rec.get("scope") != pd["scope"] or \
-                pc.sha(np_) != rec.get("npz_sha1"):
-            raise SystemExit(f"результат открытого резерва {pd['id']} не "
-                             f"сходится с ним — ручное решение")
-        L.settle(pd["id"], int(rec["phys"]))
+    if not (os.path.exists(jp) and os.path.exists(np_)):
+        return
+    try:
+        w2 = want_of_eid(pd["id"])
+        got = kh.load_ep(w2)
+    except (SystemExit, KeyError, ValueError) as e:
+        raise SystemExit(f"результат открытого резерва {pd['id']} не "
+                         f"сходится с ожидаемым: {e} — ручное решение")
+    if got is None or w2["scope"] != pd["scope"] or w2["eid"] != pd["id"]:
+        raise SystemExit(f"результат открытого резерва {pd['id']} не "
+                         f"сходится с ожидаемым — ручное решение")
+    rec, z = got
+    p2 = validate(rec, z, w2)
+    phys = rec.get("phys")
+    if p2 or not isinstance(phys, int) or not \
+            0 < phys <= int(pd.get("amount", 0)):
+        raise SystemExit(f"результат открытого резерва {pd['id']} не "
+                         f"прошёл проверку ({p2[:2]}, phys {phys}) — ручное "
+                         f"решение")
+    L.settle(pd["id"], phys)
+
+
+def parse_eid(eid):
+    """'<scope>/<stage>/<метка>/t<задача>/<ключ>' -> (stage, label, task,
+    key)."""
+    parts = str(eid).split("/")
+    if len(parts) != 5 or not parts[3].startswith("t"):
+        raise ValueError(f"eid {eid}")
+    return parts[1], parts[2], int(parts[3][1:]), parts[4]
 
 
 def selftest():
@@ -249,20 +282,63 @@ def selftest():
             np.savez(np_, a=np.zeros(1))
             pc.save_json(jp, dict(eid=e1, scope="bar_c", phys=32,
                                   npz_sha1=pc.sha(np_)))
-            w2 = dict(eid="bar_c/confirm_c/BAR/t0/k33s1_t0_c00002")
-            before_reserve(L, w2, C_PENDING)
+            w2 = dict(eid="bar_c/confirm_c/BAR/t0/k33s1_t0_c00002",
+                      scope="bar_c")
+
+            def woe(eid):
+                st_, lab, t_, key = parse_eid(eid)
+                return dict(eid=eid, scope="bar_c", stage=st_, label=lab,
+                            task=t_, key=key)
+            vals = []
+
+            def val(rec, z, w):
+                vals.append(rec["eid"])
+                return [] if rec.get("ok", True) else ["контракт"]
+            keep_le = kh.load_ep
+            kh.load_ep = lambda w: (json.load(open(kh.ep_paths(
+                w["stage"], w["label"], w["task"], w["key"])[0])),
+                {}) if os.path.exists(kh.ep_paths(
+                    w["stage"], w["label"], w["task"], w["key"])[0]) else None
+            before_reserve(L, w2, C_PENDING, woe, val)
+            assert vals == [e1]
             assert L.d["pending"] is None and L.spent("bar_c") == 32 and \
                 not L.d["crashes"]
             # результата нет — допускается аварийное списание при reserve
             L.reserve("bar_c", "bar_c/confirm_c/BAR/t0/k33s1_t0_c00003")
-            before_reserve(L, w2, C_PENDING)
+            before_reserve(L, w2, C_PENDING, woe, val)
             assert L.d["pending"]["id"].endswith("00003")
+            # записанный результат с чужим контрактом или phys −7 — отказ
+            for bad in (dict(ok=False, phys=32), dict(phys=-7)):
+                e4 = "bar_c/confirm_c/BAR/t0/k33s1_t0_c00004"
+                L.d["pending"] = dict(scope="bar_c", id=e4, amount=610)
+                jp4, np4 = kh.ep_paths("confirm_c", "BAR", 0,
+                                       "k33s1_t0_c00004")
+                np.savez(np4, a=np.zeros(1))
+                pc.save_json(jp4, dict(eid=e4, scope="bar_c",
+                                       npz_sha1=pc.sha(np4), **bad))
+                before = json.dumps(L.d, sort_keys=True)
+                try:
+                    before_reserve(L, w2, C_PENDING, woe, val)
+                    raise AssertionError(f"чужой результат принят {bad}")
+                except SystemExit:
+                    pass
+                assert json.dumps(L.d, sort_keys=True) == before
+            # тот же eid в другом scope — отказ
+            L.d["pending"] = dict(scope="confirm_c", id=w2["eid"],
+                                  amount=610)
+            try:
+                before_reserve(L, w2, C_PENDING, woe, val)
+                raise AssertionError("тот же eid в другом scope принят")
+            except SystemExit:
+                pass
+            kh.load_ep = keep_le
+            L.d["pending"] = None
             # чужая стадия — отказ без изменений
             L.d["pending"] = dict(scope="confirm_a", id="confirm_a/x",
                                   amount=610)
             before = json.dumps(L.d, sort_keys=True)
             try:
-                before_reserve(L, w2, C_PENDING)
+                before_reserve(L, w2, C_PENDING, woe, val)
                 raise AssertionError("чужой резерв принят")
             except SystemExit:
                 pass

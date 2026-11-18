@@ -40,6 +40,8 @@ import k36_protocol as pc  # noqa: E402
 
 OUT = "reports/k36/latency.json"
 ARMS = ("R_s0", "T32_s0", "Tplus_s0")
+GPU_MAX_MB = 2048
+PENDING = 4                      # код: карта занята -> latency_pending
 N_PER_TASK = 5
 
 
@@ -80,15 +82,50 @@ def latency_problems(plan_c_sha1, n=300, warm=50, qsha=None):
         p.append("задержка другого плана C")
     if r.get("batch") != 1 or r.get("n") != n or r.get("warm") != warm:
         p.append("задержка: батч/объём ≠ 1 / 300 / 50")
-    if r.get("queue_sha1") != (qsha if qsha is not None else queue_sha()):
-        p.append("задержка: другая очередь")
+    want_q = qsha if qsha is not None else queue_sha()
+    try:
+        q_list = queue_sha([(int(t), c) for t, c in r.get("queue") or []])
+    except (TypeError, ValueError):
+        q_list = None
+    if r.get("queue_sha1") != want_q or q_list != want_q:
+        p.append("задержка: другая очередь (SHA или фактический список)")
+    used = r.get("mem_used_before_mb")
+    if not isinstance(used, int) or not 0 <= used <= GPU_MAX_MB:
+        p.append(f"задержка: занятость карты перед загрузкой {used} МиБ "
+                 f"> {GPU_MAX_MB}")
     pol = r.get("policies") or {}
     bar = r.get("bar") or {}
     for k, v in [(k, pol.get(k)) for k in ARMS] + [("BAR", bar.get("BAR"))]:
         if not isinstance(v, dict) or v.get("n") != n or \
                 not stats_ok(v.get("total")):
             p.append(f"задержка {k}: нет полного замера или p50/p95")
+    if not p:
+        want_s = summary_of(r)
+        got = r.get("summary") or {}
+        if any(not isinstance(got.get(k), (int, float)) or
+               abs(got[k] - v) > 1e-9 * max(1.0, abs(v))
+               for k, v in want_s.items() if k != "p50"):
+            p.append("задержка: записанные отношения ≠ пересчёту из медиан")
     return p
+
+
+def summary_of(r):
+    """Отношения — только из принятых медиан."""
+    m = {k: float(r["policies"][k]["total"]["median"]) for k in ARMS}
+    m["BAR"] = float(r["bar"]["BAR"]["total"]["median"])
+    return dict(p50=m, Tplus_over_R=m["Tplus_s0"] / m["R_s0"],
+                T32_over_R=m["T32_s0"] / m["R_s0"],
+                Tplus_over_BAR=m["Tplus_s0"] / m["BAR"])
+
+
+def gpu_used_mb(device):
+    """Занятость карты по nvidia-smi (до CUDA-контекста процесса)."""
+    import subprocess
+    idx = str(device).split(":")[-1]
+    out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used",
+                          "--format=csv,noheader,nounits", "-i", idx],
+                         capture_output=True, text=True, check=True)
+    return int(out.stdout.strip().splitlines()[0])
 
 
 def collect_obs(sim, io, L, stamp):
@@ -127,14 +164,21 @@ def measure(torch, dev, queue, arms, n, warm, block=10):
     import k21_latency as kl
     names = list(arms)
 
-    def call(nm, item):
+    descs = {t: arms[names[0]][0].task_desc(t) for t, _o in queue}
+
+    def prepare(nm, item):              # вне таймера: раз на эпизод
+        arms[nm][1].begin(item[0], 0, 0)
+
+    def call(nm, item):                 # таймер: наблюдение -> команда
         io, arm = arms[nm]
         t, obs = item
-        batch, po, s8 = io.prep(obs, io.task_desc(t), t)
-        arm.begin(t, 0, 0)
-        return arm.decide(batch, po, s8, 0)
+        batch, po, s8 = io.prep(obs, descs[t], t)
+        a, rec = arm.decide(batch, po, s8, 0)
+        cmd = io.scale(np.asarray(a, np.float32)[None])[0]
+        return a, cmd, rec
     for nm in names:
         for j in range(warm):
+            prepare(nm, queue[j % len(queue)])
             call(nm, queue[j % len(queue)])
     torch.cuda.reset_peak_memory_stats(dev)
     meas = {nm: [] for nm in names}
@@ -147,14 +191,16 @@ def measure(torch, dev, queue, arms, n, warm, block=10):
                     break
                 item = queue[pos[nm] % len(queue)]
                 pos[nm] += 1
+                prepare(nm, item)
                 torch.cuda.synchronize(dev)
                 t0 = time.perf_counter()
-                a, rec = call(nm, item)
+                a, cmd, rec = call(nm, item)
                 torch.cuda.synchronize(dev)
                 meas[nm].append((time.perf_counter() - t0) * 1e3)
                 if np.asarray(a).dtype != np.float32 or \
-                        not np.isfinite(a).all():
-                    raise SystemExit(f"{nm}: чанк не float32/конечен")
+                        not np.isfinite(a).all() or \
+                        not np.isfinite(cmd).all():
+                    raise SystemExit(f"{nm}: чанк/команда не конечны")
                 if "zero" in rec:
                     zero[nm].append(bool(rec["zero"]))
     out = {nm: dict(total=kl.q(meas[nm]), n=len(meas[nm]),
@@ -206,12 +252,16 @@ def main():
         queue = collect_obs(sim, io0, L, time.strftime("%Y%m%dT%H%M%S"))
     finally:
         sim.close()
+    used = gpu_used_mb(a.device)       # непосредственно перед загрузкой
+    if used > GPU_MAX_MB:
+        print(f"  latency_pending: на {a.device} занято {used} МиБ > "
+              f"{GPU_MAX_MB} после сбора очереди")
+        return PENDING
     dev = torch.device(a.device)
-    free0 = torch.cuda.mem_get_info(dev)
     res = dict(plan_c_sha1=pc.sha(kc.PLAN_C), batch=1, n=a.n, warm=a.warm,
                queue=[[t, c] for t, c in queue_ids()], queue_sha1=queue_sha(),
                device=torch.cuda.get_device_name(dev),
-               mem_used_before_mb=int((free0[1] - free0[0]) / 2 ** 20),
+               mem_used_before_mb=int(used),
                threads=dict(intra=torch.get_num_threads(),
                             inter=torch.get_num_interop_threads(),
                             omp=os.environ.get("OMP_NUM_THREADS")),
@@ -224,13 +274,12 @@ def main():
     res["mem_after_policies_gb"] = torch.cuda.memory_allocated(dev) / 2 ** 30
     res["bar"] = _bar_lifetime(torch, prep, dev, queue, a)
     kh.free(torch)
-    m = {k: res["policies"][k]["total"]["median"] for k in ARMS}
-    m["BAR"] = res["bar"]["BAR"]["total"]["median"]
-    res["summary"] = dict(p50=m, Tplus_over_R=m["Tplus_s0"] / m["R_s0"],
-                          T32_over_R=m["T32_s0"] / m["R_s0"],
-                          Tplus_over_BAR=m["Tplus_s0"] / m["BAR"],
-                          note="ориентир +20% к R — описательно; задержка — "
-                               "модели сида 0")
+    res["summary"] = summary_of(res)
+    m = res["summary"]["p50"]
+    res["summary_note"] = ("ориентир +20% к R — описательно; задержка — "
+                           "модели сида 0; p50/p95 ПЕРВОГО вызова после "
+                           "ожидания на 50 dev-сценах (по 6 измерений на "
+                           "наблюдение)")
     pc.save_json(OUT, res)
     pr = latency_problems(res["plan_c_sha1"], a.n, a.warm)
     if pr:
@@ -250,13 +299,17 @@ def selftest():
         try:
             g["OUT"] = os.path.join(td, "lat.json")
             assert latency_problems("P", qsha="Q") is None   # нет -> pending
+            Q = None
             ok = dict(total=dict(median=120.0, p95=130.0), n=300)
+            ql = [[0, "a"], [1, "b"]]
+            Q = queue_sha([(t, c) for t, c in ql])
             good = dict(plan_c_sha1="P", batch=1, n=300, warm=50,
-                        queue_sha1="Q",
+                        queue=ql, queue_sha1=Q, mem_used_before_mb=512,
                         policies={k: dict(ok) for k in ARMS},
                         bar=dict(BAR=dict(ok)))
+            good["summary"] = summary_of(good)
             pc.save_json(g["OUT"], good)
-            assert latency_problems("P", qsha="Q") == []
+            assert latency_problems("P", qsha=Q) == []
             nop = {k: dict(n=300) for k in ARMS}
             for bad in (dict(good, plan_c_sha1="X"), dict(good, n=1),
                         dict(good, warm=0), dict(good, queue_sha1="Z"),
@@ -269,9 +322,21 @@ def selftest():
                             total=dict(median=float("nan"), p95=1.0),
                             n=300)))):
                 pc.save_json(g["OUT"], bad)
-                assert latency_problems("P", qsha="Q"), bad
+                assert latency_problems("P", qsha=Q), bad
+            # записанное отношение 0.5 при медианах 15/10 мс — отказ
+            tw = dict(good, policies=dict(good["policies"], Tplus_s0=dict(
+                total=dict(median=15.0, p95=16.0), n=300)),
+                bar=dict(BAR=dict(total=dict(median=10.0, p95=11.0), n=300)))
+            tw["summary"] = dict(summary_of(tw), Tplus_over_BAR=0.5)
+            pc.save_json(g["OUT"], tw)
+            assert latency_problems("P", qsha=Q)
+            assert abs(summary_of(tw)["Tplus_over_BAR"] - 1.5) < 1e-12
+            for bad in (dict(good, queue=[[0, "a"]]),
+                        dict(good, mem_used_before_mb=8192)):
+                pc.save_json(g["OUT"], bad)
+                assert latency_problems("P", qsha=Q), bad
             open(g["OUT"], "w").write("{испорчен")
-            assert latency_problems("P", qsha="Q")
+            assert latency_problems("P", qsha=Q)
         finally:
             g["OUT"] = keep
     assert stats_ok(dict(median=1.0, p95=1.0)) and \
@@ -280,7 +345,8 @@ def selftest():
         queue_sha([(0, "b")])
     print("самопроверка k36c_latency пройдена: задержка чужого плана C, "
           "неполного объёма, другой очереди, без руки, без p50/p95, с p95 < "
-          "p50 или NaN, испорченный файл — отказ; нет файла — "
+          "p50 или NaN, испорченный файл, неверное записанное отношение, "
+          "чужой список очереди, занятая карта — отказ; нет файла — "
           "latency_pending без чтения данных (замер — на GPU)")
     return 0
 

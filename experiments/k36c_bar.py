@@ -239,7 +239,7 @@ def bar_episode_problems(rec, z, want, q, vocab):
 
 
 def run_bar_ep(want, sim, io, arm, L, q, vocab, keep_first=False,
-               crash=None, allowed=None):
+               crash=None, allowed=None, woe=None, validate=None):
     """allowed — допустимые открытые резервы [(scope, префикс eid)];
     чужой открытый резерв — отказ до списания."""
     import k36b_gate as kg
@@ -249,8 +249,13 @@ def run_bar_ep(want, sim, io, arm, L, q, vocab, keep_first=False,
     if got is None:
         if L.is_done(want["eid"]):
             raise SystemExit(f"{want['eid']}: учтён, но результата нет")
-        kg.before_reserve(L, want, allowed or [(
-            want["scope"], f"{want['scope']}/{want['stage']}/")])
+        kg.before_reserve(
+            L, want, allowed or [(want["scope"],
+                                  f"{want['scope']}/{want['stage']}/")],
+            woe or (lambda eid: (_ for _ in ()).throw(
+                SystemExit(f"{eid}: нет ожидаемого эпизода"))),
+            validate or (lambda r, z, w2: bar_episode_problems(
+                r, z, w2, q, vocab)))
         L.reserve(want["scope"], want["eid"], amount=pc.EP)
         arm.keep_first = bool(keep_first)
         ep = kcol.run_episode(sim, io, arm, want["task"], want["reset_id"])
@@ -386,10 +391,13 @@ def bar_check(a, kind, sims=None, src=None):
         L = pc.ledger()
         arm = BarArm(torch, src["bar"])
         files = {}
-        for w in bar_wants(prep, kind, src["revision"]):
+        wants = bar_wants(prep, kind, src["revision"])
+        by_eid = {w["eid"]: w for w in wants}
+        for w in wants:
             sim = sims["old" if w["key"].endswith("_old") else "new"]
             run_bar_ep(w, sim, src["io"], arm, L, q, vocab,
-                       keep_first=(kind == "bar_smoke"))
+                       keep_first=(kind == "bar_smoke"),
+                       woe=lambda eid: by_eid[eid])
             files.update(kh.ep_files(w))
         pc.save_json(GATES[kind], dict(ok=True, problems=[], files=files,
                                        prepare_sha1=prep["sha1"],

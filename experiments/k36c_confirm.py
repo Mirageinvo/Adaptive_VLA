@@ -172,6 +172,19 @@ def _chunk(torch, prep, plan, C, L, sim, src_key, chunk, device, revision,
            loader=None, bar_loader=None):
     """Область жизни одного источника (сид или BAR) -> число блоков."""
     n = 0
+    qb = kbar.consts_bar(prep)
+
+    def woe(eid):
+        _st, lab, t, key = kg.parse_eid(eid)
+        return c_want(prep, plan, lab, t, key, revision)
+
+    vb = int(json.load(open(kbar.GATES["bar_smoke"], encoding="utf-8"))[
+        "vocab"])                      # словарь BAR из пройденного smoke
+
+    def validate(rec, z, w2):
+        if w2["label"] == "BAR":
+            return kbar.bar_episode_problems(rec, z, w2, qb, vb)
+        return kh.episode_problems(rec, z, w2, C)
     if src_key == "BAR":
         b = (bar_loader or kbar.load_bar)(torch, device, prep)
         arm = kbar.BarArm(torch, b["bar"])
@@ -182,7 +195,8 @@ def _chunk(torch, prep, plan, C, L, sim, src_key, chunk, device, revision,
             for cid in cases:
                 w = c_want(prep, plan, lab, t, cid, b["revision"])
                 kbar.run_bar_ep(w, sim, b["io"], arm, L, q, vocab,
-                                allowed=kg.C_PENDING)
+                                allowed=kg.C_PENDING, woe=woe,
+                                validate=validate)
                 files.update(kh.ep_files(w))
             pc.save_json(block_path(lab, t, g), dict(
                 label=lab, task=t, block=g, cases=cases, files=files,
@@ -203,7 +217,8 @@ def _chunk(torch, prep, plan, C, L, sim, src_key, chunk, device, revision,
         files = {}
         for cid in cases:
             w = c_want(prep, plan, lab, t, cid)
-            kg.before_reserve(L, w, kg.C_PENDING)
+            if kh.load_ep(w) is None:          # дальше будет новый reserve
+                kg.before_reserve(L, w, kg.C_PENDING, woe, validate)
             kh.run_ep(w, sim, v["io"], arms[lab], L, C)
             files.update(kh.ep_files(w))
         pc.save_json(block_path(lab, t, g), dict(

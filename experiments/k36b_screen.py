@@ -81,10 +81,19 @@ def _screen_seed(torch, prep, C, L, sim, s, wants, device, loader=None,
     act = actor if actor is not None else load_tplus(torch, prep, s,
                                                      v["mod"].H)
     arm = kh.make_arm(torch, prep, f"T32_s{s}", v, actor=act)
+    hashes = {w["seed"]: w["actor_hash"] for w in wants}
+
+    def woe(eid):
+        _st, lab, t, key = kg.parse_eid(eid)
+        s2 = pc.parse_arm(lab)[2]
+        return screen_want(prep, s2, t, key, hashes[s2])
     out = []
     for w in wants:
         if w["seed"] == s:
-            kg.before_reserve(L, w, kg.SCREEN_PENDING)
+            if kh.load_ep(w) is None:          # дальше будет новый reserve
+                kg.before_reserve(L, w, kg.SCREEN_PENDING, woe,
+                                  lambda r, z, w2: kh.episode_problems(
+                                      r, z, w2, C))
             out.append((w, kh.run_ep(w, sim, v["io"], arm, L, C)))
     return out
 
@@ -273,9 +282,44 @@ def selftest():
         actor_changed=False, accepted_added=0)})
     assert not f["actor_updated"] and st == "stopped_B_no_gain"
     assert kh.STAGE_SCOPE[STAGE] == "screen_b"
+    # открытый резерв C и уже записанный эпизод screen: перечитывание без
+    # нового reserve проходит; новый reserve при том же резерве — отказ
+    import tempfile
+    import types
+    import k31_collect as kcol
+    keep = {k: getattr(kh, k) for k in ("load_source", "make_arm",
+                                         "load_ep", "run_ep")}
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            L = kcol.Ledger(os.path.join(td, "l.json"), pc.CAPS)
+            L.reserve("bar_c", "bar_c/confirm_c/BAR/t0/k33s1_t0_c00001")
+            before = json.dumps(L.d, sort_keys=True)
+            w = dict(seed=0, eid="screen_b/screen_b/Tplus_s0/t0/c1",
+                     scope="screen_b", actor_hash="A")
+            kh.load_source = lambda *a, **k: dict(mod=types.SimpleNamespace(
+                H=4), io=None)
+            kh.make_arm = lambda *a, **k: None
+            kh.run_ep = lambda *a, **k: ("rec", "z")
+            kh.load_ep = lambda w_: ("rec", "z")          # уже записан
+            out = _screen_seed(None, {}, {}, L, None, 0, [w], "cpu",
+                               actor=object())
+            assert out == [(w, ("rec", "z"))] and \
+                json.dumps(L.d, sort_keys=True) == before
+            kh.load_ep = lambda w_: None                  # будет reserve
+            try:
+                _screen_seed(None, {}, {}, L, None, 0, [w], "cpu",
+                             actor=object())
+                raise AssertionError("новый reserve при чужом резерве")
+            except SystemExit:
+                pass
+            assert json.dumps(L.d, sort_keys=True) == before
+        finally:
+            for k, v in keep.items():
+                setattr(kh, k, v)
     print("самопроверка k36b_screen пройдена: правило B (joint ≥ 0.03, "
           "6 чистых успехов из 180 проходят, отставание по сиду > 2 — стоп, "
-          "неизменённый actor — стоп)")
+          "неизменённый actor — стоп); при открытом резерве C записанный "
+          "эпизод screen перечитывается без отказа, новый reserve — отказ")
     return 0
 
 
