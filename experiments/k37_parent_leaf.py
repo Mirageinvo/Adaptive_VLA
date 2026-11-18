@@ -407,6 +407,13 @@ def validator(C):
     return val
 
 
+def zero_head_problems(t1, zero):
+    p = kh.compare_eps(t1, zero)
+    if zero[1]["k_u"].any():
+        p.append("ненулевой выход головки")
+    return p
+
+
 def pilot(a, sim=None, src_loader=None, heads=None):
     """По сиду: на каждой сцене T1, (проверка нулевой головки), T2."""
     import torch
@@ -421,43 +428,48 @@ def pilot(a, sim=None, src_loader=None, heads=None):
     val = validator(C)
     allowed = [("pilot", "pilot/"), ("checks", "checks/ident/")]
     sim = sim or kb36.BankSim("bank", kb36.SPACE_DEV)
-    try:
-        for s in (0, 1):
-            v = kh.load_source(torch, s, a.device, src_loader)
-            arms = dict(
-                T1=kh.make_arm(torch, k36, f"T32_s{s}", v),
-                T2=kop.T2Arm(torch, kh.make_arm(torch, k36, f"T32_s{s}", v),
-                             H[s][0]),
-                Z=kop.T2Arm(torch, kh.make_arm(torch, k36, f"T32_s{s}", v),
-                            kop.make_head(torch)))
-            io = v["io"]
-            for d in p37["dev"]:
-                w1, w2, wz = wants(p37, k36, s, d, hh[s])
-                plan = [(w1, arms["T1"], None)]
-                if ident_case(p37, s, d):
-                    plan.append((wz, arms["Z"], save_t2))
-                plan.append((w2, arms["T2"], save_t2))
-                for w, arm, save in plan:
-                    def run_save(w=w, arm=arm, save=save, io=io):
-                        arm.episode = kh.episode_number(w["eid"])
-                        ep = kcol.run_episode(sim, io, arm, w["task"],
-                                              w["reset_id"])
-                        if save is None:
-                            kh.save_ep(w, ep)
-                            return int(ep["physical"])
-                        return save(w, ep)
-                    kg.transact(w, L, run_save, val, allowed, W.__getitem__)
-                if ident_case(p37, s, d):
-                    pr = kh.compare_eps(kh.load_ep(w1), kh.load_ep(wz))
+
+    def run_seed(s):
+        v = kh.load_source(torch, s, a.device, src_loader)
+        arms = dict(
+            T1=kh.make_arm(torch, k36, f"T32_s{s}", v),
+            T2=kop.T2Arm(torch, kh.make_arm(torch, k36, f"T32_s{s}", v),
+                         H[s][0]),
+            Z=kop.T2Arm(torch, kh.make_arm(torch, k36, f"T32_s{s}", v),
+                        kop.make_head(torch)))
+        io = v["io"]
+        for d in p37["dev"]:
+            w1, w2, wz = wants(p37, k36, s, d, hh[s])
+            plan = [(w1, arms["T1"], None)]
+            if ident_case(p37, s, d):
+                plan.append((wz, arms["Z"], save_t2))
+            plan.append((w2, arms["T2"], save_t2))
+            for w, arm, save in plan:
+                def run_save(w=w, arm=arm, save=save):
+                    arm.episode = kh.episode_number(w["eid"])
+                    ep = kcol.run_episode(sim, io, arm, w["task"],
+                                          w["reset_id"])
+                    if save is None:
+                        kh.save_ep(w, ep)
+                        return int(ep["physical"])
+                    return save(w, ep)
+                result = kg.transact(w, L, run_save, val, allowed, W.__getitem__)
+                if w["stage"] == "t1":
+                    t1 = result
+                elif w["stage"] == "ident":
+                    pr = zero_head_problems(t1, result)
                     if pr:
                         raise SystemExit(f"нулевая головка ≠ T1 (s{s} "
                                          f"t{d['task']}): {pr[:4]}")
                     print(f"  s{s} t{d['task']}: нулевая головка = T1 "
                           f"побитово", flush=True)
-                print(f"  s{s} t{d['task']} {d['case_id']}: пара готова; "
-                      f"pilot {L.spent('pilot')}/{CAPS['pilot']}, checks "
-                      f"{L.spent('checks')}/{CAPS['checks']}", flush=True)
-            del arms, v, io
+            print(f"  s{s} t{d['task']} {d['case_id']}: пара готова; "
+                  f"pilot {L.spent('pilot')}/{CAPS['pilot']}, checks "
+                  f"{L.spent('checks')}/{CAPS['checks']}", flush=True)
+
+    try:
+        for s in (0, 1):
+            run_seed(s)
             kh.free(torch)
         return 0
     finally:
@@ -486,22 +498,55 @@ def decide(pairs):
                     delta_pp=100.0 * Dd / max(len(pairs), 1))
 
 
+def analysis_stop(problems, n_pairs):
+    pc.save_json(os.path.join(OUT, "analysis.json"), dict(
+        status="technical_stop", problems=problems[:50], n_pairs=n_pairs))
+    print("  K-37: ТЕХНИЧЕСКИЙ СТОП — " + "; ".join(problems[:3]))
+    return 3
+
+
 def analyze(a):
     install_paths()
     p37, k36 = load_prepare()
-    C = kh.consts(k36)
+    if not os.path.isfile(LEDGER):
+        return analysis_stop(["нет журнала пилота"], 0)
+    L = ledger()
+    validate = validator(kh.consts(k36))
     pairs, prob, per_task = [], [], {}
+    n_ident = 0
     for s in (0, 1):
         hh = pc.load_json(os.path.join(OUT, f"fit_s{s}.json"))["head_hash"]
         for d in p37["dev"]:
-            w1, w2, _wz = wants(p37, k36, s, d, hh)
-            g1, g2 = kh.load_ep(w1), kh.load_ep(w2)
-            if g1 is None or g2 is None:
-                prob.append(f"s{s} t{d['task']} {d['case_id']}: нет пары")
+            w1, w2, wz = wants(p37, k36, s, d, hh)
+            expected = (w1, w2, wz) if ident_case(p37, s, d) else (w1, w2)
+            results = []
+            for w in expected:
+                eid = w["eid"]
+                try:
+                    got = kh.load_ep(w)
+                except (OSError, ValueError, SystemExit) as e:
+                    prob.append(f"{eid}: эпизод не читается ({e})")
+                    continue
+                if got is None or not L.is_done(eid):
+                    prob.append(f"{eid}: нет записанного и учтённого эпизода")
+                    continue
+                pr = validate(*got, w)
+                if not pr:
+                    pr = kh.ledger_owner_problems(L, eid, got[0]["phys"],
+                                                  w["scope"])
+                if pr:
+                    prob.extend(f"{eid}: {x}" for x in pr)
+                    continue
+                results.append(got)
+            if len(results) != len(expected):
                 continue
-            prob += [f"T1 {w1['eid']}: {x}" for x in
-                     kh.episode_problems(*g1, w1, C)]
-            prob += [f"T2 {w2['eid']}: {x}" for x in t2_problems(*g2, w2, C)]
+            g1, g2 = results[:2]
+            if len(expected) == 3:
+                pr = zero_head_problems(g1, results[2])
+                if pr:
+                    prob.append(f"{wz['eid']}: нулевая головка ≠ T1 {pr[:4]}")
+                    continue
+                n_ident += 1
             zz = g2[1]
             act = int(((zz["k_reason"] == 0) & zz["k_u"].any(1)).sum())
             calls_n = int(len(zz["k_reason"]))
@@ -517,16 +562,16 @@ def analyze(a):
             pt["T2"] += y2
             pt["W"] += int(y2 and not y1)
             pt["L"] += int(y1 and not y2)
-    if prob or len(pairs) != 30:
-        pc.save_json(os.path.join(OUT, "analysis.json"), dict(
-            status="technical_stop", problems=prob[:50],
-            n_pairs=len(pairs)))
-        print("  K-37: ТЕХНИЧЕСКИЙ СТОП — " + "; ".join(prob[:3]))
-        return 3
+    if len(pairs) != 30 or n_ident != len(IDENT):
+        prob.append(f"пары {len(pairs)}/30, проверки нулевой головки "
+                    f"{n_ident}/{len(IDENT)}")
+    if prob:
+        return analysis_stop(prob, len(pairs))
     st, det = decide(pairs)
     pc.save_json(os.path.join(OUT, "analysis.json"), dict(
         status=st, details=det, per_task=per_task, rule=RULE,
-        pairs=[list(x) for x in pairs], prepare_sha1=p37["sha1"]))
+        pairs=[list(x) for x in pairs], n_ident=n_ident,
+        prepare_sha1=p37["sha1"]))
     print(f"  K-37: W {det['W']}, L {det['L']}, D {det['D']} "
           f"({det['delta_pp']:+.1f} п.п.), по сидам {det['per_seed']}, "
           f"сцен с плюсом {det['scenes_positive']}; по задачам {per_task} — "
@@ -628,8 +673,8 @@ def status(a):
 
 def e2e_selftest():
     """Пилот на игрушке: ToySim, FakeIO, игрушечный K-25 и actor; T1, T2
-    (ненулевая головка) и проверка нулевой головки; повтор не исполняет
-    заново; подмена команды T2 — отказ проверки."""
+    (ненулевая головка) и две проверки нулевой головки; повтор не исполняет
+    заново; анализ читает 30 пар; подмена команды T2 — отказ проверки."""
     import tempfile
     import torch
     import k21_model as km
@@ -679,8 +724,8 @@ def e2e_selftest():
         for s in (0, 1)}), k32_plan=dict(
         bounds=dict(L=list(Lb) + [-1.0], U=list(Ub) + [1.0]),
         scale_q=np.asarray(io.max_act_q).tolist()))
-    dev = [dict(task=t, case_id=f"k33s0_t{t}_c0000{i}", pos=i, hash=None)
-           for t in TASKS for i in (1, 2)][:4]
+    dev = [dict(task=t, case_id=f"k33s0_t{t}_c{i:05d}", pos=i, hash=None)
+           for t in TASKS for i in range(N_DEV)]
     p37 = dict(sha1="PREP37", dev=dev, ident=[list(x) for x in IDENT])
     src = dict(mod=mod, dec=dec, M=M, io=io, actors=dict(T=actor))
     keep = {k: g_[k] for k in ("OUT", "DATA", "LEDGER", "load_prepare")}
@@ -699,12 +744,26 @@ def e2e_selftest():
             n_pairs = 2 * len(dev)
             n_ident = sum(1 for s in (0, 1) for d in dev
                           if ident_case(p37, s, d))
-            assert n_ident == 1                         # (s0, t0) в наборе
+            assert n_ident == len(IDENT) == 2
             assert len(L.d["done"]) == 2 * n_pairs + n_ident, L.d["done"]
             sp = dict(L.d["spent"])
             assert pilot(a_, sim=kh._NoClose(kppo.ToySim()),
                          src_loader=lambda s: src, heads=heads) == 0
             assert dict(L.d["spent"]) == sp == dict(ledger().d["spent"])
+            for s in (0, 1):
+                pc.save_json(os.path.join(OUT, f"fit_s{s}.json"),
+                             dict(head_hash=hh))
+            assert analyze(a_) == 0
+            out = os.path.join(OUT, "analysis.json")
+            archived = pc.load_json(out)
+            assert len(archived["pairs"]) == 30 and archived["n_ident"] == 2
+            d = next(d for d in dev if ident_case(p37, 1, d))
+            _, _, wz = wants(p37, k36, 1, d, hh)
+            _, np_ = kh.ep_paths(wz["stage"], wz["label"], wz["task"], wz["key"])
+            os.replace(np_, np_ + ".missing")
+            assert analyze(a_) == 3
+            assert pc.load_json(out)["status"] == "technical_stop"
+            os.replace(np_ + ".missing", np_)
             C = kh.consts(k36)
             n_act = 0
             for s in (0, 1):
@@ -760,8 +819,9 @@ def selftest():
           "(D ≥ 2, сиды ≥ 0, ≥ 2 сцены — кандидат; D ≤ −2 и сиды ≤ 0 — "
           "отрицательно; прочее — неопределённо); бюджет 62 эпизода; "
           "игрушечный пилот: T1/T2/нулевая головка через транзакции, "
-          "нулевая = T1 побитово, повтор не исполняет заново, подмена "
-          "команды T2 или D_leaf — отказ проверки")
+          "обе нулевые = T1 побитово, повтор не исполняет заново, "
+          "анализ 30 пар отвергает отсутствие проверки нулевой головки, "
+          "подмена команды T2 или D_leaf — отказ проверки")
     return 0
 
 
