@@ -80,10 +80,15 @@ CODE_BC = ("k36b_gate.py", "k36b_train.py", "k36b_screen.py", "k36c_bar.py",
            "k36bc_run.sh")
 
 
-def bar_revision():
+def bar_revision(prep):
+    """Ревизия original BAR из prepare K-36; текущий снимок K-21 обязан
+    совпадать."""
     import k21_data as d21
-    return json.load(open(d21.REPORT, encoding="utf-8"))["bar_pin"][
-        "revision"]
+    want = prep["k32_plan"]["bar_revision"]
+    cur = json.load(open(d21.REPORT, encoding="utf-8"))["bar_pin"]["revision"]
+    if cur != want:
+        raise SystemExit(f"ревизия BAR K-21 {cur} ≠ prepare K-36 {want}")
+    return want
 
 
 def make_plan_c(prep):
@@ -101,7 +106,7 @@ def make_plan_c(prep):
         kind="k36_plan_c", prepare_sha1=prep["sha1"],
         gate_b_sha1=pc.sha(kbs.GATE_B),
         gate_b_files=json.load(open(kbs.GATE_B))["files"],
-        tplus=tplus, bar_revision=bar_revision(),
+        tplus=tplus, bar_revision=bar_revision(prep),
         code={f: pc.sha(os.path.join(HERE, f)) for f in CODE_BC},
         task_order=task_order_c(),
         cells_sha1=hashlib.sha1(json.dumps(cells).encode()).hexdigest(),
@@ -168,7 +173,7 @@ def _chunk(torch, prep, plan, C, L, sim, src_key, chunk, device, revision,
     """Область жизни одного источника (сид или BAR) -> число блоков."""
     n = 0
     if src_key == "BAR":
-        b = (bar_loader or kbar.load_bar)(torch, device)
+        b = (bar_loader or kbar.load_bar)(torch, device, prep)
         arm = kbar.BarArm(torch, b["bar"])
         q = kbar.consts_bar(prep)
         vocab = int(b["bar"]["codec"].vocab_size)
@@ -198,9 +203,7 @@ def _chunk(torch, prep, plan, C, L, sim, src_key, chunk, device, revision,
         files = {}
         for cid in cases:
             w = c_want(prep, plan, lab, t, cid)
-            pr = kg.pending_problems(L, kg.C_PENDING)
-            if pr:
-                raise SystemExit("; ".join(pr))
+            kg.before_reserve(L, w, kg.C_PENDING)
             kh.run_ep(w, sim, v["io"], arms[lab], L, C)
             files.update(kh.ep_files(w))
         pc.save_json(block_path(lab, t, g), dict(
@@ -218,7 +221,7 @@ def confirm_c(a, sim=None):
         if not os.path.exists(PLAN_C):
             pc.save_json(PLAN_C, make_plan_c(prep))
         p = plan_c_problems(prep) + kbs.gate_b_problems()
-        b = kbar.load_bar(torch, a.device)
+        b = kbar.load_bar(torch, a.device, prep)
         rev, vocab = b["revision"], int(b["bar"]["codec"].vocab_size)
         del b
         kh.free(torch)

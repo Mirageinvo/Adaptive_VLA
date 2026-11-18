@@ -175,6 +175,19 @@ def finish_report(torch, t, st, s):
     return rep
 
 
+def trained_facts(seed):
+    """Факты продолжения из файлов, а не из полей отчёта: изменился ли
+    фактический actor final.pt относительно начала продолжения и сколько
+    actor-обновлений принято (счётчик state.pt)."""
+    import torch
+    ck = torch.load(final_path(seed), map_location="cpu", weights_only=False)
+    st = torch.load(os.path.join(kin.run_dir(seed), "state.pt"),
+                    map_location="cpu", weights_only=False)
+    start = (st.get("imported") or {}).get("continuation_start_actor_hash")
+    return dict(actor_changed=kppo.tensor_hash(ck["actor"]) != start,
+                accepted_added=int((st.get("st") or {}).get("accepted", 0)))
+
+
 def train_problems(seed, prep):
     """Отчёт продолжения сида seed полон и принадлежит ИМЕННО этому сиду:
     seed/оператор/контракт/prepare, три исходных отпечатка = prepare этого
@@ -225,6 +238,10 @@ def train_problems(seed, prep):
             sd["T"]["actor_hash"] or \
             json.loads(json.dumps(st.get("contract"))) != want_c:
         pr.append("состояние тренера ≠ final.pt / импорту этого сида")
+    f = trained_facts(seed)
+    if r.get("actor_changed") != f["actor_changed"] or \
+            r.get("accepted_added") != f["accepted_added"]:
+        pr.append(f"отчёт: actor_changed/accepted_added ≠ фактам файлов {f}")
     return pr
 
 
@@ -239,9 +256,6 @@ def continue_b(a):
         if p:
             raise SystemExit("этап B не разрешён: " + "; ".join(p[:3]))
         prep = pc.load_prepare()
-        pr = kg.pending_problems(pc.ledger(), kg.TRAIN_PENDING)
-        if pr:
-            raise SystemExit("; ".join(pr))
         pr = kh.resources_problems(torch, a.device)
         if pr:
             raise SystemExit("; ".join(pr))
@@ -250,6 +264,11 @@ def continue_b(a):
             if not train_problems(s, prep):
                 print(f"  Tplus_s{s}: продолжение завершено и закреплено")
                 continue
+            pr = kg.pending_problems(L, [
+                (f"train_tplus_s{s}", f"k36/tplus/s{s}/"),
+                (f"val_tplus_s{s}", f"k32/T/s{s}/val_")])
+            if pr:                     # только перед обучением этого сида
+                raise SystemExit("; ".join(pr))
             rep = _train_seed(torch, prep, L, sim, s, a.device,
                               log=lambda x: print(x, flush=True))
             kh.free(torch)
@@ -443,6 +462,13 @@ def selftest():
                                 os.path.join(kin.run_dir(1), f))
             shutil.copyfile(report_path(0), report_path(1))
             assert train_problems(1, prepf), "actor s0 принят как s1"
+            # отчёт заявляет больше принятых обновлений, чем state.pt
+            rj = json.load(open(report_path(0)))
+            pc.save_json(report_path(0), dict(rj, accepted_added=999))
+            assert train_problems(0, prepf)
+            pc.save_json(report_path(0), rj)
+            assert train_problems(0, prepf) == []
+            assert trained_facts(0)["accepted_added"] == st0["accepted"]
             # фактический actor final.pt ≠ отчёту — отказ
             ck = torch.load(final_path(0), weights_only=False)
             ck["actor"] = {k: v + 1e-3 for k, v in ck["actor"].items()}

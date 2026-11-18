@@ -51,11 +51,17 @@ for _k, _v in STAGE_SCOPE.items():
 
 
 # --- рука BAR ---------------------------------------------------------------------
-def load_bar(torch, device):
+def load_bar(torch, device, prep):
+    """Original BAR закреплённой в prepare K-36 ревизии; иначе отказ до
+    загрузки (и до любого BAR-резерва)."""
     import k21_data as d21
     import k29_policy as kp
     import k31_harness as kh31
     prep21 = json.load(open(d21.REPORT, encoding="utf-8"))
+    want = prep["k32_plan"]["bar_revision"]
+    if prep21["bar_pin"]["revision"] != want:
+        raise SystemExit(f"ревизия BAR {prep21['bar_pin']['revision']} ≠ "
+                         f"закреплённой в prepare K-36 {want}")
     bar = d21.load_bar(torch.device(device), prep21["bar_pin"])
     io = kh31.IO(kp.Inputs(torch, bar["proc"], device))
     return dict(bar=bar, io=io, revision=prep21["bar_pin"]["revision"])
@@ -237,17 +243,14 @@ def run_bar_ep(want, sim, io, arm, L, q, vocab, keep_first=False,
     """allowed — допустимые открытые резервы [(scope, префикс eid)];
     чужой открытый резерв — отказ до списания."""
     import k36b_gate as kg
-    pr = kg.pending_problems(L, allowed or [(want["scope"],
-                                             f"{want['scope']}/"
-                                             f"{want['stage']}/")])
-    if pr:
-        raise SystemExit("; ".join(pr))
     if os.path.exists(kh.reject_path(want["eid"])):
         raise SystemExit(f"{want['eid']}: был отвергнут — технический стоп")
     got = kh.load_ep(want)
     if got is None:
         if L.is_done(want["eid"]):
             raise SystemExit(f"{want['eid']}: учтён, но результата нет")
+        kg.before_reserve(L, want, allowed or [(
+            want["scope"], f"{want['scope']}/{want['stage']}/")])
         L.reserve(want["scope"], want["eid"], amount=pc.EP)
         arm.keep_first = bool(keep_first)
         ep = kcol.run_episode(sim, io, arm, want["task"], want["reset_id"])
@@ -372,13 +375,13 @@ def bar_check(a, kind, sims=None, src=None):
             raise SystemExit("; ".join(pr))
         if kind != "bar_legacy":
             prev = "bar_legacy" if kind == "bar_smoke" else "bar_smoke"
-            src0 = src or load_bar(torch, a.device)
+            src0 = src or load_bar(torch, a.device, prep)
             vocab = int(src0["bar"]["codec"].vocab_size)
             p0 = gate_problems(prev, prep, src0["revision"], vocab)
             if p0:
                 raise SystemExit(f"{kind} без {prev}: " + "; ".join(p0))
             src = src0
-        src = src or load_bar(torch, a.device)
+        src = src or load_bar(torch, a.device, prep)
         vocab = int(src["bar"]["codec"].vocab_size)
         L = pc.ledger()
         arm = BarArm(torch, src["bar"])
@@ -561,6 +564,26 @@ def selftest():
     assert snapshot_problems(z2)                    # пересчёт, не delta
     z3 = dict(zz, j_a_codec=(aa + 1e-3)[None])
     assert snapshot_problems(z3)
+    # ревизия BAR K-21 ≠ prepare K-36 — отказ до загрузки модели и в плане C
+    import k21_data as d21
+    import k36c_confirm as kc
+    keep_r = d21.REPORT
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            d21.REPORT = os.path.join(td, "k21.json")
+            pc.save_json(d21.REPORT, dict(bar_pin=dict(revision="OTHER")))
+            prep_r = dict(k32_plan=dict(bar_revision="PINNED"))
+            for fn in (lambda: load_bar(None, "cpu", prep_r),
+                       lambda: kc.bar_revision(prep_r)):
+                try:
+                    fn()
+                    raise AssertionError("чужая ревизия BAR принята")
+                except SystemExit:
+                    pass
+            pc.save_json(d21.REPORT, dict(bar_pin=dict(revision="PINNED")))
+            assert kc.bar_revision(prep_r) == "PINNED"
+        finally:
+            d21.REPORT = keep_r
     print("самопроверка k36c_bar пройдена: эпизод BAR (B1, свой схват) — "
           "журнал токенов и команд, исполненное = масштабу команд; подмены "
           "действия/команды/токена/NaN/последнего вызова/пустой журнал, "
@@ -569,7 +592,8 @@ def selftest():
           "commit — settle без списания; чужой открытый резерв и вход без "
           "passed_B_candidate — отказ до списания; контроль decode по всем "
           "шагам [B, T, D] -> [T, 7] (расхождение последнего шага и чужая "
-          "длина — отказ), снимок пересчитывается по f_official")
+          "длина — отказ), снимок пересчитывается по f_official; ревизия "
+          "BAR ≠ prepare — отказ до загрузки и в плане C")
     return 0
 
 

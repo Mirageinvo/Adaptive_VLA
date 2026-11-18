@@ -60,7 +60,13 @@ def decision_a():
     import k36_harness as kh
     if not os.path.exists(ka.GATE_A) or not os.path.exists(ka.OUT_A):
         return "technical", None, ["нет решения/анализа A (analyze-a)"]
-    g = json.load(open(ka.GATE_A, encoding="utf-8"))
+    try:
+        g = json.load(open(ka.GATE_A, encoding="utf-8"))
+        an = json.load(open(ka.OUT_A, encoding="utf-8"))
+        if not isinstance(g, dict) or not isinstance(an, dict):
+            raise ValueError("не объект")
+    except (OSError, ValueError) as e:
+        return "technical", None, [f"решение/анализ A не читается: {e}"]
     try:
         prep = pc.load_prepare()
     except SystemExit as e:
@@ -85,13 +91,24 @@ def decision_a():
         return "technical", None, [f"сбор A: {e.code}"]
     if pr:
         return "technical", None, [f"данные A: {pr[:3]}"]
+    fst, frule = ka.resource_rule(Y)
+    if g.get("status") != fst or g.get("rule") != frule or \
+            an.get("status") != fst or an.get("rule") != frule:
+        return "technical", None, [
+            f"сохранённые float-статус/флаги решения и анализа A ≠ "
+            f"пересчёту по исходам ({fst})"]
     st, flags, det = rule_a_exact(Y)
     return ("passed" if st == "passed_A_development" else "stopped"), st, \
-        dict(flags=flags, **det, float_status=g.get("status"))
+        dict(flags=flags, **det, float_status=fst, float_rule=frule)
 
 
 def write_decision_a():
-    kind, st, det = decision_a()
+    """Всегда перезаписывает gate_a_exact.json (прежний статус не
+    остаётся при сбое); любой сбой чтения — technical."""
+    try:
+        kind, st, det = decision_a()
+    except Exception as e:                                   # noqa: BLE001
+        kind, st, det = "technical", None, [f"{type(e).__name__}: {e}"]
     rec = dict(kind=kind, status=st, details=det, rule=dict(
         joint_net_min=JOINT_MIN, per_seed_net_min=SEED_MIN,
         note="целочисленная форма §7.3 при 100 случаях на задачу"))
@@ -99,6 +116,8 @@ def write_decision_a():
         import k36_analyze as ka
         rec.update(gate_a_sha1=pc.sha(ka.GATE_A),
                    analysis_sha1=pc.sha(ka.OUT_A))
+    if os.path.exists(GATE_A_EXACT):
+        os.remove(GATE_A_EXACT)
     pc.save_json(GATE_A_EXACT, rec)
     return kind, st, det
 
@@ -138,6 +157,40 @@ def pending_problems(L, allowed):
         return []
     return [f"открыт чужой резерв {pd.get('id')} ({pd.get('scope')}) — "
             f"сначала завершите его стадию; списание не выполняется"]
+
+
+def _paths_of(eid):
+    """eid эпизода '<scope>/<stage>/<метка>/t<задача>/<ключ>' -> пути."""
+    import k36_harness as kh
+    parts = str(eid).split("/")
+    if len(parts) != 5 or not parts[3].startswith("t"):
+        return None
+    return kh.ep_paths(parts[1], parts[2], int(parts[3][1:]), parts[4])
+
+
+def before_reserve(L, want, allowed):
+    """Непосредственно перед новым reserve эпизода want: открытый резерв —
+    этот же eid (его обработает транзакция) либо резерв этой стадии
+    (точные scope и префикс eid). Если для него уже записан результат —
+    settle фактическим расходом (без аварийного списания); если нет —
+    reserve спишет его как аварию. Чужая стадия — отказ без изменений."""
+    pd = L.d.get("pending")
+    if not pd or pd.get("id") == want["eid"]:
+        return
+    pr = pending_problems(L, allowed)
+    if pr:
+        raise SystemExit("; ".join(pr))
+    paths = _paths_of(pd["id"])
+    if paths is None:
+        raise SystemExit(f"открытый резерв {pd['id']}: не эпизод стадии")
+    jp, np_ = paths
+    if os.path.exists(jp) and os.path.exists(np_):
+        rec = json.load(open(jp, encoding="utf-8"))
+        if rec.get("eid") != pd["id"] or rec.get("scope") != pd["scope"] or \
+                pc.sha(np_) != rec.get("npz_sha1"):
+            raise SystemExit(f"результат открытого резерва {pd['id']} не "
+                             f"сходится с ним — ручное решение")
+        L.settle(pd["id"], int(rec["phys"]))
 
 
 def selftest():
@@ -181,9 +234,87 @@ def selftest():
         assert pending_problems(L, bar)
         assert pending_problems(L, [("confirm_a",
                                      "confirm_a/confirm_a/")]) == []
+    # записанный, но не учтённый результат ДРУГОГО эпизода стадии —
+    # settle его фактическим расходом, а не аварийное списание 610
+    import k36_harness as kh
+    with tempfile.TemporaryDirectory() as td:
+        keep = kh.OUT
+        try:
+            kh.OUT = os.path.join(td, "r")
+            L = kcol.Ledger(os.path.join(td, "l2.json"), pc.CAPS)
+            e1 = "bar_c/confirm_c/BAR/t0/k33s1_t0_c00001"
+            L.reserve("bar_c", e1)
+            jp, np_ = kh.ep_paths("confirm_c", "BAR", 0, "k33s1_t0_c00001")
+            os.makedirs(os.path.dirname(jp))
+            np.savez(np_, a=np.zeros(1))
+            pc.save_json(jp, dict(eid=e1, scope="bar_c", phys=32,
+                                  npz_sha1=pc.sha(np_)))
+            w2 = dict(eid="bar_c/confirm_c/BAR/t0/k33s1_t0_c00002")
+            before_reserve(L, w2, C_PENDING)
+            assert L.d["pending"] is None and L.spent("bar_c") == 32 and \
+                not L.d["crashes"]
+            # результата нет — допускается аварийное списание при reserve
+            L.reserve("bar_c", "bar_c/confirm_c/BAR/t0/k33s1_t0_c00003")
+            before_reserve(L, w2, C_PENDING)
+            assert L.d["pending"]["id"].endswith("00003")
+            # чужая стадия — отказ без изменений
+            L.d["pending"] = dict(scope="confirm_a", id="confirm_a/x",
+                                  amount=610)
+            before = json.dumps(L.d, sort_keys=True)
+            try:
+                before_reserve(L, w2, C_PENDING)
+                raise AssertionError("чужой резерв принят")
+            except SystemExit:
+                pass
+            assert json.dumps(L.d, sort_keys=True) == before
+        finally:
+            kh.OUT = keep
+    # повреждённое решение A: technical, прежний passed не остаётся;
+    # подменённый float-статус — technical
+    import k36_analyze as ka
+    G = globals()
+    keep = dict(GATE_A_EXACT=G["GATE_A_EXACT"])
+    keep_ka = (ka.GATE_A, ka.OUT_A, ka.collect_a)
+    keep_lp, keep_af = pc.load_prepare, kh.a_files
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            G["GATE_A_EXACT"] = os.path.join(td, "exact.json")
+            ka.GATE_A, ka.OUT_A = (os.path.join(td, "g.json"),
+                                   os.path.join(td, "a.json"))
+            pc.save_json(G["GATE_A_EXACT"], dict(kind="passed"))
+            open(ka.GATE_A, "w").write("{испорчен")
+            open(ka.OUT_A, "w").write("{}")
+            kind, st, det = write_decision_a()
+            assert kind == "technical" and json.load(open(
+                G["GATE_A_EXACT"]))["kind"] == "technical"
+            Yp = table({0: (8, 9, -8), 1: (8, 9, -8)})
+            fst, frule = ka.resource_rule(Yp)
+            fs = [os.path.join(td, "e.json")]
+            open(fs[0], "w").write("x")
+            pc.load_prepare = lambda: dict(sha1="P")
+            kh.a_files = lambda prep: set(fs)
+            ka.collect_a = lambda: (Yp, [], {}, None)
+            pc.save_json(ka.OUT_A, dict(status=fst, rule=frule))
+            gate = dict(status=fst, rule=frule, prepare_sha1="P",
+                        files={fs[0]: pc.sha(fs[0])},
+                        analysis_sha1=pc.sha(ka.OUT_A))
+            pc.save_json(ka.GATE_A, gate)
+            kind, st, det = write_decision_a()
+            assert kind == "passed" and det["float_status"] == fst
+            pc.save_json(ka.OUT_A, dict(status="technical_stop", rule=frule))
+            pc.save_json(ka.GATE_A, dict(gate, status="technical_stop",
+                                         analysis_sha1=pc.sha(ka.OUT_A)))
+            kind, st, det = write_decision_a()
+            assert kind == "technical"
+        finally:
+            G.update(keep)
+            ka.GATE_A, ka.OUT_A, ka.collect_a = keep_ka
+            pc.load_prepare, kh.a_files = keep_lp, keep_af
     assert code_of("stopped") == 4 and code_of("technical") == 3
     print("самопроверка k36b_gate пройдена: правило A в целых (ровно +18 и "
-          "−6 проходят, +17 и −7 — стоп), чужой открытый резерв — отказ")
+          "−6 проходят, +17 и −7 — стоп), чужой открытый резерв — отказ; "
+          "записанный результат другого эпизода стадии — settle, а не "
+          "аварийное списание")
     return 0
 
 

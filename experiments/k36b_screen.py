@@ -84,9 +84,7 @@ def _screen_seed(torch, prep, C, L, sim, s, wants, device, loader=None,
     out = []
     for w in wants:
         if w["seed"] == s:
-            pr = kg.pending_problems(L, kg.SCREEN_PENDING)
-            if pr:
-                raise SystemExit("; ".join(pr))
+            kg.before_reserve(L, w, kg.SCREEN_PENDING)
             out.append((w, kh.run_ep(w, sim, v["io"], arm, L, C)))
     return out
 
@@ -118,6 +116,7 @@ def outcomes(prep, hashes, C):
 
 
 def rule_b(Y, train_reps):
+    """train_reps — факты продолжения из файлов (kbt.trained_facts)."""
     R = pc.RULE_B
     d = {t: np.mean([Y["Tplus"][s][t].astype(float) -
                      Y["T32"][s][t].astype(float) for s in (0, 1)], 0)
@@ -165,8 +164,7 @@ def screen_b(a, sim=None, loader=None):
 
 def decide_b(prep, hashes, C):
     Y, files, p = outcomes(prep, hashes, C)
-    reps = {s: json.load(open(kbt.report_path(s), encoding="utf-8"))
-            for s in pc.parse_seeds()}
+    reps = {s: kbt.trained_facts(s) for s in pc.parse_seeds()}
     if p:
         pc.save_json(GATE_B, dict(status="technical_stop", problems=p[:50]))
         print("  гейт B: ТЕХНИЧЕСКИЙ СТОП — " + "; ".join(p[:3]))
@@ -221,8 +219,7 @@ def decision_b():
                          (kbt.report_path(s), kbt.final_path(s))}
     if set(g["files"]) != want:
         return "technical", None, ["решение B: набор файлов ≠ ожидаемому"]
-    reps = {s: json.load(open(kbt.report_path(s), encoding="utf-8"))
-            for s in pc.parse_seeds()}
+    reps = {s: kbt.trained_facts(s) for s in pc.parse_seeds()}
     st, flags, _d = rule_b(Y, reps)
     if g.get("status") != st or g.get("flags") != flags:
         return "technical", None, [f"статус решения B ≠ пересчёту ({st})"]

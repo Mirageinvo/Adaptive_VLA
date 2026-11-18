@@ -191,11 +191,9 @@ def analyze_c(a):
         pc.save_json(OUT, dict(status="technical_stop", problems=prob[:50]))
         print("  анализ C: ТЕХНИЧЕСКИЙ СТОП — " + "; ".join(prob[:4]))
         return 3
-    import k21_data as d21
     import k36c_confirm as kc
     import k36c_latency as kl36
-    lp = kl36.latency_problems(pc.sha(kc.PLAN_C), kl36.queue_sha(
-        d21.load_prepared(require_teacher=False)))
+    lp = kl36.latency_problems(pc.sha(kc.PLAN_C))
     if lp:
         pc.save_json(OUT, dict(status="technical_stop", problems=lp))
         print("  анализ C: ТЕХНИЧЕСКИЙ СТОП — задержка: " + "; ".join(lp))
