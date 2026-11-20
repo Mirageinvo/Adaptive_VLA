@@ -173,18 +173,21 @@ def code_shas():
 
 def heads_info(torch, p37):
     out = dict(T2={}, T2P={})
-    an = pc.load_json(os.path.join(kpl.OUT, "analysis.json"))
-    for s in SEEDS:
-        _h, hh = kpl.load_head(torch, p37, s)
-        d = os.path.join(kpl.OUT, "t2", f"T2_s{s}")
-        recs = [pc.load_json(os.path.join(d, f)) for f in sorted(
-            os.listdir(d)) if f.endswith(".json")] if os.path.isdir(d) else []
-        n_pairs = sum(1 for x in an.get("pairs", []) if x[0] == s)
-        if len(recs) != n_pairs or not recs or any(
-                str(r.get("actor_hash", "")).rsplit("+", 1)[-1] != hh
-                for r in recs):
-            raise SystemExit(f"головка T2 s{s} ≠ головке в эпизодах пилота "
-                             f"({len(recs)} записей из {n_pairs})")
+    k36 = pc.load_prepare()
+    keep = dict(OUT=kh.OUT, REJECTED=kh.REJECTED)
+    kpl.install_paths()
+    try:
+        for s in SEEDS:
+            _h, hh = kpl.load_head(torch, p37, s)
+            for d in p37["dev"]:
+                _w1, w2, _wz = kpl.wants(p37, k36, s, d, hh)
+                # load_ep: идентификаторы (в т. ч. actor_hash = T32 + хеш
+                # головки), want_hash и SHA npz ровно этого eid
+                if kh.load_ep(w2) is None:
+                    raise SystemExit(f"пилот: нет эпизода {w2['eid']} с "
+                                     f"головкой T2 s{s}")
+    finally:
+        kh.OUT, kh.REJECTED = keep["OUT"], keep["REJECTED"]
         out["T2"][str(s)] = dict(path=kpl.head_path(s), head_hash=hh,
                                  sha256=sha256(kpl.head_path(s)))
         r = pc.load_json(kc.report_path(s))
@@ -428,12 +431,12 @@ def bind_device(torch, idx, g, props=None):
     bus = getattr(props, "pci_bus_id", None)
     dv = getattr(props, "pci_device_id", None)
     dom = getattr(props, "pci_domain_id", None)
-    if bus is None or dv is None:
-        raise SystemExit(f"cuda:{idx}: torch не даёт ни UUID, ни PCI bus ID "
-                         f"— привязку к карте подтвердить нельзя")
+    if bus is None or dv is None or dom is None:
+        raise SystemExit(f"cuda:{idx}: torch не даёт ни UUID, ни полного PCI "
+                         f"domain/bus/device — привязку подтвердить нельзя")
     d_, b_, rest = g["pci"].split(":")
     ok = int(b_, 16) == int(bus) and int(rest.split(".")[0], 16) == int(dv) \
-        and (dom is None or int(d_, 16) == int(dom))
+        and int(d_, 16) == int(dom)
     if not ok:
         raise SystemExit(f"cuda:{idx} в torch (PCI {dom}:{bus}:{dv}) ≠ "
                          f"{g['pci']}")
@@ -993,7 +996,7 @@ def analyze(a):
     m = pc.load_json(mp)
     if m.get("ok") is not True or m.get("plan_sha256") != plan["sha256"]:
         raise SystemExit("merge не пройден или от другого плана")
-    prob, rows, _parts = build_merge(a.run_root, plan, k36)   # заново
+    prob, rows, parts = build_merge(a.run_root, plan, k36)    # заново
     if prob:
         raise SystemExit("проверка частей при анализе: " + "; ".join(
             prob[:3]))
@@ -1001,7 +1004,7 @@ def analyze(a):
     if sorted(rows, key=key) != sorted(m["rows"], key=key):
         raise SystemExit("merged.json ≠ проверенным записям частей")
     Y, task = scene_table(rows, plan["scenes"])
-    m = dict(m, rows=rows)
+    m = dict(m, rows=rows, parts=parts)
     st = contrast_stats(Y, task, [("T2", "T1"), ("T2", "T2P"),
                                   ("T2P", "T1")])
     h1 = st["T2-T1"]["lo"] > 0
@@ -1083,7 +1086,10 @@ def selftest():
     assert bind_device(None, 1, g, P(uuid="abc")) == "uuid"
     assert bind_device(None, 1, g, P(pci_bus_id=0x3B, pci_device_id=0,
                                      pci_domain_id=0)) == "pci"
-    for bad_p in (P(uuid="zzz"), P(pci_bus_id=0x3C, pci_device_id=0), P()):
+    for bad_p in (P(uuid="zzz"), P(pci_bus_id=0x3C, pci_device_id=0,
+                                   pci_domain_id=0),
+                  P(pci_bus_id=0x3B, pci_device_id=0),          # без домена
+                  P(pci_bus_id=0x3B, pci_device_id=0, pci_domain_id=1), P()):
         try:
             bind_device(None, 1, g, bad_p)
             raise AssertionError("привязка к чужой/непроверяемой карте")
