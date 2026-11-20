@@ -197,7 +197,7 @@ def run(a):
             io0 = kh31.IO(kp.Inputs(torch, None, "cpu"))
             queue = collect_obs(sim, io0, L, time.strftime("%Y%m%dT%H%M%S"))
         finally:
-            sim.close()
+            kcf.close_sim(sim)
         g2 = kcf.gpu_query(idx)
         if g2["used"] > GPU_MAX_MB:
             raise kcf.Busy(f"{a.device}: занято {g2['used']} МиБ перед "

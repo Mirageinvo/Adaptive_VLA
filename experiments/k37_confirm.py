@@ -425,10 +425,45 @@ def env_versions():
     return v
 
 
-def bind_device(torch, idx, g, props=None):
+def driver_identity(idx, lib=None):
+    """UUID и PCI-адрес устройства с CUDA-порядковым номером idx через
+    драйвер (libcuda: cuDeviceGet -> cuDeviceGetUuid, cuDeviceGetPCIBusId).
+    Порядковый номер драйвера = номер cuda:idx в torch."""
+    import ctypes
+    try:
+        cu = lib or ctypes.CDLL("libcuda.so.1")
+    except OSError as e:
+        raise SystemExit(f"libcuda недоступна: {e}")
+    dev = ctypes.c_int()
+    raw = (ctypes.c_ubyte * 16)()
+    buf = ctypes.create_string_buffer(64)
+    fn = getattr(cu, "cuDeviceGetUuid_v2", None) or cu.cuDeviceGetUuid
+    for nm, rc in (("cuInit", lambda: cu.cuInit(0)),
+                   ("cuDeviceGet", lambda: cu.cuDeviceGet(ctypes.byref(dev),
+                                                          int(idx))),
+                   ("cuDeviceGetUuid", lambda: fn(raw, dev)),
+                   ("cuDeviceGetPCIBusId",
+                    lambda: cu.cuDeviceGetPCIBusId(buf, 64, dev))):
+        r = rc()
+        if r != 0:
+            raise SystemExit(f"{nm}(cuda:{idx}) вернул {r}")
+    h = bytes(raw).hex()
+    return dict(uuid=f"GPU-{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}",
+                pci=buf.value.decode())
+
+
+def pci_key(s):
+    """'00000000:01:00.0' / '0000:01:00.0' -> (domain, bus, device, fn)."""
+    d_, b_, rest = str(s).strip().split(":")
+    dv, fn = rest.split(".")
+    return int(d_, 16), int(b_, 16), int(dv, 16), int(fn, 16)
+
+
+def bind_device(torch, idx, g, props=None, ident=None):
     """До загрузки моделей: CUDA-контекст на cuda:idx и сверка с картой
-    nvidia-smi (той же, что проверка памяти и блокировка): UUID, а если torch
-    его не даёт — PCI domain/bus/device. Нечем сверить — отказ."""
+    nvidia-smi (той же, что проверка памяти и блокировка). Источник —
+    поле uuid torch, если есть; иначе драйвер CUDA (UUID и PCI-адрес,
+    оба должны совпасть). Нечем сверить — отказ."""
     if props is None:
         torch.zeros(1, device=torch.device(f"cuda:{idx}"))
         props = torch.cuda.get_device_properties(idx)
@@ -437,20 +472,23 @@ def bind_device(torch, idx, g, props=None):
         if str(u).replace("GPU-", "").lower() != \
                 g["uuid"].replace("GPU-", "").lower():
             raise SystemExit(f"cuda:{idx} в torch ≠ {g['uuid']} (UUID {u})")
-        return "uuid"
-    bus = getattr(props, "pci_bus_id", None)
-    dv = getattr(props, "pci_device_id", None)
-    dom = getattr(props, "pci_domain_id", None)
-    if bus is None or dv is None or dom is None:
-        raise SystemExit(f"cuda:{idx}: torch не даёт ни UUID, ни полного PCI "
-                         f"domain/bus/device — привязку подтвердить нельзя")
-    d_, b_, rest = g["pci"].split(":")
-    ok = int(b_, 16) == int(bus) and int(rest.split(".")[0], 16) == int(dv) \
-        and int(d_, 16) == int(dom)
-    if not ok:
-        raise SystemExit(f"cuda:{idx} в torch (PCI {dom}:{bus}:{dv}) ≠ "
-                         f"{g['pci']}")
-    return "pci"
+        return "torch-uuid"
+    ident = ident or driver_identity(idx)
+    if ident["uuid"].lower() != g["uuid"].lower() or \
+            pci_key(ident["pci"]) != pci_key(g["pci"]):
+        raise SystemExit(f"cuda:{idx} в драйвере ({ident['uuid']}, "
+                         f"{ident['pci']}) ≠ nvidia-smi ({g['uuid']}, "
+                         f"{g['pci']})")
+    return "driver-uuid+pci"
+
+
+def close_sim(sim):
+    """Закрыть среду, не скрывая исходную ошибку: отказ воркера при
+    закрытии только печатается."""
+    try:
+        sim.close()
+    except SystemExit as e:
+        print(f"  (при закрытии среды: {e})", flush=True)
 
 
 # --- назначения ------------------------------------------------------------------------------
@@ -600,7 +638,7 @@ def collect(a, sim=None, src_loader=None, heads=None, gpu_runner=None,
         except torch.cuda.OutOfMemoryError as e:
             raise Busy(f"CUDA OOM: {e}")
         finally:
-            sim.close()
+            close_sim(sim)
         rep = part_problems(plan, k36, rr, k, C)
         pc.save_json(os.path.join(pd, "part_report.json"), rep)
         print(f"  part {k:02d}: " + ("готова, проверка пройдена"
@@ -773,7 +811,7 @@ def preflight(a, sim=None, src_loader=None, heads=None, gpu_runner=None,
         except torch.cuda.OutOfMemoryError as e:
             raise Busy(f"CUDA OOM: {e}")
         finally:
-            sim.close()
+            close_sim(sim)
         secs = []
         for w in allw.values():
             rec, z = kh.load_ep(w)
@@ -1120,18 +1158,52 @@ def selftest():
         globals()["sha256"] = stub["sh"]
     # привязка к карте до загрузки моделей
     P = lambda **k: type("P", (), k)()  # noqa: E731
-    assert bind_device(None, 1, g, P(uuid="abc")) == "uuid"
-    assert bind_device(None, 1, g, P(pci_bus_id=0x3B, pci_device_id=0,
-                                     pci_domain_id=0)) == "pci"
-    for bad_p in (P(uuid="zzz"), P(pci_bus_id=0x3C, pci_device_id=0,
-                                   pci_domain_id=0),
-                  P(pci_bus_id=0x3B, pci_device_id=0),          # без домена
-                  P(pci_bus_id=0x3B, pci_device_id=0, pci_domain_id=1), P()):
+    assert bind_device(None, 1, g, P(uuid="abc")) == "torch-uuid"
+    good = dict(uuid="GPU-abc", pci="0000:3B:00.0")
+    assert bind_device(None, 1, g, P(), good) == "driver-uuid+pci"
+    for bad_i in (dict(good, uuid="GPU-zzz"), dict(good, pci="0000:3C:00.0"),
+                  dict(good, pci="0001:3B:00.0")):
         try:
-            bind_device(None, 1, g, bad_p)
-            raise AssertionError("привязка к чужой/непроверяемой карте")
+            bind_device(None, 1, g, P(), bad_i)
+            raise AssertionError("привязка к чужой карте")
         except SystemExit:
             pass
+    try:
+        bind_device(None, 1, g, P(uuid="zzz"))
+        raise AssertionError("чужой UUID torch")
+    except SystemExit:
+        pass
+    # драйвер CUDA на заглушке libcuda: формат UUID и PCI
+    import ctypes
+
+    class FakeCu:
+        def cuInit(self, f):
+            return 0
+
+        def cuDeviceGet(self, ref, i):
+            ref._obj.value = i
+            return 0
+
+        def cuDeviceGetUuid_v2(self, raw, dev):
+            for j in range(16):
+                raw[j] = j
+            return 0
+
+        def cuDeviceGetPCIBusId(self, buf, n, dev):
+            buf.value = b"0000:3B:00.0"
+            return 0
+    di = driver_identity(1, FakeCu())
+    assert di == dict(uuid="GPU-00010203-0405-0607-0809-0a0b0c0d0e0f",
+                      pci="0000:3B:00.0"), di
+    assert pci_key("00000000:3B:00.0") == pci_key(di["pci"])
+    bad_cu = FakeCu()
+    bad_cu.cuInit = lambda f: 100
+    try:
+        driver_identity(1, bad_cu)
+        raise AssertionError("ошибка драйвера прошла")
+    except SystemExit:
+        pass
+    _ = ctypes
     # блокировки: вторая на тот же файл — отказ
     with tempfile.TemporaryDirectory() as td:
         l1 = Lock(os.path.join(td, "g.lock"), "карта", Busy)
