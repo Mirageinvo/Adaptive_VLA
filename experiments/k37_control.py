@@ -296,6 +296,7 @@ def selftest():
     import k32_model as km32
     import k32_policy as kpol
     k29m.no_tf32(torch)
+    torch.manual_seed(0)                     # игрушка не зависит от RNG
     M = k29m.build(torch)
     E = kr.build(torch)
     L = np.array([-1.1, -2.0, -1.5, -0.5, -3.0, -1.0])
@@ -317,7 +318,9 @@ def selftest():
         for p in actor.out.parameters():
             p.copy_(torch.randn(p.shape, generator=g2))
     n_act, worst, differ = 0, 0.0, 0
-    for seed in range(12):
+    for seed in range(60):
+        if n_act >= 3 and differ >= 1:
+            break
         mk = lambda: kpol.Arm(torch, mod, dec, M, kind="T", seed=0,  # noqa
                               actor=actor)
         head = kop.make_head(torch)

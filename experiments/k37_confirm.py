@@ -173,8 +173,18 @@ def code_shas():
 
 def heads_info(torch, p37):
     out = dict(T2={}, T2P={})
+    an = pc.load_json(os.path.join(kpl.OUT, "analysis.json"))
     for s in SEEDS:
         _h, hh = kpl.load_head(torch, p37, s)
+        d = os.path.join(kpl.OUT, "t2", f"T2_s{s}")
+        recs = [pc.load_json(os.path.join(d, f)) for f in sorted(
+            os.listdir(d)) if f.endswith(".json")] if os.path.isdir(d) else []
+        n_pairs = sum(1 for x in an.get("pairs", []) if x[0] == s)
+        if len(recs) != n_pairs or not recs or any(
+                str(r.get("actor_hash", "")).rsplit("+", 1)[-1] != hh
+                for r in recs):
+            raise SystemExit(f"головка T2 s{s} ≠ головке в эпизодах пилота "
+                             f"({len(recs)} записей из {n_pairs})")
         out["T2"][str(s)] = dict(path=kpl.head_path(s), head_hash=hh,
                                  sha256=sha256(kpl.head_path(s)))
         r = pc.load_json(kc.report_path(s))
@@ -243,10 +253,16 @@ def prepare(a):
     rr = os.path.join(RUNS, a.run_id)
     new = make_plan(a.run_id)
     sh = canon_sha(new)
-    if os.path.exists(plan_path(rr)):
+    shp = os.path.join(rr, "plan.sha256")
+    if os.path.exists(plan_path(rr)) or os.path.exists(shp):
+        if not (os.path.exists(plan_path(rr)) and os.path.exists(shp)):
+            raise SystemExit(f"{rr}: план или plan.sha256 отсутствует — "
+                             f"каталог повреждён, нужен новый run_id")
         old = json.load(open(plan_path(rr), encoding="utf-8"))
-        if canon_sha(old) != sh:
-            raise SystemExit(f"{plan_path(rr)} закреплён иначе")
+        rec = open(shp).read().strip()
+        if not (canon_sha(old) == rec == sh):
+            raise SystemExit(f"{plan_path(rr)} закреплён иначе или "
+                             f"plan.sha256 не сходится")
         print(f"  план закреплён, совпадает: {sh[:16]}")
         return OK
     os.makedirs(rr, exist_ok=True)
@@ -317,25 +333,27 @@ def dev_index(device):
 
 def gpu_query(idx, runner=None):
     """-> dict(uuid, total, used, free, util); N/A/ошибка — SystemExit."""
-    cmd = ["nvidia-smi", "--query-gpu=index,uuid,memory.total,memory.used,"
-           "memory.free,utilization.gpu,name", "--format=csv,noheader,nounits",
-           "-i", str(idx)]
+    cmd = ["nvidia-smi", "--query-gpu=index,uuid,pci.bus_id,memory.total,"
+           "memory.used,memory.free,utilization.gpu,name",
+           "--format=csv,noheader,nounits", "-i", str(idx)]
     try:
         out = (runner or (lambda c: subprocess.check_output(
             c, text=True, timeout=60)))(cmd).strip()
     except Exception as e:                                   # noqa: BLE001
         raise SystemExit(f"nvidia-smi: {type(e).__name__}: {e}")
     f = [x.strip() for x in out.split(",")]
-    if len(f) != 7:
+    if len(f) != 8:
         raise SystemExit(f"nvidia-smi: неожиданный ответ {out!r}")
     try:
-        nums = [int(x) for x in f[2:6]]
+        nums = [int(x) for x in f[3:7]]
+        int(f[0])
     except ValueError:
         raise SystemExit(f"nvidia-smi: не число в {out!r}")
-    if not f[1].startswith("GPU-") or int(f[0]) != int(idx):
-        raise SystemExit(f"nvidia-smi: UUID/индекс {out!r}")
-    return dict(index=int(f[0]), uuid=f[1], total=nums[0], used=nums[1],
-                free=nums[2], util=nums[3], name=f[6])
+    if not f[1].startswith("GPU-") or int(f[0]) != int(idx) or \
+            f[2].count(":") != 2:
+        raise SystemExit(f"nvidia-smi: UUID/индекс/PCI {out!r}")
+    return dict(index=int(f[0]), uuid=f[1], pci=f[2], total=nums[0],
+                used=nums[1], free=nums[2], util=nums[3], name=f[7])
 
 
 def check_gpu(idx, need_gb, runner=None):
@@ -346,8 +364,11 @@ def check_gpu(idx, need_gb, runner=None):
     return g
 
 
+_DISK_USAGE = None                     # самопроверка подставляет свой
+
+
 def check_disk(path, need_gb=RES["disk_gb"], usage=None):
-    free = (usage or shutil.disk_usage)(path).free
+    free = (usage or _DISK_USAGE or shutil.disk_usage)(path).free
     if free < need_gb * 2 ** 30:
         raise Busy(f"диск: свободно {free / 2 ** 30:.1f} ГиБ < {need_gb}")
     return free
@@ -391,15 +412,32 @@ def env_versions():
     return v
 
 
-def verify_torch_uuid(torch, idx, uuid):
-    """После создания контекста: UUID карты в torch = UUID nvidia-smi."""
-    pr = torch.cuda.get_device_properties(idx)
-    u = getattr(pr, "uuid", None)
-    if u is None:
-        return "не проверен (torch без uuid)"
-    if str(u).replace("GPU-", "") != uuid.replace("GPU-", ""):
-        raise SystemExit(f"cuda:{idx} в torch ≠ {uuid} (UUID {u})")
-    return "совпадает"
+def bind_device(torch, idx, g, props=None):
+    """До загрузки моделей: CUDA-контекст на cuda:idx и сверка с картой
+    nvidia-smi (той же, что проверка памяти и блокировка): UUID, а если torch
+    его не даёт — PCI domain/bus/device. Нечем сверить — отказ."""
+    if props is None:
+        torch.zeros(1, device=torch.device(f"cuda:{idx}"))
+        props = torch.cuda.get_device_properties(idx)
+    u = getattr(props, "uuid", None)
+    if u is not None:
+        if str(u).replace("GPU-", "").lower() != \
+                g["uuid"].replace("GPU-", "").lower():
+            raise SystemExit(f"cuda:{idx} в torch ≠ {g['uuid']} (UUID {u})")
+        return "uuid"
+    bus = getattr(props, "pci_bus_id", None)
+    dv = getattr(props, "pci_device_id", None)
+    dom = getattr(props, "pci_domain_id", None)
+    if bus is None or dv is None:
+        raise SystemExit(f"cuda:{idx}: torch не даёт ни UUID, ни PCI bus ID "
+                         f"— привязку к карте подтвердить нельзя")
+    d_, b_, rest = g["pci"].split(":")
+    ok = int(b_, 16) == int(bus) and int(rest.split(".")[0], 16) == int(dv) \
+        and (dom is None or int(d_, 16) == int(dom))
+    if not ok:
+        raise SystemExit(f"cuda:{idx} в torch (PCI {dom}:{bus}:{dv}) ≠ "
+                         f"{g['pci']}")
+    return "pci"
 
 
 # --- назначения ------------------------------------------------------------------------------
@@ -408,6 +446,16 @@ def part_dir(rr, k):
 
 
 def assign(a):
+    lk = os.path.join(a.run_root, ".assignments.lock")
+    with open(lk, "a+") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)              # ждём другой assign
+        try:
+            return _assign(a)
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def _assign(a):
     plan, _k = load_plan(a.run_root, verify=False)
     path = os.path.join(a.run_root, "assignments.json")
     d = json.load(open(path)) if os.path.exists(path) else dict(history=[])
@@ -511,11 +559,11 @@ def collect(a, sim=None, src_loader=None, heads=None, gpu_runner=None,
                                   bank_dir=plan["bank"]["dir"])
         t0, n0 = time.time(), sum(1 for e in W if L.is_done(e))
         try:
+            if torch_check:
+                bind_device(torch, idx, g)
             for s in SEEDS:
                 check_gpu(idx, need, gpu_runner)
                 v = kh.load_source(torch, s, a.device, src_loader)
-                if torch_check and str(a.device).startswith("cuda"):
-                    verify_torch_uuid(torch, idx, g["uuid"])
                 arms = make_arms(torch, k36, s, v, H)
                 ws = [w for w in W.values() if w["seed"] == s]
 
@@ -682,29 +730,26 @@ def preflight(a, sim=None, src_loader=None, heads=None, gpu_runner=None,
                 m, z = pf_wants(plan, k36, s, sc)
                 for w in m + z:
                     allw[w["eid"]] = w
-        secs, eps, prob = [], {}, []
+        eps, prob = {}, []
         uuid_state = None
-        if str(a.device).startswith("cuda"):
-            torch.cuda.reset_peak_memory_stats(idx)
         try:
+            if torch_check:
+                uuid_state = bind_device(torch, idx, g)   # контекст создан
+                torch.cuda.reset_peak_memory_stats(idx)
             for s in SEEDS:
                 check_gpu(idx, plan["resource"]["preflight_need_gb"],
                           gpu_runner)
                 v = kh.load_source(torch, s, a.device, src_loader)
-                if torch_check and str(a.device).startswith("cuda"):
-                    uuid_state = verify_torch_uuid(torch, idx, g["uuid"])
                 arms = make_arms(torch, k36, s, v, H, zero=True)
                 for sc in scs:
                     m, z = pf_wants(plan, k36, s, sc)
                     for w in m + z:
                         key = ("Z_" + w["kind"]) if w["stage"] == "zero" \
                             else ("T1" if w["kind"] == "T" else w["kind"])
-                        t_ = time.time()
                         run_wants(torch, [w], L, sim, v,
                                   lambda _w, key=key: arms[key], val,
                                   [("checks", "checks/")], d,
                                   allw.__getitem__)
-                        secs.append(time.time() - t_)
                     if z:
                         t1 = kh.load_ep(m[0])
                         for wz in z:
@@ -712,11 +757,15 @@ def preflight(a, sim=None, src_loader=None, heads=None, gpu_runner=None,
                             prob += [f"нулевая {wz['eid']}: {x}" for x in pr]
                 arms = v = None
                 kh.free(torch)
+        except torch.cuda.OutOfMemoryError as e:
+            raise Busy(f"CUDA OOM: {e}")
         finally:
             sim.close()
+        secs = []
         for w in allw.values():
             rec, z = kh.load_ep(w)
             fc = first_call(z)
+            secs.append(float(rec["seconds"]))     # время исполнения эпизода
             eps[w["eid"]] = dict(
                 success=bool(rec["summary"]["success"]),
                 init_hash=rec["summary"]["init_hash"],
@@ -726,7 +775,7 @@ def preflight(a, sim=None, src_loader=None, heads=None, gpu_runner=None,
                 first_base=fc["base"].tolist(), first_D=fc["D"].tolist(),
                 first_a=fc["a"].tolist())
         peak = (torch.cuda.max_memory_reserved(idx) / 2 ** 30
-                if str(a.device).startswith("cuda") else 0.0)
+                if torch_check else 0.0)
         rep = dict(plan_sha256=plan["sha256"], host=host, uuid=g["uuid"],
                    gpu=g, device=a.device, torch_uuid=uuid_state,
                    versions=env_versions(), peak_gb=float(peak),
@@ -820,17 +869,17 @@ def status(a):
     return OK
 
 
-def merge(a):
-    plan, k36 = load_plan(a.run_root)
+def build_merge(rr, plan, k36):
+    """Полная проверка всех частей -> (problems, rows, parts)."""
     C = kh.consts(k36)
-    ap = os.path.join(a.run_root, "assignments.json")
+    ap = os.path.join(rr, "assignments.json")
     asg = json.load(open(ap)) if os.path.exists(ap) else dict(history=[])
     last = {}
     for h in asg["history"]:
         last[h["part"]] = h
     prob, rows, parts = [], [], {}
     for k in range(N_PARTS):
-        pd = part_dir(a.run_root, k)
+        pd = part_dir(rr, k)
         ap_ = os.path.join(pd, "assignment.json")
         local = pc.load_json(ap_) if os.path.exists(ap_) else None
         h = last.get(k)
@@ -838,11 +887,11 @@ def merge(a):
                                   ("part", "host", "uuid", "n")} != \
                 {x: h.get(x) for x in ("part", "host", "uuid", "n")}:
             prob.append(f"part {k}: назначение ≠ последнему у координатора")
-        rep = part_problems(plan, k36, a.run_root, k, C)
-        parts[str(k)] = {x: rep.get(x) for x in ("n", "spent", "crashes",
-                                                 "rejected", "ok")}
-        prob += [f"part {k}: {x}" for x in rep["problems"]]
-        if rep["ok"]:
+        rep_ = part_problems(plan, k36, rr, k, C)
+        parts[str(k)] = {x: rep_.get(x) for x in ("n", "spent", "crashes",
+                                                  "rejected", "ok")}
+        prob += [f"part {k}: {x}" for x in rep_["problems"]]
+        if rep_["ok"]:
             install(pd)
             for w in part_wants(plan, k36, k):
                 rec, z = kh.load_ep(w)
@@ -855,26 +904,43 @@ def merge(a):
                                  success=bool(rec["summary"]["success"]),
                                  phys=rec["phys"], calls=int(len(z["j_ep"])),
                                  active=act))
+    prob += rows_problems(rows, plan)
+    return prob, rows, parts
+
+
+def rows_problems(rows, plan):
+    """Точное множество eid плана, без дублей; каждая сцена — все 6."""
+    p = []
     eids = [r["eid"] for r in rows]
     want = [e for k in range(N_PARTS) for e in plan["parts"][str(k)]["eids"]]
-    if len(set(eids)) != len(eids) or set(eids) != set(want) or \
-            len(want) != 2880:
-        prob.append(f"набор eid: {len(set(eids))} уникальных из "
-                    f"{len(want)}")
+    n_want = 6 * len(plan["scenes"])
+    if len(want) != n_want or len(set(want)) != n_want:
+        p.append(f"план: eid {len(set(want))} из {n_want}")
+    if len(eids) != len(set(eids)):
+        p.append(f"дубли eid: {len(eids) - len(set(eids))}")
+    if set(eids) != set(want):
+        p.append(f"набор eid ≠ плану ({len(set(eids))} из {len(set(want))})")
     by = {}
     for r in rows:
-        by.setdefault((r["task"], r["case_id"]), set()).add(
+        by.setdefault((r["task"], r["case_id"]), []).append(
             (r["seed"], r["policy"]))
-    full = {(s, p_) for s in SEEDS for p_ in POLICIES}
-    nb = sum(1 for v in by.values() if v != full)
+    full = sorted((s_, p_) for s_ in SEEDS for p_ in POLICIES)
+    nb = sum(1 for v in by.values() if sorted(v) != full)
     if nb or len(by) != len(plan["scenes"]):
-        prob.append(f"сцен с неполным набором {nb}; сцен {len(by)}")
+        p.append(f"сцен с неполным/дублированным набором {nb}; сцен "
+                 f"{len(by)}")
+    return p
+
+
+def merge(a):
+    plan, k36 = load_plan(a.run_root)
+    prob, rows, parts = build_merge(a.run_root, plan, k36)
     out = dict(plan_sha256=plan["sha256"], ok=not prob, problems=prob[:100],
                parts=parts, rows=rows if not prob else [],
                time=time.strftime("%Y-%m-%dT%H:%M:%S"))
     pc.save_json(os.path.join(a.run_root, "merged.json"), out)
-    print("  merge: " + ("полный набор 2880, проверка пройдена" if not prob
-                          else "ОТКАЗ: " + "; ".join(prob[:4])))
+    print("  merge: " + (f"полный набор {len(rows)}, проверка пройдена"
+                         if not prob else "ОТКАЗ: " + "; ".join(prob[:4])))
     return OK if not prob else TECH
 
 
@@ -883,8 +949,11 @@ def scene_table(rows, scenes):
     ix = {(sc["task"], sc["case_id"]): i for i, sc in enumerate(scenes)}
     Y = {p_: np.full((len(scenes), len(SEEDS)), -1, int) for p_ in POLICIES}
     for r in rows:
-        Y[r["policy"]][ix[(r["task"], r["case_id"])], r["seed"]] = \
-            int(r["success"])
+        cell = (ix[(r["task"], r["case_id"])], r["seed"])
+        if Y[r["policy"]][cell] != -1:
+            raise SystemExit(f"дубль исхода {r['policy']} {r['case_id']} "
+                             f"s{r['seed']}")
+        Y[r["policy"]][cell] = int(r["success"])
     if any((v < 0).any() for v in Y.values()):
         raise SystemExit("таблица исходов неполна")
     return Y, np.array([sc["task"] for sc in scenes])
@@ -917,14 +986,22 @@ def contrast_stats(Y, task, contrasts, n_boot=BOOT["n"], seed=BOOT["seed"]):
 
 
 def analyze(a):
-    plan, _k = load_plan(a.run_root)
+    plan, k36 = load_plan(a.run_root)
     mp = os.path.join(a.run_root, "merged.json")
     if not os.path.exists(mp):
         raise SystemExit("нет merged.json — сначала merge")
     m = pc.load_json(mp)
     if m.get("ok") is not True or m.get("plan_sha256") != plan["sha256"]:
         raise SystemExit("merge не пройден или от другого плана")
-    Y, task = scene_table(m["rows"], plan["scenes"])
+    prob, rows, _parts = build_merge(a.run_root, plan, k36)   # заново
+    if prob:
+        raise SystemExit("проверка частей при анализе: " + "; ".join(
+            prob[:3]))
+    key = lambda r: r["eid"]  # noqa: E731
+    if sorted(rows, key=key) != sorted(m["rows"], key=key):
+        raise SystemExit("merged.json ≠ проверенным записям частей")
+    Y, task = scene_table(rows, plan["scenes"])
+    m = dict(m, rows=rows)
     st = contrast_stats(Y, task, [("T2", "T1"), ("T2", "T2P"),
                                   ("T2P", "T1")])
     h1 = st["T2-T1"]["lo"] > 0
@@ -977,12 +1054,14 @@ def selftest():
     # канонический хеш не зависит от порядка ключей
     assert canon_sha(dict(a=1, b=[1, 2])) == canon_sha(dict(b=[1, 2], a=1))
     # nvidia-smi: N/A и не число — отказ; мало памяти — Busy
-    ok_line = "1, GPU-abc, 32510, 13213, 19297, 93, Tesla V100"
+    ok_line = ("1, GPU-abc, 00000000:3B:00.0, 32510, 13213, 19297, 93, "
+               "Tesla V100")
     g = gpu_query(1, lambda c: ok_line)
     assert g["free"] == 19297 and g["uuid"] == "GPU-abc"
-    for bad in ("1, GPU-abc, 32510, N/A, 19297, 93, V100",
+    for bad in ("1, GPU-abc, 00000000:3B:00.0, 32510, N/A, 19297, 93, V100",
                 "1, GPU-abc, 32510",
-                "0, GPU-abc, 32510, 1, 19297, 93, V100"):
+                "0, GPU-abc, 00000000:3B:00.0, 32510, 1, 19297, 93, V100",
+                "1, GPU-abc, [N/A], 32510, 1, 19297, 93, V100"):
         try:
             gpu_query(1, lambda c, b=bad: b)
             raise AssertionError(bad)
@@ -999,6 +1078,17 @@ def selftest():
         raise AssertionError("мало диска прошло")
     except Busy:
         pass
+    # привязка к карте до загрузки моделей
+    P = lambda **k: type("P", (), k)()  # noqa: E731
+    assert bind_device(None, 1, g, P(uuid="abc")) == "uuid"
+    assert bind_device(None, 1, g, P(pci_bus_id=0x3B, pci_device_id=0,
+                                     pci_domain_id=0)) == "pci"
+    for bad_p in (P(uuid="zzz"), P(pci_bus_id=0x3C, pci_device_id=0), P()):
+        try:
+            bind_device(None, 1, g, bad_p)
+            raise AssertionError("привязка к чужой/непроверяемой карте")
+        except SystemExit:
+            pass
     # блокировки: вторая на тот же файл — отказ
     with tempfile.TemporaryDirectory() as td:
         l1 = Lock(os.path.join(td, "g.lock"), "карта", Busy)
@@ -1100,15 +1190,18 @@ def e2e_selftest():
         plan["parts"][k]["eids"] = [w["eid"] for w in
                                     part_wants(plan, k36, int(k))]
     src = dict(mod=mod, dec=dec, M=M, io=io, actors=dict(T=actor))
-    ok_line = "{i}, GPU-{u}, 32510, 0, 32510, 0, Tesla V100"
+    ok_line = "{i}, GPU-{u}, 00000000:3B:00.0, 32510, 0, 32510, 0, Tesla V100"
     keep = {k: g_[k] for k in ("load_plan", "env_versions", "N_PARTS",
-                               "dev_scenes")}
+                               "dev_scenes", "_DISK_USAGE", "make_plan",
+                               "RUNS")}
     keep_kh = dict(OUT=kh.OUT, REJECTED=kh.REJECTED, SS=dict(kh.STAGE_SCOPE))
     with tempfile.TemporaryDirectory() as td:
         os.environ["K37_LOCK_DIR"] = os.path.join(td, "locks")
         try:
             g_.update(load_plan=lambda rr, verify=True: (dict(plan), k36),
-                      env_versions=lambda: dict(torch="x"), N_PARTS=2)
+                      env_versions=lambda: dict(torch="x"), N_PARTS=2,
+                      _DISK_USAGE=lambda p: type("U", (), dict(
+                          free=100 * 2 ** 30))())
             rr = os.path.join(td, "run")
             os.makedirs(rr)
             host = socket.gethostname()
@@ -1129,10 +1222,28 @@ def e2e_selftest():
             assert r1["admitted"] and r1["n_episodes"] == 22 and \
                 r1["compare"]["identical_trajectories"] == \
                 r1["compare"]["n"] == 22
-            # назначения и сбор двух частей на «карте» u0
-            for k in (0, 1):
-                assign(NS(run_root=rr, part=k, host=host, uuid="GPU-u0",
-                          state="assigned"))
+            # prepare: повтор — только при целом plan.sha256
+            g_.update(make_plan=lambda rid: dict(run_id=rid, scenes=[],
+                                                 parts={}),
+                      RUNS=os.path.join(td, "runs"))
+            assert prepare(NS(run_id="p")) == OK == prepare(NS(run_id="p"))
+            os.remove(os.path.join(td, "runs", "p", "plan.sha256"))
+            try:
+                prepare(NS(run_id="p"))
+                raise AssertionError("повтор без plan.sha256 прошёл")
+            except SystemExit:
+                pass
+            # назначения: параллельные assign не теряют записи
+            import threading
+            ths = [threading.Thread(target=assign, args=(NS(
+                run_root=rr, part=k, host=host, uuid="GPU-u0",
+                state="assigned"),)) for k in (0, 1)]
+            for th in ths:
+                th.start()
+            for th in ths:
+                th.join()
+            hist = json.load(open(os.path.join(rr, "assignments.json")))
+            assert sorted(h["part"] for h in hist["history"]) == [0, 1]
             g_["dev_index"] = lambda d: 0
             gr = lambda c: ok_line.format(i=0, u="u0")  # noqa: E731
 
@@ -1176,20 +1287,34 @@ def e2e_selftest():
             assert e_last in d1["done"] and not d1["pending"] and \
                 not d1["crashes"]
             # слияние полного набора игрушки (2 части)
-            ok_m = merge_toy(rr, plan, k36)
-            assert ok_m["ok"], ok_m["problems"][:3]
+            pr_m, rows_m, _pp = build_merge(rr, plan, k36)
+            assert not pr_m and len(rows_m) == 36, pr_m[:3]
+            # противоречащий дубль исхода -> отказ и в слиянии, и в таблице
+            dup = rows_m + [dict(rows_m[0], success=not rows_m[0]["success"])]
+            assert rows_problems(dup, plan)
+            try:
+                scene_table(dup, plan["scenes"])
+                raise AssertionError("дубль принят таблицей")
+            except SystemExit:
+                pass
+            # назначение подменено локально -> отказ
+            ap0 = os.path.join(part_dir(rr, 0), "assignment.json")
+            a0 = pc.load_json(ap0)
+            pc.save_json(ap0, dict(a0, n=99))
+            assert build_merge(rr, plan, k36)[0]
+            pc.save_json(ap0, a0)
             # пропуск: удалить файл эпизода -> отказ
             w0 = part_wants(plan, k36, 0)[4]
             install(part_dir(rr, 0))
             jp, np_ = kh.ep_paths(w0["stage"], w0["label"], w0["task"],
                                   w0["key"])
             os.replace(np_, np_ + ".bak")
-            assert not merge_toy(rr, plan, k36)["ok"]
+            assert build_merge(rr, plan, k36)[0]
             os.replace(np_ + ".bak", np_)
             # чужая головка: подмена хеша головки в плане -> отказ
             bad = json.loads(json.dumps(plan))
             bad["heads"]["T2"]["0"]["head_hash"] = "другая"
-            assert not merge_toy(rr, bad, k36)["ok"]
+            assert build_merge(rr, bad, k36)[0]
             # вторая очередь на ту же карту при занятой блокировке
             lk = Lock(os.path.join(lock_dir(), "GPU-u0.lock"), "карта", Busy)
             try:
@@ -1199,8 +1324,8 @@ def e2e_selftest():
                 pass
             lk.release()
             # анализ на игрушечном полном наборе
-            m = merge_toy(rr, plan, k36)
-            Y, task = scene_table(m["rows"], plan["scenes"])
+            _pr, rows_m, _pp = build_merge(rr, plan, k36)
+            Y, task = scene_table(rows_m, plan["scenes"])
             st = contrast_stats(Y, task, [("T2", "T1"), ("T2", "T2P")],
                                 n_boot=200)
             assert set(st) == {"T2-T1", "T2-T2P"}
@@ -1212,26 +1337,6 @@ def e2e_selftest():
             kh.STAGE_SCOPE.clear()
             kh.STAGE_SCOPE.update(keep_kh["SS"])
             os.environ.pop("K37_LOCK_DIR", None)
-
-
-def merge_toy(rr, plan, k36):
-    """Слияние без координатора назначений и без требования 2880 (игрушка):
-    проверка частей и полноты сцен."""
-    C = kh.consts(k36)
-    prob, rows = [], []
-    for k in range(N_PARTS):
-        rep = part_problems(plan, k36, rr, k, C)
-        prob += rep["problems"]
-        if rep["ok"]:
-            install(part_dir(rr, k))
-            for w in part_wants(plan, k36, k):
-                rec, z = kh.load_ep(w)
-                rows.append(dict(task=w["task"], case_id=w["case_id"],
-                                 seed=w["seed"],
-                                 policy=dict(T="T1").get(w["kind"],
-                                                         w["kind"]),
-                                 success=bool(rec["summary"]["success"])))
-    return dict(ok=not prob, problems=prob, rows=rows)
 
 
 _dev_index_orig = dev_index

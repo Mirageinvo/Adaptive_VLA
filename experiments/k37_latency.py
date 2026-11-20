@@ -202,21 +202,20 @@ def run(a):
         if g2["used"] > GPU_MAX_MB:
             raise kcf.Busy(f"{a.device}: занято {g2['used']} МиБ перед "
                            f"загрузкой")
+        bind = kcf.bind_device(torch, idx, g2)      # до загрузки моделей
         H = kcf.load_heads(torch, plan)
         dev = torch.device(a.device)
         res = dict(plan_sha256=plan["sha256"], batch=1, warm=WARM,
                    block=BLOCK, repeats=REPEATS, queue=queue_ids(),
                    queue_sha1=queue_sha(), gpu=g2,
                    node_gpus_before=node_gpus(), loadavg=os.getloadavg(),
-                   versions=kcf.env_versions(),
+                   versions=kcf.env_versions(), device_binding=bind,
                    boundary="сырое CPU-наблюдение -> io.prep -> T32 (+ "
                             "головка) -> CPU float32 чанк -> io.scale",
                    time=time.strftime("%Y-%m-%dT%H:%M:%S"))
         raw = {}
         for s in kcf.SEEDS:
             v = kh.load_source(torch, s, a.device)
-            res.setdefault("torch_uuid", kcf.verify_torch_uuid(
-                torch, idx, g["uuid"]))
             arms = kcf.make_arms(torch, k36, s, v, H)
             raw[s] = measure(torch, dev, queue,
                              {p_: (v["io"], arms[p_])
