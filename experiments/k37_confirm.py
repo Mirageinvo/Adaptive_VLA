@@ -186,18 +186,19 @@ def heads_info(torch, p37):
                 if kh.load_ep(w2) is None:
                     raise SystemExit(f"пилот: нет эпизода {w2['eid']} с "
                                      f"головкой T2 s{s}")
+            out["T2"][str(s)] = dict(path=kpl.head_path(s), head_hash=hh,
+                                     sha256=sha256(kpl.head_path(s)))
+            r = pc.load_json(kc.report_path(s))
+            if r.get("ok") is not True or r.get("seed") != s or \
+                    r.get("prepare_sha1") != p37["sha1"] or \
+                    sha256(kc.head_path(s)) != r.get("head_sha256"):
+                raise SystemExit(f"контрольная головка s{s} не прошла "
+                                 f"проверку")
+            out["T2P"][str(s)] = dict(path=kc.head_path(s),
+                                      head_hash=r["head_hash"],
+                                      sha256=r["head_sha256"])
     finally:
         kh.OUT, kh.REJECTED = keep["OUT"], keep["REJECTED"]
-        out["T2"][str(s)] = dict(path=kpl.head_path(s), head_hash=hh,
-                                 sha256=sha256(kpl.head_path(s)))
-        r = pc.load_json(kc.report_path(s))
-        if r.get("ok") is not True or r.get("seed") != s or \
-                r.get("prepare_sha1") != p37["sha1"] or \
-                sha256(kc.head_path(s)) != r.get("head_sha256"):
-            raise SystemExit(f"контрольная головка s{s} не прошла проверку")
-        out["T2P"][str(s)] = dict(path=kc.head_path(s),
-                                  head_hash=r["head_hash"],
-                                  sha256=r["head_sha256"])
     return out
 
 
@@ -1081,6 +1082,33 @@ def selftest():
         raise AssertionError("мало диска прошло")
     except Busy:
         pass
+    # heads_info: оба сида в плане; пропавший/чужой эпизод пилота — отказ
+    stub = dict(lp=pc.load_prepare, lh=kpl.load_head, wa=kpl.wants,
+                le=kh.load_ep, lj=pc.load_json, sh=globals()["sha256"])
+    try:
+        pc.load_prepare = lambda: {}
+        kpl.load_head = lambda t, p, s: (None, f"h{s}")
+        kpl.wants = lambda p, k, s, d, hh: (None, dict(eid=f"{s}/{d}"), None)
+        globals()["sha256"] = lambda p: "S"
+        pc.load_json = lambda p: dict(ok=True, seed=int(p[-6]),
+                                      prepare_sha1="P", head_sha256="S",
+                                      head_hash="hp")
+        kh.load_ep = lambda w: ("rec", "z")
+        hi = heads_info(None, dict(sha1="P", dev=[0, 1]))
+        assert sorted(hi["T2"]) == sorted(hi["T2P"]) == ["0", "1"]
+        assert hi["T2"]["0"]["head_hash"] == "h0" != hi["T2"]["1"][
+            "head_hash"]
+        kh.load_ep = lambda w: None if w["eid"] == "1/1" else ("rec", "z")
+        try:
+            heads_info(None, dict(sha1="P", dev=[0, 1]))
+            raise AssertionError("пропавший эпизод пилота принят")
+        except SystemExit:
+            pass
+    finally:
+        pc.load_prepare, kpl.load_head, kpl.wants = stub["lp"], stub["lh"], \
+            stub["wa"]
+        kh.load_ep, pc.load_json = stub["le"], stub["lj"]
+        globals()["sha256"] = stub["sh"]
     # привязка к карте до загрузки моделей
     P = lambda **k: type("P", (), k)()  # noqa: E731
     assert bind_device(None, 1, g, P(uuid="abc")) == "uuid"
