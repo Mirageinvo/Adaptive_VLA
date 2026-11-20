@@ -408,7 +408,16 @@ class Lock:
 def env_versions():
     import torch
     import k33_protocol as p33
-    v = dict(p33.versions(), torch=torch.__version__,
+    repo = {}
+    for i, d in enumerate(x for x in os.environ.get("PYTHONPATH", "")
+                          .split(os.pathsep) if x):
+        try:
+            repo[f"pythonpath{i}"] = subprocess.check_output(
+                ["git", "-C", d, "rev-parse", "HEAD"], text=True,
+                stderr=subprocess.DEVNULL, timeout=30).strip()
+        except Exception as e:                               # noqa: BLE001
+            repo[f"pythonpath{i}"] = f"нет: {type(e).__name__}"
+    v = dict(p33.versions(), repos=repo, torch=torch.__version__,
              cuda=torch.version.cuda,
              cudnn=str(torch.backends.cudnn.version()),
              python=sys.version.split()[0],
