@@ -304,6 +304,11 @@ def selftest():
 def main():
     if "--selftest" in sys.argv:
         return selftest()
+    if len(sys.argv) > 1 and sys.argv[1] in (
+            "prepare", "gpuinfo", "assign", "preflight", "collect",
+            "status", "merge", "analyze"):
+        import k38_grip_run as kgr
+        return kgr.main(sys.argv[1:])
     ap = argparse.ArgumentParser(description="K-38: схват")
     ap.add_argument("cmd", choices=("audit",))
     ap.add_argument("--archive", default="reports/k37c/runs/c2")
