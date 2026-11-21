@@ -50,7 +50,7 @@ def episode_event(J, A, max_steps=kg.MAX_STEPS):
             continue
         n_calls += 1
         if first is None:
-            first = dict(call=i, elapsed=el, tau=int(tau), k=k,
+            first = dict(call=i + 1, elapsed=el, tau=int(tau), k=k,
                          early=bool(tau - 2 < k), late=bool(tau < k))
     return first, n_calls
 
@@ -115,7 +115,6 @@ def summarize(rows):
 
 
 def audit(a):
-    import k31_collect as kcol
     import k36_harness as kh
     import k36_protocol as pc
     import k37_confirm as kcf
@@ -125,8 +124,21 @@ def audit(a):
     rows, prob = [], []
     for k in range(kcf.N_PARTS):
         pd = kcf.part_dir(rr, k)
+        lp = os.path.join(pd, "ledger.json")
+        try:
+            ledger = pc.load_json(lp)
+        except (OSError, ValueError) as exc:
+            prob.append(f"part {k}: журнал не читается ({exc})")
+            continue
+        if (not isinstance(ledger, dict) or
+                ledger.get("caps") != kcf.CAP_PART or
+                not isinstance(ledger.get("done"), dict)):
+            prob.append(f"part {k}: неверный журнал или лимиты")
+            continue
+        if ledger.get("pending") is not None:
+            prob.append(f"part {k}: открыт резерв {ledger['pending']}")
+            continue
         kcf.install(pd)
-        L = kcol.Ledger(os.path.join(pd, "ledger.json"), kcf.CAP_PART)
         for w in kcf.part_wants(plan, k36, k):
             if w["kind"] != "T":
                 continue
@@ -136,9 +148,10 @@ def audit(a):
                 continue
             rec, z = got
             pr = kh.episode_problems(rec, z, w, C)
-            dn = L.d["done"].get(w["eid"])
-            if not dn or dn["scope"] != "confirm" or \
-                    int(dn["actual"]) != int(rec["phys"]):
+            dn = ledger["done"].get(w["eid"])
+            if (not isinstance(dn, dict) or dn.get("scope") != "confirm" or
+                    type(dn.get("actual")) is not int or
+                    dn["actual"] != rec["phys"]):
                 pr.append(f"журнал части {dn} ≠ записи ({rec['phys']})")
             if pr:
                 prob += [f"{w['eid']}: {x}" for x in pr[:3]]
@@ -151,17 +164,28 @@ def audit(a):
                              steps=int(rec["summary"]["steps"]),
                              ev=ev, n_calls=nc,
                              lost=boundary_lost(z["actions"])))
-    if len(rows) != N_EXPECTED or prob:
+    if len(rows) != N_EXPECTED:
         prob.append(f"записей T1 {len(rows)} из {N_EXPECTED}")
+    if len({r["eid"] for r in rows}) != len(rows):
+        prob.append("повторный eid T1 в архиве")
     mp = os.path.join(rr, "merged.json")
     m_succ = None
     if os.path.exists(mp):
-        m = pc.load_json(mp)
-        m_succ = sum(1 for r in m.get("rows", []) if r["policy"] == "T1" and
-                     r["success"])
-        if m_succ != sum(r["success"] for r in rows):
-            prob.append(f"успехов T1 в merged.json {m_succ} ≠ по файлам "
-                        f"{sum(r['success'] for r in rows)}")
+        try:
+            m = pc.load_json(mp)
+            merged_t1 = [(r["eid"], r["success"]) for r in m["rows"]
+                         if r["policy"] == "T1"]
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            prob.append(f"merged.json не читается ({exc})")
+        else:
+            raw_t1 = [(r["eid"], r["success"]) for r in rows]
+            m_succ = sum(ok is True for _, ok in merged_t1)
+            if m.get("ok") is not True or m.get("plan_sha256") != plan["sha256"]:
+                prob.append("merged.json: незавершённое слияние или другой план")
+            if (any(not isinstance(eid, str) or type(ok) is not bool
+                    for eid, ok in merged_t1) or
+                    sorted(merged_t1) != sorted(raw_t1)):
+                prob.append("merged.json: исходы T1 по eid ≠ записям эпизодов")
     rep = summarize(rows) if rows else dict(status="technical_stop")
     if prob:
         rep["status"] = "technical_stop"
@@ -185,8 +209,8 @@ def audit(a):
               f"{x['reached_fail']}, успехов {x['reached_success']}); "
               f"U = {100 * rep['U'][kind]:.2f} п.п. (нужно ≥ {NEED} неудач)")
     print(f"  обрыв до первой изменённой команды: early "
-          f"{A['cut_before_early']}, late {A['cut_before_late']}; потеряно "
-          f"границей чанка {A['boundary_lost']} (из них неудач "
+          f"{A['cut_before_early']}, late {A['cut_before_late']}; только "
+          f"переходы у границ чанков {A['boundary_lost']} (из них неудач "
           f"{A['boundary_lost_fail']}); без перехода {A['no_transition']}")
     for nm in ("by_task", "by_seed"):
         print(f"  {nm}: " + "; ".join(
@@ -214,7 +238,7 @@ def selftest():
     A = np.concatenate([np.c_[np.zeros((k, 6)), -s[:k, 6]]
                         for s, k in zip(seq, ks)])
     ev, nc = episode_event(J, A)
-    assert ev == dict(call=1, elapsed=8, tau=4, k=8, early=True, late=True)
+    assert ev == dict(call=2, elapsed=8, tau=4, k=8, early=True, late=True)
     assert nc == 1
 
     class Base:
@@ -237,7 +261,7 @@ def selftest():
     for j, k in enumerate(ks):
         arm.decide(None, 0, None, 8 * j)
         arm.executed(k)
-    assert arm.event["tau"] == ev["tau"] and \
+    assert arm.event["call"] == ev["call"] and arm.event["tau"] == ev["tau"] and \
         arm.event["elapsed"] == ev["elapsed"]
     # обрыв: событие на вызове, где k ≤ tau−2 — ни один сдвиг не исполнен
     J2 = dict(J, k=np.array([8, 2, 3]))
