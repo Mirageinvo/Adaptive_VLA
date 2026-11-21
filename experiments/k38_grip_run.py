@@ -224,22 +224,22 @@ def prefix_problems(z, rec, ref, ev):
     J1 = {k[2:]: v for k, v in rz.items() if k.startswith("j_")}
     _e, ev1 = replay_expected(J1, "zero")
     P = len(A) if ev is None else ev["elapsed"] + ev["first"]
-    if ev is not None:
-        if ev1 is None or (ev1["call"], ev1["tau"]) != (ev["call"],
-                                                         ev["tau"]):
-            p.append("событие ≠ событию архивного T1")
-        else:
-            Jn = {k[2:]: v for k, v in z.items() if k.startswith("j_")}
-            c = ev["call"] - 1
-            if not np.array_equal(Jn["a_codec"][c], J1["a_codec"][c]):
-                p.append("предложение на вызове события ≠ архиву")
-    m = min(P, len(A), len(A1))
+    reached = ev is not None and ev["first"] < ev["k"]
+    if (ev is None) != (ev1 is None) or (ev is not None and
+            any(ev[k] != ev1[k] for k in ("call", "elapsed", "tau"))):
+        p.append("событие ≠ событию архивного T1")
+    elif ev is not None:
+        c = ev["call"] - 1
+        if not np.array_equal(z["j_a_codec"][c], J1["a_codec"][c]):
+            p.append("предложение на вызове события ≠ архиву")
+        if reached != (ev["first"] < ev1["k"]):
+            p.append("достижение первой изменённой команды ≠ архиву")
+    m = min(P, len(A))
     if not np.array_equal(A[:m], A1[:m]):
         p.append("общий префикс ≠ архивному T1")
-    if P >= len(A):                       # сдвиг не исполнен
-        if len(A) != len(A1) or not np.array_equal(A, A1) or \
-                rec["summary"]["success"] != rr["summary"]["success"]:
-            p.append("сдвиг не исполнен, но эпизод ≠ T1")
+    if not reached and (not np.array_equal(A, A1) or
+                         rec["summary"] != rr["summary"]):
+        p.append("сдвиг не исполнен, но эпизод ≠ T1")
     return p
 
 
@@ -305,7 +305,10 @@ def archive_ep(c2rr, c2, k36, case_part, s, sc, C):
     pr = kh.episode_problems(*got, w, C)
     led = pc.load_json(os.path.join(pd, "ledger.json"))
     dn = led["done"].get(w["eid"])
-    if pr or not dn or dn["actual"] != got[0]["phys"] or led["pending"]:
+    if (pr or led.get("caps") != kcf.CAP_PART or
+            led.get("pending") is not None or not isinstance(dn, dict) or
+            dn.get("scope") != w["scope"] or type(dn.get("actual")) is not int or
+            dn["actual"] != got[0]["phys"]):
         raise SystemExit(f"архив {w['eid']}: {pr[:2]} / журнал {dn}")
     jp, np_ = kh.ep_paths("confirm", f"T32_s{s}", sc["task"],
                           sc["case_id"])
@@ -337,14 +340,16 @@ def make_plan(run_id, c2rr):
             if not os.path.exists(dst):
                 shutil.copyfile(src, dst + ".tmp")
                 os.replace(dst + ".tmp", dst)
-        refs[f"{s}|{sc['case_id']}"] = dict(
-            json=rel_j, npz=rel_n, json_sha256=sha256(os.path.join(rr, rel_j)),
+        ref = dict(
+            eid=got[0]["eid"], json=rel_j, npz=rel_n,
+            json_sha256=sha256(os.path.join(rr, rel_j)),
             npz_sha256=sha256(os.path.join(rr, rel_n)),
             src_json_sha256=sha256(jp), src_npz_sha256=sha256(np_),
             success=bool(got[0]["summary"]["success"]), tag=tag)
-        if refs[f"{s}|{sc['case_id']}"]["json_sha256"] != \
-                refs[f"{s}|{sc['case_id']}"]["src_json_sha256"]:
-            raise SystemExit(f"копия {rel_j} ≠ источнику")
+        for typ in ("json", "npz"):
+            if ref[f"{typ}_sha256"] != ref[f"src_{typ}_sha256"]:
+                raise SystemExit(f"копия {ref[typ]} ≠ источнику")
+        refs[f"{s}|{sc['case_id']}"] = ref
         return got
     for sc in sel:
         for s in SEEDS:
@@ -564,13 +569,14 @@ def make_arm(torch, k36, s, v, kind):
     return kg.GripArm(kh.make_arm(torch, k36, f"T32_s{s}", v), kind)
 
 
-def run_one(w, L, sim, io, arm, val, allowed, disk_path, woe, saver):
+def run_one(w, L, sim, io, arm, val, allowed, disk_path, woe, saver, *,
+            reference_eid):
     import k36b_gate as kgt
     if kh.load_ep(w) is None and not L.is_done(w["eid"]):
         kcf.check_disk(disk_path)
 
     def run_save():
-        arm.episode = kh.episode_number(w["eid"])
+        arm.episode = kh.episode_number(reference_eid)
         ep = kcol.run_episode(sim, io, arm, w["task"], w["reset_id"])
         return saver(w, ep)
     return kgt.transact(w, L, run_save, val, allowed, woe)
@@ -586,6 +592,18 @@ def zero_validator(C):
         return kh.episode_problems(dict(r, kind="T"), z, dict(w_, kind="T"),
                                    C)
     return val
+
+
+def record_validator(rr, plan, C):
+    check_zero = zero_validator(C)
+
+    def validate(rec, z, w):
+        if w["kind"] == "Gzero":
+            return check_zero(rec, z, w)
+        ref = load_ref(rr, plan, w["seed"], w)
+        return g_problems(rec, z, w, C, ref)
+
+    return validate
 
 
 def zero_saver(w, ep):
@@ -616,6 +634,7 @@ def preflight(a, sim=None, src_loader=None, gpu_runner=None,
         install(d)
         C = kh.consts(k36)
         L = kcol.Ledger(os.path.join(d, "ledger.json"), CAP_PF)
+        val = record_validator(rr, plan, C)
         sim = sim or kb36.BankSim("bank", 2, bank_dir=plan["c2"]["bank"]
                                   ["dir"])
         jobs = [(x["seed"], x["scene"], "zero") for x in plan["pf_zero"]]
@@ -641,19 +660,14 @@ def preflight(a, sim=None, src_loader=None, gpu_runner=None,
                 for _s, sc, kind in js:
                     w = g_want(plan["sha256"], k36, "pfzero" if kind ==
                                "zero" else "pfsmoke", kind, s, sc)
-                    ref = load_ref(rr, plan, s, sc)
-                    if kind == "zero":
-                        val = zero_validator(C)
-                        sv = zero_saver
-                    else:
-                        val = (lambda r, z, w_, ref=ref: g_problems(
-                            r, z, w_, C, ref))
-                        sv = save_g
+                    sv = zero_saver if kind == "zero" else save_g
+                    base_eid = plan["refs"][f"{s}|{sc['case_id']}"]["eid"]
                     got = run_one(w, L, sim, v["io"], make_arm(
                         torch, k36, s, v, kind), val,
-                        [("checks", "checks/")], d, W.__getitem__, sv)
+                        [("checks", "checks/")], d, W.__getitem__, sv,
+                        reference_eid=base_eid)
                     if kind == "zero":
-                        pr = kh.compare_eps(ref, got)
+                        pr = kh.compare_eps(load_ref(rr, plan, s, sc), got)
                         prob += [f"нулевой сдвиг {sc['case_id']} s{s}: {x}"
                                  for x in pr]
                     else:
@@ -742,6 +756,7 @@ def collect(a, sim=None, src_loader=None, gpu_runner=None, torch_check=True):
         install(pd)
         C = kh.consts(k36)
         L = kcol.Ledger(os.path.join(pd, "ledger.json"), CAP_PART)
+        val = record_validator(rr, plan, C)
         PW = part_wants(plan, k36, k)
         W = {w["eid"]: w for _s, _sc, _k, w in PW}
         sim = sim or kb36.BankSim("bank", 2,
@@ -757,12 +772,10 @@ def collect(a, sim=None, src_loader=None, gpu_runner=None, torch_check=True):
                 for s_, sc, kind, w in PW:
                     if s_ != s:
                         continue
-                    ref = load_ref(rr, plan, s, sc)
-                    run_one(w, L, sim, v["io"], arms[kind],
-                            lambda r, z, w_, ref=ref: g_problems(
-                                r, z, w_, C, ref),
-                            [("screen", "screen/")], pd, W.__getitem__,
-                            save_g)
+                    base_eid = plan["refs"][f"{s}|{sc['case_id']}"]["eid"]
+                    run_one(w, L, sim, v["io"], arms[kind], val,
+                            [("screen", "screen/")], pd, W.__getitem__, save_g,
+                            reference_eid=base_eid)
                     n = sum(1 for e in W if L.is_done(e))
                     if n % 10 == 0:
                         print(f"  part {k}: {n}/{len(W)}; расход "
@@ -904,6 +917,8 @@ def merge(a):
 def contrasts(table, n_boot=BOOT["n"], seed=BOOT["seed"]):
     """table: [dict(task, case_id, seed, T1, early, late)] -> статистика."""
     scenes = sorted({(r["task"], r["case_id"]) for r in table})
+    if {t for t, _ in scenes} != set(TASKS):
+        raise SystemExit("таблица исходов: набор задач ≠ плану")
     ix = {sc: i for i, sc in enumerate(scenes)}
     Y = {p_: np.full((len(scenes), len(SEEDS)), -1, int)
          for p_ in ("T1",) + KINDS}
@@ -1056,6 +1071,13 @@ def selftest():
     assert prefix_problems(z2, dict(summary=dict(success=True)), ref2,
                            ev2) == []
     assert prefix_problems(z2, dict(summary=dict(success=False)), ref2, ev2)
+    assert prefix_problems(z2, dict(summary=dict(success=True)), ref2, None)
+    J3 = dict(J2, k=np.array([8, 3]))
+    exp3, ev3 = replay_expected(J3, "early")
+    A3 = np.concatenate([kp.scale_exec(exp3[i][None], q)[0][:J3["k"][i]]
+                         for i in range(2)])
+    z3 = dict(actions=A3, **{f"j_{k}": v for k, v in J3.items()})
+    assert prefix_problems(z3, dict(summary=dict(success=True)), ref2, ev3)
     # анализ и правило
     tab = []
     rng = np.random.default_rng(0)
@@ -1137,7 +1159,8 @@ def e2e_selftest():
     src = dict(mod=mod, dec=dec, M=M, io=io, actors=dict(T=actor))
     sc_all = [dict(task=t, case_id=f"k33s2_t{t}_c{i:05d}", pos=i, hash=None,
                    rank=0, part=0) for t in TASKS for i in range(2)]
-    sel, pfz, smk = sc_all[:3], sc_all[3], sc_all[4]
+    sel = [sc_all[i] for i in (0, 2, 5)]  # по одной сцене каждой задачи
+    pfz, smk = sc_all[3], sc_all[4]
     keep = {k: g_[k] for k in ("load_plan", "N_PARTS", "env_record")}
     keep_kh = dict(OUT=kh.OUT, REJECTED=kh.REJECTED, SS=dict(kh.STAGE_SCOPE))
     with tempfile.TemporaryDirectory() as td:
@@ -1159,6 +1182,7 @@ def e2e_selftest():
                                    case_id=sc["case_id"])
                     arm = kg.GripArm(kh.make_arm(torch, k36, f"T32_s{s}",
                                                  src), "zero")
+                    arm.episode = kh.episode_number(w["eid"])
                     ep = kcol.run_episode(kppo.ToySim(), io, arm, w["task"],
                                           w["reset_id"])
                     kh.save_ep(w, ep)
@@ -1171,7 +1195,7 @@ def e2e_selftest():
                     shutil.copyfile(jp, os.path.join(rr, rel))
                     shutil.copyfile(np_, os.path.join(rr, rel[:-5] + ".npz"))
                     refs[f"{s}|{sc['case_id']}"] = dict(
-                        json=rel, npz=rel[:-5] + ".npz",
+                        eid=w["eid"], json=rel, npz=rel[:-5] + ".npz",
                         json_sha256=sha256(os.path.join(rr, rel)),
                         npz_sha256=sha256(os.path.join(rr, rel[:-5] +
                                                        ".npz")),
@@ -1218,8 +1242,14 @@ def e2e_selftest():
                                sim=kh._NoClose(kppo.ToySim()),
                                src_loader=lambda s: src, gpu_runner=gr,
                                torch_check=False) == OK
-                prob, rows = build_merge(rr, plan, k36)
-                assert not prob and len(rows) == 12, prob[:3]
+                assert merge(NS(run_root=rr)) == OK
+                merged = pc.load_json(os.path.join(rr, "merged.json"))
+                assert merged["ok"] and len(merged["rows"]) == 12
+                assert analyze(NS(run_root=rr)) == OK
+                report = pc.load_json(os.path.join(rr, "analysis.json"))
+                assert all(np.isfinite(v[key])
+                           for v in report["contrasts"].values()
+                           for key in ("delta", "lo", "hi"))
                 # подмена копии T1 — отказ проверки
                 e0 = refs[f"0|{sel[0]['case_id']}"]
                 fp = os.path.join(rr, e0["npz"])
@@ -1231,13 +1261,6 @@ def e2e_selftest():
                 except SystemExit:
                     pass
                 open(fp, "wb").write(b)
-                tab = {}
-                for r in rows:
-                    x = tab.setdefault((r["case_id"], r["seed"]), dict(
-                        task=r["task"], case_id=r["case_id"], seed=r["seed"],
-                        T1=r["t1_success"]))
-                    x[r["kind"]] = r["success"]
-                assert len(tab) == 6
             finally:
                 kcf.dev_index = kcf_dev
         finally:
