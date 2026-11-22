@@ -28,6 +28,8 @@ min(L(C1,Y), L(C2,Y)); L = SmoothL1(β 0.05) руки + 0.25·BCE схвата.
 Flat 207→106→28. Контроль числа ветвей: одна альтернатива (132→96→28)
 и селектор 207→32→2. Режимы входа селектора/flat: old/old, fresh/fresh,
 fresh RGB/old state, old RGB/fresh state (равные веса).
+Каждая сестра в энкодере, селекторе и flat имеет половину веса её пары.
+Генераторы и flat делят порог повышенного веса по номинальным gen train.
 Визуальные признаки стандартизуются по train генератора (o0 и o4), как
 и состояние; выход селектора стартует с нулей (равные вероятности).
 Сцены: gen — энкодер и генератор; sel — селектор; flat — gen + sel;
@@ -36,6 +38,7 @@ fresh RGB/old state, old RGB/fresh state (равные веса).
 """
 import argparse
 import hashlib
+import io
 import os
 import sys
 import time
@@ -91,19 +94,26 @@ def load_rows(torch, plan, shard, ok):
         if not ok(p, job):
             raise SystemExit(f"шард {job} отсутствует или не проверен")
         with np.load(p, allow_pickle=False) as z:
-            for i in range(len(z["t"])):
-                r = dict(kind="nom", seed=e["seed"], task=e["task"],
-                         case=e["case_id"], split=e["split"], eid=e["eid"],
-                         t=int(z["t"][i]), img0=prep_rgb(torch, z["rgb0"][i]),
-                         img4=prep_rgb(torch, z["rgb4"][i]),
-                         s0=z["s0"][i].astype(np.float64),
-                         s4=z["s4"][i].astype(np.float64),
-                         B=z["B"][i].astype(np.float32),
-                         Y=z["Y"][i][:4].astype(np.float32),
-                         h0=str(z["obs0_hash"][i]))
-                nom_idx[(e["eid"], r["t"])] = len(rows)
-                rows.append(r)
-                cnt["nom"] += 1
+            times = z["t"]
+            if not np.array_equal(times, e["windows"]):
+                raise SystemExit(f"шард {job}: окна ≠ data_plan")
+            if not len(times):
+                continue
+            data = {k: z[k] for k in ("rgb0", "rgb4", "s0", "s4", "B", "Y",
+                                      "obs0_hash")}
+        for i, t in enumerate(times):
+            r = dict(kind="nom", seed=e["seed"], task=e["task"],
+                     case=e["case_id"], split=e["split"], eid=e["eid"],
+                     t=int(t), img0=prep_rgb(torch, data["rgb0"][i]),
+                     img4=prep_rgb(torch, data["rgb4"][i]),
+                     s0=data["s0"][i].astype(np.float64),
+                     s4=data["s4"][i].astype(np.float64),
+                     B=data["B"][i].astype(np.float32),
+                     Y=data["Y"][i, :4].astype(np.float32),
+                     h0=str(data["obs0_hash"][i]))
+            nom_idx[(e["eid"], r["t"])] = len(rows)
+            rows.append(r)
+            cnt["nom"] += 1
     groups = {}
     for s in plan["sisters"]:
         if not s["missing"]:
@@ -118,16 +128,18 @@ def load_rows(torch, plan, shard, ok):
             if not ok(p, job):
                 raise SystemExit(f"шард {job} отсутствует или не проверен")
             with np.load(p, allow_pickle=False) as z:
-                sis.append(dict(sign=int(z["sign"]), t=int(z["t"]),
-                                B=z["B"].astype(np.float32),
-                                h0=str(z["obs0_hash"]),
-                                live=bool(z["has_y"]) and bool(z["has_o4"]),
-                                img4=prep_rgb(torch, z["rgb4"]),
-                                s4=z["s4"].astype(np.float64),
-                                Y=z["Y"][:4].astype(np.float32)))
+                x = dict(sign=int(z["sign"]), t=int(z["t"]),
+                         B=z["B"].astype(np.float32), h0=str(z["obs0_hash"]),
+                         live=bool(z["has_y"]) and bool(z["has_o4"]))
+                if x["live"]:
+                    x.update(img4=prep_rgb(torch, z["rgb4"]),
+                             s4=z["s4"].astype(np.float64),
+                             Y=z["Y"][:4].astype(np.float32))
+                sis.append(x)
         n = rows[nom_idx[(eid, t)]] if (eid, t) in nom_idx else None
-        if n is None or any(x["t"] != t or x["h0"] != n["h0"] or
-                            not np.array_equal(x["B"], n["B"]) for x in sis):
+        if (n is None or [x["sign"] for x in sis] != [1, -1] or
+                any(x["t"] != t or x["h0"] != n["h0"] or
+                    not np.array_equal(x["B"], n["B"]) for x in sis)):
             cnt["pair_reject"] += 1
             continue
         live = [x for x in sis if x["live"]]
@@ -241,6 +253,22 @@ def regret_loss(torch, logits, d):
     return (p * (d - d.min(-1, keepdim=True).values)).sum(-1)
 
 
+def action_errors(arm, grip, ya, yg):
+    """Ошибки руки и схвата по четырём шагам."""
+    arm_error = (arm - ya).abs().mean((-2, -1))
+    grip_error = ((grip > 0) != (yg > 0)).float().mean(-1)
+    return arm_error, grip_error
+
+
+def action_distance(arm, grip, ya, yg):
+    arm_error, grip_error = action_errors(arm, grip, ya, yg)
+    return arm_error + CFG["grip_w"] * grip_error
+
+
+def weighted_mean(values, weights):
+    return (values * weights).sum() / weights.sum()
+
+
 # --- обучение ------------------------------------------------------------------------------------
 def tensors(torch, rows, C, s11_stats, enc, dev, v_stats=None):
     """Признаки строк: x0, (v, s11) для o0, o4 (и o4b у пар), цели."""
@@ -262,7 +290,8 @@ def tensors(torch, rows, C, s11_stats, enc, dev, v_stats=None):
         v = km.state11(np.stack(s))
         return torch.as_tensor((v - s11_stats[0]) / s11_stats[1],
                                dtype=torch.float32)
-    T = dict(n=len(rows))
+    T = dict(n=len(rows), weight=torch.as_tensor(
+        [r.get("weight", 1.0) for r in rows], dtype=torch.float32))
     T["v0"], T["s0"] = vis([r["img0"] for r in rows]), s11([r["s0"] for r in rows])
     T["v4"], T["s4"] = vis([r["img4"] for r in rows]), s11([r["s4"] for r in rows])
     B = np.stack([r["B"] for r in rows])
@@ -281,8 +310,6 @@ def tensors(torch, rows, C, s11_stats, enc, dev, v_stats=None):
         Yb = np.stack([rows[i]["Yb"] for i in pr])
         T["yb_a"] = torch.as_tensor(norm_arm(Yb, C), dtype=torch.float32)
         T["yb_g"] = torch.as_tensor((Yb[..., 6] > 0).astype(np.float32))
-        T["v4b"] = vis([rows[i]["img4b"] for i in pr])
-        T["s4b"] = s11([rows[i]["s4b"] for i in pr])
     return T
 
 
@@ -302,6 +329,8 @@ def gen_alts(torch, gen, x0, b_arm, n_alt):
 
 def fit_loop(torch, model, loss_fn, n, val_fn, epochs, seed):
     """Мини-батчи по индексам 0…n−1; лучшая эпоха по val_fn()."""
+    if n == 0:
+        raise SystemExit("нет строк для обучения")
     opt = torch.optim.AdamW(model.parameters(), lr=CFG["lr"],
                             weight_decay=CFG["wd"])
     best, best_sd, hist = float("inf"), None, []
@@ -319,6 +348,8 @@ def fit_loop(torch, model, loss_fn, n, val_fn, epochs, seed):
         model.eval()
         with torch.no_grad():
             v = float(val_fn())
+        if not np.isfinite(v) or not np.isfinite(tot):
+            raise SystemExit(f"эпоха {ep}: нечисловая потеря")
         hist.append(dict(epoch=ep, train=tot / max(n, 1), val=v))
         if v < best:
             best = v
@@ -328,20 +359,19 @@ def fit_loop(torch, model, loss_fn, n, val_fn, epochs, seed):
     return dict(best_val=best, history=hist)
 
 
-def weights_hard(torch, T, idx, C):
-    """Вес 2 верхней четверти ошибки номинального хвоста (по train)."""
-    d = torch.as_tensor(tail_dist(T["b_arm"][idx].numpy(),
-                                  T["b_grip"][idx].numpy(),
-                                  _yc(T, idx), C), dtype=torch.float32)
-    q = torch.quantile(d, 0.75) if len(d) else 0
-    return torch.where(d >= q, CFG["hard_w"], 1.0)
+def baseline_error(r, C):
+    """Ошибка B в нормированных координатах, симметричная для пары."""
+    tail = r["B"][4:8]
+    arm, grip = norm_arm(tail, C), tail[:, 6]
+    d = tail_dist(arm, grip, r["Y"], C)
+    if r["kind"] == "pair":
+        d = (d + tail_dist(arm, grip, r["Yb"], C)) / 2
+    return float(d)
 
 
-def _yc(T, idx):
-    """Восстановить кодек-подобную метку для tail_dist (рука нормирована)."""
-    ya = T["ya"][idx].numpy()
-    g = np.where(T["yg"][idx].numpy() > 0.5, 1.0, -1.0)[..., None]
-    return np.concatenate([ya, g], -1)
+def with_hard_weights(rows, C, cutoff):
+    return [dict(r, weight=CFG["hard_w"] if baseline_error(r, C) >= cutoff else 1.0)
+            for r in rows]
 
 
 def fit_seed(torch, rows, C, seed, dev, n_alt_list=(2, 1)):
@@ -353,19 +383,23 @@ def fit_seed(torch, rows, C, seed, dev, n_alt_list=(2, 1)):
     gen_va = [r for r in rows if r["split"] == "gen" and r["case"] in vals]
     sel_tr = [r for r in rows if r["split"] == "sel" and r["case"] not in vals]
     sel_va = [r for r in rows if r["split"] == "sel" and r["case"] in vals]
+    if not all((gen_tr, gen_va, sel_tr, sel_va)):
+        raise SystemExit(f"s{seed}: нужны отдельные непустые train и val для gen и sel")
     import k21_model as km
-    s_all = np.stack([km.state11(np.stack([r["s0"], r["s4"]]))
-                      for r in gen_tr]).reshape(-1, 11)
-    st = (s_all.mean(0), np.where(s_all.std(0) < 1e-6, 1.0, s_all.std(0)))
+    pre_tr, pre_va = expand_pairs(gen_tr), expand_pairs(gen_va)
+    s_all = km.state11(np.stack([r[key] for r in pre_tr for key in ("s0", "s4")]))
+    s_weights = np.repeat([r["weight"] for r in pre_tr], 2)
+    s_mean = np.average(s_all, axis=0, weights=s_weights)
+    s_std = np.sqrt(np.average((s_all - s_mean) ** 2, axis=0, weights=s_weights))
+    st = (s_mean, np.where(s_std < 1e-6, 1.0, s_std))
     rep = dict(seed=seed, n=dict(gen_tr=len(gen_tr), gen_va=len(gen_va),
                                  sel_tr=len(sel_tr), sel_va=len(sel_va)))
     # 1) энкодер: B[:4] по o0 и Y[:4] по o4 (+ сёстры)
     enc = B_["Enc"]().to(dev)
     head = B_["mlp"](2 * VIS + 11, 96, 28).to(dev)
-    import k21_model as km2
 
     def enc_batch(rs):
-        imgs, s, ya, yg = [], [], [], []
+        imgs, s, ya, yg, w = [], [], [], [], []
         for r in rs:
             for img, ss, tgt in ((r["img0"], r["s0"], r["B"][:4]),
                                  (r["img4"], r["s4"], r["Y"])):
@@ -373,17 +407,13 @@ def fit_seed(torch, rows, C, seed, dev, n_alt_list=(2, 1)):
                 s.append(ss)
                 ya.append(norm_arm(tgt, C))
                 yg.append(tgt[:, 6] > 0)
-            if r["kind"] == "pair":
-                imgs.append(r["img4b"])
-                s.append(r["s4b"])
-                ya.append(norm_arm(r["Yb"], C))
-                yg.append(r["Yb"][:, 6] > 0)
+                w.append(r["weight"])
         x = torch.as_tensor(np.stack(imgs)).to(dev).float() / 255
-        sv = torch.as_tensor((km2.state11(np.stack(s)) - st[0]) / st[1],
+        sv = torch.as_tensor((km.state11(np.stack(s)) - st[0]) / st[1],
                              dtype=torch.float32, device=dev)
-        return x, sv, torch.as_tensor(np.stack(ya), dtype=torch.float32,
-                                      device=dev), \
-            torch.as_tensor(np.stack(yg), dtype=torch.float32, device=dev)
+        targets = [torch.as_tensor(np.asarray(a), dtype=torch.float32, device=dev)
+                   for a in (ya, yg, w)]
+        return x, sv, *targets
 
     class Pre(torch.nn.Module):
         def __init__(self):
@@ -393,37 +423,43 @@ def fit_seed(torch, rows, C, seed, dev, n_alt_list=(2, 1)):
     pre = Pre()
 
     def enc_loss(rs):
-        x, sv, ya, yg = enc_batch(rs)
+        x, sv, ya, yg, weight = enc_batch(rs)
         o = pre.head(torch.cat([pre.enc(x), sv], 1))
-        return row_loss(torch, torch.tanh(o[:, :24].reshape(-1, 4, 6)),
-                        o[:, 24:], ya, yg).mean()
+        loss = row_loss(torch, torch.tanh(o[:, :24].reshape(-1, 4, 6)),
+                        o[:, 24:], ya, yg)
+        return weighted_mean(loss, weight)
     rep["enc"] = fit_loop(torch, pre, lambda idx: enc_loss(
-        [gen_tr[i] for i in idx.tolist()]), len(gen_tr),
-        lambda: enc_loss(gen_va or gen_tr[:64]), CFG["epochs"]["enc"], seed)
+        [pre_tr[i] for i in idx.tolist()]), len(pre_tr),
+        lambda: enc_loss(pre_va), CFG["epochs"]["enc"], seed)
     for p in enc.parameters():
         p.requires_grad_(False)
     enc.eval()
     rep["params"] = dict(enc=n_params(enc))
 
     # нормировка визуальных признаков по train генератора (o0 и o4)
-    raw = tensors(torch, gen_tr, C, st, enc, dev, None)
+    raw = tensors(torch, pre_tr, C, st, enc, dev, None)
     vv = torch.cat([raw["v0"], raw["v4"]])
-    vst = (vv.mean(0), torch.clamp(vv.std(0), min=1e-6))
+    vw = raw["weight"].repeat(2)[:, None]
+    vmean = (vv * vw).sum(0) / vw.sum()
+    vstd = (((vv - vmean).square() * vw).sum(0) / vw.sum()).sqrt()
+    vst = (vmean, vstd.clamp_min(1e-6))
 
     def T_of(rs):
         return {k: (v.to(dev) if hasattr(v, "to") else v) for k, v in
                 tensors(torch, rs, C, st, enc, dev, vst).items()}
-    Tg, Tgv = T_of(gen_tr), T_of(gen_va or gen_tr[:64])
-    Ts, Tsv = T_of(sel_tr), T_of(sel_va or sel_tr[:64])
+    nominal_d = [baseline_error(r, C) for r in gen_tr if r["kind"] == "nom"]
+    if not nominal_d:
+        raise SystemExit(f"s{seed}: нет номинальных строк gen train")
+    cutoff = float(np.quantile(nominal_d, 0.75))
+    rep["hard_cutoff"] = cutoff
+    gen_weighted = with_hard_weights(gen_tr, C, cutoff)
+    Tg, Tgv = T_of(gen_weighted), T_of(gen_va)
+    Ts, Tsv = T_of(expand_pairs(sel_tr)), T_of(expand_pairs(sel_va))
     models = dict(enc=enc, s11_stats=st, v_stats=vst)
     for n_alt in n_alt_list:
         # 2) генератор
         gen = B_["mlp"](132, 96, 28 * n_alt).to(dev)
-        wg = weights_hard(torch, {k: (v.cpu() if hasattr(v, "cpu") else v)
-                                  for k, v in Tg.items()},
-                          torch.arange(Tg["n"]), C).to(dev)
-
-        def gloss(T, idx, w=None):
+        def gloss(T, idx):
             alts = gen_alts(torch, gen, T["x0"][idx], T["b_arm"][idx], n_alt)
             ls = single_loss(torch, alts, (T["ya"][idx], T["yg"][idx]))
             if len(T["pair_idx"]):
@@ -445,9 +481,8 @@ def fit_seed(torch, rows, C, seed, dev, n_alt_list=(2, 1)):
                                        T["yb_g"][jj])) / 2
                     ls = ls.clone()
                     ls[mi] = pl
-            ww = w[idx] if w is not None else torch.ones_like(ls)
-            return (ls * ww).sum() / ww.sum()
-        rg = fit_loop(torch, gen, lambda idx: gloss(Tg, idx.to(dev), wg),
+            return weighted_mean(ls, T["weight"][idx])
+        rg = fit_loop(torch, gen, lambda idx: gloss(Tg, idx.to(dev)),
                       Tg["n"], lambda: gloss(Tgv, torch.arange(
                           Tgv["n"], device=dev)), CFG["epochs"]["gen"], seed)
         for p in gen.parameters():
@@ -459,27 +494,21 @@ def fit_seed(torch, rows, C, seed, dev, n_alt_list=(2, 1)):
             sel[2].weight.zero_()
             sel[2].bias.zero_()
 
-        def cand_d(T, idx, use_b=False):
+        def cand_d(T, idx):
             with torch.no_grad():
                 alts = gen_alts(torch, gen, T["x0"][idx], T["b_arm"][idx],
                                 n_alt)
-            ya, yg = (T["yb_a"], T["yb_g"]) if use_b else (T["ya"], T["yg"])
-            ya, yg = ya[idx] if not use_b else ya, yg[idx] if not use_b \
-                else yg
-            ds = [((T["b_arm"][idx] - ya).abs().mean(-1) +
-                   CFG["grip_w"] * ((T["b_grip"][idx] > 0).float() != yg
-                                    ).float()).mean(-1)]
-            for a, g in alts:
-                ds.append(((a - ya).abs().mean(-1) + CFG["grip_w"] *
-                           ((g > 0).float() != yg).float()).mean(-1))
-            return torch.stack(ds, -1)
+            ya, yg = T["ya"][idx], T["yg"][idx]
+            candidates = [(T["b_arm"][idx], T["b_grip"][idx]), *alts]
+            return torch.stack([action_distance(a, g, ya, yg)
+                                for a, g in candidates], -1)
 
         def sloss(T, idx):
             d = cand_d(T, idx)
             tot = 0.0
             for mode in MODES:
-                tot = tot + regret_loss(torch, sel(xmid(torch, T, mode, idx)),
-                                        d).mean()
+                loss = regret_loss(torch, sel(xmid(torch, T, mode, idx)), d)
+                tot = tot + weighted_mean(loss, T["weight"][idx])
             return tot / len(MODES)
         rs_ = fit_loop(torch, sel, lambda idx: sloss(Ts, idx.to(dev)),
                        Ts["n"], lambda: sloss(Tsv, torch.arange(
@@ -489,8 +518,8 @@ def fit_seed(torch, rows, C, seed, dev, n_alt_list=(2, 1)):
         rep["params"][f"tree{n_alt}"] = n_params(gen) + n_params(sel)
     # 4) flat: gen + sel, все режимы
     flat = B_["mlp"](207, 106, 28).to(dev)
-    Tf = T_of(gen_tr + sel_tr)
-    Tfv = T_of((gen_va + sel_va) or (gen_tr + sel_tr)[:64])
+    Tf = T_of(expand_pairs(gen_weighted + with_hard_weights(sel_tr, C, cutoff)))
+    Tfv = T_of(expand_pairs(gen_va + sel_va))
 
     def floss(T, idx):
         tot = 0.0
@@ -498,8 +527,8 @@ def fit_seed(torch, rows, C, seed, dev, n_alt_list=(2, 1)):
             o = flat(xmid(torch, T, mode, idx))
             a, g = tail_from(torch, o[:, :24].reshape(-1, 4, 6), o[:, 24:],
                              T["b_arm"][idx])
-            tot = tot + row_loss(torch, a, g, T["ya"][idx], T["yg"][idx]
-                                 ).mean()
+            loss = row_loss(torch, a, g, T["ya"][idx], T["yg"][idx])
+            tot = tot + weighted_mean(loss, T["weight"][idx])
         return tot / len(MODES)
     rep["flat"] = fit_loop(torch, flat, lambda idx: floss(Tf, idx.to(dev)),
                            Tf["n"], lambda: floss(Tfv, torch.arange(
@@ -524,11 +553,11 @@ def evaluate(torch, models, rows, C, dev, n_alt=2):
         grips = [T["b_grip"]] + [torch.where(g > 0, 1.0, -1.0)
                                  for _a, g in alts]
 
-        def dist(arm, grip):
-            return ((arm - T["ya"]).abs().mean(-1) + CFG["grip_w"] *
-                    ((grip > 0).float() != T["yg"]).float()).mean(-1)
-        D = torch.stack([dist(a, g) for a, g in zip(arms, grips)], -1)
-        out = dict(d=D.cpu().numpy())
+        ya, yg = T["ya"], T["yg"]
+        ar, gr = zip(*(action_errors(a, g, ya, yg) for a, g in zip(arms, grips)))
+        arm_err, grip_mis = torch.stack(ar, -1), torch.stack(gr, -1)
+        out = dict(d=(arm_err + CFG["grip_w"] * grip_mis).cpu().numpy(),
+                   arm_err=arm_err.cpu().numpy(), grip_mis=grip_mis.cpu().numpy())
         for nm, mode in (("old", (0, 0)), ("fresh", (1, 1)),
                          ("rgb_only", (1, 0)), ("state_only", (0, 1))):
             ch = sel(xmid(torch, T, mode)).argmax(-1)
@@ -536,35 +565,41 @@ def evaluate(torch, models, rows, C, dev, n_alt=2):
             o = flat(xmid(torch, T, mode))
             a, g = tail_from(torch, o[:, :24].reshape(-1, 4, 6), o[:, 24:],
                              T["b_arm"])
-            out[f"d_flat_{nm}"] = dist(a, torch.where(g > 0, 1.0, -1.0)
-                                       ).cpu().numpy()
-        out["arm_err"] = torch.stack([(a - T["ya"]).abs().mean((-2, -1))
-                                      for a in arms], -1).cpu().numpy()
-        out["grip_mis"] = torch.stack([((g > 0).float() != T["yg"]).float()
-                                       .mean(-1) for g in grips], -1
-                                      ).cpu().numpy()
+            af, gf = action_errors(a, g, ya, yg)
+            out[f"d_flat_{nm}"] = (af + CFG["grip_w"] * gf).cpu().numpy()
+            out[f"arm_flat_{nm}"] = af.cpu().numpy()
+            out[f"grip_flat_{nm}"] = gf.cpu().numpy()
     return out
 
 
 def summarize_eval(rows, ev):
     idx_all = np.arange(len(rows))
+    weights = np.asarray([r.get("weight", 1.0) for r in rows])
     rep = {}
 
     def block(ix):
         if len(ix) == 0:
             return None
+        w = weights[ix]
         d = ev["d"][ix]
-        r = dict(n=int(len(ix)), d_B=float(d[:, 0].mean()),
-                 d_oracle=float(d.min(1).mean()))
+        r = dict(n=int(len(ix)), weight_sum=float(w.sum()),
+                 d_B=float(np.average(d[:, 0], weights=w)),
+                 d_oracle=float(np.average(d.min(1), weights=w)))
         for nm in ("old", "fresh", "rgb_only", "state_only"):
             ch = ev[f"choice_{nm}"][ix]
-            r[f"d_tree_{nm}"] = float(d[np.arange(len(ix)), ch].mean())
-            r[f"share_alt_{nm}"] = float((ch != 0).mean())
-            r[f"d_flat_{nm}"] = float(ev[f"d_flat_{nm}"][ix].mean())
-        r["arm_err"] = ev["arm_err"][ix].mean(0).round(5).tolist()
-        r["grip_mis"] = ev["grip_mis"][ix].mean(0).round(4).tolist()
-        r["fresh_ne_old"] = float((ev["choice_fresh"][ix] !=
-                                   ev["choice_old"][ix]).mean())
+            r[f"d_tree_{nm}"] = float(np.average(ev["d"][ix, ch], weights=w))
+            r[f"share_alt_{nm}"] = float(np.average(ch != 0, weights=w))
+            r[f"d_flat_{nm}"] = float(np.average(ev[f"d_flat_{nm}"][ix], weights=w))
+            r[f"arm_tree_{nm}"] = float(np.average(ev["arm_err"][ix, ch], weights=w))
+            r[f"grip_tree_{nm}"] = float(np.average(ev["grip_mis"][ix, ch], weights=w))
+            r[f"arm_flat_{nm}"] = float(np.average(ev[f"arm_flat_{nm}"][ix], weights=w))
+            r[f"grip_flat_{nm}"] = float(np.average(ev[f"grip_flat_{nm}"][ix], weights=w))
+        r["arm_err"] = np.average(ev["arm_err"][ix], axis=0, weights=w).round(5).tolist()
+        r["grip_mis"] = np.average(ev["grip_mis"][ix], axis=0, weights=w).round(4).tolist()
+        r["oracle_share"] = (np.bincount(d.argmin(1), weights=w,
+                                         minlength=d.shape[1]) / w.sum()).tolist()
+        r["fresh_ne_old"] = float(np.average(ev["choice_fresh"][ix] !=
+                                             ev["choice_old"][ix], weights=w))
         return r
     rep["all"] = block(idx_all)
     for key, f in (("task", "task"), ("seed", "seed"), ("kind", "kind")):
@@ -575,27 +610,33 @@ def summarize_eval(rows, ev):
 
 
 def expand_pairs(rows):
-    """Пара -> две строки сестёр (sisA, sisB) с общим pair_id."""
+    """Пара -> две строки с общим pair_id, каждая с половиной веса пары."""
     out = []
     for i, r in enumerate(rows):
         if r["kind"] != "pair":
-            out.append(r)
+            out.append(dict(r, weight=r.get("weight", 1.0)))
             continue
-        out.append(dict(r, kind="sisA", pair_id=i))
-        out.append(dict(r, kind="sisB", pair_id=i, img4=r["img4b"],
-                        s4=r["s4b"], Y=r["Yb"]))
+        half = r.get("weight", 1.0) / 2
+        out.append(dict(r, kind="sisA", pair_id=i, weight=half))
+        out.append(dict(r, kind="sisB", pair_id=i, weight=half,
+                        img4=r["img4b"], s4=r["s4b"], Y=r["Yb"]))
     return out
 
 
 def sister_pref(rows, ev):
-    """Доля пар, где лучшая ветвь (argmin d) у сестёр различается."""
+    """Разные предпочтения и выигрыш oracle над одним хвостом на пару."""
     by = {}
     for i, r in enumerate(rows):
         if r["kind"] in ("sisA", "sisB"):
-            by.setdefault(r["pair_id"], []).append(int(np.argmin(ev["d"][i])))
-    pr = [v for v in by.values() if len(v) == 2]
-    return dict(n=len(pr), share=float(np.mean([a != b for a, b in pr]))
-                if pr else None)
+            by.setdefault(r["pair_id"], []).append(ev["d"][i])
+    pairs = [v for v in by.values() if len(v) == 2]
+    if not pairs:
+        return dict(n=0, share=None, oracle_gain_mean=None)
+    d = np.asarray(pairs)
+    idx = np.argmin(d, axis=-1)
+    gain = d.mean(1).min(-1) - d.min(-1).mean(1)
+    return dict(n=len(pairs), share=float((idx[:, 0] != idx[:, 1]).mean()),
+                oracle_gain_mean=float(gain.mean()))
 
 
 def pair_magnitudes(rows, C):
@@ -613,7 +654,8 @@ def pair_magnitudes(rows, C):
     d, m = np.array(ds), np.array(mx)
     return dict(n=len(d), d_mean=float(d.mean()), d_median=float(np.median(d)),
                 d_p90=float(np.quantile(d, 0.9)), maxabs_median=float(
-                    np.median(m)), maxabs_p90=float(np.quantile(m, 0.9)),
+                     np.median(m)), maxabs_p90=float(np.quantile(m, 0.9)),
+                 maxabs_max=float(m.max()),
                 share_d_gt_0_01=float((d > 0.01).mean()),
                 share_d_gt_0_05=float((d > 0.05).mean()))
 
@@ -629,19 +671,44 @@ def _setup(run):
     import k39_cache as kc
     plan = kc.load_data_plan(run)
     k36 = pc.load_prepare()
+    if k36["sha1"] != plan["k36_prepare_sha1"]:
+        raise SystemExit("prepare K-36 ≠ data_plan")
     C = kh.consts(k36)
     return plan, C, kc
 
 
 def _rows(torch, run, plan, kc, seed=None):
+    import k36_protocol as pc
+
     if seed is not None:                    # только шарды этого сида
         eids = {e["eid"] for e in plan["episodes"] if e["seed"] == seed}
         plan = dict(plan, episodes=[e for e in plan["episodes"]
                                     if e["eid"] in eids],
                     sisters=[x for x in plan["sisters"] if x["eid"] in eids])
-    rows, cnt = load_rows(
-        torch, plan, lambda job: kc.shard_path(run, job),
-        lambda p, job: kc.shard_ok(p, job, plan["sha256"]))
+    lp = os.path.join(kc.rep_dir(run), "ledger.json")
+    if not os.path.exists(lp):
+        raise SystemExit(f"нет журнала {lp}")
+    ledger = pc.load_json(lp)
+    if ledger.get("caps") != plan["caps"]:
+        raise SystemExit("лимиты журнала ≠ data_plan")
+    expected = {kc.job_name("cache", k, e)
+                for k, e in kc.jobs_of(plan, kc.TRAIN_SPLITS, True)}
+    done = ledger["done"]
+    pending_id = (ledger["pending"] or {}).get("id")
+    missing = sorted(expected - done.keys())
+    if missing or pending_id in expected:
+        raise SystemExit(f"кеш ещё не принят журналом: "
+                         f"{len(missing)} незакрытых заданий, "
+                         f"первое {missing[0] if missing else pending_id}")
+
+    def accepted(path, job):
+        meta = kc.shard_ok(path, job, plan["sha256"])
+        if meta and done[job] == dict(scope="cache", actual=meta["phys"]):
+            return meta
+        return False
+
+    rows, cnt = load_rows(torch, plan, lambda job: kc.shard_path(run, job),
+                          accepted)
     vs = val_scenes(plan)
     for r in rows:
         r["_val"] = vs
@@ -660,11 +727,13 @@ def fit_cmd(a):
     md = model_dir(a.run_id, a.seed)
     os.makedirs(md, exist_ok=True)
     path = os.path.join(md, "heads.pt")
-    torch.save({k: (v.state_dict() if hasattr(v, "state_dict") else v)
-                for k, v in models.items()}, path + ".tmp")
+    stamp = dict(run_id=a.run_id, seed=a.seed, model_code=kc.sha256(__file__),
+                 plan=plan["sha256"], cfg=CFG)
+    ck = {k: (v.state_dict() if hasattr(v, "state_dict") else v)
+          for k, v in models.items()}
+    torch.save(dict(ck, fit=stamp), path + ".tmp")
     os.replace(path + ".tmp", path)
-    rep.update(counts=cnt, seconds=time.time() - t0, plan=plan["sha256"],
-               sha256=kc.sha256(path), cfg=CFG)
+    rep.update(stamp, counts=cnt, seconds=time.time() - t0, sha256=kc.sha256(path))
     pc.save_json(os.path.join(kc.rep_dir(a.run_id), f"fit_s{a.seed}.json"),
                  rep)
     print(f"  fit s{a.seed}: строк gen {rep['n']['gen_tr']}+{rep['n']['gen_va']}"
@@ -675,10 +744,24 @@ def fit_cmd(a):
     return 0
 
 
-def load_models(torch, run, s, dev):
+def load_models(torch, run, s, dev, plan_sha=None, weights_sha=None):
+    import k39_cache as kc
+
     B_ = build(torch)
-    ck = torch.load(os.path.join(model_dir(run, s), "heads.pt"),
-                    map_location=dev, weights_only=False)
+    path = os.path.join(model_dir(run, s), "heads.pt")
+    if not os.path.isfile(path):
+        raise SystemExit(f"нет весов s{s}: {path}")
+    with open(path, "rb") as fh:
+        body = fh.read()
+    if weights_sha is not None and hashlib.sha256(body).hexdigest() != weights_sha:
+        raise SystemExit(f"s{s}: heads.pt ≠ отпечатку весов")
+    ck = torch.load(io.BytesIO(body), map_location="cpu", weights_only=False)
+    want = dict(run_id=run, seed=s, model_code=kc.sha256(__file__), cfg=CFG)
+    if plan_sha is not None:
+        want["plan"] = plan_sha
+    stamp = ck.get("fit", {})
+    if any(stamp.get(k) != v for k, v in want.items()):
+        raise SystemExit(f"s{s}: происхождение весов ≠ текущему fit")
     enc = B_["Enc"]().to(dev)
     enc.load_state_dict(ck["enc"])
     m = dict(enc=enc.eval(), s11_stats=ck["s11_stats"],
@@ -686,10 +769,11 @@ def load_models(torch, run, s, dev):
     for k, (i, h, o) in dict(gen2=(132, 96, 56), sel2=(207, 32, 3),
                              gen1=(132, 96, 28), sel1=(207, 32, 2),
                              flat=(207, 106, 28)).items():
-        if k in ck:
-            net = B_["mlp"](i, h, o).to(dev)
-            net.load_state_dict(ck[k])
-            m[k] = net.eval()
+        if k not in ck:
+            raise SystemExit(f"s{s}: нет {k} в heads.pt")
+        net = B_["mlp"](i, h, o).to(dev)
+        net.load_state_dict(ck[k])
+        m[k] = net.eval()
     return m
 
 
@@ -698,16 +782,25 @@ def offline_cmd(a):
     import k36_protocol as pc
     plan, C, kc = _setup(a.run_id)
     dev = torch.device(a.device)
-    rows_all, cnt = _rows(torch, a.run_id, plan, kc)
-    rep = dict(plan=plan["sha256"], counts=cnt,
-               pairs_all=pair_magnitudes(rows_all, C))
+    fits = {}
     for s in SEEDS:
-        if not os.path.exists(os.path.join(model_dir(a.run_id, s),
-                                           "heads.pt")):
-            continue
-        m = load_models(torch, a.run_id, s, dev)
-        diag = expand_pairs([r for r in rows_all if r["seed"] == s and
-                             r["split"] == "diag"])
+        path = os.path.join(kc.rep_dir(a.run_id), f"fit_s{s}.json")
+        if not os.path.isfile(path):
+            raise SystemExit(f"нет отчёта fit для s{s}")
+        fit = pc.load_json(path)
+        if fit.get("plan") != plan["sha256"] or fit.get("seed") != s:
+            raise SystemExit(f"s{s}: отчёт fit ≠ data_plan/сиду")
+        fits[s] = fit["sha256"]
+    rows_all, cnt = _rows(torch, a.run_id, plan, kc)
+    diag_rows = [r for r in rows_all if r["split"] == "diag"]
+    rep = dict(plan=plan["sha256"], counts=cnt,
+               pairs_all=pair_magnitudes(rows_all, C),
+               pairs_diag=pair_magnitudes(diag_rows, C), weights_sha256=fits)
+    for s in SEEDS:
+        m = load_models(torch, a.run_id, s, dev, plan["sha256"], fits[s])
+        diag = expand_pairs([r for r in diag_rows if r["seed"] == s])
+        if not diag:
+            raise SystemExit(f"s{s}: нет диагностических строк")
         for n_alt in (2, 1):
             ev = evaluate(torch, m, diag, C, dev, n_alt)
             sm = summarize_eval(diag, ev)
@@ -775,7 +868,7 @@ def selftest():
                      Y=(Y[1] + sign) if has_y else np.zeros((8, 7),
                                                             np.float32))
         plan = dict(episodes=[dict(eid="e1", seed=0, task=0, case_id="c1",
-                                   split="gen")],
+                                    split="gen", windows=[0, 8])],
                     sisters=[dict(eid="e1", t=8, sign=1, missing=False,
                                   job="sis/e1/8/+1"),
                              dict(eid="e1", t=8, sign=-1, missing=False,
@@ -796,35 +889,36 @@ def selftest():
         assert load_rows(torch, plan, sp, ok)[1]["pair_reject"] == 1
         sis("cache/sis/e1/8/-1", -1, True, h="hX")     # чужой o0
         assert load_rows(torch, plan, sp, ok)[1]["pair_reject"] == 1
-    # 5) игрушечная развилка: o4 определяет нужный хвост
+        sis("cache/sis/e1/8/-1", 1, True)             # повтор знака +
+        assert load_rows(torch, plan, sp, ok)[1]["pair_reject"] == 1
+    # 5) Проверка масштаба: B и обе метки исходно в координатах кодека.
+    scaled = dict(mid=np.linspace(0.25, 0.75, 6), half=np.full(6, 0.5))
+    Bc = np.tile(np.r_[scaled["mid"], 1.0], (8, 1))
+    Yc = Bc[:4].copy()
+    Yc[:, :6] += 0.1
+    assert abs(baseline_error(dict(B=Bc, Y=Yc, kind="nom"), scaled) - 0.2) < 1e-9
+    # 6) Только сёстры дают противоположные хвосты, сцены не пересекаются.
     rows = []
-    rng = np.random.default_rng(1)
-    for i in range(160):
-        side = (i % 2) * 2 - 1                    # −1 / +1
+    for i in range(90):
         img0 = np.full((2, 3, IMG, IMG), 128, np.uint8)
-        img4 = np.full((2, 3, IMG, IMG), 128 + 60 * side, np.uint8)
         Bc = np.zeros((8, 7), np.float32)
         Bc[:, 6] = 1.0
-        Yc = np.zeros((4, 7), np.float32)
-        Yc[:, 0] = 0.8 * side
-        Yc[:, 6] = 1.0
-        split = ("gen", "sel", "diag")[i % 3 if i < 150 else 2]
-        base = dict(seed=0, task=(0, 6, 8)[i % 3], case=f"c{i // 2}",
-                    split=split, eid=f"e{i // 2}", t=0, img0=img0,
+        Yc = Bc[:4].copy()
+        Yp, Yn = Yc.copy(), Yc.copy()
+        Yp[:, 0], Yn[:, 0] = 0.8, -0.8
+        base = dict(seed=0, task=(0, 6, 8)[(i // 3) % 3], case=f"c{i}",
+                     split=("gen", "sel", "diag")[i % 3], eid=f"e{i}", t=0, img0=img0,
                     s0=np.zeros(8), B=Bc, h0="x")
-        rows.append(dict(base, kind="nom", img4=img4, s4=base["s0"], Y=Yc))
-        if i % 2 == 0 and split != "diag":
-            Yb = Yc.copy()
-            Yb[:, 0] = -0.8 * side
-            rows.append(dict(base, kind="pair", img4=img4, s4=base["s0"],
-                             Y=Yc, img4b=np.full_like(img4, 128 - 60 * side),
-                             s4b=base["s0"], Yb=Yb))
+        rows.append(dict(base, kind="nom", img4=img0, s4=base["s0"], Y=Yc))
+        rows.append(dict(base, kind="pair", img4=np.full_like(img0, 188),
+                         s4=base["s0"], Y=Yp, img4b=np.full_like(img0, 68),
+                         s4b=base["s0"], Yb=Yn))
     for r in rows:
-        r["_val"] = {f"c{j}" for j in range(0, 20)}
+        r["_val"] = {f"c{j}" for j in range(12) if j % 3 != 2}
     CFG["epochs"].update(enc=6, gen=80, sel=80, flat=80)
     models, rep = fit_seed(torch, rows, C, 0, torch.device("cpu"),
                            n_alt_list=(2,))
-    diag = [r for r in rows if r["split"] == "diag"]
+    diag = expand_pairs([r for r in rows if r["split"] == "diag"])
     ev = evaluate(torch, models, diag, C, torch.device("cpu"), 2)
     sm = summarize_eval(diag, ev)["all"]
     # старое наблюдение одинаково у обеих «сторон» -> один выбор на всех
@@ -832,6 +926,8 @@ def selftest():
     # свежее различает стороны и улучшает расстояние
     assert len(set(ev["choice_fresh"].tolist())) >= 2, sm
     assert sm["d_tree_fresh"] < sm["d_tree_old"], sm
+    assert sm["d_flat_fresh"] < sm["d_flat_old"], sm
+    assert sister_pref(diag, ev)["oracle_gain_mean"] > 0
     # при o4 = o0 свежий и старый режимы совпадают побитово
     same = [dict(r, img4=r["img0"], s4=r["s0"]) for r in diag]
     ev2 = evaluate(torch, models, same, C, torch.device("cpu"), 2)
@@ -840,8 +936,9 @@ def selftest():
                             s4=0, s4b=1), dict(kind="nom")])
     assert [r["kind"] for r in ex] == ["sisA", "sisB", "nom"] and \
         ex[1]["Y"] == 2 and ex[1]["img4"] == "b"
+    assert [r["weight"] for r in ex] == [0.5, 0.5, 1.0]
     sp_ = sister_pref(ex, dict(d=np.array([[0, 1, 2], [2, 1, 0], [0, 0, 0]])))
-    assert sp_ == dict(n=1, share=1.0)
+    assert sp_ == dict(n=1, share=1.0, oracle_gain_mean=1.0)
     print("самопроверка k39_model пройдена: парная потеря инвариантна к "
           "перестановке; сожаление равнодушно к равным ветвям; параметры "
           "24 955 / 25 044; загрузчик: пары по (eid, t), маска has_y, отказ "
