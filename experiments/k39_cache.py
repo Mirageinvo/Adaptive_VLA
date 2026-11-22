@@ -3,10 +3,10 @@
 """K-39, этап 1: автономный кеш пар наблюдений o0 / o4 и меток учителя.
 
 Команды:
-  prepare-data --run-id f1 [--archive reports/k37c/runs/c2]
-  micro --run-id f1 --device D      6 эпизодов (micro-сцена × 3 задачи × 2 сида)
-  collect --run-id f1 --device D    360 номинальных эпизодов + сёстры
-  status --run-id f1
+  prepare-data --run-id f2 [--profile f1|f2] [--archive reports/k37c/runs/c2]
+  micro --run-id f2 --device D      6 номинальных повторов и проверки развилок
+  collect --run-id f2 --device D    360 номинальных эпизодов + сёстры
+  status --run-id f2
 Окружение: OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 (проверяется).
 
 Выборка (prepare-data; без чтения исходов для ранжирования): задачи 0/6/8;
@@ -25,13 +25,15 @@ episode = номер архивного эпизода, call = номер чан
 [8,7] (метка — первые 4). Полный повтор сверяется с архивом (исход,
 steps, success_step, done_step). На первом окне эпизода (в micro — на
 каждом) прямой T32 на o0 = j_a_codec побитово.
-Сёстры: на каждой задаче 4 train-сцены (2 первые gen + 2 первые sel) и
-2 первые diag; окно по хешу среди отобранных с j_k = 8; ось x/y по хешу;
+Сёстры: на каждой задаче фиксированные префиксы списков gen / sel / diag
+(2 / 2 / 2 у f1, 16 / 16 / 6 у f2). Окно по хешу среди отобранных
+с j_k = 8; ось x/y по хешу;
 два повтора из reset с ±0.15·half на индексах 1, 2 первых четырёх
 команд (клип по L, U; io.scale один раз); Y на своём o4.
-Хранение: миниатюры 2×3×48×48 uint8 (отражение, CenterCrop 196, bilinear
-antialias), state8, B, Y, маски; шард на эпизод — временный файл,
-проверка, атомарная публикация; журнал reports/k39/<run>/ledger.json.
+Хранение: исходные кадры [2, H, W, 3] и проприоцепция в каждой точке,
+хеши наблюдений, миниатюры 2×3×48×48 uint8, state8, B, Y, исполненный
+физический префикс и маски. Сжатие без потерь, шард на эпизод, атомарная
+публикация и журнал reports/k39/<run>/ledger.json.
 """
 import argparse
 import hashlib
@@ -46,7 +48,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-PROTOCOL = "k39-cache-v1"
+PROTOCOL = "k39-cache-v2"
 TASKS = (0, 6, 8)
 SEEDS = (0, 1)
 N_TRAIN, N_GEN, N_DIAG = 48, 32, 12
@@ -56,7 +58,9 @@ EP = 610
 SIS_DELTA = 0.15
 THREADS = 8
 THUMB = 48
-CAPS = dict(cache=(360 + 72) * EP, checks=48 * EP)
+FORK_SCENES = {"f1": (2, 2, 2), "f2": (16, 16, 6)}
+TRAIN_SPLITS = ("gen", "sel", "diag")
+CAMERAS = ("agentview_image", "robot0_eye_in_hand_image")
 CODE = ("k39_cache.py", "k38_grip_run.py", "k37_confirm.py",
         "k36_harness.py", "k36_bank.py", "k36_protocol.py", "k32_policy.py",
         "k31_collect.py", "k29_policy.py", "k33_bank.py")
@@ -112,17 +116,36 @@ def pick_windows(eid, elapsed, k, max_steps=600):
     return sorted(sel), excl
 
 
+def profile_caps(profile):
+    nominal = len(TASKS) * len(SEEDS) * (N_TRAIN + N_DIAG)
+    sisters = len(TASKS) * len(SEEDS) * 2 * sum(FORK_SCENES[profile])
+    return dict(cache=(nominal + sisters) * EP, checks=48 * EP)
+
+
+def sister_specs(e, signs):
+    eligible = [t for t in e["windows"] if e["k_at"][str(t)] == 8]
+    if not eligible:
+        return [dict(eid=e["eid"], missing=True)]
+    t = min(eligible, key=lambda tt: h256(f"k39-f1-sister|{e['eid']}|{tt}"))
+    axis = int(h256(f"k39-f1-axis|{e['case_id']}|{t}")[0], 16) % 2
+    return [dict(eid=e["eid"], t=t, axis=axis, sign=sign, missing=False,
+                 job=f"sis/{e['eid']}/{t}/{sign:+d}") for sign in signs]
+
+
 def prepare_data(a):
     import k36_harness as kh
     import k36_protocol as pc
     import k37_confirm as kcf
     import k38_grip_run as kgr
     run = a.run_id
+    profile = a.profile or ("f2" if run == "f2" else "f1")
     rd, dd = rep_dir(run), data_dir(run)
     planp = os.path.join(rd, "data_plan.json")
     c2, k36 = kcf.load_plan(a.archive)
     g1p = os.path.join(kgr.RUNS, "g1")
     g1, _k = kgr.load_plan(g1p, verify=False)
+    if g1["c2"]["plan_sha256"] != c2["sha256"]:
+        raise SystemExit("скрининг g1 закреплён на другом архиве c2")
     g1_ids = {s["case_id"] for s in g1["scenes"]}
     C = kh.consts(k36)
     case_part = {sc["case_id"]: int(k) for k, v in c2["parts"].items()
@@ -157,41 +180,43 @@ def prepare_data(a):
                                     windows=wins, input=cp,
                                     k_at={str(int(tt)): int(kk) for tt, kk in
                                           zip(J["elapsed"], J["k"])}))
-    # сёстры и сырые пары для задержки
-    sisters, raw = [], []
+    # Сёстры получают те же идентификаторы окон в f1 и f2.
+    # Очередь из сырых пар нужна отдельно для фиксированного замера задержки.
+    by_case = {(e["case_id"], e["seed"]): e for e in eps}
+    sisters, micro_sisters, raw = [], [], []
     for t in TASKS:
-        picks = sp[t]["gen"][:2] + sp[t]["sel"][:2] + sp[t]["diag"][:2]
-        for sc in picks:
-            for s in SEEDS:
-                e = next(x for x in eps if x["case_id"] == sc["case_id"] and
-                         x["seed"] == s)
-                c8 = [w for w in e["windows"] if e["k_at"][str(w)] == 8]
-                if not c8:
-                    sisters.append(dict(eid=e["eid"], missing=True))
-                    continue
-                w = min(c8, key=lambda tt: h256(f"k39-f1-sister|{e['eid']}|"
-                                                f"{tt}"))
-                axis = int(h256(f"k39-f1-axis|{sc['case_id']}|{w}")[0], 16) % 2
-                for sign in (1, -1):
-                    sisters.append(dict(eid=e["eid"], t=int(w), axis=axis,
-                                        sign=sign, missing=False,
-                                        job=f"sis/{e['eid']}/{w}/{sign:+d}"))
+        for split, n in zip(TRAIN_SPLITS, FORK_SCENES[profile]):
+            for sc in sp[t][split][:n]:
+                for s in SEEDS:
+                    sisters.extend(sister_specs(by_case[sc["case_id"], s],
+                                                (1, -1)))
         for sc in sp[t]["diag"][:5]:
             for s in SEEDS:
-                e = next(x for x in eps if x["case_id"] == sc["case_id"] and
-                         x["seed"] == s)
+                e = by_case[sc["case_id"], s]
                 if e["windows"]:
                     w = min(e["windows"], key=lambda tt: h256(
                         f"k39-f1-raw|{e['eid']}|{tt}"))
                     raw.append(dict(eid=e["eid"], t=int(w)))
+    if profile == "f2":
+        for s in SEEDS:
+            for t in TASKS:
+                sc = sp[t]["micro"][0]
+                specs = sister_specs(by_case[sc["case_id"], s], (0, 1, -1))
+                if not specs[0]["missing"]:
+                    micro_sisters.extend(specs)
+                    break
+            else:
+                raise SystemExit(f"micro s{s}: нет полного окна для развилки")
     plan = dict(kind="k39_data_plan", run_id=run, protocol=PROTOCOL,
+                profile=profile,
                 code={f: sha256(os.path.join(HERE, f)) for f in CODE},
                 c2_plan_sha256=c2["sha256"], g1_plan_sha256=g1["sha256"],
                 k36_prepare_sha1=k36["sha1"], bank=c2["bank"],
                 splits={str(t): {k: [s["case_id"] for s in v]
                                  for k, v in sp[t].items()} for t in TASKS},
-                episodes=eps, sisters=sisters, raw_pairs=raw,
-                n_excluded_short=n_excl, caps=CAPS, threads=THREADS,
+                episodes=eps, sisters=sisters, micro_sisters=micro_sisters,
+                raw_pairs=raw, n_excluded_short=n_excl,
+                caps=profile_caps(profile), threads=THREADS,
                 thumb=THUMB, sister_delta=SIS_DELTA)
     sh = kcf.canon_sha(plan)
     if os.path.exists(planp):
@@ -206,14 +231,17 @@ def prepare_data(a):
         fh.write(sh + "\n")
     nw = {sp_: sum(len(e["windows"]) for e in eps if e["split"] in sp_)
           for sp_ in (("gen", "sel"), ("diag",), ("micro",))}
-    print(f"  data_plan {planp}: sha256 {sh[:16]}; эпизодов {len(eps)} "
+    print(f"  data_plan {planp} ({profile}): sha256 {sh[:16]}; "
+          f"эпизодов {len(eps)} "
           f"(train {sum(e['split'] in ('gen', 'sel') for e in eps)}, diag "
           f"{sum(e['split'] == 'diag' for e in eps)}, micro "
           f"{sum(e['split'] == 'micro' for e in eps)}); окон train "
           f"{nw[('gen', 'sel')]}, diag {nw[('diag',)]}, micro "
           f"{nw[('micro',)]}; исключено коротких {n_excl}; сестёр "
           f"{sum(not x['missing'] for x in sisters)} (без окна k=8: "
-          f"{sum(x['missing'] for x in sisters)}); сырых пар {len(raw)}")
+          f"{sum(x['missing'] for x in sisters)}); сырых пар для замера "
+          f"{len(raw)}; развилок micro {len(micro_sisters)}; "
+          f"лимит cache {plan['caps']['cache']}")
     return 0
 
 
@@ -225,6 +253,8 @@ def load_data_plan(run, verify=True):
     if sh != open(os.path.join(rd, "data_plan.sha256")).read().strip():
         raise SystemExit("data_plan.json ≠ data_plan.sha256")
     if verify:
+        if p["protocol"] != PROTOCOL:
+            raise SystemExit("для этого плана нужна исходная версия кеша")
         bad = [f for f, s in p["code"].items()
                if sha256(os.path.join(HERE, f)) != s]
         if bad:
@@ -252,7 +282,7 @@ def thumbs(torch, obs):
     196 (смещение (224 − 196) / 2 = 14), bilinear antialias до 48 ->
     [2, 3, 48, 48] uint8. Чистый torch (без torchvision)."""
     out = []
-    for key in ("agentview_image", "robot0_eye_in_hand_image"):
+    for key in CAMERAS:
         x = torch.tensor(np.asarray(obs[key])[:, :, ::-1].copy()).permute(
             0, 3, 1, 2).float()
         H, W = x.shape[-2:]
@@ -267,8 +297,16 @@ def thumbs(torch, obs):
 
 
 def raw_obs(obs):
-    return {k: np.array(obs[k], copy=True) for k in
-            ("state", "agentview_image", "robot0_eye_in_hand_image")}
+    return {k: np.array(obs[k], copy=True) for k in ("state", *CAMERAS)}
+
+
+def observation_fields(torch, io, obs, elapsed):
+    from k31_collect import obs_hash
+    return {f"o{elapsed}": thumbs(torch, obs),
+            f"s{elapsed}": np.array(io.inp.state8(obs)[0], copy=True),
+            f"rgb{elapsed}": np.stack([obs[key][0] for key in CAMERAS]),
+            f"state{elapsed}_raw": np.array(obs["state"][0], copy=True),
+            f"obs{elapsed}_hash": obs_hash(obs)}
 
 
 class Replay:
@@ -293,6 +331,8 @@ class Replay:
         self.steps, self.succ_step, self.done_step = 0, -1, -1
 
     def step(self, a):
+        if self.done_step >= 0:
+            raise SystemExit("повтор продолжился после terminal")
         obs, r_, d_, _s = self.sim.step(np.asarray(a, np.float32)[None])
         self.obs = obs
         prev = self.reward
@@ -307,12 +347,12 @@ class Replay:
 def teacher(torch, arm, io, desc, task, reset_id, ep_no, chunk, obs,
             elapsed):
     """Изолированный запрос T32 -> (a [8,7], секунды)."""
-    t0 = time.time()
+    t0 = time.monotonic()
     arm.begin(task, reset_id, ep_no)
     arm.call = int(chunk)
     batch, po, s8 = io.prep(obs, desc, task)
     a, _rec = arm.decide(batch, po, s8, int(elapsed))
-    return np.asarray(a, np.float32), time.time() - t0
+    return np.asarray(a, np.float32), time.monotonic() - t0
 
 
 def run_episode_rows(torch, sim, io, arm, e, ref, check_all, raw_ts):
@@ -326,7 +366,7 @@ def run_episode_rows(torch, sim, io, arm, e, ref, check_all, raw_ts):
     ep_no = kh.episode_number(e["eid"])
     q = io.inp.max_act_q
     import k29_policy as kp
-    t0 = time.time()
+    t0 = time.monotonic()
     rp = Replay(sim, io, e["task"], e["pos"])
     prob, tsec = [], []
     if (rp.ih[0][0], rp.ih[1][0]) != (rec["summary"]["init_hash"],
@@ -335,7 +375,8 @@ def run_episode_rows(torch, sim, io, arm, e, ref, check_all, raw_ts):
     wins = set(e["windows"])
     idx = {int(t): i for i, t in enumerate(J["elapsed"])}
     rows = dict(t=[], o0=[], o4=[], s0=[], s4=[], B=[], Y=[], k=[],
-                direct_ok=[])
+                direct_ok=[], prefix_phys=[], rgb0=[], rgb4=[],
+                state0_raw=[], state4_raw=[], obs0_hash=[], obs4_hash=[])
     raws = {}
     first = True
     pend = {}
@@ -355,27 +396,26 @@ def run_episode_rows(torch, sim, io, arm, e, ref, check_all, raw_ts):
                 if not ok:
                     prob.append(f"t={st}: прямой T32 ≠ j_a_codec")
                 first = False
-            pend[st + 4] = dict(t=st, o0=thumbs(torch, rp.obs),
-                                s0=io.inp.state8(rp.obs)[0], B=B,
+            pend[st + 4] = dict(t=st, B=B, prefix_phys=A[st:st + 4],
                                 k=int(J["k"][i]), ok=ok,
                                 raw0=raw_obs(rp.obs) if st in raw_ts
-                                else None)
+                                else None,
+                                **observation_fields(torch, io, rp.obs, 0))
         if st in pend:
             p_ = pend.pop(st)
             Y, ts = teacher(torch, arm, io, desc, e["task"], e["pos"],
                             ep_no, p_["t"] // 8, rp.obs, st)
             tsec.append(ts)
             if check_all:
-                Y2, _ = teacher(torch, arm, io, desc, e["task"], e["pos"],
-                                ep_no, p_["t"] // 8, rp.obs, st)
+                Y2, ts2 = teacher(torch, arm, io, desc, e["task"], e["pos"],
+                                  ep_no, p_["t"] // 8, rp.obs, st)
+                tsec.append(ts2)
                 if not np.array_equal(Y, Y2):
                     prob.append(f"t={st}: повтор off-grid ≠")
-            for kk, v in (("t", p_["t"]), ("o0", p_["o0"]),
-                          ("o4", thumbs(torch, rp.obs)), ("s0", p_["s0"]),
-                          ("s4", io.inp.state8(rp.obs)[0]), ("B", p_["B"]),
-                          ("Y", Y), ("k", p_["k"]),
-                          ("direct_ok", -1 if p_["ok"] is None
-                           else int(p_["ok"]))):
+            p_.update(observation_fields(torch, io, rp.obs, 4))
+            p_.update(Y=Y, direct_ok=-1 if p_["ok"] is None else int(p_["ok"]))
+            for kk in rows:
+                v = p_[kk]
                 rows[kk].append(v)
             if p_["raw0"] is not None:
                 raws[p_["t"]] = dict(o0=p_["raw0"], o4=raw_obs(rp.obs))
@@ -393,12 +433,12 @@ def run_episode_rows(torch, sim, io, arm, e, ref, check_all, raw_ts):
         np.zeros((0, 11))
     out["state11_4"] = km.state11(out["s4"]) if len(out["s4"]) else \
         np.zeros((0, 11))
-    return out, raws, prob, dict(replay_s=time.time() - t0 - sum(tsec),
+    return out, raws, prob, dict(replay_s=time.monotonic() - t0 - sum(tsec),
                                  teacher_s=sum(tsec), n_teacher=len(tsec),
                                  phys=10 + len(A))
 
 
-def run_sister(torch, sim, io, arm, e, ref, sis, C):
+def run_sister(torch, sim, io, arm, e, ref, sis, C, nominal):
     """Префикс из reset до t, затем 4 команды с ±δ на индексах 1, 2."""
     import k29_policy as kp
     import k36_harness as kh
@@ -409,17 +449,23 @@ def run_sister(torch, sim, io, arm, e, ref, sis, C):
     i = {int(tt): j for j, tt in enumerate(J["elapsed"])}[t]
     B = np.asarray(J["a_codec"][i], np.float32)
     P = B[:4].copy()
-    d = SIS_DELTA * float(C["half"][sis["axis"]]) * sis["sign"]
-    for j in (1, 2):
-        P[j, sis["axis"]] = np.clip(P[j, sis["axis"]] + d,
-                                    C["L"][sis["axis"]], C["U"][sis["axis"]])
+    if sis["sign"]:
+        axis = sis["axis"]
+        delta = SIS_DELTA * float(C["half"][axis]) * sis["sign"]
+        for j in (1, 2):
+            P[j, axis] = np.clip(P[j, axis] + delta, C["L"][axis], C["U"][axis])
     phys = kp.scale_exec(P[None], io.inp.max_act_q)[0]
+    start = time.monotonic()
     rp = Replay(sim, io, e["task"], e["pos"])
     prob = []
+    if (rp.ih[0][0], rp.ih[1][0]) != (rec["summary"]["init_hash"],
+                                      rec["summary"]["init_hash_full"]):
+        prob.append("сестра: post-wait хеши ≠ архиву")
     for st in range(t):
         rp.step(A[st])
-    o0 = thumbs(torch, rp.obs)
-    s0 = io.inp.state8(rp.obs)[0]
+    o0 = observation_fields(torch, io, rp.obs, 0)
+    if o0["obs0_hash"] != nominal["obs0_hash"]:
+        prob.append("сестра: o0 ≠ номинальному наблюдению")
     if not np.array_equal(phys[0], A[t]):
         prob.append("действие до возмущения ≠ архиву")
     alive = 0
@@ -428,20 +474,29 @@ def run_sister(torch, sim, io, arm, e, ref, sis, C):
             break
         rp.step(phys[j])
         alive += 1
-    Y = None
+    o_mid = observation_fields(torch, io, rp.obs, 4)
+    Y, ts = None, 0.0
     if rp.done_step < 0 and alive == 4:
-        Y, _ts = teacher(torch, arm, io, io.task_desc(e["task"]), e["task"],
-                         e["pos"], kh.episode_number(e["eid"]), t // 8,
-                         rp.obs, t + 4)
+        Y, ts = teacher(torch, arm, io, io.task_desc(e["task"]), e["task"],
+                        e["pos"], kh.episode_number(e["eid"]), t // 8,
+                        rp.obs, t + 4)
+    if sis["sign"] == 0 and (Y is None or
+                            not np.array_equal(phys, A[t:t + 4]) or
+                            o_mid["obs4_hash"] != nominal["obs4_hash"] or
+                            not np.array_equal(Y, nominal["Y"])):
+        prob.append("нулевой повтор: действия, o4 или Y ≠ номиналу")
+    # Фотография из обрыва имеет собственную отметку и не служит входом o4.
     out = dict(t=np.array(t), axis=np.array(sis["axis"]),
                sign=np.array(sis["sign"]), B=B, issued=B[:4],
                executed=P, amp=np.array(float(P[1, sis["axis"]] -
                                               B[1, sis["axis"]])),
-               o0=o0, o4=thumbs(torch, rp.obs), s0=s0,
-               s4=io.inp.state8(rp.obs)[0], alive=np.array(alive),
+               prefix_phys=phys[:alive], alive=np.array(alive),
+               terminal_step=np.array(rp.done_step), has_o4=np.array(alive == 4),
                Y=Y if Y is not None else np.zeros((8, 7), np.float32),
-               has_y=np.array(Y is not None))
-    return out, prob, dict(phys=10 + t + alive)
+               has_y=np.array(Y is not None), **o0, **o_mid)
+    return out, prob, dict(phys=10 + t + alive, teacher_s=ts,
+                           n_teacher=int(Y is not None),
+                           replay_s=time.monotonic() - start - ts)
 
 
 # --- исполнение с журналом -----------------------------------------------------------------
@@ -460,13 +515,17 @@ def write_shard(path, data, meta):
 def shard_ok(path, job, plan_sha):
     if not os.path.exists(path):
         return None
-    z = dict(np.load(path, allow_pickle=False))
-    m = json.loads(str(z["meta"]))
-    if m.get("job") != job or m.get("plan") != plan_sha or m.get("problems"):
-        return False
-    for k, v in z.items():
-        if v.dtype.kind == "f" and not np.isfinite(v).all():
+    with np.load(path, allow_pickle=False) as z:
+        m = json.loads(str(z["meta"]))
+        phys = m.get("phys")
+        if (m.get("job") != job or m.get("plan") != plan_sha or
+                m.get("problems") or type(phys) is not int or
+                not 0 < phys <= EP):
             return False
+        for k in z.files:
+            v = z[k]
+            if v.dtype.kind == "f" and not np.isfinite(v).all():
+                return False
     return m
 
 
@@ -474,9 +533,67 @@ def jobs_of(plan, splits, with_sisters):
     js = [("ep", e) for e in plan["episodes"] if e["split"] in splits]
     if with_sisters:
         by = {e["eid"]: e for e in plan["episodes"]}
-        js += [("sis", dict(by[s["eid"]], sis=s)) for s in plan["sisters"]
+        which = "micro_sisters" if splits == ("micro",) else "sisters"
+        js += [("sis", dict(by[s["eid"]], sis=s)) for s in plan.get(which, [])
                if not s["missing"]]
     return js
+
+
+def job_name(tag, kind, e):
+    return f"{tag}/{e['eid'] if kind == 'ep' else e['sis']['job']}"
+
+
+def nominal_window(run, tag, e):
+    """Один проверенный выше в той же очереди номинальный результат."""
+    path = shard_path(run, job_name(tag, "ep", e))
+    with np.load(path, allow_pickle=False) as z:
+        ix = np.flatnonzero(z["t"] == e["sis"]["t"])
+        if len(ix) != 1:
+            raise SystemExit(f"{path}: нет единственного номинального окна")
+        return {k: z[k][ix[0]] for k in ("obs0_hash", "obs4_hash", "Y")}
+
+
+def restore_pending(run, plan, ledger):
+    pending = ledger.d["pending"]
+    if pending is None:
+        return
+    scope = pending["scope"]
+    if scope == "checks":
+        tag, splits = "micro", ("micro",)
+    elif scope == "cache":
+        tag, splits = "cache", TRAIN_SPLITS
+    else:
+        raise SystemExit(f"резерв с неизвестной областью {scope}")
+    job = pending["id"]
+    expected = {job_name(tag, k, e) for k, e in jobs_of(plan, splits, True)}
+    if job not in expected or pending["amount"] != EP:
+        raise SystemExit(f"резерв {job} не соответствует data_plan")
+    m = shard_ok(shard_path(run, job), job, plan["sha256"])
+    if m is False:
+        raise SystemExit(f"{job}: повреждён записанный шард резерва")
+    if m:
+        ledger.settle(job, m["phys"])
+
+
+def sister_report(run, tag, plan):
+    which = "micro_sisters" if tag == "micro" else "sisters"
+    count = dict(planned=0, both_live=0, different_obs=0, different_target=0)
+    for spec in plan[which]:
+        if spec["missing"] or spec["sign"] != 1:
+            continue
+        count["planned"] += 1
+        plus = f"{tag}/{spec['job']}"
+        minus = plus.rsplit("/", 1)[0] + "/-1"
+        with np.load(shard_path(run, plus), allow_pickle=False) as pos, \
+                np.load(shard_path(run, minus), allow_pickle=False) as neg:
+            if bool(pos["has_y"]) and bool(neg["has_y"]):
+                count["both_live"] += 1
+                count["different_obs"] += int(pos["obs4_hash"] != neg["obs4_hash"])
+                yp, yn = pos["Y"][:4], neg["Y"][:4]
+                count["different_target"] += int(
+                    np.max(np.abs(yp[:, :6] - yn[:, :6])) > 1e-5 or
+                    not np.array_equal(yp[:, 6], yn[:, 6]))
+    return count
 
 
 def execute(a, splits, with_sisters, check_all, scope, tag):
@@ -490,6 +607,8 @@ def execute(a, splits, with_sisters, check_all, scope, tag):
     run = a.run_id
     plan = load_data_plan(run)
     k36 = pc.load_prepare()
+    if k36["sha1"] != plan["k36_prepare_sha1"]:
+        raise SystemExit("prepare K-36 ≠ data_plan")
     tp = kgr.threads_problems(torch)
     if tp:
         raise SystemExit("потоки: " + "; ".join(tp))
@@ -497,14 +616,23 @@ def execute(a, splits, with_sisters, check_all, scope, tag):
     idx = kcf.dev_index(a.device)
     g = kcf.gpu_query(idx)
     rd = rep_dir(run)
-    locks = [kcf.Lock(os.path.join(rd, f".{tag}.lock"), tag, SystemExit)]
+    locks = [kcf.Lock(os.path.join(rd, ".ledger.lock"),
+                     f"журнал {run}", kcf.Busy)]
     try:
         locks.append(kcf.Lock(os.path.join(kcf.lock_dir(),
                                            g["uuid"] + ".lock"),
                               f"карта {g['uuid']}", kcf.Busy))
         kcf.check_gpu(idx, kcf.RES["min_free_gb"])
         kcf.check_disk(rd)
-        L = kcol.Ledger(os.path.join(rd, "ledger.json"), CAPS)
+        if scope == "cache":
+            mp = os.path.join(rd, "micro.json")
+            if not os.path.exists(mp):
+                raise SystemExit("сначала выполните micro для этого data_plan")
+            m = pc.load_json(mp)
+            if m.get("rc") != 0 or m.get("plan_sha256") != plan["sha256"]:
+                raise SystemExit("micro не пройден для этого data_plan")
+        L = kcol.Ledger(os.path.join(rd, "ledger.json"), plan["caps"])
+        restore_pending(run, plan, L)
         raw_ts = {}
         for r in plan["raw_pairs"]:
             raw_ts.setdefault(r["eid"], set()).add(r["t"])
@@ -522,22 +650,24 @@ def execute(a, splits, with_sisters, check_all, scope, tag):
                 v = kh.load_source(torch, s, a.device)
                 arm = kh.make_arm(torch, k36, f"T32_s{s}", v)
                 for kind, e in js:
-                    job = (f"{tag}/{e['eid']}" if kind == "ep" else
-                           f"{tag}/{e['sis']['job']}")
+                    job = job_name(tag, kind, e)
                     path = shard_path(run, job)
                     m = shard_ok(path, job, plan["sha256"])
                     if m:
-                        if not L.is_done(job):
-                            L.settle(job, m["phys"])
+                        if L.d["done"].get(job) != dict(scope=scope,
+                                                        actual=m["phys"]):
+                            raise SystemExit(f"{job}: шард ≠ журналу")
+                        stats.append(m)
                         continue
                     if m is False:
                         raise SystemExit(f"{path}: шард с проблемами или "
                                          f"чужой — разбор вручную")
                     if L.is_done(job):
                         raise SystemExit(f"{job}: учтён, шарда нет")
+                    ref = load_input(run, e)
+                    nominal = nominal_window(run, tag, e) if kind == "sis" else None
                     kcf.check_disk(rd)
                     L.reserve(scope, job, amount=EP)
-                    ref = load_input(run, e)
                     if kind == "ep":
                         data, raws, prob, st = run_episode_rows(
                             torch, sim, v["io"], arm, e, ref, check_all,
@@ -551,21 +681,19 @@ def execute(a, splits, with_sisters, check_all, scope, tag):
                                              problems=[]))
                     else:
                         data, prob, st = run_sister(torch, sim, v["io"], arm,
-                                                    e, ref, e["sis"], C)
+                                                    e, ref, e["sis"], C, nominal)
                     meta = dict(job=job, plan=plan["sha256"], eid=e["eid"],
                                 seed=s, task=e["task"], case_id=e["case_id"],
                                 split=e["split"], kind=kind, problems=prob,
                                 **st)
                     write_shard(path, data, meta)
-                    stats.append(dict(job=job, problems=prob, **st))
+                    stats.append(meta)
                     if prob or not shard_ok(path, job, plan["sha256"]):
                         print(f"  {job}: ПРОБЛЕМЫ {prob[:3]} — резерв "
                               f"открыт, остановка", flush=True)
                         return 3, stats
                     L.commit(job, st["phys"])
-                    n = sum(1 for _k, x in js if L.is_done(
-                        f"{tag}/{x['eid']}" if _k == "ep" else
-                        f"{tag}/{x['sis']['job']}"))
+                    n = sum(L.is_done(job_name(tag, k, x)) for k, x in js)
                     print(f"  s{s} {kind} {e['case_id']} {e['split']}: "
                           f"окон {len(data['t']) if kind == 'ep' else 1}, "
                           f"replay {st.get('replay_s', 0):.1f} с, учитель "
@@ -587,38 +715,51 @@ def execute(a, splits, with_sisters, check_all, scope, tag):
 
 def micro(a):
     import k36_protocol as pc
-    rc, st = execute(a, ("micro",), False, True, "checks", "micro")
-    eps = [x for x in st if "job" in x]
-    rep = dict(rc=rc, episodes=eps, tail=st[-1] if st and "peak_gb" in
-               st[-1] else None, time=time.strftime("%Y-%m-%dT%H:%M:%S"))
-    if eps:
+    rc, st = execute(a, ("micro",), True, True, "checks", "micro")
+    plan = load_data_plan(a.run_id, verify=False)
+    eps = [x for x in st if x.get("kind") == "ep"]
+    sibs = [x for x in st if x.get("kind") == "sis"]
+    rep = dict(rc=rc, plan_sha256=plan["sha256"], episodes=eps, sisters=sibs,
+               tail=st[-1] if st and "peak_gb" in st[-1] else None,
+               time=time.strftime("%Y-%m-%dT%H:%M:%S"))
+    if rc == 0 and eps:
         rs = np.mean([x["replay_s"] for x in eps])
         tq = np.sum([x["teacher_s"] for x in eps]) / max(
             1, np.sum([x["n_teacher"] for x in eps]))
-        plan = load_data_plan(a.run_id, verify=False)
         nw = sum(len(e["windows"]) for e in plan["episodes"]
-                 if e["split"] in ("gen", "sel", "diag"))
-        ne = sum(e["split"] in ("gen", "sel", "diag")
+                 if e["split"] in TRAIN_SPLITS)
+        ne = sum(e["split"] in TRAIN_SPLITS for e in plan["episodes"])
+        nd = sum(e["split"] in TRAIN_SPLITS and bool(e["windows"])
                  for e in plan["episodes"])
         ns = sum(not s["missing"] for s in plan["sisters"])
-        eta = (ne * rs + (nw + ne) * tq + ns * (rs * 0.6 + tq)) / 3600
+        short_s = (np.mean([x["replay_s"] + x["teacher_s"] for x in sibs])
+                   if sibs else rs * 0.6 + tq)
+        eta = (ne * rs + (nw + nd) * tq + ns * short_s) / 3600
         rep["eta_h"] = float(eta)
         print(f"  micro: эпизодов {len(eps)}, replay {rs:.1f} с/эп, учитель "
               f"{tq:.2f} с/вызов; collect: {ne} эп., {nw} окон, {ns} сестёр "
               f"-> ориентировочно {eta:.1f} ч", flush=True)
+        rep["forks"] = sister_report(a.run_id, "micro", plan)
+        if sibs:
+            print(f"  micro: сёстры {rep['forks']}; "
+                  f"короткий повтор {short_s:.1f} с в среднем", flush=True)
     pc.save_json(os.path.join(rep_dir(a.run_id), "micro.json"), rep)
     print("  micro: " + ("пройден" if rc == 0 else "НЕ пройден"))
     return rc
 
 
 def collect(a):
-    rc, st = execute(a, ("gen", "sel", "diag"), True, False, "cache",
+    rc, st = execute(a, TRAIN_SPLITS, True, False, "cache",
                      "cache")
     import k36_protocol as pc
-    pc.save_json(os.path.join(rep_dir(a.run_id), "collect_last.json"),
-                 dict(rc=rc, n=len([x for x in st if "job" in x]),
-                      tail=st[-1] if st and "peak_gb" in st[-1] else None,
-                      time=time.strftime("%Y-%m-%dT%H:%M:%S")))
+    rep = dict(rc=rc, n=len([x for x in st if "job" in x]),
+               tail=st[-1] if st and "peak_gb" in st[-1] else None,
+               time=time.strftime("%Y-%m-%dT%H:%M:%S"))
+    if rc == 0:
+        plan = load_data_plan(a.run_id, verify=False)
+        rep["forks"] = sister_report(a.run_id, "cache", plan)
+        print(f"  collect: сёстры {rep['forks']}", flush=True)
+    pc.save_json(os.path.join(rep_dir(a.run_id), "collect_last.json"), rep)
     print("  collect: " + ("завершён" if rc == 0 else "остановлен"))
     return rc
 
@@ -630,15 +771,75 @@ def status(a):
                                                             spent={},
                                                             pending=None,
                                                             crashes=[])
-    for tag, splits, sis in (("micro", ("micro",), False),
-                             ("cache", ("gen", "sel", "diag"), True)):
-        js = jobs_of(plan, splits, sis)
-        names = [f"{tag}/{e['eid']}" if k == "ep" else f"{tag}/{e['sis']['job']}"
-                 for k, e in js]
+    for tag, splits in (("micro", ("micro",)), ("cache", TRAIN_SPLITS)):
+        js = jobs_of(plan, splits, True)
+        names = [job_name(tag, k, e) for k, e in js]
         print(f"  {tag}: {sum(n in d['done'] for n in names)}/{len(names)}")
     print(f"  расход {d['spent']}; резерв {(d['pending'] or {}).get('id', '—')}"
           f"; аварий {len(d['crashes'])}")
     return 0
+
+
+def selftest_replay(torch):
+    import tempfile
+    import k31_collect as kcol
+    from k32_ppo import ToySim
+
+    class Sim(ToySim):
+        def _obs(self):
+            obs = super()._obs()
+            for key in CAMERAS:
+                obs[key] = np.broadcast_to(obs[key][:, :1, :1],
+                                           (1, 224, 224, 3)).copy()
+            return obs
+
+    class IO(kcol.FakeIO):
+        @property
+        def inp(self):
+            return self
+
+        def state8(self, obs):
+            return np.asarray(obs["state"][:, :8], np.float64)
+
+    class Arm(kcol.FakeAgent):
+        def begin(self, task, init, episode=None):
+            super().begin(task, init)
+
+    io, arm = IO(), Arm()
+    bas = kcol.run_episode(Sim(), io, arm, 0, 2)
+    B = bas["calls"][0]["a_codec"]
+    e = dict(eid="toy", task=0, pos=2, windows=[0])
+    ref = (dict(summary=bas), dict(actions=bas["actions"],
+                                   j_elapsed=np.array([0]),
+                                   j_a_codec=B[None], j_k=np.array([8])))
+    out, _, prob, _ = run_episode_rows(torch, Sim(), io, arm, e, ref,
+                                       True, set())
+    assert not prob, prob
+    assert out["rgb4"].shape == (1, 2, 224, 224, 3)
+    assert out["rgb4"].dtype == np.uint8
+    assert np.array_equal(out["prefix_phys"][0], bas["actions"][:4])
+    nominal = {k: out[k][0] for k in ("obs0_hash", "obs4_hash", "Y")}
+    C = dict(half=np.ones(6), L=-np.ones(6), U=np.ones(6))
+    sibs = []
+    for sign in (0, 1, -1):
+        spec = dict(t=0, axis=0, sign=sign)
+        data, prob, _ = run_sister(torch, Sim(), io, arm, e, ref, spec, C,
+                                     nominal)
+        assert not prob and bool(data["has_y"]), prob
+        assert data["obs0_hash"] == nominal["obs0_hash"]
+        sibs.append(data)
+    assert np.array_equal(sibs[0]["rgb4"], out["rgb4"][0])
+    assert np.array_equal(sibs[0]["state4_raw"], out["state4_raw"][0])
+    assert sibs[1]["obs4_hash"] != sibs[2]["obs4_hash"]
+    assert not np.array_equal(sibs[1]["Y"], sibs[2]["Y"])
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "row.npz")
+        write_shard(path, out, dict(job="toy", plan="test", phys=22,
+                                    problems=[]))
+        assert shard_ok(path, "toy", "test")
+        with np.load(path, allow_pickle=False) as z:
+            assert np.array_equal(z["rgb4"], out["rgb4"])
+            assert np.array_equal(z["state4_raw"], out["state4_raw"])
 
 
 def selftest():
@@ -677,10 +878,13 @@ def selftest():
     t2 = thumbs(torch, dict(agentview_image=img2,
                             robot0_eye_in_hand_image=img2))
     assert t2[0, 1, :, -1].min() == 255 and t2[0, 1, :, 0].max() == 0
-    assert CAPS["cache"] == 263520 and CAPS["checks"] == 29280
+    assert profile_caps("f1") == dict(cache=263520, checks=29280)
+    assert profile_caps("f2") == dict(cache=497760, checks=29280)
+    selftest_replay(torch)
     print("самопроверка k39_cache пройдена: разбиение 32/16/12/1 без сцен "
           "g1, детерминизм; окна (j_k ≥ 5, t + 8 ≤ 600, ≤ 8 групп); "
-          "миниатюры 2×3×48×48 uint8; лимиты 263 520 / 29 280")
+          "исходные кадры и миниатюры; нулевой и два сестринских повтора; "
+          "лимиты f1/f2 263 520 / 497 760")
     return 0
 
 
@@ -691,6 +895,7 @@ def main():
     ap.add_argument("cmd", choices=("prepare-data", "micro", "collect",
                                     "status"))
     ap.add_argument("--run-id", required=True)
+    ap.add_argument("--profile", choices=tuple(FORK_SCENES))
     ap.add_argument("--archive", default="reports/k37c/runs/c2")
     ap.add_argument("--device", default="cuda:0")
     a = ap.parse_args()
