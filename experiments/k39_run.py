@@ -307,8 +307,8 @@ class Heads:
         return v, torch.as_tensor(s11[0], dtype=torch.float32,
                                   device=self.dev)
 
-    def start(self, B, t, sense0):
-        """x0 и банк C1/C2 (кодек) из сохранённого o0."""
+    def context(self, B, t, sense0):
+        """x0 и нормированный хвост B — без генерации кандидатов."""
         torch, km = self.torch, self.km
         v0, s0 = sense0
         bf = torch.as_tensor(km.chunk_feat(B, self.C), device=self.dev)
@@ -316,6 +316,13 @@ class Heads:
                                                  device=self.dev)])[None]
         b_arm = torch.as_tensor(km.norm_arm(B[4:8], self.C)[None],
                                 dtype=torch.float32, device=self.dev)
+        return dict(x0=x0, b_arm=b_arm, cands=None)
+
+    def start(self, B, t, sense0):
+        """Контекст и банк C1/C2 (кодек) из сохранённого o0 (дерево)."""
+        torch, km = self.torch, self.km
+        st = self.context(B, t, sense0)
+        x0, b_arm = st["x0"], st["b_arm"]
         with torch.no_grad():
             alts = km.gen_alts(torch, self.m["gen2"], x0, b_arm, 2)
         cands = [B[4:8].astype(np.float32)]
@@ -351,6 +358,41 @@ class Heads:
 
 
 # --- эпизод 4+4 ------------------------------------------------------------------------------------
+def chunk_start(heads, policy, B, t, obs, s8):
+    """Начало чанка: дерево — признаки o0, контекст и банк; flat — признаки
+    o0 и контекст; T1 / Refresh4 — ничего."""
+    if policy in ("TreeOld", "TreeFresh"):
+        sense0 = heads.sense(dict(obs, s8=s8))
+        return dict(heads.start(B, t, sense0), sense0=sense0)
+    if policy == "FlatFresh":
+        sense0 = heads.sense(dict(obs, s8=s8))
+        return dict(heads.context(B, t, sense0), sense0=sense0)
+    return None
+
+
+def chunk_mid(heads, policy, st, B, obs_mid, io, arm, desc, task, t):
+    """Решение в o4 -> (хвост [4,7], выбор, оценки, новый прогноз)."""
+    if policy == "TreeOld":
+        ch, sc = heads.select(st, st["sense0"])
+        return st["cands"][ch], ch, sc, None
+    if policy == "TreeFresh":
+        ch, sc = heads.select(st, heads.sense(dict(
+            obs_mid, s8=io.inp.state8(obs_mid))))
+        return st["cands"][ch], ch, sc, None
+    if policy == "FlatFresh":
+        return heads.flat(st, heads.sense(dict(
+            obs_mid, s8=io.inp.state8(obs_mid)))), 0, None, None
+    if policy == "Refresh4":
+        saved = arm.last
+        call = arm.call
+        b2, p2, s82 = io.prep(obs_mid, desc, task)
+        r2, _r = arm.decide(b2, p2, s82, t + 4)
+        arm.last, arm.call = saved, call
+        r2 = np.asarray(r2, np.float32)
+        return r2[:4], 0, None, r2
+    return B[4:8], 0, None, None
+
+
 def run_episode(sim, io, arm, heads, policy, task, reset_id):
     """Цикл с решением после четырёх реальных шагов. arm — k32_policy.Arm
     (детерминированный T); heads — Heads или None для T1/Refresh4."""
@@ -399,11 +441,7 @@ def run_episode(sim, io, arm, heads, policy, task, reset_id):
             batch, po, s8 = io.prep(obs, desc, task)
             B, rec = arm.decide(batch, po, s8, t)
             B = np.asarray(B, np.float32)
-            st = None
-            if heads is not None and policy != "T1":
-                obs_s = dict(obs, s8=s8)
-                sense0 = heads.sense(obs_s)
-                st = heads.start(B, t, sense0)
+            st = chunk_start(heads, policy, B, t, obs, s8)
             prefix = io.scale(B[None])[0][:4]
             k = 0
             for j in range(4):
@@ -415,26 +453,8 @@ def run_episode(sim, io, arm, heads, policy, task, reset_id):
             final = B.copy()
             choice, scores, refresh_a = 0, None, None
             if mid:
-                if policy == "TreeOld":
-                    choice, scores = heads.select(st, sense0)
-                    final[4:8] = st["cands"][choice]
-                elif policy == "TreeFresh":
-                    s8m = io.inp.state8(obs)
-                    choice, scores = heads.select(st, heads.sense(
-                        dict(obs, s8=s8m)))
-                    final[4:8] = st["cands"][choice]
-                elif policy == "FlatFresh":
-                    s8m = io.inp.state8(obs)
-                    final[4:8] = heads.flat(st, heads.sense(dict(obs,
-                                                                 s8=s8m)))
-                elif policy == "Refresh4":
-                    rec_saved = arm.last
-                    arm.call = call - 1
-                    b2, p2, s82 = io.prep(obs, desc, task)
-                    refresh_a, _r2 = arm.decide(b2, p2, s82, t + 4)
-                    refresh_a = np.asarray(refresh_a, np.float32)
-                    arm.last = rec_saved
-                    final[4:8] = refresh_a[:4]
+                final[4:8], choice, scores, refresh_a = chunk_mid(
+                    heads, policy, st, B, obs, io, arm, desc, task, t)
                 tail = io.scale(final[None])[0][4:8]
                 for j in range(4):
                     if done_step >= 0 or steps >= kcol.ENV["max_steps"]:
@@ -446,7 +466,7 @@ def run_episode(sim, io, arm, heads, policy, task, reset_id):
                               final=final, mid=bool(mid), choice=int(choice),
                               scores=None if scores is None else
                               np.asarray(scores, np.float32),
-                              cands=None if st is None else st["cands"],
+                              cands=None if st is None else st.get("cands"),
                               refresh=refresh_a))
     finally:
         arm.forward = fwd0
@@ -560,6 +580,19 @@ def ep_problems(z, meta, policy, C, want_hash=None):
         p.append(f"тяжёлых вызовов {meta['heavy']} ≠ {want_heavy}")
     if meta["phys"] != 10 + len(A) or s["steps"] != len(A):
         p.append("расход ≠ шагам")
+    if not np.array_equal(K["mid"], np.asarray(J["k"]) > 4):
+        p.append("mid ≠ (k > 4)")
+    ss, ds, st_ = s["success_step"], s["done_step"], s["steps"]
+    if s["success"]:
+        if not (0 <= ss < st_ and (ds < 0 or ss <= ds)):
+            p.append("success_step несогласован с успехом")
+    elif ss != -1:
+        p.append("success_step при неуспехе")
+    if ds >= 0:
+        if ds + 1 != st_ or s["own_steps"] != st_:
+            p.append("done_step/steps несогласованы")
+    elif st_ != 600 or s["own_steps"] != st_:
+        p.append("без terminal эпизод не дошёл до лимита")
     return p
 
 
@@ -576,6 +609,32 @@ def shard_meta(path):
         return json.loads(str(z["meta"]))
 
 
+def check_shard(run, j, plan, C, tag, after=None, done=None):
+    """-> (meta, problems): job, план, расход, полная проверка эпизода,
+    дополнительная сверка; done — запись журнала (если есть)."""
+    path = shard_path(run, j["job"])
+    m = shard_meta(path)
+    if m is None:
+        return None, ["нет шарда"]
+    p = []
+    if m.get("job") != j["job"] or m.get("plan") != plan["sha256"]:
+        p.append("шард чужого задания или плана")
+    if type(m.get("phys")) is not int or not 0 < m["phys"] <= EP:
+        p.append(f"расход {m.get('phys')} вне 1…{EP}")
+    if m.get("problems"):
+        p.append(f"записанные проблемы {m['problems'][:2]}")
+    if p:
+        return m, p
+    with np.load(path, allow_pickle=False) as z:
+        zz = dict(z)
+    p += ep_problems(zz, m, j["policy"], C, j["scene"].get("hash"))
+    if after:
+        p += after(j, zz, m)
+    if done is not None and done != dict(scope=tag, actual=m["phys"]):
+        p.append(f"журнал {done} ≠ записи")
+    return m, p
+
+
 def load_heads(torch, run, plan, s, C, dev):
     import k39_model as km
     m = km.load_models(torch, run, s, dev, plan["data_plan_sha256"],
@@ -583,7 +642,7 @@ def load_heads(torch, run, plan, s, C, dev):
     return Heads(torch, m, C, dev)
 
 
-def admitted(run, uuid, torch):
+def admitted(run, uuid, torch, plan_sha):
     import k36_protocol as pc
     import k38_grip_run as kgr
     p = os.path.join(screen_dir(run), "preflight",
@@ -591,8 +650,9 @@ def admitted(run, uuid, torch):
     if not os.path.exists(p):
         raise SystemExit(f"карта {uuid} не прошла preflight K-39")
     r = pc.load_json(p)
-    if not r.get("admitted") or r.get("env") != kgr.env_record(torch):
-        raise SystemExit("preflight: не допущена или среда изменилась")
+    if not r.get("admitted") or r.get("env") != kgr.env_record(torch) or \
+            r.get("plan") != plan_sha:
+        raise SystemExit("preflight: не допущена, другой план или среда")
     return r
 
 
@@ -623,8 +683,17 @@ def run_queue(a, jobs, scope_dir, caps, tag, validate_plan, sim_kind,
         L = kcol.Ledger(os.path.join(scope_dir, "ledger.json"), caps)
         pd = L.d["pending"]
         if pd:
-            m = shard_meta(shard_path(a.run_id, pd["id"]))
-            if m and m.get("plan") == plan["sha256"] and not m.get("problems"):
+            byjob = {j["job"]: j for j in jobs}
+            if pd["id"] not in byjob or pd["scope"] != tag or \
+                    pd["amount"] != EP:
+                raise SystemExit(f"открытый резерв {pd['id']} не из этой "
+                                 f"очереди")
+            m, pr = check_shard(a.run_id, byjob[pd["id"]], plan, C, tag,
+                                after)
+            if m is not None:
+                if pr:
+                    raise SystemExit(f"записанный эпизод резерва {pd['id']} "
+                                     f"не прошёл проверку: {pr[:3]}")
                 L.settle(pd["id"], m["phys"])
         sim = kb36.BankSim("bank", sim_kind[0], bank_dir=sim_kind[1])
         dev = torch.device(a.device)
@@ -643,13 +712,11 @@ def run_queue(a, jobs, scope_dir, caps, tag, validate_plan, sim_kind,
                     any(j["policy"] in MAIN[1:] for j in js) else None
                 for j in js:
                     path = shard_path(a.run_id, j["job"])
-                    m = shard_meta(path)
-                    if m is not None:
-                        if m.get("plan") != plan["sha256"] or \
-                                m.get("problems") or L.d["done"].get(
-                                    j["job"]) != dict(scope=tag,
-                                                      actual=m["phys"]):
-                            raise SystemExit(f"{path}: шард ≠ журналу/плану")
+                    if shard_meta(path) is not None:
+                        m, pr = check_shard(a.run_id, j, plan, C, tag, after,
+                                            L.d["done"].get(j["job"]))
+                        if pr:
+                            raise SystemExit(f"{path}: {pr[:3]}")
                         res.append((j, m))
                         continue
                     if L.is_done(j["job"]):
@@ -660,11 +727,7 @@ def run_queue(a, jobs, scope_dir, caps, tag, validate_plan, sim_kind,
                     ep = run_episode(sim, v["io"], arm, heads, j["policy"],
                                      j["scene"]["task"], j["scene"]["pos"])
                     meta = save_ep(path, j["job"], ep, plan["sha256"])
-                    with np.load(path, allow_pickle=False) as z:
-                        prob = ep_problems(dict(z), meta, j["policy"], C,
-                                           j["scene"].get("hash"))
-                        if after:
-                            prob += after(j, dict(z), meta)
+                    _m, prob = check_shard(a.run_id, j, plan, C, tag, after)
                     if prob:
                         meta["problems"] = prob
                         with np.load(path, allow_pickle=False) as z:
@@ -709,16 +772,19 @@ def preflight(a):
            if e["split"] == "micro"}
     picks = [eps[(0, 0)], eps[(1, 8)]]
     jobs = []
-    for e in picks:
+    for e in picks:  # имена дополняются хостом/UUID ниже
         sc = dict(task=e["task"], case_id=e["case_id"], pos=e["pos"],
                   hash=e["hash"])
         for pol in ("T1", "TreeFresh", "FlatFresh"):
             jobs.append(dict(job=f"pf/{pol}/s{e['seed']}/t{e['task']}/"
                              f"{e['case_id']}", policy=pol, seed=e["seed"],
                              scene=sc, eid=e["eid"]))
-    g = kcf.gpu_query(kcf.dev_index(a.device))
-    d = os.path.join(screen_dir(a.run_id), "preflight",
-                     f"{socket.gethostname()}__{g['uuid']}")
+    idx = kcf.dev_index(a.device)
+    g = kcf.gpu_query(idx)
+    tagc = f"{socket.gethostname()}__{g['uuid']}"
+    for j in jobs:                          # шарды допуска — свои у карты
+        j["job"] = j["job"].replace("pf/", f"pf/{tagc}/", 1)
+    d = os.path.join(screen_dir(a.run_id), "preflight", tagc)
     os.makedirs(d, exist_ok=True)
     refs = {e["eid"]: kc.load_input(a.run_id, e) for e in picks}
 
@@ -744,7 +810,8 @@ def preflight(a):
         with np.load(shard_path(a.run_id, j["job"]), allow_pickle=False) as z:
             K = {k[2:]: z[k] for k in z.files if k.startswith("k_")}
             i = int(np.flatnonzero(K["mid"])[0]) if K["mid"].any() else -1
-            first[j["job"]] = dict(
+            key = j["job"].replace(f"pf/{tagc}/", "pf/", 1)
+            first[key] = dict(mid=bool(i >= 0),
                 success=m["summary"]["success"], call=i,
                 choice=int(K["choice"][i]) if i >= 0 else -1,
                 tail=K["final"][i][4:8].tolist() if i >= 0 else None)
@@ -753,14 +820,19 @@ def preflight(a):
     if a.reference:
         if rc == OK:
             pc.save_json(refp, dict(first=first, uuid=g["uuid"],
-                                    host=socket.gethostname()))
+                                    host=socket.gethostname(),
+                                    plan=plan["sha256"]))
     else:
         if not os.path.exists(refp):
             raise SystemExit("нет эталона: preflight --reference")
-        ref = pc.load_json(refp)["first"]
+        refd = pc.load_json(refp)
+        if refd.get("plan") != plan["sha256"]:
+            raise SystemExit("эталон допуска от другого плана")
+        ref = refd["first"]
         for k_, v in first.items():
             r = ref.get(k_)
-            if r is None or r["choice"] != v["choice"] or \
+            if r is None or r["mid"] != v["mid"] or r["call"] != v["call"] \
+                    or r["choice"] != v["choice"] or \
                     r["success"] != v["success"] or (
                         v["tail"] is not None and np.abs(
                             np.subtract(r["tail"], v["tail"]))[:, :6].max()
@@ -769,8 +841,7 @@ def preflight(a):
                 prob.append(f"{k_}: решение первой развилки ≠ эталону")
     rep = dict(admitted=not prob, problems=prob, first=first,
                env=kgr.env_record(torch), uuid=g["uuid"],
-               peak_gb=float(torch.cuda.max_memory_reserved() / 2 ** 30)
-               if torch.cuda.is_available() else 0.0,
+               peak_gb=float(torch.cuda.max_memory_reserved(idx) / 2 ** 30),
                plan=plan["sha256"])
     pc.save_json(d + ".json", rep)
     print(f"  preflight K-39 {a.device}: " + ("ДОПУЩЕНА" if not prob else
@@ -795,7 +866,7 @@ def collect(a):
             g["uuid"] or asg.get("host") != socket.gethostname() or \
             asg.get("state") != "assigned":
         raise SystemExit(f"part {k}: назначение не этой карте/плану")
-    admitted(a.run_id, g["uuid"], torch)
+    admitted(a.run_id, g["uuid"], torch, plan["sha256"])
     jobs = part_jobs(plan, k)
     rc, res = run_queue(a, jobs, pd, dict(screen=plan["parts"][str(k)]["cap"]),
                         "screen", None, (SPACE, BANK_DIR), plan)
@@ -870,18 +941,13 @@ def build_merge(run, plan):
             prob.append(f"part {k}: журнал ≠ плану")
         tot = 0
         for j in jobs:
-            path = shard_path(run, j["job"])
-            m = shard_meta(path)
-            if not m or m.get("plan") != plan["sha256"]:
-                prob.append(f"{j['job']}: нет записи")
-                continue
-            with np.load(path, allow_pickle=False) as z:
-                zz = dict(z)
-            pr = ep_problems(zz, m, j["policy"], C, j["scene"]["hash"])
-            dn = led["done"].get(j["job"])
-            if not dn or dn["actual"] != m["phys"]:
-                pr.append("журнал ≠ записи")
+            m, pr = check_shard(run, j, plan, C, "screen", None,
+                                led["done"].get(j["job"]))
             prob += [f"{j['job']}: {x}" for x in pr]
+            if m is None or pr:
+                continue
+            with np.load(shard_path(run, j["job"]), allow_pickle=False) as z:
+                zz = dict(z)
             tot += m["phys"]
             K = {kk[2:]: zz[kk] for kk in zz if kk.startswith("k_")}
             rows.append(dict(job=j["job"], policy=j["policy"], seed=j["seed"],
@@ -1014,9 +1080,11 @@ def latency(a):
         dev = torch.device(a.device)
         kcf.bind_device(torch, idx, g)
         by = {e["eid"]: e for e in dp["episodes"]}
-        res = {}
+        res, qrec = {}, []
         for s in SEEDS:
             pairs = [r for r in dp["raw_pairs"] if by[r["eid"]]["seed"] == s]
+            if len(pairs) != 15:
+                raise SystemExit(f"s{s}: сырых пар {len(pairs)} ≠ 15")
             raws = []
             for r in pairs:
                 with np.load(kc.shard_path(a.run_id, f"raw/{r['eid']}/"
@@ -1024,41 +1092,35 @@ def latency(a):
                         as z:
                     o0 = {k[3:]: z[k] for k in z.files if k.startswith("o0_")}
                     o4 = {k[3:]: z[k] for k in z.files if k.startswith("o4_")}
+                need = {"state", "agentview_image", "robot0_eye_in_hand_image"}
+                if set(o0) != need or set(o4) != need:
+                    raise SystemExit(f"сырая пара {r['eid']}/{r['t']} неполна")
+                qrec.append([r["eid"], r["t"], sha256(kc.shard_path(
+                    a.run_id, f"raw/{r['eid']}/{r['t']}"))])
                 raws.append((by[r["eid"]]["task"], r["t"], o0, o4))
             v = kh.load_source(torch, s, a.device)
             arm = kh.make_arm(torch, k36, f"T32_s{s}", v)
             heads = load_heads(torch, a.run_id, plan, s, C, dev)
             io = v["io"]
 
+            descs = {tk: io.task_desc(tk) for tk in {r[0] for r in raws}}
+
             def one(pol, task, t, o0, o4):
+                arm.begin(task, 0)                 # вне таймера, как в эпизоде
+                arm.call = t // 8
+                desc = descs[task]
                 torch.cuda.synchronize(dev)
                 t0 = time.perf_counter()
-                arm.begin(task, 0)
-                batch, po, s8 = io.prep(o0, io.task_desc(task), task)
+                batch, po, s8 = io.prep(o0, desc, task)
                 B, _r = arm.decide(batch, po, s8, t)
                 B = np.asarray(B, np.float32)
-                st = None
-                if pol in ("TreeOld", "TreeFresh", "FlatFresh"):
-                    sense0 = heads.sense(dict(o0, s8=s8))
-                    st = heads.start(B, t, sense0)
+                st = chunk_start(heads, pol, B, t, o0, s8)
                 io.scale(B[None])
                 torch.cuda.synchronize(dev)
                 t1 = time.perf_counter()
                 final = B.copy()
-                if pol == "TreeOld":
-                    ch, _sc = heads.select(st, sense0)
-                    final[4:8] = st["cands"][ch]
-                elif pol == "TreeFresh":
-                    ch, _sc = heads.select(st, heads.sense(dict(
-                        o4, s8=io.inp.state8(o4))))
-                    final[4:8] = st["cands"][ch]
-                elif pol == "FlatFresh":
-                    final[4:8] = heads.flat(st, heads.sense(dict(
-                        o4, s8=io.inp.state8(o4))))
-                elif pol == "Refresh4":
-                    b2, p2, s82 = io.prep(o4, io.task_desc(task), task)
-                    r2, _ = arm.decide(b2, p2, s82, t + 4)
-                    final[4:8] = np.asarray(r2, np.float32)[:4]
+                final[4:8] = chunk_mid(heads, pol, st, B, o4, io, arm, desc,
+                                       task, t)[0]
                 io.scale(final[None])
                 torch.cuda.synchronize(dev)
                 t2 = time.perf_counter()
@@ -1093,6 +1155,7 @@ def latency(a):
                                      p95=float(np.quantile(tot, 0.95))))
         pc.save_json(os.path.join(screen_dir(a.run_id), "latency.json"),
                      dict(plan=plan["sha256"], gpu=g, raw=res, summary=summ,
+                          queue=qrec, queue_sha256=h256(json.dumps(qrec)),
                           env=kgr.env_record(torch),
                           loadavg=os.getloadavg()))
         for p_, v_ in summ.items():
@@ -1182,11 +1245,23 @@ def selftest():
                   sel2=B_["mlp"](207, 32, 3).eval(),
                   flat=B_["mlp"](207, 106, 28).eval())
     heads = Heads(torch, models, C, torch.device("cpu"))
+    ncall = dict(gen=0)
+    g0 = models["gen2"].forward
+
+    def gcount(x):
+        ncall["gen"] += 1
+        return g0(x)
+    models["gen2"].forward = gcount
+    import copy
     import tempfile
     with tempfile.TemporaryDirectory() as td:
         for pol in list(MAIN) + ["Refresh4"]:
             arm = kh.make_arm(torch, k36, "T32_s0", src)
+            ncall["gen"] = 0
             e = run_episode(Sim(), io, arm, heads, pol, 0, 3)
+            # банк кандидатов строят только деревья
+            assert (ncall["gen"] > 0) == (pol in ("TreeOld", "TreeFresh")), \
+                (pol, ncall)
             path = os.path.join(td, f"{pol}.npz")
             meta = save_ep(path, pol, e, "P")
             with np.load(path, allow_pickle=False) as z:
@@ -1204,6 +1279,39 @@ def selftest():
                 assert ep_problems(bad, meta, pol, C)
             if pol == "T1":
                 assert np.array_equal(e["actions"], ref["actions"])
+            # перевёрнутый успех и сброшенный mid — отказ
+            m2 = copy.deepcopy(meta)
+            m2["summary"]["success"] = not m2["summary"]["success"]
+            assert ep_problems(zz, m2, pol, C)
+            if zz["k_mid"].any():
+                bad = dict(zz)
+                bad["k_mid"] = zz["k_mid"].copy()
+                bad["k_mid"][int(np.flatnonzero(zz["k_mid"])[0])] = False
+                assert ep_problems(bad, meta, pol, C)
+    # проверка шарда до settle: чужой план, расход, запись журнала
+    g_ = globals()
+    keep_sp = g_["shard_path"]
+    with tempfile.TemporaryDirectory() as td:
+        g_["shard_path"] = lambda run, job: os.path.join(
+            td, job.replace("/", "__") + ".npz")
+        try:
+            arm = kh.make_arm(torch, k36, "T32_s0", src)
+            e = run_episode(Sim(), io, arm, None, "T1", 0, 3)
+            j = dict(job="ep/T1/s0/t0/x", policy="T1", seed=0,
+                     scene=dict(task=0, case_id="x", pos=3, hash=None))
+            meta = save_ep(shard_path("r", j["job"]), j["job"], e, "P")
+            plan_ = dict(sha256="P")
+            assert check_shard("r", j, plan_, C, "screen")[1] == []
+            assert check_shard("r", j, dict(sha256="Q"), C, "screen")[1]
+            assert check_shard("r", dict(j, job="ep/T1/s0/t0/y"), plan_, C,
+                               "screen")[1]
+            assert check_shard("r", j, plan_, C, "screen", None,
+                               dict(scope="screen", actual=meta["phys"] + 1)
+                               )[1]
+            assert check_shard("r", j, plan_, C, "screen",
+                               lambda *x: ["архив ≠"])[1] == ["архив ≠"]
+        finally:
+            g_["shard_path"] = keep_sp
     # TreeOld и TreeFresh при o4 = o0 дают один выбор
     st = heads.start(ref["calls"][0]["a_codec"], 0, heads.sense(dict(
         Sim().reset(0, [3]), s8=np.zeros((1, 8)))))
@@ -1223,7 +1331,8 @@ def selftest():
     assert cr["D"] == 12 and cr["L"] == 0 and cr["N"] == 48
     print("самопроверка k39_run пройдена: T1 4+4 = коллектору побитово; "
           "все пять политик проходят проверку записи; один тяжёлый вызов на "
-          "чанк (Refresh4 — плюс один на середину); порча хвоста — отказ; "
+          "чанк (Refresh4 — плюс один на середину); банк C1/C2 строят только "
+          "деревья; порча хвоста, перевёрнутый успех, сброшенный mid — отказ; "
           "одинаковый вход — один выбор; W/L/D")
     return 0
 
