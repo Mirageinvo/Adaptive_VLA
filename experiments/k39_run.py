@@ -609,9 +609,13 @@ def shard_meta(path):
         return json.loads(str(z["meta"]))
 
 
-def check_shard(run, j, plan, C, tag, after=None, done=None):
+_NO_LEDGER = object()
+
+
+def check_shard(run, j, plan, C, tag, after=None, done=_NO_LEDGER):
     """-> (meta, problems): job, план, расход, полная проверка эпизода,
-    дополнительная сверка; done — запись журнала (если есть)."""
+    дополнительная сверка. done — запись журнала: если передана (в т. ч.
+    None — записи нет), она обязана совпасть с (tag, расход)."""
     path = shard_path(run, j["job"])
     m = shard_meta(path)
     if m is None:
@@ -630,8 +634,9 @@ def check_shard(run, j, plan, C, tag, after=None, done=None):
     p += ep_problems(zz, m, j["policy"], C, j["scene"].get("hash"))
     if after:
         p += after(j, zz, m)
-    if done is not None and done != dict(scope=tag, actual=m["phys"]):
-        p.append(f"журнал {done} ≠ записи")
+    if done is not _NO_LEDGER and done != dict(scope=tag, actual=m["phys"]):
+        p.append(f"журнал {done} ≠ записи (нет закрытой записи или иной "
+                 f"расход)")
     return m, p
 
 
@@ -1068,6 +1073,8 @@ def latency(a):
     import k39_cache as kc
     plan = load_plan(a.run_id)
     dp = kc.load_data_plan(a.run_id)
+    if dp["sha256"] != plan["data_plan_sha256"]:
+        raise SystemExit("data_plan ≠ плану скрининга")
     idx = kcf.dev_index(a.device)
     g = kcf.gpu_query(idx)
     lk = kcf.Lock(os.path.join(kcf.lock_dir(), g["uuid"] + ".lock"),
@@ -1087,9 +1094,13 @@ def latency(a):
                 raise SystemExit(f"s{s}: сырых пар {len(pairs)} ≠ 15")
             raws = []
             for r in pairs:
-                with np.load(kc.shard_path(a.run_id, f"raw/{r['eid']}/"
-                                           f"{r['t']}"), allow_pickle=False) \
-                        as z:
+                rjob = f"raw/{r['eid']}/{r['t']}"
+                with np.load(kc.shard_path(a.run_id, rjob),
+                             allow_pickle=False) as z:
+                    rm = json.loads(str(z["meta"]))
+                    if rm.get("job") != rjob or rm.get("plan") != dp["sha256"]:
+                        raise SystemExit(f"сырая пара {rjob}: метаданные ≠ "
+                                         f"плану")
                     o0 = {k[3:]: z[k] for k in z.files if k.startswith("o0_")}
                     o4 = {k[3:]: z[k] for k in z.files if k.startswith("o4_")}
                 need = {"state", "agentview_image", "robot0_eye_in_hand_image"}
@@ -1310,6 +1321,11 @@ def selftest():
                                )[1]
             assert check_shard("r", j, plan_, C, "screen",
                                lambda *x: ["архив ≠"])[1] == ["архив ≠"]
+            # готовый шард без закрытой записи журнала — отказ
+            assert check_shard("r", j, plan_, C, "screen", None, None)[1]
+            assert check_shard("r", j, plan_, C, "screen", None,
+                               dict(scope="screen", actual=meta["phys"])
+                               )[1] == []
         finally:
             g_["shard_path"] = keep_sp
     # TreeOld и TreeFresh при o4 = o0 дают один выбор
