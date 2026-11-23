@@ -64,6 +64,8 @@ PROFILES = dict(one=4, two=8, three=12)
 # Пилот Refresh4 против T1: 4 сцены на задачу с позиций 8–11 банка (вне
 # профилей one/two), только T1 и Refresh4, без обученных голов.
 REFRESH_PILOT = dict(n=4, offset=8)
+PREFLIGHT_POLICIES = dict(refresh=("T1", "Refresh4"),
+                          main=("T1", "TreeFresh", "FlatFresh"))
 EP = 610
 BOOT = dict(n=50_000, seed=39001)
 TIE_TOL = 0.0
@@ -206,9 +208,8 @@ def make_plan(run, profile, n_parts, variant="base"):
                    if sc["rank"] < max(1, n // 4)}
         main = list(MAIN)
     parts = {str(k): [] for k in range(n_parts)}
-    for i, sc in enumerate(sorted(scenes, key=lambda x: (x["rank"],
-                                                         x["task"]))):
-        parts[str(i % n_parts)].append(sc["case_id"])
+    for sc in sorted(scenes, key=lambda x: (x["rank"], x["task"])):
+        parts[str(sc["rank"] % n_parts)].append(sc["case_id"])
     k36 = pc.load_prepare()
     plan = dict(kind="k39_screen_plan", run_id=run, protocol=PROTOCOL,
                 profile=profile, variant=None if pilot else variant,
@@ -289,10 +290,10 @@ def part_jobs(plan, k):
     for s in SEEDS:
         for cid in plan["parts"][str(k)]["scenes"]:
             sc = by[cid]
-            pols = policy_order(sc["rank"], s, [p_ for p_ in plan["policies"]
-                                                if p_ != "Refresh4"])
+            base = [p_ for p_ in plan["policies"] if p_ != "Refresh4"]
             if cid in plan["refresh"]:
-                pols = pols + ["Refresh4"]
+                base = base + ["Refresh4"]
+            pols = policy_order(sc["rank"], s, base)
             for pol in pols:
                 out.append(dict(job=f"ep/{pol}/s{s}/t{sc['task']}/{cid}",
                                 policy=pol, seed=s, scene=sc))
@@ -800,6 +801,8 @@ def preflight(a):
     import k37_confirm as kcf
     plan = load_plan(a.run_id)
     dp = kc.load_data_plan(a.run_id)
+    if dp["sha256"] != plan["data_plan_sha256"]:
+        raise SystemExit("data_plan ≠ плану скрининга")
     eps = {(e["seed"], e["task"]): e for e in dp["episodes"]
            if e["split"] == "micro"}
     picks = [eps[(0, 0)], eps[(1, 8)]]
@@ -807,9 +810,8 @@ def preflight(a):
     for e in picks:  # имена дополняются хостом/UUID ниже
         sc = dict(task=e["task"], case_id=e["case_id"], pos=e["pos"],
                   hash=e["hash"])
-        for pol in ("T1",) + tuple(p_ for p_ in ("TreeFresh", "FlatFresh",
-                                                  "Refresh4")
-                                   if p_ in plan["policies"]):
+        for pol in PREFLIGHT_POLICIES[
+                "refresh" if plan["profile"] == "refresh" else "main"]:
             jobs.append(dict(job=f"pf/{pol}/s{e['seed']}/t{e['task']}/"
                              f"{e['case_id']}", policy=pol, seed=e["seed"],
                              scene=sc, eid=e["eid"]))
@@ -1234,6 +1236,17 @@ def selftest():
     jj = part_jobs(pp, 0)
     assert len(jj) == 96 and {j["policy"] for j in jj} == {"T1", "Refresh4"}
     assert all(j["scene"]["pos"] >= 8 for j in jj)
+    # две части: у каждой по 2 сцены каждой задачи; T1 первым в половине пар
+    pp2 = dict(pp, parts={str(k): dict(scenes=[x["case_id"] for x in sorted(
+        scs, key=lambda y: (y["rank"], y["task"])) if x["rank"] % 2 == k])
+        for k in (0, 1)})
+    from collections import Counter
+    for k in (0, 1):
+        jk = part_jobs(pp2, k)
+        assert Counter(j["scene"]["task"] for j in jk) == {
+            t: 8 for t in TASKS}
+        firsts = [jk[i]["policy"] for i in range(0, len(jk), 2)]
+        assert Counter(firsts) == {"T1": 12, "Refresh4": 12}
     # игрушечный источник, среда с кадрами 224
     M = k29m.build(torch)
     Lb = np.array([-1.1, -2.0, -1.5, -0.5, -3.0, -1.0])
