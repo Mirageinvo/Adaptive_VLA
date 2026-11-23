@@ -171,13 +171,14 @@ def policy_order(rank, seed, pols):
     return pols[k:] + pols[:k]
 
 
-def make_plan(run, profile, n_parts):
+def make_plan(run, profile, n_parts, variant="base"):
     import k36_protocol as pc
     import k39_cache as kc
     dp = kc.load_data_plan(run)
     fits = {}
     for s in SEEDS:
-        f = pc.load_json(os.path.join(rep_dir(run), f"fit_s{s}.json"))
+        import k39_model as km
+        f = pc.load_json(os.path.join(rep_dir(run), km.fit_name(s, variant)))
         if f.get("plan") != dp["sha256"] or f.get("seed") != s:
             raise SystemExit(f"fit s{s} ≠ data_plan")
         fits[str(s)] = dict(sha256=f["sha256"], model_code=f["model_code"])
@@ -192,7 +193,8 @@ def make_plan(run, profile, n_parts):
         parts[str(i % n_parts)].append(sc["case_id"])
     k36 = pc.load_prepare()
     plan = dict(kind="k39_screen_plan", run_id=run, protocol=PROTOCOL,
-                profile=profile, data_plan_sha256=dp["sha256"],
+                profile=profile, variant=variant,
+                data_plan_sha256=dp["sha256"],
                 k36_prepare_sha1=k36["sha1"],
                 code={f: sha256(os.path.join(HERE, f)) for f in CODE},
                 fits=fits, bank=dict(bank_id=bm["bank_id"], files=bm["files"],
@@ -223,7 +225,7 @@ def prepare_screen(a):
     import k36_protocol as pc
     import k37_confirm as kcf
     p = plan_path(a.run_id)
-    new = make_plan(a.run_id, a.profile, a.parts)
+    new = make_plan(a.run_id, a.profile, a.parts, a.variant)
     sh = kcf.canon_sha(new)
     shp = p.replace(".json", ".sha256")
     if os.path.exists(p) or os.path.exists(shp):
@@ -286,6 +288,7 @@ class Heads:
         import k39_model as km
         self.torch, self.km, self.C, self.dev = torch, km, C, dev
         self.m = models
+        self.nearb = km.VARIANTS[models.get("variant", "base")]["nearb"]
         vm, vs = models["v_stats"]
         self.vm = torch.as_tensor(vm, dtype=torch.float32, device=dev)
         self.vs = torch.as_tensor(vs, dtype=torch.float32, device=dev)
@@ -316,7 +319,9 @@ class Heads:
                                                  device=self.dev)])[None]
         b_arm = torch.as_tensor(km.norm_arm(B[4:8], self.C)[None],
                                 dtype=torch.float32, device=self.dev)
-        return dict(x0=x0, b_arm=b_arm, cands=None)
+        b_grip = torch.as_tensor(np.sign(B[4:8, 6])[None],
+                                 dtype=torch.float32, device=self.dev)
+        return dict(x0=x0, b_arm=b_arm, b_grip=b_grip, cands=None)
 
     def start(self, B, t, sense0):
         """Контекст и банк C1/C2 (кодек) из сохранённого o0 (дерево)."""
@@ -324,7 +329,8 @@ class Heads:
         st = self.context(B, t, sense0)
         x0, b_arm = st["x0"], st["b_arm"]
         with torch.no_grad():
-            alts = km.gen_alts(torch, self.m["gen2"], x0, b_arm, 2)
+            alts = km.gen_alts(torch, self.m["gen2"], x0, b_arm, 2,
+                               st["b_grip"] if self.nearb else None)
         cands = [B[4:8].astype(np.float32)]
         for arm, gl in alts:
             c = np.zeros((4, 7), np.float32)
@@ -349,7 +355,8 @@ class Heads:
         with torch.no_grad():
             o = self.m["flat"](xm)
             arm, gl = km.tail_from(torch, o[:, :24].reshape(-1, 4, 6),
-                                   o[:, 24:], st["b_arm"])
+                                   o[:, 24:], st["b_arm"],
+                                   st["b_grip"] if self.nearb else None)
         c = np.zeros((4, 7), np.float32)
         c[:, :6] = (arm[0].cpu().numpy() * self.C["half"] +
                     self.C["mid"]).astype(np.float32)
@@ -643,7 +650,8 @@ def check_shard(run, j, plan, C, tag, after=None, done=_NO_LEDGER):
 def load_heads(torch, run, plan, s, C, dev):
     import k39_model as km
     m = km.load_models(torch, run, s, dev, plan["data_plan_sha256"],
-                       plan["fits"][str(s)]["sha256"])
+                       plan["fits"][str(s)]["sha256"],
+                       plan.get("variant", "base"))
     return Heads(torch, m, C, dev)
 
 
@@ -1371,6 +1379,8 @@ def main():
                     choices=("assigned", "released", "done"))
     ap.add_argument("--reference", action="store_true")
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--variant", default="base",
+                    choices=("base", "long", "nearb"))
     a = ap.parse_args()
     import k37_confirm as kcf
     fn = {"bank": bank, "prepare-screen": prepare_screen,
