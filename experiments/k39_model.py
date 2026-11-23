@@ -603,6 +603,16 @@ def evaluate(torch, models, rows, C, dev, n_alt=2):
         arm_err, grip_mis = torch.stack(ar, -1), torch.stack(gr, -1)
         out = dict(d=(arm_err + CFG["grip_w"] * grip_mis).cpu().numpy(),
                    arm_err=arm_err.cpu().numpy(), grip_mis=grip_mis.cpu().numpy())
+        # хвосты кандидатов в кодеке float32 — та же арифметика, что в
+        # k39_run.Heads.start (кандидат 0 — B[4:8] побитово)
+        tails = [np.stack([r["B"][4:8] for r in rows]).astype(np.float32)]
+        for a_, g_ in alts:
+            c = np.zeros((len(rows), 4, 7), np.float32)
+            c[..., :6] = (a_.cpu().numpy() * C["half"] + C["mid"]
+                          ).astype(np.float32)
+            c[..., 6] = np.where(g_.cpu().numpy() > 0, 1.0, -1.0)
+            tails.append(c)
+        out["tails"] = np.stack(tails, 1)
         for nm, mode in (("old", (0, 0)), ("fresh", (1, 1)),
                          ("rgb_only", (1, 0)), ("state_only", (0, 1))):
             ch = sel(xmid(torch, T, mode)).argmax(-1)
@@ -652,6 +662,28 @@ def summarize_eval(rows, ev):
             [i for i in idx_all if rows[i][f] == v]))
             for v in sorted({r[f] for r in rows}, key=str)}
     return rep
+
+
+def nominal_changes(ev, nom):
+    """Штатные окна: разница d и ФАКТИЧЕСКИ изменённые команды (хвост 4×7
+    float32 ≠ B[4:8] / fresh ≠ old), а также смена индекса ветви."""
+    ix = np.flatnonzero(nom)
+    tl = ev["tails"][ix]
+    rr = np.arange(len(ix))
+    cf, co = ev["choice_fresh"][ix], ev["choice_old"][ix]
+    tf, to = tl[rr, cf], tl[rr, co]
+    b = tl[:, 0]
+    diff = lambda x, y: (x != y).reshape(len(ix), -1).any(1)  # noqa: E731
+    return dict(
+        n=int(len(ix)),
+        d_fresh_minus_old=float(ev["d"][ix, cf].mean() -
+                                ev["d"][ix, co].mean()),
+        changed_fresh=int(diff(tf, b).sum()),
+        changed_old=int(diff(to, b).sum()),
+        fresh_ne_old=int(diff(tf, to).sum()),
+        index_ne0_fresh=int((cf != 0).sum()),
+        index_ne0_old=int((co != 0).sum()),
+        index_fresh_ne_old=int((cf != co).sum()))
 
 
 def expand_pairs(rows):
@@ -786,7 +818,12 @@ def fit_cmd(a):
           for k, v in models.items()}
     torch.save(dict(ck, fit=stamp), path + ".tmp")
     os.replace(path + ".tmp", path)
-    rep.update(stamp, counts=cnt, seconds=time.time() - t0, sha256=kc.sha256(path))
+    eh = hashlib.sha256()
+    for k_, v_ in sorted(models["enc"].state_dict().items()):
+        eh.update(k_.encode())
+        eh.update(v_.detach().cpu().numpy().tobytes())
+    rep.update(stamp, counts=cnt, seconds=time.time() - t0,
+               sha256=kc.sha256(path), enc_sha256=eh.hexdigest())
     pc.save_json(os.path.join(kc.rep_dir(a.run_id),
                               fit_name(a.seed, a.variant)), rep)
     print(f"  fit s{a.seed}: строк gen {rep['n']['gen_tr']}+{rep['n']['gen_va']}"
@@ -864,15 +901,7 @@ def offline_cmd(a):
             sm = summarize_eval(diag, ev)
             sm["sister_pref_differs"] = sister_pref(diag, ev)
             nom = np.array([r["kind"] == "nom" for r in diag])
-            sm["nominal"] = dict(
-                n=int(nom.sum()),
-                d_fresh_minus_old=float(
-                    ev["d"][nom, ev["choice_fresh"][nom]].mean() -
-                    ev["d"][nom, ev["choice_old"][nom]].mean()),
-                changed_fresh=int((ev["choice_fresh"][nom] != 0).sum()),
-                changed_old=int((ev["choice_old"][nom] != 0).sum()),
-                fresh_ne_old=int((ev["choice_fresh"][nom] !=
-                                  ev["choice_old"][nom]).sum()))
+            sm["nominal"] = nominal_changes(ev, nom)
             rep[f"s{s}_alt{n_alt}"] = sm
     rep["variant"] = a.variant
     name = "offline.json" if a.variant == "base" else \
@@ -890,9 +919,11 @@ def offline_cmd(a):
                   f"fresh≠old {x['fresh_ne_old']:.4f}")
             nm_ = v["nominal"]
             print(f"      штатные окна n {nm_['n']}: d_fresh − d_old "
-                  f"{nm_['d_fresh_minus_old']:+.5f}; изменённых хвостов fresh "
-                  f"{nm_['changed_fresh']}, old {nm_['changed_old']}, "
-                  f"fresh≠old {nm_['fresh_ne_old']}; выигрыш раздельного "
+                  f"{nm_['d_fresh_minus_old']:+.5f}; фактически изменённых "
+                  f"хвостов fresh {nm_['changed_fresh']}, old "
+                  f"{nm_['changed_old']}, fresh≠old {nm_['fresh_ne_old']} "
+                  f"(индекс ≠ 0: {nm_['index_ne0_fresh']}/"
+                  f"{nm_['index_ne0_old']}); выигрыш раздельного "
                   f"выбора в парах "
                   f"{v['sister_pref_differs'].get('oracle_gain_mean')}")
     return 0
@@ -1029,6 +1060,13 @@ def selftest():
         assert torch.equal(torch.where(gl > 0, 1.0, -1.0), b_g)
     al = gen_alts(torch, gtmp, x0, b_arm, 2, b_g)
     assert not torch.equal(al[0][0], al[1][0])          # ветви различны
+    tl = np.zeros((3, 3, 4, 7), np.float32)
+    tl[:, 2] = 1.0                       # C2 отличается от B, C1 = B побитово
+    evn = dict(tails=tl, choice_fresh=np.array([1, 2, 0]),
+               choice_old=np.array([0, 0, 0]), d=np.zeros((3, 3)))
+    nc = nominal_changes(evn, np.array([True, True, True]))
+    assert nc["changed_fresh"] == 1 and nc["index_ne0_fresh"] == 2 and \
+        nc["fresh_ne_old"] == 1 and nc["index_fresh_ne_old"] == 2
     ex = expand_pairs([dict(kind="pair", Y=1, Yb=2, img4="a", img4b="b",
                             s4=0, s4b=1), dict(kind="nom")])
     assert [r["kind"] for r in ex] == ["sisA", "sisB", "nom"] and \

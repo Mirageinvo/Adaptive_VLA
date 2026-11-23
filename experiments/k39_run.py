@@ -179,8 +179,13 @@ def make_plan(run, profile, n_parts, variant="base"):
     for s in SEEDS:
         import k39_model as km
         f = pc.load_json(os.path.join(rep_dir(run), km.fit_name(s, variant)))
-        if f.get("plan") != dp["sha256"] or f.get("seed") != s:
-            raise SystemExit(f"fit s{s} ≠ data_plan")
+        wp = os.path.join(km.model_dir(run, s, variant), "heads.pt")
+        if f.get("plan") != dp["sha256"] or f.get("seed") != s or \
+                f.get("variant") != variant or \
+                f.get("model_code") != sha256(km.__file__) or \
+                not os.path.isfile(wp) or sha256(wp) != f.get("sha256"):
+            raise SystemExit(f"fit s{s} ({variant}): отчёт, код модели или "
+                             f"файл весов не сходятся")
         fits[str(s)] = dict(sha256=f["sha256"], model_code=f["model_code"])
     n = PROFILES[profile]
     bm, scenes = bank_scenes(n)
