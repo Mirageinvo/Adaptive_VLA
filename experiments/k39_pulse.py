@@ -272,8 +272,11 @@ def run_pulse(sim, io, arm, sc, seed, amp, policy, C, run, stop_after=False,
             if target:
                 tgt.update(k=k, mid=bool(mid))
                 if mid:
-                    tgt.update(o4=kcol.obs_hash(obs), eef4=np.asarray(
-                        obs["state"][0], np.float64)[EEF].copy())
+                    st_ = np.asarray(obs["state"], np.float64)
+                    if st_.shape != (1, 9) or not np.isfinite(st_).all():
+                        raise SystemExit(f"state o4: форма {st_.shape} или "
+                                         f"нечисловые значения")
+                    tgt.update(o4=kcol.obs_hash(obs), eef4=st_[0, EEF].copy())
                     if keep_o4:
                         tgt["o4_obs"] = {kk: np.array(v, copy=True)
                                          for kk, v in obs.items()}
@@ -379,6 +382,19 @@ def ep_problems(z, meta, job, C):
     tg_idx = [i for i in range(n) if int(J["elapsed"][i]) == tstar]
     if [i for i in range(n) if K["target"][i]] != tg_idx:
         p.append("целевой чанк ≠ t")
+    tg = meta["target"]
+    ti = [i for i in range(n) if K["target"][i]]
+    if bool(tg["reached"]) != bool(ti) or len(ti) > 1:
+        p.append("target.reached ≠ журналу")
+    elif ti:
+        kk = int(J["k"][ti[0]])
+        if tg["k"] != min(kk, 4) or bool(tg["mid"]) != (kk > 4) or \
+                not tg["o0"]:
+            p.append("target k/mid/o0 ≠ журналу")
+        if bool(tg["o4"]) != bool(tg["mid"]):
+            p.append("хеш o4 не согласован с mid")
+    elif tg["o0"] or tg["o4"] or tg["mid"] or tg["k"]:
+        p.append("target без вмешательства не пуст")
     refresh = False
     for i in range(n):
         B, F = J["a_codec"][i], K["final"][i]
@@ -440,6 +456,9 @@ def pair_problems(a, b):
         return p
     if (ta["o0"], ta["o4"], ta["mid"]) != (tb["o0"], tb["o4"], tb["mid"]):
         p.append("хеши o0/o4 пары различны")
+    if not ta["o0"] or not tb["o0"] or (ta["mid"] and not (ta["o4"] and
+                                                            tb["o4"])):
+        p.append("нет хеша o0/o4 в достигнутой точке")
     t = int(np.flatnonzero(za["k_target"])[0])
     cut = int(za["j_elapsed"][t]) + (4 if ta["mid"] else int(za["j_k"][t]))
     if not np.array_equal(za["actions"][:cut], zb["actions"][:cut]):
@@ -460,7 +479,8 @@ def queue(plan, part):
                           part), key=lambda x: (x["rank"], x["task"])):
             k = (sc["rank"] + s) % 3
             lv = LEVELS[k:] + LEVELS[:k]
-            for li, lev in enumerate(lv):
+            for lev in lv:
+                li = LEVELS.index(lev)
                 pol = POLS if (sc["rank"] + s + li) % 2 == 0 else POLS[::-1]
                 for pl in pol:
                     out.append(dict(
@@ -589,7 +609,15 @@ def source(card, k36, s):
 
 
 # --- калибровка ------------------------------------------------------------------------------------------
+def cal_row_path(run, job):
+    return os.path.join(rep_dir(run), "calib", job.replace("/", "__") +
+                        ".json")
+
+
 def calibrate(a):
+    """0 / 0.15 / 0.30 на обоих сидах; при клипе > 0.5 суммарно на 0.30 —
+    0.225 тоже на обоих. Строка повтора пишется атомарно до commit;
+    повторный запуск читает готовые строки."""
     import k36_harness as kh
     import k36_protocol as pc
     import k31_collect as kcol
@@ -597,52 +625,86 @@ def calibrate(a):
     _m, calib, _p = scenes(run)
     k36 = pc.load_prepare()
     C = kh.consts(k36)
-    card = Card(a.device, run)
     L = kcol.Ledger(os.path.join(rep_dir(run), "calib_ledger.json"),
                     dict(calib=48 * EP))
-    rows = []
-    try:
-        card.start(run)
-        for s in SEEDS:
-            v, arm = source(card, k36, s)
+    pd = L.d["pending"]
+    if pd and os.path.exists(cal_row_path(run, pd["id"])):
+        L.commit(pd["id"], pc.load_json(cal_row_path(run, pd["id"]))[
+            "physical"])
+    card = None
 
-            def one(sc, lev, amp):
-                job = f"cal/{lev}/s{s}/t{sc['task']}/{sc['case_id']}"
+    def stage(levels):
+        nonlocal card
+        rows = []
+        for s in SEEDS:
+            todo = [(sc, lev) for sc in calib for lev in levels]
+            jobs = {(sc["task"], lev): f"cal/{lev}/s{s}/t{sc['task']}/"
+                    f"{sc['case_id']}" for sc, lev in todo}
+            need = [x for x in todo if not os.path.exists(
+                cal_row_path(run, jobs[(x[0]["task"], x[1])]))]
+            v = arm = None
+            if need:
+                if card is None:
+                    card = Card(a.device, run)
+                    card.start(run)
+                v, arm = source(card, k36, s)
+            for sc, lev in todo:
+                job = jobs[(sc["task"], lev)]
+                rp = cal_row_path(run, job)
+                if os.path.exists(rp):
+                    r = pc.load_json(rp)
+                    if not L.is_done(job) or r["job"] != job:
+                        raise SystemExit(f"{job}: строка без записи журнала")
+                    rows.append(r)
+                    continue
                 if L.is_done(job):
-                    raise SystemExit(f"{job}: учтён — калибровку не повторять")
+                    raise SystemExit(f"{job}: учтён, строки нет")
+                amp = AMP_ALT if lev == "alt" else AMP[lev]
                 L.reserve("calib", job, amount=EP)
                 ep = run_pulse(card.sim, v["io"], arm, sc, s, amp, "T1", C,
                                run, stop_after=True)
-                L.commit(job, int(ep["physical"]))
                 tg = ep["target"]
-                return dict(task=sc["task"], seed=s, level=lev, amp=amp,
-                            reached=tg["reached"], k=tg["k"], mid=tg["mid"],
-                            delta=None if tg["delta"] is None else
-                            (tg["delta"] / C["half"][sc["axis"]]).tolist(),
-                            clip=None if tg["clip"] is None else
-                            tg["clip"].tolist(),
-                            eef4=None if tg["eef4"] is None else
-                            tg["eef4"].tolist(), axis=sc["axis"])
-            for sc in calib:
-                for lev in LEVELS:
-                    rows.append(one(sc, lev, AMP[lev]))
-            sub = [r for r in rows if r["seed"] == s and r["level"] == "strong"]
-            if frac_clip(sub) > 0.5:
-                for sc in calib:
-                    rows.append(one(sc, "alt", AMP_ALT))
-            arm = v = None
-            kh.free(card.torch)
+                r = dict(job=job, task=sc["task"], seed=s, level=lev, amp=amp,
+                         reached=tg["reached"], k=tg["k"], mid=tg["mid"],
+                         delta=None if tg["delta"] is None else
+                         (tg["delta"] / C["half"][sc["axis"]]).tolist(),
+                         clip=None if tg["clip"] is None else
+                         tg["clip"].tolist(),
+                         eef4=None if tg["eef4"] is None else
+                         tg["eef4"].tolist(), axis=sc["axis"],
+                         physical=int(ep["physical"]))
+                pc.save_json(rp, r)               # атомарно, до commit
+                L.commit(job, r["physical"])
+                rows.append(r)
+            if arm is not None:
+                arm = v = None
+                kh.free(card.torch)
+        return rows
+    try:
+        rows = stage(LEVELS)
+        if frac_clip([r for r in rows if r["level"] == "strong"]) > 0.5:
+            rows += stage(("alt",))
     finally:
-        card.close()
+        if card is not None:
+            card.close()
     rep = summarize_cal(rows)
     pc.save_json(os.path.join(rep_dir(run), "calibration.json"), rep)
     for k_, x in rep["levels"].items():
         print(f"  {k_}: o4 {x['o4_share']:.2f}, клип {x['clip_share']:.2f}, "
-              f"|Δ|/half {x['delta_mean']:.3f}, смещение кисти медиана "
-              f"{x['eef_med']:.4f} м")
+              f"|Δ|/half {x['delta_mean']:.3f} (ключей {x['n_cmp']}), "
+              f"смещение кисти медиана {x['eef_med']:.4f} м, p90 "
+              f"{x['eef_p90']:.4f} м")
     print(f"  калибровка: {rep['status']}; strong = {rep['strong']} "
           f"({rep['reason']})")
     return OK if rep["status"] == "ok" else TECH
+
+
+def executed_deltas(r):
+    """|Δ|/half только по исполненным строкам 1 и 2."""
+    if r["delta"] is None:
+        return []
+    return [abs(x) for e, x in zip((r["k"] > 1, r["k"] > 2), r["delta"])
+            if e]
 
 
 def frac_clip(rows):
@@ -659,37 +721,44 @@ def frac_clip(rows):
 
 
 def summarize_cal(rows):
-    zero = {(r["task"], r["seed"]): r for r in rows if r["level"] == "zero"}
+    by = {(r["task"], r["seed"], r["level"]): r for r in rows}
+    keys = sorted({(r["task"], r["seed"]) for r in rows})
+    have = sorted({r["level"] for r in rows} - {"zero"})
+    st_raw = [r for r in rows if r["level"] == "strong"]
+    chosen = "alt" if frac_clip(st_raw) > 0.5 else "strong"
+    # сопоставимые ключи: o4 достигнут на нуле, мягком и выбранном уровнях
+    cmp_ = [k for k in keys if all(by.get(k + (lv,), {}).get("mid")
+                                   for lv in ("zero", "mild", chosen))]
     lv = {}
-    for lev in ("mild", "strong", "alt"):
+    for lev in have:
         rs = [r for r in rows if r["level"] == lev]
-        if not rs:
-            continue
-        disp = [float(np.linalg.norm(np.subtract(r["eef4"], zero[(
-            r["task"], r["seed"])]["eef4"]))) for r in rs
-            if r["mid"] and zero.get((r["task"], r["seed"]), {}).get("mid")]
-        dl = [abs(x) for r in rs if r["delta"] for x in r["delta"]]
-        lv[lev] = dict(n=len(rs), o4_share=float(np.mean([r["mid"]
-                                                          for r in rs])),
+        rc = [by[k + (lev,)] for k in cmp_ if k + (lev,) in by]
+        disp = [float(np.linalg.norm(np.subtract(r["eef4"], by[(
+            r["task"], r["seed"], "zero")]["eef4"]))) for r in rc]
+        dl = [x for r in rc for x in executed_deltas(r)]
+        lv[lev] = dict(n=len(rs), n_cmp=len(rc),
+                       o4_share=float(np.mean([r["mid"] for r in rs])),
                        clip_share=frac_clip(rs),
                        delta_mean=float(np.mean(dl)) if dl else 0.0,
                        eef_med=float(np.median(disp)) if disp else 0.0,
                        eef_p90=float(np.quantile(disp, 0.9)) if disp else 0.0)
-    status, strong, reason = "ok", AMP["strong"], "клип ≤ 0.5"
-    st = lv["strong"]
-    if st["o4_share"] < 0.5:
-        status, reason = "needs_review", "большинство повторов без o4"
-    elif st["clip_share"] > 0.5:
-        if "alt" in lv and lv["alt"]["clip_share"] <= 0.5:
-            strong, reason = AMP_ALT, "клип 0.30 > 0.5, взят 0.225"
-        else:
-            status, reason = "needs_review", "клип > 0.5 и на 0.225"
-    if status == "ok":
-        use = lv["alt"] if strong == AMP_ALT else st
-        if use["delta_mean"] <= 1.1 * lv["mild"]["delta_mean"]:
-            status, reason = "needs_review", "сильный ≈ мягкий по факту"
-    return dict(status=status, strong=strong, reason=reason, levels=lv,
-                rows=rows)
+    status = "ok"
+    strong = AMP_ALT if chosen == "alt" else AMP["strong"]
+    reason = ("клип 0.30 > 0.5 по обоим сидам, взят 0.225"
+              if chosen == "alt" else "клип 0.30 ≤ 0.5")
+    use = lv.get(chosen)
+    if use is None:
+        status, reason = "needs_review", "нет повторов выбранного уровня"
+    elif use["o4_share"] < 0.5:
+        status, reason = "needs_review", f"{chosen}: большинство без o4"
+    elif use["clip_share"] > 0.5:
+        status, reason = "needs_review", f"{chosen}: клип > 0.5"
+    elif not cmp_:
+        status, reason = "needs_review", "нет сопоставимых ключей"
+    elif use["delta_mean"] <= 1.1 * lv["mild"]["delta_mean"]:
+        status, reason = "needs_review", "сильный ≈ мягкий по факту"
+    return dict(status=status, strong=strong, chosen=chosen, reason=reason,
+                levels=lv, comparable=[list(k) for k in cmp_], rows=rows)
 
 
 # --- допуск и сбор -------------------------------------------------------------------------------------
@@ -840,7 +909,9 @@ def preflight(a):
                                       a2["actions"][:cut]) or \
                         (t1["o0"], t1["o4"]) != (t2["o0"], t2["o4"]):
                     prob.append(f"s{s}: префикс или o4 пары различны")
-                if not t2["refresh"] or a2["heavy"] != a1["heavy"] + 1 or \
+                if not t2["refresh"] or t1["refresh"] or \
+                        a1["heavy"] != len(a1["calls"]) or \
+                        a2["heavy"] != len(a2["calls"]) + 1 or \
                         t2["P"] is None or np.array_equal(t2["P"],
                                                           t2["B"][:4]):
                     prob.append(f"s{s}: импульс или один пересчёт не "
@@ -859,6 +930,7 @@ def preflight(a):
                     if not np.array_equal(np.asarray(R2, np.float32),
                                           t2["R"]):
                         prob.append(f"s{s}: прямой T32 в o4 ≠ R")
+                    arm2 = None
                 first[str(s)] = dict(
                     o0=t1["o0"], o4=t1["o4"], succ=[a1["success"],
                                                     a2["success"]],
@@ -1141,8 +1213,23 @@ def analyze(a):
                                                  "RefreshOnce"])),
                          clip=float(np.mean([x for r in rs for x in r["clip"]]))
                          if lev != "zero" else 0.0)
+    t1 = {(r["task"], r["case_id"], r["seed"], r["level"]): r for r in rows
+          if r["policy"] == "T1"}
+    for lev in ("mild", "strong"):
+        d_ = [float(np.linalg.norm(np.subtract(r["eef4"], t1[k[:3] + (
+            "zero",)]["eef4"]))) for k, r in t1.items() if k[3] == lev and
+            r["o4"] and t1.get(k[:3] + ("zero",), {}).get("o4")]
+        desc[lev]["eef_disp"] = dict(
+            n=len(d_), med=float(np.median(d_)) if d_ else None,
+            p90=float(np.quantile(d_, 0.9)) if d_ else None)
     pc.save_json(os.path.join(rep_dir(a.run_id), "analysis.json"),
                  dict(plan=plan["sha256"], stats=st, desc=desc, boot=BOOT))
+    for lev in ("mild", "strong"):
+        e_ = desc[lev]["eef_disp"]
+        if e_["n"]:
+            print(f"  смещение кисти {lev} к zero (T1, o4): медиана "
+                  f"{e_['med']:.4f} м, p90 {e_['p90']:.4f} м, ключей "
+                  f"{e_['n']}")
     for lev in LEVELS:
         v = st[lev]
         print(f"  {lev}: SR T1 {100 * v['sr_T1']:.1f} / Refresh "
@@ -1200,6 +1287,11 @@ def selftest():
         c = Counter((j["scene"]["case_id"], j["seed"]) for j in q)
         assert set(c.values()) == {6}
         assert Counter(j["scene"]["task"] for j in q) == {t: 24 for t in TASKS}
+    allq = qs[0] + qs[1]
+    for lev in LEVELS:
+        js = [j for j in allq if j["level"] == lev]
+        firsts = [js[i]["policy"] for i in range(0, len(js), 2)]
+        assert Counter(firsts) == {"T1": 24, "RefreshOnce": 24}, lev
     # игрушечный полный цикл: 6 комбинаций одного старта
     M = k29m.build(torch)
     Lb = np.array([-1.1, -2.0, -1.5, -0.5, -3.0, -1.0])
@@ -1219,6 +1311,19 @@ def selftest():
             p_.copy_(torch.randn(p_.shape, generator=g2))
 
     class Sim(kppo.ToySim):
+        END = 22                    # done на этом шаге среды (10 — ожидание)
+
+        def step(self, a):
+            self.t += 1
+            self.acc += float(np.asarray(a)[0, 0])
+            if self.t <= 10:
+                return self._obs(), np.array([0.0]), np.array([False]), \
+                    np.array([False])
+            d = self.t >= self.END
+            s_ = bool(d and (self.init + int(abs(self.acc) * 1e3)) % 2 == 0)
+            return self._obs(), np.array([float(s_)]), np.array([d]), \
+                np.array([s_])
+
         def _obs(self):
             o = super()._obs()
             for k in ("agentview_image", "robot0_eye_in_hand_image"):
@@ -1255,26 +1360,41 @@ def selftest():
         g_["shard_path"] = lambda run, job: os.path.join(
             td, job.replace("/", "__") + ".npz")
         try:
-            got = {}
-            for lev in LEVELS:
-                for pol in POLS:
-                    arm = kh.make_arm(torch, k36, "T32_s0", src)
-                    ep = run_pulse(Sim(), io, arm, sc, 0, AMP[lev], pol, Ck,
-                                   "toy")
-                    j = dict(job=f"ep/{lev}/{pol}/s0/t0/toy", level=lev,
-                             amp=AMP[lev], policy=pol, seed=0, scene=sc)
-                    m = save_ep(shard_path("toy", j["job"]), j["job"], ep,
-                                "P", dict(level=lev, policy=pol))
-                    pl = dict(sha256="P")
-                    mm, zz, pr = check_shard("toy", j, pl, Ck, "screen")
-                    assert pr == [], (lev, pol, pr)
-                    got[(lev, pol)] = (mm, zz)
-                    assert m["target"]["reached"]
-                    if pol == "RefreshOnce" and m["target"]["mid"]:
-                        assert m["target"]["refresh"] and m["heavy"] == \
-                            len(ep["calls"]) + 1
-                assert pair_problems(got[(lev, "T1")],
-                                     got[(lev, "RefreshOnce")]) == []
+            for END in (22, 40):    # terminal ровно после 4-го / позже
+                Sim.END = END
+                got = {}
+                for lev in LEVELS:
+                    for pol in POLS:
+                        arm = kh.make_arm(torch, k36, "T32_s0", src)
+                        ep = run_pulse(Sim(), io, arm, sc, 0, AMP[lev], pol, Ck,
+                                       "toy")
+                        tgi = [i for i, c in enumerate(ep["calls"])
+                               if c["target"]]
+                        assert len(tgi) == 1
+                        if END == 40:
+                            assert ep["target"]["mid"] and \
+                                len(ep["calls"]) > tgi[0] + 1
+                            assert ep["target"]["refresh"] == \
+                                (pol == "RefreshOnce")
+                            assert ep["heavy"] == len(ep["calls"]) + int(
+                                pol == "RefreshOnce")
+                        else:
+                            assert not ep["target"]["mid"] and \
+                                ep["heavy"] == len(ep["calls"])
+                        j = dict(job=f"ep/{lev}/{pol}/s0/t0/toy", level=lev,
+                                 amp=AMP[lev], policy=pol, seed=0, scene=sc)
+                        m = save_ep(shard_path("toy", j["job"]), j["job"], ep,
+                                    "P", dict(level=lev, policy=pol))
+                        pl = dict(sha256="P")
+                        mm, zz, pr = check_shard("toy", j, pl, Ck, "screen")
+                        assert pr == [], (lev, pol, pr)
+                        got[(lev, pol)] = (mm, zz)
+                        assert m["target"]["reached"]
+                        if pol == "RefreshOnce" and m["target"]["mid"]:
+                            assert m["target"]["refresh"] and m["heavy"] == \
+                                len(ep["calls"]) + 1
+                    assert pair_problems(got[(lev, "T1")],
+                                         got[(lev, "RefreshOnce")]) == []
             # порча: хвост, хеш o4, чужой префикс — отказ
             mm, zz = got[("strong", "RefreshOnce")]
             bad = dict(zz)
@@ -1292,7 +1412,18 @@ def selftest():
             za["actions"][0, 0] += 1
             assert pair_problems((got[("strong", "T1")][0], za),
                                  got[("strong", "RefreshOnce")])
-            # нулевой T1 = обычный эпизод K-39 T1
+            # target без хешей / с чужим k — отказ эпизода и пары
+            m3 = json.loads(json.dumps(mm))
+            m3["target"].update(o0=None, o4=None, k=0)
+            jb = dict(job="x", level="strong", amp=AMP["strong"],
+                      policy="RefreshOnce", seed=0, scene=sc)
+            assert ep_problems(zz, m3, jb, Ck)
+            m4 = json.loads(json.dumps(got[("strong", "T1")][0]))
+            m4["target"].update(o0=None, o4=None)
+            m5 = json.loads(json.dumps(mm))
+            m5["target"].update(o0=None, o4=None)
+            assert pair_problems((m4, got[("strong", "T1")][1]), (m5, zz))
+            # нулевой T1 (END 40) = обычный эпизод K-39 T1
             import k39_run as kr
             arm = kh.make_arm(torch, k36, "T32_s0", src)
             e1 = kr.run_episode(Sim(), io, arm, None, "T1", 0, 3)
@@ -1305,6 +1436,27 @@ def selftest():
                                None)[2]
         finally:
             g_["shard_path"] = keep
+    # калибровка: решение о 0.225 по обоим сидам; выбранный уровень без o4
+    def crow(t, s_, lev, mid, clip, d=0.3):
+        return dict(task=t, seed=s_, level=lev, k=4 if mid else 1, mid=mid,
+                    reached=True, clip=[clip, clip], delta=[d, d],
+                    eef4=[0.0, 0.0, d] if mid else None)
+    rr = []
+    for t in TASKS:
+        for s_ in SEEDS:
+            rr += [crow(t, s_, "zero", True, False, 0.0),
+                   crow(t, s_, "mild", True, False, 0.15),
+                   crow(t, s_, "strong", True, s_ == 0 or t < 5),
+                   crow(t, s_, "alt", False, False, 0.225)]
+    cs = summarize_cal(rr)
+    assert cs["chosen"] == "alt" and cs["status"] == "needs_review"
+    cs = summarize_cal([r for r in rr if r["level"] != "alt"])
+    assert cs["status"] == "needs_review"          # выбран alt, его нет
+    rr2 = [dict(r, clip=[False, False]) if r["level"] == "strong" else r
+           for r in rr if r["level"] != "alt"]
+    cs = summarize_cal(rr2)
+    assert cs["chosen"] == "strong" and cs["status"] == "ok", cs["reason"]
+    assert executed_deltas(dict(delta=[0.3, 0.3], k=2)) == [0.3]
     # анализ: известные W/L и взаимодействие
     rows = []
     for t in TASKS:
@@ -1326,9 +1478,11 @@ def selftest():
     assert st["I_strong"]["est"] > 0
     print("самопроверка k39_pulse пройдена: импульс (строки 1–2, ось, клип, "
           "ноль побитово); очередь 2 × 144, все 6 вариантов сцены в части; "
-          "игрушечный цикл: 6 комбинаций приняты, пары совпадают до хвоста, "
-          "один пересчёт; порча хвоста/o4/префикса и шард без журнала — "
-          "отказ; нулевой T1 = T1 K-39; W/L/D и I")
+          "порядок T1 первым 24/48 на уровне; игрушечный цикл при terminal "
+          "на 4-м шаге и позже: 6 комбинаций приняты, один пересчёт и "
+          "возврат к T1; порча хвоста/o4/префикса/target и шард без журнала "
+          "— отказ; нулевой T1 = T1 K-39; калибровка по обоим сидам; W/L/D "
+          "и I")
     return 0
 
 
