@@ -61,6 +61,9 @@ BANK_MANIFEST = "reports/k39/bank_manifest.json"
 BANK_LEDGER = "data/k39/bank_ledger.json"
 N_BANK, MAX_CAND = 12, 48
 PROFILES = dict(one=4, two=8, three=12)
+# Пилот Refresh4 против T1: 4 сцены на задачу с позиций 8–11 банка (вне
+# профилей one/two), только T1 и Refresh4, без обученных голов.
+REFRESH_PILOT = dict(n=4, offset=8)
 EP = 610
 BOOT = dict(n=50_000, seed=39001)
 TIE_TOL = 0.0
@@ -84,8 +87,11 @@ def rep_dir(run):
     return os.path.join("reports/k39", run)
 
 
+SCREEN = "screen"                    # имя каталога скрининга (--screen)
+
+
 def screen_dir(run):
-    return os.path.join(rep_dir(run), "screen")
+    return os.path.join(rep_dir(run), SCREEN)
 
 
 # --- банк space 3 -------------------------------------------------------------------------------
@@ -150,7 +156,7 @@ def bank(a):
     return OK
 
 
-def bank_scenes(n_per_task):
+def bank_scenes(n_per_task, offset=0):
     import k33_bank as kb
     m = json.load(open(BANK_MANIFEST, encoding="utf-8"))
     bad = [p for p, s in m["files"].items() if sha256(p) != s]
@@ -159,8 +165,9 @@ def bank_scenes(n_per_task):
     out = []
     for t in TASKS:
         cs, _m = kb.load_task(SPACE, t, BANK_DIR)
-        for pos, c in enumerate(cs[:n_per_task]):
-            out.append(dict(task=t, case_id=c["case_id"], pos=pos,
+        for i, c in enumerate(cs[offset:offset + n_per_task]):
+            out.append(dict(task=t, case_id=c["case_id"], pos=offset + i,
+                            rank=i,
                             hash=[c["init_hash"], c["init_hash_full"]]))
     return m, out
 
@@ -176,7 +183,8 @@ def make_plan(run, profile, n_parts, variant="base"):
     import k39_cache as kc
     dp = kc.load_data_plan(run)
     fits = {}
-    for s in SEEDS:
+    pilot = profile == "refresh"
+    for s in SEEDS if not pilot else ():
         import k39_model as km
         f = pc.load_json(os.path.join(rep_dir(run), km.fit_name(s, variant)))
         wp = os.path.join(km.model_dir(run, s, variant), "heads.pt")
@@ -187,25 +195,30 @@ def make_plan(run, profile, n_parts, variant="base"):
             raise SystemExit(f"fit s{s} ({variant}): отчёт, код модели или "
                              f"файл весов не сходятся")
         fits[str(s)] = dict(sha256=f["sha256"], model_code=f["model_code"])
-    n = PROFILES[profile]
-    bm, scenes = bank_scenes(n)
-    for sc in scenes:
-        sc["rank"] = sc["pos"]
-    refresh = {sc["case_id"] for sc in scenes if sc["pos"] < max(1, n // 4)}
+    if pilot:
+        bm, scenes = bank_scenes(REFRESH_PILOT["n"], REFRESH_PILOT["offset"])
+        refresh = {sc["case_id"] for sc in scenes}
+        main = ["T1"]
+    else:
+        n = PROFILES[profile]
+        bm, scenes = bank_scenes(n)
+        refresh = {sc["case_id"] for sc in scenes
+                   if sc["rank"] < max(1, n // 4)}
+        main = list(MAIN)
     parts = {str(k): [] for k in range(n_parts)}
-    for i, sc in enumerate(sorted(scenes, key=lambda x: (x["pos"],
+    for i, sc in enumerate(sorted(scenes, key=lambda x: (x["rank"],
                                                          x["task"]))):
         parts[str(i % n_parts)].append(sc["case_id"])
     k36 = pc.load_prepare()
     plan = dict(kind="k39_screen_plan", run_id=run, protocol=PROTOCOL,
-                profile=profile, variant=variant,
+                profile=profile, variant=None if pilot else variant,
                 data_plan_sha256=dp["sha256"],
                 k36_prepare_sha1=k36["sha1"],
                 code={f: sha256(os.path.join(HERE, f)) for f in CODE},
                 fits=fits, bank=dict(bank_id=bm["bank_id"], files=bm["files"],
                                      space=SPACE, dir=BANK_DIR),
                 scenes=scenes, refresh=sorted(refresh), parts=parts,
-                policies=list(MAIN) + ["Refresh4"], seeds=list(SEEDS),
+                policies=main + ["Refresh4"], seeds=list(SEEDS),
                 env=dict(B=1, exec_seed=101, waiting_steps=10, max_steps=600,
                          prefix=4, horizon=8),
                 caps=dict(part=None, preflight=8 * EP), threads=8,
@@ -215,7 +228,7 @@ def make_plan(run, profile, n_parts, variant="base"):
                                         tree_dev="and D(Fresh-Flat) > 0 and "
                                         "D(Fresh-T1) > 0")))
     for k, ids in parts.items():
-        n_ep = len(ids) * len(SEEDS) * len(MAIN) + sum(
+        n_ep = len(ids) * len(SEEDS) * len(main) + sum(
             len(SEEDS) for c in ids if c in refresh)
         plan["parts"][k] = dict(scenes=ids, n_episodes=n_ep,
                                 cap=(n_ep + 1) * EP)
@@ -276,7 +289,8 @@ def part_jobs(plan, k):
     for s in SEEDS:
         for cid in plan["parts"][str(k)]["scenes"]:
             sc = by[cid]
-            pols = policy_order(sc["rank"], s, list(MAIN))
+            pols = policy_order(sc["rank"], s, [p_ for p_ in plan["policies"]
+                                                if p_ != "Refresh4"])
             if cid in plan["refresh"]:
                 pols = pols + ["Refresh4"]
             for pol in pols:
@@ -610,7 +624,7 @@ def ep_problems(z, meta, policy, C, want_hash=None):
 
 # --- исполнение очереди ----------------------------------------------------------------------------
 def shard_path(run, job):
-    return os.path.join("data/k39", run, "screen",
+    return os.path.join("data/k39", run, SCREEN,
                         job.replace("/", "__") + ".npz")
 
 
@@ -793,7 +807,9 @@ def preflight(a):
     for e in picks:  # имена дополняются хостом/UUID ниже
         sc = dict(task=e["task"], case_id=e["case_id"], pos=e["pos"],
                   hash=e["hash"])
-        for pol in ("T1", "TreeFresh", "FlatFresh"):
+        for pol in ("T1",) + tuple(p_ for p_ in ("TreeFresh", "FlatFresh",
+                                                  "Refresh4")
+                                   if p_ in plan["policies"]):
             jobs.append(dict(job=f"pf/{pol}/s{e['seed']}/t{e['task']}/"
                              f"{e['case_id']}", policy=pol, seed=e["seed"],
                              scene=sc, eid=e["eid"]))
@@ -1048,7 +1064,8 @@ def analyze(a):
     fo = out["all"]["TreeFresh-TreeOld"]
     fresh = bool(fo and 100 * fo["D"] >= 3 * fo["N"] and
                  all(v >= 0 for v in fo["per_seed"].values()))
-    tree = fresh and out["all"]["TreeFresh-FlatFresh"]["D"] > 0 and \
+    tree = fresh and bool(out["all"]["TreeFresh-FlatFresh"]) and \
+        out["all"]["TreeFresh-FlatFresh"]["D"] > 0 and \
         out["all"]["TreeFresh-T1"]["D"] > 0
     sr = {p_: float(np.mean([r["success"] for r in rows
                              if r["policy"] == p_])) for p_ in
@@ -1058,6 +1075,8 @@ def analyze(a):
            for p_ in ("TreeOld", "TreeFresh")}
     status_ = "tree_dev_candidate" if tree else ("fresh_signal" if fresh
                                                  else "no_signal")
+    if plan["profile"] == "refresh":
+        status_ = "refresh_pilot"
     pc.save_json(os.path.join(screen_dir(a.run_id), "analysis.json"),
                  dict(plan=plan["sha256"], sr=sr, contrasts=out,
                       alt_share=alt, status=status_, boot=BOOT))
@@ -1124,7 +1143,9 @@ def latency(a):
                 raws.append((by[r["eid"]]["task"], r["t"], o0, o4))
             v = kh.load_source(torch, s, a.device)
             arm = kh.make_arm(torch, k36, f"T32_s{s}", v)
-            heads = load_heads(torch, a.run_id, plan, s, C, dev)
+            pols = list(plan["policies"])
+            heads = load_heads(torch, a.run_id, plan, s, C, dev) if any(
+                p_ in pols for p_ in MAIN[1:]) else None
             io = v["io"]
 
             descs = {tk: io.task_desc(tk) for tk in {r[0] for r in raws}}
@@ -1149,7 +1170,6 @@ def latency(a):
                 torch.cuda.synchronize(dev)
                 t2 = time.perf_counter()
                 return (t1 - t0) * 1e3, (t2 - t1) * 1e3
-            pols = list(MAIN) + ["Refresh4"]
             for j in range(10):
                 for pol in pols:
                     one(pol, *raws[j % len(raws)])
@@ -1165,7 +1185,7 @@ def latency(a):
             arm = v = heads = None
             kh.free(torch)
         summ = {}
-        for p_ in list(MAIN) + ["Refresh4"]:
+        for p_ in plan["policies"]:
             x = np.concatenate([np.asarray(res[str(s)][p_]) for s in SEEDS])
             tot = x.sum(1)
             if not np.isfinite(x).all() or len(x) != 300:
@@ -1206,6 +1226,14 @@ def selftest():
     torch.manual_seed(0)
     # порядок политик и очередь
     assert policy_order(1, 0, list(MAIN)) == list(MAIN[1:]) + [MAIN[0]]
+    scs = [dict(task=t, case_id=f"c{t}_{i}", pos=8 + i, rank=i, hash=None)
+           for t in TASKS for i in range(4)]
+    pp = dict(scenes=scs, refresh=[x["case_id"] for x in scs],
+              policies=["T1", "Refresh4"],
+              parts={"0": dict(scenes=[x["case_id"] for x in scs])})
+    jj = part_jobs(pp, 0)
+    assert len(jj) == 96 and {j["policy"] for j in jj} == {"T1", "Refresh4"}
+    assert all(j["scene"]["pos"] >= 8 for j in jj)
     # игрушечный источник, среда с кадрами 224
     M = k29m.build(torch)
     Lb = np.array([-1.1, -2.0, -1.5, -0.5, -3.0, -1.0])
@@ -1374,7 +1402,8 @@ def main():
                                     "assign", "preflight", "collect",
                                     "status", "merge", "analyze", "latency"))
     ap.add_argument("--run-id", default="f2")
-    ap.add_argument("--profile", choices=tuple(PROFILES), default="one")
+    ap.add_argument("--profile", choices=tuple(PROFILES) + ("refresh",),
+                    default="one")
     ap.add_argument("--parts", type=int, default=1)
     ap.add_argument("--part", type=int, default=0)
     ap.add_argument("--device", default="cuda:0")
@@ -1384,9 +1413,13 @@ def main():
                     choices=("assigned", "released", "done"))
     ap.add_argument("--reference", action="store_true")
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--screen", default="screen",
+                    help="каталог скрининга (пилот Refresh4 — refresh)")
     ap.add_argument("--variant", default="base",
                     choices=("base", "long", "nearb"))
     a = ap.parse_args()
+    global SCREEN
+    SCREEN = a.screen
     import k37_confirm as kcf
     fn = {"bank": bank, "prepare-screen": prepare_screen,
           "gpuinfo": kcf.gpuinfo, "assign": assign, "preflight": preflight,
