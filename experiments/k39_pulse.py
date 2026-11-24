@@ -199,8 +199,15 @@ def ep_number(run, task, cid, seed):
     return kh.episode_number(f"k39-pulse|{run}|{task}|{cid}|{seed}")
 
 
+def eef_of(obs):
+    st_ = np.asarray(obs["state"], np.float64)
+    if st_.shape != (1, 9) or not np.isfinite(st_).all():
+        raise SystemExit(f"state: форма {st_.shape} или нечисловые значения")
+    return st_[0, EEF].copy()
+
+
 def run_pulse(sim, io, arm, sc, seed, amp, policy, C, run, stop_after=False,
-              keep_o4=False):
+              keep_o4=False, trace=False):
     """Эпизод с импульсом в чанке sc["t"]; stop_after — оборвать сразу после
     префикса целевого чанка (калибровка)."""
     import k18_collector as k18c
@@ -223,6 +230,7 @@ def run_pulse(sim, io, arm, sc, seed, amp, policy, C, run, stop_after=False,
         raise SystemExit("среда завершилась во время ожидания")
     ih, ihf = k18c.init_hashes(obs, 1)
     acts, calls, heavy = [], [], dict(n=0)
+    eefs = [] if trace else None          # кисть после каждого шага
     tgt = dict(reached=False, k=0, mid=False, refresh=False, o0=None,
                o4=None, eef4=None, P=None, delta=None, clip=None, R=None,
                B=None, o4_obs=None)
@@ -244,6 +252,8 @@ def run_pulse(sim, io, arm, sc, seed, amp, policy, C, run, stop_after=False,
         if bool(d_[0]) and done_step < 0:
             done_step = steps
         steps += 1
+        if eefs is not None:
+            eefs.append(eef_of(obs))
     live = lambda: done_step < 0 and steps < kcol.ENV["max_steps"]  # noqa
     try:
         while live():
@@ -311,6 +321,8 @@ def run_pulse(sim, io, arm, sc, seed, amp, policy, C, run, stop_after=False,
                 init_hash_full=ihf[0], actions=A,
                 actions_sha1=kcol.actions_sha(A), calls=calls,
                 heavy=int(heavy["n"]), target=tgt,
+                eef_trace=None if eefs is None else
+                (np.stack(eefs) if eefs else np.zeros((0, 3))),
                 seconds=time.time() - t0)
 
 
@@ -720,6 +732,138 @@ def cal_row_problems(r, job):
     if type(ph) is not int or not 10 < ph <= EP:
         p.append(f"расход {ph!r} вне (10, {EP}]")
     return p
+
+
+PROBE_OFFSETS = (4, 8, 16, 24)
+
+
+def probe_job(amp, s, sc):
+    return f"probe/a{amp:.3f}/s{s}/t{sc['task']}/{sc['case_id']}"
+
+
+def probe(a):
+    """T1 до конца на 12 калибровочных стартах при амплитудах --amps (0
+    добавляется всегда): исходы пар и смещение кисти к нулю на t+4/8/16/24.
+    Не входит в план; строки — reports/k39/pulse/<run>/probe/."""
+    import k36_harness as kh
+    import k36_protocol as pc
+    import k31_collect as kcol
+    run = a.run_id
+    amps = sorted({0.0} | {float(x) for x in a.amps.split(",")})
+    if len(amps) > 6 or max(amps) > 1.0 or min(amps) < 0:
+        raise SystemExit(f"амплитуды {amps}")
+    _m, calib, _p = scenes(run)
+    k36 = pc.load_prepare()
+    C = kh.consts(k36)
+    L = kcol.Ledger(os.path.join(rep_dir(run), "probe_ledger.json"),
+                    dict(probe=12 * 6 * EP))
+    pd = L.d["pending"]
+    if pd and os.path.exists(cal_row_path(run, pd["id"])):
+        r = pc.load_json(cal_row_path(run, pd["id"]))
+        pr = cal_row_problems(r, pd["id"])
+        if pd["scope"] != "probe" or pd["amount"] != EP or \
+                not pd["id"].startswith("probe/"):
+            pr.append(f"резерв {pd} не пробный")
+        if pr:
+            raise SystemExit(f"резерв {pd['id']}: {pr}")
+        L.commit(pd["id"], r["physical"])
+    card = None
+    rows = []
+    try:
+        for s in SEEDS:
+            todo = [(sc, amp) for sc in calib for amp in amps]
+            need = [x for x in todo if not os.path.exists(
+                cal_row_path(run, probe_job(x[1], s, x[0])))]
+            v = arm = None
+            if need:
+                if card is None:
+                    card = Card(a.device, run)
+                    card.start(run)
+                v, arm = source(card, k36, s)
+            for sc, amp in todo:
+                job = probe_job(amp, s, sc)
+                rp = cal_row_path(run, job)
+                if os.path.exists(rp):
+                    r = pc.load_json(rp)
+                    pr = cal_row_problems(r, job)
+                    if L.d["done"].get(job) != dict(scope="probe",
+                                                    actual=r.get("physical")):
+                        pr.append(f"журнал {L.d['done'].get(job)} ≠ строке")
+                    if pr:
+                        raise SystemExit(f"{job}: {pr}")
+                    rows.append(r)
+                    continue
+                if L.is_done(job):
+                    raise SystemExit(f"{job}: учтён, строки нет")
+                L.reserve("probe", job, amount=EP)
+                ep = run_pulse(card.sim, v["io"], arm, sc, s, amp, "T1", C,
+                               run, trace=True)
+                tg, tr = ep["target"], ep["eef_trace"]
+                r = dict(job=job, task=sc["task"], case_id=sc["case_id"],
+                         seed=s, amp=amp, t=sc["t"], axis=sc["axis"],
+                         success=ep["success"], steps=ep["steps"],
+                         done_step=ep["done_step"], reached=tg["reached"],
+                         k=tg["k"], mid=tg["mid"],
+                         clip=None if tg["clip"] is None else
+                         tg["clip"].tolist(),
+                         eef={str(d): (tr[sc["t"] + d - 1].tolist()
+                                       if sc["t"] + d - 1 < len(tr) else None)
+                              for d in PROBE_OFFSETS},
+                         physical=int(ep["physical"]))
+                pc.save_json(rp, r)
+                L.commit(job, r["physical"])
+                rows.append(r)
+                print(f"  {job}: успех {r['success']}, шагов {r['steps']}",
+                      flush=True)
+            if arm is not None:
+                arm = v = None
+                kh.free(card.torch)
+    finally:
+        if card is not None:
+            card.close()
+    rep = summarize_probe(rows)
+    pc.save_json(os.path.join(rep_dir(run), "probe.json"), rep)
+    print(f"  T1 без импульса: успех {rep['sr_zero']}/{rep['n']}")
+    for k_, x in rep["levels"].items():
+        dv = ", ".join(f"+{d}: {x['eef'][d]['med']:.4f}/"
+                       f"{x['eef'][d]['p90']:.4f} (n {x['eef'][d]['n']})"
+                       if x["eef"][d]["n"] else f"+{d}: —"
+                       for d in x["eef"])
+        print(f"  амплитуда {k_}: успех {x['sr']}/{x['n']}; сломал "
+              f"{x['broke']} {x['broke_keys']}; починил {x['fixed']} "
+              f"{x['fixed_keys']}; o4 {x['o4']}/{x['n']}, клип "
+              f"{x['clip_share']:.2f}; смещение кисти к нулю, м (медиана/p90)"
+              f": {dv}")
+    return OK
+
+
+def summarize_probe(rows):
+    by = {(r["task"], r["seed"], r["amp"]): r for r in rows}
+    keys = sorted({(r["task"], r["seed"]) for r in rows})
+    zero = {k: by[k + (0.0,)] for k in keys if k + (0.0,) in by}
+    lv = {}
+    for amp in sorted({r["amp"] for r in rows} - {0.0}):
+        rs = [by[k + (amp,)] for k in keys if k + (amp,) in by and k in zero]
+        brk = [[r["task"], r["seed"]] for r in rs
+               if zero[(r["task"], r["seed"])]["success"] and not r["success"]]
+        fix = [[r["task"], r["seed"]] for r in rs
+               if not zero[(r["task"], r["seed"])]["success"] and r["success"]]
+        ev = {}
+        for d in PROBE_OFFSETS:
+            dd = [float(np.linalg.norm(np.subtract(
+                r["eef"][str(d)], zero[(r["task"], r["seed"])]["eef"][str(d)])))
+                for r in rs if r["eef"][str(d)] is not None and
+                zero[(r["task"], r["seed"])]["eef"][str(d)] is not None]
+            ev[str(d)] = dict(n=len(dd),
+                              med=float(np.median(dd)) if dd else None,
+                              p90=float(np.quantile(dd, 0.9)) if dd else None)
+        lv[f"{amp:g}"] = dict(n=len(rs), sr=sum(r["success"] for r in rs),
+                              broke=len(brk), broke_keys=brk, fixed=len(fix),
+                              fixed_keys=fix,
+                              o4=sum(bool(r["mid"]) for r in rs),
+                              clip_share=frac_clip(rs), eef=ev)
+    return dict(n=len(zero), sr_zero=sum(r["success"] for r in zero.values()),
+                levels=lv, rows=rows)
 
 
 def executed_deltas(r):
@@ -1451,6 +1595,13 @@ def selftest():
             m5 = json.loads(json.dumps(mm))
             m5["target"].update(o0=None, o4=None)
             assert pair_problems((m4, got[("strong", "T1")][1]), (m5, zz))
+            # трасса кисти: по точке на шаг, действия не меняются
+            arm = kh.make_arm(torch, k36, "T32_s0", src)
+            et = run_pulse(Sim(), io, arm, sc, 0, AMP["strong"], "T1", Ck,
+                           "toy", trace=True)
+            assert et["eef_trace"].shape == (et["steps"], 3) and \
+                np.array_equal(et["actions"],
+                               got[("strong", "T1")][1]["actions"])
             # нулевой T1 (END 40) = обычный эпизод K-39 T1
             import k39_run as kr
             arm = kh.make_arm(torch, k36, "T32_s0", src)
@@ -1496,6 +1647,17 @@ def selftest():
     assert cal_row_problems(dict(job="cal/x", physical=-9), "cal/x")
     assert cal_row_problems(dict(job="cal/y", physical=40), "cal/x")
     assert cal_row_problems(dict(job="cal/x", physical=40), "cal/x") == []
+    pz = lambda t, s_, a_, ok, e: dict(  # noqa: E731
+        task=t, seed=s_, amp=a_, success=ok, mid=True, k=4,
+        clip=[False, False], eef={str(d): [0.0, 0.0, e if d < 16 else 0.0]
+                                  for d in PROBE_OFFSETS})
+    pr_ = [pz(t, s_, 0.0, True, 0.0) for t in TASKS for s_ in SEEDS] + \
+        [pz(t, s_, 0.3, not (t == 0 and s_ == 1), 0.006)
+         for t in TASKS for s_ in SEEDS]
+    sp = summarize_probe(pr_)
+    assert sp["sr_zero"] == 12 and sp["levels"]["0.3"]["broke"] == 1
+    assert abs(sp["levels"]["0.3"]["eef"]["8"]["med"] - 0.006) < 1e-9 and \
+        sp["levels"]["0.3"]["eef"]["16"]["med"] == 0.0
     # анализ: известные W/L и взаимодействие
     rows = []
     for t in TASKS:
@@ -1520,8 +1682,8 @@ def selftest():
           "порядок T1 первым 24/48 на уровне; игрушечный цикл при terminal "
           "на 4-м шаге и позже: 6 комбинаций приняты, один пересчёт и "
           "возврат к T1; порча хвоста/o4/префикса/target и шард без журнала "
-          "— отказ; нулевой T1 = T1 K-39; калибровка по обоим сидам; W/L/D "
-          "и I")
+          "— отказ; нулевой T1 = T1 K-39; калибровка по обоим сидам; трасса и сводка "
+          "probe; W/L/D и I")
     return 0
 
 
@@ -1529,7 +1691,8 @@ def main():
     if "--selftest" in sys.argv:
         return selftest()
     ap = argparse.ArgumentParser(description="K-39 B: импульс и пересчёт")
-    ap.add_argument("cmd", choices=("bank", "calibrate", "prepare", "gpuinfo",
+    ap.add_argument("cmd", choices=("bank", "calibrate", "probe", "prepare",
+                                    "gpuinfo",
                                     "assign", "preflight", "collect",
                                     "status", "merge", "analyze"))
     ap.add_argument("--run-id", default="b1")
@@ -1541,9 +1704,10 @@ def main():
                     choices=("assigned", "released", "done"))
     ap.add_argument("--reference", action="store_true")
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--amps", default="0.3")
     a = ap.parse_args()
     import k37_confirm as kcf
-    fn = dict(bank=bank, calibrate=calibrate, prepare=prepare,
+    fn = dict(bank=bank, calibrate=calibrate, probe=probe, prepare=prepare,
               gpuinfo=kcf.gpuinfo, assign=assign, preflight=preflight,
               collect=collect, status=status, merge=merge,
               analyze=analyze)[a.cmd]
