@@ -940,12 +940,14 @@ def probe_grip(a):
     try:
         for s in SEEDS:
             cur = [None, None]
+            v = arm = None
             for sc in calib:
                 job = f"grip/ref/s{s}/t{sc['task']}/{sc['case_id']}"
                 old = pc.load_json(cal_row_path(run, probe_job(0.0, s, sc)))
                 want = dict(task=sc["task"], case_id=sc["case_id"], seed=s,
                             init=list(sc["hash"]),
-                            actions_sha1=old["actions_sha1"])
+                            actions_sha1=old["actions_sha1"],
+                            success=old["success"], steps=old["steps"])
                 if os.path.exists(cal_row_path(run, job)):
                     r = _row_read(L, scope, run, job, want, pc)
                 else:
@@ -966,7 +968,11 @@ def probe_grip(a):
                     A = ep["actions"]
                     g = grip_event(A)
                     t = grip_t(g)
-                    ok = t is not None and t in ep["chunk_hashes"]
+                    if t is not None and t not in ep["chunk_hashes"]:
+                        print(f"  {job}: t {t} не граница чанка — резерв "
+                              f"открыт", flush=True)
+                        return TECH
+                    ok = t is not None
                     r = dict(job=job, task=sc["task"], case_id=sc["case_id"],
                              seed=s, amp=0.0, init=list(sc["hash"]),
                              actions_sha1=ep["actions_sha1"],
@@ -985,9 +991,10 @@ def probe_grip(a):
                           f"{r['tail']}", flush=True)
                 A_ = np.zeros((len(r["grip"]), 7))
                 A_[:, 6] = r["grip"]
-                if grip_event(A_) != r["g"] or (r["t"] is not None and
-                                                grip_t(r["g"]) != r["t"]):
+                if grip_event(A_) != r["g"] or grip_t(r["g"]) != r["t"] or \
+                        len(r["grip"]) != r["steps"]:
                     raise SystemExit(f"{job}: g/t ≠ пересчёту")
+                r["tail"] = bool(r["t"] is not None and r["g"] < r["t"] + 8)
                 refs[(sc["task"], s)] = r
                 if r["t"] is None:
                     continue
@@ -1019,7 +1026,7 @@ def probe_grip(a):
                     print(f"  {job2}: успех {r2['success']}, шагов "
                           f"{r2['steps']}", flush=True)
             if cur[0] is not None:
-                cur[0] = cur[1] = None
+                cur[0] = cur[1] = v = arm = None
                 kh.free(card.torch)
     finally:
         if card is not None:
