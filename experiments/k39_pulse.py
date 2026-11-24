@@ -629,8 +629,14 @@ def calibrate(a):
                     dict(calib=48 * EP))
     pd = L.d["pending"]
     if pd and os.path.exists(cal_row_path(run, pd["id"])):
-        L.commit(pd["id"], pc.load_json(cal_row_path(run, pd["id"]))[
-            "physical"])
+        r = pc.load_json(cal_row_path(run, pd["id"]))
+        pr = cal_row_problems(r, pd["id"])
+        if pd["scope"] != "calib" or pd["amount"] != EP or \
+                not pd["id"].startswith("cal/"):
+            pr.append(f"резерв {pd} не калибровочный")
+        if pr:
+            raise SystemExit(f"резерв {pd['id']}: {pr}")
+        L.commit(pd["id"], r["physical"])
     card = None
 
     def stage(levels):
@@ -653,8 +659,12 @@ def calibrate(a):
                 rp = cal_row_path(run, job)
                 if os.path.exists(rp):
                     r = pc.load_json(rp)
-                    if not L.is_done(job) or r["job"] != job:
-                        raise SystemExit(f"{job}: строка без записи журнала")
+                    pr = cal_row_problems(r, job)
+                    if L.d["done"].get(job) != dict(scope="calib",
+                                                    actual=r.get("physical")):
+                        pr.append(f"журнал {L.d['done'].get(job)} ≠ строке")
+                    if pr:
+                        raise SystemExit(f"{job}: {pr}")
                     rows.append(r)
                     continue
                 if L.is_done(job):
@@ -690,6 +700,9 @@ def calibrate(a):
     rep = summarize_cal(rows)
     pc.save_json(os.path.join(rep_dir(run), "calibration.json"), rep)
     for k_, x in rep["levels"].items():
+        if k_ == "zero":
+            print(f"  zero: o4 {x['o4_share']:.2f} (из {x['n']})")
+            continue
         print(f"  {k_}: o4 {x['o4_share']:.2f}, клип {x['clip_share']:.2f}, "
               f"|Δ|/half {x['delta_mean']:.3f} (ключей {x['n_cmp']}), "
               f"смещение кисти медиана {x['eef_med']:.4f} м, p90 "
@@ -697,6 +710,16 @@ def calibrate(a):
     print(f"  калибровка: {rep['status']}; strong = {rep['strong']} "
           f"({rep['reason']})")
     return OK if rep["status"] == "ok" else TECH
+
+
+def cal_row_problems(r, job):
+    p = []
+    if r.get("job") != job:
+        p.append("строка чужого задания")
+    ph = r.get("physical")
+    if type(ph) is not int or not 10 < ph <= EP:
+        p.append(f"расход {ph!r} вне (10, {EP}]")
+    return p
 
 
 def executed_deltas(r):
@@ -730,13 +753,18 @@ def summarize_cal(rows):
     cmp_ = [k for k in keys if all(by.get(k + (lv,), {}).get("mid")
                                    for lv in ("zero", "mild", chosen))]
     lv = {}
-    for lev in have:
+    for lev in ["zero"] + have:
         rs = [r for r in rows if r["level"] == lev]
-        rc = [by[k + (lev,)] for k in cmp_ if k + (lev,) in by]
+        # метрики уровня — по стартам, где o4 есть и на нём, и на нуле
+        own = [by[k + (lev,)] for k in keys
+               if by.get(k + (lev,), {}).get("mid") and
+               by.get(k + ("zero",), {}).get("mid")]
         disp = [float(np.linalg.norm(np.subtract(r["eef4"], by[(
-            r["task"], r["seed"], "zero")]["eef4"]))) for r in rc]
+            r["task"], r["seed"], "zero")]["eef4"]))) for r in own]
+        # |Δ| для сравнения 1.1× — на общих ключах (нуль, мягкий, выбранный)
+        rc = [by[k + (lev,)] for k in cmp_ if k + (lev,) in by]
         dl = [x for r in rc for x in executed_deltas(r)]
-        lv[lev] = dict(n=len(rs), n_cmp=len(rc),
+        lv[lev] = dict(n=len(rs), n_cmp=len(rc), n_o4=len(own),
                        o4_share=float(np.mean([r["mid"] for r in rs])),
                        clip_share=frac_clip(rs),
                        delta_mean=float(np.mean(dl)) if dl else 0.0,
@@ -1457,6 +1485,17 @@ def selftest():
     cs = summarize_cal(rr2)
     assert cs["chosen"] == "strong" and cs["status"] == "ok", cs["reason"]
     assert executed_deltas(dict(delta=[0.3, 0.3], k=2)) == [0.3]
+    rr3 = [dict(r, mid=False, k=2, eef4=None)
+           if (r["level"], r["task"], r["seed"]) == ("strong", 0, 0) else
+           (dict(r, mid=True, k=4, eef4=[0.0, 0.0, 0.225])
+            if r["level"] == "alt" else r) for r in rr]
+    cs = summarize_cal(rr3)
+    assert cs["chosen"] == "alt" and cs["status"] == "ok", cs["reason"]
+    assert cs["levels"]["strong"]["n_o4"] == 11 and \
+        cs["levels"]["alt"]["n_cmp"] == 12 and "zero" in cs["levels"]
+    assert cal_row_problems(dict(job="cal/x", physical=-9), "cal/x")
+    assert cal_row_problems(dict(job="cal/y", physical=40), "cal/x")
+    assert cal_row_problems(dict(job="cal/x", physical=40), "cal/x") == []
     # анализ: известные W/L и взаимодействие
     rows = []
     for t in TASKS:
