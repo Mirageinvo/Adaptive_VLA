@@ -786,6 +786,11 @@ def probe(a):
                 if os.path.exists(rp):
                     r = pc.load_json(rp)
                     pr = cal_row_problems(r, job)
+                    want = dict(task=sc["task"], case_id=sc["case_id"],
+                                seed=s, amp=amp, t=sc["t"], axis=sc["axis"],
+                                init=list(sc["hash"]))
+                    if {k_: r.get(k_) for k_ in want} != want:
+                        pr.append("параметры строки ≠ заданию")
                     if L.d["done"].get(job) != dict(scope="probe",
                                                     actual=r.get("physical")):
                         pr.append(f"журнал {L.d['done'].get(job)} ≠ строке")
@@ -799,8 +804,18 @@ def probe(a):
                 ep = run_pulse(card.sim, v["io"], arm, sc, s, amp, "T1", C,
                                run, trace=True)
                 tg, tr = ep["target"], ep["eef_trace"]
+                if [ep["init_hash"], ep["init_hash_full"]] != list(sc["hash"]):
+                    print(f"  {job}: начальный хеш ≠ банку — резерв открыт",
+                          flush=True)
+                    return TECH
+                A = ep["actions"]
                 r = dict(job=job, task=sc["task"], case_id=sc["case_id"],
                          seed=s, amp=amp, t=sc["t"], axis=sc["axis"],
+                         init=[ep["init_hash"], ep["init_hash_full"]],
+                         o0=tg["o0"], actions_sha1=ep["actions_sha1"],
+                         # история до первой изменяемой команды (строка 1)
+                         prefix_sha1=kcol.actions_sha(A[:sc["t"] + 1])
+                         if tg["reached"] else ep["actions_sha1"],
                          success=ep["success"], steps=ep["steps"],
                          done_step=ep["done_step"], reached=tg["reached"],
                          k=tg["k"], mid=tg["mid"],
@@ -822,6 +837,8 @@ def probe(a):
         if card is not None:
             card.close()
     rep = summarize_probe(rows)
+    if rep["problems"]:
+        raise SystemExit("probe: " + "; ".join(rep["problems"][:4]))
     pc.save_json(os.path.join(rep_dir(run), "probe.json"), rep)
     print(f"  T1 без импульса: успех {rep['sr_zero']}/{rep['n']}")
     for k_, x in rep["levels"].items():
@@ -841,6 +858,30 @@ def summarize_probe(rows):
     by = {(r["task"], r["seed"], r["amp"]): r for r in rows}
     keys = sorted({(r["task"], r["seed"]) for r in rows})
     zero = {k: by[k + (0.0,)] for k in keys if k + (0.0,) in by}
+    prob = []
+    if len(by) != len(rows):
+        prob.append("дубли строк")
+    for amp in sorted({r["amp"] for r in rows}):
+        n_ = sum(k + (amp,) in by and k in zero for k in keys)
+        if n_ != len(TASKS) * len(SEEDS):
+            prob.append(f"амплитуда {amp:g}: пар {n_} ≠ "
+                        f"{len(TASKS) * len(SEEDS)}")
+    for (t, s_, amp), r in by.items():
+        z = zero.get((t, s_))
+        if z is None or amp == 0.0:
+            continue
+        if (r.get("init"), r.get("case_id"), r.get("t"), r.get("axis")) != \
+                (z.get("init"), z.get("case_id"), z.get("t"), z.get("axis")):
+            prob.append(f"t{t} s{s_} {amp:g}: старт ≠ нулевому")
+        elif r["reached"] != z["reached"]:
+            prob.append(f"t{t} s{s_} {amp:g}: достижение t ≠ нулевому")
+        elif r["reached"] and (not r.get("o0") or r["o0"] != z.get("o0") or
+                               r.get("prefix_sha1") != z.get("prefix_sha1")):
+            prob.append(f"t{t} s{s_} {amp:g}: o0/префикс ≠ нулевому")
+        elif not r["reached"] and (r.get("actions_sha1") !=
+                                   z.get("actions_sha1") or
+                                   r["success"] != z["success"]):
+            prob.append(f"t{t} s{s_} {amp:g}: без импульса эпизод ≠ нулевому")
     lv = {}
     for amp in sorted({r["amp"] for r in rows} - {0.0}):
         rs = [by[k + (amp,)] for k in keys if k + (amp,) in by and k in zero]
@@ -863,7 +904,7 @@ def summarize_probe(rows):
                               o4=sum(bool(r["mid"]) for r in rs),
                               clip_share=frac_clip(rs), eef=ev)
     return dict(n=len(zero), sr_zero=sum(r["success"] for r in zero.values()),
-                levels=lv, rows=rows)
+                levels=lv, problems=prob, rows=rows)
 
 
 def executed_deltas(r):
@@ -1648,14 +1689,26 @@ def selftest():
     assert cal_row_problems(dict(job="cal/y", physical=40), "cal/x")
     assert cal_row_problems(dict(job="cal/x", physical=40), "cal/x") == []
     pz = lambda t, s_, a_, ok, e: dict(  # noqa: E731
-        task=t, seed=s_, amp=a_, success=ok, mid=True, k=4,
+        task=t, seed=s_, amp=a_, success=ok, mid=True, k=4, reached=True,
+        case_id=f"c{t}", t=24, axis=0, init=[f"h{t}", "f"], o0=f"o{t}{s_}",
+        prefix_sha1=f"p{t}{s_}", actions_sha1=f"a{t}{s_}{a_}",
         clip=[False, False], eef={str(d): [0.0, 0.0, e if d < 16 else 0.0]
                                   for d in PROBE_OFFSETS})
     pr_ = [pz(t, s_, 0.0, True, 0.0) for t in TASKS for s_ in SEEDS] + \
         [pz(t, s_, 0.3, not (t == 0 and s_ == 1), 0.006)
          for t in TASKS for s_ in SEEDS]
     sp = summarize_probe(pr_)
+    assert sp["problems"] == [], sp["problems"]
     assert sp["sr_zero"] == 12 and sp["levels"]["0.3"]["broke"] == 1
+    bad_ = [dict(r, o0="чужой") if (r["task"], r["seed"], r["amp"]) ==
+            (0, 1, 0.3) else r for r in pr_]
+    assert summarize_probe(bad_)["problems"]
+    bad_ = [dict(r, init=["x", "y"]) if (r["task"], r["seed"], r["amp"]) ==
+            (2, 0, 0.3) else r for r in pr_]
+    assert summarize_probe(bad_)["problems"]
+    six = pr_ + [pz(t, s_, 0.6, True, 0.012) for t in TASKS for s_ in SEEDS]
+    six[-1] = dict(six[-1], amp=0.3)          # подмена amp → дубль/нехватка
+    assert summarize_probe(six)["problems"]
     assert abs(sp["levels"]["0.3"]["eef"]["8"]["med"] - 0.006) < 1e-9 and \
         sp["levels"]["0.3"]["eef"]["16"]["med"] == 0.0
     # анализ: известные W/L и взаимодействие
