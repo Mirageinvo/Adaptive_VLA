@@ -66,6 +66,21 @@ def online_point(A, J):
     return None
 
 
+GROUPS = tuple(f"s{s}_{o}" for s in (0, 1) for o in ("fail", "success"))
+
+
+def pop_weights(n_all, cov, sfx):
+    """Доли стартов с триггером в группах сид × исход T1 среди всех
+    эпизодов популяции (обе сида) и внутри каждого сида."""
+    N = sum(n_all[f"{g}{sfx}"] for g in GROUPS)
+    Ns = {s: n_all[f"s{s}_fail{sfx}"] + n_all[f"s{s}_success{sfx}"]
+          for s in (0, 1)}
+    return dict(N=N, groups={g: cov[f"{g}_online{sfx}"] / N for g in GROUPS},
+                per_seed={str(s): dict(N=Ns[s], groups={
+                    g: cov[f"{g}_online{sfx}"] / Ns[s] for g in GROUPS
+                    if g.startswith(f"s{s}_")}) for s in (0, 1)})
+
+
 def select(jobs, used):
     out, taken = [], set(used)
     for seed in (0, 1):
@@ -129,6 +144,9 @@ def prepare(archive, v1):
                 raise SystemExit(f"{w['eid']}: архив не прошёл сверку ({pr})")
             grp = f"s{w['seed']}_{'success' if succ else 'fail'}"
             n_all[grp] += 1
+            rest = w["case_id"] not in used
+            if rest:
+                n_all[f"{grp}_rest"] += 1
             J = {k[2:]: z[k] for k in z if k.startswith("j_")}
             pt = online_point(z["actions"], J)
             arch = kfp.anchor(z["actions"])
@@ -138,6 +156,8 @@ def prepare(archive, v1):
                 continue
             g, t = pt
             cov[f"{grp}_online"] += 1
+            if rest:
+                cov[f"{grp}_online_rest"] += 1
             if w["case_id"] in used:
                 cov[f"{grp}_online_used_v1"] += 1
                 continue
@@ -145,20 +165,14 @@ def prepare(archive, v1):
                              physical=rec["phys"], npz_sha1=rec["npz_sha1"]))
     if rows:
         raise SystemExit("в merged.json остались записи T1 вне плана")
-    N = sum(n_all.values())
-    weights = dict(
-        N=N, p_fail=sum(cov[f"s{s}_fail_online"] for s in (0, 1)) / N,
-        p_success=sum(cov[f"s{s}_success_online"] for s in (0, 1)) / N,
-        per_seed={str(s): dict(
-            N=n_all[f"s{s}_fail"] + n_all[f"s{s}_success"],
-            p_fail=cov[f"s{s}_fail_online"] /
-            (n_all[f"s{s}_fail"] + n_all[f"s{s}_success"]),
-            p_success=cov[f"s{s}_success_online"] /
-            (n_all[f"s{s}_fail"] + n_all[f"s{s}_success"])) for s in (0, 1)})
-    print(f"  t{TASK}: всего {dict(sorted(n_all.items()))}; триггер "
+    weights = {pop: pop_weights(n_all, cov, sfx) for pop, sfx in
+               (("rest", "_rest"), ("all", ""))}
+    print(f"  t{TASK}: эпизодов {dict(sorted(n_all.items()))}; триггер "
           f"{dict(sorted(cov.items()))}", flush=True)
-    print(f"  веса: p_fail {weights['p_fail']:.4f}, p_success "
-          f"{weights['p_success']:.4f} (N {N})", flush=True)
+    for pop, wv in weights.items():
+        print(f"  веса [{pop}] N {wv['N']}: " + ", ".join(
+            f"{g} {x:.4f}" for g, x in sorted(wv["groups"].items())),
+            flush=True)
     jobs = select(cand, used)
     here = Path(__file__).resolve().parent
     return dict(protocol=PROTOCOL, archive_plan=plan["sha256"],
@@ -259,6 +273,7 @@ def scene_files(out, job, plan):
 def checked_result(path, frame_path, ident):
     import k36_harness as kh
     import k36_protocol as pc
+    from k36_harness import SUMMARY
     row = pc.load_json(path)
     if not isinstance(row, dict) or any(
             type(row.get(k)) is not type(v) or row[k] != v
@@ -284,11 +299,12 @@ def checked_result(path, frame_path, ident):
             raise SystemExit(f"{path} {name}: неверная сводка ({pr})")
     if not isinstance(row.get("arm_same"), bool):
         raise SystemExit(f"{path}: нет arm_same")
+    det = lambda e: {k: e[k] for k in SUMMARY}  # noqa: E731  без seconds
     if row["grip_same"] and (arms["GripOnly"]["success"] != row["t1"] or
-                             arms["ArmOnly"] != arms["RefreshOnce"]):
+                             det(arms["ArmOnly"]) != det(arms["RefreshOnce"])):
         raise SystemExit(f"{path}: схват R = B, а исходы не сходятся")
     if row["arm_same"] and (arms["ArmOnly"]["success"] != row["t1"] or
-                            arms["GripOnly"] != arms["RefreshOnce"]):
+                            det(arms["GripOnly"]) != det(arms["RefreshOnce"])):
         raise SystemExit(f"{path}: рука R = B, а исходы не сходятся")
     return row
 
@@ -345,9 +361,9 @@ def collect(a, plan, k36):
         raise SystemExit(f"часть {a.part}")
     pd_ = part_dir(a.out, a.part)
     pd_.mkdir(parents=True, exist_ok=True)
-    ledger = Ledger(str(pd_ / "ledger.json"), plan["caps"])
     plock = kcf.Lock(str(pd_ / ".part.lock"), f"part {a.part}", kcf.Busy)
     try:
+        ledger = Ledger(str(pd_ / "ledger.json"), plan["caps"])
         rows = restore_rows(a.out, plan, a.part, ledger)
         n_part = sum(j["part"] == a.part for j in plan["jobs"])
         todo = [j for j in plan["jobs"] if j["part"] == a.part and
@@ -424,18 +440,45 @@ def counts(rows, arm):
                 lost=sum(not r["arms"][arm]["success"] for r in s))
 
 
-def weighted(rows, arm, W, n_boot=BOOT["n"], seed=BOOT["seed"]):
-    f = np.array([r["arms"][arm]["success"] for r in rows if not r["t1"]],
-                 float)
-    s = np.array([not r["arms"][arm]["success"] for r in rows if r["t1"]],
-                 float)
-    est = 100 * (W["p_fail"] * f.mean() - W["p_success"] * s.mean())
+def scene_gain(r, arm):
+    """Исход ветви минус исход T1 на сцене: +1 спасение, −1 потеря."""
+    return int(r["arms"][arm]["success"]) - int(r["t1"])
+
+
+def scene_inter(r):
+    y = {a: int(r["arms"][a]["success"]) for a in ARMS}
+    return y["RefreshOnce"] - y["GripOnly"] - y["ArmOnly"] + int(r["t1"])
+
+
+def group_of(r):
+    return f"s{r['seed']}_{'success' if r['t1'] else 'fail'}"
+
+
+def weighted_all(rows, metrics, gw, n_boot=BOOT["n"], seed=BOOT["seed"]):
+    """metrics: имя -> f(row). Σ_g w_g · среднее_g; bootstrap по сценам
+    внутри групп с общими индексами для всех метрик. -> {имя: est/lo/hi}."""
+    groups = {g: [r for r in rows if group_of(r) == g] for g in gw}
+    if any(not v for v in groups.values()):
+        raise SystemExit("взвешивание: пустая группа")
     rng = np.random.default_rng(seed)
-    bf = f[rng.integers(0, len(f), (n_boot, len(f)))].mean(1)
-    bs = s[rng.integers(0, len(s), (n_boot, len(s)))].mean(1)
-    b = 100 * (W["p_fail"] * bf - W["p_success"] * bs)
-    lo, hi = np.quantile(b, [0.025, 0.975])
-    return dict(est=float(est), lo=float(lo), hi=float(hi))
+    idx = {g: rng.integers(0, len(v), (n_boot, len(v)))
+           for g, v in groups.items()}
+    out = {}
+    for name, f in metrics.items():
+        est, b = 0.0, np.zeros(n_boot)
+        for g, v in groups.items():
+            m = np.array([f(r) for r in v], float)
+            est += gw[g] * m.mean()
+            b += gw[g] * m[idx[g]].mean(1)
+        lo, hi = np.quantile(100 * b, [0.025, 0.975])
+        out[name] = dict(est=float(100 * est), lo=float(lo), hi=float(hi))
+    return out
+
+
+def metric_set():
+    m = {a: (lambda r, a=a: scene_gain(r, a)) for a in ARMS}
+    m["interaction"] = scene_inter
+    return m
 
 
 def summarize(rows, plan):
@@ -444,10 +487,13 @@ def summarize(rows, plan):
                by_seed={str(s): {a: counts([r for r in rows
                                             if r["seed"] == s], a)
                                  for a in ARMS} for s in (0, 1)},
-               weighted={a: weighted(rows, a, W) for a in ARMS},
-               weighted_by_seed={str(s): {a: weighted(
-                   [r for r in rows if r["seed"] == s], a,
-                   W["per_seed"][str(s)]) for a in ARMS} for s in (0, 1)},
+               weighted={pop: weighted_all(rows, metric_set(),
+                                           W[pop]["groups"])
+                         for pop in ("rest", "all")},
+               weighted_by_seed={str(s): weighted_all(
+                   [r for r in rows if r["seed"] == s], metric_set(),
+                   W["rest"]["per_seed"][str(s)]["groups"])
+                   for s in (0, 1)},
                grip_shift=dict(Counter(r["grip"]["shift"] for r in rows)),
                grip_same=sum(r["grip_same"] for r in rows),
                arm_same=sum(r["arm_same"] for r in rows))
@@ -463,7 +509,7 @@ def summarize(rows, plan):
     out["interaction"] = dict(sum=int(sum(inter)),
                               pos=sum(x > 0 for x in inter),
                               neg=sum(x < 0 for x in inter))
-    est = {a: out["weighted"][a]["est"] for a in ARMS}
+    est = {a: out["weighted"]["rest"][a]["est"] for a in ARMS}
     out["signals"] = [a for a in ARMS if est[a] >= THRESHOLD_PP]
     out["decision"] = ("+".join(out["signals"]) + "_signal"
                        if out["signals"] else "no_gain")
@@ -472,30 +518,45 @@ def summarize(rows, plan):
 
 def summarize_cmd(a, plan):
     import k36_protocol as pc
+    import k37_confirm as kcf
     rows = []
     for k in range(N_PARTS):
         p = part_dir(a.out, k) / "ledger.json"
         if not p.exists():
             raise SystemExit(f"part {k}: нет журнала")
-        led = Ledger(str(p), plan["caps"])
-        rr = restore_rows(a.out, plan, k, led)
-        if len(rr) != sum(j["part"] == k for j in plan["jobs"]) or \
-                led.pending_id() is not None:
+        lk = kcf.Lock(str(part_dir(a.out, k) / ".part.lock"), f"part {k}",
+                      kcf.Busy)                 # занята — сбор ещё идёт
+        try:
+            led = Ledger(str(p), plan["caps"])
+            if led.pending_id() is not None:
+                raise SystemExit(f"part {k}: открытый резерв — сначала "
+                                 f"перезапустите сбор части")
+            rr = restore_rows(a.out, plan, k, led)
+        finally:
+            lk.release()
+        if len(rr) != sum(j["part"] == k for j in plan["jobs"]):
             raise SystemExit(f"part {k}: неполная")
         rows += list(rr.values())
     res = summarize(rows, plan)
     pc.save_json(str(a.out / "summary.json"), dict(
         res, plan=plan["sha256"], rows=rows))
-    for arm in ARMS:
-        c, wv = res["totals"][arm], res["weighted"][arm]
-        print(f"  {arm}: спасено {c['rescued']}/{c['n_fail']}, потеряно "
-              f"{c['lost']}/{c['n_success']}; взвешенно {wv['est']:+.1f} "
-              f"п.п. 95% [{wv['lo']:+.1f}; {wv['hi']:+.1f}]; по сидам "
-              f"{ {s: res['by_seed'][s][arm] for s in ('0', '1')} }")
+    for arm in (*ARMS, "interaction"):
+        wr, wa = res["weighted"]["rest"][arm], res["weighted"]["all"][arm]
+        ws = {s: round(res["weighted_by_seed"][s][arm]["est"], 1)
+              for s in ("0", "1")}
+        head = arm
+        if arm in ARMS:
+            c = res["totals"][arm]
+            head += (f": спасено {c['rescued']}/{c['n_fail']}, потеряно "
+                     f"{c['lost']}/{c['n_success']}")
+        print(f"  {head}; против T1 на оставшихся стартах c2 "
+              f"{wr['est']:+.1f} п.п. 95% [{wr['lo']:+.1f}; {wr['hi']:+.1f}]"
+              f" (на всех 320: {wa['est']:+.1f}); по сидам {ws}")
     print(f"  схват R к T1: {res['grip_shift']}; схват R = B на "
           f"{res['grip_same']} сценах")
     print(f"  исходы (T1 · G A R): {res['pairs']}")
-    print(f"  взаимодействие R − G − A + T1 по сценам: {res['interaction']}")
+    print(f"  взаимодействие R − G − A + T1 по сценам (без весов): "
+          f"{res['interaction']}")
     print(f"  K-39 2×2: {res['decision']}")
 
 
@@ -558,7 +619,8 @@ def selftest():
     assert Counter((j["want"]["seed"], j["success"]) for j in sel) == {
         (0, False): 12, (0, True): 12, (1, False): 12, (1, True): 12}
     # анализ: взвешивание и решение
-    W = dict(p_fail=0.17, p_success=0.47)
+    gw = {"s0_fail": 0.06, "s0_success": 0.26, "s1_fail": 0.11,
+          "s1_success": 0.21}
     rows = []
     for i in range(24):
         rows.append(dict(t1=False, seed=i % 2, grip=dict(shift="later"),
@@ -571,14 +633,51 @@ def selftest():
                              GripOnly=dict(success=True),
                              ArmOnly=dict(success=i >= 2),
                              RefreshOnce=dict(success=i >= 1))))
-    plan = dict(weights=dict(W, per_seed={"0": W, "1": W}))
+    for r in rows:
+        r["arms"] = {k_: dict(v, physical=0) for k_, v in r["arms"].items()}
+    ps = {str(s_): dict(groups={g: 2 * x for g, x in gw.items()
+                                if g.startswith(f"s{s_}_")}) for s_ in (0, 1)}
+    plan = dict(weights={pop: dict(groups=gw, per_seed=ps)
+                         for pop in ("rest", "all")})
     sm = summarize(rows, plan)
+    # ручной расчёт: GripOnly спасает i<6 (s0: i=0,2,4; s1: 1,3,5) → 3/12
+    # в каждой группе провалов, потерь нет
+    want = 100 * (0.06 * 3 / 12 + 0.11 * 3 / 12)
+    assert abs(sm["weighted"]["rest"]["GripOnly"]["est"] - want) < 1e-9
+    # RefreshOnce: спасения i<3 (s0: 0,2 → 2; s1: 1 → 1), потеря i=0 (s0)
+    want_r = 100 * (0.06 * 2 / 12 + 0.11 * 1 / 12 - 0.26 * 1 / 12)
+    assert abs(sm["weighted"]["rest"]["RefreshOnce"]["est"] - want_r) < 1e-9
+
     assert sm["totals"]["GripOnly"] == dict(n_fail=24, n_success=24,
                                             rescued=6, lost=0)
-    assert abs(sm["weighted"]["GripOnly"]["est"] - 100 * 0.17 * 0.25) < 1e-9
-    assert abs(sm["weighted"]["RefreshOnce"]["est"] -
-               100 * (0.17 * 3 / 24 - 0.47 / 24)) < 1e-9
     assert sm["decision"] == "GripOnly_signal"
+    # запись: одинаковые эпизоды с разным seconds принимаются, разный
+    # исход при схвате R = B — отказ
+    import json as _json
+    import tempfile
+    ep = dict(success=True, success_step=5, done_step=9, own_steps=10,
+              steps=10, physical=20, init_hash="a", init_hash_full="b",
+              actions_sha1="c", seconds=1.0)
+    ident = dict(eid="e", plan="P", seed=0, t1=True, t=0, g=5,
+                 archive_npz_sha1="z", physical=20)
+    row = dict(ident, o0="h0", o4="h4", grip_same=True, arm_same=False,
+               grip=dict(t1=[-1, 1, 1, 1], refresh=[-1, 1, 1, 1],
+                         changed_steps=[], shift="same"),
+               arms=dict(GripOnly=dict(ep), ArmOnly=dict(ep, seconds=2.0),
+                         RefreshOnce=dict(ep, seconds=3.0)))
+    with tempfile.TemporaryDirectory() as td:
+        pth, fp = Path(td) / "r.json", Path(td) / "r.png"
+        fp.write_bytes(b"x")
+        pth.write_text(_json.dumps(row))
+        assert checked_result(pth, fp, ident)["t1"] is True
+        bad = dict(row, arms=dict(row["arms"], ArmOnly=dict(
+            ep, success=False, success_step=-1)))
+        pth.write_text(_json.dumps(bad))
+        try:
+            checked_result(pth, fp, ident)
+            raise AssertionError("разный исход принят")
+        except SystemExit:
+            pass
     assert sm["totals"]["ArmOnly"]["lost"] == 2
     # взаимодействие R − G − A + T1: провалы i=0 → −1, i=1,2 → 0,
     # i=3..5 → −1; успехи i=1 → +1, остальные 0
@@ -614,13 +713,19 @@ def main():
     plan, k36, _C = prepare(a.archive, a.v1)
     plan["sha256"] = kcf.canon_sha(plan)
     pp = a.out / "plan.json"
-    lk = kcf.Lock(str(a.out / ".plan.lock"), str(a.out), kcf.Busy)
-    try:
-        if pp.exists() and pc.load_json(str(pp)) != plan:
-            raise SystemExit("план изменился, укажите новый --out")
-        pc.save_json(str(pp), plan)
-    finally:
-        lk.release()
+    if a.prepare_only:
+        lk = kcf.Lock(str(a.out / ".plan.lock"), str(a.out), kcf.Busy)
+        try:
+            if pp.exists() and pc.load_json(str(pp)) != plan:
+                raise SystemExit("план изменился, укажите новый --out")
+            if not pp.exists():
+                pc.save_json(str(pp), plan)
+        finally:
+            lk.release()
+    elif not pp.exists():
+        raise SystemExit("плана нет — сначала --prepare-only")
+    elif pc.load_json(str(pp)) != plan:
+        raise SystemExit("план на диске ≠ пересчитанному из архива")
     print(f"  {len(plan['jobs'])} сцен, SHA {plan['sha256'][:16]}",
           flush=True)
     if a.prepare_only:
