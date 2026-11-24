@@ -231,6 +231,7 @@ def run_pulse(sim, io, arm, sc, seed, amp, policy, C, run, stop_after=False,
     ih, ihf = k18c.init_hashes(obs, 1)
     acts, calls, heavy = [], [], dict(n=0)
     eefs = [] if trace else None          # кисть после каждого шага
+    ohash = {} if trace else None         # хеш наблюдения в начале чанка
     tgt = dict(reached=False, k=0, mid=False, refresh=False, o0=None,
                o4=None, eef4=None, P=None, delta=None, clip=None, R=None,
                B=None, o4_obs=None)
@@ -258,6 +259,8 @@ def run_pulse(sim, io, arm, sc, seed, amp, policy, C, run, stop_after=False,
     try:
         while live():
             t = steps
+            if ohash is not None:
+                ohash[t] = kcol.obs_hash(obs)
             call = t // 8 + 1
             arm.call = call - 1
             batch, po, s8 = io.prep(obs, desc, task)
@@ -323,6 +326,7 @@ def run_pulse(sim, io, arm, sc, seed, amp, policy, C, run, stop_after=False,
                 heavy=int(heavy["n"]), target=tgt,
                 eef_trace=None if eefs is None else
                 (np.stack(eefs) if eefs else np.zeros((0, 3))),
+                chunk_hashes=ohash,
                 seconds=time.time() - t0)
 
 
@@ -803,28 +807,11 @@ def probe(a):
                 L.reserve("probe", job, amount=EP)
                 ep = run_pulse(card.sim, v["io"], arm, sc, s, amp, "T1", C,
                                run, trace=True)
-                tg, tr = ep["target"], ep["eef_trace"]
                 if [ep["init_hash"], ep["init_hash_full"]] != list(sc["hash"]):
                     print(f"  {job}: начальный хеш ≠ банку — резерв открыт",
                           flush=True)
                     return TECH
-                A = ep["actions"]
-                r = dict(job=job, task=sc["task"], case_id=sc["case_id"],
-                         seed=s, amp=amp, t=sc["t"], axis=sc["axis"],
-                         init=[ep["init_hash"], ep["init_hash_full"]],
-                         o0=tg["o0"], actions_sha1=ep["actions_sha1"],
-                         # история до первой изменяемой команды (строка 1)
-                         prefix_sha1=kcol.actions_sha(A[:sc["t"] + 1])
-                         if tg["reached"] else ep["actions_sha1"],
-                         success=ep["success"], steps=ep["steps"],
-                         done_step=ep["done_step"], reached=tg["reached"],
-                         k=tg["k"], mid=tg["mid"],
-                         clip=None if tg["clip"] is None else
-                         tg["clip"].tolist(),
-                         eef={str(d): (tr[sc["t"] + d - 1].tolist()
-                                       if sc["t"] + d - 1 < len(tr) else None)
-                              for d in PROBE_OFFSETS},
-                         physical=int(ep["physical"]))
+                r = probe_row(job, sc, s, amp, ep)
                 pc.save_json(rp, r)
                 L.commit(job, r["physical"])
                 rows.append(r)
@@ -854,7 +841,243 @@ def probe(a):
     return OK
 
 
-def summarize_probe(rows):
+def probe_row(job, sc, s, amp, ep):
+    import k31_collect as kcol
+    tg, tr, A = ep["target"], ep["eef_trace"], ep["actions"]
+    return dict(job=job, task=sc["task"], case_id=sc["case_id"],
+                seed=s, amp=amp, t=sc["t"], axis=sc["axis"],
+                init=[ep["init_hash"], ep["init_hash_full"]],
+                o0=tg["o0"], actions_sha1=ep["actions_sha1"],
+                # история до первой изменяемой команды (строка 1)
+                prefix_sha1=kcol.actions_sha(A[:sc["t"] + 1])
+                if tg["reached"] else ep["actions_sha1"],
+                success=ep["success"], steps=ep["steps"],
+                done_step=ep["done_step"], reached=tg["reached"],
+                k=tg["k"], mid=tg["mid"],
+                clip=None if tg["clip"] is None else tg["clip"].tolist(),
+                eef=eef_at(tr, sc["t"]), physical=int(ep["physical"]))
+
+
+def eef_at(tr, t):
+    return {str(d): (tr[t + d - 1].tolist() if 0 <= t + d - 1 < len(tr)
+                     else None) for d in PROBE_OFFSETS}
+
+
+def grip_event(A):
+    """Первое устойчивое закрытие по всей исполненной последовательности:
+    g — индекс первой физической команды close (+1), перед которой три
+    open (−1; до начала — команда ожидания, open), а за ней ещё две close.
+    -> g | None."""
+    from k38_grip_operator import OPEN, CLOSE
+    import k31_collect as kcol
+    g = np.concatenate([[kcol.DUMMY[6]] * 3,
+                        np.asarray(A, np.float64)[:, 6]])
+    for i in range(3, len(g) - 2):
+        if (g[i - 3:i] == OPEN).all() and (g[i:i + 3] == CLOSE).all():
+            return i - 3
+    return None
+
+
+def grip_t(g):
+    """Последний штатный чанк, где o4 предшествует закрытию."""
+    return None if g is None or g < 4 else 8 * ((g - 4) // 8)
+
+
+def _row_resume(L, scope, run, pc):
+    pd = L.d["pending"]
+    if pd and os.path.exists(cal_row_path(run, pd["id"])):
+        r = pc.load_json(cal_row_path(run, pd["id"]))
+        pr = cal_row_problems(r, pd["id"])
+        if pd["scope"] != scope or pd["amount"] != EP or \
+                not pd["id"].startswith(scope + "/"):
+            pr.append(f"резерв {pd} не из {scope}")
+        if pr:
+            raise SystemExit(f"резерв {pd['id']}: {pr}")
+        L.commit(pd["id"], r["physical"])
+
+
+def _row_read(L, scope, run, job, want, pc):
+    r = pc.load_json(cal_row_path(run, job))
+    pr = cal_row_problems(r, job)
+    if {k_: r.get(k_) for k_ in want} != want:
+        pr.append("параметры строки ≠ заданию")
+    if L.d["done"].get(job) != dict(scope=scope, actual=r.get("physical")):
+        pr.append(f"журнал {L.d['done'].get(job)} ≠ строке")
+    if pr:
+        raise SystemExit(f"{job}: {pr}")
+    return r
+
+
+def probe_grip(a):
+    """Импульс в последнем чанке, где o4 предшествует первому устойчивому
+    закрытию схвата нулевой траектории. Сначала опорный проход T1 без
+    импульса (SHA действий = прежнему нулевому probe; g, t, хеши границ,
+    кисть), затем импульсы --amps на тех же стартах."""
+    import k36_harness as kh
+    import k36_protocol as pc
+    import k31_collect as kcol
+    run, scope = a.run_id, "grip"
+    amps = sorted({float(x) for x in a.amps.split(",")} - {0.0})
+    if not amps or len(amps) > 4 or max(amps) > 1.0 or min(amps) < 0:
+        raise SystemExit(f"амплитуды {amps}")
+    _m, calib, _p = scenes(run)
+    k36 = pc.load_prepare()
+    C = kh.consts(k36)
+    L = kcol.Ledger(os.path.join(rep_dir(run), "probe_grip_ledger.json"),
+                    dict(grip=12 * 5 * EP))
+    _row_resume(L, scope, run, pc)
+    card = None
+    refs, rows = {}, []
+
+    def ensure(s, cur):
+        nonlocal card
+        if cur[0] is None:
+            if card is None:
+                card = Card(a.device, run)
+                card.start(run)
+            cur[0], cur[1] = source(card, k36, s)
+        return cur
+    try:
+        for s in SEEDS:
+            cur = [None, None]
+            for sc in calib:
+                job = f"grip/ref/s{s}/t{sc['task']}/{sc['case_id']}"
+                old = pc.load_json(cal_row_path(run, probe_job(0.0, s, sc)))
+                want = dict(task=sc["task"], case_id=sc["case_id"], seed=s,
+                            init=list(sc["hash"]),
+                            actions_sha1=old["actions_sha1"])
+                if os.path.exists(cal_row_path(run, job)):
+                    r = _row_read(L, scope, run, job, want, pc)
+                else:
+                    if L.is_done(job):
+                        raise SystemExit(f"{job}: учтён, строки нет")
+                    v, arm = ensure(s, cur)
+                    L.reserve(scope, job, amount=EP)
+                    sc0 = dict(sc, t=-1)
+                    ep = run_pulse(card.sim, v["io"], arm, sc0, s, 0.0, "T1",
+                                   C, run, trace=True)
+                    if [ep["init_hash"], ep["init_hash_full"]] != \
+                            list(sc["hash"]) or ep["actions_sha1"] != \
+                            old["actions_sha1"] or ep["success"] != \
+                            old["success"]:
+                        print(f"  {job}: ≠ прежнему нулевому probe — резерв "
+                              f"открыт", flush=True)
+                        return TECH
+                    A = ep["actions"]
+                    g = grip_event(A)
+                    t = grip_t(g)
+                    ok = t is not None and t in ep["chunk_hashes"]
+                    r = dict(job=job, task=sc["task"], case_id=sc["case_id"],
+                             seed=s, amp=0.0, init=list(sc["hash"]),
+                             actions_sha1=ep["actions_sha1"],
+                             success=ep["success"], steps=ep["steps"],
+                             g=g, t=t if ok else None,
+                             tail=bool(ok and g < t + 8),
+                             o0=ep["chunk_hashes"][t] if ok else None,
+                             prefix_sha1=kcol.actions_sha(A[:t + 1])
+                             if ok else None,
+                             eef=eef_at(ep["eef_trace"], t) if ok else None,
+                             grip=np.asarray(A[:, 6]).astype(int).tolist(),
+                             physical=int(ep["physical"]))
+                    pc.save_json(cal_row_path(run, job), r)
+                    L.commit(job, r["physical"])
+                    print(f"  {job}: g {g}, t {r['t']}, закрытие в хвосте "
+                          f"{r['tail']}", flush=True)
+                A_ = np.zeros((len(r["grip"]), 7))
+                A_[:, 6] = r["grip"]
+                if grip_event(A_) != r["g"] or (r["t"] is not None and
+                                                grip_t(r["g"]) != r["t"]):
+                    raise SystemExit(f"{job}: g/t ≠ пересчёту")
+                refs[(sc["task"], s)] = r
+                if r["t"] is None:
+                    continue
+                for amp in amps:
+                    sc2 = dict(sc, t=r["t"])
+                    job2 = f"grip/a{amp:.3f}/s{s}/t{sc['task']}/" \
+                        f"{sc['case_id']}"
+                    want2 = dict(task=sc["task"], case_id=sc["case_id"],
+                                 seed=s, amp=amp, t=r["t"], axis=sc["axis"],
+                                 init=list(sc["hash"]))
+                    if os.path.exists(cal_row_path(run, job2)):
+                        rows.append(_row_read(L, scope, run, job2, want2, pc))
+                        continue
+                    if L.is_done(job2):
+                        raise SystemExit(f"{job2}: учтён, строки нет")
+                    v, arm = ensure(s, cur)
+                    L.reserve(scope, job2, amount=EP)
+                    ep = run_pulse(card.sim, v["io"], arm, sc2, s, amp, "T1",
+                                   C, run, trace=True)
+                    if [ep["init_hash"], ep["init_hash_full"]] != \
+                            list(sc["hash"]):
+                        print(f"  {job2}: начальный хеш ≠ банку — резерв "
+                              f"открыт", flush=True)
+                        return TECH
+                    r2 = probe_row(job2, sc2, s, amp, ep)
+                    pc.save_json(cal_row_path(run, job2), r2)
+                    L.commit(job2, r2["physical"])
+                    rows.append(r2)
+                    print(f"  {job2}: успех {r2['success']}, шагов "
+                          f"{r2['steps']}", flush=True)
+            if cur[0] is not None:
+                cur[0] = cur[1] = None
+                kh.free(card.torch)
+    finally:
+        if card is not None:
+            card.close()
+    rep = summarize_grip(refs, rows, calib)
+    if rep["all"]["problems"] or rep["tail"]["problems"]:
+        raise SystemExit("probe-grip: " + "; ".join(
+            (rep["all"]["problems"] + rep["tail"]["problems"])[:4]))
+    pc.save_json(os.path.join(rep_dir(run), "probe_grip.json"), rep)
+    print(f"  стартов с закрытием и t: {rep['n_valid']}/{rep['n']}; "
+          f"закрытие в хвосте: {rep['n_tail']}; без события: "
+          f"{rep['no_event']}")
+    for part in ("all", "tail"):
+        x = rep[part]
+        print(f"  [{part}] T1 без импульса: успех {x['sr_zero']}/{x['n']}")
+        for k_, y in x["levels"].items():
+            dv = ", ".join(f"+{d}: {y['eef'][d]['med']:.4f}/"
+                           f"{y['eef'][d]['p90']:.4f} (n {y['eef'][d]['n']})"
+                           if y["eef"][d]["n"] else f"+{d}: —"
+                           for d in y["eef"])
+            print(f"  [{part}] амплитуда {k_}: успех {y['sr']}/{y['n']}; "
+                  f"сломал {y['broke']} {y['broke_keys']}; починил "
+                  f"{y['fixed']} {y['fixed_keys']}; o4 {y['o4']}/{y['n']}, "
+                  f"клип {y['clip_share']:.2f}; смещение кисти, м: {dv}")
+    return OK
+
+
+def summarize_grip(refs, rows, calib):
+    ax = {c["task"]: c for c in calib}
+    zero = []
+    for (t, s_), r in refs.items():
+        if r["t"] is None:
+            continue
+        zero.append(dict(task=t, seed=s_, amp=0.0, case_id=r["case_id"],
+                         t=r["t"], axis=ax[t]["axis"], init=r["init"],
+                         reached=True, mid=True, k=4, o0=r["o0"],
+                         prefix_sha1=r["prefix_sha1"],
+                         actions_sha1=r["actions_sha1"],
+                         success=r["success"], clip=None, eef=r["eef"],
+                         tail=r["tail"]))
+    tail = {(z["task"], z["seed"]) for z in zero if z["tail"]}
+    n_all = len(zero)
+    out = dict(n=len(refs), n_valid=n_all, n_tail=len(tail),
+               no_event=sorted([list(k) for k, r in refs.items()
+                                if r["t"] is None]),
+               events={f"{k[0]}/{k[1]}": dict(g=r["g"], t=r["t"],
+                                              tail=r["tail"])
+                       for k, r in refs.items()})
+    out["all"] = summarize_probe(zero + rows, n_all)
+    out["tail"] = summarize_probe(
+        [r for r in zero + rows if (r["task"], r["seed"]) in tail],
+        len(tail))
+    for x in (out["all"], out["tail"]):
+        x.pop("rows", None)
+    return out
+
+
+def summarize_probe(rows, n_expected=None):
     by = {(r["task"], r["seed"], r["amp"]): r for r in rows}
     keys = sorted({(r["task"], r["seed"]) for r in rows})
     zero = {k: by[k + (0.0,)] for k in keys if k + (0.0,) in by}
@@ -863,9 +1086,9 @@ def summarize_probe(rows):
         prob.append("дубли строк")
     for amp in sorted({r["amp"] for r in rows}):
         n_ = sum(k + (amp,) in by and k in zero for k in keys)
-        if n_ != len(TASKS) * len(SEEDS):
-            prob.append(f"амплитуда {amp:g}: пар {n_} ≠ "
-                        f"{len(TASKS) * len(SEEDS)}")
+        want = len(TASKS) * len(SEEDS) if n_expected is None else n_expected
+        if n_ != want:
+            prob.append(f"амплитуда {amp:g}: пар {n_} ≠ {want}")
     for (t, s_, amp), r in by.items():
         z = zero.get((t, s_))
         if z is None or amp == 0.0:
@@ -1640,7 +1863,9 @@ def selftest():
             arm = kh.make_arm(torch, k36, "T32_s0", src)
             et = run_pulse(Sim(), io, arm, sc, 0, AMP["strong"], "T1", Ck,
                            "toy", trace=True)
-            assert et["eef_trace"].shape == (et["steps"], 3) and \
+            assert sorted(et["chunk_hashes"]) == list(range(
+                0, et["steps"], 8)) and \
+                et["eef_trace"].shape == (et["steps"], 3) and \
                 np.array_equal(et["actions"],
                                got[("strong", "T1")][1]["actions"])
             # нулевой T1 (END 40) = обычный эпизод K-39 T1
@@ -1709,6 +1934,46 @@ def selftest():
     six = pr_ + [pz(t, s_, 0.6, True, 0.012) for t in TASKS for s_ in SEEDS]
     six[-1] = dict(six[-1], amp=0.3)          # подмена amp → дубль/нехватка
     assert summarize_probe(six)["problems"]
+    # событие схвата: по всей последовательности, через границу чанка
+    def acts(seq):
+        A_ = np.zeros((len(seq), 7))
+        A_[:, 6] = seq
+        return A_
+    assert grip_event(acts([-1] * 15 + [1] * 3 + [-1] * 4)) == 15
+    assert grip_event(acts([-1] * 15 + [1, 1] + [-1] * 3 + [1] * 3)) == 20
+    assert grip_event(acts([-1] * 15 + [1, 1, -1] + [1] * 3)) is None
+    assert grip_event(acts([1, 1, 1] + [-1] * 5)) == 0
+    assert grip_event(acts([-1] * 10 + [1, 1])) is None
+    assert grip_t(15) == 8 and grip_t(4) == 0 and grip_t(3) is None and \
+        grip_t(12) == 8 and grip_t(11) == 0 and grip_t(None) is None
+    # сводка фазового probe: хвостовые случаи отдельно
+    refs = {}
+    rws = []
+    for t in TASKS:
+        for s_ in SEEDS:
+            g = None if (t, s_) == (8, 1) else (13 if s_ == 0 else 17)
+            tt = grip_t(g)
+            refs[(t, s_)] = dict(case_id=f"c{t}", init=[f"h{t}", "f"], g=g,
+                                 t=tt, tail=g is not None and g < tt + 8,
+                                 o0=f"o{t}{s_}", prefix_sha1=f"p{t}{s_}",
+                                 actions_sha1=f"a{t}{s_}", success=True,
+                                 eef={str(d): [0.0, 0.0, 0.0]
+                                      for d in PROBE_OFFSETS})
+            if tt is not None:
+                rws.append(dict(task=t, seed=s_, amp=0.3, case_id=f"c{t}",
+                                t=tt, axis=0, init=[f"h{t}", "f"],
+                                reached=True, mid=True, k=4,
+                                o0=f"o{t}{s_}", prefix_sha1=f"p{t}{s_}",
+                                actions_sha1="x", success=s_ == 1,
+                                clip=[False, False],
+                                eef={str(d): [0.0, 0.0, 0.01]
+                                     for d in PROBE_OFFSETS}))
+    cal_ = [dict(task=t, axis=0) for t in TASKS]
+    sg = summarize_grip(refs, rws, cal_)
+    assert sg["n_valid"] == 11 and sg["no_event"] == [[8, 1]]
+    assert sg["n_tail"] == 6 and sg["all"]["problems"] == []
+    assert sg["all"]["levels"]["0.3"]["broke"] == 6 and \
+        sg["tail"]["levels"]["0.3"]["broke"] == 6
     assert abs(sp["levels"]["0.3"]["eef"]["8"]["med"] - 0.006) < 1e-9 and \
         sp["levels"]["0.3"]["eef"]["16"]["med"] == 0.0
     # анализ: известные W/L и взаимодействие
@@ -1736,7 +2001,7 @@ def selftest():
           "на 4-м шаге и позже: 6 комбинаций приняты, один пересчёт и "
           "возврат к T1; порча хвоста/o4/префикса/target и шард без журнала "
           "— отказ; нулевой T1 = T1 K-39; калибровка по обоим сидам; трасса и сводка "
-          "probe; W/L/D и I")
+          "probe; событие схвата и фазовый probe; W/L/D и I")
     return 0
 
 
@@ -1744,7 +2009,8 @@ def main():
     if "--selftest" in sys.argv:
         return selftest()
     ap = argparse.ArgumentParser(description="K-39 B: импульс и пересчёт")
-    ap.add_argument("cmd", choices=("bank", "calibrate", "probe", "prepare",
+    ap.add_argument("cmd", choices=("bank", "calibrate", "probe",
+                                    "probe-grip", "prepare",
                                     "gpuinfo",
                                     "assign", "preflight", "collect",
                                     "status", "merge", "analyze"))
@@ -1760,10 +2026,12 @@ def main():
     ap.add_argument("--amps", default="0.3")
     a = ap.parse_args()
     import k37_confirm as kcf
-    fn = dict(bank=bank, calibrate=calibrate, probe=probe, prepare=prepare,
+    fn = {"probe-grip": probe_grip}
+    fn.update(bank=bank, calibrate=calibrate, probe=probe, prepare=prepare,
               gpuinfo=kcf.gpuinfo, assign=assign, preflight=preflight,
               collect=collect, status=status, merge=merge,
-              analyze=analyze)[a.cmd]
+              analyze=analyze)
+    fn = fn[a.cmd]
     try:
         return fn(a)
     except kcf.Busy as e:
