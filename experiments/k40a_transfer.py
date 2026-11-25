@@ -137,12 +137,31 @@ def prepare(a):
 
 
 # --- повтор с захватом ---------------------------------------------------------------------
-def decide_rec(arm, io, desc, task, init, ep_no, chunk, obs, elapsed):
-    arm.begin(task, init, ep_no)
-    arm.call = int(chunk)
-    batch, po, s8 = io.prep(obs, desc, task)
-    a, rec = arm.decide(batch, po, s8, int(elapsed))
-    return np.asarray(a, np.float32), rec
+F_KEYS = ("x0", "x1", "x2", "W0", "W1", "W2", "iv0", "iv1", "iv2")
+
+
+def decide_rec(arm, io, desc, task, init, ep_no, chunk, obs, elapsed,
+               keep_F=False):
+    """Штатный decide; keep_F — забрать признаки всех узлов из того же
+    прохода (обёртка forward, без лишнего вызова)."""
+    got = {}
+    fwd = arm.forward
+
+    def wrapped(*x, **kw):
+        out = fwd(*x, **kw)
+        got["F"] = {k: out[0][k][0].detach().float().cpu().numpy()
+                    for k in F_KEYS}
+        return out
+    if keep_F:
+        arm.forward = wrapped
+    try:
+        arm.begin(task, init, ep_no)
+        arm.call = int(chunk)
+        batch, po, s8 = io.prep(obs, desc, task)
+        a, rec = arm.decide(batch, po, s8, int(elapsed))
+    finally:
+        arm.forward = fwd
+    return np.asarray(a, np.float32), rec, got.get("F")
 
 
 def raw_obs(obs):
@@ -181,16 +200,19 @@ def replay_capture(sim, io, arm, job, rec, z):
         if step == t:
             cap["o0_hash"] = obs_hash(rp.obs)
             cap["o0"] = raw_obs(rp.obs)
-            B, r0 = decide_rec(arm, io, desc, task, init, episode_number(eid),
-                               t // 8, rp.obs, t)
+            B, r0, F0 = decide_rec(arm, io, desc, task, init,
+                                   episode_number(eid), t // 8, rp.obs, t,
+                                   keep_F=True)
+            cap["F0"] = F0
             if not np.array_equal(B, Barch):
                 raise SystemExit(f"{eid}: прогноз T32 в o0 ≠ архивному")
             cap["S0"] = np.asarray(r0["S"], np.float32)
         if step == t + 4:
             cap["o4_hash"] = obs_hash(rp.obs)
             cap["o4"] = raw_obs(rp.obs)
-            R, r4 = decide_rec(arm, io, desc, task, init, episode_number(eid),
-                               t // 8 + 1, rp.obs, step)
+            R, r4, _f = decide_rec(arm, io, desc, task, init,
+                                   episode_number(eid), t // 8 + 1, rp.obs,
+                                   step)
             cap["S4"] = np.asarray(r4["S"], np.float32)
         if step == g + 1:
             cap["st_g_T1"] = state9(rp.obs)
@@ -264,6 +286,8 @@ def run_job(sim, io, armobj, job, rec, z):
                 st_g_A=pr.got["st_g_A"], st_end_A=pr.got["st_end_A"],
                 y_T1=np.bool_(rec["summary"]["success"]),
                 y_A=np.bool_(ep["success"]),
+                **{f"F0_{k}": np.asarray(v, np.float32)
+                   for k, v in cap["F0"].items()},
                 **{f"o0_{k}": v for k, v in cap["o0"].items()},
                 **{f"o4_{k}": v for k, v in cap["o4"].items()})
     res = dict(branch={k: ep[k] for k in (*SUMMARY, "seconds")},
@@ -328,12 +352,72 @@ def checked_result(path, dp, ident):
     if row["tail_same"] and ep["success"] != row["t1"]:
         raise SystemExit(f"{path}: хвост = B, исход ≠ T1")
     with np.load(dp, allow_pickle=False) as z:
-        miss = [k for k in DATA_KEYS if k not in z.files]
-        if miss or bool(z["y_A"]) != ep["success"] or \
-                bool(z["y_T1"]) != row["t1"] or int(z["t"]) != row["t"] or \
-                int(z["g"]) != row["g"]:
-            raise SystemExit(f"{dp}: данные ≠ записи ({miss})")
+        pr = data_problems(dict(z), row)
+    if pr:
+        raise SystemExit(f"{dp}: данные: {pr[:4]}")
     return row
+
+
+OBS_KEYS = ("state", "agentview_image", "robot0_eye_in_hand_image")
+
+
+def data_problems(z, row):
+    """Содержимое обучающего npz против записи сцены."""
+    import k31_collect as kcol
+    import k39_grip_probe as gp
+    need = list(DATA_KEYS) + [f"{o}_{k}" for o in ("o0", "o4")
+                              for k in OBS_KEYS] + \
+        [f"F0_{k}" for k in F_KEYS]
+    miss = [k for k in need if k not in z]
+    if miss:
+        return [f"нет ключей {miss[:4]}"]
+    p = []
+    ep = row["branch"]
+    t, g = row["t"], row["g"]
+    if bool(z["y_A"]) != ep["success"] or bool(z["y_T1"]) != row["t1"] or \
+            int(z["t"]) != t or int(z["g"]) != g:
+        p.append("исходы или t/g ≠ записи")
+    for o in ("o0", "o4"):
+        st_, a1, a2 = (z[f"{o}_{k}"] for k in OBS_KEYS)
+        if st_.shape != (9,) or not np.isfinite(st_).all():
+            p.append(f"{o}: state формы {st_.shape} или не конечен")
+        for im in (a1, a2):
+            if im.dtype != np.uint8 or im.ndim != 3 or im.shape[-1] != 3:
+                p.append(f"{o}: кадр {im.dtype} {im.shape}")
+        if kcol.obs_hash({k: z[f"{o}_{k}"][None] for k in OBS_KEYS}) != \
+                row[o]:
+            p.append(f"{o}: хеш наблюдения ≠ записи")
+    S0, S4 = z["S0"], z["S4"]
+    if S0.ndim != 1 or S0.shape != S4.shape or \
+            not (np.isfinite(S0).all() and np.isfinite(S4).all()):
+        p.append(f"S0/S4: формы {S0.shape}/{S4.shape} или не конечны")
+    x0, x1, x2 = z["F0_x0"], z["F0_x1"], z["F0_x2"]
+    if x0.ndim != 2 or (x0.shape[0], x1.shape[0], x2.shape[0]) != \
+            (4, 8, 16) or not (x0.shape[1] == x1.shape[1] == x2.shape[1]):
+        p.append(f"F0: формы узлов {x0.shape} {x1.shape} {x2.shape}")
+    if not all(np.isfinite(z[f"F0_{k}"]).all() for k in F_KEYS):
+        p.append("F0: не конечны")
+    B, R, tail = z["B"], z["R"], z["tail"]
+    if B.shape != (8, 7) or R.shape != (8, 7) or tail.shape != (4, 7):
+        p.append(f"B/R/tail формы {B.shape} {R.shape} {tail.shape}")
+    elif not np.array_equal(tail, gp.arm_tail(B[4:], R[:4])):
+        p.append("хвост ≠ ArmOnly(B, R)")
+    elif bool(row["tail_same"]) != bool(np.array_equal(tail, B[4:])):
+        p.append("tail_same ≠ данным")
+    A = z["actions_A"]
+    if A.shape != (ep["steps"], 7) or \
+            kcol.actions_sha(A) != ep["actions_sha1"]:
+        p.append(f"действия ArmOnly {A.shape} или SHA ≠ сводке")
+    n_t1 = row["physical"] - kcol.ENV["waiting_steps"]
+    for k, n in (("st_g_T1", n_t1), ("st_end_T1", n_t1),
+                 ("st_g_A", ep["steps"]), ("st_end_A", ep["steps"])):
+        need_n = g + 1 if k.startswith("st_g") else t + 8
+        v = z[k]
+        reach = n >= need_n
+        if v.shape != (9,) or (reach and not np.isfinite(v).all()) or \
+                (not reach and not np.isnan(v).all()):
+            p.append(f"{k}: достижимость {reach}, значение не согласовано")
+    return p
 
 
 def case_spend(row):
@@ -511,6 +595,7 @@ def selftest():
     assert decision(mk(0, 0, 0, 0)) == "no_rescues"
     assert decision(mk(-1, 3, 0, -1)) == "negative"
     # хвост ArmOnly
+    import k31_collect as kcol
     import k39_grip_probe as gp
     B4 = np.zeros((4, 7), np.float32)
     B4[:, 6] = 1
@@ -520,7 +605,6 @@ def selftest():
     assert np.array_equal(t_[:, :6], R[:4, :6]) and \
         np.array_equal(t_[:, 6], B4[:, 6])
     # Probe: сверка o4 и захват
-    import k31_collect as kcol
 
     class S:
         def reset(self, task, starts):
@@ -555,31 +639,78 @@ def selftest():
         raise AssertionError("чужой o4 принят")
     except SystemExit:
         pass
-    # запись данных и проверка
+    # запись данных и проверка содержимого
+    rng = np.random.default_rng(0)
+    obs = {o: dict(state=rng.normal(size=9),
+                   agentview_image=rng.integers(0, 255, (8, 8, 3), np.uint8),
+                   robot0_eye_in_hand_image=rng.integers(0, 255, (8, 8, 3),
+                                                         np.uint8))
+           for o in ("o0", "o4")}
+    Bm = rng.uniform(-.5, .5, (8, 7)).astype(np.float32)
+    Bm[:, 6] = 1
+    Rm = rng.uniform(-.5, .5, (8, 7)).astype(np.float32)
+    Rm[:, 6] = -1
+    A_ = rng.normal(size=(61, 7)).astype(np.float32)
     ident = dict(eid="e", plan="P", seed=0, t1=False, t=8, g=13,
-                 arm=ARM, archive_npz_sha1="z", physical=300)
+                 arm=ARM, archive_npz_sha1="z", physical=30)   # T1: 20 шагов
     ep = dict(success=True, success_step=50, done_step=60, own_steps=61,
               steps=61, physical=71, init_hash="a", init_hash_full="b",
-              actions_sha1="c", seconds=1.0)
-    data = {k: np.zeros(3) for k in DATA_KEYS}
-    data.update(g=np.int64(13), t=np.int64(8), y_T1=np.bool_(False),
-                y_A=np.bool_(True))
+              actions_sha1=kcol.actions_sha(A_), seconds=1.0)
+    data = dict(B=Bm, R=Rm, tail=gp.arm_tail(Bm[4:], Rm[:4]),
+                S0=np.ones(10, np.float32), S4=np.ones(10, np.float32),
+                g=np.int64(13), t=np.int64(8), actions_A=A_,
+                st_g_T1=np.ones(9), st_end_T1=np.ones(9),
+                st_g_A=np.ones(9), st_end_A=np.ones(9),
+                y_T1=np.bool_(False), y_A=np.bool_(True),
+                F0_x0=np.ones((4, 5), np.float32),
+                F0_x1=np.ones((8, 5), np.float32),
+                F0_x2=np.ones((16, 5), np.float32),
+                **{f"F0_{k}": np.ones(3, np.float32)
+                   for k in ("W0", "W1", "W2", "iv0", "iv1", "iv2")},
+                **{f"{o}_{k}": v for o, d in obs.items()
+                   for k, v in d.items()})
+    hashes = {o: kcol.obs_hash({k: v[None] for k, v in d.items()})
+              for o, d in obs.items()}
     with tempfile.TemporaryDirectory() as td:
         dp, pth = Path(td) / "r.npz", Path(td) / "r.json"
-        dsha = save_data(dp, data)
-        row = dict(ident, o0="h0", o4="h4", tail_same=False, grip={},
-                   branch=ep, data_sha256=dsha)
-        pth.write_text(json.dumps(row))
+
+        def put(dd):
+            row = dict(ident, o0=hashes["o0"], o4=hashes["o4"],
+                       tail_same=False, grip={}, branch=ep,
+                       data_sha256=save_data(dp, dd))
+            pth.write_text(json.dumps(row))
+        put(data)
         assert checked_result(pth, dp, ident)["t1"] is False
-        save_data(dp, dict(data, y_A=np.bool_(False)))
-        try:
-            checked_result(pth, dp, ident)
-            raise AssertionError("подменённые данные приняты")
-        except SystemExit:
-            pass
+        bad = [{k: v for k, v in data.items()
+                if k != "o4_robot0_eye_in_hand_image"},
+               dict(data, S0=np.ones(11, np.float32)),
+               dict(data, actions_A=A_[:1]),
+               dict(data, tail=Rm[:4]),
+               dict(data, y_A=np.bool_(False)),
+               dict(data, st_end_T1=np.ones(9)),      # T1 не дошёл до t+8?
+               dict(data, o0_state=data["o0_state"] + 1)]
+        # T1: 20 шагов ≥ g+1 = 14 и ≥ t+8 = 16 → обе точки достижимы;
+        # сделаем недостижимой конечную: physical 20 → 10 шагов
+        for i, dd in enumerate(bad):
+            if i == 5:
+                ident2 = dict(ident, physical=20)
+                row = dict(ident2, o0=hashes["o0"], o4=hashes["o4"],
+                           tail_same=False, grip={}, branch=ep,
+                           data_sha256=save_data(dp, dd))
+                pth.write_text(json.dumps(row))
+                args = (pth, dp, ident2)
+            else:
+                put(dd)
+                args = (pth, dp, ident)
+            try:
+                checked_result(*args)
+                raise AssertionError(f"порча {i} принята")
+            except SystemExit:
+                pass
     print("самопроверка k40a_transfer пройдена: правило решения (signal / "
           "weak / offline / negative / no_rescues); хвост ArmOnly; сверка "
-          "o4 и захват состояний; данные с SHA и согласованием исходов")
+          "o4 и захват состояний; содержимое данных (камеры, формы, хеши "
+          "наблюдений и действий, хвост, достижимость) — порча отвергается")
     return 0
 
 
