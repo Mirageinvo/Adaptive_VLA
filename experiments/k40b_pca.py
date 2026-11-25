@@ -66,6 +66,7 @@ def k21_batch(inp, imgs, states8, descs):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--batch", type=int, default=BATCH)
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
@@ -81,6 +82,9 @@ def main():
         raise SystemExit(f"потоки: {pr}")
     if OUT.exists() or REP.exists():
         raise SystemExit(f"{OUT} уже есть — PCA закреплён, не пересчитываю")
+    k36 = pc.load_prepare()
+    if not k36["k32"]["seeds"]["0"]["source"].get("weights_hash"):
+        raise SystemExit("нет отпечатка весов источника T32_s0")
     D = k21.load_prepared(require_teacher=False)
     rows = sorted(np.asarray(D["train_rows"]).tolist(), key=rank)[:N_ROWS]
     s11 = np.asarray(D["state11"])[np.asarray(D["train_rows"])]
@@ -97,8 +101,8 @@ def main():
     if tid is None:
         tid = bar.config.vlm_config.image_token_id
     feats, ntok = [], set()
-    for i in range(0, len(rows), BATCH):
-        r = rows[i:i + BATCH]
+    for i in range(0, len(rows), a.batch):
+        r = rows[i:i + a.batch]
         b = k21_batch(inp, [D["IMG"][j] for j in r],
                       np.asarray(D["state8"])[r],
                       [str(x) for x in np.asarray(D["task"])[r]])
@@ -116,6 +120,8 @@ def main():
         ntok.add(int(img.shape[1]))
         feats += [kc.group_vis(x).ravel() for x in img]
     X = np.stack(feats)
+    if not np.isfinite(X).all():
+        raise SystemExit("визуальные признаки K-21 не конечны")
     p = fit_pca(X)
     mu11, sd11 = s11.mean(0), s11.std(0)
     sd11 = np.where(sd11 > 1e-8, sd11, 1.0)
@@ -128,8 +134,10 @@ def main():
                tokens_per_obs=sorted(ntok), n_comp=N_COMP,
                explained_total=float(p["explained"].sum()),
                k21_prep_sha1=D["prep_report"]["out"]["sha1"],
-               source_weights=kh.source_hash(0) if hasattr(
-                   kh, "source_hash") else None,
+               source_seed=0, k36_prepare_sha1=k36["sha1"],
+               source_weights=k36["k32"]["seeds"]["0"]["source"][
+                   "weights_hash"],
+               shapes={k: list(v.shape) for k, v in p.items()},
                out_sha256=kcf.sha256(OUT))
     pc.save_json(str(REP), rep)
     print(f"  PCA: строк {len(rows)}, D {rep['vis_dim']}, токенов на "
