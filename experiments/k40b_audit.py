@@ -113,7 +113,12 @@ def verified_rows(archive, rep):
     if missing:
         rep["problems"].append(f"нет каталогов частей {missing}")
         return None
-    prob, rows, parts = kcf.build_merge(archive, plan, k36)
+    try:
+        prob, rows, parts = kcf.build_merge(archive, plan, k36)
+    except (SystemExit, OSError, KeyError, ValueError) as e:
+        rep["problems"].append(f"c2: проверка частей: {type(e).__name__}: "
+                               f"{e}")
+        return None
     rep["parts"] = parts
     if prob:
         rep["problems"] += [f"c2: {x}" for x in prob[:10]]
@@ -126,7 +131,12 @@ def verified_rows(archive, rep):
         rep["problems"].append("нет merged.json")
     else:
         m = pc.load_json(str(mp))
-        old = {r["eid"]: {k: r.get(k) for k in CMP} for r in m.get("rows", [])}
+        mr = m.get("rows", [])
+        if len(mr) != N_EXPECTED or len({r["eid"] for r in mr}) != len(mr):
+            rep["problems"].append(f"merged.json: строк {len(mr)}, "
+                                   f"уникальных eid "
+                                   f"{len({r['eid'] for r in mr})}")
+        old = {r["eid"]: {k: r.get(k) for k in CMP} for r in mr}
         new = {r["eid"]: {k: r.get(k) for k in CMP} for r in rows}
         if m.get("ok") is not True or m.get("plan_sha256") != plan["sha256"]:
             rep["problems"].append("merged.json не подтверждает план")

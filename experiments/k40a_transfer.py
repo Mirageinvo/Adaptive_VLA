@@ -359,6 +359,11 @@ def checked_result(path, dp, ident):
 
 
 OBS_KEYS = ("state", "agentview_image", "robot0_eye_in_hand_image")
+H_DIM, N_CMD = 768, 20
+S_DIM = 6 * H_DIM + 72
+F_SHAPES = dict(x0=(4, H_DIM), x1=(8, H_DIM), x2=(16, H_DIM),
+                W0=(N_CMD, 4), W1=(N_CMD, 8), W2=(N_CMD, 16),
+                iv0=(4, 2), iv1=(8, 2), iv2=(16, 2))
 
 
 def data_problems(z, row):
@@ -387,19 +392,19 @@ def data_problems(z, row):
         if kcol.obs_hash({k: z[f"{o}_{k}"][None] for k in OBS_KEYS}) != \
                 row[o]:
             p.append(f"{o}: хеш наблюдения ≠ записи")
-    S0, S4 = z["S0"], z["S4"]
-    if S0.ndim != 1 or S0.shape != S4.shape or \
-            not (np.isfinite(S0).all() and np.isfinite(S4).all()):
-        p.append(f"S0/S4: формы {S0.shape}/{S4.shape} или не конечны")
-    x0, x1, x2 = z["F0_x0"], z["F0_x1"], z["F0_x2"]
-    if x0.ndim != 2 or (x0.shape[0], x1.shape[0], x2.shape[0]) != \
-            (4, 8, 16) or not (x0.shape[1] == x1.shape[1] == x2.shape[1]):
-        p.append(f"F0: формы узлов {x0.shape} {x1.shape} {x2.shape}")
-    if not all(np.isfinite(z[f"F0_{k}"]).all() for k in F_KEYS):
-        p.append("F0: не конечны")
+    for k in ("S0", "S4"):
+        if z[k].shape != (S_DIM,) or not np.isfinite(z[k]).all():
+            p.append(f"{k}: форма {z[k].shape} ≠ ({S_DIM},) или не конечен")
+    for k, shp in F_SHAPES.items():
+        v = z[f"F0_{k}"]
+        if v.shape != shp or not np.isfinite(v).all():
+            p.append(f"F0_{k}: форма {v.shape} ≠ {shp} или не конечен")
     B, R, tail = z["B"], z["R"], z["tail"]
-    if B.shape != (8, 7) or R.shape != (8, 7) or tail.shape != (4, 7):
-        p.append(f"B/R/tail формы {B.shape} {R.shape} {tail.shape}")
+    if B.shape != (8, 7) or R.shape != (8, 7) or tail.shape != (4, 7) or \
+            not all(np.isfinite(x).all() for x in (B, R, tail,
+                                                   z["actions_A"])):
+        p.append(f"B/R/tail формы {B.shape} {R.shape} {tail.shape} или "
+                 f"не конечны")
     elif not np.array_equal(tail, gp.arm_tail(B[4:], R[:4])):
         p.append("хвост ≠ ArmOnly(B, R)")
     elif bool(row["tail_same"]) != bool(np.array_equal(tail, B[4:])):
@@ -657,16 +662,13 @@ def selftest():
               steps=61, physical=71, init_hash="a", init_hash_full="b",
               actions_sha1=kcol.actions_sha(A_), seconds=1.0)
     data = dict(B=Bm, R=Rm, tail=gp.arm_tail(Bm[4:], Rm[:4]),
-                S0=np.ones(10, np.float32), S4=np.ones(10, np.float32),
+                S0=np.ones(S_DIM, np.float32), S4=np.ones(S_DIM, np.float32),
                 g=np.int64(13), t=np.int64(8), actions_A=A_,
                 st_g_T1=np.ones(9), st_end_T1=np.ones(9),
                 st_g_A=np.ones(9), st_end_A=np.ones(9),
                 y_T1=np.bool_(False), y_A=np.bool_(True),
-                F0_x0=np.ones((4, 5), np.float32),
-                F0_x1=np.ones((8, 5), np.float32),
-                F0_x2=np.ones((16, 5), np.float32),
-                **{f"F0_{k}": np.ones(3, np.float32)
-                   for k in ("W0", "W1", "W2", "iv0", "iv1", "iv2")},
+                **{f"F0_{k}": np.ones(shp, np.float32)
+                   for k, shp in F_SHAPES.items()},
                 **{f"{o}_{k}": v for o, d in obs.items()
                    for k, v in d.items()})
     hashes = {o: kcol.obs_hash({k: v[None] for k, v in d.items()})
@@ -684,6 +686,11 @@ def selftest():
         bad = [{k: v for k, v in data.items()
                 if k != "o4_robot0_eye_in_hand_image"},
                dict(data, S0=np.ones(11, np.float32)),
+               dict(data, S0=np.ones(11, np.float32),
+                    S4=np.ones(11, np.float32)),
+               dict(data, F0_W1=np.ones((20, 4), np.float32)),
+               dict(data, F0_iv2=np.ones((16, 3), np.float32)),
+               dict(data, R=np.full((8, 7), np.nan, np.float32)),
                dict(data, actions_A=A_[:1]),
                dict(data, tail=Rm[:4]),
                dict(data, y_A=np.bool_(False)),
@@ -692,7 +699,7 @@ def selftest():
         # T1: 20 шагов ≥ g+1 = 14 и ≥ t+8 = 16 → обе точки достижимы;
         # сделаем недостижимой конечную: physical 20 → 10 шагов
         for i, dd in enumerate(bad):
-            if i == 5:
+            if i == 9:
                 ident2 = dict(ident, physical=20)
                 row = dict(ident2, o0=hashes["o0"], o4=hashes["o4"],
                            tail_same=False, grip={}, branch=ep,
