@@ -28,6 +28,7 @@ import socket
 import numpy as np
 
 PROTOCOL = "k40b-collect-v1"
+RESERVE = 610
 SCOPE = "k40b_collect"
 N_PARTS = 2
 N_WIN, WIN = 8, 8
@@ -39,6 +40,7 @@ F_SHAPES = dict(x0=(4, 768), x1=(8, 768), x2=(16, 768), W0=(20, 4),
                 iv2=(16, 2))
 S_DIM = 6 * 768 + 72
 CAMS = ("agentview_image", "robot0_eye_in_hand_image")
+IMG = (224, 224, 3)
 CODE = ("k40b_collect.py", "k40b_audit.py", "k40a_transfer.py",
         "k39_cache.py")
 
@@ -141,7 +143,7 @@ def prepare(a):
                 code={n: kcf.sha256(here / n) for n in CODE},
                 episodes=eps, counts={f"{r}_{s}": n for (r, s), n in
                                       sorted(cnt.items())},
-                caps={SCOPE: (len(eps) // N_PARTS + 1) * 610}), k36
+                caps={SCOPE: (len(eps) // N_PARTS + 1) * RESERVE}), k36
 
 
 # --- сбор ---------------------------------------------------------------------------------
@@ -167,12 +169,23 @@ class VisTap:
 
 
 def vis_only(arm, bar, io, desc, task, obs):
+    """-> визуальные токены; их число обязано совпасть с числом позиций
+    изображения в обработанном промпте."""
     torch = arm.torch
     batch, _po, _s8 = io.prep(obs, desc, task)
     with torch.no_grad(), arm.autocast:
         img = bar.vlm.get_image_features(batch["pixel_values"],
                                          batch.get("pixel_attention_mask"))
-    return img.detach().float().cpu().numpy()
+    img = img.detach().float().cpu().numpy()
+    tid = getattr(bar, "image_token_id", None)
+    if tid is None:
+        tid = bar.config.vlm_config.image_token_id
+    n_pos = int((batch["input_ids"] == tid).sum())
+    n_tok = int(np.prod(img.shape[:-1]))
+    if n_tok != n_pos:
+        raise SystemExit(f"визуальных токенов {n_tok} ≠ позиций изображения "
+                         f"в промпте {n_pos}")
+    return img
 
 
 def point_map(ts):
@@ -267,7 +280,7 @@ DATA = dict(t=(N_WIN,), call=(N_WIN,), B=(N_WIN, 8, 7),
             **{f"F_{k}": (N_WIN, *v) for k, v in F_SHAPES.items()})
 
 
-def data_problems(z, e, q):
+def data_problems(z, e, q, vis_dim=None):
     import k29_policy as kp
     p = []
     miss = [k for k in (*DATA, "p_vis", *(f"p_{c}" for c in CAMS))
@@ -281,12 +294,14 @@ def data_problems(z, e, q):
             p.append(f"{k}: не конечен")
     v = z["p_vis"]
     if v.ndim != 4 or v.shape[:3] != (N_WIN, 5, N_GROUPS) or \
-            not np.isfinite(v).all():
-        p.append(f"p_vis: {v.shape} или не конечен")
+            v.shape[3] < 1 or (vis_dim is not None and v.shape[3] != vis_dim) \
+            or not np.isfinite(v).all():
+        p.append(f"p_vis: {v.shape} (ожидалось D = {vis_dim}) или не конечен")
     for c in CAMS:
         im = z[f"p_{c}"]
-        if im.dtype != np.uint8 or im.ndim != 5 or im.shape[:2] != (N_WIN, 5):
-            p.append(f"p_{c}: {im.dtype} {im.shape}")
+        if im.dtype != np.uint8 or im.shape != (N_WIN, 5, *IMG):
+            p.append(f"p_{c}: {im.dtype} {im.shape} ≠ uint8 "
+                     f"{(N_WIN, 5, *IMG)}")
     if p:
         return p
     if list(z["t"]) != list(e["t"]) or list(z["call"]) != list(e["windows"]):
@@ -322,8 +337,11 @@ def checked(out, e, plan, q):
         raise SystemExit(f"{jp}: запись не соответствует плану")
     if not dp.is_file() or kcf.sha256(dp) != row.get("data_sha256"):
         raise SystemExit(f"{dp}: данные отсутствуют или изменены")
+    vd = row.get("vis_dim")
+    if type(vd) is not int or vd < 1:
+        raise SystemExit(f"{jp}: vis_dim {vd!r}")
     with np.load(dp, allow_pickle=False) as z:
-        pr = data_problems(dict(z), e, q)
+        pr = data_problems(dict(z), e, q, vd)
     if pr:
         raise SystemExit(f"{dp}: {pr[:3]}")
     return row
@@ -331,9 +349,17 @@ def checked(out, e, plan, q):
 
 def restore(out, plan, part, ledger, q):
     eps = {e["eid"]: e for e in plan["episodes"] if e["part"] == part}
-    done, pid = ledger.d["done"], ledger.pending_id()
-    if not set(done).issubset(eps) or (pid is not None and pid not in eps):
-        raise SystemExit("ledger: записи вне части")
+    done, pending, pid = ledger.d["done"], ledger.d["pending"], \
+        ledger.pending_id()
+    if not set(done).issubset(eps):
+        raise SystemExit("ledger: учтённые эпизоды вне части")
+    if pending is not None and (pid not in eps or pid in done or pending !=
+                                dict(id=pid, scope=SCOPE, amount=RESERVE)):
+        raise SystemExit("ledger: открытый резерв не из части")
+    for c in ledger.d["crashes"]:
+        if c.get("id") not in eps or c.get("scope") != SCOPE or \
+                c.get("amount") != RESERVE:
+            raise SystemExit("ledger: авария не из части")
     rows = {}
     for eid, e in eps.items():
         jp, _dp = ep_files(out, e)
@@ -345,6 +371,13 @@ def restore(out, plan, part, ledger, q):
             rows[eid] = row
         elif eid in done:
             raise SystemExit(f"{jp}: учтён, записи нет")
+    spent = sum(eps[k]["phys"] for k in done) + \
+        RESERVE * len(ledger.d["crashes"])
+    if ledger.d["spent"] != {SCOPE: spent}:
+        raise SystemExit(f"ledger: расход {ledger.d['spent']} ≠ {spent}")
+    dims = {r["vis_dim"] for r in rows.values()}
+    if len(dims) > 1:
+        raise SystemExit(f"разная размерность визуальных признаков {dims}")
     if pid in rows:
         ledger.settle(pid, eps[pid]["phys"])
     return rows
@@ -402,10 +435,14 @@ def collect(a, plan, k36):
                             val(rec, z, e["want"]):
                         raise SystemExit(f"{e['eid']}: архив изменился")
                     kcf.check_disk(a.out)
-                    ledger.reserve(SCOPE, e["eid"], amount=610)
+                    if rows:
+                        vd0 = next(iter(rows.values()))["vis_dim"]
+                    else:
+                        vd0 = None
+                    ledger.reserve(SCOPE, e["eid"], amount=RESERVE)
                     data = replay_windows(sim, src["io"], arm,
                                           src["mod"].bar, e, rec, z, q)
-                    pr = data_problems(data, e, q)
+                    pr = data_problems(data, e, q, vd0)
                     if pr:
                         raise SystemExit(f"{e['eid']}: {pr[:3]}")
                     jp, dp = ep_files(a.out, e)
@@ -439,12 +476,18 @@ def collect(a, plan, k36):
 
 def status(a, plan):
     import json
+    dims = set()
     for k in range(N_PARTS):
+        for jp in part_dir(a.out, k).glob("*.json"):
+            if jp.name != "ledger.json":
+                dims.add(json.load(open(jp)).get("vis_dim"))
         n = sum(e["part"] == k for e in plan["episodes"])
         lp = part_dir(a.out, k) / "ledger.json"
         d = json.load(open(lp)) if lp.exists() else dict(done={}, crashes=[])
         print(f"  part {k}: {len(d['done'])}/{n}; аварий "
               f"{len(d['crashes'])}")
+    print(f"  размерность визуальных признаков: {sorted(dims, key=str)}" +
+          ("" if len(dims) <= 1 else "  — РАЗНАЯ, данные не годятся"))
 
 
 def selftest():
@@ -499,7 +542,7 @@ def selftest():
                 call=np.arange(N_WIN, dtype=np.int64), B=tgt.copy(),
                 target=tgt, actions=acts,
                 p_vis=np.ones((N_WIN, 5, 4, 6), np.float32),
-                **{f"p_{c}": np.zeros((N_WIN, 5, 4, 4, 3), np.uint8)
+                **{f"p_{c}": np.zeros((N_WIN, 5, *IMG), np.uint8)
                    for c in CAMS})
     e = dict(t=list(range(0, 64, 8)), windows=list(range(8)), policy="T1")
     assert data_problems(data, e, q) == []
@@ -508,17 +551,50 @@ def selftest():
                 dict(data, S0=np.ones((N_WIN, 10), np.float32)),
                 dict(data, p_vis=np.full((N_WIN, 5, 4, 6), np.nan,
                                          np.float32)),
-                {k: v for k, v in data.items() if k != "p_" + CAMS[1]}):
+                {k: v for k, v in data.items() if k != "p_" + CAMS[1]},
+                dict(data, p_vis=np.ones((N_WIN, 5, 4, 0), np.float32)),
+                dict(data, **{f"p_{CAMS[0]}": np.zeros((N_WIN, 5, 224, 224,
+                                                        1), np.uint8)})):
         assert data_problems(bad, e, q), "порча принята"
+    assert data_problems(data, e, q, vis_dim=7), "чужая D принята"
+    assert data_problems(data, e, q, vis_dim=6) == []
     assert data_problems(dict(data, B=tgt + 0.1), dict(e, policy="T2P"),
                          q) == []
     pm = point_map([0, 8, 24])
     assert pm[8] == [(0, 8), (8, 0)] and pm[24] == [(24, 0)] and \
         sum(len(v) for v in pm.values()) == 15
+    # журнал: общий расход и чужой резерв
+    import tempfile
+    import k31_collect as kcol
+    plan_ = dict(sha256="P", episodes=[dict(eid="e1", part=0, phys=84, role="R"),
+                                       dict(eid="e2", part=0, phys=90, role="T1a")])
+    with tempfile.TemporaryDirectory() as td:
+        L = kcol.Ledger(str(Path(td) / "l.json"), {SCOPE: 2 * RESERVE})
+        assert restore(Path(td), plan_, 0, L, q) == {}
+        L.d["spent"] = {SCOPE: 74}                 # расход без учтённых
+        try:
+            restore(Path(td), plan_, 0, L, q)
+            raise AssertionError("расход без учтённых принят")
+        except SystemExit:
+            pass
+        L.d["spent"] = {SCOPE: 0}
+        L.d["pending"] = dict(id="e1", scope=SCOPE, amount=5)
+        try:
+            restore(Path(td), plan_, 0, L, q)
+            raise AssertionError("чужой резерв принят")
+        except SystemExit:
+            pass
+        L.d["pending"] = dict(id="x", scope=SCOPE, amount=RESERVE)
+        try:
+            restore(Path(td), plan_, 0, L, q)
+            raise AssertionError("резерв вне части принят")
+        except SystemExit:
+            pass
     print("самопроверка k40b_collect пройдена: окна ⌊k(M−1)/7⌋ по полным "
           "чанкам; 4 последовательные группы токенов; роли R/T1a/T1b = "
           "аудиту; цель T1 = B, у T2/T2P — k_a2; масштаб цели = действиям; "
-          "формы, конечность, порча — отказ")
+          "формы кадров и признаков, единая D, журнал (расход, резерв) — "
+          "порча отвергается")
     return 0
 
 
