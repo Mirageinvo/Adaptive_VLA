@@ -67,6 +67,19 @@ def h256(s):
 
 
 # --- банк -------------------------------------------------------------------------------------
+def file_hash_ok(p, want):
+    """Хеш файла тем алгоритмом, которым его записал манифест: 40 hex —
+    SHA1 (K-33), 64 hex — SHA256 (K-37, K-39)."""
+    alg = {40: hashlib.sha1, 64: hashlib.sha256}.get(len(str(want)))
+    if alg is None:
+        raise SystemExit(f"неизвестный формат хеша {want!r}")
+    h = alg()
+    with open(p, "rb") as fh:
+        for b in iter(lambda: fh.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest() == want
+
+
 def prev_seen():
     """Подписи и seed всех прежних банков по их манифестам (с проверкой
     SHA файлов)."""
@@ -78,14 +91,14 @@ def prev_seen():
         if "space" in m:
             spaces.add(int(m["space"]))
         for p, s in m["files"].items():
-            if not os.path.exists(p) or sha256(p) != s:
+            if not os.path.exists(p) or not file_hash_ok(p, s):
                 raise SystemExit(f"{mp}: файл {p} отсутствует или изменён")
             z = np.load(p, allow_pickle=False)
             sigs.update(str(x) for x in z["sig"])
             seeds.update(int(x) for x in z["seed"])
     if SPACE in spaces:
         raise SystemExit(f"space {SPACE} уже занят прежним банком")
-    return sigs, seeds
+    return frozenset(sigs), frozenset(seeds)
 
 
 def bank(a):
@@ -101,10 +114,8 @@ def bank(a):
             raise SystemExit(f"банк закреплён, файлы изменены: {bad}")
         print(f"  {MANIFEST}: закреплён (bank_id {m['bank_id'][:12]})")
         return OK
-    for t in TASKS:
-        if os.path.exists(kb.task_path(SPACE, t, BANK_DIR)):
-            raise SystemExit(f"space {SPACE} t{t} уже есть — нужен разбор")
-    seen, seeds0 = prev_seen()
+    seen_prev, seeds0 = prev_seen()
+    seen_build = set(seen_prev)          # растёт по мере отбора задач
     L = kcol.Ledger(BANK_LEDGER, dict(bank=10 * (len(TASKS) * MAX_CAND +
                                                  len(TASKS) * N_SCENES)))
     per, files = {}, {}
@@ -112,7 +123,8 @@ def bank(a):
         official = set(kb.official_joint_sigs(t))
         results, start = [], 0
         while True:
-            cases, rej = kb.select(results, N_SCENES, set(seen), official)
+            cases, rej = kb.select(results, N_SCENES, set(seen_build),
+                                   official)
             if len(cases) >= N_SCENES:
                 break
             if start >= MAX_CAND:
@@ -125,10 +137,19 @@ def bank(a):
                                       os.path.join(WORK,
                                                    f"gen_t{t}_c{start}.pkl"))
             start += n
-        cases, rej = kb.select(results, N_SCENES, seen, official)
+        cases, rej = kb.select(results, N_SCENES, seen_build, official)
         if len({json.dumps(c["meta"], sort_keys=True) for c in cases}) != 1:
             raise SystemExit(f"t{t}: разные модели сцен")
-        p = kb.save_task(SPACE, t, cases, cases[0]["meta"], BANK_DIR)
+        p = kb.task_path(SPACE, t, BANK_DIR)
+        if os.path.exists(p):            # продолжение после частичной записи
+            old, _m = kb.load_task(SPACE, t, BANK_DIR)
+            if [(c["case_id"], c["init_hash"], c["init_hash_full"])
+                    for c in old] != [(c["case_id"], c["init_hash"],
+                                       c["init_hash_full"]) for c in cases]:
+                raise SystemExit(f"{p}: записанная задача ≠ пересчёту из "
+                                 f"кеша генерации — нужен разбор")
+        else:
+            p = kb.save_task(SPACE, t, cases, cases[0]["meta"], BANK_DIR)
         files[p] = sha256(p)
         per[str(t)] = dict(cases=len(cases), candidates=start,
                            reject_counts={w: sum(1 for r in rej
@@ -140,7 +161,7 @@ def bank(a):
     sigs = [str(x) for p_ in files for x in np.load(p_)["sig"]]
     if len(set(seeds)) != len(seeds) or set(seeds) & seeds0:
         raise SystemExit("коллизия seed (внутри банка или с прежними)")
-    if len(set(sigs)) != len(sigs) or set(sigs) & seen:
+    if len(set(sigs)) != len(sigs) or set(sigs) & seen_prev:
         raise SystemExit("коллизия подписей (внутри банка или с прежними)")
     jobs = []
     for t in TASKS:
@@ -496,6 +517,33 @@ def part_dir(k):
     return ROOT / f"part-{int(k)}"
 
 
+def ledger_problems(d, plan, k, jobs, final):
+    """Журнал части: лимиты, резерв, аварии (id/область/сумма), done."""
+    p = []
+    ids = {j["eid"] for j in jobs}
+    if d.get("caps") != dict(base=plan["parts"][str(k)]["cap"]):
+        p.append(f"лимиты {d.get('caps')}")
+    if set(d.get("spent", {})) - {"base"}:
+        p.append(f"чужие области расхода {d['spent']}")
+    pd_ = d.get("pending")
+    if pd_ is not None and (final or pd_.get("id") not in ids or
+                            pd_.get("scope") != "base" or
+                            pd_.get("amount") != EP or
+                            pd_.get("id") in d["done"]):
+        p.append(f"открытый резерв {pd_}")
+    for c in d.get("crashes", []):
+        if c.get("id") not in ids or c.get("scope") != "base" or \
+                c.get("amount") != EP:
+            p.append(f"чужая авария {c}")
+    if set(d["done"]) - ids:
+        p.append("учтены эпизоды вне части")
+    if any(v.get("scope") != "base" for v in d["done"].values()):
+        p.append("учёт в чужой области")
+    if final and set(d["done"]) != ids:
+        p.append(f"учтено {len(d['done'])} из {len(ids)}")
+    return p
+
+
 def collect(a):
     import k31_collect as kcol
     import k36_harness as kh
@@ -519,6 +567,9 @@ def collect(a):
         L = kcol.Ledger(str(pd / "ledger.json"),
                         dict(base=plan["parts"][str(k)]["cap"]))
         jobs = queue(plan, k)
+        lp_ = ledger_problems(L.d, plan, k, jobs, final=False)
+        if lp_:
+            raise SystemExit(f"журнал part {k}: {lp_[:3]}")
         by = {j["eid"]: j for j in jobs}
         pdg = L.d["pending"]
         if pdg:
@@ -586,36 +637,45 @@ def status(a):
 
 
 def finalize(a):
-    """Все 192 шарда проверены, журналы закрыты -> baseline_manifest.json."""
+    """Все 192 шарда проверены, журналы закрыты (строго) ->
+    baseline_manifest.json; существующий манифест обязан совпасть."""
     import k36_harness as kh
     import k36_protocol as pc
+    import k37_confirm as kcf
     plan = load_plan()
     C = kh.consts(pc.load_prepare())
-    out, prob = {}, []
-    for k in range(N_PARTS):
-        lp = part_dir(k) / "ledger.json"
-        if not lp.exists():
-            raise SystemExit(f"part {k}: нет журнала")
-        d = json.load(open(lp))
-        jobs = queue(plan, k)
-        if d["pending"] is not None or set(d["done"]) != {j["eid"]
-                                                          for j in jobs}:
-            prob.append(f"part {k}: журнал ≠ плану")
-            continue
-        tot = 0
-        for j in jobs:
-            m, pr = check_shard(j, plan["sha256"], C, d["done"][j["eid"]])
-            prob += [f"{j['eid']}: {x}" for x in pr]
-            if m is None or pr:
+    out, prob, locks = {}, [], []
+    try:
+        for k in range(N_PARTS):
+            pd = part_dir(k)
+            pd.mkdir(parents=True, exist_ok=True)
+            locks.append(kcf.Lock(str(pd / ".lock"), f"part {k}", kcf.Busy))
+            lp = pd / "ledger.json"
+            if not lp.exists():
+                raise SystemExit(f"part {k}: нет журнала")
+            d = json.load(open(lp))
+            jobs = queue(plan, k)
+            lpr = ledger_problems(d, plan, k, jobs, final=True)
+            if lpr:
+                prob += [f"part {k}: {x}" for x in lpr]
                 continue
-            tot += m["summary"]["physical"]
-            out[j["eid"]] = dict(sha256=sha256(shard_path(j["eid"])),
-                                 success=m["summary"]["success"],
-                                 task=j["scene"]["task"], seed=j["seed"],
-                                 case_id=j["scene"]["case_id"],
-                                 part=k, steps=m["summary"]["steps"])
-        if d["spent"].get("base", 0) != tot + EP * len(d["crashes"]):
-            prob.append(f"part {k}: расход ≠ сумме")
+            tot = 0
+            for j in jobs:
+                m, pr = check_shard(j, plan["sha256"], C, d["done"][j["eid"]])
+                prob += [f"{j['eid']}: {x}" for x in pr]
+                if m is None or pr:
+                    continue
+                tot += m["summary"]["physical"]
+                out[j["eid"]] = dict(sha256=sha256(shard_path(j["eid"])),
+                                     success=m["summary"]["success"],
+                                     task=j["scene"]["task"], seed=j["seed"],
+                                     case_id=j["scene"]["case_id"],
+                                     part=k, steps=m["summary"]["steps"])
+            if d["spent"] != dict(base=tot + EP * len(d["crashes"])):
+                prob.append(f"part {k}: расход ≠ сумме")
+    finally:
+        for lk in locks:
+            lk.release()
     if set(out) != set(plan["episodes"]):
         prob.append(f"эпизодов {len(out)} ≠ {len(plan['episodes'])}")
     if prob:
@@ -623,7 +683,13 @@ def finalize(a):
         return TECH
     man = dict(kind="k40b_eval_baseline", plan=plan["sha256"],
                episodes=out)
-    pc.save_json(str(ROOT / "baseline_manifest.json"), man)
+    mp = ROOT / "baseline_manifest.json"
+    if mp.exists():
+        if pc.load_json(str(mp)) != man:
+            raise SystemExit("baseline_manifest.json уже есть и ≠ пересчёту")
+        print("  baseline_manifest: уже закреплён, совпадает")
+    else:
+        pc.save_json(str(mp), man)
     sr = {t: np.mean([v["success"] for v in out.values() if v["task"] == t])
           for t in TASKS}
     print(f"  baseline_manifest: {len(out)} эпизодов; SR T32 по задачам "
@@ -733,7 +799,30 @@ def selftest():
             assert ep_problems(zz, meta, j, C)
         finally:
             g_["SHARDS"] = keep
-    print("самопроверка k40b_eval_base пройдена: Screen 3 × 32, 4 части × 48, "
+    # алгоритм хеша прежних манифестов
+    with tempfile.TemporaryDirectory() as td:
+        fp = Path(td) / "f.bin"
+        fp.write_bytes(b"abc")
+        assert file_hash_ok(fp, hashlib.sha1(b"abc").hexdigest())
+        assert file_hash_ok(fp, hashlib.sha256(b"abc").hexdigest())
+        assert not file_hash_ok(fp, hashlib.sha1(b"x").hexdigest())
+    # строгий журнал части
+    pl = dict(parts={"0": dict(cap=49 * EP)})
+    jb = [dict(eid="a"), dict(eid="b")]
+    good = dict(caps=dict(base=49 * EP), spent=dict(base=100),
+                pending=None, crashes=[], done={
+                    "a": dict(scope="base", actual=50),
+                    "b": dict(scope="base", actual=50)})
+    assert ledger_problems(good, pl, 0, jb, True) == []
+    for bad in (dict(good, crashes=[dict(id="x", scope="base", amount=EP)]),
+                dict(good, crashes=[dict(id="a", scope="z", amount=EP)]),
+                dict(good, crashes=[dict(id="a", scope="base", amount=5)]),
+                dict(good, caps=dict(base=1)),
+                dict(good, pending=dict(id="a", scope="base", amount=EP)),
+                dict(good, done={"a": dict(scope="base", actual=50)})):
+        assert ledger_problems(bad, pl, 0, jb, True), bad
+    print("самопроверка k40b_eval_base пройдена: SHA1/SHA256 прежних "
+          "манифестов; строгий журнал части; Screen 3 × 32, 4 части × 48, "
           "оба сида сцены в части; игрушечный T32: шард проходит, чужой план, "
           "хеш, тяжёлые вызовы, действия и запись без журнала — отказ")
     return 0
