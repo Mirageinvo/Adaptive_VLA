@@ -205,8 +205,28 @@ def plan_path():
     return ROOT / "plan.json"
 
 
-def verify_ckpt(ck, name, pca_sha, train_sha):
+def verify_baseline():
+    """Штатный finalize фазы I на существующем манифесте: журналы, шарды,
+    совпадение пересчитанного манифеста. -> манифест."""
+    import k36_protocol as pc
+    kb = base()
+    mp = kb.ROOT / "baseline_manifest.json"
+    if not mp.exists():
+        raise SystemExit("нет baseline_manifest — сначала фаза I finalize")
+    if kb.finalize(None) != kb.OK:
+        raise SystemExit("фаза I: finalize не подтвердил базовые результаты")
+    return pc.load_json(str(mp))
+
+
+def verify_ckpt(ck, name, pca_sha, train_sha, trep=None):
     pr = []
+    if trep is not None:
+        for k in ("collect_plan", "pca_source", "config", "params",
+                  "pca_sha256", "train_code_sha256"):
+            if ck.get(k) != trep.get(k):
+                pr.append(f"{k} чекпойнта ≠ отчёту обучения")
+    if not ck.get("state"):
+        pr.append("пустой state")
     if ck.get("pca_sha256") != pca_sha:
         pr.append("PCA ≠ закреплённому")
     if ck.get("train_code_sha256") != train_sha:
@@ -226,23 +246,31 @@ def prepare(a):
     bm_p = kb.ROOT / "baseline_manifest.json"
     if not bm_p.exists():
         raise SystemExit("нет baseline_manifest — сначала фаза I finalize")
-    bm = pc.load_json(str(bm_p))
-    if bm.get("plan") != bp["sha256"] or set(bm["episodes"]) != \
-            set(bp["episodes"]):
-        raise SystemExit("baseline_manifest ≠ базовому плану")
+    verify_baseline()
+    import k36_harness as kh
+    import k40b_train as kt
+    k36 = pc.load_prepare()
+    C = kh.consts(k36)
     pca_sha = sha256(PCA)
-    rep = pc.load_json(str(PCA_REP))
-    if rep.get("out_sha256") != pca_sha:
-        raise SystemExit("PCA ≠ своему отчёту")
+    P, _prep = kt.load_pca(PCA, k36)                # штатная проверка PCA
+    cp = pc.load_json(str(COLLECT_PLAN))
+    if kcf.canon_sha({k: v for k, v in cp.items() if k != "sha256"}) != \
+            cp.get("sha256"):
+        raise SystemExit("план сбора B ≠ своему SHA")
+    trep = pc.load_json(str(TRAIN_REP))
+    if trep.get("collect_plan") != cp["sha256"] or \
+            trep.get("pca_sha256") != pca_sha:
+        raise SystemExit("отчёт обучения ≠ плану сбора или PCA")
     train_sha = sha256(Path(HERE) / "k40b_train.py")
     ck = {}
     for pol in POLICIES:
         for s in (0, 1):
             p = MODELS / CKPT[pol].format(s)
             c = torch.load(p, map_location="cpu")
-            pr = verify_ckpt(c, pol, pca_sha, train_sha)
+            pr = verify_ckpt(c, pol, pca_sha, train_sha, trep)
             if pr or c.get("seed") != s:
                 raise SystemExit(f"{p}: {pr} сид {c.get('seed')}")
+            Head(torch, c, P, C)                 # state_dict грузится в модель
             ck[f"{pol}_s{s}"] = dict(path=str(p), sha256=sha256(p))
     plan = dict(kind="k40b_eval_heads_plan", protocol=PROTOCOL,
                 base_plan=bp["sha256"], baseline_manifest=sha256(bm_p),
@@ -294,6 +322,12 @@ def load_plan(verify=True):
                 if sha256(v["path"]) != v["sha256"]]
         if sha256(PCA) != p["pca"]["sha256"]:
             bad.append("PCA")
+        if sha256(PCA_REP) != p["pca"]["report_sha256"]:
+            bad.append("pca.json")
+        if sha256(TRAIN_REP) != p["train_report_sha256"]:
+            bad.append("отчёт обучения")
+        if sha256(COLLECT_PLAN) != p["collect_plan_sha256"]:
+            bad.append("план сбора")
         if sha256(kb.ROOT / "baseline_manifest.json") != \
                 p["baseline_manifest"]:
             bad.append("baseline_manifest")
@@ -389,6 +423,8 @@ def ep_problems(z, meta, j, C):
         p.append(f"тяжёлых вызовов {meta['heavy']} ≠ чанков {n}")
     if not np.isfinite(H["goals"]).all() or H["goals"].shape != (n, 4, 75):
         p.append("подцели формы/конечности")
+    if H["z0"].shape != (n, 75) or not np.isfinite(H["z0"]).all():
+        p.append(f"z0 формы {H['z0'].shape} или не конечен")
     ss, ds, st_ = s["success_step"], s["done_step"], s["steps"]
     if s["physical"] != 10 + len(A) or st_ != len(A) or s["physical"] > EP:
         p.append("расход ≠ шагам")
@@ -455,30 +491,35 @@ def preflight(a):
     try:
         card.start()
         sim = card.sim(kb.SPACE, kb.BANK_DIR)
-        s = 0
-        v, arm = card.source(k36, s)
-        ref = kb.shard_path(kb.eid_of("T32", s, sc))
-        with np.load(ref) as z:
-            A_ref = z["actions"]
         P = dict(np.load(PCA))
-        ep0 = run_head(sim, v["io"], arm, v["mod"].bar,
-                       zero_head(card.torch, P, C), C, sc["task"],
-                       sc["pos"], kb.eid_of("T32", s, sc))
-        if not np.array_equal(np.asarray(ep0["actions"], np.float32), A_ref):
-            prob.append("нулевая голова ≠ базовому T32")
-        info["zero_seconds"] = float(ep0["seconds"])
-        for pol in POLICIES:
-            hd = load_head(card.torch, plan, pol, s, C)
-            ep = run_head(sim, v["io"], arm, v["mod"].bar, hd, C, sc["task"],
-                          sc["pos"], eid_of(pol, s, sc))
-            d = np.stack([x["delta"] for x in ep["log"]])
-            info[pol] = dict(success=bool(ep["success"]),
-                             delta_rms=float(np.sqrt((d ** 2).mean())),
-                             seconds=float(ep["seconds"]))
-            if ep["heavy"] != len(ep["calls"]):
-                prob.append(f"{pol}: тяжёлых ≠ чанков")
-        arm = v = None
-        kh.free(card.torch)
+        for s in (0, 1):
+            v, arm = card.source(k36, s)
+            ref = kb.shard_path(kb.eid_of("T32", s, sc))
+            with np.load(ref) as z:
+                A_ref = z["actions"]
+                m_ref = json.loads(str(z["meta"]))
+            ep0 = run_head(sim, v["io"], arm, v["mod"].bar,
+                           zero_head(card.torch, P, C), C, sc["task"],
+                           sc["pos"], kb.eid_of("T32", s, sc))
+            if not np.array_equal(np.asarray(ep0["actions"], np.float32),
+                                  A_ref) or \
+                    {k: ep0[k] for k in kb.SUMMARY} != m_ref["summary"] or \
+                    ep0["heavy"] != m_ref["heavy"]:
+                prob.append(f"s{s}: нулевая голова ≠ базовому T32")
+            info[f"zero_s{s}_seconds"] = float(ep0["seconds"])
+            for pol in POLICIES:
+                hd = load_head(card.torch, plan, pol, s, C)
+                ep = run_head(sim, v["io"], arm, v["mod"].bar, hd, C,
+                              sc["task"], sc["pos"], eid_of(pol, s, sc))
+                d = np.concatenate([x["delta"][:x["k"]] for x in ep["log"]])
+                info[f"{pol}_s{s}"] = dict(
+                    success=bool(ep["success"]),
+                    executed_rms=float(np.sqrt((d ** 2).mean())),
+                    seconds=float(ep["seconds"]))
+                if ep["heavy"] != len(ep["calls"]):
+                    prob.append(f"{pol} s{s}: тяжёлых ≠ чанков")
+            arm = v = None
+            kh.free(card.torch)
         rep = dict(admitted=not prob, problems=prob, info=info,
                    plan=plan["sha256"], env=kgr.env_record(card.torch),
                    uuid=card.g["uuid"], host=socket.gethostname())
@@ -621,7 +662,7 @@ def analyze(a):
     plan = load_plan()
     bp = plan["base_plan_obj"]
     C = kh.consts(pc.load_prepare())
-    bm = pc.load_json(str(kb.ROOT / "baseline_manifest.json"))
+    bm = verify_baseline()
     Y, prob, dstat = {}, [], {p: [] for p in POLICIES}
     for e, v in bm["episodes"].items():
         if sha256(kb.shard_path(e)) != v["sha256"]:
@@ -648,7 +689,9 @@ def analyze(a):
                 Y[(j["policy"], j["seed"], sc["task"], sc["case_id"])] = \
                     int(m["summary"]["success"])
                 with np.load(shard_path(j["eid"])) as z:
-                    dstat[j["policy"]].append(z["h_delta"].reshape(-1))
+                    dstat[j["policy"]].append(np.concatenate(
+                        [z["h_delta"][i][:int(z["h_k"][i])].reshape(-1)
+                         for i in range(len(z["h_k"]))]))
             if d["spent"] != dict(base=tot + EP * len(d["crashes"])):
                 prob.append(f"part {k}: расход ≠ сумме")
     finally:
@@ -667,7 +710,8 @@ def analyze(a):
         tree_t32=contrast(Y, "TreeB", "T32", scenes, tasks),
         tree_flat=contrast(Y, "TreeB", "FlatB", scenes, tasks),
         flat_t32=contrast(Y, "FlatB", "T32", scenes, tasks),
-        delta={p: dict(rms=float(np.sqrt(np.mean(np.concatenate(v) ** 2))),
+        delta={p: dict(executed_rms=float(np.sqrt(np.mean(
+                    np.concatenate(v) ** 2))),
                        at_cap=float(np.mean(np.abs(np.concatenate(v)) >=
                                             0.999 * kt.CAP)))
                for p, v in dstat.items()})
@@ -826,6 +870,8 @@ def _toy_heads(torch, kh, kcol, kt, k36, src, Sim, io, mod, P, C):
             bad["h_final"][..., 6] *= -1
             assert ep_problems(bad, meta, j, C)
             assert ep_problems(zz, dict(meta, heavy=meta["heavy"] + 1), j, C)
+            for z0bad in (zz["h_z0"][:, :10], zz["h_z0"] * np.nan):
+                assert ep_problems(dict(zz, h_z0=z0bad), meta, j, C)
             assert check_shard(dict(j, policy="FlatB"), "P", C)[1]
         finally:
             g_["SHARDS"] = keep
