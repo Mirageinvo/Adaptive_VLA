@@ -36,7 +36,9 @@ KDPE = Path("/home/malinin_aa/KDPE")
 CKPT = KDPE / "data/weights/diffusion_cnn_assembly_mg/checkpoints/step_79999.ckpt"
 CKPT_SHA = "eaa7fa94d22cb883329252dcb2e077ae99a6128b20d86d79101898e10af47e19"
 DATA = KDPE / "data/datasets/robomimic/datasets/assembly"
-START0, N_STARTS = 4610000, 100
+START0, N_STARTS = 4610000, 100            # Screen
+BENCH0 = 4600000                            # замер: старые сиды штатной оценки
+DATASET = DATA / "image_abs.hdf5"           # единый путь: манифест и раннер
 OUT = Path("/home/malinin_aa/Adaptive_VLA/reports/k41")
 N_ACT = 8
 
@@ -74,7 +76,8 @@ def kdpe_setup():
     sys.path.insert(0, str(KDPE))
     keep = sys.argv
     sys.argv = [keep[0], "--model", "cnn", "--task", TASK, "--population",
-                "1", "--Filter.name", "passall"]
+                "1", "--Filter.name", "passall", "--output_dir",
+                str(OUT / "kdpe_config")]      # не трогать штатный каталог
     try:
         import mimicgen                 # регистрирует ThreePieceAssembly_D0
         import robosuite.environments.base as B
@@ -131,6 +134,7 @@ def make_runner(cfg, start0, n, n_envs):
         r.n_test_vis, r.n_train_vis = 0, 0
         r.n_action_steps = N_ACT
         r.test_start_seed = start0
+        r.dataset_path = str(DATASET)
     return hydra.utils.instantiate(cfg.task.env_runner,
                                    output_dir=str(OUT / "runner"))
 
@@ -241,7 +245,7 @@ def cmd_manifest(a):
     import h5py
     kdpe_setup()
     _p, cfg = load_policy(torch, a.device)
-    f = h5py.File(DATA / "image_abs.hdf5", "r")
+    f = h5py.File(DATASET, "r")
     ea = json.loads(f["data"].attrs["env_args"])
     m = dict(
         kind="k41_manifest",
@@ -249,7 +253,8 @@ def cmd_manifest(a):
             ["git", "-C", str(KDPE), "rev-parse", "HEAD"]).decode().strip(),
         ckpt=dict(path=str(CKPT), sha256=CKPT_SHA),
         dataset=dict(d0_sha256=sha256(DATA / "three_piece_assembly_d0.hdf5"),
-                     image_abs_sha256=sha256(DATA / "image_abs.hdf5"),
+                     image_abs_path=str(DATASET),
+                     image_abs_sha256=sha256(DATASET),
                      n_demos=len(f["data"].keys()), env_name=ea["env_name"],
                      env_version=ea.get("env_version"),
                      env_kwargs=ea["env_kwargs"]),
@@ -283,9 +288,10 @@ def cmd_starts(a):
     env = runner.env
     hs = {}
     for b in range(0, N_STARTS, a.n_envs):
-        idx = list(range(b, b + a.n_envs))
+        idx = list(range(b, min(b + a.n_envs, N_STARTS)))
+        pad = idx + [idx[0]] * (a.n_envs - len(idx))   # хвост — как в раннере
         env.call_each("run_dill_function",
-                      args_list=[(runner.env_init_fn_dills[i],) for i in idx])
+                      args_list=[(runner.env_init_fn_dills[i],) for i in pad])
         obs = env.reset()
         for j, i in enumerate(idx):
             hs[str(runner.env_seeds[i])] = obs_hash(obs, j)
@@ -302,6 +308,10 @@ def cmd_admit(a):
     """Один старт: штатный predict_action с генератором чанка против
     обёртки с нулевой головой при том же ключе."""
     import torch
+    sp = OUT / "starts.json"
+    if not sp.exists():
+        raise SystemExit("нет starts.json — сначала команда starts")
+    st = json.loads(sp.read_text())
     kdpe_setup()
     torch_setup(torch)
     policy, cfg = load_policy(torch, a.device)
@@ -310,20 +320,20 @@ def cmd_admit(a):
     r_our, A_our, s_our = run_batch(torch, runner, policy, [0], 0,
                                     head=lambda gc, act: torch.zeros_like(
                                         act[..., :-1]))
-    same = np.array_equal(A_std, A_our) and r_std == r_our
-    st = json.loads((OUT / "starts.json").read_text()) if \
-        (OUT / "starts.json").exists() else None
-    hash_ok = st is None or st["reset_hash"][str(START0)] == \
-        r_std[0]["reset_hash"]
+    shape_ok = A_std.shape == A_our.shape
+    same = shape_ok and np.array_equal(A_std, A_our) and r_std == r_our
+    hash_ok = st["reset_hash"].get(str(START0)) == r_std[0]["reset_hash"] \
+        == r_our[0]["reset_hash"]
     rep = dict(kind="k41_admit", start=START0, same=bool(same),
                reset_hash_ok=bool(hash_ok), std=r_std[0], ours=r_our[0],
-               chunks=int(A_std.shape[1]),
-               max_abs_diff=float(np.abs(A_std - A_our).max()),
-               seconds=dict(std=s_std, ours=s_our))
+               chunks=[int(A_std.shape[1]), int(A_our.shape[1])],
+               max_abs_diff=float(np.abs(A_std - A_our).max()) if shape_ok
+               else None, seconds=dict(std=s_std, ours=s_our))
     (OUT / "admit.json").write_text(json.dumps(rep, indent=1))
     print(f"  допуск K-41: {'СОВПАДАЕТ' if same and hash_ok else 'РАСХОЖДЕНИЕ'}"
-          f"; штатная {r_std[0]}, обёртка {r_our[0]}; max|Δa| "
-          f"{rep['max_abs_diff']:.3g}; время {s_std:.0f} / {s_our:.0f} с")
+          f"; штатная {r_std[0]}, обёртка {r_our[0]}; чанков "
+          f"{rep['chunks']}; max|Δa| {rep['max_abs_diff']}; время "
+          f"{s_std:.0f} / {s_our:.0f} с")
     return 0 if same and hash_ok else 3
 
 
@@ -332,10 +342,11 @@ def cmd_bench(a):
     kdpe_setup()
     torch_setup(torch)
     policy, cfg = load_policy(torch, a.device)
-    runner = make_runner(cfg, START0, a.n, a.n)
+    runner = make_runner(cfg, BENCH0, a.n, a.n)
     res, _A, sec = run_batch(torch, runner, policy, list(range(a.n)), 0)
     sr = np.mean([r["success"] for r in res])
-    rep = dict(kind="k41_bench", n=a.n, seconds=sec, sr=float(sr),
+    rep = dict(kind="k41_bench", n=a.n, seeds=[BENCH0, BENCH0 + a.n - 1],
+               seconds=sec, sr=float(sr),
                first_success=[r["first_success"] for r in res],
                results=res)
     (OUT / f"bench_{a.n}.json").write_text(json.dumps(rep, indent=1))
