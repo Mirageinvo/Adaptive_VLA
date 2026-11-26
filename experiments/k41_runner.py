@@ -409,8 +409,8 @@ def cmd_diag(a):
     (A) кешированный reset_to, (B) штатный сброс по сиду (кеш очищается
     перед каждым сбросом)."""
     import torch
+    kdpe_setup()                       # путь к локальному diffusion_policy
     from diffusion_policy.common.pytorch_util import dict_apply
-    kdpe_setup()
     torch_setup(torch)
     policy, cfg = load_policy(torch, a.device)
     runner = make_runner(cfg, START0, a.n, 1)
