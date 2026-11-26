@@ -192,6 +192,7 @@ def run_batch(torch, runner, policy, idx, replica, head=None, mode="ours",
     if len(idx) != n_envs:
         raise SystemExit("батч ≠ числу сред")
     seeds = [runner.env_seeds[i] for i in idx]
+    cold_reset_prepare(env, seeds)          # штатный сброс по сиду (diag)
     env.call_each("run_dill_function",
                   args_list=[(runner.env_init_fn_dills[i],) for i in idx])
     obs = env.reset()
@@ -325,10 +326,10 @@ def warm_reset(runner, idx):
 
 
 def cmd_admit(a):
-    """Один старт, кеш сброса заполнен заранее (одинаковый путь reset_to у
-    всех прогонов). Прогоны: штатный (std1), штатный (std2), обёртка с
-    нулевой головой (ours) при одном ключе. Допуск: ours = std2 побитово
-    (действия, исход). std1 против std2 — воспроизводимость среды."""
+    """Один старт, все прогоны через штатный сброс по сиду (кеш очищается
+    в run_batch). Прогоны: штатный (std1), штатный (std2), обёртка с
+    нулевой головой (ours) при одном ключе. Допуск: std1 = std2 = ours
+    побитово (действия, исход), холодный сброс = starts.json."""
     import torch
     sp = OUT / "starts.json"
     if not sp.exists():
@@ -338,20 +339,18 @@ def cmd_admit(a):
     torch_setup(torch)
     policy, cfg = load_policy(torch, a.device)
     runner = make_runner(cfg, START0, 1, 1)
-    cold = warm_reset(runner, [0])[0]
     zero = lambda gc, act: torch.zeros_like(act[..., :-1])  # noqa: E731
     r1, A1, s1 = run_batch(torch, runner, policy, [0], 0, mode="std")
     r2, A2, s2 = run_batch(torch, runner, policy, [0], 0, mode="std")
     r3, A3, s3 = run_batch(torch, runner, policy, [0], 0, head=zero)
     same = A2.shape == A3.shape and np.array_equal(A2, A3) and r2 == r3
     env_rep = A1.shape == A2.shape and np.array_equal(A1, A2) and r1 == r2
-    cold_ok = st["reset_hash"].get(str(START0)) == cold
+    cold_ok = st["reset_hash"].get(str(START0)) == r1[0]["reset_hash"]
     cached_ok = r1[0]["reset_hash"] == r2[0]["reset_hash"] == \
         r3[0]["reset_hash"]
-    rep = dict(kind="k41_admit", start=START0, same=bool(same),
-               env_repeatable=bool(env_rep), cold_reset_ok=bool(cold_ok),
-               cached_reset_ok=bool(cached_ok),
-               cold_vs_cached_obs_equal=bool(cold == r1[0]["reset_hash"]),
+    rep = dict(kind="k41_admit", start=START0, reset="cold_by_seed",
+               same=bool(same), env_repeatable=bool(env_rep),
+               cold_reset_ok=bool(cold_ok), resets_equal=bool(cached_ok),
                std1=r1[0], std2=r2[0], ours=r3[0],
                first_diff=dict(std2_ours=first_diff(A2, A3),
                                std1_std2=first_diff(A1, A2)),
@@ -362,7 +361,7 @@ def cmd_admit(a):
     print(f"  допуск K-41: {'СОВПАДАЕТ' if ok else 'РАСХОЖДЕНИЕ'}; обёртка = "
           f"штатной: {'да' if same else 'НЕТ'}; среда воспроизводима: "
           f"{'да' if env_rep else 'НЕТ'}; холодный сброс = starts.json: "
-          f"{'да' if cold_ok else 'НЕТ'}; кешированные сбросы равны: "
+          f"{'да' if cold_ok else 'НЕТ'}; сбросы трёх прогонов равны: "
           f"{'да' if cached_ok else 'НЕТ'}; первый отличающийся чанк "
           f"{rep['first_diff']}; исходы std1/std2/ours "
           f"{[r1[0]['success'], r2[0]['success'], r3[0]['success']]}; время "
@@ -373,6 +372,16 @@ def cmd_admit(a):
 # --- диагностика: сэмплер на одинаковом входе, среда на одинаковых командах ----------------------
 def _pop_cache(e, seed):
     e.env.env.seed_state_map.pop(seed, None)
+
+
+def cold_reset_prepare(env, seeds):
+    """Удалить старты из кеша сброса KDPE в каждой среде батча: следующий
+    reset — штатный по сиду (diag: только он повторяет o8 и состояние)."""
+    import dill
+    import functools
+    env.call_each("run_dill_function", args_list=[
+        (dill.dumps(functools.partial(_pop_cache, seed=int(sd))),)
+        for sd in seeds])
 
 
 def _sim_state(e):
@@ -478,7 +487,6 @@ def cmd_bench(a):
     torch_setup(torch)
     policy, cfg = load_policy(torch, a.device)
     runner = make_runner(cfg, BENCH0, a.n, a.n)
-    warm_reset(runner, list(range(a.n)))       # как в Screen: путь reset_to
     res, _A, sec = run_batch(torch, runner, policy, list(range(a.n)), 0)
     sr = np.mean([r["success"] for r in res])
     rep = dict(kind="k41_bench", n=a.n, seeds=[BENCH0, BENCH0 + a.n - 1],
