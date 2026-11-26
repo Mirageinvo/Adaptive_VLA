@@ -116,6 +116,20 @@ def plan_path():
     return ROOT / "plan.json"
 
 
+BAR_CFG = Path("third_party/actioncodec/config/eval/bar.yaml")
+
+
+def bar_inputs():
+    """Отпечаток входов исходного BAR: bar_pin из prepare K-21 (без
+    машинного пути к снимку) и SHA конфига загрузчика."""
+    import k21_data as d21
+    import k37_confirm as kcf
+    pin = json.load(open(d21.REPORT, encoding="utf-8"))["bar_pin"]
+    core = {k: v for k, v in pin.items() if k != "path"}
+    return dict(pin_sha256=kcf.canon_sha(core), revision=pin["revision"],
+                cfg_sha256=sha256(BAR_CFG)), pin
+
+
 def ref_eids(bp):
     """Эталонные эпизоды T32 Screen для допуска (первая сцена части 0)."""
     b = kb()
@@ -150,6 +164,7 @@ def prepare(a):
                 base_plan=bp["sha256"], heads_plan=hp["sha256"],
                 heads_analysis_sha256=sha256(ha), ref_shards=refs,
                 bar_revision=k36["k32_plan"]["bar_revision"],
+                bar_inputs=bar_inputs()[0],
                 k36_prepare_sha1=k36["sha1"],
                 checkpoints=hp["checkpoints"], pca=hp["pca"],
                 scenes=scenes,
@@ -163,12 +178,15 @@ def prepare(a):
     plan["episodes"] = [j["eid"] for k in range(N_PARTS)
                         for j in queue(plan, k)]
     sh = kcf.canon_sha(plan)
+    if plan["bar_inputs"]["revision"] != plan["bar_revision"]:
+        raise SystemExit("ревизия bar_pin K-21 ≠ ревизии prepare K-36")
     p = plan_path()
     if p.exists():
         old = pc.load_json(str(p))
-        if kcf.canon_sha({k: v for k, v in old.items() if k != "sha256"}) \
-                != sh:
-            raise SystemExit("план подтверждения закреплён иначе")
+        if not (old.get("sha256") == kcf.canon_sha(
+                {k: v for k, v in old.items() if k != "sha256"}) == sh):
+            raise SystemExit("план подтверждения закреплён иначе или его "
+                             "sha256 испорчен")
         print(f"  план закреплён: {sh[:16]}")
         return OK
     plan["sha256"] = sh
@@ -210,6 +228,8 @@ def load_plan(verify=True):
         if k36["sha1"] != p["k36_prepare_sha1"] or \
                 k36["k32_plan"]["bar_revision"] != p["bar_revision"]:
             bad.append("prepare K-36 / ревизия BAR")
+        if bar_inputs()[0] != p["bar_inputs"]:
+            bad.append("входы BAR (bar_pin K-21 / конфиг)")
         if bad:
             raise SystemExit(f"≠ плану подтверждения: {bad}")
     return p
@@ -329,6 +349,9 @@ def preflight(a):
         # BAR: закреплённая ревизия, один эпизод на той же сцене
         import k31_collect as kcol
         import k36c_bar as kbar
+        import k21_data as d21
+        _bi, pin = bar_inputs()
+        d21.check_pin(pin, verify_content=True)  # содержимое снимка = адресу
         card.kcf.check_gpu(card.idx, card.kcf.RES["min_free_gb"])
         src = kbar.load_bar(card.torch, a.device, k36)
         if src["revision"] != plan["bar_revision"]:
@@ -351,15 +374,16 @@ def preflight(a):
         src = barm = None
         kh.free(card.torch)
         refp = ROOT / "preflight" / "reference.json"
-        if a.reference:
-            if not prob:
-                refp.parent.mkdir(parents=True, exist_ok=True)
-                pc.save_json(str(refp), dict(plan=plan["sha256"], vocab=vocab,
-                                             bar=bar_fp, uuid=card.g["uuid"]))
-        else:
-            ref = pc.load_json(str(refp)) if refp.exists() else None
-            if not ref or ref.get("plan") != plan["sha256"]:
-                raise SystemExit("нет эталона допуска (preflight --reference)")
+        ref = pc.load_json(str(refp)) if refp.exists() else None
+        if ref is not None and ref.get("plan") != plan["sha256"]:
+            raise SystemExit("эталон допуска от другого плана")
+        if ref is None and a.reference and not prob:
+            refp.parent.mkdir(parents=True, exist_ok=True)
+            pc.save_json(str(refp), dict(plan=plan["sha256"], vocab=vocab,
+                                         bar=bar_fp, uuid=card.g["uuid"]))
+        elif ref is None:
+            raise SystemExit("нет эталона допуска (preflight --reference)")
+        else:                       # эталон уже есть — только сверка
             if ref["vocab"] != vocab or \
                     {k: ref["bar"][k] for k in ("actions_sha1", "success",
                                                 "steps")} != \
@@ -367,6 +391,7 @@ def preflight(a):
                                             "steps")}:
                 prob.append("BAR на этой карте ≠ эталону")
         rep = dict(admitted=not prob, problems=prob, info=info, vocab=vocab,
+                   reference_sha256=sha256(refp) if refp.exists() else None,
                    plan=plan["sha256"], env=kgr.env_record(card.torch),
                    uuid=card.g["uuid"], host=socket.gethostname())
         admission_path(card).parent.mkdir(parents=True, exist_ok=True)
@@ -406,6 +431,9 @@ def collect(a):
                 adm.get("env") != kgr.env_record(card.torch):
             raise SystemExit("карта не допущена для этого плана/среды")
         vocab = reference_vocab(plan)
+        if adm.get("reference_sha256") != \
+                sha256(ROOT / "preflight" / "reference.json"):
+            raise SystemExit("допуск карты получен по другому эталону")
         L = kcol.Ledger(str(pd / "ledger.json"),
                         dict(base=plan["parts"][str(k)]["cap"]))
         jobs = queue(plan, k)
