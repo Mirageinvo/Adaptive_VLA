@@ -304,9 +304,30 @@ def cmd_starts(a):
     return 0
 
 
+def first_diff(A, B):
+    """Номер первого чанка с отличающимися действиями (-1 — совпадают)."""
+    if A.shape != B.shape:
+        n = min(A.shape[1], B.shape[1])
+        d = [i for i in range(n) if not np.array_equal(A[:, i], B[:, i])]
+        return d[0] if d else n
+    d = [i for i in range(A.shape[1]) if not np.array_equal(A[:, i], B[:, i])]
+    return d[0] if d else -1
+
+
+def warm_reset(runner, idx):
+    """Один сброс стартов idx до прогонов: кеш состояний раннера
+    заполнен, и все прогоны идут одинаковым путём reset_to."""
+    env = runner.env
+    env.call_each("run_dill_function",
+                  args_list=[(runner.env_init_fn_dills[i],) for i in idx])
+    env.reset()
+
+
 def cmd_admit(a):
-    """Один старт: штатный predict_action с генератором чанка против
-    обёртки с нулевой головой при том же ключе."""
+    """Один старт, кеш сброса заполнен заранее (одинаковый путь reset_to у
+    всех прогонов). Прогоны: штатный (std1), штатный (std2), обёртка с
+    нулевой головой (ours) при одном ключе. Допуск: ours = std2 побитово
+    (действия, исход). std1 против std2 — воспроизводимость среды."""
     import torch
     sp = OUT / "starts.json"
     if not sp.exists():
@@ -316,25 +337,31 @@ def cmd_admit(a):
     torch_setup(torch)
     policy, cfg = load_policy(torch, a.device)
     runner = make_runner(cfg, START0, 1, 1)
-    r_std, A_std, s_std = run_batch(torch, runner, policy, [0], 0, mode="std")
-    r_our, A_our, s_our = run_batch(torch, runner, policy, [0], 0,
-                                    head=lambda gc, act: torch.zeros_like(
-                                        act[..., :-1]))
-    shape_ok = A_std.shape == A_our.shape
-    same = shape_ok and np.array_equal(A_std, A_our) and r_std == r_our
-    hash_ok = st["reset_hash"].get(str(START0)) == r_std[0]["reset_hash"] \
-        == r_our[0]["reset_hash"]
+    warm_reset(runner, [0])
+    zero = lambda gc, act: torch.zeros_like(act[..., :-1])  # noqa: E731
+    r1, A1, s1 = run_batch(torch, runner, policy, [0], 0, mode="std")
+    r2, A2, s2 = run_batch(torch, runner, policy, [0], 0, mode="std")
+    r3, A3, s3 = run_batch(torch, runner, policy, [0], 0, head=zero)
+    same = A2.shape == A3.shape and np.array_equal(A2, A3) and r2 == r3
+    env_rep = A1.shape == A2.shape and np.array_equal(A1, A2) and r1 == r2
+    hash_ok = st["reset_hash"].get(str(START0)) == r1[0]["reset_hash"] \
+        == r2[0]["reset_hash"] == r3[0]["reset_hash"]
     rep = dict(kind="k41_admit", start=START0, same=bool(same),
-               reset_hash_ok=bool(hash_ok), std=r_std[0], ours=r_our[0],
-               chunks=[int(A_std.shape[1]), int(A_our.shape[1])],
-               max_abs_diff=float(np.abs(A_std - A_our).max()) if shape_ok
-               else None, seconds=dict(std=s_std, ours=s_our))
+               env_repeatable=bool(env_rep), reset_hash_ok=bool(hash_ok),
+               std1=r1[0], std2=r2[0], ours=r3[0],
+               first_diff=dict(std2_ours=first_diff(A2, A3),
+                               std1_std2=first_diff(A1, A2)),
+               chunks=[int(A1.shape[1]), int(A2.shape[1]), int(A3.shape[1])],
+               seconds=dict(std1=s1, std2=s2, ours=s3))
     (OUT / "admit.json").write_text(json.dumps(rep, indent=1))
-    print(f"  допуск K-41: {'СОВПАДАЕТ' if same and hash_ok else 'РАСХОЖДЕНИЕ'}"
-          f"; штатная {r_std[0]}, обёртка {r_our[0]}; чанков "
-          f"{rep['chunks']}; max|Δa| {rep['max_abs_diff']}; время "
-          f"{s_std:.0f} / {s_our:.0f} с")
-    return 0 if same and hash_ok else 3
+    ok = same and hash_ok
+    print(f"  допуск K-41: {'СОВПАДАЕТ' if ok else 'РАСХОЖДЕНИЕ'} "
+          f"(обёртка против штатной); среда воспроизводима: "
+          f"{'да' if env_rep else 'НЕТ'}; первый отличающийся чанк "
+          f"{rep['first_diff']}; исходы std1/std2/ours "
+          f"{[r1[0]['success'], r2[0]['success'], r3[0]['success']]}; время "
+          f"{s1:.0f}/{s2:.0f}/{s3:.0f} с")
+    return 0 if ok else 3
 
 
 def cmd_bench(a):
@@ -362,6 +389,11 @@ def selftest():
     assert len(s) == 18 and all(0 <= x < 2 ** 60 for x in s)
     obs = dict(a=np.arange(12).reshape(2, 6), b=np.ones((2, 3)))
     assert obs_hash(obs, 0) != obs_hash(obs, 1)
+    A = np.zeros((1, 5, 8, 10))
+    B = A.copy()
+    B[0, 3, 0, 0] = 1
+    assert first_diff(A, A) == -1 and first_diff(A, B) == 3
+    assert first_diff(A, A[:, :4]) == 4
     print("самопроверка k41_runner пройдена: ключи шума различны по старту, "
           "реплике и чанку; хеш наблюдения по среде")
     return 0
