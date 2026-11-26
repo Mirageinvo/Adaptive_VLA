@@ -370,6 +370,107 @@ def cmd_admit(a):
     return 0 if ok else 3
 
 
+# --- диагностика: сэмплер на одинаковом входе, среда на одинаковых командах ----------------------
+def _pop_cache(e, seed):
+    e.env.env.seed_state_map.pop(seed, None)
+
+
+def _sim_state(e):
+    rm = e.env.env.env                     # MultiStep -> Video -> Image -> robomimic
+    return (np.asarray(rm.get_state()["states"], np.float64).copy(),
+            np.asarray(rm.env.sim.data.qacc_warmstart, np.float64).copy())
+
+
+def _call(env, fn, *args):
+    import dill
+    import functools
+    return env.call_each("run_dill_function", args_list=[(dill.dumps(
+        functools.partial(fn, *args) if args else fn),)])[0]
+
+
+def _act(torch, policy, od, seed, mode):
+    g = torch.Generator(device=policy.device).manual_seed(seed)
+    with torch.no_grad():
+        if mode == "std":
+            policy.kwargs["generator"] = g
+            try:
+                return policy.predict_action(od)["action"].cpu().numpy()
+            finally:
+                policy.kwargs.pop("generator", None)
+        return sample(torch, policy, od, [g])[0].cpu().numpy()
+
+
+def cmd_diag(a):
+    """(1) На записанных o_0 и o_8 штатного прогона: std, std, ours с
+    генератором одного ключа — побитово. (2) Первый чанк -> команды среды;
+    дважды: сброс + эти 8 команд; сравнение наблюдения и состояния
+    симулятора (и qacc_warmstart) после сброса и после 8 шагов —
+    (A) кешированный reset_to, (B) штатный сброс по сиду (кеш очищается
+    перед каждым сбросом)."""
+    import torch
+    from diffusion_policy.common.pytorch_util import dict_apply
+    kdpe_setup()
+    torch_setup(torch)
+    policy, cfg = load_policy(torch, a.device)
+    runner = make_runner(cfg, START0, a.n, 1)
+    env = runner.env
+    tod = lambda o: dict_apply(dict(o), lambda x: torch.from_numpy(x).to(  # noqa
+        device=policy.device))
+    rows = []
+    for i in range(a.n):
+        seed = int(runner.env_seeds[i])
+        init = [(runner.env_init_fn_dills[i],)]
+        env.call_each("run_dill_function", args_list=init)
+        env.reset()                                    # холодный, кеш заполнен
+        # (1) сэмплер
+        env.call_each("run_dill_function", args_list=init)
+        o0 = env.reset()
+        k0 = noise_seed(seed, 0, 0)
+        a0 = _act(torch, policy, tod(o0), k0, "std")
+        cmd = runner.undo_transform_action(a0)
+        o8, *_ = env.step(cmd)
+        samp = []
+        for c, o in enumerate((o0, o8)):
+            k = noise_seed(seed, 0, c)
+            x = [_act(torch, policy, tod(o), k, m) for m in ("std", "std",
+                                                            "ours")]
+            samp.append(dict(chunk=c, std_std=bool(np.array_equal(x[0], x[1])),
+                             std_ours=bool(np.array_equal(x[1], x[2])),
+                             max_abs=float(np.abs(x[1] - x[2]).max())))
+        # (2) среда на одинаковых командах
+        envr = {}
+        for name, cold in (("cached", False), ("cold", True)):
+            rec = []
+            for _rep in range(2):
+                if cold:
+                    _call(env, _pop_cache, seed)
+                env.call_each("run_dill_function", args_list=init)
+                obs = env.reset()
+                h0, (s0, w0) = obs_hash(obs, 0), _call(env, _sim_state)
+                obs, *_ = env.step(cmd)
+                h8, (s8, w8) = obs_hash(obs, 0), _call(env, _sim_state)
+                rec.append((h0, s0, w0, h8, s8, w8))
+            r1, r2 = rec
+            envr[name] = dict(
+                obs0_equal=r1[0] == r2[0], state0_equal=bool(np.array_equal(
+                    r1[1], r2[1])), warm0_equal=bool(np.array_equal(r1[2],
+                                                                   r2[2])),
+                obs8_equal=r1[3] == r2[3], state8_equal=bool(np.array_equal(
+                    r1[4], r2[4])),
+                state8_max_abs=float(np.abs(r1[4] - r2[4]).max()),
+                warm0_max_abs=float(np.abs(r1[2] - r2[2]).max()))
+        rows.append(dict(seed=seed, sampler=samp, env=envr))
+        print(f"  старт {seed}: сэмплер "
+              f"{[(x['chunk'], x['std_std'], x['std_ours']) for x in samp]}; "
+              + "; ".join(f"{n}: o0 {v['obs0_equal']}, s0 {v['state0_equal']}"
+                          f", warm0 {v['warm0_equal']}, o8 {v['obs8_equal']}, "
+                          f"s8 {v['state8_equal']} (max {v['state8_max_abs']:.2g})"
+                          for n, v in envr.items()), flush=True)
+    (OUT / "diag.json").write_text(json.dumps(dict(kind="k41_diag", rows=rows),
+                                              indent=1))
+    return 0
+
+
 def cmd_bench(a):
     import torch
     kdpe_setup()
@@ -410,14 +511,15 @@ def main():
     if "--selftest" in sys.argv:
         return selftest()
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("cmd", choices=("manifest", "starts", "admit", "bench"))
+    ap.add_argument("cmd", choices=("manifest", "starts", "admit", "bench",
+                                    "diag"))
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--n-envs", type=int, default=50)
     ap.add_argument("--n", type=int, default=50)
     a = ap.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
     return dict(manifest=cmd_manifest, starts=cmd_starts, admit=cmd_admit,
-                bench=cmd_bench)[a.cmd](a)
+                bench=cmd_bench, diag=cmd_diag)[a.cmd](a)
 
 
 if __name__ == "__main__":
