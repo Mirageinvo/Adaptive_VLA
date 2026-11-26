@@ -192,13 +192,15 @@ def run_batch(torch, runner, policy, idx, replica, head=None, mode="ours",
     if len(idx) != n_envs:
         raise SystemExit("батч ≠ числу сред")
     seeds = [runner.env_seeds[i] for i in idx]
+    t_start = time.time()                   # полный цикл: сброс + раскатка
     cold_reset_prepare(env, seeds)          # штатный сброс по сиду (diag)
     env.call_each("run_dill_function",
                   args_list=[(runner.env_init_fn_dills[i],) for i in idx])
     obs = env.reset()
     hashes = [obs_hash(obs, i) for i in range(n_envs)]
+    t_reset = time.time() - t_start
     policy.reset()
-    acts, done, chunk, t0 = [], False, 0, time.time()
+    acts, done, chunk = [], False, 0
     while not done:
         od = dict_apply(dict(obs), lambda x: torch.from_numpy(x).to(
             device=policy.device))
@@ -232,8 +234,9 @@ def run_batch(torch, runner, policy, idx, replica, head=None, mode="ours",
         res.append(dict(seed=int(seeds[i]), reset_hash=hashes[i],
                         success=bool(r.max() >= 1) if len(r) else False,
                         first_success=int(hit[0]) if len(hit) else -1,
-                        steps=int(len(r)), chunks=chunk))
-    return res, np.stack(acts, 1), time.time() - t0
+                        steps=int(len(r)), chunks=chunk,
+                        reset_seconds=float(t_reset)))
+    return res, np.stack(acts, 1), time.time() - t_start
 
 
 # --- команды ------------------------------------------------------------------------------------------------
@@ -343,8 +346,12 @@ def cmd_admit(a):
     r1, A1, s1 = run_batch(torch, runner, policy, [0], 0, mode="std")
     r2, A2, s2 = run_batch(torch, runner, policy, [0], 0, mode="std")
     r3, A3, s3 = run_batch(torch, runner, policy, [0], 0, head=zero)
-    same = A2.shape == A3.shape and np.array_equal(A2, A3) and r2 == r3
-    env_rep = A1.shape == A2.shape and np.array_equal(A1, A2) and r1 == r2
+    det = lambda r: [{k: v for k, v in x.items() if k != "reset_seconds"}  # noqa
+                     for x in r]                       # без времени
+    same = A2.shape == A3.shape and np.array_equal(A2, A3) and \
+        det(r2) == det(r3)
+    env_rep = A1.shape == A2.shape and np.array_equal(A1, A2) and \
+        det(r1) == det(r2)
     cold_ok = st["reset_hash"].get(str(START0)) == r1[0]["reset_hash"]
     cached_ok = r1[0]["reset_hash"] == r2[0]["reset_hash"] == \
         r3[0]["reset_hash"]
@@ -490,11 +497,13 @@ def cmd_bench(a):
     res, _A, sec = run_batch(torch, runner, policy, list(range(a.n)), 0)
     sr = np.mean([r["success"] for r in res])
     rep = dict(kind="k41_bench", n=a.n, seeds=[BENCH0, BENCH0 + a.n - 1],
-               seconds=sec, sr=float(sr),
+               seconds=sec, reset_seconds=res[0]["reset_seconds"],
+               sr=float(sr),
                first_success=[r["first_success"] for r in res],
                results=res)
     (OUT / f"bench_{a.n}.json").write_text(json.dumps(rep, indent=1))
-    print(f"  bench: {a.n} сред одним батчем, {sec:.0f} с; SR {100 * sr:.0f}%;"
+    print(f"  bench: {a.n} сред одним батчем, {sec:.0f} с (из них сброс "
+          f"{res[0]['reset_seconds']:.0f} с); SR {100 * sr:.0f}%;"
           f" медиана шага успеха "
           f"{np.median([x for x in rep['first_success'] if x >= 0] or [-1]):.0f}")
     return 0
