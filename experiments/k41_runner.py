@@ -381,11 +381,12 @@ def _sim_state(e):
             np.asarray(rm.env.sim.data.qacc_warmstart, np.float64).copy())
 
 
-def _call(env, fn, *args):
+def _call(env, fn, **kwargs):
+    """KDPE вызывает callback как fn(env): параметры — только именованные."""
     import dill
     import functools
     return env.call_each("run_dill_function", args_list=[(dill.dumps(
-        functools.partial(fn, *args) if args else fn),)])[0]
+        functools.partial(fn, **kwargs) if kwargs else fn),)])[0]
 
 
 def _act(torch, policy, od, seed, mode):
@@ -443,7 +444,7 @@ def cmd_diag(a):
             rec = []
             for _rep in range(2):
                 if cold:
-                    _call(env, _pop_cache, seed)
+                    _call(env, _pop_cache, seed=seed)
                 env.call_each("run_dill_function", args_list=init)
                 obs = env.reset()
                 h0, (s0, w0) = obs_hash(obs, 0), _call(env, _sim_state)
@@ -502,6 +503,23 @@ def selftest():
     B[0, 3, 0, 0] = 1
     assert first_diff(A, A) == -1 and first_diff(A, B) == 3
     assert first_diff(A, A[:, :4]) == 4
+    try:
+        import dill
+    except ImportError:                   # локально без dill — пропуск
+        dill = None
+
+    class FE:
+        def __init__(self):
+            self.env = type("V", (), {})()
+            self.env.env = type("I", (), {})()
+            self.env.env.seed_state_map = {1: "a", 2: "b"}
+
+        def call_each(self, name, args_list):
+            return [dill.loads(args_list[0][0])(self)]
+    if dill is not None:
+        fe = FE()
+        _call(fe, _pop_cache, seed=2)
+        assert fe.env.env.seed_state_map == {1: "a"}
     print("самопроверка k41_runner пройдена: ключи шума различны по старту, "
           "реплике и чанку; хеш наблюдения по среде")
     return 0
