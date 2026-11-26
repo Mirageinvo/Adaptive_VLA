@@ -320,7 +320,8 @@ def warm_reset(runner, idx):
     env = runner.env
     env.call_each("run_dill_function",
                   args_list=[(runner.env_init_fn_dills[i],) for i in idx])
-    env.reset()
+    obs = env.reset()
+    return [obs_hash(obs, j) for j in range(len(idx))]   # холодный сброс
 
 
 def cmd_admit(a):
@@ -337,27 +338,32 @@ def cmd_admit(a):
     torch_setup(torch)
     policy, cfg = load_policy(torch, a.device)
     runner = make_runner(cfg, START0, 1, 1)
-    warm_reset(runner, [0])
+    cold = warm_reset(runner, [0])[0]
     zero = lambda gc, act: torch.zeros_like(act[..., :-1])  # noqa: E731
     r1, A1, s1 = run_batch(torch, runner, policy, [0], 0, mode="std")
     r2, A2, s2 = run_batch(torch, runner, policy, [0], 0, mode="std")
     r3, A3, s3 = run_batch(torch, runner, policy, [0], 0, head=zero)
     same = A2.shape == A3.shape and np.array_equal(A2, A3) and r2 == r3
     env_rep = A1.shape == A2.shape and np.array_equal(A1, A2) and r1 == r2
-    hash_ok = st["reset_hash"].get(str(START0)) == r1[0]["reset_hash"] \
-        == r2[0]["reset_hash"] == r3[0]["reset_hash"]
+    cold_ok = st["reset_hash"].get(str(START0)) == cold
+    cached_ok = r1[0]["reset_hash"] == r2[0]["reset_hash"] == \
+        r3[0]["reset_hash"]
     rep = dict(kind="k41_admit", start=START0, same=bool(same),
-               env_repeatable=bool(env_rep), reset_hash_ok=bool(hash_ok),
+               env_repeatable=bool(env_rep), cold_reset_ok=bool(cold_ok),
+               cached_reset_ok=bool(cached_ok),
+               cold_vs_cached_obs_equal=bool(cold == r1[0]["reset_hash"]),
                std1=r1[0], std2=r2[0], ours=r3[0],
                first_diff=dict(std2_ours=first_diff(A2, A3),
                                std1_std2=first_diff(A1, A2)),
                chunks=[int(A1.shape[1]), int(A2.shape[1]), int(A3.shape[1])],
                seconds=dict(std1=s1, std2=s2, ours=s3))
     (OUT / "admit.json").write_text(json.dumps(rep, indent=1))
-    ok = same and hash_ok
-    print(f"  допуск K-41: {'СОВПАДАЕТ' if ok else 'РАСХОЖДЕНИЕ'} "
-          f"(обёртка против штатной); среда воспроизводима: "
-          f"{'да' if env_rep else 'НЕТ'}; первый отличающийся чанк "
+    ok = same and env_rep and cold_ok and cached_ok
+    print(f"  допуск K-41: {'СОВПАДАЕТ' if ok else 'РАСХОЖДЕНИЕ'}; обёртка = "
+          f"штатной: {'да' if same else 'НЕТ'}; среда воспроизводима: "
+          f"{'да' if env_rep else 'НЕТ'}; холодный сброс = starts.json: "
+          f"{'да' if cold_ok else 'НЕТ'}; кешированные сбросы равны: "
+          f"{'да' if cached_ok else 'НЕТ'}; первый отличающийся чанк "
           f"{rep['first_diff']}; исходы std1/std2/ours "
           f"{[r1[0]['success'], r2[0]['success'], r3[0]['success']]}; время "
           f"{s1:.0f}/{s2:.0f}/{s3:.0f} с")
@@ -370,6 +376,7 @@ def cmd_bench(a):
     torch_setup(torch)
     policy, cfg = load_policy(torch, a.device)
     runner = make_runner(cfg, BENCH0, a.n, a.n)
+    warm_reset(runner, list(range(a.n)))       # как в Screen: путь reset_to
     res, _A, sec = run_batch(torch, runner, policy, list(range(a.n)), 0)
     sr = np.mean([r["success"] for r in res])
     rep = dict(kind="k41_bench", n=a.n, seeds=[BENCH0, BENCH0 + a.n - 1],
