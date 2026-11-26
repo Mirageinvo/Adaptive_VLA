@@ -61,22 +61,27 @@ def main():
     import k36_protocol as pc
     import k37_confirm as kcf
     import k40b_train as kt
+    import k40b_eval_heads as keh
     A, meta, C, plan_sha, P, _prep = kt.load_windows(a.collect, a.pca)
+    pca_sha = kcf.sha256(a.pca)                  # фактически загруженный PCA
+    train_sha = kcf.sha256(Path(kt.__file__).resolve())
     K = kt.Consts(torch, C, "cpu")
     trep = pc.load_json(str(a.train_report))
     if trep.get("collect_plan") != plan_sha:
         raise SystemExit("отчёт обучения ≠ плану сбора")
     M = kt.build(torch)
+    if trep.get("pca_sha256") != pca_sha:
+        raise SystemExit("отчёт обучения ≠ загруженному PCA")
     rep = dict(kind="k40b_goalcheck", collect_plan=plan_sha,
-               pca_sha256=kcf.sha256(a.pca), results={})
+               pca_sha256=pca_sha, train_code_sha256=train_sha, results={})
     for name in MODELS:
         for s in (0, 1):
             p = a.models / f"{name}_s{s}.pt"
             ck = torch.load(p, map_location="cpu")
-            for k in ("collect_plan", "pca_sha256", "config", "params",
-                      "train_code_sha256"):
-                if ck.get(k) != trep.get(k):
-                    raise SystemExit(f"{p}: {k} ≠ отчёту обучения")
+            pr = keh.verify_ckpt(ck, name.split("_")[0], pca_sha, train_sha,
+                                 trep)
+            if pr or ck.get("seed") != s:
+                raise SystemExit(f"{p}: {pr} сид {ck.get('seed')} ≠ {s}")
             m = (M["Tree"]() if ck["kind"] == "tree" else
                  M["Flat"](ck["params"]["flat_hidden"]))
             m.load_state_dict(ck["state"])
