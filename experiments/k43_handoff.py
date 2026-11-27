@@ -67,11 +67,13 @@ def auto_open_min(trs, cfg=CFG):
         run = 0
         for t, o in enumerate(g):
             run = run + 1 if o else 0
-            if run >= cfg["open_run"]:
+            if run >= cfg["open_run"] and np.isfinite(ap[t + 1]):
                 vals.append(ap[t + 1])
     if not vals:
         raise SystemExit("нет участков с длинным open — задайте --open-min")
     med = float(np.median(vals))
+    if not np.isfinite(med) or med <= 0:
+        raise SystemExit(f"авто-порог апертуры {med} — задайте --open-min")
     return cfg["open_frac"] * med, dict(n=len(vals), median=med,
                                         p5=float(np.quantile(vals, 0.05)))
 
@@ -88,6 +90,9 @@ def check_trace(tr):
             p.append(f"{k} {tuple(tr[k].shape)} ≠ {sh}")
     if n > MAX_STEPS:
         p.append(f"шагов {n} > {MAX_STEPS}")
+    for k in ("A", "state", "pot"):
+        if not np.isfinite(np.asarray(tr[k], np.float64)).all():
+            p.append(f"{k}: нечисловые значения")
     if tr["success"] and not bool(tr["on"][-1].all()):
         p.append("успех без двух On в конце")
     return p
@@ -142,12 +147,15 @@ def outcome(tr, h, cfg=CFG):
     tau, k, j = h["tau"], h["first"], h["second"]
     pot, gr, on = tr["pot"], tr["grasp"], tr["on"]
     rise = float(pot[tau:, j, 2].max() - pot[tau, j, 2])
-    lifted2 = rise >= cfg["pot_lift"] or bool((gr[tau:, j] == 1).any())
     kept1 = bool(on[tau:, k].all())
     n = len(tr["A"])
-    return dict(lifted_second=lifted2, first_kept=kept1,
-                first_lost_at=None if kept1 else
+    return dict(contact_second=bool((gr[tau:, j] == 1).any()),
+                lifted_second=rise >= cfg["pot_lift"],
+                second_on_ever=bool(on[tau:, j].any()),
+                first_kept=kept1,
+                first_left_at=None if kept1 else
                 int(tau + np.argmin(on[tau:, k])),
+                first_on_end=bool(on[-1, k]),
                 suffix=n - tau, both_on_end=bool(on[-1].all()))
 
 
@@ -187,9 +195,13 @@ def summarize(rows):
         d["fail_stage"] = dict(Counter(f"on_end{r['n_on_end']}/max{r['max_on']}"
                                        for r in fail))
         d["fe_after"] = dict(
+            contact_second=sum(r["after"]["contact_second"] for r in fe),
             lifted_second=sum(r["after"]["lifted_second"] for r in fe),
+            second_on_ever=sum(r["after"]["second_on_ever"] for r in fe),
             first_kept=sum(r["after"]["first_kept"] for r in fe),
-            first_lost=sum(not r["after"]["first_kept"] for r in fe),
+            first_left_back=sum(not r["after"]["first_kept"] and
+                                r["after"]["first_on_end"] for r in fe),
+            first_lost_end=sum(not r["after"]["first_on_end"] for r in fe),
             tau_q=np.quantile([r["handoff"]["tau"] for r in fe],
                               [0, .5, 1]).tolist() if fe else None)
         d["se_suffix_q"] = np.quantile([r["after"]["suffix"] for r in se],
@@ -213,10 +225,12 @@ def print_summary(s, open_min, info):
         print(f"    недоступно на провалах: {d['why_fail']}; на успехах: "
               f"{d['why_success']}")
         print(f"    стадия провалов (On в конце / max On): {d['fail_stage']}")
-        print(f"    среди F_e: T32 поднимал вторую {d['fe_after']['lifted_second']}, "
-              f"первая сохранилась до конца {d['fe_after']['first_kept']}, "
-              f"первая потеряна {d['fe_after']['first_lost']}; tau min/med/max "
-              f"{d['fe_after']['tau_q']}")
+        fa = d["fe_after"]
+        print(f"    среди F_e: контакт со второй {fa['contact_second']}, подъём "
+              f"второй {fa['lifted_second']}, вторая хоть раз On "
+              f"{fa['second_on_ever']}; первая On непрерывно "
+              f"{fa['first_kept']}, выходила и вернулась {fa['first_left_back']}, "
+              f"не On в конце {fa['first_lost_end']}; tau min/med/max {fa['tau_q']}")
         print(f"    успешный суффикс после tau (p50/p90/max): {d['se_suffix_q']}")
         print("    ожидаемые чистые выигрыши на 96: " + ", ".join(
             f"{k} {v:+.1f}" for k, v in d["expected_wins"].items()))
@@ -240,20 +254,33 @@ def audit(a):
         if ka.trace_name(dict(seed=t["seed"], case_id=t["case_id"])) != pth.stem:
             prob.append(f"{t['eid']}: имя файла ≠ сид/сцене")
         prob += [f"{t['eid']}: {x}" for x in check_trace(t)]
-    if not a.partial:
-        jobs = ka.archive_jobs(Path(a.archive))
-        want = {j["want"]["eid"]: j for j in jobs}
-        got = {t["eid"]: t for t in trs}
-        if set(want) != set(got):
-            raise SystemExit(f"трассы ≠ архиву: есть {len(got)}, нужно {len(want)} "
-                             "(или --partial)")
-        for e, j in want.items():
-            t = got[e]
-            w = j["want"]
-            if (t["npz_sha1"], t["success"], t["seed"], t["case_id"]) != (
-                    j["npz_sha1"], bool(j["success"]), int(w["seed"]),
-                    w["case_id"]):
-                prob.append(f"{e}: хеш шарда/итог/сид/сцена ≠ архиву")
+    # сверка с архивом и для --partial (по наличным трассам)
+    jobs = ka.archive_jobs(Path(a.archive))
+    want = {j["want"]["eid"]: j for j in jobs}
+    got = {t["eid"]: t for t in trs}
+    if not set(got) <= set(want):
+        raise SystemExit("есть трассы вне архива c2")
+    if not a.partial and set(want) != set(got):
+        raise SystemExit(f"трассы ≠ архиву: есть {len(got)}, нужно {len(want)} "
+                         "(или --partial)")
+    import k31_collect as kcol
+    from k39_failure_probe import reference
+    for e, j in ((e, want[e]) for e in sorted(got)):
+        t = got[e]
+        w = j["want"]
+        if (t["npz_sha1"], t["success"], t["seed"], t["case_id"]) != (
+                j["npz_sha1"], bool(j["success"]), int(w["seed"]),
+                w["case_id"]):
+            prob.append(f"{e}: хеш шарда/итог/сид/сцена ≠ архиву")
+            continue
+        rec, z = reference(Path(a.archive), j["part"], w)
+        za = np.asarray(z["actions"], np.float32)
+        q = rec["summary"]
+        if len(t["A"]) != len(za) or len(t["A"]) != int(q["steps"]) or \
+                kcol.actions_sha(t["A"]) != kcol.actions_sha(za) or \
+                ("actions_sha1" in q and
+                 kcol.actions_sha(t["A"]) != q["actions_sha1"]):
+            prob.append(f"{e}: команды/число шагов трассы ≠ архиву")
     if prob:
         raise SystemExit("трассы: " + "; ".join(prob[:4]))
     if a.open_min is not None:
@@ -262,15 +289,16 @@ def audit(a):
         open_min, info = auto_open_min(trs)
     rows = [episode_row(t, open_min) for t in trs]
     s = summarize(rows)
-    print(f"  K-43 аудит точки передачи: трасс {len(trs)}"
-          f"{' (неполный набор)' if a.partial else ', сверены с архивом'}; "
+    print(f"  K-43 аудит точки передачи: трасс {len(trs)}, сверены с архивом"
+          f"{' (неполный набор)' if a.partial else ''}; "
           f"условия {CFG}")
     print_summary(s, open_min, info)
     OUT.mkdir(parents=True, exist_ok=True)
-    pc.save_json(str(OUT / "audit.json"), dict(cfg=CFG, open_min=open_min,
+    dst = OUT / ("audit_partial.json" if a.partial else "audit.json")
+    pc.save_json(str(dst), dict(cfg=CFG, open_min=open_min,
                                                open_info=info, summary=s,
                                                rows=rows, partial=bool(a.partial)))
-    print(f"\n  записано {OUT / 'audit.json'}")
+    print(f"\n  записано {dst}")
 
 
 # --- самопроверка ---------------------------------------------------------------------
@@ -314,6 +342,17 @@ def selftest():
     assert check_trace(t) == []
     o = outcome(t, h)
     assert o["lifted_second"] and o["first_kept"] and o["suffix"] == 400 - 112
+    assert not o["contact_second"] and not o["second_on_ever"]
+    # контакт со второй без подъёма — не подъём
+    tc = _toy(place1=105, release_at=90)
+    tc["grasp"][200:, 1] = 1
+    oc = outcome(tc, handoff(tc, om))
+    assert oc["contact_second"] and not oc["lifted_second"]
+    # нечисловые значения отвергаются, авто-порог их пропускает
+    tn = _toy(place1=105, release_at=90)
+    tn["state"][300, 0] = np.nan
+    assert any("нечисловые" in x for x in check_trace(tn))
+    assert np.isfinite(auto_open_min([tn])[0])
     # устойчивость: On только 7 наблюдений к границе -> следующая граница
     assert handoff(_toy(place1=106, release_at=90), om)["tau"] == 120
     # нет первой постановки
@@ -341,7 +380,13 @@ def selftest():
     # потеря первой после развилки
     t4 = _toy(place1=105, release_at=90, lose1=150)
     o4 = outcome(t4, handoff(t4, om))
-    assert not o4["first_kept"] and o4["first_lost_at"] == 150
+    assert not o4["first_kept"] and o4["first_left_at"] == 150
+    assert not o4["first_on_end"]
+    # кратковременный выход первой из On с возвратом
+    t6 = _toy(place1=105, release_at=90)
+    t6["on"][150:160, 0] = False
+    o6 = outcome(t6, handoff(t6, om))
+    assert not o6["first_kept"] and o6["first_on_end"]
     # удержание (grasp == 1) первой на границе -> не свободен
     t5 = _toy(place1=105, release_at=90)
     t5["grasp"][100:120, 0] = 1
