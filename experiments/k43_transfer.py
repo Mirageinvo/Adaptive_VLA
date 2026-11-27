@@ -60,7 +60,8 @@ CFG0 = dict(
     gain=1.0, pos_m=0.05, umax=0.6, rot_gain=1.0, rot_rad=0.5, umax_rot=0.3,
     # допуски и запасы
     tol_xy=0.010, tol_z=0.010, tol_rot=0.20, clear_tol=0.015, pot_lift=0.015,
-    drop_m=0.010, retreat_m=0.06, pair_margin=0.9,
+    drop_m=0.010, retreat_m=0.06, pair_margin=0.9, region_margin=0.010,
+    settle=16,
     # максимум чанков на фазу
     max_chunks=dict(up=3, over=4, pre=3, descend=3, close=1, lift=3, carry=5,
                     lower=3, release=1, retreat=1),
@@ -240,9 +241,10 @@ def probe_sim(space, bank_dir):
 def second_transfer_steps(tr, h, cfg):
     """Индексы второго переноса в успешной трассе после развилки h ->
     dict(g2, a2, r2, m2) | None. g2 — закрытие, после которого вторая
-    кофеварка удерживается и поднимается; r2 — первая open после g2, после
-    которой вторая On до конца; a2 — самая высокая точка кисти за 24 шага до
-    g2; m2 — самая высокая точка кисти между g2 и r2."""
+    кофеварка удерживается и поднимается, а после раскрытия r2 в пределах
+    settle шагов становится On и остаётся до конца (иначе — следующая
+    попытка); a2 — самая высокая точка кисти за 24 шага до g2; m2 — самая
+    высокая точка кисти между g2 и r2."""
     import k42_audit as ka
     A, gr, on, pot = tr["A"], tr["grasp"], tr["on"], tr["pot"]
     eef = tr["state"][:, 2:5]
@@ -256,8 +258,13 @@ def second_transfer_steps(tr, h, cfg):
         if pot[g:end + 1, j, 2].max() - pot[g, j, 2] < cfg["pot_lift"]:
             continue
         r2 = end
-        if r2 >= len(A) or not on[r2 + 1:, j].all() or not on[-1].all():
-            return None
+        if r2 >= len(A) or not on[-1].all():
+            continue
+        tail = on[r2 + 1:, j]
+        bad = np.nonzero(~tail)[0]
+        settle = int(bad[-1]) + 1 if len(bad) else 0     # с какого шага On до конца
+        if settle > cfg["settle"] or settle >= len(tail):
+            continue
         lo = max(tau, g - 24)
         a2 = int(lo + np.argmax(eef[lo:g + 1, 2]))
         m2 = int(g + np.argmax(eef[g:r2 + 1, 2]))
@@ -383,12 +390,17 @@ def fit_templates(a):
     print(f"  dev-сцены: {[(r['eid'], r['success'], r['handoff']['tau']) for r in dev]}")
     print(f"  источников шаблонов: {len(cands)} (сцен {len({c[1]['case_id'] for c in cands})})",
           flush=True)
+    # архив читается последовательно: reference меняет общий k36_harness.OUT
+    refs = {}
+    for _h, r, _hh, _ix in cands:
+        j = jobs[r["eid"]]
+        refs[r["eid"]] = reference(Path(a.archive), j["part"], j["want"])
     sims = [probe_sim(kbk.SPACE, kbk.BANK_DIR) for _ in range(a.workers)]
     try:
         def work(i_c):
             i, (_h, r, h, ix) = i_c
             j = jobs[r["eid"]]
-            rec, z = reference(Path(a.archive), j["part"], j["want"])
+            rec, z = refs[r["eid"]]
             steps = sorted({ix["a2"], ix["g2"], ix["r2"], ix["m2"], ix["end"]})
             got = template_job((sims[i % len(sims)], j, rec, z, steps))
             return template_from(got, ix, h)
@@ -447,14 +459,28 @@ def plan_goal(tpl, probe, first, second, eef_q, cfg):
     St = stove_pose(probe)
     p1 = np.asarray(probe["pos"][first])[:2]
     dmin = tpl["d_min"] * cfg["pair_margin"]
+    reg = probe.get("region")
+    if not reg:
+        return dict(ok=False, why="регион плиты неизвестен")
     for i, t in enumerate(T):
         Tg = pmul(St, pose(*t["rel_place"]))
+        if not in_region(Tg[0], reg, cfg["region_margin"]):
+            continue
         if np.linalg.norm(Tg[0][:2] - p1) >= dmin:
             return dict(ok=True, grasp_i=gi, place_i=i, goal=pq(Tg),
                         pre=pq(pmul(To, pose(*T[gi]["rel_pre"]))),
                         grasp=pq(pmul(To, pose(*T[gi]["rel_grasp"]))),
                         rot_to_grasp=best[0], first=int(first), second=int(second))
     return dict(ok=False, why="нет свободного места в каталоге")
+
+
+def in_region(p, reg, margin):
+    """Центр в прямоугольнике сайта региона (полуразмеры size[0], size[1] в
+    его системе), сжатом на margin."""
+    R = np.asarray(reg["mat"], np.float64).reshape(3, 3)
+    loc = R.T @ (np.asarray(p, np.float64) - np.asarray(reg["pos"], np.float64))
+    sz = np.asarray(reg["size"], np.float64)
+    return bool(abs(loc[0]) <= sz[0] - margin and abs(loc[1]) <= sz[1] - margin)
 
 
 class Transfer:
@@ -470,9 +496,12 @@ class Transfer:
         self.finished = False
         self.eef_obj = None
         self.z_pot0 = None
+        self.probe = None
 
     def _stop(self, why):
         self.info["stop"] = why
+        self.info["on_at_stop"] = None if self.probe is None else \
+            list(self.probe["on"])
         self.finished = True
         return None
 
@@ -489,8 +518,11 @@ class Transfer:
         p, qc = s[2:5], s[5:9]
         cfg, pl = self.cfg, self.plan
         j = pl["second"]
+        self.probe = probe
         if self.log:
             self.log[-1]["end_pos"] = p.tolist()
+        if not probe["on"][pl["first"]]:
+            return self._stop("первая кофеварка вышла из On")
         mc = cfg.get("max_option_chunks")
         if mc is not None and self.n_total >= mc:
             return self._stop("прерывание: лимит чанков опции")
@@ -729,10 +761,25 @@ def run_branch(sim, io, arm, C, cfg, tpl, open_min, branch, task, pos, eid, *,
               option=None if ag.opt is None else dict(info=ag.opt.info, log=ag.opt.log,
                                                       chunks=ag.opt.n_total),
               log=ag.log, on_end=last.get("on"), branch=branch,
+              ended_in_option=bool(ag.log and ag.log[-1]["kind"] == "opt"),
               t32_after=sum(1 for x in ag.log if x["kind"] == "t32" and
-                            ag.opt is not None and x["elapsed"] >
-                            (ob.trigger or {}).get("tau", 10 ** 9)))
+                            x.get("k", 0) > 0 and ag.opt is not None and
+                            x["elapsed"] > (ob.trigger or {}).get("tau", 10 ** 9)))
     return ep
+
+
+def full_transfer(eb):
+    """Полный второй перенос: опция исполнила отпускание, и либо она
+    завершилась с обеими On, либо штатный успех наступил, пока управление
+    у опции."""
+    o = eb.get("option") or {}
+    if not any(x["phase"] in ("release", "retreat") for x in o.get("log", [])):
+        return False
+    info = o.get("info", {})
+    if info.get("stop") == "завершена" and info.get("on_at_stop") and \
+            all(info["on_at_stop"]):
+        return True
+    return bool(eb["success"] and eb.get("ended_in_option"))
 
 
 # --- smoke ---------------------------------------------------------------------------
@@ -828,14 +875,16 @@ def smoke(a):
                         continue
                     o = eb["option"] or {}
                     info = o.get("info", {})
-                    full = info.get("stop") == "завершена" and \
-                        bool(eb["on_end"] and all(eb["on_end"]))
-                    if name == "full" and (full or eb["success"]):
-                        n_full += int(full or eb["success"])
-                    if name == "interrupt" and eb["t32_after"] < 1 and \
-                            eb["done_step"] < 0:
-                        prob.append(f"{d['eid']}: после прерывания T32 не продолжил")
+                    full = full_transfer(eb)
+                    if name == "full":
+                        n_full += int(full)
+                    if name == "interrupt" and not (
+                            str(info.get("stop", "")).startswith("прерывание") and
+                            eb["t32_after"] >= 1):
+                        prob.append(f"{d['eid']}: прерывание не по лимиту или T32 "
+                                    f"не исполнил чанк после него")
                     row[name] = dict(success=eb["success"], steps=eb["steps"],
+                                     full=bool(full),
                                      stop=info.get("stop"), phases=info.get("phases"),
                                      chunks=o.get("chunks"), on_end=eb["on_end"],
                                      t32_after=eb["t32_after"], heavy=eb["heavy"],
@@ -885,7 +934,8 @@ class ToyPots:
         return dict(pos=self.pots.tolist(), quat=[[0, 0, 0, 1.0]] * 2,
                     grasp=[int(self.held == i) for i in range(2)], on=self.on(),
                     stove=dict(pos=self.STOVE.tolist(), quat=[0, 0, 0, 1.0]),
-                    region=None, eef=dict(pos=self.eef.tolist(), quat=[0, 0, 0, 1.0]))
+                    region=dict(pos=self.STOVE.tolist(), size=[0.07, 0.07, 0.01],
+                                mat=np.eye(3).tolist()), eef=dict(pos=self.eef.tolist(), quat=[0, 0, 0, 1.0]))
 
     def _obs(self):
         st = np.array([[self.ap / 2, -self.ap / 2, *self.eef, 0, 0, 0, 1.0]])
@@ -1057,4 +1107,49 @@ def selftest():
     assert tr.next(st, pr, 300) is not None
     assert tr.next(st, pr, 308) is None and tr.info["stop"] == "бюджет фазы up"
     assert kh.CFG["stable"] == 8
+    # полный перенос: штатный успех без исполненной опции не засчитывается
+    assert full_transfer(eb)
+    assert not full_transfer(dict(success=True, ended_in_option=False,
+                                  option=dict(log=[], info=dict(stop=None))))
+    assert not full_transfer(dict(success=True, ended_in_option=False, option=dict(
+        log=[dict(phase="release")], info=dict(stop="бюджет фазы retreat",
+                                               on_at_stop=[True, False]))))
+    assert not full_transfer(dict(e0, option=None))
+    # место вне региона отвергается
+    tpl3 = dict(tpl, templates=[dict(tpl["templates"][0],
+                                     rel_place=pq(pose([0.2, 0, 0], [0, 0, 0, 1])))])
+    pr3 = sim.probe()
+    pg = plan_goal(tpl3, pr3, 0, 1, [0, 0, 0, 1], cfg)
+    assert not pg["ok"] and "места" in pg["why"], pg
+    assert not plan_goal(tpl, dict(pr3, region=None), 0, 1, [0, 0, 0, 1], cfg)["ok"]
+    assert in_region([0.05, 0.15, 0], pr3["region"], 0.01) and \
+        not in_region([0.07, 0.15, 0], pr3["region"], 0.01)
+    # первая вышла из On -> остановка опции
+    tr2 = Transfer(e0["plan"], tpl, cfg, q, L, U)
+    pr4 = json.loads(json.dumps(pr))
+    pr4["on"] = [False, False]
+    assert tr2.next(st, pr4, 300) is None and \
+        tr2.info["stop"] == "первая кофеварка вышла из On"
+    # шаблон: первая попытка без постановки пропускается, On после осадки
+    n = 200
+    A = np.full((n, 7), OPEN)
+    A[50:70, 6] = CLOSE
+    A[120:140, 6] = CLOSE
+    stt = np.zeros((n + 1, 9))
+    pot = np.zeros((n + 1, 2, 3))
+    gr = np.zeros((n + 1, 2), np.int8)
+    on = np.zeros((n + 1, 2), bool)
+    on[:, 0] = True
+    for g0, e_ in ((50, 70), (120, 140)):
+        gr[g0 + 1:e_ + 1, 1] = 1
+        pot[g0 + 5:e_ + 1, 1, 2] = 0.05
+    on[144:, 1] = True                    # осела через 4 шага после раскрытия
+    trs_ = dict(A=A, state=stt, pot=pot, grasp=gr, on=on)
+    ix = second_transfer_steps(trs_, dict(tau=40, first=0, second=1), CFG0)
+    assert ix is not None and ix["g2"] == 120 and ix["r2"] == 140, ix
+    on2 = on.copy()
+    on2[144:, 1] = False
+    on2[170:, 1] = True                   # осела позже settle — не шаблон
+    assert second_transfer_steps(dict(trs_, on=on2), dict(tau=40, first=0, second=1),
+                                 CFG0) is None
     print("k43_transfer selftest ok")
