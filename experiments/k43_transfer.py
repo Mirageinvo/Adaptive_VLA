@@ -254,7 +254,7 @@ def second_transfer_steps(tr, h, cfg):
         if g < tau:
             continue
         end = ka.close_end(A, g)
-        nxt = evs[n_ + 1] if n_ + 1 < len(evs) else len(A)
+        nxt = evs[n_ + 1] if n_ + 1 < len(evs) else None
         if not (gr[g:end + 1, j] == 1).any():
             continue
         if pot[g:end + 1, j, 2].max() - pot[g, j, 2] < cfg["pot_lift"]:
@@ -267,7 +267,7 @@ def second_transfer_steps(tr, h, cfg):
         settle = int(bad[-1]) + 1 if len(bad) else 0     # с какого шага On до конца
         # осадка — до settle шагов и до начала следующего закрытия
         if settle > cfg["settle"] or settle >= len(tail) or \
-                r2 + 1 + settle >= nxt:
+                (nxt is not None and r2 + 1 + settle >= nxt):
             continue
         lo = max(tau, g - 24)
         a2 = int(lo + np.argmax(eef[lo:g + 1, 2]))
@@ -747,7 +747,13 @@ class HandoffArm:
 
     def executed(self, k):
         if self.cur == "opt":
-            pass
+            # сохранность первой по шагам исполненного чанка (и последнего
+            # неполного, после которого decide уже не будет)
+            first = self.opt.plan["first"]
+            if not all(o[first] for o in self.rs.ob.ON[self.on_idx:]):
+                self.opt.info["first_left_on"] = True
+                if not self.opt.finished:
+                    self.opt._stop("первая кофеварка вышла из On")
         else:
             self.arm.executed(k)
         self.log[-1]["k"] = int(k)
@@ -785,6 +791,8 @@ def full_transfer(eb):
     if not any(x["phase"] in ("release", "retreat") for x in o.get("log", [])):
         return False
     info = o.get("info", {})
+    if info.get("first_left_on"):
+        return False
     if info.get("stop") == "завершена" and info.get("on_at_stop") and \
             all(info["on_at_stop"]):
         return True
@@ -1186,4 +1194,36 @@ def selftest():
     tr5 = Transfer(e0["plan"], tpl, cfg, q, L, U)
     assert tr5.next(st, pr, 300, [[True, False], [False, False], [True, False]]) is None
     assert tr5.info["stop"] == "первая кофеварка вышла из On"
+    # On второй впервые на терминальном наблюдении, следующего закрытия нет
+    n5 = 72
+    A5 = np.full((n5, 7), OPEN)
+    A5[50:70, 6] = CLOSE
+    gr5 = np.zeros((n5 + 1, 2), np.int8)
+    gr5[51:71, 1] = 1
+    pot5 = np.zeros((n5 + 1, 2, 3))
+    pot5[55:71, 1, 2] = 0.05
+    on5 = np.zeros((n5 + 1, 2), bool)
+    on5[:, 0] = True
+    on5[n5, 1] = True
+    ix5 = second_transfer_steps(dict(A=A5, state=np.zeros((n5 + 1, 9)), pot=pot5,
+                                     grasp=gr5, on=on5),
+                                dict(tau=40, first=0, second=1), CFG0)
+    assert ix5 is not None and ix5["g2"] == 50 and ix5["r2"] == 70, ix5
+    # executed: выход первой из On в шагах последнего чанка опции
+    ha = HandoffArm.__new__(HandoffArm)
+    ha.cur, ha.log, ha.on_idx = "opt", [dict(kind="opt")], 1
+    ha.opt = Transfer(e0["plan"], tpl, cfg, q, L, U)
+
+    class _RS:
+        pass
+    ha.rs = _RS()
+    ha.rs.ob = _RS()
+    ha.rs.ob.ON = [[True, False], [True, False], [False, True], [True, True]]
+    ha.executed(3)
+    assert ha.opt.info["first_left_on"] and ha.opt.finished
+    # потеря On первой в последнем чанке (успех среды в release) — не перенос
+    eb2 = json.loads(json.dumps({k: v for k, v in eb.items() if k in (
+        "success", "ended_in_option", "option")}, default=lambda o: o.tolist()))
+    eb2["option"]["info"]["first_left_on"] = True
+    assert full_transfer(eb) and not full_transfer(eb2)
     print("k43_transfer selftest ok")
