@@ -28,6 +28,9 @@ release/unknown → time. Порог апертуры open_min — --open-min и
   python3 experiments/k43_handoff.py --selftest
   python3 experiments/k43_handoff.py audit [--traces DIR] [--archive DIR]
                                            [--open-min M] [--partial]
+  python3 experiments/k43_handoff.py fit-templates [--n-src 24] [--workers 4]
+  python3 experiments/k43_handoff.py smoke --device cuda:0 [--n-dev 4]
+Этап 2 (шаблоны, опция второго переноса, smoke) — k43_transfer.py.
 """
 import argparse
 from collections import Counter
@@ -290,15 +293,18 @@ def audit(a):
         open_min, info = float(a.open_min), "задан"
     else:
         open_min, info = auto_open_min(trs)
-    rows = [episode_row(t, open_min) for t in trs]
+    cfg = dict(CFG, budget=int(a.budget)) if a.budget is not None else CFG
+    rows = [episode_row(t, open_min, cfg) for t in trs]
     s = summarize(rows)
     print(f"  K-43 аудит точки передачи: трасс {len(trs)}, сверены с архивом"
           f"{' (неполный набор)' if a.partial else ''}; "
-          f"условия {CFG}")
+          f"условия {cfg}")
     print_summary(s, open_min, info)
     OUT.mkdir(parents=True, exist_ok=True)
     dst = OUT / ("audit_partial.json" if a.partial else "audit.json")
-    pc.save_json(str(dst), dict(cfg=CFG, open_min=open_min,
+    if a.budget is not None and cfg["budget"] != CFG["budget"]:
+        dst = dst.with_name(dst.stem + f"_budget{cfg['budget']}.json")
+    pc.save_json(str(dst), dict(cfg=cfg, open_min=open_min,
                                                open_info=info, summary=s,
                                                rows=rows, partial=bool(a.partial)))
     print(f"\n  записано {dst}")
@@ -410,6 +416,8 @@ def selftest():
     assert need_fe(160, 123, 1, 0) == 9 and need_fe(160, 123, 0.4, 0) == 21
     assert need_fe(160, 123, 0.4, 0.01) == 24
     print("k43_handoff selftest ok")
+    import k43_transfer as kt
+    kt.selftest()
 
 
 def main():
@@ -423,9 +431,23 @@ def main():
     p.add_argument("--archive", type=Path, default=ARCHIVE)
     p.add_argument("--open-min", type=float, default=None)
     p.add_argument("--partial", action="store_true")
+    p.add_argument("--budget", type=int, default=None,
+                   help="минимальный остаток шагов (иначе 128); отчёт — audit_budgetN.json")
+    p = sub.add_parser("fit-templates")
+    p.add_argument("--traces", type=Path, default=TRACES)
+    p.add_argument("--archive", type=Path, default=ARCHIVE)
+    p.add_argument("--n-src", type=int, default=24)
+    p.add_argument("--workers", type=int, default=4)
+    p = sub.add_parser("smoke")
+    p.add_argument("--device", required=True)
+    p.add_argument("--archive", type=Path, default=ARCHIVE)
+    p.add_argument("--n-dev", type=int, default=4)
     a = ap.parse_args()
     if a.cmd == "audit":
         audit(a)
+        return
+    import k43_transfer as kt
+    sys.exit(kt.fit_templates(a) if a.cmd == "fit-templates" else kt.smoke(a))
 
 
 if __name__ == "__main__":
