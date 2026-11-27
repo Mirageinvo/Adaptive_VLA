@@ -249,10 +249,12 @@ def second_transfer_steps(tr, h, cfg):
     A, gr, on, pot = tr["A"], tr["grasp"], tr["on"], tr["pot"]
     eef = tr["state"][:, 2:5]
     j, tau = h["second"], h["tau"]
-    for g in ka.close_events(A):
+    evs = ka.close_events(A)
+    for n_, g in enumerate(evs):
         if g < tau:
             continue
         end = ka.close_end(A, g)
+        nxt = evs[n_ + 1] if n_ + 1 < len(evs) else len(A)
         if not (gr[g:end + 1, j] == 1).any():
             continue
         if pot[g:end + 1, j, 2].max() - pot[g, j, 2] < cfg["pot_lift"]:
@@ -263,7 +265,9 @@ def second_transfer_steps(tr, h, cfg):
         tail = on[r2 + 1:, j]
         bad = np.nonzero(~tail)[0]
         settle = int(bad[-1]) + 1 if len(bad) else 0     # с какого шага On до конца
-        if settle > cfg["settle"] or settle >= len(tail):
+        # осадка — до settle шагов и до начала следующего закрытия
+        if settle > cfg["settle"] or settle >= len(tail) or \
+                r2 + 1 + settle >= nxt:
             continue
         lo = max(tau, g - 24)
         a2 = int(lo + np.argmax(eef[lo:g + 1, 2]))
@@ -510,7 +514,7 @@ class Transfer:
         self.i += 1
         self.n_phase = 0
 
-    def next(self, state, probe, elapsed):
+    def next(self, state, probe, elapsed, on_hist=None):
         import k42_recovery as kr
         if self.finished:
             return None
@@ -521,7 +525,8 @@ class Transfer:
         self.probe = probe
         if self.log:
             self.log[-1]["end_pos"] = p.tolist()
-        if not probe["on"][pl["first"]]:
+        if not probe["on"][pl["first"]] or (
+                on_hist is not None and not all(o[pl["first"]] for o in on_hist)):
             return self._stop("первая кофеварка вышла из On")
         mc = cfg.get("max_option_chunks")
         if mc is not None and self.n_total >= mc:
@@ -686,7 +691,7 @@ class HandoffArm:
     def begin_state(self):
         self.heavy, self.log = 0, []
         self.opt, self.started, self.plan, self.fork_hash = None, False, None, None
-        self.cur = None
+        self.cur, self.on_idx = None, None
 
     call = property(lambda s: s.arm.call, lambda s, v: setattr(s.arm, "call", v))
     episode = property(lambda s: s.arm.episode,
@@ -717,7 +722,11 @@ class HandoffArm:
             raise kcol.Mismatch("развилка не воспроизвелась на префиксе")
         if self.opt is not None and not self.opt.finished:
             st = np.asarray(self.rs.obs["state"], np.float64)[0]
-            ch = self.opt.next(st, self.rs.probe, elapsed)
+            # On по каждому шагу с прошлого вызова опции (история наблюдателя)
+            ON = self.rs.ob.ON
+            hist = ON[self.on_idx:] if self.on_idx is not None else ON[-1:]
+            self.on_idx = len(ON)
+            ch = self.opt.next(st, self.rs.probe, elapsed, hist)
             if ch is not None:
                 self.cur = "opt"
                 self.log.append(dict(kind="opt", elapsed=int(elapsed)))
@@ -861,10 +870,8 @@ def smoke(a):
             if tau is not None:
                 h = [c["hash"] for c in e0["calls"] if c["tau"] == tau]
                 ex = dict(tau=tau, hash=h[0] if h else e0["fork_hash"])
+                # прерывание — один раз, на первой сцене с реальным полным переносом
                 variants = [("full", cfg)]
-                if not interrupted:
-                    variants.append(("interrupt", dict(cfg, max_option_chunks=2)))
-                    interrupted = True
                 for name, cf in variants:
                     try:
                         eb = run_branch(sim, io, arm, C, cf, tpl, tpl["open_min"],
@@ -878,6 +885,10 @@ def smoke(a):
                     full = full_transfer(eb)
                     if name == "full":
                         n_full += int(full)
+                        if full and not interrupted:
+                            variants.append(("interrupt",
+                                             dict(cfg, max_option_chunks=2)))
+                            interrupted = True
                     if name == "interrupt" and not (
                             str(info.get("stop", "")).startswith("прерывание") and
                             eb["t32_after"] >= 1):
@@ -895,6 +906,8 @@ def smoke(a):
             rep["scenes"].append(row)
         if n_full < 1:
             prob.append("ни одного полного второго переноса")
+        elif not interrupted:
+            prob.append("проверка прерывания не выполнена")
         arm = v = None
         kh.free(card.torch)
         rep.update(admitted=not prob, problems=prob, n_full=n_full,
@@ -1152,4 +1165,25 @@ def selftest():
     on2[170:, 1] = True                   # осела позже settle — не шаблон
     assert second_transfer_steps(dict(trs_, on=on2), dict(tau=40, first=0, second=1),
                                  CFG0) is None
+    # быстрый перезахват: On наступил после следующего закрытия — шаблон от
+    # следующей попытки, не от первой
+    A3 = A.copy()
+    A3[50:70, 6] = CLOSE
+    A3[74:90, 6] = CLOSE
+    A3[120:140, 6] = OPEN
+    gr3 = np.zeros_like(gr)
+    pot3 = np.zeros_like(pot)
+    for g0, e_ in ((50, 70), (74, 90)):
+        gr3[g0 + 1:e_ + 1, 1] = 1
+        pot3[g0 + 5:e_ + 1, 1, 2] = 0.05
+    on3 = on.copy()
+    on3[:, 1] = False
+    on3[76:, 1] = True       # в окне осадки первой, но после начала второго закрытия
+    ix3 = second_transfer_steps(dict(trs_, A=A3, grasp=gr3, pot=pot3, on=on3),
+                                dict(tau=40, first=0, second=1), CFG0)
+    assert ix3 is not None and ix3["g2"] == 74, ix3
+    # краткий выход первой из On между границами -> остановка
+    tr5 = Transfer(e0["plan"], tpl, cfg, q, L, U)
+    assert tr5.next(st, pr, 300, [[True, False], [False, False], [True, False]]) is None
+    assert tr5.info["stop"] == "первая кофеварка вышла из On"
     print("k43_transfer selftest ok")
