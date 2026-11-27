@@ -31,13 +31,15 @@ xy к кисти в момент первого close. Окно разметки
 Режим провала — первая попытка, которая не lifted + placed, со стадией
 (сколько кофеварок уже на плите); иначе no_attempt.
 
-Онлайн-триггер плана (§2): граница чанка b (кратна 8) в (g, g + 16],
-все команды g…b−1 — close, подъём кисти ≥ lift, апертура пальцев
-|q0| + |q1| ≤ порога hold_k наблюдений подряд, цель сдвинулась не более
-чем на stay (прокси «ориентир остался на столе» — по sim, т. е. верхняя
-оценка для зрения), цель не на плите, осталось ≥ min_left шагов. Только
-первое срабатывание на эпизод. Порог апертуры — --aperture или авто:
-середина между p95 пустых (miss) и p5 удерживаемых (lifted).
+Триггер — повтор трассы через штатный k42_recovery.Observer с порогами
+раннера (load_cfg; --aperture задаёт empty_max): та же первая граница,
+те же отказы (захват, раскрытие, неопределённость, мало шагов, terminal).
+(a) — развилка наблюдателя; (b) — (a) и на этой же границе цель (ближайшая
+к кисти в g) сдвинулась не более stay и не на плите (по sim — верхняя
+оценка для RGB-защиты); при отказе (b) другой развилки на сцене нет, как в
+раннере. Исход после развилки (самовосстановление T32) размечается
+отдельно. Порог апертуры attempt-разметки — авто: середина между p95 пустых
+(miss) и p5 удерживаемых (lifted); он описательный.
 
 --frames N: для первых N провалов части с закрытием сохраняется PNG кадров
 (как они приходят в наблюдении, без переворота) на g, g+8, g+16, g+40 с
@@ -147,25 +149,6 @@ def attempt(tr, g, cfg=CFG):
     return out
 
 
-def boundary(tr, g, b, thr, cfg=CFG):
-    """Проверка на границе b попытки g только по наблюдениям ≤ b ->
-    (a, b, причина a). (a) — проприоцепция как у раннера; (b) — (a) и цель
-    (ближайшая к кисти в g) осталась на месте и не на плите (по sim)."""
-    eef, pot = tr["state"][:, 2:5], tr["pot"]
-    ap = aperture(tr["state"])
-    k0 = b - cfg["hold_k"] + 1
-    if eef[b, 2] - eef[g, 2] < cfg["lift"]:
-        return False, False, "no_lift"
-    if k0 < g + 1 or (ap[k0:b + 1] > thr).any():
-        return False, False, "aperture"
-    if MAX_STEPS - b < cfg["min_left"]:
-        return False, False, "time"
-    tgt = int(np.argmin(np.linalg.norm(pot[g, :, :2] - eef[g, :2], axis=1)))
-    ok_b = (np.linalg.norm(pot[b, tgt] - pot[g, tgt]) <= cfg["stay"] and
-            not tr["on"][b, tgt])
-    return True, bool(ok_b), "ok"
-
-
 def fork_outcome(tr, g, b, cfg=CFG):
     """Разметка после развилки b (вне триггера): self_recovered — та же
     кофеварка позже поднялась ≥ pot_lift без вмешательства."""
@@ -176,31 +159,38 @@ def fork_outcome(tr, g, b, cfg=CFG):
                 outcome="self_recovered" if rise >= cfg["pot_lift"] else "not_lifted")
 
 
-def causal_triggers(tr, thr, cfg=CFG):
-    """Первая штатная граница (кратна 8) в (g, g + window_trig] любой
-    попытки, где все команды g…b−1 — close и условие выполнено по данным
-    до b. Границы на terminal (b = числу исполненных команд) исключены.
-    -> dict(a=развилка | None, b=развилка | None, why=причины у (a))."""
-    A = tr["A"]
-    n = len(A)
-    out, why = dict(a=None, b=None), Counter()
-    for g in close_events(A):
-        end = close_end(A, g)
-        b = (g // N8 + 1) * N8
-        while b <= g + cfg["window_trig"] and b <= end and b < n:
-            ok_a, ok_b, w = boundary(tr, g, b, thr, cfg)
-            why[w] += 1
-            if ok_a and out["a"] is None:
-                out["a"] = fork_outcome(tr, g, b, cfg)
-            if ok_b and out["b"] is None:
-                out["b"] = fork_outcome(tr, g, b, cfg)
-            if out["a"] is not None and out["b"] is not None:
-                return dict(out, why=dict(why))
-            b += N8
-    return dict(out, why=dict(why))
+def runner_cfg(aperture=None):
+    """Пороги раннера (config.json после smoke или CFG0)."""
+    import k42_recovery as kr
+    c = kr.load_cfg()
+    if aperture is not None:
+        c = dict(c, empty_max=float(aperture))
+    return c
 
 
-def classify(tr, thr, cfg=CFG):
+def runner_triggers(tr, rcfg, cfg=CFG):
+    """Повтор трассы штатным Observer раннера -> dict(a, b, why).
+    Эпизод с terminal короче лимита: done на последнем шаге."""
+    import k42_recovery as kr
+    A, S = np.asarray(tr["A"], np.float64), np.asarray(tr["state"], np.float64)
+    ob = kr.Observer.replay(rcfg, S, A, done=len(A) < MAX_STEPS)
+    why = Counter(f"{e['outcome']}:{e['reason']}" for e in ob["events"])
+    why.update(f"отказ:{x['reason']}" for x in ob["refusals"])
+    t = ob["trigger"]
+    if t is None:
+        return dict(a=None, b=None, why=dict(why))
+    g, b = int(t["g"]), int(t["tau"])
+    a = fork_outcome(tr, g, b, cfg)
+    pot = tr["pot"]
+    tgt = a["target"]
+    ok_b = (np.linalg.norm(pot[b, tgt] - pot[g, tgt]) <= cfg["stay"] and
+            not tr["on"][b, tgt])
+    if not ok_b:
+        why["объект:сдвинут или на плите"] += 1
+    return dict(a=a, b=a if ok_b else None, why=dict(why))
+
+
+def classify(tr, thr, cfg=CFG, rcfg=None):
     """Эпизод -> попытки (описательно), класс первой, режим провала и
     причинные триггеры (a)/(b) с исходом после развилки."""
     events = close_events(tr["A"])
@@ -220,7 +210,8 @@ def classify(tr, thr, cfg=CFG):
     if mode is None:
         mode = dict(kind="no_attempt", stage=len(placed))
     return dict(attempts=atts, first=atts[0]["kind"] if atts else "no_close",
-                mode=mode, trigger=causal_triggers(tr, thr, cfg),
+                mode=mode,
+                trigger=runner_triggers(tr, rcfg or runner_cfg(), cfg),
                 n_on_end=int(tr["on"][-1].sum()))
 
 
@@ -576,8 +567,8 @@ def print_summary(s):
     print(f"\n  Эпизоды с miss хоть раз: провалы {s['episodes_with_miss']['fail']}, "
           f"успехи {s['episodes_with_miss']['success']}; повторный захват той же "
           f"кофеварки после miss [да, всего]: {s['regrasp_after_miss']}")
-    print("\n  Причинный триггер: (a) проприоцепция как у раннера; "
-          "(b) (a) + объект на месте и не на плите (sim)")
+    print("\n  Триггер штатного наблюдателя: (a) развилка раннера; "
+          "(b) (a) + на той же границе объект на месте и не на плите (sim)")
     print("  сид  усл.  провалы: триг (самовосст.)  успехи: триг (самовосст.)  "
           "нужно при r=1 / r=0.4  выполнено")
     for sd, d in s["by_seed"].items():
@@ -589,7 +580,7 @@ def print_summary(s):
                   f"          ≥{d['need']['1.0']} / ≥{d['need']['0.4']}"
                   f"         r=1: {'да' if st['meets']['1.0'] else 'нет'}, "
                   f"r=0.4: {'да' if st['meets']['0.4'] else 'нет'}")
-    print(f"  проверки границ (a) по причинам: {s['why_a']}")
+    print(f"  исходы наблюдателя и отказы: {s['why_a']}")
     print(f"\n  Апертура в удержании: lifted {s['ap_hold']['lifted']}; miss {s['ap_hold']['miss']}")
     print(f"  Подъём кисти у miss: {s['eef_rise_miss']}")
     print(f"  Цель попытки определена по: {s['contact_target']}")
@@ -609,11 +600,17 @@ def report(a):
             raise SystemExit(f"трассы ≠ архиву: есть {len(got)}, нужно {len(want)} "
                              "(или --partial)")
     cams = {np.asarray(t["cam"]).tobytes() for t in trs}
-    rows0 = [dict(classify(t, np.inf), success=t["success"], seed=t["seed"]) for t in trs]
-    thr, info = (a.aperture, "задан") if a.aperture is not None else auto_threshold(rows0)
-    rows = [dict(classify(t, thr), success=t["success"], seed=t["seed"], eid=t["eid"])
-            for t in trs]
+    rc = runner_cfg(a.aperture)
+    rows0 = [dict(classify(t, np.inf, rcfg=rc), success=t["success"], seed=t["seed"])
+             for t in trs]
+    thr, info = auto_threshold(rows0)
+    rows = [dict(classify(t, thr, rcfg=rc), success=t["success"], seed=t["seed"],
+                 eid=t["eid"]) for t in trs]
     s = summarize(rows, thr, info)
+    s["runner_cfg"] = rc
+    print(f"  пороги раннера: empty_max {rc['empty_max'] * 1e3:.1f} мм, held_min "
+          f"{rc['held_min'] * 1e3:.1f} мм, lift {rc['lift_m'] * 1e3:.0f} мм, окно "
+          f"{rc['window']}, k_ap {rc['k_ap']}, min_left {rc['min_left']}")
     s["camera_constant"] = len(cams) == 1
     print_summary(s)
     print(f"  калибровка {CAMERA} одинакова во всех эпизодах: {s['camera_constant']}")
@@ -677,71 +674,84 @@ def selftest():
         ev = close_events(A)
         assert (ev[:1] or [None])[0] == grip_event(A)
         assert all(b > a for a, b in zip(ev, ev[1:]))
+    import k42_recovery as kr
     thr = 0.005
+    rc = dict(kr.CFG0)
     T = lambda r, c: r["trigger"][c]  # noqa: E731
+    W = lambda r: r["trigger"]["why"]  # noqa: E731
+    cl = lambda tr, **k: classify(tr, thr, rcfg=rc, **k)  # noqa: E731
     ok = _toy([(20, ("close", 0, 0.02)), (24, ("lift", 0, 60)), (60, ("open", True)),
                (100, ("close", 1, 0.02)), (104, ("lift", 1, 60)), (140, ("open", True))])
-    r = classify(ok, thr)
+    r = cl(ok)
     assert r["first"] == "lifted" and r["mode"]["kind"] == "no_attempt"
     assert r["mode"]["stage"] == 2 and r["n_on_end"] == 2
     assert T(r, "a") is None and T(r, "b") is None
     assert [a["by"] for a in r["attempts"]] == ["contact", "contact"]
-    # промах первой: пустой подъём; триггер на границе 32 по данным до неё;
-    # позже T32 сам захватывает ту же кофеварку -> исход самовосстановление
+    # промах первой: пустой подъём; развилка наблюдателя на 32; позже T32 сам
+    # захватывает ту же кофеварку -> исход самовосстановление
     miss = _toy([(20, ("close", 0, 0.0)), (25, ("lift", None, 40)), (50, ("open", False)),
                  (80, ("close", 0, 0.02)), (84, ("lift", 0, 60)), (120, ("open", True))])
-    r = classify(miss, thr)
+    r = cl(miss)
     assert r["first"] == "miss" and r["mode"] == dict(kind="miss", stage=0)
     assert T(r, "a")["b"] == 32 and T(r, "a")["g"] == 20 and T(r, "a")["stage"] == 0
     assert T(r, "a")["outcome"] == "self_recovered" and T(r, "b")["b"] == 32
-    # случай ревью: триггер на 32, кофеварка поднята на 44 той же попыткой
+    # случай ревью 1: триггер на 32, кофеварка поднята на 44 той же попыткой
     late = _toy([(20, ("close", 0, 0.0)), (25, ("lift", None, 40)),
                  (40, ("close", 0, 0.02)), (44, ("lift", 0, 60)), (80, ("open", True))])
-    r = classify(late, thr)
+    r = cl(late)
     assert T(r, "a") is not None and T(r, "a")["b"] == 32
     assert T(r, "a")["outcome"] == "self_recovered"
+    # случай ревью 2: удержание подтверждено на 24, затем уронил при close ->
+    # наблюдатель закрыл попытку как захват, развилки нет
+    held_drop = _toy([(16, ("close", 0, 0.02)), (17, ("lift", 0, 60)),
+                      (28, ("close", 0, 0.0)), (60, ("open", False))])
+    r = cl(held_drop)
+    assert T(r, "a") is None and W(r).get("held:захват") == 1, W(r)
     # без подъёма: раскрыл до границы
-    nolift = _toy([(20, ("close", 0, 0.0)), (26, ("open", False))])
-    r = classify(nolift, thr)
+    r = cl(_toy([(20, ("close", 0, 0.0)), (26, ("open", False))]))
     assert r["first"] == "nolift" and T(r, "a") is None
-    # уронил вне плиты: захват удачный -> триггера нет
+    # уронил вне плиты: захват удачный -> развилки нет
     drop = _toy([(20, ("close", 0, 0.02)), (24, ("lift", 0, 60)), (60, ("open", False))])
-    r = classify(drop, thr)
+    r = cl(drop)
     assert r["first"] == "lifted" and r["mode"] == dict(kind="drop", stage=0)
     assert r["attempts"][0]["fate"] == "drop" and T(r, "a") is None
-    assert classify(_toy([]), thr)["first"] == "no_close"
-    # пальцы раскрыты при подъёме (не пусто) -> нет триггера, причина aperture
-    r = classify(_toy([(20, ("close", 0, 0.02)), (25, ("lift", None, 40)),
-                       (50, ("open", False))]), thr)
-    assert T(r, "a") is None and r["trigger"]["why"].get("aperture", 0) > 0
-    # мало времени
-    r = classify(_toy([(550, ("close", 0, 0.0)), (551, ("lift", None, 40)),
-                       (590, ("open", False))]), thr)
-    assert T(r, "a") is None and r["trigger"]["why"].get("time", 0) > 0
-    # сдвинутая кофеварка: (a) срабатывает, (b) — нет
-    r = classify(_toy([(20, ("close", 0, 0.0)), (25, ("lift", None, 40)),
-                       (28, ("push", 0)), (50, ("open", False))]), thr)
-    assert T(r, "a") is not None and T(r, "b") is None
-    # промах на второй кофеварке после установки первой
-    r = classify(_toy([(20, ("close", 0, 0.02)), (24, ("lift", 0, 60)), (60, ("open", True)),
-                       (100, ("close", 1, 0.0)), (101, ("lift", None, 40)),
-                       (130, ("open", False))]), thr)
-    assert T(r, "a")["stage"] == 1 and r["mode"] == dict(kind="miss", stage=1)
-    # медленный подъём: к границам 24 и 32 подъёма ещё нет, окно 16 закрыто
-    r = classify(_toy([(20, ("close", 0, 0.0)), (36, ("lift", None, 40)),
-                       (70, ("open", False))]), thr)
-    assert T(r, "a") is None and r["trigger"]["why"].get("no_lift", 0) > 0
-    # граница на terminal (b = числу команд) не учитывается
-    r = classify(_toy([(20, ("close", 0, 0.0)), (21, ("lift", None, 40))], n=32), thr)
+    assert cl(_toy([]))["first"] == "no_close"
+    # пальцы раскрыты при подъёме -> наблюдатель видит захват, развилки нет
+    r = cl(_toy([(20, ("close", 0, 0.02)), (25, ("lift", None, 40)),
+                 (50, ("open", False))]))
     assert T(r, "a") is None
-    r = classify(_toy([(20, ("close", 0, 0.0)), (21, ("lift", None, 40))], n=33), thr)
+    # мало времени -> отказ наблюдателя
+    r = cl(_toy([(550, ("close", 0, 0.0)), (551, ("lift", None, 40)),
+                 (590, ("open", False))]))
+    assert T(r, "a") is None and W(r).get("отказ:мало шагов") == 1, W(r)
+    # сдвинутая кофеварка: (a) срабатывает, (b) — нет, другой развилки нет
+    r = cl(_toy([(20, ("close", 0, 0.0)), (25, ("lift", None, 40)),
+                 (28, ("push", 0)), (50, ("open", False)),
+                 (80, ("close", 0, 0.0)), (85, ("lift", None, 40)),
+                 (110, ("open", False))]))
+    assert T(r, "a")["b"] == 32 and T(r, "b") is None
+    # промах на второй кофеварке после установки первой
+    r = cl(_toy([(20, ("close", 0, 0.02)), (24, ("lift", 0, 60)), (60, ("open", True)),
+                 (100, ("close", 1, 0.0)), (101, ("lift", None, 40)),
+                 (130, ("open", False))]))
+    assert T(r, "a")["stage"] == 1 and r["mode"] == dict(kind="miss", stage=1)
+    # медленный подъём: к последней границе окна подъёма ещё нет
+    r = cl(_toy([(20, ("close", 0, 0.0)), (36, ("lift", None, 40)),
+                 (70, ("open", False))]))
+    assert T(r, "a") is None and W(r).get("uncertain:нет подъёма") == 1, W(r)
+    # граница на terminal (последний шаг эпизода) не учитывается
+    r = cl(_toy([(20, ("close", 0, 0.0)), (21, ("lift", None, 40))], n=32))
+    assert T(r, "a") is None
+    r = cl(_toy([(20, ("close", 0, 0.0)), (21, ("lift", None, 40))], n=33))
     assert T(r, "a") is not None and T(r, "a")["b"] == 32
+    # пороги раннера: empty_max ниже апертуры -> не промах
+    r = classify(miss, thr, rcfg=dict(rc, empty_max=-1.0))
+    assert T(r, "a") is None
     # порог по данным, сводка по сидам, нужное число провалов
-    rows = [dict(classify(t, np.inf), success=s_, seed=0)
-            for t, s_ in ((ok, True), (miss, False))]
+    rows = [dict(cl(t), success=s_, seed=0) for t, s_ in ((ok, True), (miss, False))]
     th, info = auto_threshold(rows)
     assert 0 < th < 0.02 and not info["overlap"], (th, info)
-    s = summarize([dict(classify(t, th), success=x, seed=sd) for t, x, sd in
+    s = summarize([dict(classify(t, th, rcfg=rc), success=x, seed=sd) for t, x, sd in
                    ((ok, True, 0), (miss, False, 0), (drop, False, 1))], th, info)
     assert s["by_seed"]["all"]["a"]["fail"]["trig"] == 1
     assert s["by_seed"]["0"]["a"]["fail"] == dict(n=1, trig=1, self_recovered=1,
@@ -785,7 +795,7 @@ def main():
                            help="PNG кадров с проекцией для первых N провалов части")
         else:
             p.add_argument("--aperture", type=float, default=None,
-                           help="порог пустой апертуры, м (по умолчанию — авто)")
+                           help="empty_max раннера, м (по умолчанию — из config.json/CFG0)")
             p.add_argument("--partial", action="store_true",
                            help="разрешить неполный набор трасс")
     a = ap.parse_args()

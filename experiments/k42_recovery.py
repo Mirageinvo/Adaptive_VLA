@@ -37,7 +37,7 @@ RetryOld и RetryLive равны T32 (эпизоды не исполняются
 collect --part K --device D | status | analyze | --selftest.
 """
 import argparse
-from collections import deque
+from collections import Counter, deque
 import hashlib
 import json
 import os
@@ -1289,10 +1289,10 @@ def prepare(a):
         raise SystemExit(f"локализатор null ({loc_e.get('why')}): RetryLive "
                          f"совпадёт с RetryOld, защита по объекту откажет "
                          f"везде — prepare отказан")
-    live_p, live_sha = live_admission(loc_e)
+    cfg = load_cfg()
+    live_p, live_sha = live_admission(loc_e, cfg)
     m, pilot, dev = scenes()
     k36 = pc.load_prepare()
-    cfg = load_cfg()
     plan = dict(kind="k42_recovery_plan", protocol=PROTOCOL,
                 bank=dict(bank_id=m["bank_id"], files=m["files"],
                           space=SPACE, dir=BANK_DIR,
@@ -1463,6 +1463,10 @@ def live_example(forced, cfg):
         if not o or not l_ or not l_.get("info"):
             continue
         il = l_["info"]
+        gd = l_.get("guard") or {}
+        if not gd.get("ok") or (o.get("guard") or {}) != gd:
+            out["why"] = f"защита по объекту: {gd.get('why', 'нет записи')}"
+            continue
         sh = il.get("shift_m")
         if il.get("fallback") or sh is None or sh < cfg["live_min_m"]:
             out["why"] = f"цель не сменилась ({il.get('fallback') or sh})"
@@ -1475,28 +1479,38 @@ def live_example(forced, cfg):
             out["why"] = f"опция не дошла до подъёма: {il.get('stop')}"
             continue
         return dict(ok=True, case_id=f["case_id"], n=len(forced), why="",
-                    shift_m=sh, reached=il.get("reached"),
+                    shift_m=sh, guard_shift_m=gd.get("shift_m"),
+                    reached=il.get("reached"),
                     result=il.get("result"))
     return out
 
 
-def live_admission(loc_entry):
-    """Калибровочный smoke (до плана) с этой калибровкой и живым
-    примером -> (путь, SHA) | SystemExit."""
-    for f in sorted((ROOT / "smoke").glob("*.json")):
+def live_admission(loc_entry, cfg):
+    """Калибровочный smoke (до плана) с этой калибровкой, той же
+    конфигурацией и живым примером -> (путь, SHA) | SystemExit."""
+    for f in sorted((ROOT / "smoke_calib").glob("*.json")):
         r = json.load(open(f, encoding="utf-8"))
-        if r.get("plan") is None and \
+        if r.get("plan") is None and r.get("config") == cfg and \
                 r.get("calib_sha256") == loc_entry["sha256"] and \
                 (r.get("live_example") or {}).get("ok") and \
                 not r.get("problems"):
             return str(f), sha256(f)
     raise SystemExit("нет smoke с этой калибровкой и живым примером "
-                     "RetryLive (цель сменилась, действия ≠ RetryOld, "
-                     "опция дошла до подъёма) — prepare отказан")
+                     "RetryLive при той же конфигурации (защита прошла, "
+                     "цель сменилась, действия ≠ RetryOld, опция дошла до "
+                     "подъёма) — prepare отказан")
 
 
 def smoke_path(c):
     return ROOT / "smoke" / f"{socket.gethostname()}__{c.g['uuid']}.json"
+
+
+def smoke_calib_path(c, calib_sha):
+    """Калибровочный smoke (до плана) — отдельный файл на калибровку:
+    допуск карты после prepare его не перезаписывает."""
+    tag = (calib_sha or "null")[:16]
+    return ROOT / "smoke_calib" / \
+        f"{socket.gethostname()}__{c.g['uuid']}__{tag}.json"
 
 
 def smoke(a):
@@ -1649,7 +1663,8 @@ def smoke(a):
         rep.update(admitted=not prob, problems=prob,
                    env=kgr.env_record(c.torch), uuid=c.g["uuid"],
                    host=socket.gethostname())
-        pc.save_json(str(smoke_path(c)), rep)
+        pc.save_json(str(smoke_path(c) if planned else
+                         smoke_calib_path(c, rep["calib_sha256"])), rep)
     finally:
         c.close()
     print(f"  smoke {a.device}: " + ("ДОПУЩЕНА" if not prob else
@@ -1699,11 +1714,13 @@ def aperture_summary(rows, probe):
 # --- калибровка локализатора ----------------------------------------------------------------------
 def calib_job(args):
     """В отдельном процессе: K33Env той же сцены, ожидание, переисполнение
-    действий; кадры t = 0, t = g и после отвода опции (2 чанка
-    retreat_up/retreat_back с раскрытым схватом, как в пилоте), позы тел
-    moka, матрица камеры."""
-    task, space, bank_dir, pos, A, g, S, ev, cfg = args
+    действий; кадры t = 0, закрытия g, развилки tau (первая граница после
+    обнаружения, как у пилота) и после отвода — первые две фазы штатной
+    RetryOption с развилки (scale_exec, проверка зазора); позы тел moka,
+    матрица камеры."""
+    task, space, bank_dir, pos, A, g, S, ev, cfg, q, L, U = args
     try:
+        import k29_policy as kp
         import k33_bank as kb
         from robosuite.utils import camera_utils as cu
         K = kb.make_env_class()
@@ -1734,24 +1751,35 @@ def calib_job(args):
                 dev.append(float(np.abs(np.asarray(obs["state"]) -
                                         S[t + 1]).max()))
             out.update(frame_g=np.asarray(obs["agentview_image"]),
-                       bodies_g=bodies(), max_state_dev=max(dev))
-            cp = np.asarray(ev["close_pos"], np.float64)
-            ap_ = np.asarray(ev["approach_pos"], np.float64)
-            z_clear = max(float(ap_[2]), float(cp[2]) + cfg["clear_m"])
-            q0 = st9(obs["state"])[5:9]
-            for ph in ("retreat_up", "retreat_back"):
-                s9 = st9(obs["state"])
-                p_ = s9[2:5]
-                T = np.array([*(p_[:2] if ph == "retreat_up" else ap_[:2]),
-                              max(z_clear, float(p_[2])) if ph == "retreat_up"
-                              else z_clear])
-                E = pctl(p_, s9[5:9], T, q0, OPEN, cfg)
+                       bodies_g=bodies())
+            # развилка как у пилота: первая граница после обнаружения
+            tau = H8 * ((g + int(cfg["n_post"]) + H8 - 1) // H8)
+            if tau > len(A) or MAX_STEPS - tau < H8 * len(PHASES):
+                raise RuntimeError(f"развилка {tau} вне эпизода/лимита")
+            for t in range(g, tau):
+                obs, _r, _d, _i = env.step(np.asarray(A[t], np.float64))
+                dev.append(float(np.abs(np.asarray(obs["state"]) -
+                                        S[t + 1]).max()))
+            out.update(frame_f=np.asarray(obs["agentview_image"]),
+                       bodies_f=bodies(), max_state_dev=max(dev), tau=tau)
+            # первые две фазы штатной RetryOption (масштаб и проверка высоты)
+            R = RetryOption(ev, cfg, "RetryOld", NullLocalizer(), q, L, U,
+                            cfg["held_min"])
+            el = tau
+            for _ph in range(3):
+                ch = R.next(st9(obs["state"]), el, None)
+                if ch is None or R.i > 2:
+                    break
+                E = kp.scale_exec(np.asarray(ch)[None], q)[0]
                 for t in range(H8):
-                    obs, _r, _d, _i = env.step(E[t])
+                    obs, _r, _d, _i = env.step(np.asarray(E[t], np.float64))
+                R.executed(H8)
+                el += H8
             out.update(frame_r=np.asarray(obs["agentview_image"]),
-                       bodies_r=bodies(),
+                       bodies_r=bodies(), stop=R.info.get("stop"),
+                       phases=[x["phase"] for x in R.log],
                        z_after_retreat=float(st9(obs["state"])[4]),
-                       z_clear=z_clear,
+                       z_clear=R.z_clear,
                        P=np.asarray(cu.get_camera_transform_matrix(
                            sim, "agentview", 224, 224))[:3])
             return out
@@ -1774,12 +1802,16 @@ def nearest_body(bodies, xy):
         np.asarray(kv[1][:2]) - np.asarray(xy)))
 
 
+CAL_FRAMES = (("r", "frame_r", "bodies_r"), ("g", "frame_g", "bodies_g"),
+              ("f", "frame_f", "bodies_f"))
+
+
 def build_calib(rows, conf_min=0.6, margin_min=0.05, radius_px=24):
-    """rows: dict(frame_g, bodies_g, frame_r, bodies_r, P, close_pos)
-    удачных захватов -> (лучшая калибровка по ориентации кадра, отчёт).
-    Шаблоны — из кадров после отвода (r, как у RetryLive) и кадров закрытия
-    (g, как у защиты по объекту); оценка — отложенная по сцене (шаблоны
-    других сцен) отдельно на r и на g, мм."""
+    """rows: dict(case_id, frame_*/bodies_* для r — после отвода (кадр
+    RetryLive), g — закрытие и f — развилка (кадры защиты), P, close_pos,
+    stop) удачных захватов -> (лучшая калибровка по ориентации кадра,
+    отчёт). Записи с остановкой отвода (зазор) в r не входят. Оценка —
+    отложенная по сцене: шаблоны всех записей того же case_id исключены."""
     best = None
     for flip in (True, False):
         P = rows[0]["P"]
@@ -1790,19 +1822,27 @@ def build_calib(rows, conf_min=0.6, margin_min=0.05, radius_px=24):
                          np.asarray(r["bodies_g"][n][:2])
                          for r, n in zip(rows, tgt)])
         off = np.median(offs, 0)
+
+        def usable_(r, k):
+            return k != "r" or r.get("stop") is None
         tpls = []
         for r, n in zip(rows, tgt):
             per = []
-            for fk, bk in (("frame_r", "bodies_r"), ("frame_g", "bodies_g")):
+            for k, fk, bk in CAL_FRAMES:
+                if not usable_(r, k):
+                    continue
                 b = r[bk][n]
                 rr, cc = project(P, [b[0], b[1], z], 224, flip)
                 per.append(crop(r[fk], rr, cc))
             tpls.append(per)
         stat = {}
-        for fk, bk in (("frame_r", "bodies_r"), ("frame_g", "bodies_g")):
+        for k, fk, bk in CAL_FRAMES:
             err, oks = [], []
             for i, (r, n) in enumerate(zip(rows, tgt)):
-                others = [t for k, per in enumerate(tpls) if k != i
+                if not usable_(r, k):
+                    continue
+                others = [t for j, per in enumerate(tpls)
+                          if rows[j]["case_id"] != r["case_id"]
                           for t in per if t is not None]
                 if not others:
                     continue
@@ -1814,26 +1854,28 @@ def build_calib(rows, conf_min=0.6, margin_min=0.05, radius_px=24):
                 if res["ok"]:
                     err.append(1000 * float(np.linalg.norm(
                         np.asarray(res["xy"]) - b)))
-            stat[fk[-1]] = dict(ok_frac=float(np.mean(oks)) if oks else 0.0,
-                                err_mm_q=np.quantile(err, [.5, .9]).tolist()
-                                if err else None)
+            stat[k] = dict(n=len(oks),
+                           ok_frac=float(np.mean(oks)) if oks else 0.0,
+                           err_mm_q=np.quantile(err, [.5, .9]).tolist()
+                           if err else None)
         rep = dict(flip_v=flip, z_plane=z, offset=off.tolist(),
                    offset_spread_mm=(1000 * np.std(offs, 0)).tolist(),
-                   n=len(rows), retreat=stat["r"], close=stat["g"],
+                   n=len(rows), n_cases=len({r["case_id"] for r in rows}),
+                   retreat=stat["r"], close=stat["g"], fork=stat["f"],
                    ok_frac=stat["r"]["ok_frac"],
                    err_mm_q=stat["r"]["err_mm_q"],
-                   retreat_z_short=int(sum(
-                       r["z_after_retreat"] < r["z_clear"] - 0.010
-                       for r in rows)))
+                   retreat_stops=dict(Counter(str(r.get("stop"))
+                                              for r in rows)))
         score = (rep["ok_frac"], -(rep["err_mm_q"] or [1e9])[0])
         if best is None or score > best[0]:
             best = (score, rep, [t for per in tpls for t in per
                                  if t is not None], P)
     _s, rep, tpls, P = best
     rep["usable"] = bool(rep["ok_frac"] >= 0.8 and rep["err_mm_q"] and
-                         rep["err_mm_q"][0] <= 10.0)
+                         rep["err_mm_q"][0] <= 10.0 and
+                         rep["n_cases"] >= 2)
     rep["why"] = "" if rep["usable"] else \
-        "доля/ошибка локализации после отвода"
+        "доля/ошибка локализации после отвода или < 2 сцен"
     calib = dict(P=np.asarray(P), flip_v=np.array(rep["flip_v"]),
                  z_plane=np.array(rep["z_plane"]),
                  offset=np.asarray(rep["offset"]),
@@ -1852,7 +1894,11 @@ def calibrate(a):
     if plan_path().exists():
         raise SystemExit("план уже закреплён — калибровка меняется только "
                          "в новом каталоге")
+    import k36_harness as kh
+    import k36_protocol as pc
     _m, _pilot, dev = scenes()
+    cfg = load_cfg()
+    C = kh.consts(pc.load_prepare())
     pos = {d["case_id"]: d["pos"] for d in dev}
     jobs, keys = [], []
     for f in sorted(SMOKE.glob("dev_*.npz")):
@@ -1862,7 +1908,7 @@ def calibrate(a):
             if e["outcome"] == "held":
                 jobs.append((TASK, SPACE, os.path.abspath(BANK_DIR),
                              pos[m["case_id"]], z["actions"], e["g"],
-                             z["tr_state"], e, load_cfg()))
+                             z["tr_state"], e, cfg, C["q"], C["L"], C["U"]))
                 keys.append((m["case_id"], e))
     if len(jobs) < 3:
         raise SystemExit(f"удачных захватов в smoke {len(jobs)} < 3 — нужен "
@@ -1872,7 +1918,8 @@ def calibrate(a):
     bad = [(k[0], r.get("why")) for k, r in zip(keys, res) if not r["ok"]]
     if bad:
         raise SystemExit(f"калибровка: {bad[:3]}")
-    rows = [dict(r, close_pos=k[1]["close_pos"]) for k, r in zip(keys, res)]
+    rows = [dict(r, close_pos=k[1]["close_pos"], case_id=k[0])
+            for k, r in zip(keys, res)]
     calib, rep = build_calib(rows)
     rep["max_state_dev"] = max(r["max_state_dev"] for r in res)
     rep["events"] = [dict(case_id=k[0], g=k[1]["g"]) for k in keys]
@@ -1885,8 +1932,9 @@ def calibrate(a):
     print(f"  калибровка: {len(rows)} захватов, flip_v {rep['flip_v']}, "
           f"смещение {np.round(rep['offset'], 4).tolist()} м, доля "
           f"локализаций после отвода {rep['ok_frac']:.2f}, ошибка мм "
-          f"{rep['err_mm_q']}; на кадре закрытия (защита) {rep['close']}; "
-          f"отвод не набрал высоту {rep['retreat_z_short']}/{rep['n']}; "
+          f"{rep['err_mm_q']}; защита: закрытие {rep['close']}, развилка "
+          f"{rep['fork']}; остановки отвода {rep['retreat_stops']}; сцен "
+          f"{rep['n_cases']}; "
           f"расхождение повтора state {rep['max_state_dev']:.1e}; "
           f"{'ПРИГОДНА' if rep['usable'] else 'НЕ пригодна (RetryLive = '}"
           f"{'' if rep['usable'] else 'fallback)'}")
@@ -2500,12 +2548,22 @@ def selftest():
         o = np.array([x, y, 0.0])
         fr = _draw([o])[::-1].copy()
         bd = {"moka_pot_1_main": o.tolist()}
-        rows_c.append(dict(frame_r=fr, bodies_r=bd, frame_g=fr, bodies_g=bd,
+        rows_c.append(dict(case_id=f"c{len(rows_c)}", frame_r=fr, bodies_r=bd,
+                           frame_g=fr, bodies_g=bd, frame_f=fr, bodies_f=bd,
                            P=_toy_P(), close_pos=(o + [0.01, 0.0, 0.02])
-                           .tolist(), z_after_retreat=0.1, z_clear=0.1))
+                           .tolist(), stop=None))
     cal, crep = build_calib(rows_c)
     assert crep["flip_v"] and crep["usable"], crep
-    assert crep["close"]["ok_frac"] == 1.0 and crep["retreat_z_short"] == 0
+    assert crep["close"]["ok_frac"] == 1.0 and crep["fork"]["n"] == 5
+    # исключается вся сцена: две записи одной сцены не служат шаблоном друг
+    # другу; запись с остановкой отвода не входит в r
+    rows_s = [dict(r, case_id="same") for r in rows_c]
+    _c, rs = build_calib(rows_s)
+    assert rs["retreat"]["n"] == 0 and not rs["usable"]
+    rows_z = [dict(r, stop="зазор не достигнут") if i == 0 else r
+              for i, r in enumerate(rows_c)]
+    _c, rz = build_calib(rows_z)
+    assert rz["retreat"]["n"] == 4 and rz["close"]["n"] == 5
     assert np.allclose(crep["offset"], [0.01, 0.0])
     with tempfile.TemporaryDirectory() as td:
         fp = os.path.join(td, "c.npz")
@@ -2662,14 +2720,15 @@ def selftest():
                     if ent is None:
                         prepare(None)
                     else:
-                        live_admission(ent)
+                        live_admission(ent, cfg)
                     raise AssertionError("prepare принят")
                 except SystemExit as e:
                     assert ("null" if ent is None else "живым") in str(e), e
         finally:
             g_["CALIB"], g_["ROOT"] = keep_c, keep_r
-    good = dict(case_id="a", RetryOld=dict(actions_sha1="x"),
-                RetryLive=dict(actions_sha1="y", info=dict(
+    gk = dict(ok=True, shift_m=0.001, why="")
+    good = dict(case_id="a", RetryOld=dict(actions_sha1="x", guard=gk),
+                RetryLive=dict(actions_sha1="y", guard=gk, info=dict(
                     shift_m=0.01, fallback=None, stop="завершена",
                     phases_done=len(PHASES))))
     assert live_example([good], cfg)["ok"]
@@ -2679,7 +2738,10 @@ def selftest():
     fb["RetryLive"]["info"]["fallback"] = "низкая уверенность"
     stp = json.loads(json.dumps(good))
     stp["RetryLive"]["info"].update(stop="поза не достигнута", phases_done=4)
-    for bad_ in (same, fb, stp):
+    ng = json.loads(json.dumps(good))
+    ng["RetryLive"]["guard"] = ng["RetryOld"]["guard"] = dict(
+        ok=False, why="объект сдвинулся")
+    for bad_ in (same, fb, stp, ng):
         assert not live_example([bad_], cfg)["ok"]
     print("самопроверка k42_recovery пройдена: детектор закрытия = "
           "grip_event; пустое закрытие -> промах и триггер, занятое -> "
