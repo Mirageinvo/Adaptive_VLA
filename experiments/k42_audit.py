@@ -147,49 +147,67 @@ def attempt(tr, g, cfg=CFG):
     return out
 
 
-def trigger(tr, at, thr, cfg=CFG):
-    """Онлайн-триггер плана для попытки at -> (b | None, причина)."""
-    A, eef, pot = tr["A"], tr["state"][:, 2:5], tr["pot"]
-    g, end, n = at["g"], at["end"], len(A)
+def boundary(tr, g, b, thr, cfg=CFG):
+    """Проверка на границе b попытки g только по наблюдениям ≤ b ->
+    (a, b, причина a). (a) — проприоцепция как у раннера; (b) — (a) и цель
+    (ближайшая к кисти в g) осталась на месте и не на плите (по sim)."""
+    eef, pot = tr["state"][:, 2:5], tr["pot"]
     ap = aperture(tr["state"])
-    # онлайн цель — ближайшая к кисти кофеварка (контакт недоступен)
+    k0 = b - cfg["hold_k"] + 1
+    if eef[b, 2] - eef[g, 2] < cfg["lift"]:
+        return False, False, "no_lift"
+    if k0 < g + 1 or (ap[k0:b + 1] > thr).any():
+        return False, False, "aperture"
+    if MAX_STEPS - b < cfg["min_left"]:
+        return False, False, "time"
     tgt = int(np.argmin(np.linalg.norm(pot[g, :, :2] - eef[g, :2], axis=1)))
-    if tr["on"][g, tgt]:
-        return None, "on_stove"
-    why = "no_boundary"
-    b = (g // N8 + 1) * N8
-    while b <= g + cfg["window_trig"]:
-        if b > n:
-            return None, why if why != "no_boundary" else "episode_end"
-        if b > end:
-            return None, "reopened" if why == "no_boundary" else why
-        k0 = b - cfg["hold_k"] + 1
-        if eef[b, 2] - eef[g, 2] < cfg["lift"]:
-            why = "no_lift"
-        elif k0 < g + 1 or (ap[k0:b + 1] > thr).any():
-            why = "aperture"
-        elif np.linalg.norm(pot[b, tgt] - pot[g, tgt]) > cfg["stay"]:
-            why = "moved"
-        elif MAX_STEPS - b < cfg["min_left"]:
-            return None, "time"
-        else:
-            return int(b), "ok"
-        b += N8
-    return None, why
+    ok_b = (np.linalg.norm(pot[b, tgt] - pot[g, tgt]) <= cfg["stay"] and
+            not tr["on"][b, tgt])
+    return True, bool(ok_b), "ok"
+
+
+def fork_outcome(tr, g, b, cfg=CFG):
+    """Разметка после развилки b (вне триггера): self_recovered — та же
+    кофеварка позже поднялась ≥ pot_lift без вмешательства."""
+    eef, pot = tr["state"][:, 2:5], tr["pot"]
+    tgt = int(np.argmin(np.linalg.norm(pot[g, :, :2] - eef[g, :2], axis=1)))
+    rise = float(pot[b + 1:, tgt, 2].max() - pot[b, tgt, 2]) if b + 1 < len(pot) else 0.0
+    return dict(b=int(b), g=int(g), target=tgt, stage=int(tr["on"][b].sum()),
+                outcome="self_recovered" if rise >= cfg["pot_lift"] else "not_lifted")
+
+
+def causal_triggers(tr, thr, cfg=CFG):
+    """Первая штатная граница (кратна 8) в (g, g + window_trig] любой
+    попытки, где все команды g…b−1 — close и условие выполнено по данным
+    до b. Границы на terminal (b = числу исполненных команд) исключены.
+    -> dict(a=развилка | None, b=развилка | None, why=причины у (a))."""
+    A = tr["A"]
+    n = len(A)
+    out, why = dict(a=None, b=None), Counter()
+    for g in close_events(A):
+        end = close_end(A, g)
+        b = (g // N8 + 1) * N8
+        while b <= g + cfg["window_trig"] and b <= end and b < n:
+            ok_a, ok_b, w = boundary(tr, g, b, thr, cfg)
+            why[w] += 1
+            if ok_a and out["a"] is None:
+                out["a"] = fork_outcome(tr, g, b, cfg)
+            if ok_b and out["b"] is None:
+                out["b"] = fork_outcome(tr, g, b, cfg)
+            if out["a"] is not None and out["b"] is not None:
+                return dict(out, why=dict(why))
+            b += N8
+    return dict(out, why=dict(why))
 
 
 def classify(tr, thr, cfg=CFG):
-    """Эпизод -> попытки, класс первой, режим провала и триггер."""
+    """Эпизод -> попытки (описательно), класс первой, режим провала и
+    причинные триггеры (a)/(b) с исходом после развилки."""
     events = close_events(tr["A"])
     atts = [attempt(tr, g, cfg) for g in events]
-    placed, mode, trig = set(), None, None
-    for i, at in enumerate(atts):
+    placed, mode = set(), None
+    for at in atts:
         at["stage"] = len(placed)
-        if trig is None and at["kind"] == "miss" and at["target"] not in placed:
-            b, why = trigger(tr, at, thr, cfg)
-            at["trigger"] = why
-            if b is not None:
-                trig = dict(attempt=i, b=b, stage=at["stage"], g=at["g"])
         if at["kind"] == "lifted" and at.get("fate") == "placed":
             placed.add(at["target"])
         elif mode is None and at["target"] not in placed:
@@ -202,7 +220,13 @@ def classify(tr, thr, cfg=CFG):
     if mode is None:
         mode = dict(kind="no_attempt", stage=len(placed))
     return dict(attempts=atts, first=atts[0]["kind"] if atts else "no_close",
-                mode=mode, trigger=trig, n_on_end=int(tr["on"][-1].sum()))
+                mode=mode, trigger=causal_triggers(tr, thr, cfg),
+                n_on_end=int(tr["on"][-1].sum()))
+
+
+def need_failures(n_starts, r, gain=0.05):
+    """Минимум провалов с триггером, чтобы r · n > gain · N."""
+    return int(np.floor(gain * n_starts / r + 1e-9)) + 1
 
 
 def auto_threshold(rows):
@@ -491,37 +515,47 @@ def quant(x):
     return f"n={len(x)} p5 {q[0] * 1e3:.1f} / p50 {q[1] * 1e3:.1f} / p95 {q[2] * 1e3:.1f} мм"
 
 
+def trigger_stats(rows, cond):
+    """Срабатывания условия cond на провалах/успехах и самовосстановления."""
+    out = {}
+    for g, s in (("fail", False), ("success", True)):
+        forks = [r["trigger"][cond] for r in rows if r["success"] is s and r["trigger"][cond]]
+        out[g] = dict(n=sum(1 for r in rows if r["success"] is s), trig=len(forks),
+                      self_recovered=sum(f["outcome"] == "self_recovered" for f in forks),
+                      stage=dict(Counter(f["stage"] for f in forks)))
+    return out
+
+
 def summarize(rows, thr, info, cfg=CFG):
     fail = [r for r in rows if not r["success"]]
     succ = [r for r in rows if r["success"]]
     N, F = len(rows), len(fail)
-    f = F / N if N else 0.0
-    out = dict(n=N, fail=F, success=len(succ), threshold=thr, threshold_info=info, cfg=cfg)
+    out = dict(n=N, fail=F, success=len(succ), f=F / N if N else 0.0, threshold=thr,
+               threshold_info=info, cfg=cfg)
     out["first"] = {g: dict(Counter(r["first"] for r in grp))
                     for g, grp in (("fail", fail), ("success", succ))}
     out["mode"] = dict(Counter(f"{r['mode']['kind']}@{r['mode']['stage']}" for r in fail))
-    trig = {g: dict(Counter(r["trigger"]["stage"] for r in grp if r["trigger"]))
-            for g, grp in (("fail", fail), ("success", succ))}
-    out["trigger"] = trig
     miss = [(r, a) for r in rows for a in r["attempts"] if a["kind"] == "miss"]
-    out["miss_reasons"] = {g: dict(Counter(a.get("trigger", "after_first")
-                                           for r, a in miss if r["success"] is s))
-                           for g, s in (("fail", False), ("success", True))}
     out["regrasp_after_miss"] = {g: [sum(a["regrasp"] for r, a in miss if r["success"] is s),
                                      sum(1 for r, _a in miss if r["success"] is s)]
                                  for g, s in (("fail", False), ("success", True))}
-    any_miss = {g: sum(any(a["kind"] == "miss" for a in r["attempts"])
-                       for r in grp) for g, grp in (("fail", fail), ("success", succ))}
-    out["episodes_with_miss"] = any_miss
-    n_tf = sum(trig["fail"].values())
-    n_ts = sum(trig["success"].values())
-    c_f = n_tf / F if F else 0.0
-    c_s = n_ts / len(succ) if succ else 0.0
-    out.update(f=f, c_f=c_f, c_s=c_s, ceiling_pp=100 * f * c_f,
-               ceiling_96=96 * f * c_f,
-               r_needed_5of96=(5 / (96 * f * c_f)) if f * c_f > 0 else None)
-    out["ap_hold"] = {k: quant([a["ap_hold"] for _r, a in
-                                [(r, a) for r in rows for a in r["attempts"]]
+    out["episodes_with_miss"] = {g: sum(any(a["kind"] == "miss" for a in r["attempts"])
+                                        for r in grp)
+                                 for g, grp in (("fail", fail), ("success", succ))}
+    seeds = sorted({r["seed"] for r in rows})
+    out["by_seed"] = {}
+    for sd in ["all", *seeds]:
+        grp = rows if sd == "all" else [r for r in rows if r["seed"] == sd]
+        d = dict(n=len(grp), fail=sum(not r["success"] for r in grp),
+                 need={"1.0": need_failures(len(grp), 1.0),
+                       "0.4": need_failures(len(grp), 0.4)})
+        for cond in ("a", "b"):
+            st = trigger_stats(grp, cond)
+            st["meets"] = {k: st["fail"]["trig"] >= v for k, v in d["need"].items()}
+            d[cond] = st
+        out["by_seed"][str(sd)] = d
+    out["why_a"] = dict(sum((Counter(r["trigger"]["why"]) for r in rows), Counter()))
+    out["ap_hold"] = {k: quant([a["ap_hold"] for r in rows for a in r["attempts"]
                                 if a["kind"] == k]) for k in ("lifted", "miss")}
     out["eef_rise_miss"] = quant([a["eef_rise"] for _r, a in miss])
     out["contact_target"] = dict(Counter(a["by"] for r in rows for a in r["attempts"]))
@@ -532,25 +566,30 @@ def print_summary(s):
     print(f"\n  T1 t{TASK}: эпизодов {s['n']}, провалов {s['fail']} (f = {s['f']:.3f}), "
           f"успехов {s['success']}")
     print(f"  порог апертуры {s['threshold'] * 1e3:.1f} мм ({s['threshold_info']})")
-    print("\n  Первая попытка захвата      провалы   успехи")
+    print("\n  Первая попытка захвата (описательно)  провалы   успехи")
     for k in BASE:
-        print(f"    {k:<24} {s['first']['fail'].get(k, 0):>8} "
+        print(f"    {k:<34} {s['first']['fail'].get(k, 0):>8} "
               f"{s['first']['success'].get(k, 0):>8}")
     print("\n  Режим провала (вид@стадия: 0 — первая кофеварка, 1 — вторая)")
     for k, v in sorted(s["mode"].items(), key=lambda x: -x[1]):
-        print(f"    {k:<24} {v:>8}")
-    print("\n  Эпизоды с промахом-подъёмом (miss) хоть раз: "
-          f"провалы {s['episodes_with_miss']['fail']}, успехи {s['episodes_with_miss']['success']}")
-    print(f"  Повторный захват той же кофеварки после miss (сам T32), [да, всего]: "
-          f"{s['regrasp_after_miss']}")
-    print(f"  Проверка триггера у miss (ok — сработал): {s['miss_reasons']}")
-    print(f"\n  Онлайн-триггер (по стадиям): провалы {s['trigger']['fail']}, "
-          f"успехи {s['trigger']['success']}")
-    print(f"  c_f = {s['c_f']:.3f}, c_s = {s['c_s']:.3f}; потолок f·c_f = "
-          f"{s['ceiling_pp']:.1f} п.п. (≈ {s['ceiling_96']:.1f} провалов с триггером на 96)")
-    rn = s["r_needed_5of96"]
-    print("  для D ≥ 5 на 96 при ℓ = 0 нужна доля спасений r ≥ "
-          + (f"{rn:.2f}" + (" — недостижимо (> 1)" if rn > 1 else "") if rn else "— (нет триггеров)"))
+        print(f"    {k:<34} {v:>8}")
+    print(f"\n  Эпизоды с miss хоть раз: провалы {s['episodes_with_miss']['fail']}, "
+          f"успехи {s['episodes_with_miss']['success']}; повторный захват той же "
+          f"кофеварки после miss [да, всего]: {s['regrasp_after_miss']}")
+    print("\n  Причинный триггер: (a) проприоцепция как у раннера; "
+          "(b) (a) + объект на месте и не на плите (sim)")
+    print("  сид  усл.  провалы: триг (самовосст.)  успехи: триг (самовосст.)  "
+          "нужно при r=1 / r=0.4  выполнено")
+    for sd, d in s["by_seed"].items():
+        for cond in ("a", "b"):
+            st = d[cond]
+            fl, sc = st["fail"], st["success"]
+            print(f"  {sd:<4} ({cond})   {fl['trig']:>3}/{fl['n']:<4} ({fl['self_recovered']:>2})"
+                  f"            {sc['trig']:>3}/{sc['n']:<4} ({sc['self_recovered']:>2})"
+                  f"          ≥{d['need']['1.0']} / ≥{d['need']['0.4']}"
+                  f"         r=1: {'да' if st['meets']['1.0'] else 'нет'}, "
+                  f"r=0.4: {'да' if st['meets']['0.4'] else 'нет'}")
+    print(f"  проверки границ (a) по причинам: {s['why_a']}")
     print(f"\n  Апертура в удержании: lifted {s['ap_hold']['lifted']}; miss {s['ap_hold']['miss']}")
     print(f"  Подъём кисти у miss: {s['eef_rise_miss']}")
     print(f"  Цель попытки определена по: {s['contact_target']}")
@@ -570,9 +609,10 @@ def report(a):
             raise SystemExit(f"трассы ≠ архиву: есть {len(got)}, нужно {len(want)} "
                              "(или --partial)")
     cams = {np.asarray(t["cam"]).tobytes() for t in trs}
-    rows0 = [dict(classify(t, np.inf), success=t["success"]) for t in trs]
+    rows0 = [dict(classify(t, np.inf), success=t["success"], seed=t["seed"]) for t in trs]
     thr, info = (a.aperture, "задан") if a.aperture is not None else auto_threshold(rows0)
-    rows = [dict(classify(t, thr), success=t["success"], eid=t["eid"]) for t in trs]
+    rows = [dict(classify(t, thr), success=t["success"], seed=t["seed"], eid=t["eid"])
+            for t in trs]
     s = summarize(rows, thr, info)
     s["camera_constant"] = len(cams) == 1
     print_summary(s)
@@ -638,60 +678,77 @@ def selftest():
         assert (ev[:1] or [None])[0] == grip_event(A)
         assert all(b > a for a, b in zip(ev, ev[1:]))
     thr = 0.005
+    T = lambda r, c: r["trigger"][c]  # noqa: E731
     ok = _toy([(20, ("close", 0, 0.02)), (24, ("lift", 0, 60)), (60, ("open", True)),
                (100, ("close", 1, 0.02)), (104, ("lift", 1, 60)), (140, ("open", True))])
     r = classify(ok, thr)
     assert r["first"] == "lifted" and r["mode"]["kind"] == "no_attempt"
-    assert r["mode"]["stage"] == 2 and r["trigger"] is None and r["n_on_end"] == 2
+    assert r["mode"]["stage"] == 2 and r["n_on_end"] == 2
+    assert T(r, "a") is None and T(r, "b") is None
     assert [a["by"] for a in r["attempts"]] == ["contact", "contact"]
-    # промах первой: подъём пустой кисти, затем сам T32 захватывает заново
+    # промах первой: пустой подъём; триггер на границе 32 по данным до неё;
+    # позже T32 сам захватывает ту же кофеварку -> исход самовосстановление
     miss = _toy([(20, ("close", 0, 0.0)), (25, ("lift", None, 40)), (50, ("open", False)),
                  (80, ("close", 0, 0.02)), (84, ("lift", 0, 60)), (120, ("open", True))])
     r = classify(miss, thr)
-    assert r["first"] == "miss" and r["trigger"] == dict(attempt=0, b=32, stage=0, g=20)
-    assert r["attempts"][0]["regrasp"] and r["attempts"][0]["by"] == "nearest"
-    assert r["mode"] == dict(kind="miss", stage=0)
+    assert r["first"] == "miss" and r["mode"] == dict(kind="miss", stage=0)
+    assert T(r, "a")["b"] == 32 and T(r, "a")["g"] == 20 and T(r, "a")["stage"] == 0
+    assert T(r, "a")["outcome"] == "self_recovered" and T(r, "b")["b"] == 32
+    # случай ревью: триггер на 32, кофеварка поднята на 44 той же попыткой
+    late = _toy([(20, ("close", 0, 0.0)), (25, ("lift", None, 40)),
+                 (40, ("close", 0, 0.02)), (44, ("lift", 0, 60)), (80, ("open", True))])
+    r = classify(late, thr)
+    assert T(r, "a") is not None and T(r, "a")["b"] == 32
+    assert T(r, "a")["outcome"] == "self_recovered"
     # без подъёма: раскрыл до границы
     nolift = _toy([(20, ("close", 0, 0.0)), (26, ("open", False))])
     r = classify(nolift, thr)
-    assert r["first"] == "nolift" and r["mode"] == dict(kind="nolift", stage=0)
-    # уронил вне плиты
+    assert r["first"] == "nolift" and T(r, "a") is None
+    # уронил вне плиты: захват удачный -> триггера нет
     drop = _toy([(20, ("close", 0, 0.02)), (24, ("lift", 0, 60)), (60, ("open", False))])
     r = classify(drop, thr)
     assert r["first"] == "lifted" and r["mode"] == dict(kind="drop", stage=0)
-    assert r["attempts"][0]["fate"] == "drop"
+    assert r["attempts"][0]["fate"] == "drop" and T(r, "a") is None
     assert classify(_toy([]), thr)["first"] == "no_close"
-    # апертура удерживаемой: подъём без кофеварки, но пальцы раскрыты (не пусто)
+    # пальцы раскрыты при подъёме (не пусто) -> нет триггера, причина aperture
     r = classify(_toy([(20, ("close", 0, 0.02)), (25, ("lift", None, 40)),
                        (50, ("open", False))]), thr)
-    assert r["first"] == "miss" and r["trigger"] is None
-    assert r["attempts"][0]["trigger"] == "aperture"
+    assert T(r, "a") is None and r["trigger"]["why"].get("aperture", 0) > 0
     # мало времени
     r = classify(_toy([(550, ("close", 0, 0.0)), (551, ("lift", None, 40)),
                        (590, ("open", False))]), thr)
-    assert r["attempts"][0]["trigger"] == "time"
-    # сдвинутая кофеварка
+    assert T(r, "a") is None and r["trigger"]["why"].get("time", 0) > 0
+    # сдвинутая кофеварка: (a) срабатывает, (b) — нет
     r = classify(_toy([(20, ("close", 0, 0.0)), (25, ("lift", None, 40)),
                        (28, ("push", 0)), (50, ("open", False))]), thr)
-    assert r["attempts"][0]["trigger"] == "moved"
+    assert T(r, "a") is not None and T(r, "b") is None
     # промах на второй кофеварке после установки первой
     r = classify(_toy([(20, ("close", 0, 0.02)), (24, ("lift", 0, 60)), (60, ("open", True)),
                        (100, ("close", 1, 0.0)), (101, ("lift", None, 40)),
                        (130, ("open", False))]), thr)
-    assert r["trigger"]["stage"] == 1 and r["mode"] == dict(kind="miss", stage=1)
-    # медленный подъём: к границе 32 кисть выше 20 мм ещё нет
+    assert T(r, "a")["stage"] == 1 and r["mode"] == dict(kind="miss", stage=1)
+    # медленный подъём: к границам 24 и 32 подъёма ещё нет, окно 16 закрыто
     r = classify(_toy([(20, ("close", 0, 0.0)), (36, ("lift", None, 40)),
                        (70, ("open", False))]), thr)
-    assert r["first"] == "miss" and r["attempts"][0]["trigger"] == "no_lift"
-    # порог по данным и формула §5
-    rows = [dict(classify(t, np.inf), success=s) for t, s in ((ok, True), (miss, False))]
+    assert T(r, "a") is None and r["trigger"]["why"].get("no_lift", 0) > 0
+    # граница на terminal (b = числу команд) не учитывается
+    r = classify(_toy([(20, ("close", 0, 0.0)), (21, ("lift", None, 40))], n=32), thr)
+    assert T(r, "a") is None
+    r = classify(_toy([(20, ("close", 0, 0.0)), (21, ("lift", None, 40))], n=33), thr)
+    assert T(r, "a") is not None and T(r, "a")["b"] == 32
+    # порог по данным, сводка по сидам, нужное число провалов
+    rows = [dict(classify(t, np.inf), success=s_, seed=0)
+            for t, s_ in ((ok, True), (miss, False))]
     th, info = auto_threshold(rows)
     assert 0 < th < 0.02 and not info["overlap"], (th, info)
-    s = summarize([dict(classify(t, th), success=x) for t, x in
-                   ((ok, True), (miss, False), (drop, False))], th, info)
-    assert s["trigger"]["fail"] == {0: 1} and abs(s["c_f"] - 0.5) < 1e-9
+    s = summarize([dict(classify(t, th), success=x, seed=sd) for t, x, sd in
+                   ((ok, True, 0), (miss, False, 0), (drop, False, 1))], th, info)
+    assert s["by_seed"]["all"]["a"]["fail"]["trig"] == 1
+    assert s["by_seed"]["0"]["a"]["fail"] == dict(n=1, trig=1, self_recovered=1,
+                                                  stage={0: 1})
+    assert s["by_seed"]["1"]["a"]["fail"]["trig"] == 0
+    assert need_failures(160, 1.0) == 9 and need_failures(160, 0.4) == 21
     assert abs(ceiling(0.27, 5 / (96 * 0.27 * 0.40), 0.40) - 5 / 96) < 1e-12
-    assert abs(5 / (96 * 0.27 * 0.40) - 0.482) < 1e-3
     # канал пробы: probe обслуживается, остальное — дальше
     class Fake:
         def __init__(self, msgs):

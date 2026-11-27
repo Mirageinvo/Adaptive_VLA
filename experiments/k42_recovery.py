@@ -96,7 +96,8 @@ CFG0 = dict(
     held_min=0.010, min_left=56, n_pre=3, n_post=3,
     pos_m=0.05, rot_rad=0.5, gain=1.0, umax=0.6, rot_gain=0.0,
     umax_rot=0.3, clear_m=0.06, lift_opt_m=0.06, tol_xy=0.012,
-    tol_z=0.012, max_shift_m=0.040, approach_back=16)
+    tol_z=0.012, max_shift_m=0.040, approach_back=16,
+    guard_m=0.010, clear_tol=0.010, live_min_m=0.003)
 
 
 def sha256(p):
@@ -717,6 +718,38 @@ def load_localizer(plan_loc):
     return TemplateLocalizer.load(plan_loc["path"])
 
 
+def object_guard(loc, frame_close, frame_fork, old_xy, cfg):
+    """Защита по объекту до отвода (только RGB agentview): ориентир цели
+    локализуется на кадре закрытия g и на кадре развилки; вмешательство
+    разрешено, только если оба уверены и ориентир сдвинулся не более
+    guard_m. Неопределённость — отказ."""
+    ref = np.asarray(old_xy, np.float64) - np.asarray(loc.offset)
+    r0 = loc.locate(frame_close, ref)
+    r1 = loc.locate(frame_fork, ref)
+    out = dict(close=jsonable(r0), fork=jsonable(r1), kind=loc.kind,
+               shift_m=None)
+    if not r0.get("ok") or not r1.get("ok"):
+        why = r0.get("why") if not r0.get("ok") else r1.get("why")
+        return dict(out, ok=False, why=f"объект не локализован: {why}")
+    sh = float(np.linalg.norm(np.asarray(r1["xy"]) - np.asarray(r0["xy"])))
+    out["shift_m"] = sh
+    if sh > cfg["guard_m"]:
+        return dict(out, ok=False, why="объект сдвинулся")
+    return dict(out, ok=True, why="")
+
+
+def fork_of(meta):
+    """Действующая развилка эпизода T32: триггер наблюдателя, прошедший
+    защиту по объекту (принудительные развилки smoke — без защиты)."""
+    tr = meta["observer"]["trigger"]
+    if tr is None:
+        return None
+    g = meta.get("guard")
+    if tr.get("forced") or (g is not None and g["ok"]):
+        return tr
+    return None
+
+
 # --- опция повтора ---------------------------------------------------------------------------------
 class RetryOption:
     """До 6 чанков по 8 шагов: отвод вверх, отвод к точке подхода,
@@ -789,6 +822,13 @@ class RetryOption:
             return self._stop("завершена")
         if MAX_STEPS - int(elapsed) < H8 * (self.n - i):
             return self._stop("лимит шагов")
+        if PHASES[i] in ("retreat_back", "align") and \
+                float(p[2]) < self.z_clear - self.cfg["clear_tol"]:
+            self.info["clearance"] = dict(phase=PHASES[i], z=float(p[2]),
+                                          z_clear=self.z_clear)
+            if obs is not None:
+                self.frames["end"] = frames_of(obs)
+            return self._stop("зазор не достигнут")
         if i == 2:
             if obs is not None:
                 import k31_collect as kcol
@@ -844,7 +884,7 @@ class RecoveryArm:
     def begin_state(self):
         self.heavy, self.log = 0, []
         self.opt, self.started, self.fork_hash = None, False, None
-        self.cur = None
+        self.cur, self.guard = None, None
 
     @property
     def call(self):
@@ -870,6 +910,12 @@ class RecoveryArm:
         self.begin_state()
         self.arm.begin(task, init, episode)
 
+    def _guard(self, tr):
+        ob = self.rs.ob
+        fr = getattr(ob, "trigger_frames", {}) or {}
+        self.guard = object_guard(self.loc, fr.get("close"), fr.get("fork"),
+                                  tr["close_pos"][:2], self.cfg)
+
     def _start(self, elapsed):
         import k31_collect as kcol
         tr = self.rs.ob.trigger
@@ -878,6 +924,13 @@ class RecoveryArm:
                                         self.expect["hash"] != h):
             raise kcol.Mismatch(f"развилка ветви ({elapsed}) ≠ T32 "
                                 f"({self.expect['tau']}) или хеш")
+        self._guard(tr)
+        if not tr.get("forced") and not self.guard["ok"]:
+            raise kcol.Mismatch(f"ветвь при отказе защиты: "
+                                f"{self.guard['why']}")
+        if self.expect is not None and "guard_ok" in self.expect and \
+                bool(self.expect["guard_ok"]) != bool(self.guard["ok"]):
+            raise kcol.Mismatch("защита по объекту ≠ эпизоду T32")
         self.fork_hash, self.started = h, True
         self.fork_frames = frames_of(self.rs.obs)
         self.opt = RetryOption(tr, self.cfg, self.branch, self.loc,
@@ -887,6 +940,9 @@ class RecoveryArm:
     def decide(self, batch, po, s8, elapsed):
         import k31_collect as kcol
         tr = self.rs.ob.trigger
+        if self.branch == "T32" and tr is not None and self.guard is None \
+                and tr["tau"] == elapsed:
+            self._guard(tr)
         if self.branch != "T32" and not self.started and tr is not None:
             if tr["tau"] != elapsed:
                 raise kcol.Mismatch(f"триггер ветви {tr['tau']} ≠ границе "
@@ -945,6 +1001,7 @@ def run_branch(sim, io, arm, C, cfg, loc, branch, task, pos, eid_t32, *,
     tau = int(expect["tau"]) if expect is not None else (
         ob.trigger["tau"] if (branch != "T32" and ob.trigger) else 0)
     ep.update(heavy=ag.heavy, observer=ob.export(), branch=branch,
+              guard=None if ag.guard is None else jsonable(ag.guard),
               S=np.stack(rs.S), log=ag.log, tau=tau, fork_hash=ag.fork_hash,
               option=None if ag.opt is None else dict(
                   info=ag.opt.info, log=ag.opt.log, steps=ag.opt.steps),
@@ -988,7 +1045,7 @@ def save_ep(path, j, ep, plan_sha):
                 heavy=int(ep["heavy"]), seconds=float(ep["seconds"]),
                 summary={k: ep[k] for k in SUMMARY}, tau=int(ep["tau"]),
                 fork_hash=ep["fork_hash"], observer=ep["observer"],
-                option=jsonable(ep["option"]),
+                option=jsonable(ep["option"]), guard=ep.get("guard"),
                 prefix_heavy=int(j.get("prefix_heavy", 0)))
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp.npz")
@@ -1107,6 +1164,10 @@ def branch_problems(zz, meta, j, C, cfg, z0, m0):
     tr0 = m0["observer"]["trigger"]
     if tr0 is None:
         return p + ["ветвь без триггера T32"]
+    if fork_of(m0) is None:
+        return p + ["ветвь при отказе защиты по объекту в T32"]
+    if meta.get("guard") != m0.get("guard"):
+        p.append("защита по объекту ветви ≠ T32")
     tau = int(meta["tau"])
     if tau != int(tr0["tau"]) or meta["fork_hash"] != m0["fork_hash"]:
         p.append("развилка ≠ T32")
@@ -1223,6 +1284,12 @@ def calib_entry():
 def prepare(a):
     import k36_protocol as pc
     import k37_confirm as kcf
+    loc_e = calib_entry()
+    if loc_e["kind"] == "null":
+        raise SystemExit(f"локализатор null ({loc_e.get('why')}): RetryLive "
+                         f"совпадёт с RetryOld, защита по объекту откажет "
+                         f"везде — prepare отказан")
+    live_p, live_sha = live_admission(loc_e)
     m, pilot, dev = scenes()
     k36 = pc.load_prepare()
     cfg = load_cfg()
@@ -1232,7 +1299,8 @@ def prepare(a):
                           manifest_sha256=sha256(MANIFEST)),
                 pilot=pilot, dev=dev, config=cfg,
                 config_sha256=sha256(CONFIG) if CONFIG.exists() else None,
-                localizer=calib_entry(),
+                localizer=loc_e,
+                live_smoke=dict(path=live_p, sha256=live_sha),
                 k36_prepare_sha1=k36["sha1"],
                 t32=dict(actor=k36["k32"]["seeds"][str(SEED)]["T"][
                     "actor_hash"], source=k36["k32"]["seeds"][str(SEED)][
@@ -1385,6 +1453,48 @@ def probe_axes(sim, io, C, cfg, task, pos, u=0.3):
     return out
 
 
+def live_example(forced, cfg):
+    """Есть ли принудительная развилка smoke, где RGB сместил цель
+    RetryLive, исполненные действия ≠ RetryOld, а опция RetryLive прошла
+    все фазы (поза достигнута, закрытие и подъём исполнены)."""
+    out = dict(ok=False, case_id=None, n=len(forced), why="нет развилок")
+    for f in forced:
+        o, l_ = f.get("RetryOld"), f.get("RetryLive")
+        if not o or not l_ or not l_.get("info"):
+            continue
+        il = l_["info"]
+        sh = il.get("shift_m")
+        if il.get("fallback") or sh is None or sh < cfg["live_min_m"]:
+            out["why"] = f"цель не сменилась ({il.get('fallback') or sh})"
+            continue
+        if o["actions_sha1"] == l_["actions_sha1"]:
+            out["why"] = "действия RetryLive = RetryOld"
+            continue
+        if il.get("stop") != "завершена" or il.get("phases_done") != \
+                len(PHASES):
+            out["why"] = f"опция не дошла до подъёма: {il.get('stop')}"
+            continue
+        return dict(ok=True, case_id=f["case_id"], n=len(forced), why="",
+                    shift_m=sh, reached=il.get("reached"),
+                    result=il.get("result"))
+    return out
+
+
+def live_admission(loc_entry):
+    """Калибровочный smoke (до плана) с этой калибровкой и живым
+    примером -> (путь, SHA) | SystemExit."""
+    for f in sorted((ROOT / "smoke").glob("*.json")):
+        r = json.load(open(f, encoding="utf-8"))
+        if r.get("plan") is None and \
+                r.get("calib_sha256") == loc_entry["sha256"] and \
+                (r.get("live_example") or {}).get("ok") and \
+                not r.get("problems"):
+            return str(f), sha256(f)
+    raise SystemExit("нет smoke с этой калибровкой и живым примером "
+                     "RetryLive (цель сменилась, действия ≠ RetryOld, "
+                     "опция дошла до подъёма) — prepare отказан")
+
+
 def smoke_path(c):
     return ROOT / "smoke" / f"{socket.gethostname()}__{c.g['uuid']}.json"
 
@@ -1500,6 +1610,9 @@ def smoke(a):
                                            np.linalg.norm(want) *
                                            np.linalg.norm(did) + 1e-12))))
                 out[br] = dict(success=eb["success"], info=o.get("info"),
+                               guard=eb.get("guard"),
+                               actions_sha1=kcol.actions_sha(
+                                   np.asarray(eb["actions"], np.float32)),
                                moves=mv, steps=o.get("steps"),
                                heavy=eb["heavy"],
                                t32_after=sum(1 for x in eb["log"]
@@ -1524,6 +1637,9 @@ def smoke(a):
             rep["forced"].append(out)
         arm = v = None
         kh.free(c.torch)
+        rep["live_example"] = live_example(rep["forced"], cfg)
+        ce = calib_entry()
+        rep["calib_sha256"] = ce.get("sha256")
         rep["aperture"] = aperture_summary(rows, rep["probe"])
         rep["suggest"] = suggest_cfg(rep, ci)
         if planned and abs(rep["suggest"]["pos_m_measured"] - cfg["pos_m"]) \
@@ -1538,6 +1654,7 @@ def smoke(a):
         c.close()
     print(f"  smoke {a.device}: " + ("ДОПУЩЕНА" if not prob else
                                      "НЕ допущена: " + "; ".join(prob[:4])))
+    print(f"  живой пример RetryLive: {rep.get('live_example')}")
     print(f"  апертура: {rep.get('aperture')}")
     print("  оси (м на единицу за шаг): " + str({k: round(
         d["per_unit_step"], 4) for k, d in rep["probe"]["axes"].items()}))
@@ -1582,8 +1699,10 @@ def aperture_summary(rows, probe):
 # --- калибровка локализатора ----------------------------------------------------------------------
 def calib_job(args):
     """В отдельном процессе: K33Env той же сцены, ожидание, переисполнение
-    действий; кадры t = 0 и t = g, позы тел moka, матрица камеры."""
-    task, space, bank_dir, pos, A, g, S = args
+    действий; кадры t = 0, t = g и после отвода опции (2 чанка
+    retreat_up/retreat_back с раскрытым схватом, как в пилоте), позы тел
+    moka, матрица камеры."""
+    task, space, bank_dir, pos, A, g, S, ev, cfg = args
     try:
         import k33_bank as kb
         from robosuite.utils import camera_utils as cu
@@ -1615,7 +1734,24 @@ def calib_job(args):
                 dev.append(float(np.abs(np.asarray(obs["state"]) -
                                         S[t + 1]).max()))
             out.update(frame_g=np.asarray(obs["agentview_image"]),
-                       bodies_g=bodies(), max_state_dev=max(dev),
+                       bodies_g=bodies(), max_state_dev=max(dev))
+            cp = np.asarray(ev["close_pos"], np.float64)
+            ap_ = np.asarray(ev["approach_pos"], np.float64)
+            z_clear = max(float(ap_[2]), float(cp[2]) + cfg["clear_m"])
+            q0 = st9(obs["state"])[5:9]
+            for ph in ("retreat_up", "retreat_back"):
+                s9 = st9(obs["state"])
+                p_ = s9[2:5]
+                T = np.array([*(p_[:2] if ph == "retreat_up" else ap_[:2]),
+                              max(z_clear, float(p_[2])) if ph == "retreat_up"
+                              else z_clear])
+                E = pctl(p_, s9[5:9], T, q0, OPEN, cfg)
+                for t in range(H8):
+                    obs, _r, _d, _i = env.step(E[t])
+            out.update(frame_r=np.asarray(obs["agentview_image"]),
+                       bodies_r=bodies(),
+                       z_after_retreat=float(st9(obs["state"])[4]),
+                       z_clear=z_clear,
                        P=np.asarray(cu.get_camera_transform_matrix(
                            sim, "agentview", 224, 224))[:3])
             return out
@@ -1639,52 +1775,65 @@ def nearest_body(bodies, xy):
 
 
 def build_calib(rows, conf_min=0.6, margin_min=0.05, radius_px=24):
-    """rows: dict(frame0, bodies0, frame_g, bodies_g, P, close_pos) удачных
-    захватов -> (лучшая калибровка по ориентации кадра, отчёт). Ошибка —
-    отложенная по сцене (шаблоны других сцен), мм."""
+    """rows: dict(frame_g, bodies_g, frame_r, bodies_r, P, close_pos)
+    удачных захватов -> (лучшая калибровка по ориентации кадра, отчёт).
+    Шаблоны — из кадров после отвода (r, как у RetryLive) и кадров закрытия
+    (g, как у защиты по объекту); оценка — отложенная по сцене (шаблоны
+    других сцен) отдельно на r и на g, мм."""
     best = None
     for flip in (True, False):
         P = rows[0]["P"]
-        z = float(np.median([nearest_body(r["bodies_g"],
-                                          r["close_pos"][:2])[1][2]
-                             for r in rows]))
+        tgt = [nearest_body(r["bodies_g"], r["close_pos"][:2])[0]
+               for r in rows]
+        z = float(np.median([r["bodies_g"][n][2] for r, n in zip(rows, tgt)]))
         offs = np.array([np.asarray(r["close_pos"][:2]) -
-                         np.asarray(nearest_body(r["bodies_g"],
-                                                 r["close_pos"][:2])[1][:2])
-                         for r in rows])
+                         np.asarray(r["bodies_g"][n][:2])
+                         for r, n in zip(rows, tgt)])
         off = np.median(offs, 0)
         tpls = []
-        for r in rows:
-            _n, b0 = nearest_body(r["bodies0"], r["close_pos"][:2])
-            rr, cc = project(P, [b0[0], b0[1], z], 224, flip)
-            tpls.append(crop(r["frame0"], rr, cc))
-        err, oks = [], []
-        for i, r in enumerate(rows):
-            others = [t for k, t in enumerate(tpls) if k != i and
-                      t is not None]
-            if not others:
-                continue
-            loc = TemplateLocalizer(P, flip, z, off, others, conf_min,
-                                    margin_min, radius_px)
-            _n, b0 = nearest_body(r["bodies0"], r["close_pos"][:2])
-            res = loc.locate(r["frame0"], np.asarray(b0[:2]) +
-                             np.array([0.015, -0.010]))
-            oks.append(bool(res["ok"]))
-            if res["ok"]:
-                err.append(1000 * float(np.linalg.norm(np.asarray(res["xy"])
-                                                       - np.asarray(b0[:2]))))
+        for r, n in zip(rows, tgt):
+            per = []
+            for fk, bk in (("frame_r", "bodies_r"), ("frame_g", "bodies_g")):
+                b = r[bk][n]
+                rr, cc = project(P, [b[0], b[1], z], 224, flip)
+                per.append(crop(r[fk], rr, cc))
+            tpls.append(per)
+        stat = {}
+        for fk, bk in (("frame_r", "bodies_r"), ("frame_g", "bodies_g")):
+            err, oks = [], []
+            for i, (r, n) in enumerate(zip(rows, tgt)):
+                others = [t for k, per in enumerate(tpls) if k != i
+                          for t in per if t is not None]
+                if not others:
+                    continue
+                loc = TemplateLocalizer(P, flip, z, off, others, conf_min,
+                                        margin_min, radius_px)
+                b = np.asarray(r[bk][n][:2])
+                res = loc.locate(r[fk], b + np.array([0.015, -0.010]))
+                oks.append(bool(res["ok"]))
+                if res["ok"]:
+                    err.append(1000 * float(np.linalg.norm(
+                        np.asarray(res["xy"]) - b)))
+            stat[fk[-1]] = dict(ok_frac=float(np.mean(oks)) if oks else 0.0,
+                                err_mm_q=np.quantile(err, [.5, .9]).tolist()
+                                if err else None)
         rep = dict(flip_v=flip, z_plane=z, offset=off.tolist(),
                    offset_spread_mm=(1000 * np.std(offs, 0)).tolist(),
-                   n=len(rows), ok_frac=float(np.mean(oks)) if oks else 0.0,
-                   err_mm_q=np.quantile(err, [.5, .9]).tolist() if err
-                   else None)
+                   n=len(rows), retreat=stat["r"], close=stat["g"],
+                   ok_frac=stat["r"]["ok_frac"],
+                   err_mm_q=stat["r"]["err_mm_q"],
+                   retreat_z_short=int(sum(
+                       r["z_after_retreat"] < r["z_clear"] - 0.010
+                       for r in rows)))
         score = (rep["ok_frac"], -(rep["err_mm_q"] or [1e9])[0])
         if best is None or score > best[0]:
-            best = (score, rep, [t for t in tpls if t is not None], P)
+            best = (score, rep, [t for per in tpls for t in per
+                                 if t is not None], P)
     _s, rep, tpls, P = best
     rep["usable"] = bool(rep["ok_frac"] >= 0.8 and rep["err_mm_q"] and
                          rep["err_mm_q"][0] <= 10.0)
-    rep["why"] = "" if rep["usable"] else "доля/ошибка локализации"
+    rep["why"] = "" if rep["usable"] else \
+        "доля/ошибка локализации после отвода"
     calib = dict(P=np.asarray(P), flip_v=np.array(rep["flip_v"]),
                  z_plane=np.array(rep["z_plane"]),
                  offset=np.asarray(rep["offset"]),
@@ -1713,7 +1862,7 @@ def calibrate(a):
             if e["outcome"] == "held":
                 jobs.append((TASK, SPACE, os.path.abspath(BANK_DIR),
                              pos[m["case_id"]], z["actions"], e["g"],
-                             z["tr_state"]))
+                             z["tr_state"], e, load_cfg()))
                 keys.append((m["case_id"], e))
     if len(jobs) < 3:
         raise SystemExit(f"удачных захватов в smoke {len(jobs)} < 3 — нужен "
@@ -1735,7 +1884,9 @@ def calibrate(a):
     p33.save_json(str(CALIB.with_suffix(".json")), rep)
     print(f"  калибровка: {len(rows)} захватов, flip_v {rep['flip_v']}, "
           f"смещение {np.round(rep['offset'], 4).tolist()} м, доля "
-          f"локализаций {rep['ok_frac']:.2f}, ошибка мм {rep['err_mm_q']}; "
+          f"локализаций после отвода {rep['ok_frac']:.2f}, ошибка мм "
+          f"{rep['err_mm_q']}; на кадре закрытия (защита) {rep['close']}; "
+          f"отвод не набрал высоту {rep['retreat_z_short']}/{rep['n']}; "
           f"расхождение повтора state {rep['max_state_dev']:.1e}; "
           f"{'ПРИГОДНА' if rep['usable'] else 'НЕ пригодна (RetryLive = '}"
           f"{'' if rep['usable'] else 'fallback)'}")
@@ -1765,7 +1916,7 @@ def triggered_of(plan, k, C, cfg):
         p = shard_path(j["eid"])
         if p.exists():
             _zz, m = read_shard(p)
-            if m["observer"]["trigger"] is not None:
+            if fork_of(m) is not None:
                 out.add(j["scene"]["case_id"])
     return out
 
@@ -1828,10 +1979,10 @@ def part_loop(L, plan, k, C, cfg, runner, log=print):
         ensure(j)
         sc = j["scene"]
         z0, m0 = t32_of(sc)
-        tr = m0["observer"]["trigger"]
+        tr = fork_of(m0)
         if tr is None:
             continue
-        ex = dict(tau=tr["tau"], hash=m0["fork_hash"])
+        ex = dict(tau=tr["tau"], hash=m0["fork_hash"], guard_ok=True)
         ph = int((z0["c_tau"] < tr["tau"]).sum())
         for b in sc["order"]:
             jb = dict(by[eid_of(b, sc)], prefix_heavy=ph)
@@ -2014,6 +2165,9 @@ def analyze(a):
     import k37_confirm as kcf
     import k40b_eval_base as kb40
     plan = load_plan()
+    if plan["t32"]["seed"] != SEED or SEED != 0:
+        raise SystemExit(f"пилот закреплён на T32 s0, в плане "
+                         f"s{plan['t32']['seed']}")
     C = kh.consts(pc.load_prepare())
     cfg = plan["config"]
     rows, prob, locks, cost = [], [], [], dict(physical=0, heavy=0, sec=0.0)
@@ -2049,10 +2203,14 @@ def analyze(a):
                 if e0 not in by:
                     continue
                 z0, m0 = by[e0]
-                tr = m0["observer"]["trigger"]
+                tr = fork_of(m0)
+                g_ = m0.get("guard")
+                ref_ = list(m0["observer"]["refusals"])
+                if m0["observer"]["trigger"] is not None and tr is None:
+                    ref_.append(dict(reason=f"защита: {g_['why']}"
+                                     if g_ else "защита: нет записи"))
                 r = dict(case_id=sc["case_id"], trigger=tr,
-                         events=m0["observer"]["events"],
-                         refusals=m0["observer"]["refusals"],
+                         events=m0["observer"]["events"], refusals=ref_,
                          T32=(bool(m0["summary"]["success"]), m0))
                 for b in RETRY:
                     if tr is None:
@@ -2078,9 +2236,10 @@ def analyze(a):
     if prob:
         raise SystemExit("анализ: " + "; ".join(prob[:4]))
     res = summarize(rows)
-    res.update(plan=plan["sha256"], cost=cost,
+    res.update(plan=plan["sha256"], cost=cost, t32_seed=plan["t32"]["seed"],
                localizer=plan["localizer"]["kind"])
     pc.save_json(str(ROOT / "analysis.json"), res)
+    print(f"  T32 сид s{res['t32_seed']}, задача t{TASK}")
     print("  SR (96 сцен): " + ", ".join(f"{b} {100 * res['sr'][b]:.1f}%"
                                          for b in BRANCHES))
     for n_ in ("old_t32", "live_t32", "live_old"):
@@ -2340,12 +2499,13 @@ def selftest():
                  (0.0, 0.07)):
         o = np.array([x, y, 0.0])
         fr = _draw([o])[::-1].copy()
-        rows_c.append(dict(frame0=fr, bodies0={"moka_pot_1_main": o.tolist()},
-                           bodies_g={"moka_pot_1_main": o.tolist()},
+        bd = {"moka_pot_1_main": o.tolist()}
+        rows_c.append(dict(frame_r=fr, bodies_r=bd, frame_g=fr, bodies_g=bd,
                            P=_toy_P(), close_pos=(o + [0.01, 0.0, 0.02])
-                           .tolist()))
+                           .tolist(), z_after_retreat=0.1, z_clear=0.1))
     cal, crep = build_calib(rows_c)
     assert crep["flip_v"] and crep["usable"], crep
+    assert crep["close"]["ok_frac"] == 1.0 and crep["retreat_z_short"] == 0
     assert np.allclose(crep["offset"], [0.01, 0.0])
     with tempfile.TemporaryDirectory() as td:
         fp = os.path.join(td, "c.npz")
@@ -2391,7 +2551,7 @@ def selftest():
     sc = dict(task=TASK, case_id="toy", pos=0, rank=0, part=0,
               order=list(RETRY))
     e0 = eid_of("T32", sc)
-    ep = run_branch(GraspSim(), io, arm, C, cfg, NullLocalizer(), "T32",
+    ep = run_branch(GraspSim(), io, arm, C, cfg, loc, "T32",
                     TASK, 0, e0, force_tau=24)
     assert ep["observer"]["trigger"]["forced"] and ep["heavy"] == \
         len(ep["calls"])
@@ -2411,8 +2571,7 @@ def selftest():
             tr = m0["observer"]["trigger"]
             ex = dict(tau=tr["tau"], hash=m0["fork_hash"])
             ph = int((z0["c_tau"] < tr["tau"]).sum())
-            for br, lc in (("RetryOld", NullLocalizer()),
-                           ("RetryLive", loc)):
+            for br, lc in (("RetryOld", loc), ("RetryLive", loc)):
                 eb = run_branch(GraspSim(), io, arm, C, cfg, lc, br, TASK, 0,
                                 e0, prefix=z0["actions"][:tr["tau"]],
                                 expect=ex, force_tau=24)
@@ -2443,6 +2602,10 @@ def selftest():
                                    C, cfg, z0, m0)
             assert branch_problems(zb, dict(mb, tau=mb["tau"] + 8), jb, C,
                                    cfg, z0, m0)
+            mg = json.loads(json.dumps(mb))
+            mg["guard"]["shift_m"] = 1.0
+            assert "защита по объекту ветви ≠ T32" in branch_problems(
+                zb, mg, jb, C, cfg, z0, m0)
             mt = json.loads(json.dumps(mb))
             mt["observer"]["trigger"]["g"] += 1
             assert branch_problems(zb, mt, jb, C, cfg, z0, m0)
@@ -2488,6 +2651,36 @@ def selftest():
     assert decide_rule(dict(D=4), dict(D=6), dict(D=2)) == \
         "confirm_directed_tree_open"
     assert decide_rule(dict(D=4), dict(D=4), dict(D=9)) == "close_option"
+    # prepare без калибровки и без живого примера — отказ
+    g_ = globals()
+    keep_c, keep_r = g_["CALIB"], g_["ROOT"]
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            g_["CALIB"], g_["ROOT"] = Path(td) / "none.npz", Path(td)
+            for ent in (None, dict(kind="template", sha256="s")):
+                try:
+                    if ent is None:
+                        prepare(None)
+                    else:
+                        live_admission(ent)
+                    raise AssertionError("prepare принят")
+                except SystemExit as e:
+                    assert ("null" if ent is None else "живым") in str(e), e
+        finally:
+            g_["CALIB"], g_["ROOT"] = keep_c, keep_r
+    good = dict(case_id="a", RetryOld=dict(actions_sha1="x"),
+                RetryLive=dict(actions_sha1="y", info=dict(
+                    shift_m=0.01, fallback=None, stop="завершена",
+                    phases_done=len(PHASES))))
+    assert live_example([good], cfg)["ok"]
+    same = json.loads(json.dumps(good))
+    same["RetryLive"]["actions_sha1"] = "x"
+    fb = json.loads(json.dumps(good))
+    fb["RetryLive"]["info"]["fallback"] = "низкая уверенность"
+    stp = json.loads(json.dumps(good))
+    stp["RetryLive"]["info"].update(stop="поза не достигнута", phases_done=4)
+    for bad_ in (same, fb, stp):
+        assert not live_example([bad_], cfg)["ok"]
     print("самопроверка k42_recovery пройдена: детектор закрытия = "
           "grip_event; пустое закрытие -> промах и триггер, занятое -> "
           "захват, неопределённая апертура и мало шагов -> отказ с причиной, "
@@ -2495,7 +2688,10 @@ def selftest():
           "побитово при одинаковой цели, общий отвод, RetryLive по шаблону "
           "спасает промах; нулевая опция = T32 побитово; префикс и хеши; "
           "round-trip масштаба; шарды T32/ветвей, порча — отказ; журнал и "
-          "возобновление; контрасты W/L/D и правило решения")
+          "возобновление; контрасты W/L/D и правило решения; защита по "
+          "объекту (сдвиг/нет калибровки -> нет ветви); нет бокового "
+          "движения без зазора; prepare отказывает без калибровки и живого "
+          "примера")
     return 0
 
 
@@ -2512,9 +2708,21 @@ def _selftest_script(cfg, q, Lb, Ub, loc, kcol):
 
     def run(init, branch="T32", lc=None, prefix=None, expect=None):
         arm = ScriptArm(q, Lb, Ub, cfg)
-        return run_branch(GraspSim(), io, arm, C, cfg, lc or NullLocalizer(),
+        return run_branch(GraspSim(), io, arm, C, cfg, lc or loc,
                           branch, TASK, init, "toy", prefix=prefix,
                           expect=expect)
+
+    class GuardOnly:
+        """Защита проходит по шаблону, локализация после отвода — нет."""
+        kind, offset = "guard_only", loc.offset
+
+        def __init__(self):
+            self.n = 0
+
+        def locate(self, rgb, ref_xy):
+            self.n += 1
+            return loc.locate(rgb, ref_xy) if self.n <= 2 else \
+                NullLocalizer().locate(rgb, ref_xy)
     hit, miss, unc, late, air = (run(i) for i in range(5))
     assert hit["success"] and hit["observer"]["trigger"] is None
     assert [e["outcome"] for e in hit["observer"]["events"]][0] == "held"
@@ -2534,10 +2742,31 @@ def _selftest_script(cfg, q, Lb, Ub, loc, kcol):
     null = run(1, "Null", prefix=pre, expect=ex)
     assert np.array_equal(null["actions"], miss["actions"]) and \
         {k: null[k] for k in SUMMARY} == {k: miss[k] for k in SUMMARY}
+    assert miss["guard"]["ok"] and miss["guard"]["shift_m"] < 1e-3
     old = run(1, "RetryOld", prefix=pre, expect=ex)
-    live0 = run(1, "RetryLive", prefix=pre, expect=ex)
+    live0 = run(1, "RetryLive", lc=GuardOnly(), prefix=pre, expect=ex)
     assert np.array_equal(old["actions"], live0["actions"])
     assert live0["option"]["info"]["fallback"] == "калибровка недоступна"
+    assert old["guard"] == miss["guard"]
+    # без калибровки защита отказывает -> ветви нет (вмешательства нет)
+    try:
+        run(1, "RetryOld", lc=NullLocalizer(), prefix=pre, expect=ex)
+        raise AssertionError("ветвь при отказе защиты принята")
+    except kcol.Mismatch as e:
+        assert "защиты" in str(e)
+    m_n = run(1, "T32", lc=NullLocalizer())
+    assert m_n["observer"]["trigger"] is not None and \
+        fork_of(m_n) is None and not m_n["guard"]["ok"]
+    assert fork_of(miss) is not None
+    # сдвинутый объект: защита отказывает
+    f0 = _draw([np.array([0.06, -0.04, 0.0])])[::-1].copy()
+    f1 = _draw([np.array([0.06, -0.02, 0.0])])[::-1].copy()
+    cp_ = np.array([0.06, -0.04]) + loc.offset
+    assert object_guard(loc, f0, f0, cp_, cfg)["ok"]
+    gm = object_guard(loc, f0, f1, cp_, cfg)
+    assert not gm["ok"] and gm["why"] == "объект сдвинулся", gm
+    assert fork_of(dict(observer=dict(trigger=dict(forced=False)),
+                        guard=gm)) is None
     live = run(1, "RetryLive", lc=loc, prefix=pre, expect=ex)
     oi, li = old["option"]["info"], live["option"]["info"]
     assert oi["retreat_hash"] == li["retreat_hash"] and li["fallback"] is None
@@ -2564,10 +2793,20 @@ def _selftest_script(cfg, q, Lb, Ub, loc, kcol):
     # недостижимая поза -> досрочный возврат T32 с причиной
     cf2 = dict(cfg, gain=0.2)
     arm = ScriptArm(q, Lb, Ub, cfg)
-    e2 = run_branch(GraspSim(), io, arm, C, cf2, NullLocalizer(), "RetryOld",
+    e2 = run_branch(GraspSim(), io, arm, C, cf2, loc, "RetryOld",
                     TASK, 1, "toy", prefix=pre, expect=ex)
-    assert e2["option"]["info"]["stop"] == "поза не достигнута" and \
-        e2["option"]["steps"] == 32
+    assert e2["option"]["info"]["stop"] in ("поза не достигнута",
+                                            "зазор не достигнут"), \
+        e2["option"]["info"]
+    # высота отвода не набрана -> бокового движения нет
+    cf3 = dict(cfg, clear_m=0.5)
+    e3 = run_branch(GraspSim(), io, ScriptArm(q, Lb, Ub, cfg), C, cf3, loc,
+                    "RetryOld", TASK, 1, "toy", prefix=pre, expect=ex)
+    i3 = e3["option"]["info"]
+    assert i3["stop"] == "зазор не достигнут" and \
+        [r["phase"] for r in e3["option"]["log"]] == ["retreat_up"], i3
+    lg = e3["option"]["log"][0]
+    assert np.allclose(lg["target"][:2], lg["start_pos"][:2])
 
 
 def _selftest_resume(cfg, q, Lb, Ub, loc):
