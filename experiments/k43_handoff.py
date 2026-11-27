@@ -258,6 +258,9 @@ def audit(a):
     jobs = ka.archive_jobs(Path(a.archive))
     want = {j["want"]["eid"]: j for j in jobs}
     got = {t["eid"]: t for t in trs}
+    if len(got) != len(trs):
+        dup = sorted(e for e, c in Counter(t["eid"] for t in trs).items() if c > 1)
+        raise SystemExit(f"дубликаты eid в трассах: {dup[:3]}")
     if not set(got) <= set(want):
         raise SystemExit("есть трассы вне архива c2")
     if not a.partial and set(want) != set(got):
