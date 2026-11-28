@@ -182,7 +182,7 @@ def compose(action, delta):
 
 # --- эпизоды ------------------------------------------------------------------------------------------------
 def run_batch(torch, runner, policy, idx, replica, head=None, mode="ours",
-              log=None):
+              log=None, after_reset=None, trace=None):
     """Эпизоды стартов runner.env_seeds[idx] одним батчем (len(idx) ==
     n_envs). mode: ours — ключ на среду (+ голова); std — штатный
     predict_action с генератором чанка (только n_envs = 1)."""
@@ -197,6 +197,8 @@ def run_batch(torch, runner, policy, idx, replica, head=None, mode="ours",
     env.call_each("run_dill_function",
                   args_list=[(runner.env_init_fn_dills[i],) for i in idx])
     obs = env.reset()
+    if after_reset is not None:
+        after_reset(env)
     hashes = [obs_hash(obs, i) for i in range(n_envs)]
     t_reset = time.time() - t_start
     policy.reset()
@@ -222,6 +224,9 @@ def run_batch(torch, runner, policy, idx, replica, head=None, mode="ours",
         a = a.detach().cpu().numpy()
         if not np.isfinite(a).all():
             raise SystemExit("нечисловое действие")
+        if trace is not None:
+            trace.append(dict(obs=obs_hash(obs, 0),
+                              act=hashlib.sha1(np.ascontiguousarray(a[0])).hexdigest()))
         acts.append(a)
         obs, _r, done, _i = env.step(runner.undo_transform_action(a))
         done = bool(np.all(done))
@@ -374,6 +379,67 @@ def cmd_admit(a):
           f"{[r1[0]['success'], r2[0]['success'], r3[0]['success']]}; время "
           f"{s1:.0f}/{s2:.0f}/{s3:.0f} с")
     return 0 if ok else 3
+
+
+# --- история среды: одинаковые штатные прогоны подряд ---------------------------------------
+def _warm(e):
+    """Хеши состояния sim и qacc_warmstart (решатель MuJoCo) среды."""
+    st, wa = _sim_state(e)
+    return dict(state=hashlib.sha1(st.tobytes()).hexdigest()[:12],
+                warm=hashlib.sha1(wa.tobytes()).hexdigest()[:12],
+                warm_norm=float(np.abs(wa).sum()))
+
+
+def _zero_warm(e):
+    rm = e.env.env.env
+    rm.env.sim.data.qacc_warmstart[:] = 0
+
+
+def cmd_history(a):
+    """Пять штатных прогонов старта START0 подряд в одном процессе: 1–3 —
+    как в admit, 4–5 — с обнулением qacc_warmstart после сброса. Для каждого:
+    хеши sim/warmstart после сброса, первый чанк с другим наблюдением и с
+    другим действием относительно прогона 1. Отвечает, зависит ли эпизод от
+    предыстории среды и снимает ли это обнуление warmstart."""
+    import torch
+    kdpe_setup()
+    torch_setup(torch)
+    policy, cfg = load_policy(torch, a.device)
+    runner = make_runner(cfg, START0, 1, 1)
+    plan = [("std", False), ("std", False), ("std", False), ("std0", True),
+            ("std0", True)]
+    runs = []
+    for k, (name, zero) in enumerate(plan):
+        info = {}
+
+        def after(env, zero=zero, info=info):
+            info["before"] = _call(env, _warm)
+            if zero:
+                _call(env, _zero_warm)
+            info["after"] = _call(env, _warm)
+        tr = []
+        r, A, sec = run_batch(torch, runner, policy, [0], 0, mode="std",
+                              after_reset=after, trace=tr)
+        runs.append(dict(name=name, success=r[0]["success"], reset=r[0]["reset_hash"],
+                         chunks=len(tr), trace=tr, seconds=sec, **info))
+        ref = runs[0]["trace"]
+        d_obs = next((i for i, (x, y) in enumerate(zip(ref, tr)) if x["obs"] != y["obs"]),
+                     -1 if len(ref) == len(tr) else min(len(ref), len(tr)))
+        d_act = next((i for i, (x, y) in enumerate(zip(ref, tr)) if x["act"] != y["act"]),
+                     -1 if len(ref) == len(tr) else min(len(ref), len(tr)))
+        print(f"  прогон {k + 1} {name}: успех {r[0]['success']}, чанков {len(tr)}, "
+              f"сброс {r[0]['reset_hash'][:10]}, sim/warm после сброса "
+              f"{info['before']['state']}/{info['before']['warm']} "
+              f"(|warm| {info['before']['warm_norm']:.3g})"
+              f"{(' -> после обнуления |warm| %.3g' % info['after']['warm_norm']) if zero else ''}"
+              f"; к прогону 1: наблюдение с чанка "
+              f"{d_obs}, действие с чанка {d_act}; {sec:.0f} с", flush=True)
+        runs[-1].update(diff_obs=d_obs, diff_act=d_act)
+    (OUT / "history.json").write_text(json.dumps(runs, indent=1))
+    same = lambda i, j: runs[i]["trace"] == runs[j]["trace"]  # noqa: E731
+    print(f"  2=3: {same(1, 2)}; 4=5: {same(3, 4)}; 4=1: {same(0, 3)}; "
+          f"1=2: {same(0, 1)}")
+    return 0
 
 
 # --- диагностика: сэмплер на одинаковом входе, среда на одинаковых командах ----------------------
@@ -547,14 +613,14 @@ def main():
         return selftest()
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("cmd", choices=("manifest", "starts", "admit", "bench",
-                                    "diag"))
+                                    "diag", "history"))
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--n-envs", type=int, default=50)
     ap.add_argument("--n", type=int, default=50)
     a = ap.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
     return dict(manifest=cmd_manifest, starts=cmd_starts, admit=cmd_admit,
-                bench=cmd_bench, diag=cmd_diag)[a.cmd](a)
+                bench=cmd_bench, diag=cmd_diag, history=cmd_history)[a.cmd](a)
 
 
 if __name__ == "__main__":
