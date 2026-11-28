@@ -763,11 +763,12 @@ class HandoffArm:
 
 
 def run_branch(sim, io, arm, C, cfg, tpl, open_min, branch, task, pos, eid, *,
-               prefix=None, expect=None, wait=None):
+               prefix=None, expect=None, wait=None, budget=None):
     import k31_collect as kcol
     import k43_handoff as kh
     from k36_harness import episode_number
-    ob = Observer(open_min, dict(kh.CFG))
+    ob = Observer(open_min, dict(kh.CFG) if budget is None else
+                  dict(kh.CFG, budget=int(budget)))
     rs = RecSim(sim, ob, kcol.ENV["waiting_steps"] if wait is None else wait)
     ag = HandoffArm(arm, rs, C, cfg, tpl, branch, expect)
     arm.episode = episode_number(eid)
@@ -780,6 +781,9 @@ def run_branch(sim, io, arm, C, cfg, tpl, open_min, branch, task, pos, eid, *,
                                                       chunks=ag.opt.n_total),
               log=ag.log, on_end=last.get("on"), branch=branch,
               ended_in_option=bool(ag.log and ag.log[-1]["kind"] == "opt"),
+              on_hist=np.asarray(ob.ON, bool), grasp_hist=np.asarray(ob.GR, np.int8),
+              state_hist=np.asarray(ob.S, np.float64),
+              pot_hist=np.asarray([pp["pos"] for pp in ob.P], np.float64),
               t32_after=sum(1 for x in ag.log if x["kind"] == "t32" and
                             x.get("k", 0) > 0 and ag.opt is not None and
                             x["elapsed"] > (ob.trigger or {}).get("tau", 10 ** 9)))

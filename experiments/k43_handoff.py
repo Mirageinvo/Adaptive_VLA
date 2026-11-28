@@ -30,6 +30,8 @@ release/unknown → time. Порог апертуры open_min — --open-min и
                                            [--open-min M] [--partial]
   python3 experiments/k43_handoff.py fit-templates [--n-src 24] [--workers 4]
   python3 experiments/k43_handoff.py smoke --device cuda:0 [--n-dev 4]
+  python3 experiments/k43_handoff.py bank | prepare | collect --part K --device D
+                                     | status | analyze     (k43_pilot.py)
 Этап 2 (шаблоны, опция второго переноса, smoke) — k43_transfer.py.
 """
 import argparse
@@ -418,6 +420,8 @@ def selftest():
     print("k43_handoff selftest ok")
     import k43_transfer as kt
     kt.selftest()
+    import k43_pilot as kp
+    kp.selftest()
 
 
 def main():
@@ -442,12 +446,24 @@ def main():
     p.add_argument("--device", required=True)
     p.add_argument("--archive", type=Path, default=ARCHIVE)
     p.add_argument("--n-dev", type=int, default=4)
+    p = sub.add_parser("bank")
+    p.add_argument("--workers", type=int, default=8)
+    sub.add_parser("prepare")
+    p = sub.add_parser("collect")
+    p.add_argument("--part", required=True)
+    p.add_argument("--device", required=True)
+    sub.add_parser("status")
+    sub.add_parser("analyze")
     a = ap.parse_args()
     if a.cmd == "audit":
         audit(a)
         return
     import k43_transfer as kt
-    sys.exit(kt.fit_templates(a) if a.cmd == "fit-templates" else kt.smoke(a))
+    if a.cmd in ("fit-templates", "smoke"):
+        sys.exit(kt.fit_templates(a) if a.cmd == "fit-templates" else kt.smoke(a))
+    import k43_pilot as kp
+    sys.exit(dict(bank=kp.bank, prepare=kp.prepare, collect=kp.collect,
+                  status=kp.status, analyze=kp.analyze)[a.cmd](a))
 
 
 if __name__ == "__main__":
