@@ -446,6 +446,7 @@ def main():
     p.add_argument("--device", required=True)
     p.add_argument("--archive", type=Path, default=ARCHIVE)
     p.add_argument("--n-dev", type=int, default=4)
+    p.add_argument("--budget", type=int, default=192)
     p = sub.add_parser("bank")
     p.add_argument("--workers", type=int, default=8)
     sub.add_parser("prepare")

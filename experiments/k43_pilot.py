@@ -334,10 +334,16 @@ def common_problems(zz, meta, j, plan, start=0):
         p.append("начальный хеш ≠ банку")
     if s["steps"] != len(A) or s["physical"] != WAIT + len(A) or s["physical"] > EP:
         p.append("расход ≠ шагам")
-    if s["done_step"] >= 0 and s["done_step"] + 1 != s["steps"]:
-        p.append("done_step ≠ шагам")
-    if s["done_step"] < 0 and s["steps"] != MAX_STEPS:
+    ss, ds, st_ = s["success_step"], s["done_step"], s["steps"]
+    if ds >= 0 and (ds + 1 != st_ or s["own_steps"] != st_):
+        p.append("done_step/own_steps ≠ шагам")
+    if ds < 0 and st_ != MAX_STEPS:
         p.append("без terminal не до лимита")
+    if s["success"]:
+        if not (0 <= ss < st_ and (ds < 0 or ss <= ds)):
+            p.append("success_step несогласован с успехом")
+    elif ss != -1:
+        p.append("success_step при неуспехе")
     n = len(A) + 1
     for k, sh in (("on_hist", (n, 2)), ("grasp_hist", (n, 2)), ("pot_hist", (n, 2, 3)),
                   ("state_hist", (n, 9))):
@@ -498,6 +504,14 @@ def admission_ok(card, plan):
         return False, "smoke карты — с другими templates/config"
     if r.get("env") != kgr.env_record(card.torch):
         return False, "среда карты ≠ smoke"
+    if r.get("budget") != plan["budget"]:
+        return False, f"smoke с бюджетом {r.get('budget')} ≠ плану {plan['budget']}"
+    if r.get("code") != plan["code"]:
+        bad = sorted(f for f in plan["code"] if (r.get("code") or {}).get(f) !=
+                     plan["code"][f])
+        return False, f"smoke на другом коде: {bad[:4]}"
+    if r.get("k36_prepare_sha1") != plan["k36_prepare_sha1"]:
+        return False, "smoke с другим K-36 prepare"
     return True, ""
 
 
@@ -509,6 +523,8 @@ def collect(a):
     import k43_transfer as kt
     plan = load_plan()
     k36 = pc.load_prepare()
+    if k36["sha1"] != plan["k36_prepare_sha1"]:
+        raise SystemExit("K-36 prepare ≠ плану (другой T32)")
     C = kh.consts(k36)
     tpl = pc.load_json(str(kt.TEMPLATES))
     cfg = plan["config"]
@@ -608,7 +624,11 @@ def summarize(rows, n_boot=BOOT["n"]):
                                      for _r, i in infos),
                    chunks=np.quantile([r["Transfer"][1]["option"]["chunks"] for r in br],
                                       [0, .5, .9, 1]).tolist() if br else None),
-               saves=[r["case_id"] for r in rows if r["Transfer"][0] and not r["T32"][0]],
+               saves=[dict(case_id=r["case_id"],
+                           by="option" if kt.full_transfer(dict(
+                               r["Transfer"][1], success=True)) else "T32_after_return",
+                           stop=r["Transfer"][1]["option"]["info"].get("stop"))
+                      for r in rows if r["Transfer"][0] and not r["T32"][0]],
                losses=[dict(case_id=r["case_id"],
                             stop=r["Transfer"][1]["option"]["info"].get("stop"))
                        for r in rows if r["T32"][0] and not r["Transfer"][0]],
@@ -694,7 +714,10 @@ def analyze(a):
           f"отказ цели {cv['goal_refused']}")
     print(f"  опция: полных переносов {op['full']}, остановки {op['stops']}, первая "
           f"выходила из On {op['first_left_on']}, чанков (min/p50/p90/max) {op['chunks']}")
-    print(f"  спасения {res['saves']}; потери {res['losses']}")
+    by_ = _count(x["by"] for x in res["saves"])
+    print(f"  спасения {len(res['saves'])} (опцией {by_.get('option', 0)}, T32 после "
+          f"возврата {by_.get('T32_after_return', 0)}): {res['saves']}")
+    print(f"  потери {len(res['losses'])}: {res['losses']}")
     print(f"  стоимость: физ. шагов {res['cost']['physical']}, тяжёлых "
           f"{res['cost']['heavy']}, {res['cost']['seconds'] / 3600:.2f} ч")
     print(f"  решение: {res['decision']} (порог D ≥ {RULE['D_min']})")
@@ -796,6 +819,9 @@ def selftest():
             bad = dict(z0, actions=z0["actions"].copy())
             bad["actions"][0, 0] += 1
             assert t32_problems(bad, m0, j0, plan)
+            ms = json.loads(json.dumps(m0))
+            ms["summary"]["success"], ms["summary"]["success_step"] = True, -1
+            assert "success_step несогласован с успехом" in t32_problems(z0, ms, j0, plan)
             mt = json.loads(json.dumps(m0))
             mt["trigger"]["tau"] += 8
             assert t32_problems(z0, mt, j0, plan)

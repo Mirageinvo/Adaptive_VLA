@@ -35,6 +35,7 @@ pctl/to_codec, команда пересчитывается по новому �
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import os
 from pathlib import Path
 import socket
 import time
@@ -841,10 +842,21 @@ def smoke(a):
     k36 = pc.load_prepare()
     C = kh.consts(k36)
     jobs = {j["want"]["eid"]: j for j in ka.archive_jobs(Path(a.archive))}
-    aud = pc.load_json(str(OUT / "audit.json"))
+    import k43_pilot as kp
+    budget = int(a.budget)
+    ap = OUT / ("audit.json" if budget == 128 else f"audit_budget{budget}.json")
+    if not ap.exists():
+        raise SystemExit(f"нет {ap} — сначала audit --budget {budget}")
+    aud = pc.load_json(str(ap))
+    if aud.get("partial") or aud["cfg"]["budget"] != budget:
+        raise SystemExit(f"{ap}: неполный или другой бюджет")
     aud_tau = {r["eid"]: r["handoff"]["tau"] for r in aud["rows"]}
     dev = tpl["dev"][:a.n_dev]
-    prob, rep = [], dict(config=cfg, templates_sha256=sha256(TEMPLATES), scenes=[])
+    here = os.path.dirname(os.path.abspath(__file__))
+    prob, rep = [], dict(config=cfg, templates_sha256=sha256(TEMPLATES), scenes=[],
+                         budget=budget, audit=str(ap), audit_sha256=sha256(ap),
+                         k36_prepare_sha1=k36["sha1"],
+                         code={f: sha256(os.path.join(here, f)) for f in kp.CODE})
     card = kb40.Card(a.device)
     try:
         card.start()
@@ -870,7 +882,7 @@ def smoke(a):
             w = j["want"]
             rec, z = reference(Path(a.archive), j["part"], w)
             e0 = run_branch(sim, io, arm, C, cfg, tpl, tpl["open_min"], "T32", TASK,
-                            w["reset_id"], d["eid"])
+                            w["reset_id"], d["eid"], budget=budget)
             q = rec["summary"]
             same = np.array_equal(np.asarray(e0["actions"], np.float32),
                                   np.asarray(z["actions"], np.float32)) and \
@@ -891,7 +903,8 @@ def smoke(a):
                     try:
                         eb = run_branch(sim, io, arm, C, cf, tpl, tpl["open_min"],
                                         "Transfer", TASK, w["reset_id"], d["eid"],
-                                        prefix=np.asarray(e0["actions"])[:tau], expect=ex)
+                                        prefix=np.asarray(e0["actions"])[:tau], expect=ex,
+                                        budget=budget)
                     except kcol.Mismatch as e:
                         prob.append(f"{d['eid']} {name}: {e}")
                         continue
