@@ -314,6 +314,19 @@ def read_shard(path):
     return zz, json.loads(str(zz["meta"]))
 
 
+def controller_at(zz, step):
+    """Кто управлял на шаге step: option | t32 | prefix (переисполнение
+    префикса) | None (шага нет)."""
+    if step is None or step < 0:
+        return None
+    for t, k, o in zip(zz["c_tau"], zz["c_k"], zz["c_opt"]):
+        if int(t) <= step < int(t) + int(k):
+            return "option" if bool(o) else "t32"
+    if len(zz["c_tau"]) and step < int(zz["c_tau"][0]):
+        return "prefix"
+    return None
+
+
 def fork_of(meta):
     """Развилка, на которой исполняется ветвь: триггер и цель найдена."""
     t, g = meta["trigger"], meta["goal"]
@@ -625,8 +638,9 @@ def summarize(rows, n_boot=BOOT["n"]):
                    chunks=np.quantile([r["Transfer"][1]["option"]["chunks"] for r in br],
                                       [0, .5, .9, 1]).tolist() if br else None),
                saves=[dict(case_id=r["case_id"],
-                           by="option" if kt.full_transfer(dict(
-                               r["Transfer"][1], success=True)) else "T32_after_return",
+                           full=bool(kt.full_transfer(dict(r["Transfer"][1],
+                                                           success=True))),
+                           controller=r["Transfer"][1].get("ctrl_at_success"),
                            stop=r["Transfer"][1]["option"]["info"].get("stop"))
                       for r in rows if r["Transfer"][0] and not r["T32"][0]],
                losses=[dict(case_id=r["case_id"],
@@ -681,6 +695,9 @@ def collect_rows(plan, final=True):
                 if m1 is None or pr:
                     continue
                 want.append(j1)
+                z1, _m = read_shard(shard_path(j1["eid"]))
+                m1 = dict(m1, ctrl_at_success=controller_at(
+                    z1, m1["summary"]["success_step"]))
                 r["Transfer"] = (bool(m1["summary"]["success"]), m1)
             rows.append(r)
         prob += [f"part {k}: {x}" for x in kb40.ledger_problems(d, plan, k, want, final)]
@@ -714,9 +731,10 @@ def analyze(a):
           f"отказ цели {cv['goal_refused']}")
     print(f"  опция: полных переносов {op['full']}, остановки {op['stops']}, первая "
           f"выходила из On {op['first_left_on']}, чанков (min/p50/p90/max) {op['chunks']}")
-    by_ = _count(x["by"] for x in res["saves"])
-    print(f"  спасения {len(res['saves'])} (опцией {by_.get('option', 0)}, T32 после "
-          f"возврата {by_.get('T32_after_return', 0)}): {res['saves']}")
+    by_ = _count(x["controller"] for x in res["saves"])
+    print(f"  спасения {len(res['saves'])}: полный перенос "
+          f"{sum(x['full'] for x in res['saves'])}; управлял на шаге успеха "
+          f"{by_}: {res['saves']}")
     print(f"  потери {len(res['losses'])}: {res['losses']}")
     print(f"  стоимость: физ. шагов {res['cost']['physical']}, тяжёлых "
           f"{res['cost']['heavy']}, {res['cost']['seconds'] / 3600:.2f} ч")
@@ -804,6 +822,13 @@ def selftest():
             res = summarize(rows, n_boot=200)
             assert res["contrast"]["W"] >= 2 and res["contrast"]["L"] == 0, res["contrast"]
             assert res["option"]["full"] >= 2
+            assert all(x["controller"] == "option" and x["full"] for x in res["saves"]), \
+                res["saves"]
+            zc = dict(c_tau=np.array([0, 8, 16]), c_k=np.array([8, 8, 5]),
+                      c_opt=np.array([False, True, False]))
+            assert [controller_at(zc, t) for t in (3, 8, 15, 16, 20, 21, -1)] == \
+                ["t32", "option", "option", "t32", "t32", None, None]
+            assert controller_at(dict(zc, c_tau=zc["c_tau"] + 40), 10) == "prefix"
             # повтор ничего не исполняет
             n1 = n_run["n"]
             part_loop(kcol.Ledger(str(pd / "ledger.json"), dict(base=8 * EP)), plan, 0,
