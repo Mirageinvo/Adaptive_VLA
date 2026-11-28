@@ -59,7 +59,8 @@ CFG0 = dict(
     # контроллер (как pctl K-42; pos_m — м на единицу команды за шаг)
     gain=1.0, pos_m=0.05, umax=0.6, rot_gain=1.0, rot_rad=0.5, umax_rot=0.3,
     # допуски и запасы
-    tol_xy=0.010, tol_z=0.010, tol_rot=0.20, clear_tol=0.015, pot_lift=0.015,
+    tol_xy=0.010, tol_z=0.010, tol_rot=0.20, tol_coarse=0.020, clear_tol=0.015,
+    pot_lift=0.015,
     drop_m=0.010, retreat_m=0.06, pair_margin=0.9, region_margin=0.010,
     settle=16,
     # максимум чанков на фазу
@@ -545,9 +546,9 @@ class Transfer:
                 done = p[2] >= self.z_carry - cfg["tol_z"]
                 T, qt = np.array([p[0], p[1], self.z_carry]), qc
             elif ph == "over":
-                if p[2] < self.z_carry - cfg["clear_tol"]:
+                if self.n_phase == 0 and p[2] < self.z_carry - cfg["clear_tol"]:
                     return self._stop("зазор не достигнут перед over")
-                done = np.linalg.norm(p[:2] - pre[0][:2]) <= cfg["tol_xy"]
+                done = np.linalg.norm(p[:2] - pre[0][:2]) <= cfg["tol_coarse"]
                 T, qt = np.array([pre[0][0], pre[0][1], self.z_carry]), m2q(pre[1])
             elif ph in ("pre", "descend"):
                 tg = pre if ph == "pre" else gr
@@ -556,11 +557,13 @@ class Transfer:
                     ang(q2m(qc), tg[1]) <= cfg["tol_rot"]
                 T, qt = tg[0], m2q(tg[1])
             elif ph == "close":
-                if self.n_phase >= 1:
-                    if int(probe["grasp"][j]) != 1:
-                        return self._stop("нет удержания второй кофеварки")
+                # удержание проверяется после каждого чанка закрытия; отказ —
+                # если его нет к концу бюджета фазы
+                if self.n_phase >= 1 and int(probe["grasp"][j]) == 1:
                     self.z_pot0 = float(probe["pos"][j][2])
                     done = True
+                elif self.n_phase >= cfg["max_chunks"]["close"]:
+                    return self._stop("нет удержания второй кофеварки")
                 T, qt, grip = gr[0], m2q(gr[1]), CLOSE
             elif ph == "lift":
                 grip = CLOSE
@@ -579,9 +582,9 @@ class Transfer:
                     self.info["eef_obj"] = pq(self.eef_obj)
                 G = pmul(pose(*pl["goal"]), pinv(self.eef_obj))
                 if ph == "carry":
-                    if p[2] < self.z_carry - cfg["clear_tol"]:
+                    if self.n_phase == 0 and p[2] < self.z_carry - cfg["clear_tol"]:
                         return self._stop("зазор не достигнут перед carry")
-                    done = np.linalg.norm(p[:2] - G[0][:2]) <= cfg["tol_xy"]
+                    done = np.linalg.norm(p[:2] - G[0][:2]) <= cfg["tol_coarse"]
                     T = np.array([G[0][0], G[0][1], self.z_carry])
                 else:
                     zt = G[0][2] + cfg["drop_m"]
